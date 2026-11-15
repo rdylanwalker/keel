@@ -51,17 +51,17 @@ serve-demo:
     echo "Live API URL (use printed Bootstrap Token): http://127.0.0.1:8080/"
     cargo run --bin keel -- serve --bind 127.0.0.1:8080 --repo-dir "$tmp_dir/work" --bare-repo "$tmp_dir/bare.git"
 
-# Build UI + keel binary, kill any previous serve, start serve in background, and report credentials
-build-serve *ARGS: build
+# Stop any running background or orphaned `keel serve` process
+stop-serve:
     #!/usr/bin/env bash
     set -euo pipefail
     pid_file="target/keel-serve.pid"
-    log_file="target/keel-serve.log"
+    stopped=false
 
     if [ -f "$pid_file" ]; then
         old_pid=$(cat "$pid_file" 2>/dev/null || true)
         if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
-            echo "Stopping previous keel serve (PID $old_pid)..."
+            echo "Stopping keel serve (PID $old_pid)..."
             kill -INT "$old_pid" 2>/dev/null || true
             for _ in $(seq 1 30); do
                 kill -0 "$old_pid" 2>/dev/null || break
@@ -70,18 +70,39 @@ build-serve *ARGS: build
             if kill -0 "$old_pid" 2>/dev/null; then
                 kill -9 "$old_pid" 2>/dev/null || true
             fi
+            stopped=true
         fi
         rm -f "$pid_file"
     fi
 
-    # Also clean up any orphaned `target/debug/keel serve` without a pidfile
-    if pgrep -f "target/debug/keel serve" >/dev/null 2>&1; then
-        pkill -INT -f "target/debug/keel serve" 2>/dev/null || true
-        for _ in $(seq 1 20); do
-            pgrep -f "target/debug/keel serve" >/dev/null 2>&1 || break
-            sleep 0.1
-        done
+    # Also clean up any orphaned `keel serve` binaries without a pidfile
+    for pattern in "target/debug/keel serve" "target/release/keel serve"; do
+        if pgrep -f "$pattern" >/dev/null 2>&1; then
+            echo "Stopping orphaned '$pattern' process..."
+            pkill -INT -f "$pattern" 2>/dev/null || true
+            for _ in $(seq 1 20); do
+                pgrep -f "$pattern" >/dev/null 2>&1 || break
+                sleep 0.1
+            done
+            if pgrep -f "$pattern" >/dev/null 2>&1; then
+                pkill -9 -f "$pattern" 2>/dev/null || true
+            fi
+            stopped=true
+        fi
+    done
+
+    if [ "$stopped" = false ]; then
+        echo "No running keel serve process found."
     fi
+
+# Build UI + keel binary, kill any previous serve, start serve in background, and report credentials
+build-serve *ARGS: build
+    #!/usr/bin/env bash
+    set -euo pipefail
+    pid_file="target/keel-serve.pid"
+    log_file="target/keel-serve.log"
+
+    just stop-serve
 
     extra_args=({{ARGS}})
     has_bind=false
@@ -253,6 +274,38 @@ agent-e2e:
     pnpm --dir e2e format:check
     pnpm --dir e2e lint --quiet
     pnpm --dir e2e typecheck
+
+# Stop keel serve, delete the local kind management cluster, and remove local GitOps repos
+down cluster_name="keel-mgmt" repo_dir="./keel-gitops":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    just stop-serve
+
+    if command -v kind >/dev/null 2>&1; then
+        if kind get clusters 2>/dev/null | grep -qx "{{cluster_name}}"; then
+            echo "Deleting kind cluster '{{cluster_name}}'..."
+            kind delete cluster --name "{{cluster_name}}"
+        else
+            echo "Kind cluster '{{cluster_name}}' not found; skipping."
+        fi
+    else
+        echo "kind CLI not found; skipping cluster deletion."
+    fi
+
+    repo_dir="{{repo_dir}}"
+    repo_dir="${repo_dir%/}"
+    bare_dir="${repo_dir}.git"
+
+    for dir in "$repo_dir" "$bare_dir"; do
+        if [ -e "$dir" ]; then
+            echo "Removing local GitOps directory '$dir'..."
+            rm -rf "$dir"
+        fi
+    done
+
+    rm -f target/keel-dex-password
+
+alias cleanup := down
 
 # Clean build, coverage, and test artifacts
 clean:
