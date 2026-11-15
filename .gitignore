@@ -15,3 +15,7 @@ e2e/test-results/
 
 # mdBook build output
 book/
+
+# Local dev bootstrap GitOps repositories
+keel-gitops/
+keel-gitops.git/
