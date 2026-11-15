@@ -16,7 +16,7 @@ flowchart LR
 
 Infrastructure blueprints in `catalog/infra/` are gated by `providers/registry.yaml`.
 
-1. Open **Topology Map** in the web portal.
+1. Open **Control Plane & Providers** in the web portal.
 2. Locate the provider card (for example, **kind**, **Proxmox VE**, **AWS**, **GCP**, **Azure**, **Hetzner**, or **Cloudflare**).
 3. Click **Enable Provider** to open a PR updating `providers/registry.yaml`.
 4. Click **Go to PR** and merge the PR in **PR & Preview Inspector**.
@@ -65,6 +65,7 @@ keel preview status --pr 1 --watch --server http://127.0.0.1:8080
 - Review the **Git Diff** (the exact YAML manifests proposed under `tenants/<tenant>/infra/`, `tenants/<tenant>/apps/`, or `tenants/<tenant>/bundles/`).
 - Review the **PKO v2 Diff** (`+ Create`, `~ Update`, `- Delete`, `! Replace`).
 - Click **Merge PR Proposal** to merge into `main`, or **Reject PR** to close the proposal and garbage-collect ephemeral preview resources.
+- If a proposal was closed by mistake, select it (e.g., under the **Closed** or **All** tab) and click **Reopen PR** to reopen it.
 - Use the status filter tabs (**Open**, **Merged**, **Closed**, **All**) to browse PR history directly from your configured Git forge.
 
 ## 5. Deploy an Application

@@ -22,4 +22,12 @@ Keel deploys Kyverno policies during Stage 0 bootstrap to enforce:
 
 ## Progressive Delivery (Flagger + Envoy Gateway)
 
-Applications whose `CatalogApplication` declares `spec.progressiveDelivery.supported: true` can opt into automated canary rollouts (`--canary` in CLI or the canary toggle in the GUI). Keel synthesizes a Flagger `Canary` resource alongside the Flux `HelmRelease`, shifting traffic through **Envoy Gateway** based on **Prometheus** error-rate and latency metrics.
+Applications whose `CatalogApplication` declares `spec.progressiveDelivery.flaggerSupported: true` can opt into automated canary rollouts (`--canary` in CLI or the **Enable Flagger Canary** checkbox in the GUI deploy modal).
+
+When canary delivery is enabled, Keel synthesizes:
+
+- **`helmrelease-canary.yaml`**: Standard Flux `HelmRelease` for the application.
+- **`canary.yaml`**: A Flagger `Canary` (`flagger.app/v1beta1`, `provider: gatewayapi:v1`) targeting `keel-system/keel-ingress` and evaluating Prometheus metrics (`envoy-gateway-request-success-rate` ≥ 99% and `envoy-gateway-request-duration` p99 ≤ 500ms over `2m` windows) installed during Stage 0.
+- **`networkpolicy-canary.yaml`**: A tenant-scoped `NetworkPolicy` permitting TCP ingress on the application's service port from Envoy Gateway proxy pods in `keel-system` through `default-deny-all`.
+
+Because tenant namespaces enforce the `restricted` Pod Security Standard via Kyverno, application charts deployed into tenant namespaces must include a compliant `securityContext` (e.g., `allowPrivilegeEscalation: false`, `runAsNonRoot: true`, a numeric `runAsUser`, and `capabilities.drop: ["ALL"]`).
