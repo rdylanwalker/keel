@@ -18,7 +18,7 @@ catalog/
 
 ## How Provider Blueprints Work
 
-Enabling a provider on the **Topology Map** updates `providers/registry.yaml`. That registry acts as an allowlist:
+Enabling a provider on the **Control Plane & Providers** tab updates `providers/registry.yaml`. That registry acts as an allowlist:
 
 - `GET /api/v1/catalog` scans `catalog/infra/*/catalog.yaml` and returns only blueprints whose `metadata.provider` is `enabled: true` in `providers/registry.yaml`.
 - Enabling a provider does **not** auto-generate blueprints; you add the exact `CatalogInfraBlueprint` compositions (`catalog.yaml` + `Pulumi.yaml`) your organization wants to offer.

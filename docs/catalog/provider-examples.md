@@ -2,7 +2,7 @@
 
 Each example below provides a ready-to-use `catalog.yaml` (`CatalogInfraBlueprint`) and `Pulumi.yaml` pair that you can place under `catalog/infra/<blueprint-id>/` in your GitOps repository and merge via PR.
 
-Remember to enable the corresponding provider on the **Topology Map** (or in `providers/registry.yaml`) so the blueprint appears in **Catalog & Form Wizard**.
+Remember to enable the corresponding provider on **Control Plane & Providers** (or in `providers/registry.yaml`) so the blueprint appears in **Catalog & Form Wizard**.
 
 > **Credential & API Key Secrets:** Properties marked with `writeOnly: true` (and `format: password`) are partitioned out of plaintext `Stack.spec.config`, encrypted with SOPS + `age` into `secret.enc.yaml`, and injected into the PKO v2 workspace pod via `Stack.spec.envRefs` using the exact property name as the environment variable name.
 

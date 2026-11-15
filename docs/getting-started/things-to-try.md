@@ -63,23 +63,51 @@ kind get clusters
 
 ## 2. Deploy an Application with Canary Rollouts (`podinfo`)
 
-With a tenant namespace ready, deploy **Podinfo** (`podinfo`) using an upstream Helm chart with progressive delivery enabled.
+With a tenant namespace ready (such as `default` or `dev-team`), deploy **Podinfo** (`podinfo`) using an upstream Helm chart with Flagger + Envoy Gateway progressive delivery enabled.
 
-1. In **Catalog & Form Wizard**, select tenant `dev-team` and choose **Podinfo** (`podinfo`).
-2. Set **Replicas** to `2` and toggle **Flagger Canary Rollout** on.
-3. Click **Submit & Open Git PR Proposal** (or via CLI):
+### Step 1: Initial Canary Deployment
+
+1. In **Catalog & Form Wizard**, select your target tenant (e.g., `default`) and choose **Podinfo Microservice** (`podinfo`).
+2. Check **Enable Flagger Canary**.
+3. Fill in the form (`Replica Count`: `2`, `Ingress Hostname`: `podinfo.keel.local`, `API Secret Token`: any 8+ character secret, and keep the pre-filled `restricted` PSS `Container Security Context` defaults).
+4. Click **Submit & Open Git PR Proposal** (or via CLI):
 
 ```bash
 keel app install \
   --app podinfo \
-  --tenant dev-team \
+  --tenant default \
   --values-file ./deploy/catalog/apps/podinfo/upstream/values.yaml \
   --canary \
   --server http://127.0.0.1:8080
 ```
 
-4. Inspect the PR diff (which synthesizes both the Flux `HelmRelease` and Flagger `Canary` manifests) and merge it.
-5. Open **Topology Map** to watch Flux reconcile the release and Envoy Gateway + Flagger manage traffic shifting.
+5. Inspect the PR diff in **PR & Preview Inspector**—which synthesizes `helmrelease-canary.yaml`, `canary.yaml`, `networkpolicy-canary.yaml`, and SOPS-encrypted `secrets.enc.yaml`—and click **Merge PR**.
+6. In **Topology Map**, wait for `podinfo` to reach `Ready` / `Initialized` in the **Flagger Canary Traffic Rollouts (Envoy Gateway)** panel.
+
+### Step 2: Demonstrate a Live Canary Traffic Rollout
+
+1. Ensure `127.0.0.1 podinfo.keel.local` is in your `hosts` file and Envoy Gateway (`keel-ingress`) is port-forwarded on `127.0.0.1:8888`:
+
+```bash
+kubectl --context kind-keel-mgmt -n keel-system port-forward svc/envoy-keel-system-keel-ingress-34e23306 8888:8888
+```
+
+2. Start a traffic loop in a terminal so Prometheus records live Envoy Gateway success-rate and latency metrics:
+
+```bash
+while true; do
+  curl -s -H "Host: podinfo.keel.local" http://127.0.0.1:8888/version
+  echo ""
+  sleep 1
+done
+```
+
+3. In **Topology Map**, click **Edit** on the `podinfo` release, change **Chart Version** (for example, `6.7.1` → `6.7.0`) or **Replica Count** (`2` → `3`), re-enter **API Secret Token**, and verify **Enable Flagger Canary** remains checked.
+4. Submit and merge the PR.
+5. Watch the **Flagger Canary Traffic Rollouts (Envoy Gateway)** panel and your `curl` loop:
+   - Flagger scales up the new canary pods alongside `podinfo-primary`.
+   - Every `30s`, Flagger shifts weight (`10% → 20% → 30% → 40% → 50%`) while querying Prometheus (`envoy-gateway-request-success-rate` and `envoy-gateway-request-duration`).
+   - Your `curl` output will alternate between the old and new versions in proportion to the canary weight until Flagger promotes the new version to `podinfo-primary` (`Succeeded`).
 
 ---
 
@@ -91,7 +119,7 @@ You can use the same management cluster to provision cloud infrastructure. This 
 
 ### Step 1: Enable the `aws` Provider
 
-1. Open **Topology Map** in the web portal.
+1. Open **Control Plane & Providers** in the web portal.
 2. Locate the **Amazon Web Services (`aws`)** provider card and click **Enable Provider**.
 3. Merge the generated PR updating `providers/registry.yaml`.
 
@@ -130,7 +158,7 @@ GCP's **Always Free** tier includes 1 `e2-micro` VM per month with up to 30 GB `
 
 ### Step 2: Enable the `gcp` Provider
 
-1. Open **Topology Map** in the web portal and enable **Google Cloud Platform (`gcp`)**.
+1. Open **Control Plane & Providers** in the web portal and enable **Google Cloud Platform (`gcp`)**.
 2. Merge the generated PR updating `providers/registry.yaml`.
 
 ### Step 3: Add the `gcp-free-vm` Blueprint in the GUI
@@ -251,6 +279,6 @@ keel preview status --pr <PR_NUMBER> --watch --server http://127.0.0.1:8080
 
 Try extending the self-service catalog with another provider from [Provider Blueprint Examples](../catalog/provider-examples.md):
 
-1. Enable **Cloudflare (`cloudflare`)** or **Hetzner Cloud (`hetzner`)** on **Topology Map** and merge the PR.
+1. Enable **Cloudflare (`cloudflare`)** or **Hetzner Cloud (`hetzner`)** on **Control Plane & Providers** and merge the PR.
 2. Add the corresponding `catalog.yaml` + `Pulumi.yaml` under `catalog/infra/<blueprint-id>/` via **+ Add Catalog Item** and merge.
 3. Open **Catalog & Form Wizard** to see the JSON Schema automatically rendered as a validated form, with any `writeOnly: true` / `format: password` fields (such as `CLOUDFLARE_API_TOKEN` or `HCLOUD_TOKEN`) encrypted with SOPS + `age` into `secret.enc.yaml` and bound to `Stack.spec.envRefs` before touching Git.
