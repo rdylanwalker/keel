@@ -3,6 +3,7 @@ import {
   Boxes,
   Layers,
   GitPullRequest,
+  Server,
   ShieldCheck,
   ShieldAlert,
   Key,
@@ -47,10 +48,20 @@ const PreviewInspectorView = React.lazy(() =>
     default: m.PreviewInspectorView,
   }))
 )
+const ControlPlaneProvidersView = React.lazy(() =>
+  import("./components/ControlPlaneProvidersView").then((m) => ({
+    default: m.ControlPlaneProvidersView,
+  }))
+)
 
-export type ActiveTab = "topology" | "catalog" | "preview"
+export type ActiveTab = "topology" | "catalog" | "preview" | "providers"
 
-const VALID_TABS: readonly ActiveTab[] = ["topology", "catalog", "preview"]
+const VALID_TABS: readonly ActiveTab[] = [
+  "topology",
+  "catalog",
+  "preview",
+  "providers",
+]
 
 function parseHashTab(hash: string): ActiveTab {
   const normalized = hash.replace(/^#\/?/, "").trim() as ActiveTab
@@ -122,6 +133,7 @@ export const App: React.FC = () => {
         tenant: cfg.tenant || "default",
         targetCluster: cfg.targetCluster,
         targetNamespace: cfg.targetNamespace,
+        canary: cfg.canary,
       })
       if (!matched) {
         setEditModalError(
@@ -314,6 +326,18 @@ export const App: React.FC = () => {
             <span>PR &amp; Preview Inspector</span>
           </button>
 
+          <button
+            onClick={() => navigateToTab("providers")}
+            className={`w-full flex items-center space-x-3 px-3.5 py-2.5 rounded-xl text-xs font-semibold transition-all ${
+              activeTab === "providers"
+                ? "bg-indigo-600 text-white shadow-lg shadow-indigo-600/20"
+                : "text-slate-400 hover:text-slate-200 hover:bg-slate-800/60"
+            }`}
+          >
+            <Server className="h-4 w-4" />
+            <span>Control Plane &amp; Providers</span>
+          </button>
+
           {/* Unauthenticated info card in sidebar if unauthenticated */}
           {!authStatus.authenticated && (
             <div className="pt-6">
@@ -374,6 +398,7 @@ export const App: React.FC = () => {
                   authenticated={authStatus.authenticated}
                   onNavigateToCatalog={() => navigateToTab("catalog")}
                   onNavigateToPreview={() => navigateToTab("preview")}
+                  onNavigateToProviders={() => navigateToTab("providers")}
                   onEditRelease={handleEditRelease}
                   onEditStack={handleEditStack}
                 />
@@ -384,6 +409,13 @@ export const App: React.FC = () => {
                 />
               )}
               {activeTab === "preview" && <PreviewInspectorView />}
+              {activeTab === "providers" && (
+                <ControlPlaneProvidersView
+                  authenticated={authStatus.authenticated}
+                  onNavigateToCatalog={() => navigateToTab("catalog")}
+                  onNavigateToPreview={() => navigateToTab("preview")}
+                />
+              )}
             </React.Suspense>
           )}
         </main>

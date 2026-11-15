@@ -156,4 +156,48 @@ describe("DeployInstanceModal component", () => {
       expect(onClose).toHaveBeenCalled()
     })
   })
+
+  it("renders Enable Flagger Canary toggle when flaggerSupported is true and submits canary: true", async () => {
+    vi.mocked(api.createProposal).mockResolvedValueOnce({
+      id: "43",
+      title: "deploy podinfo canary",
+      branch: "keel/acme/app-podinfo-43",
+      author: "tester",
+      tenant: "acme",
+      status: "open",
+      createdAt: "just now",
+    })
+
+    render(
+      <DeployInstanceModal
+        isOpen={true}
+        onClose={onClose}
+        catalogItem={{
+          ...sampleAppItem,
+          flaggerSupported: true,
+          defaultCanary: false,
+        }}
+        tenant="acme"
+        onProposalCreated={onProposalCreated}
+      />
+    )
+
+    const canaryCheckbox = screen.getByLabelText(/Enable Flagger Canary/i)
+    expect(canaryCheckbox).not.toBeChecked()
+    fireEvent.click(canaryCheckbox)
+    expect(canaryCheckbox).toBeChecked()
+
+    fireEvent.click(
+      screen.getByRole("button", { name: /Submit & Open Git PR Proposal/i })
+    )
+    await waitFor(() => {
+      expect(api.createProposal).toHaveBeenCalledWith(
+        expect.objectContaining({
+          catalogId: "podinfo",
+          tenant: "acme",
+          canary: true,
+        })
+      )
+    })
+  })
 })

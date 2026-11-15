@@ -1006,10 +1006,11 @@ export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
           }`}
         >
           <div
+            data-testid="new-tenant-modal"
             className={`bg-slate-900 border-slate-800 flex flex-col space-y-4 shadow-2xl ${
               isTenantModalFullscreen
                 ? "w-full h-full rounded-none border-0 p-6"
-                : "border rounded-2xl max-w-md w-full p-6"
+                : "border rounded-2xl max-w-4xl w-full p-6"
             }`}
           >
             <div className="flex items-center justify-between border-b border-slate-800 pb-3 shrink-0">
@@ -1117,10 +1118,11 @@ export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
           }`}
         >
           <div
+            data-testid="catalog-item-modal"
             className={`bg-slate-900 border-slate-800 flex flex-col space-y-4 shadow-2xl ${
               isAddModalFullscreen
                 ? "w-full h-full rounded-none border-0 p-6 overflow-y-auto"
-                : "border rounded-2xl max-w-lg w-full p-6 my-8"
+                : "border rounded-2xl max-w-4xl w-full p-6 my-8"
             }`}
           >
             <div className="flex items-center justify-between border-b border-slate-800 pb-3 shrink-0">

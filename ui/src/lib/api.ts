@@ -98,6 +98,7 @@ interface RawCatalogEntry {
     }
     progressiveDelivery?: {
       flaggerSupported?: boolean
+      defaultCanary?: boolean
     }
     pulumiRuntime?: "yaml" | "hcl" | "opentofu-bridge"
     entrypoint?: string
@@ -139,6 +140,7 @@ export async function getCatalog(): Promise<CatalogItem[]> {
     path: app.spec?.upstream?.path,
     runtime: app.metadata?.runtime,
     flaggerSupported: app.spec?.progressiveDelivery?.flaggerSupported ?? false,
+    defaultCanary: app.spec?.progressiveDelivery?.defaultCanary ?? false,
     schema: app.spec?.schema ?? { type: "object", properties: {} },
     uiSchema: app.spec?.uiSchema,
   }))
@@ -338,6 +340,32 @@ export async function rejectProposal(
     message: closed
       ? `PR #${raw.proposal?.id ?? id} rejected and closed.`
       : "Failed to reject PR proposal",
+  }
+}
+
+export async function reopenProposal(
+  id: string | number
+): Promise<{ success: boolean; message?: string }> {
+  const res = await fetch(
+    `/api/v1/proposals/${encodeURIComponent(id)}/reopen`,
+    {
+      method: "POST",
+      headers: getHeaders(),
+    }
+  )
+  const raw = await handleResponse<
+    | { success: boolean; message?: string }
+    | { proposal?: { id?: string; state?: string } }
+  >(res)
+  if ("success" in raw) {
+    return raw
+  }
+  const reopened = raw.proposal?.state === "open"
+  return {
+    success: reopened,
+    message: reopened
+      ? `PR #${raw.proposal?.id ?? id} reopened.`
+      : "Failed to reopen PR proposal",
   }
 }
 

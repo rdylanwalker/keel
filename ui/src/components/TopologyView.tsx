@@ -1,8 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useState } from "react"
-import { LegacyColumnDef } from "@tanstack/react-table/legacy"
 import {
   Server,
-  Cloud,
   Cpu,
   Layers,
   CheckCircle2,
@@ -24,31 +22,25 @@ import {
   Filter,
   Gauge,
   Clock,
+  ChevronDown,
+  ChevronUp,
 } from "lucide-react"
-import {
-  CrdWatchEvent,
-  ProviderRegistryEntry,
-  ReleaseSummary,
-  StackSummary,
-} from "../types/api"
+import { CrdWatchEvent, ReleaseSummary, StackSummary } from "../types/api"
 import {
   createEventSourceStream,
   deleteRelease,
   deleteStack,
-  getProposals,
-  getProviders,
   getReleases,
   getStacksWithMeta,
   reconcileRelease,
   restartStackWorkspace,
-  toggleProvider,
 } from "../lib/api"
 import { isDemoMode } from "../lib/utils"
 import { StackInspectorModal } from "./StackInspectorModal"
 import { StatusBadge } from "./StatusBadge"
 import { BundleBadge } from "./BundleBadge"
 import { PrNotificationBanner } from "./PrNotificationBanner"
-import { DataTable } from "./DataTable"
+import { DataTable, DataTableColumnDef } from "./DataTable"
 
 const DEFAULT_EVENTS: CrdWatchEvent[] = [
   {
@@ -135,52 +127,6 @@ const DEFAULT_STACKS: StackSummary[] = [
   },
 ]
 
-interface ProviderInfo {
-  id: string
-  name: string
-  type: string
-  enabled: boolean
-  nodesOrRegions: string
-}
-
-const DEFAULT_PROVIDERS: ProviderInfo[] = [
-  {
-    id: "proxmox",
-    name: "Proxmox VE Cluster",
-    type: "On-Prem Hypervisor",
-    enabled: true,
-    nodesOrRegions: "3 Nodes (pve-01, pve-02, pve-03)",
-  },
-  {
-    id: "aws",
-    name: "Amazon Web Services",
-    type: "Public Cloud Provider",
-    enabled: true,
-    nodesOrRegions: "us-east-1, eu-west-1",
-  },
-  {
-    id: "gcp",
-    name: "Google Cloud Platform",
-    type: "Public Cloud Provider",
-    enabled: false,
-    nodesOrRegions: "us-central1",
-  },
-  {
-    id: "hetzner",
-    name: "Hetzner Cloud",
-    type: "Bare Metal / Cloud",
-    enabled: true,
-    nodesOrRegions: "fsn1 (Frankfurt)",
-  },
-  {
-    id: "kind",
-    name: "Local kind / k3s",
-    type: "Stage 0 Bootstrap Target",
-    enabled: true,
-    nodesOrRegions: "1 Control Plane Node",
-  },
-]
-
 function ensureManagementStack(stackList: StackSummary[]): StackSummary[] {
   if (
     stackList.some(
@@ -216,36 +162,10 @@ function formatLastSynced(value?: string): string {
   return `${diffDays}d ago`
 }
 
-function mergeProviders(liveEntries: ProviderRegistryEntry[]): ProviderInfo[] {
-  if (!liveEntries || liveEntries.length === 0) {
-    return DEFAULT_PROVIDERS
-  }
-  const knownIds = new Set(DEFAULT_PROVIDERS.map((p) => p.id))
-  const updatedDefaults = DEFAULT_PROVIDERS.map((def) => {
-    const live = liveEntries.find((e) => e.id === def.id)
-    return live
-      ? {
-          ...def,
-          enabled: live.enabled,
-          name: live.description || def.name,
-        }
-      : def
-  })
-  const extras: ProviderInfo[] = liveEntries
-    .filter((e) => !knownIds.has(e.id))
-    .map((e) => ({
-      id: e.id,
-      name: e.description || e.id,
-      type: e.package || "Infrastructure Provider",
-      enabled: e.enabled,
-      nodesOrRegions: "Default Region",
-    }))
-  return [...updatedDefaults, ...extras]
-}
-
 export interface TopologyViewProps {
   onNavigateToCatalog?: () => void
   onNavigateToPreview?: () => void
+  onNavigateToProviders?: () => void
   onEditRelease?: (namespace: string, name: string) => void
   onEditStack?: (namespace: string, name: string) => void
   authenticated?: boolean
@@ -254,6 +174,7 @@ export interface TopologyViewProps {
 export const TopologyView: React.FC<TopologyViewProps> = ({
   onNavigateToCatalog,
   onNavigateToPreview,
+  onNavigateToProviders,
   onEditRelease,
   onEditStack,
   authenticated = true,
@@ -267,21 +188,10 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
     forgeProvider?: string
     stateBackend?: string
   }>({})
-  const [providers, setProviders] = useState<ProviderInfo[]>(() =>
-    isDemoMode() ? DEFAULT_PROVIDERS : []
-  )
-  const [pendingProviderPrs, setPendingProviderPrs] = useState<
-    Record<string, { id: string; branch: string }>
-  >({})
+  const [showControlPlaneDetails, setShowControlPlaneDetails] = useState(false)
   const [loading, setLoading] = useState(false)
   const [autoRefresh, setAutoRefresh] = useState(true)
-  const [togglingId, setTogglingId] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
-  const [prNotification, setPrNotification] = useState<{
-    id: string
-    branch: string
-    prUrl?: string
-  } | null>(null)
   const [inspectedStack, setInspectedStack] = useState<{
     namespace: string
     name: string
@@ -315,6 +225,35 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
     (stack.name === "management-cluster-core"
       ? "flux-system"
       : stack.tenant || "default")
+
+  const fetchTopology = useCallback(async () => {
+    setLoading(true)
+    setError(null)
+    try {
+      const [stacksRes, releasesData] = await Promise.all([
+        getStacksWithMeta(),
+        getReleases().catch(() => []),
+      ])
+      setStacks(ensureManagementStack(stacksRes.stacks || []))
+      setClusterMeta({
+        gitRepoUrl: stacksRes.gitRepoUrl,
+        forgeProvider: stacksRes.forgeProvider,
+        stateBackend: stacksRes.stateBackend,
+      })
+      setReleases(releasesData || [])
+    } catch (err) {
+      setError(
+        err instanceof Error
+          ? err.message
+          : "Failed to load live stack topology"
+      )
+      if (!isDemoMode()) {
+        setStacks(ensureManagementStack([]))
+      }
+    } finally {
+      setLoading(false)
+    }
+  }, [])
 
   const handleQuickRestart = async (stack: StackSummary) => {
     const ns = resolveStackNamespace(stack)
@@ -398,68 +337,13 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
     }
   }
 
-  const extractPendingProviderPrs = (
-    proposals: { id: string; branch: string; status: string }[]
-  ) => {
-    const map: Record<string, { id: string; branch: string }> = {}
-    for (const pr of proposals) {
-      if (pr.status !== "open") continue
-      const match = /^keel\/providers\/toggle-([a-z0-9-]+)-\d+$/.exec(pr.branch)
-      if (match) {
-        map[match[1]] = { id: pr.id, branch: pr.branch }
-      }
-    }
-    return map
-  }
-
-  const fetchTopology = useCallback(async () => {
-    setLoading(true)
-    setError(null)
-    try {
-      const [stacksRes, providersData, proposalsData, releasesData] =
-        await Promise.all([
-          getStacksWithMeta(),
-          getProviders(),
-          getProposals().catch(() => []),
-          getReleases().catch(() => []),
-        ])
-      setStacks(ensureManagementStack(stacksRes.stacks || []))
-      setClusterMeta({
-        gitRepoUrl: stacksRes.gitRepoUrl,
-        forgeProvider: stacksRes.forgeProvider,
-        stateBackend: stacksRes.stateBackend,
-      })
-      setReleases(releasesData || [])
-      if (providersData) {
-        setProviders(mergeProviders(providersData))
-      }
-      setPendingProviderPrs(extractPendingProviderPrs(proposalsData || []))
-    } catch (err) {
-      setError(
-        err instanceof Error
-          ? err.message
-          : "Failed to load live stack topology"
-      )
-      if (!isDemoMode()) {
-        setStacks(ensureManagementStack([]))
-      }
-    } finally {
-      setLoading(false)
-    }
-  }, [])
-
   useEffect(() => {
     if (!authenticated) {
       return
     }
     let cancelled = false
-    Promise.all([
-      getStacksWithMeta(),
-      getProviders(),
-      getProposals().catch(() => []),
-      getReleases().catch(() => []),
-    ])
-      .then(([stacksRes, providersData, proposalsData, releasesData]) => {
+    Promise.all([getStacksWithMeta(), getReleases().catch(() => [])])
+      .then(([stacksRes, releasesData]) => {
         if (!cancelled) {
           setError(null)
           setStacks(ensureManagementStack(stacksRes.stacks || []))
@@ -469,10 +353,6 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
             stateBackend: stacksRes.stateBackend,
           })
           setReleases(releasesData || [])
-          if (providersData) {
-            setProviders(mergeProviders(providersData))
-          }
-          setPendingProviderPrs(extractPendingProviderPrs(proposalsData || []))
         }
       })
       .catch((err) => {
@@ -553,35 +433,9 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
     }
   }, [authenticated, isStreamPaused])
 
-  const handleToggleProvider = async (
-    id: string,
-    currentlyEnabled: boolean
-  ) => {
-    setTogglingId(id)
-    setError(null)
-    try {
-      const proposal = await toggleProvider(id, !currentlyEnabled)
-      setPrNotification({
-        id: proposal.id,
-        branch: proposal.branch || "main",
-        prUrl: proposal.prUrl,
-      })
-      setPendingProviderPrs((prev) => ({
-        ...prev,
-        [id]: { id: proposal.id, branch: proposal.branch || "main" },
-      }))
-    } catch (err) {
-      setError(
-        err instanceof Error ? err.message : `Failed to toggle provider ${id}`
-      )
-    } finally {
-      setTogglingId(null)
-    }
-  }
-
   const normalizeStatus = (status?: string) => (status ?? "").toLowerCase()
 
-  const stackColumns = useMemo<LegacyColumnDef<StackSummary, unknown>[]>(
+  const stackColumns = useMemo<DataTableColumnDef<StackSummary>[]>(
     () => [
       {
         accessorKey: "name",
@@ -741,7 +595,7 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
     [onEditStack, restartingStackKey, deletingKey]
   )
 
-  const releaseColumns = useMemo<LegacyColumnDef<ReleaseSummary, unknown>[]>(
+  const releaseColumns = useMemo<DataTableColumnDef<ReleaseSummary>[]>(
     () => [
       {
         accessorKey: "name",
@@ -753,9 +607,22 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
               <span>{rel.name}</span>
               {(rel.canary || rel.type === "canary") && (
                 <span className="text-[10px] px-1.5 py-0.5 rounded bg-purple-500/15 text-purple-300 border border-purple-500/30">
-                  Canary
+                  {rel.canaryWeight && rel.canaryWeight > 0
+                    ? `Canary ${rel.canaryWeight}%`
+                    : "Canary"}
                 </span>
               )}
+              {rel.primaryVersion &&
+                rel.version &&
+                rel.primaryVersion !== rel.version &&
+                rel.canaryPhase !== "Succeeded" && (
+                  <span
+                    className="text-[10px] font-mono text-amber-300"
+                    title="Live primary version → desired canary version"
+                  >
+                    {rel.primaryVersion} → {rel.version}
+                  </span>
+                )}
             </div>
           )
         },
@@ -941,7 +808,7 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
   }).length
 
   const canaries = releases.filter(
-    (r) => r.type === "canary" || r.canaryWeight !== undefined
+    (r) => r.canary || r.type === "canary" || r.canaryWeight !== undefined
   )
   const filteredEvents =
     eventFilterKind === "all"
@@ -955,11 +822,11 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
         <div>
           <h2 className="text-xl font-bold text-white flex items-center gap-2">
             <Boxes className="h-6 w-6 text-indigo-400" />
-            Cluster &amp; Provider Topology Map
+            Cluster &amp; Workload Topology
           </h2>
           <p className="text-xs text-slate-400 mt-1">
-            View your management cluster, provisioned workload stacks, and
-            enabled infrastructure providers
+            Monitor provisioned workload stacks, application releases, canary
+            rollouts, and live CRD events
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
@@ -1012,16 +879,6 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
             {isDemoMode() ? " (showing fallback local topology)" : ""}
           </span>
         </div>
-      )}
-
-      {prNotification && (
-        <PrNotificationBanner
-          message={`PR #${prNotification.id} opened on branch ${prNotification.branch}`}
-          prId={prNotification.id}
-          prUrl={prNotification.prUrl}
-          onNavigateToPreview={onNavigateToPreview}
-          onDismiss={() => setPrNotification(null)}
-        />
       )}
 
       {/* Stats row */}
@@ -1077,164 +934,241 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
         </div>
       </div>
 
-      {/* Management Cluster Core Card */}
-      <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 space-y-4">
-        <div className="flex items-center justify-between border-b border-slate-800 pb-4">
-          <div className="flex items-center space-x-3">
-            <div className="p-3 bg-indigo-600 rounded-xl text-white shadow-lg shadow-indigo-600/30">
-              <Server className="h-6 w-6" />
+      {/* Compact Management Control Plane Strip */}
+      <div className="bg-slate-900 border border-slate-800 rounded-xl px-4 py-3 space-y-3">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="flex flex-wrap items-center gap-2.5 text-xs">
+            <span className="inline-flex items-center gap-1.5 font-semibold text-white">
+              <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
+              <Server className="h-3.5 w-3.5 text-indigo-400" />
+              Management Control Plane
+            </span>
+            <span className="text-[10px] px-2 py-0.5 rounded-full bg-indigo-500/10 text-indigo-400 border border-indigo-500/30 font-medium">
+              protect: true
+            </span>
+            <span className="hidden sm:inline text-slate-600">·</span>
+            <span className="text-[11px] px-2 py-0.5 rounded bg-slate-950 border border-slate-800 text-slate-300">
+              Flux CD v2
+            </span>
+            <span className="text-[11px] px-2 py-0.5 rounded bg-slate-950 border border-slate-800 text-slate-300">
+              PKO v2
+            </span>
+            <span className="text-[11px] px-2 py-0.5 rounded bg-slate-950 border border-slate-800 text-slate-300">
+              Kyverno
+            </span>
+            <span className="text-[11px] px-2 py-0.5 rounded bg-slate-950 border border-slate-800 text-slate-300">
+              SOPS + age / {clusterMeta.stateBackend || "S3"}
+            </span>
+          </div>
+
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => setShowControlPlaneDetails((v) => !v)}
+              className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-[11px] font-medium bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 transition-colors cursor-pointer"
+            >
+              <span>{showControlPlaneDetails ? "Hide" : "Details"}</span>
+              {showControlPlaneDetails ? (
+                <ChevronUp className="h-3 w-3" />
+              ) : (
+                <ChevronDown className="h-3 w-3" />
+              )}
+            </button>
+            {onNavigateToProviders && (
+              <button
+                type="button"
+                onClick={onNavigateToProviders}
+                className="text-[11px] font-medium text-indigo-400 hover:text-indigo-300 px-2 py-1 cursor-pointer"
+              >
+                Providers &rarr;
+              </button>
+            )}
+          </div>
+        </div>
+
+        {showControlPlaneDetails && (
+          <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3 pt-2 border-t border-slate-800 text-xs">
+            <div className="bg-slate-950 p-2.5 rounded-lg border border-slate-800">
+              <p className="text-slate-500 flex items-center gap-1.5">
+                <Cpu className="h-3.5 w-3.5 text-indigo-400" /> GitOps Engine
+              </p>
+              <p className="font-semibold text-slate-200 mt-1">Flux CD v2</p>
             </div>
-            <div>
-              <div className="flex items-center space-x-2">
-                <h3 className="text-lg font-semibold text-white">
-                  Management Control Plane Cluster
-                </h3>
-                <span className="text-xs px-2.5 py-0.5 rounded-full bg-indigo-500/10 text-indigo-400 border border-indigo-500/30 font-medium">
-                  protect: true
-                </span>
-              </div>
-              <p className="text-xs text-slate-400 mt-0.5">
-                Seed GitOps Engine, PKO v2 Synthesizer, Kyverno Gatekeeper,
-                Envoy Ingress &amp; Flagger
+            <div className="bg-slate-950 p-2.5 rounded-lg border border-slate-800">
+              <p className="text-slate-500 flex items-center gap-1.5">
+                <Layers className="h-3.5 w-3.5 text-purple-400" /> Infra
+                Synthesizer
+              </p>
+              <p className="font-semibold text-slate-200 mt-1">PKO v2</p>
+            </div>
+            <div className="bg-slate-950 p-2.5 rounded-lg border border-slate-800">
+              <p className="text-slate-500 flex items-center gap-1.5">
+                <Shield className="h-3.5 w-3.5 text-emerald-400" /> Policy
+                Engine
+              </p>
+              <p className="font-semibold text-slate-200 mt-1">Kyverno</p>
+            </div>
+            <div className="bg-slate-950 p-2.5 rounded-lg border border-slate-800 min-w-0">
+              <p className="text-slate-500 flex items-center gap-1.5">
+                <HardDrive className="h-3.5 w-3.5 text-amber-400 shrink-0" />{" "}
+                Secrets &amp; State
+              </p>
+              <p
+                className="font-semibold text-slate-200 mt-1 truncate"
+                title={clusterMeta.stateBackend || "S3"}
+              >
+                SOPS + age / {clusterMeta.stateBackend || "S3"}
+              </p>
+            </div>
+            <div className="bg-slate-950 p-2.5 rounded-lg border border-slate-800 min-w-0 col-span-2 sm:col-span-1">
+              <p className="text-slate-500 flex items-center gap-1.5">
+                <GitBranch className="h-3.5 w-3.5 text-cyan-400 shrink-0" /> Git
+                Forge &amp; Repo
+              </p>
+              <p
+                className="font-semibold text-slate-200 mt-1 truncate font-mono text-[11px]"
+                title={clusterMeta.gitRepoUrl || "Not configured"}
+              >
+                {clusterMeta.forgeProvider
+                  ? `${clusterMeta.forgeProvider}: `
+                  : ""}
+                {clusterMeta.gitRepoUrl || "Local / Unconfigured"}
               </p>
             </div>
           </div>
-          <div className="flex items-center space-x-2">
-            <span className="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-pulse"></span>
-            <span className="text-xs font-semibold text-emerald-400">
-              Healthy
-            </span>
-          </div>
-        </div>
-
-        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-4 text-xs">
-          <div className="bg-slate-950 p-3 rounded-lg border border-slate-800">
-            <p className="text-slate-500 flex items-center gap-1.5">
-              <Cpu className="h-3.5 w-3.5 text-indigo-400" /> GitOps Engine
-            </p>
-            <p className="font-semibold text-slate-200 mt-1">Flux CD v2</p>
-          </div>
-          <div className="bg-slate-950 p-3 rounded-lg border border-slate-800">
-            <p className="text-slate-500 flex items-center gap-1.5">
-              <Layers className="h-3.5 w-3.5 text-purple-400" /> Infra
-              Synthesizer
-            </p>
-            <p className="font-semibold text-slate-200 mt-1">PKO v2</p>
-          </div>
-          <div className="bg-slate-950 p-3 rounded-lg border border-slate-800">
-            <p className="text-slate-500 flex items-center gap-1.5">
-              <Shield className="h-3.5 w-3.5 text-emerald-400" /> Policy Engine
-            </p>
-            <p className="font-semibold text-slate-200 mt-1">Kyverno</p>
-          </div>
-          <div className="bg-slate-950 p-3 rounded-lg border border-slate-800 min-w-0">
-            <p className="text-slate-500 flex items-center gap-1.5">
-              <HardDrive className="h-3.5 w-3.5 text-amber-400 shrink-0" />{" "}
-              Secrets &amp; State
-            </p>
-            <p
-              className="font-semibold text-slate-200 mt-1 truncate"
-              title={clusterMeta.stateBackend || "S3"}
-            >
-              SOPS + age / {clusterMeta.stateBackend || "S3"}
-            </p>
-          </div>
-          <div className="bg-slate-950 p-3 rounded-lg border border-slate-800 min-w-0 col-span-2 sm:col-span-1">
-            <p className="text-slate-500 flex items-center gap-1.5">
-              <GitBranch className="h-3.5 w-3.5 text-cyan-400 shrink-0" /> Git
-              Forge &amp; Repo
-            </p>
-            <p
-              className="font-semibold text-slate-200 mt-1 truncate font-mono text-[11px]"
-              title={clusterMeta.gitRepoUrl || "Not configured"}
-            >
-              {clusterMeta.forgeProvider
-                ? `${clusterMeta.forgeProvider}: `
-                : ""}
-              {clusterMeta.gitRepoUrl || "Local / Unconfigured"}
-            </p>
-          </div>
-        </div>
+        )}
       </div>
 
-      {/* Enabled Infrastructure Providers Grid */}
-      <div className="space-y-3">
-        <h3 className="text-sm font-semibold text-slate-300 uppercase tracking-wider flex items-center gap-2">
-          <Cloud className="h-4 w-4 text-indigo-400" /> Enabled Provider Mesh
-        </h3>
-        <div className="grid grid-cols-1 md:grid-cols-3 lg:grid-cols-5 gap-4">
-          {providers.map((provider) => (
-            <div
-              key={provider.id}
-              className={`flex flex-col justify-between h-full bg-slate-900 border p-4 rounded-xl transition-all ${
-                provider.enabled
-                  ? "border-slate-800 hover:border-indigo-500/60"
-                  : "border-slate-800/60 opacity-75"
-              }`}
-            >
-              <div className="space-y-2">
-                <div className="flex items-start justify-between gap-2">
-                  <span className="text-xs font-semibold text-white leading-snug">
-                    {provider.name}
-                  </span>
-                  <span
-                    className={`shrink-0 text-[10px] px-2 py-0.5 rounded-full font-medium ${
-                      provider.enabled
-                        ? "bg-emerald-500/10 text-emerald-400 border border-emerald-500/20"
-                        : "bg-slate-800 text-slate-500 border border-slate-700"
-                    }`}
-                  >
-                    {provider.enabled ? "enabled" : "disabled"}
-                  </span>
-                </div>
-                <p className="text-[11px] text-slate-400">{provider.type}</p>
-                <p className="text-[10px] font-mono text-slate-500 truncate">
-                  {provider.nodesOrRegions}
+      {/* Active Flagger Canary Progressive Delivery Section (promoted when active) */}
+      {canaries.length > 0 && (
+        <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 space-y-4">
+          <div className="flex items-center justify-between border-b border-slate-800 pb-3">
+            <div className="flex items-center space-x-3">
+              <div className="p-2.5 bg-amber-500/10 text-amber-400 rounded-xl border border-amber-500/20">
+                <Gauge className="h-5 w-5" />
+              </div>
+              <div>
+                <h3 className="text-base font-semibold text-white">
+                  Flagger Canary Traffic Rollouts (Envoy Gateway)
+                </h3>
+                <p className="text-xs text-slate-400">
+                  Automated progressive traffic shifting with Prometheus error
+                  rate &amp; p99 latency evaluation
                 </p>
               </div>
-              <div className="mt-3 pt-2 border-t border-slate-800/60 flex items-center justify-between gap-2">
-                {pendingProviderPrs[provider.id] ? (
-                  <button
-                    type="button"
-                    onClick={onNavigateToPreview}
-                    className="text-[11px] px-2.5 py-1 rounded-md font-medium bg-purple-500/10 text-purple-300 border border-purple-500/30 hover:bg-purple-500/20 transition-colors cursor-pointer"
-                  >
-                    Go to PR #{pendingProviderPrs[provider.id].id} →
-                  </button>
-                ) : (
-                  <button
-                    type="button"
-                    onClick={() =>
-                      handleToggleProvider(provider.id, provider.enabled)
-                    }
-                    disabled={togglingId === provider.id}
-                    className={`text-[11px] px-2.5 py-1 rounded-md font-medium transition-colors ${
-                      provider.enabled
-                        ? "bg-rose-500/10 text-rose-400 border border-rose-500/20 hover:bg-rose-500/20 cursor-pointer"
-                        : "bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 hover:bg-emerald-500/20 cursor-pointer"
-                    } ${togglingId === provider.id ? "opacity-50 cursor-wait" : ""}`}
-                  >
-                    {togglingId === provider.id
-                      ? "Updating..."
-                      : provider.enabled
-                        ? "Disable"
-                        : "Enable"}
-                  </button>
-                )}
-                {provider.enabled && (
-                  <button
-                    type="button"
-                    onClick={onNavigateToCatalog}
-                    className="text-[11px] font-medium text-indigo-400 hover:text-indigo-300 flex items-center gap-1 shrink-0 cursor-pointer"
-                  >
-                    Provision &rarr;
-                  </button>
-                )}
-              </div>
             </div>
-          ))}
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+            {canaries.map((canary) => {
+              const weight = canary.canaryWeight ?? 0
+              const phase = canary.canaryPhase ?? ""
+              const isPromoted =
+                weight === 0 &&
+                (phase === "Succeeded" ||
+                  phase === "Initialized" ||
+                  phase === "Promoting" ||
+                  phase === "Finalising")
+              const primaryPct = isPromoted ? 100 : Math.max(0, 100 - weight)
+              const primaryVer = canary.primaryVersion || canary.version || "—"
+              const canaryVer = canary.version || "—"
+              const errRate = canary.errorRate ?? 0.01
+              const latency = canary.latencyMs ?? 15
+
+              return (
+                <div
+                  key={canary.id || `${canary.namespace}-${canary.name}`}
+                  className="bg-slate-950 border border-slate-800 rounded-xl p-4 space-y-3"
+                >
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-bold text-white flex items-center gap-1.5">
+                      <GitBranch className="h-3.5 w-3.5 text-amber-400" />
+                      {canary.name}
+                    </span>
+                    <StatusBadge status={phase || canary.status} size="xs" />
+                  </div>
+
+                  <div className="space-y-1.5">
+                    <div className="flex items-center justify-between text-[11px]">
+                      <span className="text-slate-400">
+                        {isPromoted
+                          ? "Traffic Split (Promoted)"
+                          : "Canary Traffic Weight"}
+                      </span>
+                      <span
+                        className={`font-mono font-bold ${
+                          isPromoted
+                            ? "text-emerald-400"
+                            : phase === "Failed"
+                              ? "text-red-400"
+                              : "text-amber-400"
+                        }`}
+                      >
+                        {isPromoted ? "100% Primary" : `${weight}%`}
+                      </span>
+                    </div>
+                    <div className="w-full bg-slate-900 rounded-full h-2 overflow-hidden border border-slate-800 flex">
+                      <div
+                        className={`h-2 transition-all duration-500 ${
+                          isPromoted
+                            ? "bg-linear-to-r from-emerald-500 to-emerald-400"
+                            : phase === "Failed"
+                              ? "bg-red-500/80"
+                              : "bg-indigo-500"
+                        }`}
+                        style={{ width: `${primaryPct}%` }}
+                        title={`Primary ${primaryVer}: ${primaryPct}%`}
+                      ></div>
+                      {!isPromoted && weight > 0 && (
+                        <div
+                          className="bg-linear-to-r from-amber-400 to-emerald-400 h-2 transition-all duration-500"
+                          style={{ width: `${weight}%` }}
+                          title={`Canary ${canaryVer}: ${weight}%`}
+                        ></div>
+                      )}
+                    </div>
+                    <div className="flex items-center justify-between text-[10px] font-mono text-slate-400">
+                      <span>
+                        Primary:{" "}
+                        <strong className="text-indigo-300">
+                          {primaryVer}
+                        </strong>{" "}
+                        ({primaryPct}%)
+                      </span>
+                      {!isPromoted && (
+                        <span>
+                          Canary:{" "}
+                          <strong className="text-amber-300">
+                            {canaryVer}
+                          </strong>{" "}
+                          ({weight}%)
+                        </span>
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-2 pt-1 text-[10px] font-mono">
+                    <div className="bg-slate-900 p-2 rounded border border-slate-800">
+                      <span className="text-slate-500 block">
+                        HTTP 5xx Rate:
+                      </span>
+                      <span className="text-emerald-400 font-bold">
+                        {errRate}%
+                      </span>
+                    </div>
+                    <div className="bg-slate-900 p-2 rounded border border-slate-800">
+                      <span className="text-slate-500 block">p99 Latency:</span>
+                      <span className="text-indigo-300 font-bold">
+                        {latency}ms
+                      </span>
+                    </div>
+                  </div>
+                </div>
+              )
+            })}
+          </div>
         </div>
-      </div>
+      )}
 
       {/* Provisioned Stacks Table */}
       <div className="bg-slate-900 border border-slate-800 rounded-2xl overflow-hidden space-y-4 p-6">
@@ -1321,89 +1255,6 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
             onDismiss={() => setReleaseBanner(null)}
             className="rounded-none rounded-b-2xl border-x-0 border-b-0 px-6"
           />
-        )}
-      </div>
-
-      {/* Flagger Canary Progressive Delivery Section */}
-      <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 space-y-4">
-        <div className="flex items-center justify-between border-b border-slate-800 pb-3">
-          <div className="flex items-center space-x-3">
-            <div className="p-2.5 bg-amber-500/10 text-amber-400 rounded-xl border border-amber-500/20">
-              <Gauge className="h-5 w-5" />
-            </div>
-            <div>
-              <h3 className="text-base font-semibold text-white">
-                Flagger Canary Traffic Rollouts (Envoy Gateway)
-              </h3>
-              <p className="text-xs text-slate-400">
-                Automated progressive traffic shifting with Prometheus error
-                rate &amp; p99 latency evaluation
-              </p>
-            </div>
-          </div>
-        </div>
-
-        {canaries.length === 0 ? (
-          <div className="py-6 text-center text-xs text-slate-500 font-sans">
-            No active canary traffic rollouts found.
-          </div>
-        ) : (
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-            {canaries.map((canary) => {
-              const weight = canary.canaryWeight ?? 0
-              const errRate = canary.errorRate ?? 0.01
-              const latency = canary.latencyMs ?? 15
-
-              return (
-                <div
-                  key={canary.id}
-                  className="bg-slate-950 border border-slate-800 rounded-xl p-4 space-y-3"
-                >
-                  <div className="flex items-center justify-between">
-                    <span className="text-xs font-bold text-white flex items-center gap-1.5">
-                      <GitBranch className="h-3.5 w-3.5 text-amber-400" />
-                      {canary.name}
-                    </span>
-                    <StatusBadge status={canary.status} size="xs" />
-                  </div>
-
-                  <div className="space-y-1">
-                    <div className="flex items-center justify-between text-[11px]">
-                      <span className="text-slate-400">
-                        Canary Traffic Weight
-                      </span>
-                      <span className="font-mono font-bold text-amber-400">
-                        {weight}%
-                      </span>
-                    </div>
-                    <div className="w-full bg-slate-900 rounded-full h-2 overflow-hidden border border-slate-800">
-                      <div
-                        className="bg-gradient-to-r from-indigo-500 to-amber-400 h-2 transition-all duration-500"
-                        style={{ width: `${weight}%` }}
-                      ></div>
-                    </div>
-                  </div>
-
-                  <div className="grid grid-cols-2 gap-2 pt-1 text-[10px] font-mono">
-                    <div className="bg-slate-900 p-2 rounded border border-slate-800">
-                      <span className="text-slate-500 block">
-                        HTTP 5xx Rate:
-                      </span>
-                      <span className="text-emerald-400 font-bold">
-                        {errRate}%
-                      </span>
-                    </div>
-                    <div className="bg-slate-900 p-2 rounded border border-slate-800">
-                      <span className="text-slate-500 block">p99 Latency:</span>
-                      <span className="text-indigo-300 font-bold">
-                        {latency}ms
-                      </span>
-                    </div>
-                  </div>
-                </div>
-              )
-            })}
-          </div>
         )}
       </div>
 
@@ -1579,6 +1430,21 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
           )}
         </div>
       </div>
+
+      {/* Quiet Flagger Canary status when no rollouts are active */}
+      {canaries.length === 0 && (
+        <div className="bg-slate-900/60 border border-slate-800/80 rounded-xl px-4 py-3 flex items-center justify-between text-xs">
+          <span className="flex items-center gap-2 text-slate-400">
+            <Gauge className="h-4 w-4 text-amber-400/70" />
+            <span className="font-medium text-slate-300">
+              Flagger Canary Traffic Rollouts (Envoy Gateway)
+            </span>
+          </span>
+          <span className="text-slate-500">
+            No active canary traffic rollouts found.
+          </span>
+        </div>
+      )}
 
       {inspectedStack && (
         <StackInspectorModal

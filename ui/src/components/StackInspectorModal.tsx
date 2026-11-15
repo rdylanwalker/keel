@@ -375,7 +375,7 @@ export const StackInspectorModal: React.FC<StackInspectorModalProps> = ({
                       </span>
                     </div>
                     {cond.message && (
-                      <p className="text-xs text-slate-400 break-words">
+                      <p className="text-xs text-slate-400 wrap-break-word">
                         {cond.message}
                       </p>
                     )}
@@ -438,7 +438,7 @@ export const StackInspectorModal: React.FC<StackInspectorModalProps> = ({
                             </span>
                           )}
                         </div>
-                        <p className="text-slate-300 break-words text-[11px]">
+                        <p className="text-slate-300 wrap-break-word text-[11px]">
                           {ev.message}
                         </p>
                       </div>
@@ -470,7 +470,7 @@ export const StackInspectorModal: React.FC<StackInspectorModalProps> = ({
                 </h4>
               </div>
               <div
-                className={`bg-slate-950 border border-slate-800 rounded-xl p-3 font-mono text-[11px] text-slate-300 overflow-y-auto whitespace-pre-wrap break-words ${
+                className={`bg-slate-950 border border-slate-800 rounded-xl p-3 font-mono text-[11px] text-slate-300 overflow-y-auto whitespace-pre-wrap wrap-break-word ${
                   isFullscreen ? "flex-1 min-h-0" : "max-h-72"
                 }`}
               >
