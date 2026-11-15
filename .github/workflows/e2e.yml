@@ -45,3 +45,49 @@ jobs:
           name: playwright-report
           path: e2e/playwright-report/
           retention-days: 14
+
+  e2e-live-kind:
+    name: Live kind E2E (GUI + CLI)
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: 'pnpm'
+          cache-dependency-path: e2e/pnpm-lock.yaml
+      - name: Install kind, kubectl, helm, sops, age
+        run: |
+          curl -fsSL https://kind.sigs.k8s.io/dl/latest/kind-linux-amd64 -o /usr/local/bin/kind
+          chmod +x /usr/local/bin/kind
+          curl -fsSL "https://dl.k8s.io/release/$(curl -fsSL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl" -o /usr/local/bin/kubectl
+          chmod +x /usr/local/bin/kubectl
+          curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+          sudo apt-get update && sudo apt-get install -y age
+          curl -fsSL https://github.com/getsops/sops/releases/download/v3.9.4/sops-v3.9.4.linux.amd64 -o /usr/local/bin/sops
+          chmod +x /usr/local/bin/sops
+      - name: Build UI & Keel Binary
+        run: |
+          pnpm --dir ui install
+          pnpm --dir ui build
+          cargo build --bin keel
+      - name: Install E2E dependencies & Playwright Chromium
+        run: |
+          pnpm --dir e2e install
+          pnpm --dir e2e exec playwright install --with-deps chromium
+      - name: Run Live kind E2E
+        env:
+          KEEL_E2E_LIVE: '1'
+        run: pnpm --dir e2e test:live
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: playwright-live-report
+          path: e2e/playwright-report/
+          retention-days: 14

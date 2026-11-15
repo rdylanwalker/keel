@@ -141,7 +141,8 @@ pnpm --dir ui test:unit --coverage # Must maintain >= 80% line coverage
 pnpm --dir e2e format:check  # prettier --check
 pnpm --dir e2e lint          # eslint
 pnpm --dir e2e typecheck     # tsc --noEmit
-pnpm --dir e2e test
+pnpm --dir e2e test          # mocked Playwright suite
+pnpm --dir e2e test:live     # opt-in live kind + GUI + CLI E2E (KEEL_E2E_REUSE_CLUSTER=0 for fresh cluster)
 ```
 
 ## 6. Agent Execution Workflow
