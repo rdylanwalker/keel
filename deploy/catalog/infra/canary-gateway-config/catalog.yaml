@@ -1,0 +1,30 @@
+# Canary Gateway & Flagger MetricTemplate Blueprint (`SDD.md` §5.2, `NFR-REL-03`)
+apiVersion: keel.io/v1alpha1
+kind: CatalogInfraBlueprint
+metadata:
+  id: canary-gateway-config
+  name: Canary Gateway & MetricTemplates
+  description: Provisions Envoy GatewayClass (keel-envoy), Gateway (keel-ingress), and Flagger Prometheus MetricTemplates on a target Kubernetes cluster.
+  provider: kubernetes
+  category: progressive-delivery
+spec:
+  pulumiPath: ./Pulumi.yaml
+  outputs: []
+  schema:
+    type: object
+    required:
+      - kubeconfigSecretName
+    properties:
+      kubeconfigSecretName:
+        type: string
+        title: Target Cluster Kubeconfig Secret Name
+        description: Name of the Secret in the tenant namespace containing the target cluster kubeconfig.
+        default: workload-dev-kubeconfig
+      kubeconfigSecretNamespace:
+        type: string
+        title: Kubeconfig Secret Namespace
+        default: tenant-default
+      gatewayNamespace:
+        type: string
+        title: Gateway & MetricTemplate Namespace
+        default: keel-system

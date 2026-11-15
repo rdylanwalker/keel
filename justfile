@@ -51,6 +51,143 @@ serve-demo:
     echo "Live API URL (use printed Bootstrap Token): http://127.0.0.1:8080/"
     cargo run --bin keel -- serve --bind 127.0.0.1:8080 --repo-dir "$tmp_dir/work" --bare-repo "$tmp_dir/bare.git"
 
+# Build UI + keel binary, kill any previous serve, start serve in background, and report credentials
+build-serve *ARGS: build
+    #!/usr/bin/env bash
+    set -euo pipefail
+    pid_file="target/keel-serve.pid"
+    log_file="target/keel-serve.log"
+
+    if [ -f "$pid_file" ]; then
+        old_pid=$(cat "$pid_file" 2>/dev/null || true)
+        if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
+            echo "Stopping previous keel serve (PID $old_pid)..."
+            kill -INT "$old_pid" 2>/dev/null || true
+            for _ in $(seq 1 30); do
+                kill -0 "$old_pid" 2>/dev/null || break
+                sleep 0.1
+            done
+            if kill -0 "$old_pid" 2>/dev/null; then
+                kill -9 "$old_pid" 2>/dev/null || true
+            fi
+        fi
+        rm -f "$pid_file"
+    fi
+
+    # Also clean up any orphaned `target/debug/keel serve` without a pidfile
+    if pgrep -f "target/debug/keel serve" >/dev/null 2>&1; then
+        pkill -INT -f "target/debug/keel serve" 2>/dev/null || true
+        for _ in $(seq 1 20); do
+            pgrep -f "target/debug/keel serve" >/dev/null 2>&1 || break
+            sleep 0.1
+        done
+    fi
+
+    extra_args=({{ARGS}})
+    has_bind=false
+    has_repo_dir=false
+    for arg in "${extra_args[@]+"${extra_args[@]}"}"; do
+        case "$arg" in
+            --bind|--bind=*) has_bind=true ;;
+            --repo-dir|--repo-dir=*) has_repo_dir=true ;;
+        esac
+    done
+
+    cmd_args=()
+    if [ "$has_bind" = false ]; then
+        cmd_args+=(--bind 127.0.0.1:8080)
+    fi
+    if [ "$has_repo_dir" = false ] && [ -f "keel-gitops/.keel/config.yaml" ]; then
+        cmd_args+=(--repo-dir ./keel-gitops)
+    fi
+    if [ "${#extra_args[@]}" -gt 0 ]; then
+        cmd_args+=("${extra_args[@]}")
+    fi
+
+    mkdir -p target
+    nohup ./target/debug/keel serve "${cmd_args[@]}" > "$log_file" 2>&1 < /dev/null &
+    new_pid=$!
+    echo "$new_pid" > "$pid_file"
+
+    ready=false
+    for _ in $(seq 1 150); do
+        if ! kill -0 "$new_pid" 2>/dev/null; then
+            echo "keel serve exited unexpectedly. Log output:" >&2
+            cat "$log_file" >&2 || true
+            rm -f "$pid_file"
+            exit 1
+        fi
+        if grep -q "Keel Control Plane listening on " "$log_file" 2>/dev/null; then
+            ready=true
+            break
+        fi
+        sleep 0.1
+    done
+
+    if [ "$ready" = false ]; then
+        echo "Timed out waiting for keel serve to listen. Log output:" >&2
+        cat "$log_file" >&2 || true
+        exit 1
+    fi
+
+    echo "Keel serve running in background (PID: $new_pid, log: $log_file)"
+    grep "Keel Control Plane listening on " "$log_file" | head -n 1
+    clean_log=$(sed 's/\x1b\[[0-9;]*m//g' "$log_file")
+    forgejo_port=$(printf '%s\n' "$clean_log" | awk -F'local_port=' '/Started automatic port-forward to in-cluster Forgejo/ {print $2; exit}')
+    dex_port=$(printf '%s\n' "$clean_log" | awk -F'local_port=' '/Started automatic port-forward to in-cluster Dex OIDC/ {print $2; exit}')
+    if [ -n "$forgejo_port" ]; then
+        echo "Forgejo Local URL:       http://127.0.0.1:$forgejo_port"
+    fi
+    if [ -n "$dex_port" ]; then
+        echo "Dex OIDC Local URL:      http://127.0.0.1:$dex_port/dex"
+    fi
+    grep "Bootstrap Token" "$log_file" || true
+
+    if command -v kubectl >/dev/null 2>&1; then
+        dex_email=$(kubectl get secret -n keel-system dex-config -o jsonpath='{.data.config\.yaml}' 2>/dev/null | base64 -d 2>/dev/null | awk '/email:/ {print $NF; exit}' || true)
+        if [ -n "$dex_email" ]; then
+            echo "Dex OIDC Admin Email:    $dex_email"
+            dex_pass="${KEEL_ADMIN_PASSWORD:-}"
+            if [ -z "$dex_pass" ] && [ -f "target/keel-dex-password" ]; then
+                dex_pass=$(cat "target/keel-dex-password" 2>/dev/null || true)
+            fi
+            if [ -z "$dex_pass" ]; then
+                dex_pass=$(kubectl get secret -n keel-system dex-admin -o jsonpath='{.data.password}' 2>/dev/null | base64 -d 2>/dev/null || true)
+            fi
+            if [ -n "$dex_pass" ]; then
+                echo "Dex OIDC Admin Password: $dex_pass"
+            else
+                echo "Dex OIDC Admin Password: <not recoverable from bcrypt hash in dex-config; run 'just dex-reset-password' or set KEEL_ADMIN_PASSWORD>"
+            fi
+        fi
+        forgejo_user=$(kubectl get secret -n keel-system forgejo-admin -o jsonpath='{.data.username}' 2>/dev/null | base64 -d 2>/dev/null || true)
+        forgejo_pass=$(kubectl get secret -n keel-system forgejo-admin -o jsonpath='{.data.password}' 2>/dev/null | base64 -d 2>/dev/null || true)
+        if [ -n "$forgejo_user" ] && [ -n "$forgejo_pass" ]; then
+            echo "Forgejo Admin Username:  $forgejo_user"
+            echo "Forgejo Admin Password:  $forgejo_pass"
+        fi
+    fi
+
+# Reset the in-cluster Dex OIDC admin password, restart Dex, and save it for `just build-serve`
+dex-reset-password password="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    new_pass="{{password}}"
+    if [ -z "$new_pass" ]; then
+        new_pass=$(python3 -c 'import secrets, string; alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789"; print("".join(secrets.choice(alphabet) for _ in range(20)))')
+    fi
+    new_hash=$(python3 -c 'import sys, bcrypt; print(bcrypt.hashpw(sys.argv[1].encode(), bcrypt.gensalt(rounds=12)).decode())' "$new_pass")
+    current_cfg=$(kubectl get secret -n keel-system dex-config -o jsonpath='{.data.config\.yaml}' | base64 -d)
+    updated_cfg=$(python3 -c 'import re, sys; cfg, h = sys.argv[1], sys.argv[2]; print(re.sub(r"(?m)^(\s*hash:\s*).*$", lambda m: f"{m.group(1)}\"{h}\"", cfg, count=1), end="")' "$current_cfg" "$new_hash")
+    kubectl create secret generic dex-config -n keel-system --from-literal=config.yaml="$updated_cfg" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+    kubectl rollout restart deployment/dex -n keel-system >/dev/null
+    kubectl rollout status deployment/dex -n keel-system --timeout=60s >/dev/null
+    mkdir -p target
+    printf '%s' "$new_pass" > target/keel-dex-password
+    chmod 600 target/keel-dex-password
+    echo "Updated Dex admin password in keel-system/dex-config and restarted Dex."
+    echo "Dex OIDC Admin Password: $new_pass"
+
 # Format Rust, UI, and E2E code
 fmt:
     cargo fmt --all

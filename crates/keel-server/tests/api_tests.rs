@@ -1242,6 +1242,220 @@ async fn test_register_catalog_bundle_endpoint() {
 }
 
 #[tokio::test]
+async fn test_register_and_propose_bundle_with_flagger_canary_app() {
+    let fixture = setup_fixture().await;
+    let cookie = login_and_get_cookie(&fixture).await;
+
+    // Seed a non-Flagger app (`redis`) in the repo
+    let redis_dir = fixture.state.repo_workdir.join("catalog/apps/redis");
+    tokio::fs::create_dir_all(&redis_dir).await.unwrap();
+    tokio::fs::write(
+        redis_dir.join("catalog.yaml"),
+        r#"apiVersion: keel.io/v1alpha1
+kind: CatalogApplication
+metadata:
+  id: redis
+  name: Redis
+  category: databases
+  runtime: helm
+spec:
+  upstream:
+    repoURL: https://charts.bitnami.com/bitnami
+    chart: redis
+    version: "20.1.0"
+  progressiveDelivery:
+    flaggerSupported: false
+  schema:
+    type: object
+    properties: {}
+"#,
+    )
+    .await
+    .unwrap();
+    fixture
+        .state
+        .git_runner
+        .add(
+            &fixture.state.repo_workdir,
+            ["catalog/apps/redis/catalog.yaml"],
+        )
+        .await
+        .unwrap();
+    fixture
+        .state
+        .git_runner
+        .commit(
+            &fixture.state.repo_workdir,
+            "feat: seed redis app",
+            &CommitAuthor::new("Keel Seed", "seed@keel.local"),
+        )
+        .await
+        .unwrap();
+    fixture
+        .state
+        .git_runner
+        .push(&fixture.state.repo_workdir, "origin", "main")
+        .await
+        .unwrap();
+
+    let app = build_router(fixture.state.clone());
+
+    // 1. Rejects canary: true when referenced app has flaggerSupported=false (redis)
+    let bad_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/catalog")
+                .header(COOKIE, &cookie)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "kind": "bundle",
+                        "id": "bad-canary-bundle",
+                        "name": "Bad Canary Bundle",
+                        "category": "Platform",
+                        "items": [
+                            {
+                                "id": "cache",
+                                "kind": "app",
+                                "catalogRef": "redis",
+                                "canary": true
+                            }
+                        ]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(bad_res.status(), StatusCode::BAD_REQUEST);
+
+    // 2. Accepts canary: true when referenced app has flaggerSupported=true (grafana)
+    let create_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/catalog")
+                .header(COOKIE, &cookie)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "kind": "bundle",
+                        "id": "canary-bundle",
+                        "name": "Canary Bundle",
+                        "category": "Platform",
+                        "items": [
+                            {
+                                "id": "vm",
+                                "kind": "infra",
+                                "catalogRef": "proxmox-vm"
+                            },
+                            {
+                                "id": "web",
+                                "kind": "app",
+                                "catalogRef": "grafana",
+                                "dependsOn": ["vm"],
+                                "canary": true
+                            }
+                        ]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_res.status(), StatusCode::CREATED);
+    let create_body: Value =
+        serde_json::from_slice(&create_res.into_body().collect().await.unwrap().to_bytes())
+            .unwrap();
+    assert_eq!(create_body["bundle"]["spec"]["items"][1]["canary"], true);
+
+    // Merge catalog PR to main so POST /api/v1/proposals can load the bundle
+    let catalog_pr_id = create_body["proposal"]["id"].as_str().unwrap();
+    let merge_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/v1/proposals/{catalog_pr_id}/merge"))
+                .header(COOKIE, &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(merge_res.status(), StatusCode::OK);
+
+    // 3. Propose the bundle and verify Flagger Canary + NetworkPolicy + helmrelease-canary.yaml
+    let prop_res = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/proposals")
+                .header(COOKIE, &cookie)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "catalogId": "canary-bundle",
+                        "kind": "bundle",
+                        "tenant": "acme",
+                        "name": "canary-stack",
+                        "values": {
+                            "vm": { "cores": 2 },
+                            "web": { "replicas": 2 }
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(prop_res.status(), StatusCode::CREATED);
+    let prop_body: Value =
+        serde_json::from_slice(&prop_res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let prop_branch = prop_body["branch"].as_str().unwrap();
+
+    fixture
+        .state
+        .git_runner
+        .checkout_branch(&fixture.state.repo_workdir, prop_branch)
+        .await
+        .unwrap();
+
+    let item_dir = fixture
+        .state
+        .repo_workdir
+        .join("tenants/acme/bundles/canary-stack/web");
+    assert!(
+        tokio::fs::try_exists(item_dir.join("helmrelease-canary.yaml"))
+            .await
+            .unwrap()
+    );
+    let canary_yaml = tokio::fs::read_to_string(item_dir.join("canary.yaml"))
+        .await
+        .unwrap();
+    assert!(canary_yaml.contains("kind: Canary"));
+    assert!(canary_yaml.contains("name: canary-stack-web"));
+    assert!(canary_yaml.contains("keel.io/bundle: canary-stack"));
+    assert!(
+        tokio::fs::try_exists(item_dir.join("networkpolicy-canary.yaml"))
+            .await
+            .unwrap()
+    );
+    let kustomization_yaml = tokio::fs::read_to_string(item_dir.join("kustomization.yaml"))
+        .await
+        .unwrap();
+    assert!(kustomization_yaml.contains("helmrelease-canary.yaml"));
+    assert!(kustomization_yaml.contains("canary.yaml"));
+    assert!(kustomization_yaml.contains("networkpolicy-canary.yaml"));
+}
+
+#[tokio::test]
 async fn test_providers_list_and_toggle_endpoint() {
     let fixture = setup_fixture().await;
     let cookie = login_and_get_cookie(&fixture).await;
@@ -2023,6 +2237,222 @@ spec:
     assert_eq!(cfg_json["values"]["cluster"]["nodeCount"], 5);
     assert_eq!(cfg_json["values"]["app"]["replicaCount"], 3);
 
+    // 4. GET /api/v1/stacks/{namespace}/{bundle}-{item}/config and /api/v1/releases/{namespace}/{bundle}-{item}/config
+    //    must resolve bundle-created items under `tenants/<tenant>/bundles/<bundle>/<item>/`
+    let stack_cfg_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/stacks/tenant-acme/prod-stack-cluster/config")
+                .header(COOKIE, &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stack_cfg_res.status(), StatusCode::OK);
+    let stack_cfg_json: Value = serde_json::from_slice(
+        &stack_cfg_res
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes(),
+    )
+    .unwrap();
+    assert_eq!(stack_cfg_json["catalogId"], "proxmox-vm");
+    assert_eq!(stack_cfg_json["tenant"], "acme");
+    assert_eq!(stack_cfg_json["name"], "prod-stack-cluster");
+    assert_eq!(stack_cfg_json["values"]["nodeCount"], 5);
+
+    let rel_cfg_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/releases/tenant-acme/prod-stack-app/config")
+                .header(COOKIE, &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rel_cfg_res.status(), StatusCode::OK);
+    let rel_cfg_json: Value =
+        serde_json::from_slice(&rel_cfg_res.into_body().collect().await.unwrap().to_bytes())
+            .unwrap();
+    assert_eq!(rel_cfg_json["catalogId"], "grafana");
+    assert_eq!(rel_cfg_json["tenant"], "acme");
+    assert_eq!(rel_cfg_json["name"], "prod-stack-app");
+    assert_eq!(
+        rel_cfg_json["targetCluster"],
+        "prod-stack-cluster-kubeconfig"
+    );
+    assert_eq!(rel_cfg_json["targetNamespace"], "apps-prod");
+    assert_eq!(rel_cfg_json["values"]["replicaCount"], 3);
+
+    // 5. Editing a bundle-created stack or app via POST /api/v1/proposals updates the bundle item directory
+    //    rather than creating a duplicate `tenants/<tenant>/infra|apps/<name>` directory.
+    //    First merge the bundle branch into `main` so `sync_branch_from_remote` starts from it.
+    fixture
+        .state
+        .git_runner
+        .checkout_branch(&fixture.state.repo_workdir, "main")
+        .await
+        .unwrap();
+    // Copy the bundle files to main via a merge from the proposal branch
+    let merge_out = tokio::process::Command::new("git")
+        .args(["merge", "--ff-only", branch])
+        .current_dir(&fixture.state.repo_workdir)
+        .output()
+        .await
+        .unwrap();
+    assert!(merge_out.status.success());
+    fixture
+        .state
+        .git_runner
+        .push(&fixture.state.repo_workdir, "origin", "main")
+        .await
+        .unwrap();
+
+    let edit_stack_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/proposals")
+                .header(COOKIE, &cookie)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "catalogId": "proxmox-vm",
+                        "kind": "infra",
+                        "tenant": "acme",
+                        "name": "prod-stack-cluster",
+                        "values": { "cores": 4, "nodeCount": 7 }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(edit_stack_res.status(), StatusCode::CREATED);
+    let edit_stack_json: Value = serde_json::from_slice(
+        &edit_stack_res
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes(),
+    )
+    .unwrap();
+    let edit_stack_branch = edit_stack_json["branch"].as_str().unwrap().to_string();
+    assert!(
+        edit_stack_json["proposal"]["title"]
+            .as_str()
+            .unwrap()
+            .starts_with("[Update]")
+    );
+    fixture
+        .state
+        .git_runner
+        .checkout_branch(&fixture.state.repo_workdir, &edit_stack_branch)
+        .await
+        .unwrap();
+    assert!(
+        !tokio::fs::try_exists(
+            fixture
+                .state
+                .repo_workdir
+                .join("tenants/acme/infra/prod-stack-cluster")
+        )
+        .await
+        .unwrap()
+    );
+    let updated_cluster_values = tokio::fs::read_to_string(
+        fixture
+            .state
+            .repo_workdir
+            .join("tenants/acme/bundles/prod-stack/cluster/values.yaml"),
+    )
+    .await
+    .unwrap();
+    assert!(updated_cluster_values.contains("cores: 4"));
+    let tenants_k = tokio::fs::read_to_string(
+        fixture
+            .state
+            .repo_workdir
+            .join("tenants/kustomization.yaml"),
+    )
+    .await
+    .unwrap();
+    assert!(!tenants_k.contains("acme/infra/prod-stack-cluster/stack.yaml"));
+    assert!(tenants_k.contains("acme/bundles/prod-stack/cluster/flux-kustomization.yaml"));
+
+    let edit_app_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/proposals")
+                .header(COOKIE, &cookie)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "catalogId": "grafana",
+                        "kind": "app",
+                        "tenant": "acme",
+                        "name": "prod-stack-app",
+                        "targetCluster": "prod-stack-cluster-kubeconfig",
+                        "targetNamespace": "apps-prod",
+                        "values": { "replicas": 6, "replicaCount": 6 }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(edit_app_res.status(), StatusCode::CREATED);
+    let edit_app_json: Value =
+        serde_json::from_slice(&edit_app_res.into_body().collect().await.unwrap().to_bytes())
+            .unwrap();
+    let edit_app_branch = edit_app_json["branch"].as_str().unwrap().to_string();
+    assert!(
+        edit_app_json["proposal"]["title"]
+            .as_str()
+            .unwrap()
+            .starts_with("[Update]")
+    );
+    fixture
+        .state
+        .git_runner
+        .checkout_branch(&fixture.state.repo_workdir, &edit_app_branch)
+        .await
+        .unwrap();
+    assert!(
+        !tokio::fs::try_exists(
+            fixture
+                .state
+                .repo_workdir
+                .join("tenants/acme/apps/prod-stack-app")
+        )
+        .await
+        .unwrap()
+    );
+    let updated_app_hr = tokio::fs::read_to_string(
+        fixture
+            .state
+            .repo_workdir
+            .join("tenants/acme/bundles/prod-stack/app/helmrelease.yaml"),
+    )
+    .await
+    .unwrap();
+    assert!(updated_app_hr.contains("replicas: 6"));
+    assert!(updated_app_hr.contains("keel.io/bundle: prod-stack"));
+    assert!(updated_app_hr.contains("keel.io/bundle-item: app"));
+    assert!(updated_app_hr.contains("prod-stack-cluster-kubeconfig"));
+
     let missing_cfg = app
         .oneshot(
             Request::builder()
@@ -2642,4 +3072,227 @@ spec:
         .await
         .unwrap();
     assert_eq!(bad_res.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_toggling_canary_on_bundle_item_removes_stale_manifests_and_avoids_duplicates() {
+    let fixture = setup_fixture().await;
+    let cookie = login_and_get_cookie(&fixture).await;
+    let app = build_router(fixture.state.clone());
+
+    // 1. Seed an existing bundle app item on `main` with canary=false (`helmrelease.yaml`)
+    let item_rel = "tenants/acme/bundles/test/step-2";
+    let item_dir = fixture.state.repo_workdir.join(item_rel);
+    tokio::fs::create_dir_all(&item_dir).await.unwrap();
+    tokio::fs::write(
+        item_dir.join("values.yaml"),
+        "replicas: 1\ningressHost: step2.keel.local\n",
+    )
+    .await
+    .unwrap();
+    tokio::fs::write(
+        item_dir.join("helmrelease.yaml"),
+        "apiVersion: helm.toolkit.fluxcd.io/v2\nkind: HelmRelease\nmetadata:\n  name: test-step-2\n  namespace: tenant-acme\n  labels:\n    keel.io/tenant: acme\n    keel.io/bundle: test\n    keel.io/bundle-item: step-2\nspec:\n  chart:\n    spec:\n      chart: grafana\n",
+    )
+    .await
+    .unwrap();
+    tokio::fs::write(
+        item_dir.join("kustomization.yaml"),
+        "apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\nresources:\n  - helmrelease.yaml\n",
+    )
+    .await
+    .unwrap();
+    fixture
+        .state
+        .git_runner
+        .add(&fixture.state.repo_workdir, [item_rel])
+        .await
+        .unwrap();
+    fixture
+        .state
+        .git_runner
+        .commit(
+            &fixture.state.repo_workdir,
+            "seed bundle item",
+            &keel_git::CommitAuthor::new("tester", "tester@keel.local"),
+        )
+        .await
+        .unwrap();
+    fixture
+        .state
+        .git_runner
+        .push(&fixture.state.repo_workdir, "origin", "main")
+        .await
+        .unwrap();
+
+    // 2. Toggle canary=true via POST /api/v1/proposals
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/proposals")
+                .header(COOKIE, &cookie)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "tenant": "acme",
+                        "catalogId": "grafana",
+                        "kind": "app",
+                        "name": "test-step-2",
+                        "canary": true,
+                        "values": {
+                            "replicas": 1,
+                            "ingressHost": "step2.keel.local"
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let body: Value =
+        serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let canary_branch = body["branch"].as_str().unwrap().to_string();
+
+    fixture
+        .state
+        .git_runner
+        .checkout_branch(&fixture.state.repo_workdir, &canary_branch)
+        .await
+        .unwrap();
+
+    assert!(
+        tokio::fs::try_exists(item_dir.join("helmrelease-canary.yaml"))
+            .await
+            .unwrap()
+    );
+    assert!(
+        tokio::fs::try_exists(item_dir.join("canary.yaml"))
+            .await
+            .unwrap()
+    );
+    assert!(
+        tokio::fs::try_exists(item_dir.join("networkpolicy-canary.yaml"))
+            .await
+            .unwrap()
+    );
+    assert!(
+        !tokio::fs::try_exists(item_dir.join("helmrelease.yaml"))
+            .await
+            .unwrap(),
+        "stale helmrelease.yaml must be deleted when toggling canary=true"
+    );
+
+    // Verify GET /api/v1/releases returns exactly 1 release for test-step-2 with canary=true
+    let rel_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/v1/releases?tenant=acme")
+                .header(COOKIE, &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rel_res.status(), StatusCode::OK);
+    let rel_body: Value =
+        serde_json::from_slice(&rel_res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let step2_releases: Vec<&Value> = rel_body["releases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| r["name"] == "test-step-2")
+        .collect();
+    assert_eq!(step2_releases.len(), 1);
+    assert_eq!(step2_releases[0]["canary"], true);
+
+    // Fast-forward main to canary_branch so the next edit starts from canary=true
+    fixture
+        .state
+        .git_runner
+        .fast_forward_merge(&fixture.state.repo_workdir, "main", &canary_branch)
+        .await
+        .unwrap();
+    fixture
+        .state
+        .git_runner
+        .push(&fixture.state.repo_workdir, "origin", "main")
+        .await
+        .unwrap();
+
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
+    // 3. Toggle canary=false via POST /api/v1/proposals
+    let res2 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/proposals")
+                .header(COOKIE, &cookie)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "tenant": "acme",
+                        "catalogId": "grafana",
+                        "kind": "app",
+                        "name": "test-step-2",
+                        "canary": false,
+                        "values": {
+                            "replicas": 1,
+                            "ingressHost": "step2.keel.local"
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let res2_status = res2.status();
+    let res2_bytes = res2.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(
+        res2_status,
+        StatusCode::CREATED,
+        "unexpected status: {}",
+        String::from_utf8_lossy(&res2_bytes)
+    );
+    let body2: Value = serde_json::from_slice(&res2_bytes).unwrap();
+    let non_canary_branch = body2["branch"].as_str().unwrap().to_string();
+
+    fixture
+        .state
+        .git_runner
+        .checkout_branch(&fixture.state.repo_workdir, &non_canary_branch)
+        .await
+        .unwrap();
+
+    assert!(
+        tokio::fs::try_exists(item_dir.join("helmrelease.yaml"))
+            .await
+            .unwrap()
+    );
+    assert!(
+        !tokio::fs::try_exists(item_dir.join("helmrelease-canary.yaml"))
+            .await
+            .unwrap(),
+        "stale helmrelease-canary.yaml must be deleted when toggling canary=false"
+    );
+    assert!(
+        !tokio::fs::try_exists(item_dir.join("canary.yaml"))
+            .await
+            .unwrap(),
+        "stale canary.yaml must be deleted when toggling canary=false"
+    );
+    assert!(
+        !tokio::fs::try_exists(item_dir.join("networkpolicy-canary.yaml"))
+            .await
+            .unwrap(),
+        "stale networkpolicy-canary.yaml must be deleted when toggling canary=false"
+    );
 }

@@ -1,0 +1,98 @@
+# Pulumi YAML Blueprint: Envoy GatewayClass, Gateway, and Flagger MetricTemplates on a target cluster
+name: canary-gateway-config
+runtime: yaml
+description: Applies GatewayClass (keel-envoy), Gateway (keel-ingress), and Flagger Prometheus MetricTemplates onto a target cluster.
+
+config:
+  kubeconfigSecretName:
+    type: string
+    default: workload-dev-kubeconfig
+  kubeconfigSecretNamespace:
+    type: string
+    default: tenant-default
+  gatewayNamespace:
+    type: string
+    default: keel-system
+
+resources:
+  targetKubeconfigSecret:
+    type: kubernetes:core/v1:Secret
+    get:
+      id: ${kubeconfigSecretNamespace}/${kubeconfigSecretName}
+
+  targetCluster:
+    type: pulumi:providers:kubernetes
+    properties:
+      kubeconfig:
+        fn::fromBase64: ${targetKubeconfigSecret.data.kubeconfig}
+
+  canaryGatewayManifests:
+    type: kubernetes:yaml/v2:ConfigGroup
+    options:
+      provider: ${targetCluster}
+    properties:
+      yaml: |
+        apiVersion: gateway.networking.k8s.io/v1
+        kind: GatewayClass
+        metadata:
+          name: keel-envoy
+          labels:
+            app.kubernetes.io/managed-by: keel
+        spec:
+          controllerName: gateway.envoyproxy.io/gatewayclass-controller
+        ---
+        apiVersion: gateway.networking.k8s.io/v1
+        kind: Gateway
+        metadata:
+          name: keel-ingress
+          namespace: ${gatewayNamespace}
+          labels:
+            app.kubernetes.io/managed-by: keel
+        spec:
+          gatewayClassName: keel-envoy
+          listeners:
+            - name: http
+              protocol: HTTP
+              port: 80
+              allowedRoutes:
+                namespaces:
+                  from: All
+            - name: http-local
+              protocol: HTTP
+              port: 8888
+              allowedRoutes:
+                namespaces:
+                  from: All
+        ---
+        apiVersion: flagger.app/v1beta1
+        kind: MetricTemplate
+        metadata:
+          name: envoy-gateway-request-success-rate
+          namespace: ${gatewayNamespace}
+          labels:
+            app.kubernetes.io/managed-by: keel
+        spec:
+          provider:
+            type: prometheus
+            address: http://prometheus.${gatewayNamespace}:80
+          query: |
+            sum(rate(envoy_cluster_upstream_rq{envoy_cluster_name=~"httproute/{{ namespace }}/{{ target }}/.*",envoy_response_code!~"5.*"}[{{ interval }}]))
+            /
+            sum(rate(envoy_cluster_upstream_rq{envoy_cluster_name=~"httproute/{{ namespace }}/{{ target }}/.*"}[{{ interval }}]))
+            * 100
+        ---
+        apiVersion: flagger.app/v1beta1
+        kind: MetricTemplate
+        metadata:
+          name: envoy-gateway-request-duration
+          namespace: ${gatewayNamespace}
+          labels:
+            app.kubernetes.io/managed-by: keel
+        spec:
+          provider:
+            type: prometheus
+            address: http://prometheus.${gatewayNamespace}:80
+          query: |
+            histogram_quantile(0.99,
+              sum(rate(envoy_cluster_upstream_rq_time_bucket{envoy_cluster_name=~"httproute/{{ namespace }}/{{ target }}/.*"}[{{ interval }}])) by (le)
+            )

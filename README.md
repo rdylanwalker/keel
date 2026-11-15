@@ -91,7 +91,7 @@ keel bootstrap init \
 Copy the single-use **256-bit Stage 0 bootstrap token** printed to stdout.
 
 ### 3. Start the Control Plane & Authenticate
-Start `keel serve` (or `just serve` for a clean local repo / `just serve-demo` for a pre-seeded demo catalog):
+Start `keel serve` (or `just build-serve` to build, restart in the background, and print local URLs/credentials; `just serve` for foreground; `just serve-demo` for a pre-seeded demo catalog):
 
 ```bash
 keel serve --bind 127.0.0.1:8080 --repo-dir ./keel-gitops
@@ -207,6 +207,10 @@ just build
 
 # Start the control-plane server locally on 127.0.0.1:8080
 just serve
+
+# Or build, restart any previous backgrounded serve, and print URLs/credentials
+# (auto-uses ./keel-gitops if present; logs to target/keel-serve.log)
+just build-serve
 ```
 
 Or run the underlying commands directly:

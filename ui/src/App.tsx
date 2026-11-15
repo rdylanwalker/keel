@@ -198,6 +198,19 @@ export const App: React.FC = () => {
     }
   }, [])
 
+  useEffect(() => {
+    const handleUnauthorized = () => {
+      if (!isDemoMode()) {
+        setAuthStatus((prev) =>
+          prev.authenticated ? { ...prev, authenticated: false } : prev
+        )
+      }
+    }
+    window.addEventListener("keel:unauthorized", handleUnauthorized)
+    return () =>
+      window.removeEventListener("keel:unauthorized", handleUnauthorized)
+  }, [])
+
   const handleLogin = () => {
     if (isDemoMode()) {
       setAuthStatus({

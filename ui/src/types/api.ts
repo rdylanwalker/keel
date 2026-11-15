@@ -43,6 +43,7 @@ export interface CatalogBundleItem {
   dependsOn?: string[]
   targetClusterFrom?: string
   targetNamespace?: string
+  canary?: boolean
 }
 
 export interface CatalogItem {

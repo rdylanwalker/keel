@@ -1,0 +1,74 @@
+# Multi-Item Bundle: Cluster-Agnostic Progressive Delivery Core Addons (`SDD.md` §5.1, §5.2)
+apiVersion: keel.io/v1alpha1
+kind: CatalogBundle
+metadata:
+  id: canary-core-addons
+  name: Canary Core Addons (Envoy + Prometheus + Flagger)
+  description: Install Envoy Gateway, Prometheus, and Flagger into keel-system on any target Kubernetes cluster to enable progressive canary rollouts.
+  category: platform
+spec:
+  items:
+    - id: envoy-gateway
+      kind: app
+      catalogRef: envoy-gateway
+      targetNamespace: keel-system
+    - id: prometheus
+      kind: app
+      catalogRef: prometheus
+      targetNamespace: keel-system
+    - id: flagger
+      kind: app
+      catalogRef: flagger
+      dependsOn:
+        - envoy-gateway
+        - prometheus
+      targetNamespace: keel-system
+    - id: canary-config
+      kind: infra
+      catalogRef: canary-gateway-config
+      dependsOn:
+        - envoy-gateway
+        - flagger
+  schema:
+    type: object
+    properties:
+      envoy-gateway:
+        type: object
+        title: Envoy Gateway
+        properties:
+          deployment:
+            type: object
+            properties:
+              replicas:
+                type: integer
+                title: Replicas
+                default: 1
+                minimum: 1
+                maximum: 5
+      prometheus:
+        type: object
+        title: Prometheus
+        properties:
+          server:
+            type: object
+            properties:
+              fullnameOverride:
+                type: string
+                title: Service Name Override
+                default: prometheus
+              retention:
+                type: string
+                title: Retention Period
+                default: 7d
+      flagger:
+        type: object
+        title: Flagger
+        properties:
+          meshProvider:
+            type: string
+            title: Mesh / Gateway Provider
+            default: gatewayapi:v1
+          metricsServer:
+            type: string
+            title: Prometheus Metrics Server URL
+            default: http://prometheus.keel-system:80

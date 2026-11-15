@@ -338,6 +338,10 @@ describe("TopologyView component", () => {
     expect(await screen.findByText("SSE Live Stream")).toBeInTheDocument()
     expect(screen.getAllByText("podinfo-canary").length).toBeGreaterThan(0)
     expect(screen.getByText("35%")).toBeInTheDocument()
+    expect(screen.getByTitle("Primary —: 65%")).toBeInTheDocument()
+    expect(screen.getByTitle("Canary 6.7.1: 35%")).toBeInTheDocument()
+    expect(screen.getByText("0.01%")).toBeInTheDocument()
+    expect(screen.getByText("14ms")).toBeInTheDocument()
 
     // Receive live SSE events
     await waitFor(() => expect(onEventCb).not.toBeNull())
@@ -676,5 +680,46 @@ describe("TopologyView component", () => {
     expect(
       screen.getByText("No CRD events received yet or stream cleared.")
     ).toBeInTheDocument()
+  })
+
+  it("keeps the error banner steady without blipping while a subsequent refresh is in flight", async () => {
+    vi.mocked(api.getStacksWithMeta).mockRejectedValueOnce(
+      new TypeError("Failed to fetch")
+    )
+
+    render(<TopologyView />)
+
+    await waitFor(() => {
+      expect(screen.getByRole("alert")).toHaveTextContent("Failed to fetch")
+    })
+
+    let rejectRefresh!: (err: unknown) => void
+    vi.mocked(api.getStacksWithMeta).mockImplementationOnce(
+      () =>
+        new Promise((_, reject) => {
+          rejectRefresh = reject
+        })
+    )
+
+    fireEvent.click(screen.getByRole("button", { name: /Refresh Map/i }))
+
+    // Error banner must remain mounted while the refresh request is pending
+    expect(screen.getByRole("alert")).toHaveTextContent("Failed to fetch")
+
+    await act(async () => {
+      rejectRefresh(new TypeError("Failed to fetch"))
+    })
+
+    expect(screen.getByRole("alert")).toHaveTextContent("Failed to fetch")
+
+    // Clears only once a subsequent refresh succeeds
+    vi.mocked(api.getStacksWithMeta).mockResolvedValueOnce({
+      stacks: mockLiveStacks,
+    })
+    fireEvent.click(screen.getByRole("button", { name: /Refresh Map/i }))
+
+    await waitFor(() => {
+      expect(screen.queryByRole("alert")).not.toBeInTheDocument()
+    })
   })
 })

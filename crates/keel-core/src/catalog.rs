@@ -804,5 +804,50 @@ spec:
         // targetClusterFrom must be in dependsOn and reference an infra item
         let missing_dep_yaml = valid_bundle_yaml.replace("dependsOn: [cluster]", "dependsOn: []");
         assert!(parse_catalog_bundle(&missing_dep_yaml).is_err());
+
+        // canary: true is valid on app items and rejected on infra items
+        let valid_canary_yaml = valid_bundle_yaml.replace(
+            "      catalogRef: podinfo",
+            "      catalogRef: podinfo\n      canary: true",
+        );
+        let parsed_canary = parse_catalog_bundle(&valid_canary_yaml).unwrap();
+        assert!(parsed_canary.spec.items[0].canary);
+
+        let invalid_canary_yaml = valid_bundle_yaml.replace(
+            "      catalogRef: proxmox-k3s",
+            "      catalogRef: proxmox-k3s\n      canary: true",
+        );
+        assert!(parse_catalog_bundle(&invalid_canary_yaml).is_err());
+    }
+
+    #[test]
+    fn test_parse_progressive_delivery_addon_catalog_apps() {
+        for raw in [
+            include_str!("../../../deploy/catalog/apps/envoy-gateway/catalog.yaml"),
+            include_str!("../../../deploy/catalog/apps/prometheus/catalog.yaml"),
+            include_str!("../../../deploy/catalog/apps/flagger/catalog.yaml"),
+        ] {
+            let app = parse_catalog_application(raw).expect("addon catalog.yaml should parse");
+            app.validate().expect("addon catalog.yaml should validate");
+            assert!(!app.spec.progressive_delivery.flagger_supported);
+        }
+
+        let bundle = parse_catalog_bundle(include_str!(
+            "../../../deploy/catalog/bundles/kind-canary-platform/catalog.yaml"
+        ))
+        .expect("kind-canary-platform bundle should parse");
+        assert_eq!(bundle.spec.items.len(), 5);
+
+        let core_addons = parse_catalog_bundle(include_str!(
+            "../../../deploy/catalog/bundles/canary-core-addons/catalog.yaml"
+        ))
+        .expect("canary-core-addons bundle should parse");
+        assert_eq!(core_addons.spec.items.len(), 4);
+
+        let gw_cfg = parse_catalog_blueprint(include_str!(
+            "../../../deploy/catalog/infra/canary-gateway-config/catalog.yaml"
+        ))
+        .expect("canary-gateway-config blueprint should parse");
+        assert_eq!(gw_cfg.metadata.id, "canary-gateway-config");
     }
 }

@@ -33,13 +33,15 @@ pub struct LiveResourceInfo {
 }
 
 /// Live status and traffic weight for a Flagger `Canary` resource.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CanaryStatusInfo {
     pub status: LiveResourceStatus,
     pub last_synced: Option<String>,
     pub canary_weight: Option<u32>,
     pub canary_phase: Option<String>,
     pub primary_version: Option<String>,
+    pub error_rate: Option<f64>,
+    pub latency_ms: Option<f64>,
 }
 
 /// Normalized Kubernetes resource condition (`Ready`, `Reconciling`, `Stalled`).
@@ -215,6 +217,233 @@ impl KubeClusterStatusReader {
         let data = secret.data?;
         let bytes = data.get(key)?;
         String::from_utf8(bytes.0.clone()).ok()
+    }
+
+    async fn collect_canary_statuses_for_client(
+        client: &Client,
+    ) -> HashMap<(String, String), CanaryStatusInfo> {
+        let ar = ApiResource {
+            group: "flagger.app".to_string(),
+            version: "v1beta1".to_string(),
+            api_version: "flagger.app/v1beta1".to_string(),
+            kind: "Canary".to_string(),
+            plural: "canaries".to_string(),
+        };
+        let api: Api<DynamicObject> = Api::all_with(client.clone(), &ar);
+        let Ok(list) = api.list(&ListParams::default()).await else {
+            return HashMap::new();
+        };
+
+        let deploy_api: Api<k8s_openapi::api::apps::v1::Deployment> = Api::all(client.clone());
+        let mut primary_versions: HashMap<(String, String), String> = HashMap::new();
+        if let Ok(deploys) = deploy_api.list(&ListParams::default()).await {
+            for dep in deploys.items {
+                let Some(dep_name) = dep.metadata.name.as_deref() else {
+                    continue;
+                };
+                let Some(base_name) = dep_name.strip_suffix("-primary") else {
+                    continue;
+                };
+                let ns = dep
+                    .metadata
+                    .namespace
+                    .clone()
+                    .unwrap_or_else(|| "default".to_string());
+                let label_ver = dep
+                    .metadata
+                    .labels
+                    .as_ref()
+                    .and_then(|l| l.get("app.kubernetes.io/version"))
+                    .map(|v| v.trim().to_string())
+                    .filter(|v| !v.is_empty());
+                let image_ver = dep
+                    .spec
+                    .as_ref()
+                    .and_then(|s| s.template.spec.as_ref())
+                    .and_then(|ps| ps.containers.first())
+                    .and_then(|c| c.image.as_deref())
+                    .and_then(|img| img.rsplit_once(':').map(|(_, tag)| tag.to_string()))
+                    .filter(|v| !v.is_empty());
+                if let Some(ver) = label_ver.or(image_ver) {
+                    primary_versions.insert((ns, base_name.to_string()), ver);
+                }
+            }
+        }
+
+        let (error_rates, latencies_ms) = if list.items.is_empty() {
+            (HashMap::new(), HashMap::new())
+        } else {
+            Self::collect_canary_prometheus_metrics(client).await
+        };
+
+        let mut out = HashMap::new();
+        for item in list.items {
+            let Some(name) = item.metadata.name.clone() else {
+                continue;
+            };
+            let namespace = item
+                .metadata
+                .namespace
+                .clone()
+                .unwrap_or_else(|| "default".to_string());
+            let status_obj = item.data.get("status");
+            let phase = status_obj
+                .and_then(|s| s.get("phase"))
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let status = match phase.as_deref().unwrap_or_default() {
+                "Succeeded" | "Initialized" => LiveResourceStatus::Ready,
+                "Failed" => LiveResourceStatus::Error,
+                _ => LiveResourceStatus::Reconciling,
+            };
+            let canary_weight = status_obj
+                .and_then(|s| s.get("canaryWeight"))
+                .and_then(Value::as_u64)
+                .and_then(|w| u32::try_from(w).ok());
+            let last_synced = status_obj
+                .and_then(|s| s.get("lastTransitionTime"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .or_else(|| extract_last_synced(&item.data, None));
+            let target_ref_name = item
+                .data
+                .pointer("/spec/targetRef/name")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let primary_version = target_ref_name
+                .as_ref()
+                .and_then(|t| {
+                    primary_versions
+                        .get(&(namespace.clone(), t.clone()))
+                        .cloned()
+                })
+                .or_else(|| {
+                    primary_versions
+                        .get(&(namespace.clone(), name.clone()))
+                        .cloned()
+                });
+            let metric_key = (namespace.clone(), name.clone());
+            let target_key = target_ref_name.map(|t| (namespace.clone(), t));
+            let error_rate = error_rates
+                .get(&metric_key)
+                .or_else(|| target_key.as_ref().and_then(|k| error_rates.get(k)))
+                .map(|v| (v * 100.0).round() / 100.0);
+            let latency_ms = latencies_ms
+                .get(&metric_key)
+                .or_else(|| target_key.as_ref().and_then(|k| latencies_ms.get(k)))
+                .map(|v| (v * 10.0).round() / 10.0);
+            out.insert(
+                (namespace, name),
+                CanaryStatusInfo {
+                    status,
+                    last_synced,
+                    canary_weight,
+                    canary_phase: phase,
+                    primary_version,
+                    error_rate,
+                    latency_ms,
+                },
+            );
+        }
+        out
+    }
+
+    async fn discover_prometheus_service_name(client: &Client) -> String {
+        let svc_api: Api<k8s_openapi::api::core::v1::Service> =
+            Api::namespaced(client.clone(), "keel-system");
+        let Ok(Ok(list)) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            svc_api.list(&ListParams::default()),
+        )
+        .await
+        else {
+            return "prometheus".to_string();
+        };
+        let mut fallback: Option<String> = None;
+        for svc in list.items {
+            if let Some(name) = svc.metadata.name {
+                if name == "prometheus" {
+                    return name;
+                }
+                if fallback.is_none() && name.ends_with("-prometheus-server") {
+                    fallback = Some(name);
+                }
+            }
+        }
+        fallback.unwrap_or_else(|| "prometheus".to_string())
+    }
+
+    async fn collect_canary_prometheus_metrics(
+        client: &Client,
+    ) -> (
+        HashMap<(String, String), f64>,
+        HashMap<(String, String), f64>,
+    ) {
+        const ERROR_RATE_QUERY: &str = r#"(sum by (keel_route) (label_replace(rate(envoy_cluster_upstream_rq{envoy_cluster_name=~"httproute/[^/]+/[^/]+/.*",envoy_response_code=~"5.*"}[2m]), "keel_route", "$1/$2", "envoy_cluster_name", "httproute/([^/]+)/([^/]+)/.*")) or sum by (keel_route) (label_replace(rate(envoy_cluster_upstream_rq{envoy_cluster_name=~"httproute/[^/]+/[^/]+/.*"}[2m]), "keel_route", "$1/$2", "envoy_cluster_name", "httproute/([^/]+)/([^/]+)/.*")) * 0) / sum by (keel_route) (label_replace(rate(envoy_cluster_upstream_rq{envoy_cluster_name=~"httproute/[^/]+/[^/]+/.*"}[2m]), "keel_route", "$1/$2", "envoy_cluster_name", "httproute/([^/]+)/([^/]+)/.*")) * 100"#;
+        const P99_LATENCY_QUERY: &str = r#"histogram_quantile(0.99, sum by (le, keel_route) (label_replace(rate(envoy_cluster_upstream_rq_time_bucket{envoy_cluster_name=~"httproute/[^/]+/[^/]+/.*"}[2m]), "keel_route", "$1/$2", "envoy_cluster_name", "httproute/([^/]+)/([^/]+)/.*")))"#;
+
+        let prom_svc = Self::discover_prometheus_service_name(client).await;
+        tokio::join!(
+            Self::query_prometheus_vector(client, &prom_svc, ERROR_RATE_QUERY),
+            Self::query_prometheus_vector(client, &prom_svc, P99_LATENCY_QUERY),
+        )
+    }
+
+    async fn query_prometheus_vector(
+        client: &Client,
+        service_name: &str,
+        promql: &str,
+    ) -> HashMap<(String, String), f64> {
+        let encoded = percent_encode_query(promql);
+        let uri = format!(
+            "/api/v1/namespaces/keel-system/services/http:{service_name}:80/proxy/api/v1/query?query={encoded}"
+        );
+        let Ok(req) = http::Request::get(&uri).body(Vec::new()) else {
+            return HashMap::new();
+        };
+        let Ok(Ok(body)) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client.request::<Value>(req),
+        )
+        .await
+        else {
+            return HashMap::new();
+        };
+        parse_prometheus_vector_response(&body)
+    }
+
+    async fn build_client_from_kubeconfig_yaml(yaml: &str) -> Option<Client> {
+        let kc = kube::config::Kubeconfig::from_yaml(yaml).ok()?;
+        let mut cfg =
+            kube::Config::from_custom_kubeconfig(kc, &kube::config::KubeConfigOptions::default())
+                .await
+                .ok()?;
+        if !std::path::Path::new("/var/run/secrets/kubernetes.io/serviceaccount/token").exists()
+            && let Some(host) = cfg.cluster_url.host()
+            && host.ends_with("-control-plane")
+            && let Ok(Ok(out)) = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                tokio::process::Command::new("docker")
+                    .args(["port", host, "6443/tcp"])
+                    .output(),
+            )
+            .await
+            && out.status.success()
+        {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            if let Some(port) = stdout
+                .lines()
+                .next()
+                .and_then(|l| l.trim().rsplit(':').next())
+                .and_then(|p| p.parse::<u16>().ok())
+                && let Ok(uri) = format!("https://127.0.0.1:{port}").parse()
+            {
+                cfg.cluster_url = uri;
+            }
+        }
+        cfg.connect_timeout = Some(std::time::Duration::from_secs(3));
+        cfg.read_timeout = Some(std::time::Duration::from_secs(5));
+        Client::try_from(cfg).ok()
     }
 
     async fn list_dynamic_status_details(
@@ -417,97 +646,54 @@ impl LiveStatusSource for KubeClusterStatusReader {
     }
 
     async fn canary_statuses(&self) -> HashMap<(String, String), CanaryStatusInfo> {
-        let ar = ApiResource {
-            group: "flagger.app".to_string(),
-            version: "v1beta1".to_string(),
-            api_version: "flagger.app/v1beta1".to_string(),
-            kind: "Canary".to_string(),
-            plural: "canaries".to_string(),
-        };
-        let api: Api<DynamicObject> = Api::all_with(self.client.clone(), &ar);
-        let Ok(list) = api.list(&ListParams::default()).await else {
-            return HashMap::new();
-        };
+        let mut out = Self::collect_canary_statuses_for_client(&self.client).await;
 
-        let deploy_api: Api<k8s_openapi::api::apps::v1::Deployment> = Api::all(self.client.clone());
-        let mut primary_versions: HashMap<(String, String), String> = HashMap::new();
-        if let Ok(deploys) = deploy_api.list(&ListParams::default()).await {
-            for dep in deploys.items {
-                let Some(dep_name) = dep.metadata.name.as_deref() else {
+        // Also poll workload clusters referenced by `*-kubeconfig` Secrets in `tenant-*` namespaces
+        let secret_api: Api<k8s_openapi::api::core::v1::Secret> = Api::all(self.client.clone());
+        if let Ok(secrets) = secret_api.list(&ListParams::default()).await {
+            let mut kubeconfig_yamls = Vec::new();
+            for sec in secrets.items {
+                let Some(ns) = sec.metadata.namespace.as_deref() else {
                     continue;
                 };
-                let Some(base_name) = dep_name.strip_suffix("-primary") else {
+                let Some(name) = sec.metadata.name.as_deref() else {
                     continue;
                 };
-                let ns = dep
-                    .metadata
-                    .namespace
-                    .clone()
-                    .unwrap_or_else(|| "default".to_string());
-                let label_ver = dep
-                    .metadata
-                    .labels
-                    .as_ref()
-                    .and_then(|l| l.get("app.kubernetes.io/version"))
-                    .map(|v| v.trim().to_string())
-                    .filter(|v| !v.is_empty());
-                let image_ver = dep
-                    .spec
-                    .as_ref()
-                    .and_then(|s| s.template.spec.as_ref())
-                    .and_then(|ps| ps.containers.first())
-                    .and_then(|c| c.image.as_deref())
-                    .and_then(|img| img.rsplit_once(':').map(|(_, tag)| tag.to_string()))
-                    .filter(|v| !v.is_empty());
-                if let Some(ver) = label_ver.or(image_ver) {
-                    primary_versions.insert((ns, base_name.to_string()), ver);
+                if !ns.starts_with("tenant-") || !name.ends_with("-kubeconfig") {
+                    continue;
+                }
+                let Some(data) = sec.data else {
+                    continue;
+                };
+                let raw_bytes = data.get("value").or_else(|| data.get("kubeconfig"));
+                if let Some(bytes) = raw_bytes
+                    && let Ok(yaml) = String::from_utf8(bytes.0.clone())
+                    && !yaml.trim().is_empty()
+                {
+                    kubeconfig_yamls.push(yaml);
+                }
+            }
+
+            let remote_futures = kubeconfig_yamls.into_iter().map(|yaml| async move {
+                let client = Self::build_client_from_kubeconfig_yaml(&yaml).await?;
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    Self::collect_canary_statuses_for_client(&client),
+                )
+                .await
+                .ok()
+            });
+            for remote_map in futures::future::join_all(remote_futures)
+                .await
+                .into_iter()
+                .flatten()
+            {
+                for (k, v) in remote_map {
+                    out.entry(k).or_insert(v);
                 }
             }
         }
 
-        let mut out = HashMap::new();
-        for item in list.items {
-            let Some(name) = item.metadata.name.clone() else {
-                continue;
-            };
-            let namespace = item
-                .metadata
-                .namespace
-                .clone()
-                .unwrap_or_else(|| "default".to_string());
-            let status_obj = item.data.get("status");
-            let phase = status_obj
-                .and_then(|s| s.get("phase"))
-                .and_then(Value::as_str)
-                .map(str::to_owned);
-            let status = match phase.as_deref().unwrap_or_default() {
-                "Succeeded" | "Initialized" => LiveResourceStatus::Ready,
-                "Failed" => LiveResourceStatus::Error,
-                _ => LiveResourceStatus::Reconciling,
-            };
-            let canary_weight = status_obj
-                .and_then(|s| s.get("canaryWeight"))
-                .and_then(Value::as_u64)
-                .and_then(|w| u32::try_from(w).ok());
-            let last_synced = status_obj
-                .and_then(|s| s.get("lastTransitionTime"))
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-                .or_else(|| extract_last_synced(&item.data, None));
-            let primary_version = primary_versions
-                .get(&(namespace.clone(), name.clone()))
-                .cloned();
-            out.insert(
-                (namespace, name),
-                CanaryStatusInfo {
-                    status,
-                    last_synced,
-                    canary_weight,
-                    canary_phase: phase,
-                    primary_version,
-                },
-            );
-        }
         out
     }
 
@@ -1050,6 +1236,60 @@ pub fn extract_resource_count(data: &Value) -> Option<u32> {
     None
 }
 
+fn percent_encode_query(input: &str) -> String {
+    let mut out = String::with_capacity(input.len() * 2);
+    for b in input.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push('%');
+            out.push(
+                char::from_digit((b >> 4) as u32, 16)
+                    .unwrap_or('0')
+                    .to_ascii_uppercase(),
+            );
+            out.push(
+                char::from_digit((b & 0x0f) as u32, 16)
+                    .unwrap_or('0')
+                    .to_ascii_uppercase(),
+            );
+        }
+    }
+    out
+}
+
+fn parse_prometheus_vector_response(body: &Value) -> HashMap<(String, String), f64> {
+    let mut out = HashMap::new();
+    if body.get("status").and_then(Value::as_str) != Some("success") {
+        return out;
+    }
+    let Some(results) = body.pointer("/data/result").and_then(Value::as_array) else {
+        return out;
+    };
+    for item in results {
+        let Some(route) = item.pointer("/metric/keel_route").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some((ns, target)) = route.split_once('/') else {
+            continue;
+        };
+        let Some(raw_val) = item
+            .get("value")
+            .and_then(Value::as_array)
+            .and_then(|arr| arr.get(1))
+            .and_then(Value::as_str)
+        else {
+            continue;
+        };
+        if let Ok(val) = raw_val.parse::<f64>()
+            && val.is_finite()
+        {
+            out.insert((ns.to_string(), target.to_string()), val);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1136,18 +1376,47 @@ mod tests {
             Some("2026-11-15T09:00:00Z")
         );
         assert_eq!(extract_resource_count(&flux_ks), Some(3));
+    }
 
-        let helm_release = json!({
-            "status": {
-                "history": [
-                    { "lastDeployed": "2026-11-15T08:30:00Z" }
+    #[test]
+    fn percent_encodes_promql_queries() {
+        let encoded = percent_encode_query(r#"rate(x{a="1/2"}[2m]) * 100"#);
+        assert!(!encoded.contains(' '));
+        assert!(!encoded.contains('{'));
+        assert!(!encoded.contains('"'));
+        assert!(encoded.contains("rate%28x%7Ba%3D%221%2F2%22%7D%5B2m%5D%29"));
+    }
+
+    #[test]
+    fn parses_prometheus_vector_response_and_filters_non_finite() {
+        let body = json!({
+            "status": "success",
+            "data": {
+                "resultType": "vector",
+                "result": [
+                    {
+                        "metric": { "keel_route": "tenant-acme/podinfo" },
+                        "value": [1700000000.0, "0.25"]
+                    },
+                    {
+                        "metric": { "keel_route": "tenant-acme/empty" },
+                        "value": [1700000000.0, "NaN"]
+                    },
+                    {
+                        "metric": { "keel_route": "tenant-acme/inf" },
+                        "value": [1700000000.0, "+Inf"]
+                    }
                 ]
             }
         });
+        let parsed = parse_prometheus_vector_response(&body);
+        assert_eq!(parsed.len(), 1);
         assert_eq!(
-            extract_last_synced(&helm_release, Some("2026-11-15T08:00:00Z")).as_deref(),
-            Some("2026-11-15T08:30:00Z")
+            parsed.get(&("tenant-acme".to_string(), "podinfo".to_string())),
+            Some(&0.25)
         );
-        assert_eq!(extract_resource_count(&helm_release), None);
+
+        let err_body = json!({ "status": "error", "error": "bad query" });
+        assert!(parse_prometheus_vector_response(&err_body).is_empty());
     }
 }

@@ -422,6 +422,11 @@ const DeployInstanceModalBody: React.FC<DeployInstanceModalProps> = ({
                   </span>
                   <span className="font-semibold text-white">{bi.id}</span>
                   <span className="text-slate-500">({bi.catalogRef})</span>
+                  {bi.canary && (
+                    <span className="px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 text-[10px] uppercase">
+                      canary
+                    </span>
+                  )}
                   {bi.dependsOn && bi.dependsOn.length > 0 && (
                     <span className="text-amber-300 text-[10px]">
                       ← {bi.dependsOn.join(", ")}

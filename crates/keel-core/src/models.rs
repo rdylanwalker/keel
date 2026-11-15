@@ -1118,6 +1118,10 @@ pub enum BundleItemKind {
     App,
 }
 
+fn is_false(v: &bool) -> bool {
+    !*v
+}
+
 /// Single step/item inside a `CatalogBundle` (`SDD.md` §5.1).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1131,6 +1135,8 @@ pub struct CatalogBundleItem {
     pub target_cluster_from: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_namespace: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub canary: bool,
     #[serde(default)]
     pub bind_values: BTreeMap<String, serde_json::Value>,
 }
@@ -1210,6 +1216,12 @@ impl CatalogBundle {
             if let Some(ns) = &item.target_namespace {
                 validate_dns_label(ns, "spec.items[].targetNamespace")?;
             }
+            if item.canary && item.kind != BundleItemKind::App {
+                return Err(CoreError::Validation(format!(
+                    "Bundle item '{}' sets canary: true, which is only valid for kind: app",
+                    item.id
+                )));
+            }
             if by_id.insert(item.id.as_str(), item).is_some() {
                 return Err(CoreError::Validation(format!(
                     "Duplicate bundle item id '{}'",
@@ -1234,9 +1246,9 @@ impl CatalogBundle {
                 }
             }
             if let Some(cluster_item_id) = &item.target_cluster_from {
-                if item.kind != BundleItemKind::App {
+                if cluster_item_id == &item.id {
                     return Err(CoreError::Validation(format!(
-                        "Bundle item '{}' sets targetClusterFrom, which is only valid for kind: app",
+                        "Bundle item '{}' cannot reference itself in targetClusterFrom",
                         item.id
                     )));
                 }

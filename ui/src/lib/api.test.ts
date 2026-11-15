@@ -671,4 +671,26 @@ describe("api client module", () => {
       expect.objectContaining({ method: "POST" })
     )
   })
+
+  it("dispatches keel:unauthorized event when an API request returns 401", async () => {
+    const onUnauthorized = vi.fn()
+    window.addEventListener("keel:unauthorized", onUnauthorized)
+
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: false,
+        status: 401,
+        statusText: "Unauthorized",
+        text: async () => "Authentication session has expired",
+      })
+    )
+
+    await expect(getStacks()).rejects.toThrow(
+      "API error (401): Authentication session has expired"
+    )
+    expect(onUnauthorized).toHaveBeenCalledTimes(1)
+
+    window.removeEventListener("keel:unauthorized", onUnauthorized)
+  })
 })
