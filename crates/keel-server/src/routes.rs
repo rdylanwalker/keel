@@ -33,9 +33,10 @@ use keel_kube::{
     synthesize_flux_kustomization_yaml, synthesize_helm_release_yaml, user_git_creds_secret_name,
 };
 use keel_pko::{
-    ChangeOp, EphemeralPreviewParams, GcPlan, PkoStack, PreviewReport, PreviewResourceCandidate,
-    PreviewSummary, ResourceDiff, TenantStackParams, build_preview_branch, format_markdown_report,
-    plan_preview_gc, synthesize_ephemeral_preview, synthesize_tenant_stack,
+    ChangeOp, EphemeralPreviewParams, GcPlan, PkoEnvRef, PkoStack, PreviewReport,
+    PreviewResourceCandidate, PreviewSummary, ResourceDiff, TenantStackParams,
+    build_preview_branch, format_markdown_report, plan_preview_gc, synthesize_ephemeral_preview,
+    synthesize_tenant_stack,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -1838,6 +1839,66 @@ async fn read_pulumi_project_name(pulumi_yaml_path: &std::path::Path, fallback: 
         .to_string()
 }
 
+fn populate_stack_config_from_values(
+    config: &mut std::collections::BTreeMap<String, String>,
+    values: &Value,
+) {
+    let Some(obj) = values.as_object() else {
+        return;
+    };
+    for (key, val) in obj {
+        let rendered = match val {
+            Value::Null => continue,
+            Value::String(s) => s.clone(),
+            Value::Bool(b) => b.to_string(),
+            Value::Number(n) => n.to_string(),
+            Value::Array(_) | Value::Object(_) => val.to_string(),
+        };
+        config.insert(key.clone(), rendered);
+    }
+}
+
+fn build_infra_secret_manifest_yaml(
+    secret_name: &str,
+    namespace: &str,
+    secret_values: &Value,
+) -> Result<(String, Vec<String>), ServerError> {
+    let mut string_data = serde_json::Map::new();
+    let mut keys = Vec::new();
+    if let Some(obj) = secret_values.as_object() {
+        for (key, val) in obj {
+            let rendered = match val {
+                Value::Null => continue,
+                Value::String(s) => s.clone(),
+                Value::Bool(b) => b.to_string(),
+                Value::Number(n) => n.to_string(),
+                Value::Array(_) | Value::Object(_) => val.to_string(),
+            };
+            keys.push(key.clone());
+            string_data.insert(key.clone(), Value::String(rendered));
+        }
+    }
+    let secret_doc = json!({
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": {
+            "name": secret_name,
+            "namespace": namespace,
+            "annotations": {
+                "kustomize.toolkit.fluxcd.io/prune": "disabled"
+            },
+            "labels": {
+                "app.kubernetes.io/managed-by": "keel"
+            }
+        },
+        "type": "Opaque",
+        "stringData": string_data,
+    });
+    let yaml = serde_yml::to_string(&secret_doc)
+        .map_err(|e| ServerError::Internal(format!("failed to serialize secret manifest: {e}")))?;
+    Ok((yaml, keys))
+}
+
 /// `POST /api/v1/proposals`
 ///
 /// Validates payload against `catalog.yaml` JSONSchema, splits secrets (`writeOnly`/`format: password`),
@@ -1886,20 +1947,27 @@ pub async fn create_proposal(
         _ => None,
     };
 
+    let tenant_ns = tenant_namespace(&req.tenant)?;
+    let infra_secret_name = format!("{instance_name}-secrets");
+
     // Encrypt extracted secret fields via SOPS + age before touching Git (`SDD.md` §6.3)
-    let encrypted_secrets_yaml = if let Some(plaintext_secrets) = &plaintext_secrets_yaml {
+    let (encrypted_secrets_yaml, encrypted_infra_k8s_secret_yaml, infra_secret_keys) = if let Some(
+        plaintext_secrets,
+    ) =
+        &plaintext_secrets_yaml
+    {
         let age_key = match state.secret_store.get_tenant_age_key(&req.tenant).await? {
             Some(existing) => existing,
             None => {
                 let keypair = SopsManager::new()
-                    .generate_age_keypair()
-                    .await
-                    .map_err(|_| {
-                        ServerError::BadRequest(format!(
-                            "Tenant '{}' has no SOPS age key configured; cannot encrypt secret fields",
-                            req.tenant
-                        ))
-                    })?;
+                        .generate_age_keypair()
+                        .await
+                        .map_err(|_| {
+                            ServerError::BadRequest(format!(
+                                "Tenant '{}' has no SOPS age key configured; cannot encrypt secret fields",
+                                req.tenant
+                            ))
+                        })?;
                 let generated = TenantAgeKey::new(keypair.public_key.clone(), keypair.secret_key());
                 state
                     .secret_store
@@ -1908,18 +1976,30 @@ pub async fn create_proposal(
                 generated
             }
         };
-        Some(
-            SopsManager::new()
-                .encrypt_yaml(&age_key.public_key, plaintext_secrets)
-                .await?,
-        )
+        let sops = SopsManager::new();
+        let enc_values = sops
+            .encrypt_yaml(&age_key.public_key, plaintext_secrets)
+            .await?;
+        let (enc_k8s_secret, keys) = if !is_app {
+            let (plain_k8s_secret, keys) = build_infra_secret_manifest_yaml(
+                &infra_secret_name,
+                &tenant_ns,
+                &partitioned.secret_values,
+            )?;
+            let enc_k8s = sops
+                .encrypt_yaml(&age_key.public_key, &plain_k8s_secret)
+                .await?;
+            (Some(enc_k8s), keys)
+        } else {
+            (None, Vec::new())
+        };
+        (Some(enc_values), enc_k8s_secret, keys)
     } else {
-        None
+        (None, None, Vec::new())
     };
 
     let timestamp = Utc::now().timestamp().max(1) as u64;
     let branch = build_preview_branch(&req.tenant, &action_label, timestamp)?;
-    let tenant_ns = tenant_namespace(&req.tenant)?;
 
     let (rel_dir, manifest_yaml, preview_resource_type) = match &manifest {
         CatalogManifest::Application(app) => {
@@ -2002,6 +2082,13 @@ pub async fn create_proposal(
             stack_params
                 .config
                 .insert("keel:provider".to_string(), bp.metadata.provider.clone());
+            populate_stack_config_from_values(&mut stack_params.config, &partitioned.normal_values);
+            for secret_key in &infra_secret_keys {
+                stack_params.env_refs.insert(
+                    secret_key.clone(),
+                    PkoEnvRef::from_secret(&infra_secret_name, secret_key),
+                );
+            }
             if bp.spec.outputs.iter().any(|o| o == "kubeconfig") {
                 stack_params.config.insert(
                     "kubeconfigSecretName".to_string(),
@@ -2116,6 +2203,16 @@ pub async fn create_proposal(
             let target_pulumi_path = target_dir.join("Pulumi.yaml");
             tokio::fs::write(&target_pulumi_path, pulumi_yaml).await?;
             staged_paths.push(format!("{rel_dir}/Pulumi.yaml"));
+
+            if let Some(enc_k8s_secret) = &encrypted_infra_k8s_secret_yaml {
+                let secret_path = target_dir.join("secret.enc.yaml");
+                tokio::fs::write(&secret_path, enc_k8s_secret).await?;
+                staged_paths.push(format!("{rel_dir}/secret.enc.yaml"));
+                extra_kustomize_resources.push(format!(
+                    "{}/infra/{instance_name}/secret.enc.yaml",
+                    req.tenant
+                ));
+            }
         }
 
         // Keep tenants/kustomization.yaml updated so Flux reconciles only K8s manifests (never values.yaml / Pulumi.yaml)
@@ -2255,7 +2352,7 @@ pub async fn create_proposal(
     let pr = state.forge.create_pull_request(pr_req).await?;
 
     // Synthesize ephemeral PKO v2 preview CRs in `keel-previews`
-    let preview_params = EphemeralPreviewParams::for_action(
+    let mut preview_params = EphemeralPreviewParams::for_action(
         &pr.id,
         &req.tenant,
         &action_label,
@@ -2265,6 +2362,9 @@ pub async fn create_proposal(
         format!("organization/{instance_name}-pr-{}/{}", pr.id, req.tenant),
         &state.backend_url,
     )?;
+    if !is_app {
+        populate_stack_config_from_values(&mut preview_params.config, &partitioned.normal_values);
+    }
     let preview_stack = synthesize_ephemeral_preview(&preview_params)?;
 
     let report = PreviewReport {

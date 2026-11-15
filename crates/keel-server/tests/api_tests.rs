@@ -2361,3 +2361,157 @@ async fn test_create_and_update_infra_blueprint_pulumi_yaml() {
     .unwrap();
     assert_eq!(stored_v2, updated_pulumi);
 }
+
+#[tokio::test]
+async fn test_infra_proposal_forwards_config_and_encrypts_secret_env_refs() {
+    let fixture = setup_fixture().await;
+    let cookie = login_and_get_cookie(&fixture).await;
+    let app = build_router(fixture.state.clone());
+
+    // Seed an infra blueprint with normal config fields and a writeOnly credential field
+    let bp_dir = fixture.state.repo_workdir.join("catalog/infra/gcp-free-vm");
+    tokio::fs::create_dir_all(&bp_dir).await.unwrap();
+    tokio::fs::write(
+        bp_dir.join("catalog.yaml"),
+        r#"apiVersion: keel.io/v1alpha1
+kind: CatalogInfraBlueprint
+metadata:
+  id: gcp-free-vm
+  name: GCP Free VM
+  category: Compute
+  provider: proxmox
+spec:
+  pulumiRuntime: yaml
+  entrypoint: Pulumi.yaml
+  protectByDefault: false
+  schema:
+    type: object
+    required:
+      - vmName
+      - project
+      - GOOGLE_CREDENTIALS
+    properties:
+      vmName:
+        type: string
+        default: keel-free-vm
+      project:
+        type: string
+      GOOGLE_CREDENTIALS:
+        type: string
+        writeOnly: true
+"#,
+    )
+    .await
+    .unwrap();
+    tokio::fs::write(
+        bp_dir.join("Pulumi.yaml"),
+        "name: gcp-free-vm\nruntime: yaml\nresources: {}\n",
+    )
+    .await
+    .unwrap();
+    fixture
+        .state
+        .git_runner
+        .add(
+            &fixture.state.repo_workdir,
+            [
+                "catalog/infra/gcp-free-vm/catalog.yaml",
+                "catalog/infra/gcp-free-vm/Pulumi.yaml",
+            ],
+        )
+        .await
+        .unwrap();
+    fixture
+        .state
+        .git_runner
+        .commit(
+            &fixture.state.repo_workdir,
+            "feat(catalog): add gcp-free-vm test blueprint",
+            &CommitAuthor::new("Keel Seed", "seed@keel.local"),
+        )
+        .await
+        .unwrap();
+    fixture
+        .state
+        .git_runner
+        .push(
+            &fixture.state.repo_workdir,
+            "origin",
+            "HEAD:refs/heads/main",
+        )
+        .await
+        .unwrap();
+
+    let secret_json = r#"{"type":"service_account","project_id":"demo-free-123"}"#;
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/proposals")
+                .header(COOKIE, &cookie)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "tenant": "acme",
+                        "catalogId": "gcp-free-vm",
+                        "name": "my-gcp-vm",
+                        "values": {
+                            "vmName": "keel-free-vm",
+                            "project": "demo-free-123",
+                            "GOOGLE_CREDENTIALS": secret_json
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let body: Value =
+        serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let branch = body["branch"].as_str().unwrap();
+
+    fixture
+        .state
+        .git_runner
+        .checkout_branch(&fixture.state.repo_workdir, branch)
+        .await
+        .unwrap();
+
+    let stack_yaml = tokio::fs::read_to_string(
+        fixture
+            .state
+            .repo_workdir
+            .join("tenants/acme/infra/my-gcp-vm/stack.yaml"),
+    )
+    .await
+    .unwrap();
+    assert!(stack_yaml.contains("vmName: keel-free-vm"));
+    assert!(stack_yaml.contains("project: demo-free-123"));
+    assert!(stack_yaml.contains("GOOGLE_CREDENTIALS:"));
+    assert!(stack_yaml.contains("name: my-gcp-vm-secrets"));
+    assert!(stack_yaml.contains("key: GOOGLE_CREDENTIALS"));
+    assert!(!stack_yaml.contains("service_account"));
+
+    let secret_enc_yaml = tokio::fs::read_to_string(
+        fixture
+            .state
+            .repo_workdir
+            .join("tenants/acme/infra/my-gcp-vm/secret.enc.yaml"),
+    )
+    .await
+    .unwrap();
+    assert!(secret_enc_yaml.contains("ENC[AES256_GCM,"));
+    assert!(!secret_enc_yaml.contains("service_account"));
+
+    let tenants_kustomization = tokio::fs::read_to_string(
+        fixture
+            .state
+            .repo_workdir
+            .join("tenants/kustomization.yaml"),
+    )
+    .await
+    .unwrap();
+    assert!(tenants_kustomization.contains("acme/infra/my-gcp-vm/secret.enc.yaml"));
+}

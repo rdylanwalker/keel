@@ -863,7 +863,7 @@ async fn initialize_seed_git_repo_with_push(
          \x20 - type: Container\n\
          \x20   default:\n\
          \x20     cpu: 500m\n\
-         \x20     memory: 512Mi\n\
+         \x20     memory: 1Gi\n\
          \x20   defaultRequest:\n\
          \x20     cpu: 100m\n\
          \x20     memory: 128Mi\n\
@@ -1431,7 +1431,11 @@ async fn install_stage0_core_addons(
              \x20 prune: true\n\
              \x20 sourceRef:\n\
              \x20   kind: GitRepository\n\
-             \x20   name: {FLUX_SYSTEM_NAMESPACE}\n"
+             \x20   name: {FLUX_SYSTEM_NAMESPACE}\n\
+             \x20 decryption:\n\
+             \x20   provider: sops\n\
+             \x20   secretRef:\n\
+             \x20     name: sops-age\n"
         );
         run_kubectl_apply(ctx, kc, &tenants_ks_yaml).await?;
     } else {

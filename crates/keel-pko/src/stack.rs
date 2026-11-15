@@ -161,6 +161,7 @@ pub struct SecretKeySelector {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PkoEnvRef {
+    #[serde(rename = "type")]
     pub selector_type: String,
     pub secret: SecretKeySelector,
 }
@@ -169,7 +170,7 @@ impl PkoEnvRef {
     /// References a key inside a namespace-local Kubernetes `Secret`.
     pub fn from_secret(secret_name: impl Into<String>, key: impl Into<String>) -> Self {
         Self {
-            selector_type: "Resource".to_string(),
+            selector_type: "Secret".to_string(),
             secret: SecretKeySelector {
                 name: secret_name.into(),
                 key: key.into(),
