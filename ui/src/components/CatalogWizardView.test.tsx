@@ -24,6 +24,7 @@ vi.mock("../lib/api", () => ({
   createTenant: vi.fn(),
   deleteTenant: vi.fn(),
   createCatalogApp: vi.fn(),
+  updateCatalogItem: vi.fn(),
 }))
 
 const mockCatalog: CatalogItem[] = [
@@ -882,5 +883,76 @@ describe("CatalogWizardView component and jsonToYaml helper", () => {
     expect(screen.getByDisplayValue("6.6.0")).toBeInTheDocument()
     expect(screen.getByText(/replicaCount: 4/)).toBeInTheDocument()
     expect(onClear).toHaveBeenCalled()
+  })
+
+  it("edits an existing catalog item via modal and submits PUT update PR", async () => {
+    vi.mocked(api.getCatalog).mockResolvedValue([
+      {
+        id: "podinfo",
+        name: "Podinfo",
+        description: "Podinfo app",
+        type: "app",
+        category: "Apps",
+        version: "6.7.1",
+        runtime: "helm",
+        repoUrl: "https://github.com/stefanprodan/podinfo",
+        chart: "podinfo",
+        flaggerSupported: false,
+        schema: {
+          type: "object",
+          properties: {
+            replicaCount: { type: "integer", default: 1 },
+          },
+        },
+      },
+    ])
+    vi.mocked(api.updateCatalogItem).mockResolvedValue({
+      id: "112",
+      title: "feat(catalog): update app podinfo",
+      branch: "keel/catalog/update-podinfo-112",
+      author: "user",
+      tenant: "catalog",
+      status: "open",
+      createdAt: "just now",
+    })
+
+    render(<CatalogWizardView />)
+
+    const editBtn = await screen.findByRole("button", { name: /^Edit$/i })
+    fireEvent.click(editBtn)
+
+    expect(screen.getByText("Edit Catalog Item")).toBeInTheDocument()
+    expect(screen.getByLabelText(/Catalog Type \*/i)).toBeDisabled()
+    expect(screen.getByLabelText(/Item ID \*/i)).toBeDisabled()
+
+    fireEvent.change(screen.getByLabelText(/Item Name \*/i), {
+      target: { value: "Podinfo Pro" },
+    })
+    fireEvent.change(screen.getByLabelText(/^Version$/i), {
+      target: { value: "6.8.0" },
+    })
+
+    fireEvent.click(screen.getByRole("button", { name: /Submit Update PR/i }))
+
+    await waitFor(() => {
+      expect(api.updateCatalogItem).toHaveBeenCalledWith("app", "podinfo", {
+        name: "Podinfo Pro",
+        category: "Apps",
+        description: "Podinfo app",
+        runtime: "helm",
+        repoUrl: "https://github.com/stefanprodan/podinfo",
+        chart: "podinfo",
+        version: "6.8.0",
+        path: "",
+        flaggerSupported: false,
+        provider: undefined,
+        pulumiRuntime: undefined,
+        entrypoint: undefined,
+        protectByDefault: undefined,
+        items: undefined,
+        schema: undefined,
+      })
+    })
+    expect(await screen.findByText(/PR #112 Opened/i)).toBeInTheDocument()
   })
 })

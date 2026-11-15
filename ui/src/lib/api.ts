@@ -97,6 +97,7 @@ interface RawCatalogEntry {
   metadata?: {
     id?: string
     name?: string
+    description?: string
     category?: string
     runtime?: string
     provider?: string
@@ -106,7 +107,14 @@ interface RawCatalogEntry {
       repoURL?: string
       chart?: string
       version?: string
+      path?: string
     }
+    progressiveDelivery?: {
+      flaggerSupported?: boolean
+    }
+    pulumiRuntime?: "yaml" | "hcl" | "opentofu-bridge"
+    entrypoint?: string
+    protectByDefault?: boolean
     schema?: Record<string, unknown>
     uiSchema?: Record<string, unknown>
     items?: CatalogBundleItem[]
@@ -130,37 +138,48 @@ export async function getCatalog(): Promise<CatalogItem[]> {
   const apps: CatalogItem[] = (raw.applications ?? []).map((app) => ({
     id: app.metadata?.id ?? "unknown-app",
     name: app.metadata?.name ?? app.metadata?.id ?? "Application",
-    description: app.spec?.upstream?.chart
-      ? `Helm chart: ${app.spec.upstream.chart}`
-      : "Upstream Kubernetes application",
+    description:
+      app.metadata?.description ||
+      (app.spec?.upstream?.chart
+        ? `Helm chart: ${app.spec.upstream.chart}`
+        : "Upstream Kubernetes application"),
     type: "app",
     category: app.metadata?.category ?? "Applications",
     version: app.spec?.upstream?.version ?? "0.1.0",
     repoUrl: app.spec?.upstream?.repoURL,
     chart: app.spec?.upstream?.chart,
+    path: app.spec?.upstream?.path,
     runtime: app.metadata?.runtime,
+    flaggerSupported: app.spec?.progressiveDelivery?.flaggerSupported ?? false,
     schema: app.spec?.schema ?? { type: "object", properties: {} },
     uiSchema: app.spec?.uiSchema,
   }))
   const blueprints: CatalogItem[] = (raw.blueprints ?? []).map((bp) => ({
     id: bp.metadata?.id ?? "unknown-blueprint",
     name: bp.metadata?.name ?? bp.metadata?.id ?? "Infrastructure Blueprint",
-    description: bp.metadata?.provider
-      ? `PKO v2 infrastructure blueprint (${bp.metadata.provider})`
-      : "PKO v2 infrastructure blueprint",
+    description:
+      bp.metadata?.description ||
+      (bp.metadata?.provider
+        ? `PKO v2 infrastructure blueprint (${bp.metadata.provider})`
+        : "PKO v2 infrastructure blueprint"),
     type: "infra",
     category: bp.metadata?.category ?? "Infrastructure",
     provider: bp.metadata?.provider,
     version: "1.0.0",
+    pulumiRuntime: bp.spec?.pulumiRuntime ?? "yaml",
+    entrypoint: bp.spec?.entrypoint ?? "Pulumi.yaml",
+    protectByDefault: bp.spec?.protectByDefault ?? false,
     schema: bp.spec?.schema ?? { type: "object", properties: {} },
     uiSchema: bp.spec?.uiSchema,
   }))
   const bundles: CatalogItem[] = (raw.bundles ?? []).map((b) => ({
     id: b.metadata?.id ?? "unknown-bundle",
     name: b.metadata?.name ?? b.metadata?.id ?? "Catalog Bundle",
-    description: b.spec?.items?.length
-      ? `Multi-item bundle (${b.spec.items.map((i) => i.id).join(" → ")})`
-      : "Multi-item catalog bundle",
+    description:
+      b.metadata?.description ||
+      (b.spec?.items?.length
+        ? `Multi-item bundle (${b.spec.items.map((i) => i.id).join(" → ")})`
+        : "Multi-item catalog bundle"),
     type: "bundle",
     category: b.metadata?.category ?? "Platform",
     version: "bundle",
@@ -582,6 +601,31 @@ export async function createCatalogApp(
     headers: getHeaders(),
     body: JSON.stringify(payload),
   })
+  const raw = await handleResponse<
+    RawProposal | { proposal: RawProposal; branch?: string }
+  >(res)
+  return unwrapProposalResponse(raw)
+}
+
+export async function updateCatalogItem(
+  kind: "app" | "infra" | "bundle" | string,
+  id: string,
+  payload: Omit<CreateCatalogItemPayload, "kind" | "id">
+): Promise<Proposal> {
+  const normalizedKind =
+    kind === "infrastructure" || kind === "infra"
+      ? "infra"
+      : kind === "bundle"
+        ? "bundle"
+        : "app"
+  const res = await fetch(
+    `/api/v1/catalog/${normalizedKind}/${encodeURIComponent(id)}`,
+    {
+      method: "PUT",
+      headers: getHeaders(),
+      body: JSON.stringify(payload),
+    }
+  )
   const raw = await handleResponse<
     RawProposal | { proposal: RawProposal; branch?: string }
   >(res)

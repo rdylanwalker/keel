@@ -466,7 +466,7 @@ pub async fn register_catalog_app(
                 metadata: CatalogAppMetadata {
                     id: req.id.clone(),
                     name: req.name,
-                    description: None,
+                    description: req.description.filter(|s| !s.trim().is_empty()),
                     category: req.category,
                     runtime,
                 },
@@ -609,7 +609,7 @@ pub async fn register_catalog_app(
                 metadata: CatalogBlueprintMetadata {
                     id: req.id.clone(),
                     name: req.name,
-                    description: None,
+                    description: req.description.filter(|s| !s.trim().is_empty()),
                     category: req.category,
                     provider: provider.clone(),
                 },
@@ -757,47 +757,7 @@ pub async fn register_catalog_app(
             let schema = if let Some(custom_schema) = req.schema {
                 custom_schema
             } else {
-                let mut props = serde_json::Map::new();
-                let mut required = Vec::with_capacity(items.len());
-                for item in &items {
-                    validate_dns_label(&item.id, "items[].id")?;
-                    validate_dns_label(&item.catalog_ref, "items[].catalogRef")?;
-                    let kind_hint = match item.kind {
-                        BundleItemKind::Infra => "infra",
-                        BundleItemKind::App => "app",
-                    };
-                    let ref_manifest = load_catalog_manifest(
-                        &state.repo_workdir,
-                        &item.catalog_ref,
-                        Some(kind_hint),
-                    )
-                    .await?;
-                    let (ref_title, ref_schema) = match ref_manifest {
-                        CatalogManifest::Application(a) => (a.metadata.name, a.spec.schema),
-                        CatalogManifest::InfraBlueprint(b) => (b.metadata.name, b.spec.schema),
-                        CatalogManifest::Bundle(_) => {
-                            return Err(ServerError::BadRequest(format!(
-                                "Nested bundle '{}' is not supported inside bundle items",
-                                item.catalog_ref
-                            )));
-                        }
-                    };
-                    let mut item_schema = ref_schema.as_object().cloned().unwrap_or_default();
-                    item_schema
-                        .entry("type".to_string())
-                        .or_insert_with(|| json!("object"));
-                    item_schema.insert(
-                        "title".to_string(),
-                        json!(format!("{} ({})", ref_title, item.id)),
-                    );
-                    props.insert(item.id.clone(), Value::Object(item_schema));
-                    required.push(json!(item.id));
-                }
-                json!({
-                    "type": "object",
-                    "required": required,
-                    "properties": props,
-                })
+                compose_bundle_schema(&state.repo_workdir, &items).await?
             };
 
             let bundle = CatalogBundle {
@@ -907,6 +867,304 @@ pub async fn register_catalog_app(
             "Unsupported catalog kind '{other}'; expected 'app', 'infra', or 'bundle'"
         ))),
     }
+}
+
+async fn compose_bundle_schema(
+    repo_workdir: &std::path::Path,
+    items: &[CatalogBundleItem],
+) -> Result<Value, ServerError> {
+    let mut props = serde_json::Map::new();
+    let mut required = Vec::with_capacity(items.len());
+    for item in items {
+        validate_dns_label(&item.id, "items[].id")?;
+        validate_dns_label(&item.catalog_ref, "items[].catalogRef")?;
+        let kind_hint = match item.kind {
+            BundleItemKind::Infra => "infra",
+            BundleItemKind::App => "app",
+        };
+        let ref_manifest =
+            load_catalog_manifest(repo_workdir, &item.catalog_ref, Some(kind_hint)).await?;
+        let (ref_title, ref_schema) = match ref_manifest {
+            CatalogManifest::Application(a) => (a.metadata.name, a.spec.schema),
+            CatalogManifest::InfraBlueprint(b) => (b.metadata.name, b.spec.schema),
+            CatalogManifest::Bundle(_) => {
+                return Err(ServerError::BadRequest(format!(
+                    "Nested bundle '{}' is not supported inside bundle items",
+                    item.catalog_ref
+                )));
+            }
+        };
+        let mut item_schema = ref_schema.as_object().cloned().unwrap_or_default();
+        item_schema
+            .entry("type".to_string())
+            .or_insert_with(|| json!("object"));
+        item_schema.insert(
+            "title".to_string(),
+            json!(format!("{} ({})", ref_title, item.id)),
+        );
+        props.insert(item.id.clone(), Value::Object(item_schema));
+        required.push(json!(item.id));
+    }
+    Ok(json!({
+        "type": "object",
+        "required": required,
+        "properties": props,
+    }))
+}
+
+/// Request body for `PUT /api/v1/catalog/{kind}/{id}`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateCatalogItemRequest {
+    pub name: String,
+    pub category: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub runtime: Option<AppRuntime>,
+    #[serde(default)]
+    pub repo_url: Option<String>,
+    #[serde(default)]
+    pub chart: Option<String>,
+    #[serde(default)]
+    pub version: Option<String>,
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub flagger_supported: Option<bool>,
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub pulumi_runtime: Option<String>,
+    #[serde(default)]
+    pub entrypoint: Option<String>,
+    #[serde(default)]
+    pub protect_by_default: Option<bool>,
+    #[serde(default)]
+    pub items: Option<Vec<CatalogBundleItem>>,
+    #[serde(default)]
+    pub schema: Option<Value>,
+}
+
+fn merge_optional_text(incoming: Option<String>, existing: Option<String>) -> Option<String> {
+    match incoming {
+        Some(v) => {
+            let trimmed = v.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        }
+        None => existing,
+    }
+}
+
+/// `PUT /api/v1/catalog/{kind}/{id}`
+///
+/// Updates an existing `CatalogApplication` (`kind: "app"`), `CatalogInfraBlueprint`
+/// (`kind: "infra"` | `"infrastructure"`), or `CatalogBundle` (`kind: "bundle"`) on proposal
+/// branch `keel/catalog/update-<id>-<ts>`, commits, pushes, and opens a PR via `ForgeProvider`.
+pub async fn update_catalog_item(
+    auth: AuthSession,
+    State(state): State<AppState>,
+    axum::extract::Path((kind, id)): axum::extract::Path<(String, String)>,
+    Json(req): Json<UpdateCatalogItemRequest>,
+) -> Result<(StatusCode, Json<RegisterCatalogAppResponse>), ServerError> {
+    validate_dns_label(&id, "id")?;
+    let normalized_kind = match kind.as_str() {
+        "app" => "app",
+        "infra" | "infrastructure" => "infra",
+        "bundle" => "bundle",
+        other => {
+            return Err(ServerError::BadRequest(format!(
+                "Unsupported catalog kind '{other}'; expected 'app', 'infra', or 'bundle'"
+            )));
+        }
+    };
+
+    let rel_file = match normalized_kind {
+        "app" => format!("catalog/apps/{id}/catalog.yaml"),
+        "infra" => format!("catalog/infra/{id}/catalog.yaml"),
+        "bundle" => format!("catalog/bundles/{id}/catalog.yaml"),
+        _ => unreachable!(),
+    };
+
+    let timestamp = Utc::now().timestamp().max(1) as u64;
+    let branch = build_preview_branch("catalog", &format!("update-{id}"), timestamp)?;
+
+    let (commit_sha, updated_app, updated_bp, updated_bundle, display_name) = {
+        let _guard = state.git_lock.lock().await;
+        state
+            .git_runner
+            .sync_branch_from_remote(&state.repo_workdir, "origin", "main")
+            .await?;
+
+        let abs_file = state.repo_workdir.join(&rel_file);
+        if !tokio::fs::try_exists(&abs_file).await.unwrap_or(false) {
+            return Err(ServerError::NotFound(format!(
+                "Catalog {normalized_kind} '{id}' not found"
+            )));
+        }
+        let existing_yaml = tokio::fs::read_to_string(&abs_file).await?;
+
+        let (catalog_yaml, app_out, bp_out, bundle_out, title_name) = match normalized_kind {
+            "app" => {
+                let mut app = parse_catalog_application(&existing_yaml)?;
+                app.metadata.name = req.name.clone();
+                app.metadata.category = req.category.clone();
+                app.metadata.description =
+                    merge_optional_text(req.description, app.metadata.description);
+                if let Some(runtime) = req.runtime {
+                    app.metadata.runtime = runtime;
+                }
+                if let Some(repo_url) = req.repo_url {
+                    let trimmed = repo_url.trim();
+                    if trimmed.is_empty() {
+                        return Err(ServerError::BadRequest(
+                            "repoUrl cannot be empty".to_string(),
+                        ));
+                    }
+                    app.spec.upstream.repo_url = trimmed.to_string();
+                }
+                app.spec.upstream.chart = merge_optional_text(req.chart, app.spec.upstream.chart);
+                app.spec.upstream.version =
+                    merge_optional_text(req.version, app.spec.upstream.version);
+                app.spec.upstream.path = merge_optional_text(req.path, app.spec.upstream.path);
+                if let Some(flagger) = req.flagger_supported {
+                    app.spec.progressive_delivery.flagger_supported = flagger;
+                }
+                if let Some(schema) = req.schema {
+                    app.spec.schema = schema;
+                }
+                app.validate()?;
+                let yaml =
+                    serde_yml::to_string(&app).map_err(|e| ServerError::Internal(e.to_string()))?;
+                let name = app.metadata.name.clone();
+                (yaml, Some(app), None, None, name)
+            }
+            "infra" => {
+                let mut bp = parse_catalog_blueprint(&existing_yaml)?;
+                bp.metadata.name = req.name.clone();
+                bp.metadata.category = req.category.clone();
+                bp.metadata.description =
+                    merge_optional_text(req.description, bp.metadata.description);
+                if let Some(provider) = req.provider {
+                    validate_dns_label(&provider, "provider")?;
+                    bp.metadata.provider = provider;
+                }
+                if let Some(pulumi_runtime) = req.pulumi_runtime {
+                    let trimmed = pulumi_runtime.trim();
+                    if !trimmed.is_empty() {
+                        bp.spec.pulumi_runtime = trimmed.to_string();
+                    }
+                }
+                if let Some(entrypoint) = req.entrypoint {
+                    let trimmed = entrypoint.trim();
+                    if !trimmed.is_empty() {
+                        bp.spec.entrypoint = trimmed.to_string();
+                    }
+                }
+                if let Some(protect) = req.protect_by_default {
+                    bp.spec.protect_by_default = protect;
+                }
+                if let Some(schema) = req.schema {
+                    bp.spec.schema = schema;
+                }
+                bp.validate()?;
+                let yaml =
+                    serde_yml::to_string(&bp).map_err(|e| ServerError::Internal(e.to_string()))?;
+                let name = bp.metadata.name.clone();
+                (yaml, None, Some(bp), None, name)
+            }
+            "bundle" => {
+                let mut bundle = parse_catalog_bundle(&existing_yaml)?;
+                bundle.metadata.name = req.name.clone();
+                bundle.metadata.category = req.category.clone();
+                bundle.metadata.description =
+                    merge_optional_text(req.description, bundle.metadata.description);
+                let items_changed = if let Some(items) = req.items {
+                    if items.is_empty() {
+                        return Err(ServerError::BadRequest(
+                            "bundle items must contain at least one item".to_string(),
+                        ));
+                    }
+                    bundle.spec.items = items;
+                    true
+                } else {
+                    false
+                };
+                if let Some(schema) = req.schema {
+                    bundle.spec.schema = schema;
+                } else if items_changed {
+                    bundle.spec.schema =
+                        compose_bundle_schema(&state.repo_workdir, &bundle.spec.items).await?;
+                }
+                bundle.validate()?;
+                let yaml = serde_yml::to_string(&bundle)
+                    .map_err(|e| ServerError::Internal(e.to_string()))?;
+                let name = bundle.metadata.name.clone();
+                (yaml, None, None, Some(bundle), name)
+            }
+            _ => unreachable!(),
+        };
+
+        state
+            .git_runner
+            .checkout_new_branch(&state.repo_workdir, &branch)
+            .await?;
+        tokio::fs::write(&abs_file, &catalog_yaml).await?;
+        state
+            .git_runner
+            .add(&state.repo_workdir, [&rel_file])
+            .await?;
+
+        let author = CommitAuthor::new(
+            auth.claims.name.as_deref().unwrap_or(&auth.claims.sub),
+            auth.claims.email.as_deref().unwrap_or("keel@keel.local"),
+        );
+        let commit_msg = format!("feat(catalog): update {normalized_kind} {id}");
+        let sha = state
+            .git_runner
+            .commit(&state.repo_workdir, &commit_msg, &author)
+            .await?;
+        state
+            .git_runner
+            .push(&state.repo_workdir, "origin", &branch)
+            .await?;
+        let _ = state
+            .git_runner
+            .checkout_branch(&state.repo_workdir, "main")
+            .await;
+
+        (sha, app_out, bp_out, bundle_out, title_name)
+    };
+
+    let pr_req = CreatePrRequest::new(
+        format!("feat(catalog): update {normalized_kind} {id}"),
+        format!(
+            "Automated catalog update for `{id}` (`{display_name}`)\n\n- Commit: `{commit_sha}`\n- Path: `{rel_file}`"
+        ),
+        &branch,
+    )
+    .with_tenant("catalog")
+    .with_author(format!(
+        "{} <{}>",
+        auth.claims.name.as_deref().unwrap_or(&auth.claims.sub),
+        auth.claims.email.as_deref().unwrap_or("keel@keel.local")
+    ));
+    let proposal = state.forge.create_pull_request(pr_req).await?;
+
+    Ok((
+        StatusCode::OK,
+        Json(RegisterCatalogAppResponse {
+            application: updated_app,
+            blueprint: updated_bp,
+            bundle: updated_bundle,
+            proposal,
+            branch,
+        }),
+    ))
 }
 
 /// Request body for `POST /api/v1/catalog/fetch-schema`.

@@ -22,6 +22,7 @@ export interface CreateCatalogItemPayload {
   repoUrl?: string
   chart?: string
   version?: string
+  path?: string
   flaggerSupported?: boolean
   provider?: string
   pulumiRuntime?: "yaml" | "hcl" | "opentofu-bridge"
@@ -29,6 +30,7 @@ export interface CreateCatalogItemPayload {
   protectByDefault?: boolean
   terraformProvider?: string
   items?: CatalogBundleItem[]
+  schema?: RJSFSchema
 }
 
 export type CreateCatalogAppPayload = CreateCatalogItemPayload
@@ -52,7 +54,12 @@ export interface CatalogItem {
   provider?: string
   repoUrl?: string
   chart?: string
+  path?: string
   runtime?: string
+  flaggerSupported?: boolean
+  pulumiRuntime?: "yaml" | "hcl" | "opentofu-bridge"
+  entrypoint?: string
+  protectByDefault?: boolean
   bundleItems?: CatalogBundleItem[]
   schema: RJSFSchema
   defaultValues?: Record<string, unknown>

@@ -16,6 +16,7 @@ import {
   createTenant,
   deleteTenant,
   createCatalogApp,
+  updateCatalogItem,
   getProviders,
   toggleProvider,
   createEventSourceStream,
@@ -606,5 +607,42 @@ describe("api client module", () => {
       errorHandler(err)
     }
     expect(onError).toHaveBeenCalledWith(err)
+  })
+
+  it("updates a catalog item via PUT /api/v1/catalog/{kind}/{id}", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        proposal: {
+          id: "305",
+          title: "feat(catalog): update infra kind-cluster",
+          sourceBranch: "keel/catalog/update-kind-cluster-305",
+          state: "open",
+        },
+      }),
+    })
+    vi.stubGlobal("fetch", fetchMock)
+
+    const proposal = await updateCatalogItem("infrastructure", "kind-cluster", {
+      name: "kind Cluster v2",
+      category: "Infrastructure",
+      description: "Updated kind blueprint",
+      provider: "kind",
+      pulumiRuntime: "yaml",
+      entrypoint: "Pulumi.yaml",
+      protectByDefault: true,
+    })
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/v1/catalog/infra/kind-cluster",
+      expect.objectContaining({
+        method: "PUT",
+      })
+    )
+    expect(proposal).toMatchObject({
+      id: "305",
+      title: "feat(catalog): update infra kind-cluster",
+      branch: "keel/catalog/update-kind-cluster-305",
+    })
   })
 })

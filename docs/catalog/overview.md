@@ -8,9 +8,12 @@ catalog/
 │   └── <blueprint-id>/
 │       ├── catalog.yaml    # CatalogInfraBlueprint (keel.io/v1alpha1)
 │       └── Pulumi.yaml     # Pulumi YAML / OpenTofu program
-└── apps/
-    └── <app-id>/
-        └── catalog.yaml    # CatalogApplication (keel.io/v1alpha1)
+├── apps/
+│   └── <app-id>/
+│       └── catalog.yaml    # CatalogApplication (keel.io/v1alpha1)
+└── bundles/
+    └── <bundle-id>/
+        └── catalog.yaml    # CatalogBundle (keel.io/v1alpha1)
 ```
 
 ## How Provider Blueprints Work
@@ -89,9 +92,37 @@ spec:
         default: 2
 ```
 
-## Adding a Catalog Item
+## `CatalogBundle` Schema (`keel.io/v1alpha1`)
 
-You can register blueprints in two ways:
+A `CatalogBundle` composes multiple infrastructure blueprints and applications into an ordered dependency graph deployed atomically in a single PR. Flux `Kustomization` `dependsOn` + `healthChecks` ensure downstream items wait until upstream infrastructure is `Ready`, and `targetClusterFrom` wires an application's `kubeConfig` directly to a provisioned workload cluster `Secret`:
 
-1. **Web UI (+ Add Catalog Item):** In **Catalog & Form Wizard**, click **+ Add Catalog Item**, choose **Infrastructure Blueprint (PKO v2)** or **Application (Helm / Kustomize)**, fill in the provider/runtime fields, and merge the generated PR.
-2. **Direct Git PR:** Commit `catalog/infra/<id>/catalog.yaml` and `Pulumi.yaml` (see [Provider Blueprint Examples](provider-examples.md)) on a feature branch and open a PR.
+```yaml
+apiVersion: keel.io/v1alpha1
+kind: CatalogBundle
+metadata:
+  id: kind-with-podinfo
+  name: Kind Cluster + Podinfo
+  description: Provision a local kind workload cluster and deploy Podinfo onto it
+  category: Platform
+spec:
+  items:
+    - id: cluster
+      kind: infra
+      catalogRef: kind-cluster
+    - id: app
+      kind: app
+      catalogRef: podinfo
+      dependsOn:
+        - cluster
+      targetClusterFrom: cluster
+      targetNamespace: apps
+```
+
+## Adding & Editing Catalog Items
+
+You can register or update blueprints, applications, and bundles in two ways:
+
+1. **Web UI (+ Add Catalog Item / Edit):**
+   - In **Catalog & Form Wizard**, click **+ Add Catalog Item**, choose **Application (Helm / Kustomize)**, **Infrastructure Blueprint (PKO v2)**, or **Multi-Item Bundle (Infra + Apps)**, fill in the fields, and merge the generated PR.
+   - Select any existing catalog item and click **Edit** in the item header to update its metadata, upstream/provider settings, bundle steps, or optional JSON Schema via a Git PR (`PUT /api/v1/catalog/{kind}/{id}`). For infrastructure blueprints, existing `Pulumi.yaml` files are preserved.
+2. **Direct Git PR:** Commit `catalog/infra/<id>/catalog.yaml` (+ `Pulumi.yaml`), `catalog/apps/<id>/catalog.yaml`, or `catalog/bundles/<id>/catalog.yaml` (see [Provider Blueprint Examples](provider-examples.md)) on a feature branch and open a PR.

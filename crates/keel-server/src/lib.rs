@@ -41,6 +41,10 @@ pub fn build_router(state: AppState) -> Router {
             get(routes::get_catalog).post(routes::register_catalog_app),
         )
         .route(
+            "/api/v1/catalog/{kind}/{id}",
+            put(routes::update_catalog_item),
+        )
+        .route(
             "/api/v1/catalog/fetch-schema",
             post(routes::fetch_catalog_schema),
         )
