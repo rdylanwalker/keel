@@ -1081,7 +1081,13 @@ describe("CatalogWizardView component and jsonToYaml helper", () => {
   })
 
   it("derives JSON Schema fields from Pulumi.yaml and adds provider credentials", async () => {
+    vi.mocked(api.getCatalog).mockResolvedValue(mockCatalog)
     render(<CatalogWizardView />)
+
+    await waitFor(() => {
+      const list = screen.getByTestId("catalog-list")
+      expect(within(list).getByText("Test Microservice")).toBeInTheDocument()
+    })
 
     fireEvent.click(
       screen.getByRole("button", { name: /\+ Add Catalog Item/i })
