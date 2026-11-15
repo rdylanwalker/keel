@@ -1,0 +1,51 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/keel-core",
+    "crates/keel-git",
+    "crates/keel-pko",
+    "crates/keel-kube",
+    "crates/keel-server",
+    "crates/keel-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+# Workspace members
+keel-core = { path = "crates/keel-core" }
+keel-git = { path = "crates/keel-git" }
+keel-pko = { path = "crates/keel-pko" }
+keel-kube = { path = "crates/keel-kube" }
+keel-server = { path = "crates/keel-server" }
+
+# External dependencies
+tokio = { version = "1.43", features = ["full"] }
+axum = { version = "0.8", features = ["macros"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yml = "0.0.12"
+kube = { version = "0.98", default-features = false, features = ["runtime", "derive", "client", "rustls-tls"] }
+k8s-openapi = { version = "0.24", features = ["v1_31"] }
+thiserror = "2.0"
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+async-trait = "0.1"
+jsonschema = "0.29"
+rust-embed = "8.5"
+aes-gcm = "0.10"
+sha2 = "0.10"
+rand = "0.9"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.13", features = ["v4", "serde"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "fs"] }
+futures = "0.3"
+tokio-stream = "0.1"
+base64 = "0.22"
+hex = "0.4"

@@ -1,0 +1,51 @@
+# Managed PostgreSQL Companion Blueprint (`SDD.md` §5.1)
+apiVersion: keel.io/v1alpha1
+kind: CatalogInfraBlueprint
+metadata:
+  id: postgres-managed
+  name: Managed PostgreSQL Instance
+  description: Provision an encrypted PostgreSQL database instance exporting connection details to tenant Secrets.
+  category: database
+  provider: aws
+spec:
+  pulumiRuntime: yaml
+  entrypoint: Pulumi.yaml
+  protectByDefault: true
+  outputs:
+    - db_host
+    - db_port
+  schema:
+    type: object
+    required:
+      - dbName
+      - storageGb
+      - dbPassword
+    properties:
+      dbName:
+        type: string
+        title: Database Name
+        default: appdb
+        pattern: "^[a-z][a-z0-9_]{1,62}$"
+      instanceClass:
+        type: string
+        title: RDS Instance Class
+        default: db.t4g.micro
+        enum:
+          - db.t4g.micro
+          - db.t4g.small
+          - db.t4g.medium
+      storageGb:
+        type: integer
+        title: Allocated Storage (GiB)
+        default: 20
+        minimum: 20
+        maximum: 1000
+      dbPassword:
+        type: string
+        title: Master Database Password
+        writeOnly: true
+        minLength: 16
+  uiSchema:
+    dbPassword:
+      ui:widget: password
+      ui:help: "Encrypted via SOPS + tenant age key before committing to Git."

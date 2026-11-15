@@ -1,0 +1,38 @@
+# Managed PostgreSQL RDS Pulumi YAML Stack (`SDD.md` §5.1)
+name: postgres-managed
+runtime: yaml
+description: Managed AWS RDS PostgreSQL instance with encrypted storage
+
+config:
+  dbName:
+    type: string
+    default: appdb
+  instanceClass:
+    type: string
+    default: db.t4g.micro
+  storageGb:
+    type: integer
+    default: 20
+  dbPassword:
+    type: string
+    secret: true
+
+resources:
+  postgresInstance:
+    type: aws:rds:Instance
+    options:
+      protect: true
+    properties:
+      engine: postgres
+      engineVersion: "16.4"
+      instanceClass: ${instanceClass}
+      allocatedStorage: ${storageGb}
+      storageEncrypted: true
+      dbName: ${dbName}
+      username: keeladmin
+      password: ${dbPassword}
+      skipFinalSnapshot: false
+
+outputs:
+  db_host: ${postgresInstance.address}
+  db_port: ${postgresInstance.port}

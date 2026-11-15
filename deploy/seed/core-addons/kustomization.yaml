@@ -1,0 +1,11 @@
+# Core Addons Kustomization (`SDD.md` §2.1, §3.1)
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - helm-repositories.yaml
+  - s3-minio.yaml
+  - pko.yaml
+  - kyverno.yaml
+  - envoy-gateway.yaml
+  - prometheus.yaml
+  - flagger.yaml

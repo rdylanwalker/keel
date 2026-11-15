@@ -1,0 +1,16 @@
+# Unmodified upstream default Helm values baseline for `authentik` (`SDD.md` §3.1, §5.1)
+authentik:
+  error_reporting:
+    enabled: false
+
+server:
+  replicas: 2
+
+worker:
+  replicas: 2
+
+postgresql:
+  enabled: false
+
+redis:
+  enabled: true

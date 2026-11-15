@@ -1,0 +1,55 @@
+# Out-of-the-Box Upstream Authentik Identity Provider (`SDD.md` §5.1)
+apiVersion: keel.io/v1alpha1
+kind: CatalogApplication
+metadata:
+  id: authentik
+  name: Authentik Identity Provider
+  description: Open-source OIDC & SAML Identity Provider deployed from upstream Helm chart with companion PostgreSQL binding.
+  category: security-identity
+  runtime: helm
+spec:
+  upstream:
+    chart: authentik
+    repoURL: https://charts.goauthentik.io
+    version: "2024.12.2"
+  progressiveDelivery:
+    flaggerSupported: true
+    defaultCanary: false
+  companionInfrastructure:
+    - blueprint: postgres-managed
+      bindValues:
+        postgresql.enabled: false
+        authentik.postgresql.host: "${outputs.db_host}"
+        authentik.postgresql.password: "${secrets.db_password}"
+  schema:
+    type: object
+    required:
+      - domain
+      - adminEmail
+      - secretKey
+    properties:
+      domain:
+        type: string
+        title: Ingress Hostname
+        format: hostname
+      adminEmail:
+        type: string
+        title: Bootstrap Admin Email
+        format: email
+      secretKey:
+        type: string
+        title: Authentik Secret Key
+        writeOnly: true
+        minLength: 24
+      replicas:
+        type: integer
+        title: Worker Replicas
+        default: 2
+        minimum: 1
+        maximum: 10
+  uiSchema:
+    adminEmail:
+      ui:help: "Used for initial administrator recovery notifications."
+    secretKey:
+      ui:widget: password
+      ui:help: "Encrypted via SOPS + per-tenant age key before committing to Git."

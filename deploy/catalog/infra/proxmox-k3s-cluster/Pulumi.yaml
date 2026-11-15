@@ -1,0 +1,63 @@
+# Proxmox VE k3s Workload Cluster Pulumi Stack (`bpg/proxmox` bridge)
+name: proxmox-k3s-cluster
+runtime: yaml
+description: Provision a k3s workload cluster VM on Proxmox VE via bpg/proxmox
+
+packages:
+  proxmox:
+    source: terraform-provider
+    version: 0.16.0
+    parameters:
+      - bpg/proxmox
+      - 0.71.0
+
+config:
+  clusterName:
+    type: string
+  nodeName:
+    type: string
+    default: pve1
+  templateVmId:
+    type: integer
+    default: 900
+  cores:
+    type: integer
+    default: 4
+  memoryMb:
+    type: integer
+    default: 8192
+  sshPublicKey:
+    type: string
+
+resources:
+  k3sControlPlaneVm:
+    type: proxmox:Vm/virtualMachine:VirtualMachine
+    properties:
+      name: ${clusterName}-cp-01
+      nodeName: ${nodeName}
+      onBoot: true
+      agent:
+        enabled: true
+      clone:
+        vmId: ${templateVmId}
+        full: true
+      cpu:
+        cores: ${cores}
+        type: x86-64-v2-AES
+      memory:
+        dedicated: ${memoryMb}
+      networkDevices:
+        - bridge: vmbr0
+          model: virtio
+      initialization:
+        ipConfigs:
+          - ipv4:
+              address: dhcp
+        userAccount:
+          username: ubuntu
+          keys:
+            - ${sshPublicKey}
+
+outputs:
+  clusterName: ${clusterName}
+  controlPlaneIp: ${k3sControlPlaneVm.ipv4Addresses}

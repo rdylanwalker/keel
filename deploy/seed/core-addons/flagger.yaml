@@ -1,0 +1,30 @@
+# Flagger Progressive Delivery Controller integrated with Gateway API & Prometheus (`SDD.md` §5.2, `NFR-REL-03`)
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: flagger
+  namespace: keel-system
+  labels:
+    app.kubernetes.io/managed-by: keel
+spec:
+  interval: 10m
+  dependsOn:
+    - name: envoy-gateway
+    - name: prometheus
+  chart:
+    spec:
+      chart: flagger
+      version: "1.40.0"
+      sourceRef:
+        kind: HelmRepository
+        name: flagger
+        namespace: keel-system
+  install:
+    crds: CreateReplace
+  upgrade:
+    crds: CreateReplace
+  values:
+    meshProvider: gatewayapi:v1
+    metricsServer: http://prometheus.keel-system:9090
+    podMonitor:
+      enabled: false

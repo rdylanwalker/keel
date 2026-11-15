@@ -1,0 +1,260 @@
+@import "tailwindcss";
+
+@layer base {
+  :root {
+    --background: 222.2 84% 4.9%;
+    --foreground: 210 40% 98%;
+    --card: 222.2 84% 4.9%;
+    --card-foreground: 210 40% 98%;
+    --primary: 217.2 91.2% 59.8%;
+    --primary-foreground: 222.2 47.4% 11.2%;
+    --border: 217.2 32.6% 17.5%;
+  }
+
+  body {
+    background-color: #0f172a;
+    color: #f8fafc;
+    font-family:
+      system-ui,
+      -apple-system,
+      BlinkMacSystemFont,
+      "Segoe UI",
+      Roboto,
+      Oxygen,
+      Ubuntu,
+      Cantarell,
+      sans-serif;
+  }
+}
+
+.rjsf-container fieldset {
+  display: flex;
+  flex-direction: column;
+  gap: 0.875rem;
+  border: none;
+  padding: 0;
+  margin: 0;
+  min-width: 0;
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.rjsf-container .form-group:has(> fieldset) {
+  background-color: rgba(15, 23, 42, 0.7);
+  border: 1px solid #1e293b;
+  border-radius: 0.75rem;
+  padding: 1rem;
+}
+
+.rjsf-container legend {
+  font-size: 0.8125rem;
+  font-weight: 600;
+  color: #f8fafc;
+  margin-bottom: 0.25rem;
+  padding-bottom: 0.5rem;
+  border-bottom: 1px solid #1e293b;
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.rjsf-container .form-group {
+  display: flex;
+  flex-direction: column;
+  gap: 0.375rem;
+}
+
+.rjsf-container .control-label {
+  display: block;
+  font-size: 0.75rem;
+  font-weight: 500;
+  color: #cbd5e1;
+}
+
+.rjsf-container .required {
+  color: #f87171;
+  margin-left: 0.25rem;
+}
+
+.rjsf-container .form-control {
+  display: block;
+  width: 100%;
+  padding: 0.5rem 0.75rem;
+  font-size: 0.8125rem;
+  line-height: 1.25rem;
+  color: #f8fafc;
+  background-color: #0f172a;
+  border: 1px solid #334155;
+  border-radius: 0.5rem;
+  outline: none;
+  transition:
+    border-color 0.15s ease,
+    box-shadow 0.15s ease;
+}
+
+.rjsf-container .form-control:focus {
+  border-color: #6366f1;
+  box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.25);
+}
+
+.rjsf-container .form-control::placeholder {
+  color: #64748b;
+}
+
+.rjsf-container .checkbox label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.8125rem;
+  color: #e2e8f0;
+  cursor: pointer;
+}
+
+.rjsf-container .checkbox input[type="checkbox"] {
+  width: 1rem;
+  height: 1rem;
+  accent-color: #6366f1;
+  border-radius: 0.25rem;
+  cursor: pointer;
+}
+
+.rjsf-container .field-description,
+.rjsf-container .help-block {
+  font-size: 0.75rem;
+  color: #94a3b8;
+  margin-top: 0.125rem;
+}
+
+.rjsf-container .error-detail,
+.rjsf-container .text-danger {
+  list-style: none;
+  padding: 0;
+  margin: 0.25rem 0 0;
+  font-size: 0.75rem;
+  color: #f87171;
+}
+
+.rjsf-container .panel-danger {
+  padding: 0.75rem 1rem;
+  margin-bottom: 1rem;
+  background-color: rgba(127, 29, 29, 0.25);
+  border: 1px solid rgba(239, 68, 68, 0.35);
+  border-radius: 0.75rem;
+  font-size: 0.75rem;
+  color: #fca5a5;
+}
+
+.rjsf-container .array-item-list,
+.rjsf-container .row.array-item-list {
+  display: flex;
+  flex-direction: column;
+  flex-wrap: nowrap;
+  align-items: stretch;
+  gap: 0.75rem;
+  width: 100%;
+  min-width: 0;
+}
+
+.rjsf-container .row.array-item-list > div {
+  flex: 0 0 auto;
+  width: 100%;
+  min-width: 0;
+}
+
+.rjsf-container .rjsf-array-item,
+.rjsf-container .array-item {
+  display: flex;
+  align-items: flex-start !important;
+  gap: 0.75rem;
+  padding: 0.875rem;
+  background-color: rgba(15, 23, 42, 0.55);
+  border: 1px solid #1e293b;
+  border-radius: 0.75rem;
+  min-width: 0;
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.rjsf-container .rjsf-array-item > div:first-child,
+.rjsf-container .array-item > div:first-child {
+  flex: 1 1 0%;
+  min-width: 0;
+  width: 100%;
+}
+
+.rjsf-container
+  .rjsf-array-item
+  > div:first-child
+  > .form-group:has(> fieldset),
+.rjsf-container .array-item > div:first-child > .form-group:has(> fieldset) {
+  background-color: transparent;
+  border: none;
+  padding: 0;
+  border-radius: 0;
+}
+
+.rjsf-container .array-item-toolbox {
+  display: flex;
+  align-items: center;
+  gap: 0.375rem;
+  flex: 0 0 auto;
+  padding-left: 0.25rem;
+}
+
+.rjsf-container .array-item-toolbox .btn-group {
+  display: flex;
+  align-items: center;
+  gap: 0.375rem;
+  margin-top: 0 !important;
+}
+
+.rjsf-container .rjsf-object-property-expand button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0.375rem 0.625rem;
+  font-size: 0.75rem;
+  font-weight: 500;
+  line-height: 1rem;
+  color: #e2e8f0;
+  background-color: #1e293b;
+  border: 1px solid #334155;
+  border-radius: 0.5rem;
+  cursor: pointer;
+}
+
+.rjsf-container .array-item-add,
+.rjsf-container .rjsf-array-item-add,
+.rjsf-container .rjsf-object-property-expand {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 0.25rem;
+}
+
+.rjsf-container .array-item-add > *,
+.rjsf-container .rjsf-array-item-add > *,
+.rjsf-container .rjsf-object-property-expand > * {
+  width: auto !important;
+  flex: 0 0 auto;
+}
+
+.rjsf-container .row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  align-items: flex-end;
+  width: 100%;
+  min-width: 0;
+}
+
+.rjsf-container .row > div {
+  flex: 1 1 180px;
+  min-width: 0;
+}
+
+.rjsf-container .row > .col-xs-2,
+.rjsf-container .row > .col-xs-3,
+.rjsf-container .row > .array-item-toolbox {
+  flex: 0 0 auto;
+}

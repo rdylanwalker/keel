@@ -1,0 +1,98 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  rust-quality:
+    name: Rust Quality Gates
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Format Check
+        run: cargo fmt --all -- --check
+      - name: Clippy Lint
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Unit Tests
+        run: cargo test --workspace
+      - name: Coverage Check
+        run: cargo llvm-cov --workspace --fail-under-lines 80
+
+  ui-quality:
+    name: UI Quality Gates
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: 'pnpm'
+          cache-dependency-path: ui/pnpm-lock.yaml
+      - name: Install dependencies
+        run: pnpm --dir ui install
+      - name: Format Check
+        run: pnpm --dir ui format:check
+      - name: Lint
+        run: pnpm --dir ui lint
+      - name: Typecheck
+        run: pnpm --dir ui typecheck
+      - name: Unit Tests & Coverage
+        run: pnpm --dir ui test:unit --coverage
+
+  e2e-quality:
+    name: E2E Quality Gates
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: 'pnpm'
+          cache-dependency-path: e2e/pnpm-lock.yaml
+      - name: Build UI & Keel Binary
+        run: |
+          pnpm --dir ui install
+          pnpm --dir ui build
+          cargo build --bin keel
+      - name: Install E2E dependencies
+        run: pnpm --dir e2e install
+      - name: Install Playwright Browsers
+        run: pnpm --dir e2e exec playwright install --with-deps
+      - name: Format Check
+        run: pnpm --dir e2e format:check
+      - name: Lint
+        run: pnpm --dir e2e lint
+      - name: Typecheck
+        run: pnpm --dir e2e typecheck
+      - name: Test
+        run: pnpm --dir e2e test
+
+  docs:
+    name: Build Documentation
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: mdbook,mdbook-mermaid
+      - name: Build mdBook
+        run: mdbook build
+      - name: Upload Docs Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: keel-docs
+          path: book/

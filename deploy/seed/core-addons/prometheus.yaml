@@ -1,0 +1,32 @@
+# Prometheus Server for Control-Plane Telemetry & Flagger Canary Rollbacks (`SDD.md` §5.2, `NFR-REL-03`, `NFR-OBS-02`)
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: prometheus
+  namespace: keel-system
+  labels:
+    app.kubernetes.io/managed-by: keel
+spec:
+  interval: 10m
+  chart:
+    spec:
+      chart: prometheus
+      version: "27.5.0"
+      sourceRef:
+        kind: HelmRepository
+        name: prometheus-community
+        namespace: keel-system
+  values:
+    alertmanager:
+      enabled: false
+    kube-state-metrics:
+      enabled: true
+    prometheus-node-exporter:
+      enabled: false
+    prometheus-pushgateway:
+      enabled: false
+    server:
+      fullnameOverride: prometheus
+      retention: 7d
+      persistentVolume:
+        enabled: false
