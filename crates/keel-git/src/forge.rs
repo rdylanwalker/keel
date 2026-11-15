@@ -172,6 +172,8 @@ pub trait ForgeProvider: Send + Sync {
     async fn merge_pull_request(&self, pr_id: &str) -> Result<PullRequestInfo, ForgeError>;
 
     async fn close_pull_request(&self, pr_id: &str) -> Result<PullRequestInfo, ForgeError>;
+
+    async fn reopen_pull_request(&self, pr_id: &str) -> Result<PullRequestInfo, ForgeError>;
 }
 
 /// Checks whether a [`PullRequestInfo`] belongs to `tenant` (via explicit metadata or branch prefix).

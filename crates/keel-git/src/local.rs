@@ -103,6 +103,27 @@ impl LocalGitProvider {
         Ok(pr)
     }
 
+    /// Reopens a closed pull request without modifying its branch or merge state.
+    pub async fn reopen_pull_request(&self, pr_id: &str) -> Result<PullRequestInfo, ForgeError> {
+        validate_pr_id(pr_id)?;
+        let _guard = self.mutex.lock().await;
+
+        let mut pr = self
+            .read_proposal_unlocked(pr_id)
+            .await?
+            .ok_or_else(|| ForgeError::NotFound(pr_id.to_string()))?;
+
+        if pr.state != PullRequestState::Closed {
+            return Err(ForgeError::InvalidState(pr_id.to_string(), pr.state));
+        }
+
+        pr.state = PullRequestState::Open;
+        pr.updated_at = Utc::now();
+        self.write_proposal_unlocked(&pr, &format!("chore(proposals): reopen proposal #{pr_id}"))
+            .await?;
+        Ok(pr)
+    }
+
     fn remote_url_str(&self) -> Result<&str, ForgeError> {
         self.bare_repo_path.to_str().ok_or_else(|| {
             ForgeError::InvalidInput("bare_repo_path must be valid UTF-8".to_string())
@@ -496,6 +517,10 @@ impl ForgeProvider for LocalGitProvider {
     async fn close_pull_request(&self, pr_id: &str) -> Result<PullRequestInfo, ForgeError> {
         LocalGitProvider::close_pull_request(self, pr_id).await
     }
+
+    async fn reopen_pull_request(&self, pr_id: &str) -> Result<PullRequestInfo, ForgeError> {
+        LocalGitProvider::reopen_pull_request(self, pr_id).await
+    }
 }
 
 fn validate_pr_id(pr_id: &str) -> Result<(), ForgeError> {
@@ -737,6 +762,22 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+
+        // Reopen PR #2 and verify it is open again; reopening an open or merged PR fails
+        let reopened_pr2 = provider.reopen_pull_request("2").await.unwrap();
+        assert_eq!(reopened_pr2.state, PullRequestState::Open);
+        assert_eq!(
+            provider.list_open_pull_requests(None).await.unwrap().len(),
+            1
+        );
+        assert!(matches!(
+            provider.reopen_pull_request("2").await,
+            Err(ForgeError::InvalidState(_, PullRequestState::Open))
+        ));
+        assert!(matches!(
+            provider.reopen_pull_request("1").await,
+            Err(ForgeError::InvalidState(_, PullRequestState::Merged))
+        ));
     }
 
     #[tokio::test]
