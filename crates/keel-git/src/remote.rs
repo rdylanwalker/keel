@@ -295,8 +295,27 @@ struct GiteaGitHubPrResponse {
     updated_at: DateTime<Utc>,
 }
 
+fn rewrite_local_forge_url(base_url: &str, html_url: String) -> String {
+    let base = base_url.trim_end_matches('/');
+    if !(base.starts_with("http://127.0.0.1:") || base.starts_with("http://localhost:")) {
+        return html_url;
+    }
+    if let Some(after_scheme) = html_url
+        .strip_prefix("http://")
+        .or_else(|| html_url.strip_prefix("https://"))
+        && let Some((host_port, path)) = after_scheme.split_once('/')
+        && (host_port.contains(".svc.cluster.local")
+            || host_port.starts_with("git.example.com")
+            || host_port.starts_with("localhost")
+            || host_port.starts_with("127.0.0.1"))
+    {
+        return format!("{base}/{path}");
+    }
+    html_url
+}
+
 impl GiteaGitHubPrResponse {
-    fn into_pr_info(self, explicit_tenant: Option<String>) -> PullRequestInfo {
+    fn into_pr_info(self, explicit_tenant: Option<String>, base_url: &str) -> PullRequestInfo {
         let state = if self.merged || self.state.eq_ignore_ascii_case("merged") {
             PullRequestState::Merged
         } else if self.state.eq_ignore_ascii_case("open") {
@@ -315,7 +334,7 @@ impl GiteaGitHubPrResponse {
             target_branch: self.base.branch_ref,
             head_sha: self.head.sha,
             tenant,
-            url: self.html_url,
+            url: rewrite_local_forge_url(base_url, self.html_url),
             created_at: self.created_at,
             updated_at: self.updated_at,
             comments: Vec::new(),
@@ -336,22 +355,21 @@ impl ForgeProvider for ForgejoGiteaProvider {
             ));
         }
         let url = format!("{}/pulls", self.repo_api_url());
-        let payload = GiteaCreatePrBody {
-            title: &req.title,
-            body: &req.body,
-            head: &req.source_branch,
-            base: &req.target_branch,
-        };
+        let payload = serde_json::json!({
+            "title": req.title,
+            "body": req.body,
+            "head": req.source_branch,
+            "base": req.target_branch,
+        });
         let resp = self
-            .authorized(self.client.post(&url))
-            .json(&payload)
+            .authorized(self.client.post(&url).json(&payload))
             .send()
             .await?;
         if !resp.status().is_success() {
             return Err(map_error_response(resp, None, false).await);
         }
         let parsed: GiteaGitHubPrResponse = resp.json().await?;
-        Ok(parsed.into_pr_info(req.tenant))
+        Ok(parsed.into_pr_info(req.tenant, &self.base_url))
     }
 
     async fn get_pull_request(&self, pr_id: &str) -> Result<PullRequestInfo, ForgeError> {
@@ -362,7 +380,7 @@ impl ForgeProvider for ForgejoGiteaProvider {
             return Err(map_error_response(resp, Some(id), false).await);
         }
         let parsed: GiteaGitHubPrResponse = resp.json().await?;
-        Ok(parsed.into_pr_info(None))
+        Ok(parsed.into_pr_info(None, &self.base_url))
     }
 
     async fn post_preview_comment(
@@ -416,7 +434,7 @@ impl ForgeProvider for ForgejoGiteaProvider {
         let items: Vec<GiteaGitHubPrResponse> = resp.json().await?;
         let prs = items
             .into_iter()
-            .map(|item| item.into_pr_info(None))
+            .map(|item| item.into_pr_info(None, &self.base_url))
             .filter(|pr| tenant.is_none_or(|t| matches_tenant(pr, t)))
             .filter(|pr| state.is_none_or(|s| pr.state == s))
             .collect();
@@ -456,6 +474,20 @@ impl ForgeProvider for ForgejoGiteaProvider {
         let resp = self
             .authorized(self.client.patch(&url))
             .json(&serde_json::json!({ "state": "closed" }))
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(map_error_response(resp, Some(id), false).await);
+        }
+        self.get_pull_request(id).await
+    }
+
+    async fn reopen_pull_request(&self, pr_id: &str) -> Result<PullRequestInfo, ForgeError> {
+        let id = validate_pr_number(pr_id)?;
+        let url = format!("{}/pulls/{id}", self.repo_api_url());
+        let resp = self
+            .authorized(self.client.patch(&url))
+            .json(&serde_json::json!({ "state": "open" }))
             .send()
             .await?;
         if !resp.status().is_success() {
@@ -559,7 +591,7 @@ impl ForgeProvider for GitHubProvider {
             return Err(map_error_response(resp, None, false).await);
         }
         let parsed: GiteaGitHubPrResponse = resp.json().await?;
-        Ok(parsed.into_pr_info(req.tenant))
+        Ok(parsed.into_pr_info(req.tenant, &self.base_url))
     }
 
     async fn get_pull_request(&self, pr_id: &str) -> Result<PullRequestInfo, ForgeError> {
@@ -570,7 +602,7 @@ impl ForgeProvider for GitHubProvider {
             return Err(map_error_response(resp, Some(id), false).await);
         }
         let parsed: GiteaGitHubPrResponse = resp.json().await?;
-        Ok(parsed.into_pr_info(None))
+        Ok(parsed.into_pr_info(None, &self.base_url))
     }
 
     async fn post_preview_comment(
@@ -627,7 +659,7 @@ impl ForgeProvider for GitHubProvider {
         let items: Vec<GiteaGitHubPrResponse> = resp.json().await?;
         let prs = items
             .into_iter()
-            .map(|item| item.into_pr_info(None))
+            .map(|item| item.into_pr_info(None, &self.base_url))
             .filter(|pr| tenant.is_none_or(|t| matches_tenant(pr, t)))
             .filter(|pr| state.is_none_or(|s| pr.state == s))
             .collect();
@@ -656,6 +688,20 @@ impl ForgeProvider for GitHubProvider {
         let resp = self
             .authorized(self.client.patch(&url))
             .json(&serde_json::json!({ "state": "closed" }))
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(map_error_response(resp, Some(id), false).await);
+        }
+        self.get_pull_request(id).await
+    }
+
+    async fn reopen_pull_request(&self, pr_id: &str) -> Result<PullRequestInfo, ForgeError> {
+        let id = validate_pr_number(pr_id)?;
+        let url = format!("{}/pulls/{id}", self.repo_api_url());
+        let resp = self
+            .authorized(self.client.patch(&url))
+            .json(&serde_json::json!({ "state": "open" }))
             .send()
             .await?;
         if !resp.status().is_success() {
@@ -896,6 +942,21 @@ impl ForgeProvider for GitLabProvider {
         let resp = self
             .authorized(self.client.put(&url))
             .json(&serde_json::json!({ "state_event": "close" }))
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(map_error_response(resp, Some(iid), false).await);
+        }
+        let parsed: GitLabMrResponse = resp.json().await?;
+        Ok(parsed.into_pr_info(None))
+    }
+
+    async fn reopen_pull_request(&self, pr_id: &str) -> Result<PullRequestInfo, ForgeError> {
+        let iid = validate_pr_number(pr_id)?;
+        let url = format!("{}/merge_requests/{iid}", self.project_api_url());
+        let resp = self
+            .authorized(self.client.put(&url))
+            .json(&serde_json::json!({ "state_event": "reopen" }))
             .send()
             .await?;
         if !resp.status().is_success() {
@@ -1234,6 +1295,65 @@ mod tests {
             .await
             .unwrap();
         err_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn remote_providers_reopen_pull_request_roundtrip() {
+        let open_pr = r#"{
+            "number": 12,
+            "title": "Reopened PR",
+            "body": null,
+            "state": "open",
+            "merged": false,
+            "html_url": "http://forge.local/org/repo/pulls/12",
+            "head": { "ref": "keel/acme/app-12", "sha": "abc123" },
+            "base": { "ref": "main" },
+            "created_at": "2026-11-14T10:00:00Z",
+            "updated_at": "2026-11-14T10:05:00Z"
+        }"#
+        .to_string();
+
+        // ForgejoGiteaProvider: PATCH /pulls/12 -> 200, GET /pulls/12 -> 200
+        let (fg_url, fg_handle) =
+            spawn_mock_http_server(vec![(200, open_pr.clone()), (200, open_pr.clone())]).await;
+        let fg = ForgejoGiteaProvider::new(&fg_url, "org", "repo", "fg-tok").unwrap();
+        let fg_reopened = fg.reopen_pull_request("12").await.unwrap();
+        assert_eq!(fg_reopened.state, PullRequestState::Open);
+        let fg_reqs = fg_handle.await.unwrap();
+        assert!(fg_reqs[0].starts_with("PATCH /api/v1/repos/org/repo/pulls/12"));
+        assert!(fg_reqs[0].contains(r#""state":"open""#));
+
+        // GitHubProvider: PATCH /pulls/12 -> 200, GET /pulls/12 -> 200
+        let (gh_url, gh_handle) =
+            spawn_mock_http_server(vec![(200, open_pr.clone()), (200, open_pr)]).await;
+        let gh = GitHubProvider::new(&gh_url, "org", "repo", "gh-tok").unwrap();
+        let gh_reopened = gh.reopen_pull_request("12").await.unwrap();
+        assert_eq!(gh_reopened.state, PullRequestState::Open);
+        let gh_reqs = gh_handle.await.unwrap();
+        assert!(gh_reqs[0].starts_with("PATCH /repos/org/repo/pulls/12"));
+        assert!(gh_reqs[0].contains(r#""state":"open""#));
+
+        // GitLabProvider: PUT /merge_requests/12 -> 200
+        let open_mr = r#"{
+            "iid": 12,
+            "title": "Reopened MR",
+            "description": null,
+            "state": "opened",
+            "source_branch": "keel/acme/app-12",
+            "target_branch": "main",
+            "sha": "abc123",
+            "web_url": "http://gitlab.local/org/repo/-/merge_requests/12",
+            "created_at": "2026-11-14T10:00:00Z",
+            "updated_at": "2026-11-14T10:05:00Z"
+        }"#
+        .to_string();
+        let (gl_url, gl_handle) = spawn_mock_http_server(vec![(200, open_mr)]).await;
+        let gl = GitLabProvider::new(&gl_url, "org/repo", "gl-tok").unwrap();
+        let gl_reopened = gl.reopen_pull_request("12").await.unwrap();
+        assert_eq!(gl_reopened.state, PullRequestState::Open);
+        let gl_reqs = gl_handle.await.unwrap();
+        assert!(gl_reqs[0].starts_with("PUT /api/v4/projects/org%2Frepo/merge_requests/12"));
+        assert!(gl_reqs[0].contains(r#""state_event":"reopen""#));
     }
 
     #[test]
