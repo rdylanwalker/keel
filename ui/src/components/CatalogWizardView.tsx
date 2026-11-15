@@ -20,6 +20,7 @@ import {
   X,
   RefreshCw,
   AlertTriangle,
+  Pencil,
 } from "lucide-react"
 import {
   CatalogBundleItem,
@@ -42,6 +43,7 @@ import {
   getStackConfig,
   getStacks,
   getTenants,
+  updateCatalogItem,
 } from "../lib/api"
 import { jsonToYaml, isDemoMode } from "../lib/utils"
 
@@ -388,6 +390,10 @@ export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
   const [tenantError, setTenantError] = useState<string | null>(null)
 
   const [isAddAppModalOpen, setIsAddAppModalOpen] = useState(false)
+  const [editingCatalogItem, setEditingCatalogItem] =
+    useState<CatalogItem | null>(null)
+  const [schemaJsonText, setSchemaJsonText] = useState("")
+  const [showSchemaEditor, setShowSchemaEditor] = useState(false)
   const [appLoading, setAppLoading] = useState(false)
   const [syncingSchema, setSyncingSchema] = useState(false)
   const [appError, setAppError] = useState<string | null>(null)
@@ -692,6 +698,79 @@ export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
     }
   }
 
+  const openAddCatalogModal = () => {
+    setEditingCatalogItem(null)
+    setAppError(null)
+    setSchemaJsonText("")
+    setShowSchemaEditor(false)
+    setAppForm({
+      kind: "app",
+      id: "",
+      name: "",
+      category: "Applications",
+      description: "",
+      runtime: "helm",
+      repoUrl: "",
+      chart: "",
+      version: "",
+      path: "",
+      flaggerSupported: false,
+      provider: "kind",
+      pulumiRuntime: "yaml",
+      entrypoint: "Pulumi.yaml",
+      protectByDefault: false,
+      terraformProvider: "",
+      items: [],
+    })
+    setIsAddAppModalOpen(true)
+  }
+
+  const openEditCatalogModal = (item: CatalogItem) => {
+    const normalizedKind: "app" | "infra" | "bundle" =
+      item.type === "infrastructure" || item.type === "infra"
+        ? "infra"
+        : item.type === "bundle"
+          ? "bundle"
+          : "app"
+    setEditingCatalogItem(item)
+    setAppError(null)
+    setSchemaJsonText(
+      JSON.stringify(item.schema ?? { type: "object", properties: {} }, null, 2)
+    )
+    setShowSchemaEditor(false)
+    setAppForm({
+      kind: normalizedKind,
+      id: item.id,
+      name: item.name,
+      category:
+        item.category ||
+        (normalizedKind === "infra"
+          ? "Infrastructure"
+          : normalizedKind === "bundle"
+            ? "Platform"
+            : "Applications"),
+      description: item.description || "",
+      runtime: (item.runtime as "helm" | "kustomize") || "helm",
+      repoUrl: item.repoUrl || "",
+      chart: item.chart || "",
+      version: item.version || "",
+      path: item.path || "",
+      flaggerSupported: !!item.flaggerSupported,
+      provider: item.provider || "kind",
+      pulumiRuntime: item.pulumiRuntime || "yaml",
+      entrypoint: item.entrypoint || "Pulumi.yaml",
+      protectByDefault: !!item.protectByDefault,
+      terraformProvider: "",
+      items: item.bundleItems
+        ? item.bundleItems.map((b) => ({
+            ...b,
+            dependsOn: b.dependsOn ? [...b.dependsOn] : [],
+          }))
+        : [],
+    })
+    setIsAddAppModalOpen(true)
+  }
+
   const handleCreateCatalogApp = async (e: React.FormEvent) => {
     e.preventDefault()
     const isInfra = appForm.kind === "infra"
@@ -704,18 +783,33 @@ export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
     )
       return
 
+    let parsedSchema: RJSFSchema | undefined
+    if (showSchemaEditor && schemaJsonText.trim()) {
+      try {
+        parsedSchema = JSON.parse(schemaJsonText) as RJSFSchema
+      } catch (err) {
+        setAppError(
+          `Invalid JSON Schema: ${err instanceof Error ? err.message : "parse error"}`
+        )
+        return
+      }
+    }
+
     setAppLoading(true)
     setAppError(null)
     setCreatedProposal(null)
 
     try {
+      const isEditing = Boolean(editingCatalogItem)
       const payload: CreateCatalogItemPayload = isBundle
         ? {
             kind: "bundle",
             id: appForm.id.trim(),
             name: appForm.name.trim(),
             category: appForm.category.trim() || "Platform",
-            description: appForm.description?.trim() || undefined,
+            description: isEditing
+              ? (appForm.description?.trim() ?? "")
+              : appForm.description?.trim() || undefined,
             items: (appForm.items ?? []).map((item) => ({
               id: item.id.trim(),
               kind: item.kind,
@@ -730,6 +824,7 @@ export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
                 ? { targetNamespace: item.targetNamespace.trim() }
                 : {}),
             })),
+            ...(parsedSchema ? { schema: parsedSchema } : {}),
           }
         : isInfra
           ? {
@@ -737,27 +832,73 @@ export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
               id: appForm.id.trim(),
               name: appForm.name.trim(),
               category: appForm.category.trim() || "Infrastructure",
+              ...(isEditing
+                ? { description: appForm.description?.trim() ?? "" }
+                : appForm.description?.trim()
+                  ? { description: appForm.description.trim() }
+                  : {}),
               provider: appForm.provider || "kind",
               pulumiRuntime: appForm.pulumiRuntime || "yaml",
               entrypoint: appForm.entrypoint?.trim() || "Pulumi.yaml",
               terraformProvider: appForm.terraformProvider?.trim() || undefined,
               protectByDefault: !!appForm.protectByDefault,
+              ...(parsedSchema ? { schema: parsedSchema } : {}),
             }
           : {
               kind: "app",
               id: appForm.id.trim(),
               name: appForm.name.trim(),
               category: appForm.category.trim() || "Applications",
+              ...(isEditing
+                ? { description: appForm.description?.trim() ?? "" }
+                : appForm.description?.trim()
+                  ? { description: appForm.description.trim() }
+                  : {}),
               runtime: appForm.runtime || "helm",
               repoUrl: appForm.repoUrl?.trim() || "",
-              chart: appForm.chart?.trim() || undefined,
-              version: appForm.version?.trim() || undefined,
+              chart: isEditing
+                ? (appForm.chart?.trim() ?? "")
+                : appForm.chart?.trim() || undefined,
+              version: isEditing
+                ? (appForm.version?.trim() ?? "")
+                : appForm.version?.trim() || undefined,
+              ...(isEditing
+                ? { path: appForm.path?.trim() ?? "" }
+                : appForm.path?.trim()
+                  ? { path: appForm.path.trim() }
+                  : {}),
               flaggerSupported: !!appForm.flaggerSupported,
+              ...(parsedSchema ? { schema: parsedSchema } : {}),
             }
 
-      const proposal = await createCatalogApp(payload)
+      const proposal = editingCatalogItem
+        ? await updateCatalogItem(
+            editingCatalogItem.type,
+            editingCatalogItem.id,
+            {
+              name: payload.name,
+              category: payload.category,
+              description: payload.description,
+              runtime: payload.runtime,
+              repoUrl: payload.repoUrl,
+              chart: payload.chart,
+              version: payload.version,
+              path: payload.path,
+              flaggerSupported: payload.flaggerSupported,
+              provider: payload.provider,
+              pulumiRuntime: payload.pulumiRuntime,
+              entrypoint: payload.entrypoint,
+              protectByDefault: payload.protectByDefault,
+              items: payload.items,
+              schema: payload.schema,
+            }
+          )
+        : await createCatalogApp(payload)
       setCreatedProposal(proposal)
       setIsAddAppModalOpen(false)
+      setEditingCatalogItem(null)
+      setSchemaJsonText("")
+      setShowSchemaEditor(false)
       setAppForm({
         kind: "app",
         id: "",
@@ -768,6 +909,7 @@ export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
         repoUrl: "",
         chart: "",
         version: "",
+        path: "",
         flaggerSupported: false,
         provider: "kind",
         pulumiRuntime: "yaml",
@@ -780,7 +922,9 @@ export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
       setAppError(
         err instanceof Error
           ? err.message
-          : "Failed to create catalog app proposal"
+          : editingCatalogItem
+            ? "Failed to update catalog item proposal"
+            : "Failed to create catalog app proposal"
       )
     } finally {
       setAppLoading(false)
@@ -1034,7 +1178,7 @@ export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
             </div>
             <button
               type="button"
-              onClick={() => setIsAddAppModalOpen(true)}
+              onClick={openAddCatalogModal}
               className="px-3 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-xs font-semibold transition-colors shrink-0 flex items-center gap-1.5 shadow-md shadow-indigo-600/20"
             >
               <Plus className="h-4 w-4" />
@@ -1118,6 +1262,15 @@ export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
                   </p>
                 </div>
                 <div className="flex items-center space-x-2">
+                  <button
+                    type="button"
+                    onClick={() => openEditCatalogModal(selectedItem)}
+                    className="flex items-center space-x-1.5 px-2.5 py-1 rounded-lg text-xs font-medium bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition-colors cursor-pointer"
+                    title="Edit catalog item definition via Git PR"
+                  >
+                    <Pencil className="h-3 w-3" />
+                    <span>Edit</span>
+                  </button>
                   {selectedItem.type === "app" && selectedItem.repoUrl && (
                     <button
                       type="button"
@@ -1493,12 +1646,13 @@ export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
             <div className="flex items-center justify-between border-b border-slate-800 pb-3">
               <h3 className="text-base font-bold text-white flex items-center gap-2">
                 <Box className="h-4 w-4 text-indigo-400" />
-                Add Catalog Item
+                {editingCatalogItem ? "Edit Catalog Item" : "Add Catalog Item"}
               </h3>
               <button
                 type="button"
                 onClick={() => {
                   setIsAddAppModalOpen(false)
+                  setEditingCatalogItem(null)
                   setAppError(null)
                 }}
                 aria-label="Close modal"
@@ -1518,6 +1672,7 @@ export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
                 </label>
                 <select
                   id="catalog-type"
+                  disabled={Boolean(editingCatalogItem)}
                   value={appForm.kind || "app"}
                   onChange={(e) => {
                     const newKind = e.target.value as "app" | "infra" | "bundle"
@@ -1581,12 +1736,13 @@ export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
                     id="app-id"
                     type="text"
                     required
+                    disabled={Boolean(editingCatalogItem)}
                     placeholder="e.g. podinfo"
                     value={appForm.id}
                     onChange={(e) =>
                       setAppForm((prev) => ({ ...prev, id: e.target.value }))
                     }
-                    className="w-full px-3 py-2 bg-slate-950 border border-slate-800 rounded-lg text-xs text-slate-100 placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-indigo-500 font-mono"
+                    className="w-full px-3 py-2 bg-slate-950 border border-slate-800 rounded-lg text-xs text-slate-100 placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-indigo-500 font-mono disabled:opacity-60"
                   />
                 </div>
 
@@ -1756,6 +1912,28 @@ export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
                       Flagger Canary Support Enabled
                     </label>
                   </div>
+
+                  <div>
+                    <label
+                      htmlFor="app-description"
+                      className="block text-xs text-slate-300 font-medium mb-1"
+                    >
+                      Description
+                    </label>
+                    <input
+                      id="app-description"
+                      type="text"
+                      placeholder="Optional summary..."
+                      value={appForm.description || ""}
+                      onChange={(e) =>
+                        setAppForm((prev) => ({
+                          ...prev,
+                          description: e.target.value,
+                        }))
+                      }
+                      className="w-full px-3 py-2 bg-slate-950 border border-slate-800 rounded-lg text-xs text-slate-100 placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                    />
+                  </div>
                 </>
               )}
 
@@ -1905,6 +2083,28 @@ export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
                     >
                       Protect by Default
                     </label>
+                  </div>
+
+                  <div>
+                    <label
+                      htmlFor="infra-description"
+                      className="block text-xs text-slate-300 font-medium mb-1"
+                    >
+                      Description
+                    </label>
+                    <input
+                      id="infra-description"
+                      type="text"
+                      placeholder="Optional summary..."
+                      value={appForm.description || ""}
+                      onChange={(e) =>
+                        setAppForm((prev) => ({
+                          ...prev,
+                          description: e.target.value,
+                        }))
+                      }
+                      className="w-full px-3 py-2 bg-slate-950 border border-slate-800 rounded-lg text-xs text-slate-100 placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                    />
                   </div>
                 </>
               )}
@@ -2174,6 +2374,46 @@ export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
                 </div>
               )}
 
+              <div className="pt-1 border-t border-slate-800/80">
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (!showSchemaEditor && !schemaJsonText) {
+                      setSchemaJsonText(
+                        JSON.stringify(
+                          { type: "object", properties: {} },
+                          null,
+                          2
+                        )
+                      )
+                    }
+                    setShowSchemaEditor((prev) => !prev)
+                  }}
+                  className="text-[11px] font-medium text-indigo-400 hover:text-indigo-300 transition-colors cursor-pointer"
+                >
+                  {showSchemaEditor
+                    ? "Hide JSON Schema Editor"
+                    : "Edit JSON Schema (Optional)"}
+                </button>
+                {showSchemaEditor && (
+                  <div className="mt-2">
+                    <label
+                      htmlFor="catalog-schema-json"
+                      className="block text-xs text-slate-300 font-medium mb-1"
+                    >
+                      JSON Schema
+                    </label>
+                    <textarea
+                      id="catalog-schema-json"
+                      rows={6}
+                      value={schemaJsonText}
+                      onChange={(e) => setSchemaJsonText(e.target.value)}
+                      className="w-full px-3 py-2 bg-slate-950 border border-slate-800 rounded-lg text-[11px] text-slate-100 font-mono focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                    />
+                  </div>
+                )}
+              </div>
+
               {appError && (
                 <div className="p-3 bg-red-950/40 border border-red-500/30 rounded-lg text-red-300 text-xs flex items-center gap-2">
                   <AlertCircle className="h-4 w-4 text-red-400 shrink-0" />
@@ -2186,6 +2426,7 @@ export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
                   type="button"
                   onClick={() => {
                     setIsAddAppModalOpen(false)
+                    setEditingCatalogItem(null)
                     setAppError(null)
                   }}
                   className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-medium rounded-lg transition-colors"
@@ -2217,11 +2458,13 @@ export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
                     </>
                   ) : (
                     <span>
-                      {appForm.kind === "infra"
-                        ? "Submit Infra PR Proposal"
-                        : appForm.kind === "bundle"
-                          ? "Submit Bundle PR Proposal"
-                          : "Submit App PR Proposal"}
+                      {editingCatalogItem
+                        ? "Submit Update PR"
+                        : appForm.kind === "infra"
+                          ? "Submit Infra PR Proposal"
+                          : appForm.kind === "bundle"
+                            ? "Submit Bundle PR Proposal"
+                            : "Submit App PR Proposal"}
                     </span>
                   )}
                 </button>

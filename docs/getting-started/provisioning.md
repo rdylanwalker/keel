@@ -56,9 +56,10 @@ In **PR & Preview Inspector** (or via CLI):
 keel preview status --pr 1 --watch --server http://127.0.0.1:8080
 ```
 
-- Review the **Git Diff** (the exact YAML manifests proposed under `tenants/<tenant>/infra/` or `tenants/<tenant>/apps/`).
+- Review the **Git Diff** (the exact YAML manifests proposed under `tenants/<tenant>/infra/`, `tenants/<tenant>/apps/`, or `tenants/<tenant>/bundles/`).
 - Review the **PKO v2 Diff** (`+ Create`, `~ Update`, `- Delete`, `! Replace`).
 - Click **Merge PR Proposal** to merge into `main`, or **Reject PR** to close the proposal and garbage-collect ephemeral preview resources.
+- Use the status filter tabs (**Open**, **Merged**, **Closed**, **All**) to browse PR history directly from your configured Git forge.
 
 ## 5. Deploy an Application
 
@@ -79,4 +80,11 @@ keel app install \
 
 Monitor deployment progress and live events in **GitOps & Canary Console**.
 
-> **Status Lifecycle (`Pending` → `Reconciling` → `Synced` / `Ready`):** When `keel serve` is connected to a bootstrapped management cluster (via `KUBECONFIG` or in-cluster config), it overlays live Flux CD and PKO v2 CRD conditions onto the Git state. If no cluster is reachable (for example, `just serve` without a cluster) or Flux/PKO has not reconciled the resource yet, stacks and releases remain `Pending`.
+> **Status Lifecycle (`Pending` → `Reconciling` → `Synced` / `Ready` → `Deleting`):** When `keel serve` is connected to a bootstrapped management cluster (via `KUBECONFIG` or in-cluster config), it overlays live Flux CD and PKO v2 CRD conditions onto the Git state. If no cluster is reachable (for example, `just serve` without a cluster) or Flux/PKO has not reconciled the resource yet, stacks and releases remain `Pending`. Resources removed from `main` whose Kubernetes objects are still terminating remain visible as `Deleting` until cluster cleanup completes.
+
+## 6. Edit or Delete Deployed Resources
+
+From **Topology Map** or **GitOps & Canary Console**:
+
+- **Edit:** Click **Edit** on any infrastructure stack or application release to load its persisted configuration into **Catalog & Form Wizard** and open an update PR.
+- **Delete:** Click **Delete** on any stack or release to open a removal PR. After merging, the resource transitions to `Deleting` until Flux CD and PKO v2 finish tearing down the underlying cluster/cloud resources.

@@ -1974,3 +1974,170 @@ spec:
         .unwrap();
     assert_eq!(missing_cfg.status(), StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn test_update_catalog_item_endpoint() {
+    let fixture = setup_fixture().await;
+    let cookie = login_and_get_cookie(&fixture).await;
+    let app = build_router(fixture.state.clone());
+
+    // 1. Update existing app ("grafana" from setup_fixture)
+    let update_app_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri("/api/v1/catalog/app/grafana")
+                .header(COOKIE, &cookie)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "name": "Grafana Updated",
+                        "category": "Monitoring",
+                        "description": "Updated observability stack",
+                        "version": "8.9.0",
+                        "flaggerSupported": true
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(update_app_res.status(), StatusCode::OK);
+    let app_json: Value = serde_json::from_slice(
+        &update_app_res
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes(),
+    )
+    .unwrap();
+    assert_eq!(
+        app_json["application"]["metadata"]["name"],
+        "Grafana Updated"
+    );
+    assert_eq!(
+        app_json["application"]["metadata"]["description"],
+        "Updated observability stack"
+    );
+    assert_eq!(
+        app_json["application"]["spec"]["upstream"]["version"],
+        "8.9.0"
+    );
+    assert_eq!(
+        app_json["application"]["spec"]["progressiveDelivery"]["flaggerSupported"],
+        true
+    );
+    assert!(
+        app_json["branch"]
+            .as_str()
+            .unwrap()
+            .starts_with("keel/catalog/update-grafana-")
+    );
+
+    // 2. Update existing infra blueprint ("proxmox-vm" from setup_fixture) and verify Pulumi.yaml is preserved
+    let pulumi_path = fixture
+        .state
+        .repo_workdir
+        .join("catalog/infra/proxmox-vm/Pulumi.yaml");
+    let custom_pulumi = "name: proxmox-vm\nruntime: yaml\nresources:\n  vm:\n    type: custom:Vm\n";
+    tokio::fs::write(&pulumi_path, custom_pulumi).await.unwrap();
+    fixture
+        .state
+        .git_runner
+        .add(
+            &fixture.state.repo_workdir,
+            ["catalog/infra/proxmox-vm/Pulumi.yaml"],
+        )
+        .await
+        .unwrap();
+    fixture
+        .state
+        .git_runner
+        .commit(
+            &fixture.state.repo_workdir,
+            "chore: add custom Pulumi.yaml",
+            &keel_git::CommitAuthor::new("Test", "test@keel.local"),
+        )
+        .await
+        .unwrap();
+    fixture
+        .state
+        .git_runner
+        .push(&fixture.state.repo_workdir, "origin", "main")
+        .await
+        .unwrap();
+
+    let update_infra_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri("/api/v1/catalog/infra/proxmox-vm")
+                .header(COOKIE, &cookie)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "name": "Proxmox VM v2",
+                        "category": "Compute",
+                        "description": "Updated PVE blueprint",
+                        "protectByDefault": true
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(update_infra_res.status(), StatusCode::OK);
+    let infra_json: Value = serde_json::from_slice(
+        &update_infra_res
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes(),
+    )
+    .unwrap();
+    assert_eq!(infra_json["blueprint"]["metadata"]["name"], "Proxmox VM v2");
+    assert_eq!(infra_json["blueprint"]["spec"]["protectByDefault"], true);
+
+    let infra_branch = infra_json["branch"].as_str().unwrap();
+    fixture
+        .state
+        .git_runner
+        .checkout_branch(&fixture.state.repo_workdir, infra_branch)
+        .await
+        .unwrap();
+    let preserved_pulumi = tokio::fs::read_to_string(&pulumi_path).await.unwrap();
+    assert_eq!(preserved_pulumi, custom_pulumi);
+    fixture
+        .state
+        .git_runner
+        .checkout_branch(&fixture.state.repo_workdir, "main")
+        .await
+        .unwrap();
+
+    // 3. Updating a non-existent catalog item returns 404
+    let missing_res = app
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri("/api/v1/catalog/app/does-not-exist")
+                .header(COOKIE, &cookie)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "name": "Missing",
+                        "category": "Applications"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing_res.status(), StatusCode::NOT_FOUND);
+}
