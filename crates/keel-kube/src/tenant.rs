@@ -587,6 +587,193 @@ pub fn synthesize_helm_release_yaml(input: &HelmReleaseSpecInput) -> Result<Stri
     Ok(serde_yml::to_string(&manifest)?)
 }
 
+/// Input specification for synthesizing a Flagger `Canary` (`flagger.app/v1beta1`) targeting
+/// Envoy Gateway (`gatewayapi:v1`) and Prometheus (`SDD.md` §5.2, `NFR-REL-03`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FlaggerCanarySpecInput {
+    pub tenant_id: String,
+    pub release_name: String,
+    pub target_deployment_name: Option<String>,
+    pub service_port: u16,
+    pub gateway_name: String,
+    pub gateway_namespace: String,
+    pub hosts: Vec<String>,
+    pub extra_labels: BTreeMap<String, String>,
+}
+
+impl FlaggerCanarySpecInput {
+    pub fn new(tenant_id: impl Into<String>, release_name: impl Into<String>) -> Self {
+        Self {
+            tenant_id: tenant_id.into(),
+            release_name: release_name.into(),
+            target_deployment_name: None,
+            service_port: 80,
+            gateway_name: "keel-ingress".to_string(),
+            gateway_namespace: "keel-system".to_string(),
+            hosts: Vec::new(),
+            extra_labels: BTreeMap::new(),
+        }
+    }
+}
+
+/// Synthesizes a Flagger `Canary` (`flagger.app/v1beta1`) manifest for Envoy Gateway + Prometheus.
+pub fn synthesize_flagger_canary(input: &FlaggerCanarySpecInput) -> Result<Value, KubeError> {
+    let namespace = tenant_namespace(&input.tenant_id)?;
+    validate_resource_name("release_name", &input.release_name)?;
+    let target_name = input
+        .target_deployment_name
+        .as_deref()
+        .unwrap_or(&input.release_name);
+    validate_resource_name("target_deployment_name", target_name)?;
+    validate_resource_name("gateway_name", &input.gateway_name)?;
+    validate_resource_name("gateway_namespace", &input.gateway_namespace)?;
+
+    if input.service_port == 0 {
+        return Err(KubeError::InvalidInput(
+            "Flagger Canary service_port must be >= 1".to_string(),
+        ));
+    }
+
+    let mut service = serde_json::Map::new();
+    service.insert("port".to_string(), json!(input.service_port));
+    service.insert("targetPort".to_string(), json!(input.service_port));
+    service.insert(
+        "gatewayRefs".to_string(),
+        json!([
+            {
+                "name": input.gateway_name,
+                "namespace": input.gateway_namespace,
+                "group": "gateway.networking.k8s.io",
+                "kind": "Gateway"
+            }
+        ]),
+    );
+    let clean_hosts: Vec<String> = input
+        .hosts
+        .iter()
+        .map(|h| h.trim().to_string())
+        .filter(|h| !h.is_empty())
+        .collect();
+    if !clean_hosts.is_empty() {
+        service.insert("hosts".to_string(), json!(clean_hosts));
+    }
+
+    let mut labels = tenant_common_labels(&input.tenant_id);
+    for (k, v) in &input.extra_labels {
+        labels.insert(k.clone(), v.clone());
+    }
+
+    Ok(json!({
+        "apiVersion": "flagger.app/v1beta1",
+        "kind": "Canary",
+        "metadata": {
+            "name": input.release_name,
+            "namespace": namespace,
+            "labels": labels,
+        },
+        "spec": {
+            "provider": "gatewayapi:v1",
+            "targetRef": {
+                "apiVersion": "apps/v1",
+                "kind": "Deployment",
+                "name": target_name,
+            },
+            "service": Value::Object(service),
+            "analysis": {
+                "interval": "30s",
+                "threshold": 5,
+                "maxWeight": 50,
+                "stepWeight": 10,
+                "metrics": [
+                    {
+                        "name": "envoy-request-success-rate",
+                        "templateRef": {
+                            "name": "envoy-gateway-request-success-rate",
+                            "namespace": input.gateway_namespace
+                        },
+                        "thresholdRange": { "min": 99 },
+                        "interval": "2m"
+                    },
+                    {
+                        "name": "envoy-request-duration",
+                        "templateRef": {
+                            "name": "envoy-gateway-request-duration",
+                            "namespace": input.gateway_namespace
+                        },
+                        "thresholdRange": { "max": 500 },
+                        "interval": "2m"
+                    }
+                ]
+            }
+        }
+    }))
+}
+
+/// Synthesizes a Flagger `Canary` manifest directly as YAML.
+pub fn synthesize_flagger_canary_yaml(input: &FlaggerCanarySpecInput) -> Result<String, KubeError> {
+    let manifest = synthesize_flagger_canary(input)?;
+    Ok(serde_yml::to_string(&manifest)?)
+}
+
+/// Synthesizes a tenant `NetworkPolicy` allowing Envoy Gateway proxy pods (`keel-system`)
+/// to reach the application's service port through `default-deny-all` (`SDD.md` §5.2).
+pub fn synthesize_canary_gateway_network_policy(
+    tenant_id: &str,
+    release_name: &str,
+    service_port: u16,
+) -> Result<Value, KubeError> {
+    let namespace = tenant_namespace(tenant_id)?;
+    validate_resource_name("release_name", release_name)?;
+    if service_port == 0 {
+        return Err(KubeError::InvalidInput(
+            "NetworkPolicy service_port must be >= 1".to_string(),
+        ));
+    }
+
+    Ok(json!({
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "NetworkPolicy",
+        "metadata": {
+            "name": format!("allow-{release_name}-envoy-ingress"),
+            "namespace": namespace,
+            "labels": tenant_common_labels(tenant_id),
+        },
+        "spec": {
+            "podSelector": {},
+            "policyTypes": ["Ingress"],
+            "ingress": [
+                {
+                    "from": [
+                        {
+                            "namespaceSelector": {
+                                "matchLabels": {
+                                    "kubernetes.io/metadata.name": "keel-system"
+                                }
+                            }
+                        }
+                    ],
+                    "ports": [
+                        {
+                            "protocol": "TCP",
+                            "port": service_port
+                        }
+                    ]
+                }
+            ]
+        }
+    }))
+}
+
+/// Synthesizes a tenant Envoy Gateway ingress `NetworkPolicy` directly as YAML.
+pub fn synthesize_canary_gateway_network_policy_yaml(
+    tenant_id: &str,
+    release_name: &str,
+    service_port: u16,
+) -> Result<String, KubeError> {
+    let manifest = synthesize_canary_gateway_network_policy(tenant_id, release_name, service_port)?;
+    Ok(serde_yml::to_string(&manifest)?)
+}
+
 /// Health-check target for `Kustomization.spec.healthChecks` (e.g., waiting on a PKO `Stack` CR).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FluxHealthCheckRef {
@@ -970,5 +1157,45 @@ mod tests {
         let hr = synthesize_helm_release(&input).unwrap();
         assert_eq!(hr["spec"]["targetNamespace"], "staging-apps");
         assert_eq!(hr["spec"]["install"]["createNamespace"], true);
+    }
+
+    #[test]
+    fn flagger_canary_synthesizes_gateway_api_and_prometheus_metrics() {
+        let mut input = FlaggerCanarySpecInput::new("default", "podinfo");
+        input.service_port = 9898;
+        input.hosts = vec!["podinfo.keel.local".to_string()];
+
+        let canary = synthesize_flagger_canary(&input).unwrap();
+        assert_eq!(canary["apiVersion"], "flagger.app/v1beta1");
+        assert_eq!(canary["kind"], "Canary");
+        assert_eq!(canary["metadata"]["name"], "podinfo");
+        assert_eq!(canary["metadata"]["namespace"], "tenant-default");
+        assert_eq!(canary["spec"]["provider"], "gatewayapi:v1");
+        assert_eq!(canary["spec"]["targetRef"]["kind"], "Deployment");
+        assert_eq!(canary["spec"]["targetRef"]["name"], "podinfo");
+        assert_eq!(canary["spec"]["service"]["port"], 9898);
+        assert_eq!(
+            canary["spec"]["service"]["gatewayRefs"][0]["name"],
+            "keel-ingress"
+        );
+        assert_eq!(
+            canary["spec"]["service"]["gatewayRefs"][0]["namespace"],
+            "keel-system"
+        );
+        assert_eq!(canary["spec"]["service"]["hosts"][0], "podinfo.keel.local");
+        assert_eq!(
+            canary["spec"]["analysis"]["metrics"][0]["name"],
+            "envoy-request-success-rate"
+        );
+
+        let np = synthesize_canary_gateway_network_policy("default", "podinfo", 9898).unwrap();
+        assert_eq!(np["kind"], "NetworkPolicy");
+        assert_eq!(np["metadata"]["name"], "allow-podinfo-envoy-ingress");
+        assert_eq!(np["metadata"]["namespace"], "tenant-default");
+        assert_eq!(
+            np["spec"]["ingress"][0]["from"][0]["namespaceSelector"]["matchLabels"]["kubernetes.io/metadata.name"],
+            "keel-system"
+        );
+        assert_eq!(np["spec"]["ingress"][0]["ports"][0]["port"], 9898);
     }
 }
