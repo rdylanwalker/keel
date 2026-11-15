@@ -84,6 +84,12 @@ pub struct ReleaseSummary {
     pub runtime: String,
     pub canary: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub canary_weight: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub canary_phase: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub primary_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub target_cluster: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bundle: Option<String>,
@@ -444,6 +450,9 @@ impl ClusterStateProvider for RepoClusterStateProvider {
                     version,
                     runtime,
                     canary: kind == "Canary",
+                    canary_weight: None,
+                    canary_phase: None,
+                    primary_version: None,
                     target_cluster,
                     bundle: doc_bundle,
                     bundle_item: doc_bundle_item,
@@ -550,12 +559,45 @@ impl ClusterStateProvider for KubeClusterStateProvider {
             .list_stacks(tenant, None)
             .await
             .unwrap_or_default();
+        // Deduplicate paired HelmRelease + Canary manifests into a single ReleaseSummary with `canary = true`
+        let canary_keys: std::collections::HashSet<(String, String)> = releases
+            .iter()
+            .filter(|r| r.canary)
+            .map(|r| (r.namespace.clone(), r.name.clone()))
+            .collect();
+        let has_paired_hr: std::collections::HashSet<(String, String)> = releases
+            .iter()
+            .filter(|r| !r.canary && canary_keys.contains(&(r.namespace.clone(), r.name.clone())))
+            .map(|r| (r.namespace.clone(), r.name.clone()))
+            .collect();
+        releases.retain(|r| {
+            !(r.canary && has_paired_hr.contains(&(r.namespace.clone(), r.name.clone())))
+        });
+        for rel in &mut releases {
+            if canary_keys.contains(&(rel.namespace.clone(), rel.name.clone())) {
+                rel.canary = true;
+            }
+        }
+
         let live_stacks = self.live.stack_statuses().await;
         let live = self.live.release_status_details().await;
+        let live_canaries = self.live.canary_statuses().await;
         for rel in &mut releases {
             if let Some(info) = live.get(&(rel.namespace.clone(), rel.name.clone())) {
                 rel.status = Self::status_label(&info.status);
                 rel.last_synced = info.last_synced.clone();
+            }
+            if rel.canary
+                && let Some(cinfo) = live_canaries.get(&(rel.namespace.clone(), rel.name.clone()))
+            {
+                rel.status = Self::status_label(&cinfo.status);
+                rel.last_synced = cinfo
+                    .last_synced
+                    .clone()
+                    .or_else(|| rel.last_synced.clone());
+                rel.canary_weight = cinfo.canary_weight;
+                rel.canary_phase = cinfo.canary_phase.clone();
+                rel.primary_version = cinfo.primary_version.clone();
             }
         }
         // Keep any live tenant-* release that is absent from Git `main` (awaiting Flux prune or mid-termination),
@@ -589,6 +631,9 @@ impl ClusterStateProvider for KubeClusterStateProvider {
                     version: None,
                     runtime: "helm".to_string(),
                     canary: false,
+                    canary_weight: None,
+                    canary_phase: None,
+                    primary_version: None,
                     target_cluster: None,
                     bundle: None,
                     bundle_item: None,

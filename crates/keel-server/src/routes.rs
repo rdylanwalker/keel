@@ -26,10 +26,11 @@ use keel_git::{
     CommitAuthor, CreatePrRequest, PullRequestComment, PullRequestInfo, PullRequestState,
 };
 use keel_kube::{
-    CrdReconcileStatus, CrdWatchEvent, FluxDependencyRef, FluxHealthCheckRef,
-    FluxKustomizationSpecInput, HelmChartSourceKind, HelmChartSourceRef, HelmReleaseSpecInput,
-    HelmValuesSecretRef, RemoteKubeConfigRef, StackDiagnostics, TenantAgeKey,
+    CrdReconcileStatus, CrdWatchEvent, FlaggerCanarySpecInput, FluxDependencyRef,
+    FluxHealthCheckRef, FluxKustomizationSpecInput, HelmChartSourceKind, HelmChartSourceRef,
+    HelmReleaseSpecInput, HelmValuesSecretRef, RemoteKubeConfigRef, StackDiagnostics, TenantAgeKey,
     TenantIsolationConfig, TenantManifestBundle, UserGitCredentials, WatchedCrdKind,
+    synthesize_canary_gateway_network_policy_yaml, synthesize_flagger_canary_yaml,
     synthesize_flux_kustomization_yaml, synthesize_helm_release_yaml, user_git_creds_secret_name,
 };
 use keel_pko::{
@@ -1929,6 +1930,12 @@ pub async fn create_proposal(
 
     let (schema, action_label, is_app) = match &manifest {
         CatalogManifest::Application(app) => {
+            if req.canary && !app.spec.progressive_delivery.flagger_supported {
+                return Err(ServerError::BadRequest(format!(
+                    "Catalog application '{}' does not support Flagger canary rollouts (flaggerSupported=false)",
+                    app.metadata.id
+                )));
+            }
             (&app.spec.schema, format!("app-{}", app.metadata.id), true)
         }
         CatalogManifest::InfraBlueprint(bp) => {
@@ -2187,6 +2194,51 @@ pub async fn create_proposal(
                     req.tenant
                 ));
             }
+            if req.canary {
+                let mut canary_input = FlaggerCanarySpecInput::new(&req.tenant, &instance_name);
+                let chart_name = app
+                    .spec
+                    .upstream
+                    .chart
+                    .as_deref()
+                    .unwrap_or(&app.metadata.id);
+                canary_input.service_port = partitioned
+                    .normal_values
+                    .get("service")
+                    .and_then(|s| s.get("port"))
+                    .and_then(|p| p.as_u64())
+                    .and_then(|p| u16::try_from(p).ok())
+                    .filter(|p| *p > 0)
+                    .unwrap_or(if chart_name == "podinfo" { 9898 } else { 80 });
+                if let Some(host) = partitioned
+                    .normal_values
+                    .get("ingressHost")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    canary_input.hosts.push(host.to_string());
+                }
+                let canary_yaml = synthesize_flagger_canary_yaml(&canary_input)?;
+                let canary_path = target_dir.join("canary.yaml");
+                tokio::fs::write(&canary_path, canary_yaml).await?;
+                staged_paths.push(format!("{rel_dir}/canary.yaml"));
+                extra_kustomize_resources
+                    .push(format!("{}/apps/{instance_name}/canary.yaml", req.tenant));
+
+                let np_yaml = synthesize_canary_gateway_network_policy_yaml(
+                    &req.tenant,
+                    &instance_name,
+                    canary_input.service_port,
+                )?;
+                let np_path = target_dir.join("networkpolicy-canary.yaml");
+                tokio::fs::write(&np_path, np_yaml).await?;
+                staged_paths.push(format!("{rel_dir}/networkpolicy-canary.yaml"));
+                extra_kustomize_resources.push(format!(
+                    "{}/apps/{instance_name}/networkpolicy-canary.yaml",
+                    req.tenant
+                ));
+            }
         }
 
         if !is_app {
@@ -2259,6 +2311,23 @@ pub async fn create_proposal(
             req.tenant,
             if is_app { "apps" } else { "infra" }
         );
+        if is_app {
+            if req.canary {
+                let stale = format!("{}/apps/{instance_name}/helmrelease.yaml", req.tenant);
+                resources.retain(|r| r != &stale);
+            } else {
+                let stale_hr = format!(
+                    "{}/apps/{instance_name}/helmrelease-canary.yaml",
+                    req.tenant
+                );
+                let stale_canary = format!("{}/apps/{instance_name}/canary.yaml", req.tenant);
+                let stale_np = format!(
+                    "{}/apps/{instance_name}/networkpolicy-canary.yaml",
+                    req.tenant
+                );
+                resources.retain(|r| r != &stale_hr && r != &stale_canary && r != &stale_np);
+            }
+        }
         for res in extra_kustomize_resources {
             if !resources.contains(&res) {
                 resources.push(res);
@@ -3395,6 +3464,22 @@ pub async fn reject_proposal(
     }))
 }
 
+/// `POST /api/v1/proposals/{pr_id}/reopen`
+///
+/// Reopens a previously closed PR proposal via the configured [`ForgeProvider`].
+pub async fn reopen_proposal(
+    _auth: AuthSession,
+    State(state): State<AppState>,
+    AxumPath(pr_id): AxumPath<String>,
+) -> Result<Json<MergeProposalResponse>, ServerError> {
+    let reopened = state.forge.reopen_pull_request(&pr_id).await?;
+
+    Ok(Json(MergeProposalResponse {
+        proposal: reopened,
+        gc_plan: GcPlan::default(),
+    }))
+}
+
 /// Query parameters for `GET /api/v1/stacks`.
 #[derive(Debug, Deserialize)]
 pub struct ListStacksQuery {
@@ -3802,6 +3887,7 @@ pub async fn get_stack_config(
         version: None,
         target_cluster: None,
         target_namespace: None,
+        canary: None,
         values,
     }))
 }
@@ -3819,6 +3905,8 @@ pub struct ReleaseConfigResponse {
     pub target_cluster: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_namespace: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canary: Option<bool>,
     pub values: Value,
 }
 
@@ -3842,20 +3930,24 @@ pub async fn get_release_config(
         .join("apps")
         .join(&name);
 
-    let (values, hr_doc) = {
+    let (values, hr_doc, is_canary) = {
         let _guard = state.git_lock.lock().await;
         let values_path = app_dir.join("values.yaml");
         let hr_path = app_dir.join("helmrelease.yaml");
         let hr_canary_path = app_dir.join("helmrelease-canary.yaml");
+        let canary_cr_path = app_dir.join("canary.yaml");
 
         let has_values = tokio::fs::try_exists(&values_path).await.unwrap_or(false);
-        let active_hr_path = if tokio::fs::try_exists(&hr_path).await.unwrap_or(false) {
-            Some(hr_path)
-        } else if tokio::fs::try_exists(&hr_canary_path)
+        let has_canary_hr = tokio::fs::try_exists(&hr_canary_path)
             .await
-            .unwrap_or(false)
-        {
+            .unwrap_or(false);
+        let has_canary_cr = tokio::fs::try_exists(&canary_cr_path)
+            .await
+            .unwrap_or(false);
+        let active_hr_path = if has_canary_hr {
             Some(hr_canary_path)
+        } else if tokio::fs::try_exists(&hr_path).await.unwrap_or(false) {
+            Some(hr_path)
         } else {
             None
         };
@@ -3883,7 +3975,7 @@ pub async fn get_release_config(
             None
         };
 
-        (values, hr_doc)
+        (values, hr_doc, has_canary_hr || has_canary_cr)
     };
 
     let chart_name = hr_doc
@@ -3939,6 +4031,7 @@ pub async fn get_release_config(
         version,
         target_cluster,
         target_namespace,
+        canary: if is_canary { Some(true) } else { None },
         values,
     }))
 }

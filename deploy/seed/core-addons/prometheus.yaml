@@ -1,3 +1,4 @@
+# yaml-language-server: $schema=none
 # Prometheus Server for Control-Plane Telemetry & Flagger Canary Rollbacks (`SDD.md` §5.2, `NFR-REL-03`, `NFR-OBS-02`)
 apiVersion: helm.toolkit.fluxcd.io/v2
 kind: HelmRelease

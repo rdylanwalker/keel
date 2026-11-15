@@ -41,6 +41,29 @@ spec:
         description: Sensitive bearer token partitioned out of plaintext values.yaml and encrypted via SOPS + tenant age key.
         writeOnly: true
         minLength: 8
+      securityContext:
+        type: object
+        title: Container Security Context
+        description: Restricted Pod Security Standard settings required by Kyverno admission policies in tenant namespaces.
+        default:
+          allowPrivilegeEscalation: false
+          runAsNonRoot: true
+          runAsUser: 100
+          capabilities:
+            drop:
+              - ALL
+          seccompProfile:
+            type: RuntimeDefault
+        properties:
+          allowPrivilegeEscalation:
+            type: boolean
+            default: false
+          runAsNonRoot:
+            type: boolean
+            default: true
+          runAsUser:
+            type: integer
+            default: 100
   uiSchema:
     ingressHost:
       ui:placeholder: "podinfo.keel.local"
