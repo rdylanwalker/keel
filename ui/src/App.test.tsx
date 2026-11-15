@@ -52,7 +52,7 @@ describe("App top-level application component", () => {
     })
   })
 
-  it("switches navigation tabs across all 4 views", async () => {
+  it("switches navigation tabs across all 3 views", async () => {
     vi.mocked(api.getAuthStatus).mockResolvedValue({
       authenticated: true,
       phase: "bootstrap",
@@ -86,18 +86,6 @@ describe("App top-level application component", () => {
       await screen.findByText("PR & PKO v2 Preview Inspector")
     ).toBeInTheDocument()
     expect(window.location.hash).toBe("#preview")
-
-    // Tab 4: GitOps Console
-    const gitopsTabBtn = screen.getByRole("button", {
-      name: /GitOps & Canary Console/i,
-    })
-    await act(async () => {
-      fireEvent.click(gitopsTabBtn)
-    })
-    expect(
-      await screen.findByText("GitOps & Progressive Delivery Console")
-    ).toBeInTheDocument()
-    expect(window.location.hash).toBe("#gitops")
 
     // Back to Tab 1: Topology
     const topologyTabBtn = screen.getByRole("button", {

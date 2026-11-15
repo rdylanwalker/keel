@@ -375,17 +375,18 @@ crates/
 | `POST` | `/api/v1/proposals/{pr_id}/reject` | Closes/rejects an open PR proposal via `ForgeProvider`. |
 | `GET` | `/api/v1/stacks` | Lists infrastructure stacks across Proxmox, AWS, GCP, Azure, Hetzner, Cloudflare, and custom providers (including `Deleting` stacks). |
 | `GET` | `/api/v1/stacks/{namespace}/{name}/config` & `DELETE /api/v1/stacks/{namespace}/{name}` | Fetches persisted stack config for editing or opens a PR to delete an infrastructure stack. |
+| `POST` | `/api/v1/stacks/{namespace}/{name}/restart` | Triggers a Kubernetes rollout restart on the stack's PKO v2 `Workspace` StatefulSet. |
 | `GET` | `/api/v1/releases` | Lists deployed Helm, Kustomize, and Flagger Canary applications (including `Deleting` releases). |
 | `GET` | `/api/v1/releases/{namespace}/{name}/config` & `DELETE /api/v1/releases/{namespace}/{name}` | Fetches persisted release values for editing or opens a PR to delete a release. |
+| `POST` | `/api/v1/releases/{namespace}/{name}/reconcile` | Annotates a Flux `HelmRelease` (or `Kustomization`) with `reconcile.fluxcd.io/requestedAt` to trigger immediate reconciliation. |
 | `GET` | `/api/v1/bundles/{namespace}/{name}/config` | Fetches combined per-item configuration for a deployed `CatalogBundle`. |
 | `GET` | `/api/v1/events/stream` | **SSE stream** pushing real-time `kube-rs` CRD condition transitions (`GitRepository`, `Kustomization`, `HelmRelease`, `Stack`, `Canary`). |
 | `PUT` | `/api/v1/profile/git-credentials` | Stores `AES-256-GCM`-encrypted SSH keys or Forge PATs in a Kubernetes `Secret` for the authenticated user's Git operations. |
 
 ### 7.4 React + Shadcn + Tailwind GUI Views
-1. **Cluster & Provider Topology Map:** Live health view of the management cluster, provisioned workload clusters, Proxmox nodes, and enabled cloud providers, including `Drifted / Error / Deleting` status tracking, Bundle grouping, and PR-driven Edit/Delete actions.
+1. **Cluster & Provider Topology Map:** Live health view of the management cluster, provisioned workload clusters, Proxmox nodes, and enabled cloud providers—including `Drifted / Error / Deleting` status tracking, Bundle grouping, **+ Deploy Stack** / **+ Deploy App** actions, TanStack table sorting/filtering, PR-driven Edit/Delete/Reconcile actions, real-time Flux reconciliation timeline, and Flagger canary traffic-weight gauge + Prometheus error/latency sparklines.
 2. **Self-Service Catalog & Dynamic Form Wizard:** Searchable catalog rendering `catalog.yaml` JSONSchemas via `@rjsf/core` + Shadcn components, supporting creating and editing Apps, Infrastructure Blueprints, and Multi-Item Bundles via Git PRs, complete with live `values.yaml` diff preview before submission.
-3. **PR & PKO Preview Inspector:** Side-by-side view of Open, Merged, Closed, or All Git PRs (with direct external links to Forgejo/Gitea/GitHub/GitLab), resource-level PKO diff trees (`+ Create`, `~ Update`, `- Delete`, `! Replace`), and policy check status.
-4. **GitOps & Progressive Delivery Console:** Real-time Flux reconciliation timeline and Flagger canary traffic-weight gauge + Prometheus error/latency sparklines.
+3. **PR & PKO Preview Inspector:** Side-by-side view of Open, Merged, Closed, or All Git PRs (with direct external links to Forgejo/Gitea/GitHub/GitLab), resource-level PKO diff trees (`+ Create`, `~ Update`, `- Delete`, `! Replace`), syntax-highlighted unified Git diffs, and policy check status.
 
 ---
 

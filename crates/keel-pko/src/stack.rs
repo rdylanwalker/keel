@@ -293,6 +293,24 @@ impl PkoWorkspaceTemplate {
             },
         }
     }
+
+    /// Appends an environment variable to the `pulumi` workspace container.
+    pub fn with_env_var(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        if let Some(container) = self
+            .spec
+            .pod_template
+            .spec
+            .containers
+            .iter_mut()
+            .find(|c| c.name == "pulumi")
+        {
+            container.env.push(WorkspaceEnvVar {
+                name: name.into(),
+                value: value.into(),
+            });
+        }
+        self
+    }
 }
 
 /// Spec for a PKO v2 `pulumi.com/v1` `Stack` CR.
@@ -473,6 +491,8 @@ pub struct EphemeralPreviewParams {
     pub git_secret_name: Option<String>,
     pub config: BTreeMap<String, String>,
     pub env_refs: BTreeMap<String, PkoEnvRef>,
+    /// Optional `DOCKER_HOST` endpoint injected into the PKO workspace pod for local `kind`-in-`kind` dev.
+    pub docker_host: Option<String>,
 }
 
 impl EphemeralPreviewParams {
@@ -503,6 +523,7 @@ impl EphemeralPreviewParams {
             git_secret_name: None,
             config: BTreeMap::new(),
             env_refs: BTreeMap::new(),
+            docker_host: None,
         })
     }
 }
@@ -520,6 +541,8 @@ pub struct TenantStackParams {
     pub output_secret_name: Option<String>,
     pub config: BTreeMap<String, String>,
     pub env_refs: BTreeMap<String, PkoEnvRef>,
+    /// Optional `DOCKER_HOST` endpoint injected into the PKO workspace pod for local `kind`-in-`kind` dev.
+    pub docker_host: Option<String>,
 }
 
 impl TenantStackParams {
@@ -543,6 +566,7 @@ impl TenantStackParams {
             output_secret_name: None,
             config: BTreeMap::new(),
             env_refs: BTreeMap::new(),
+            docker_host: None,
         }
     }
 }
@@ -740,7 +764,12 @@ pub fn synthesize_ephemeral_preview(
             output_secret_name: None,
             config: params.config.clone(),
             env_refs: params.env_refs.clone(),
-            workspace_template: Some(PkoWorkspaceTemplate::restricted_default()),
+            workspace_template: Some(match &params.docker_host {
+                Some(host) => {
+                    PkoWorkspaceTemplate::restricted_default().with_env_var("DOCKER_HOST", host)
+                }
+                None => PkoWorkspaceTemplate::restricted_default(),
+            }),
         },
     };
 
@@ -819,7 +848,12 @@ pub fn synthesize_tenant_stack(params: &TenantStackParams) -> Result<PkoStack, P
             output_secret_name,
             config: params.config.clone(),
             env_refs: params.env_refs.clone(),
-            workspace_template: Some(PkoWorkspaceTemplate::restricted_default()),
+            workspace_template: Some(match &params.docker_host {
+                Some(host) => {
+                    PkoWorkspaceTemplate::restricted_default().with_env_var("DOCKER_HOST", host)
+                }
+                None => PkoWorkspaceTemplate::restricted_default(),
+            }),
         },
     })
 }
@@ -1099,6 +1133,21 @@ mod tests {
             stack_no_secret.spec.service_account_name.as_deref(),
             Some("custom-analytics-sa")
         );
+
+        params.docker_host =
+            Some("tcp://keel-docker-proxy.flux-system.svc.cluster.local:2375".to_string());
+        let stack_docker =
+            synthesize_tenant_stack(&params).expect("valid tenant stack with docker host");
+        let docker_json = stack_docker.to_json_value().expect("json value");
+        let env =
+            docker_json["spec"]["workspaceTemplate"]["spec"]["podTemplate"]["spec"]["containers"]
+                [0]["env"]
+                .as_array()
+                .unwrap();
+        assert!(env.iter().any(|e| {
+            e["name"] == "DOCKER_HOST"
+                && e["value"] == "tcp://keel-docker-proxy.flux-system.svc.cluster.local:2375"
+        }));
     }
 
     #[test]

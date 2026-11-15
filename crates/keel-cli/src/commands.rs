@@ -526,6 +526,8 @@ pub fn default_bare_repo_for_workdir(repo_dir: &Path) -> PathBuf {
 
 const STARTER_KIND_CLUSTER_CATALOG_YAML: &str =
     include_str!("../../../deploy/catalog/infra/kind-cluster/catalog.yaml");
+const STARTER_KIND_CLUSTER_PULUMI_YAML: &str =
+    include_str!("../../../deploy/catalog/infra/kind-cluster/Pulumi.yaml");
 const STARTER_PODINFO_CATALOG_YAML: &str =
     include_str!("../../../deploy/catalog/apps/podinfo/catalog.yaml");
 
@@ -941,6 +943,10 @@ async fn initialize_seed_git_repo_with_push(
             STARTER_KIND_CLUSTER_CATALOG_YAML.to_string(),
         ));
         files_to_write.push((
+            "catalog/infra/kind-cluster/Pulumi.yaml",
+            STARTER_KIND_CLUSTER_PULUMI_YAML.to_string(),
+        ));
+        files_to_write.push((
             "catalog/apps/podinfo/catalog.yaml",
             STARTER_PODINFO_CATALOG_YAML.to_string(),
         ));
@@ -1233,6 +1239,62 @@ async fn install_stage0_core_addons(
     tracing::info!("Applying Kyverno policies & management core Stack");
     let kyverno_yaml = artifacts.kyverno_bundle.to_multi_doc_yaml()?;
     run_kubectl_apply(ctx, kc, &kyverno_yaml).await?;
+
+    if artifacts.kyverno_bundle.policy_exception.is_some() {
+        tracing::info!("Deploying local-dev Docker socket proxy in flux-system for nested kind");
+        let docker_proxy_yaml = format!(
+            "apiVersion: apps/v1\n\
+             kind: Deployment\n\
+             metadata:\n\
+             \x20 name: keel-docker-proxy\n\
+             \x20 namespace: {FLUX_SYSTEM_NAMESPACE}\n\
+             \x20 labels:\n\
+             \x20   app.kubernetes.io/managed-by: keel\n\
+             \x20   keel.io/local-dev-only: \"true\"\n\
+             spec:\n\
+             \x20 replicas: 1\n\
+             \x20 selector:\n\
+             \x20   matchLabels:\n\
+             \x20     app: keel-docker-proxy\n\
+             \x20 template:\n\
+             \x20   metadata:\n\
+             \x20     labels:\n\
+             \x20       app: keel-docker-proxy\n\
+             \x20   spec:\n\
+             \x20     containers:\n\
+             \x20       - name: socat\n\
+             \x20         image: alpine/socat:latest\n\
+             \x20         args:\n\
+             \x20           - TCP-LISTEN:2375,fork,reuseaddr\n\
+             \x20           - UNIX-CONNECT:/var/run/docker.sock\n\
+             \x20         ports:\n\
+             \x20           - containerPort: 2375\n\
+             \x20         volumeMounts:\n\
+             \x20           - name: docker-sock\n\
+             \x20             mountPath: /var/run/docker.sock\n\
+             \x20     volumes:\n\
+             \x20       - name: docker-sock\n\
+             \x20         hostPath:\n\
+             \x20           path: /var/run/docker.sock\n\
+             \x20           type: Socket\n\
+             ---\n\
+             apiVersion: v1\n\
+             kind: Service\n\
+             metadata:\n\
+             \x20 name: keel-docker-proxy\n\
+             \x20 namespace: {FLUX_SYSTEM_NAMESPACE}\n\
+             \x20 labels:\n\
+             \x20   app.kubernetes.io/managed-by: keel\n\
+             \x20   keel.io/local-dev-only: \"true\"\n\
+             spec:\n\
+             \x20 selector:\n\
+             \x20   app: keel-docker-proxy\n\
+             \x20 ports:\n\
+             \x20   - port: 2375\n\
+             \x20     targetPort: 2375\n"
+        );
+        run_kubectl_apply(ctx, kc, &docker_proxy_yaml).await?;
+    }
 
     let mgmt_sa_name = artifacts
         .management_stack
@@ -2183,10 +2245,16 @@ async fn build_serve_state_with_forward(
         generated_token = Some(token);
     }
 
-    let repo_state_provider = RepoClusterStateProvider::new(&repo_workdir);
-    let mgmt_stack_backend =
-        tokio::fs::read_to_string(repo_workdir.join("clusters/management/management-stack.yaml"))
+    let live_mgmt_backend = if let Some(ref reader) = kube_reader {
+        reader
+            .read_stack_backend(FLUX_SYSTEM_NAMESPACE, "management-cluster-core")
             .await
+    } else {
+        None
+    };
+    let repo_state_provider = RepoClusterStateProvider::new(&repo_workdir);
+    let mgmt_stack_backend = live_mgmt_backend.or_else(|| {
+        std::fs::read_to_string(repo_workdir.join("clusters/management/management-stack.yaml"))
             .ok()
             .and_then(|raw| serde_yml::from_str::<serde_json::Value>(&raw).ok())
             .and_then(|v| {
@@ -2194,7 +2262,8 @@ async fn build_serve_state_with_forward(
                     .and_then(|s| s.get("backend"))
                     .and_then(|b| b.as_str())
                     .map(str::to_string)
-            });
+            })
+    });
     let mut state = AppState::new(
         forge,
         secret_store,
@@ -2211,6 +2280,14 @@ async fn build_serve_state_with_forward(
 
     if let Some(reader) = kube_reader {
         tracing::info!("Connected to Kubernetes cluster for live Flux/PKO status reconciliation");
+        if reader.has_docker_proxy_service().await {
+            tracing::info!(
+                "Detected keel-docker-proxy in flux-system; enabling DOCKER_HOST for kind workspaces"
+            );
+            state = state.with_docker_proxy_url(Some(
+                "tcp://keel-docker-proxy.flux-system.svc.cluster.local:2375".to_string(),
+            ));
+        }
         state = state.with_state_provider(Arc::new(KubeClusterStateProvider::new(
             repo_state_provider,
             Arc::new(reader),
@@ -3270,6 +3347,8 @@ spec:
             provider: Some("aws".to_string()),
             preview: false,
             protect: true,
+            bundle: None,
+            bundle_item: None,
             status: "Ready".to_string(),
         }];
 

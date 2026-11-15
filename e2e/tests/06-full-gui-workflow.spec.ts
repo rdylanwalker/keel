@@ -104,13 +104,11 @@ test.describe('06 - Full Localhost GUI GitOps Workflow', () => {
     await page.getByRole('button', { name: /Merge PR/i }).click();
     await expect(page.getByText(/merged cleanly/i)).toBeVisible({ timeout: 10000 });
 
-    // 6. Verify status & reconciliation in Topology Map and GitOps Console
+    // 6. Verify status & reconciliation in Topology Map
     await page.getByRole('button', { name: /Topology Map/i }).click();
     await page.getByRole('button', { name: /Refresh Map/i }).click();
     await expect(page.getByText('management-cluster-core')).toBeVisible();
     await expect(page.getByText('e2e-team').first()).toBeVisible({ timeout: 10000 });
-
-    await page.getByRole('button', { name: /GitOps & Canary Console/i }).click();
     await expect(page.getByText(/Live Reconciler Event Stream/i)).toBeVisible();
     await expect(page.getByText(/podinfo/i).first()).toBeVisible({ timeout: 10000 });
   });

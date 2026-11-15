@@ -3,7 +3,6 @@ import {
   Boxes,
   Layers,
   GitPullRequest,
-  Activity,
   ShieldCheck,
   ShieldAlert,
   Key,
@@ -27,20 +26,10 @@ const PreviewInspectorView = React.lazy(() =>
     default: m.PreviewInspectorView,
   }))
 )
-const GitOpsConsoleView = React.lazy(() =>
-  import("./components/GitOpsConsoleView").then((m) => ({
-    default: m.GitOpsConsoleView,
-  }))
-)
 
-export type ActiveTab = "topology" | "catalog" | "preview" | "gitops"
+export type ActiveTab = "topology" | "catalog" | "preview"
 
-const VALID_TABS: readonly ActiveTab[] = [
-  "topology",
-  "catalog",
-  "preview",
-  "gitops",
-]
+const VALID_TABS: readonly ActiveTab[] = ["topology", "catalog", "preview"]
 
 function parseHashTab(hash: string): ActiveTab {
   const normalized = hash.replace(/^#\/?/, "").trim() as ActiveTab
@@ -240,18 +229,6 @@ export const App: React.FC = () => {
             <span>PR &amp; Preview Inspector</span>
           </button>
 
-          <button
-            onClick={() => navigateToTab("gitops")}
-            className={`w-full flex items-center space-x-3 px-3.5 py-2.5 rounded-xl text-xs font-semibold transition-all ${
-              activeTab === "gitops"
-                ? "bg-indigo-600 text-white shadow-lg shadow-indigo-600/20"
-                : "text-slate-400 hover:text-slate-200 hover:bg-slate-800/60"
-            }`}
-          >
-            <Activity className="h-4 w-4" />
-            <span>GitOps &amp; Canary Console</span>
-          </button>
-
           {/* Unauthenticated info card in sidebar if unauthenticated */}
           {!authStatus.authenticated && (
             <div className="pt-6">
@@ -331,12 +308,6 @@ export const App: React.FC = () => {
                 />
               )}
               {activeTab === "preview" && <PreviewInspectorView />}
-              {activeTab === "gitops" && (
-                <GitOpsConsoleView
-                  onEditRelease={handleEditRelease}
-                  onNavigateToPreview={() => navigateToTab("preview")}
-                />
-              )}
             </React.Suspense>
           )}
         </main>

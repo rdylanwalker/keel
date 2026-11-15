@@ -91,6 +91,11 @@ impl KindBootstrapTarget {
         }
     }
 
+    /// Builds the `kind` cluster config YAML mounting `/var/run/docker.sock` for local-dev nested `kind`.
+    pub fn build_local_dev_kind_config_yaml() -> &'static str {
+        "kind: Cluster\napiVersion: kind.x-k8s.io/v1alpha4\nnodes:\n  - role: control-plane\n    extraMounts:\n      - hostPath: /var/run/docker.sock\n        containerPath: /var/run/docker.sock\n"
+    }
+
     /// Builds explicit CLI arguments for `kind create cluster`.
     pub fn build_create_args(cfg: &BootstrapConfig) -> Result<Vec<String>, CoreError> {
         Self::ensure_kind_target(cfg)?;
@@ -186,12 +191,30 @@ impl BootstrapTarget for KindBootstrapTarget {
         &self,
         cfg: &BootstrapConfig,
     ) -> Result<ClusterConnection, CoreError> {
-        let create_args = Self::build_create_args(cfg)?;
+        let mut temp_config_path: Option<PathBuf> = None;
+        let effective_cfg =
+            if cfg.kind_config_path.is_none() && cfg.local_dev_docker_socket_exception {
+                let path = std::env::temp_dir()
+                    .join(format!("keel-kind-config-{}.yaml", cfg.cluster_name));
+                tokio::fs::write(&path, Self::build_local_dev_kind_config_yaml()).await?;
+                temp_config_path = Some(path.clone());
+                let mut cloned = cfg.clone();
+                cloned.kind_config_path = Some(path);
+                Some(cloned)
+            } else {
+                None
+            };
+        let create_args = Self::build_create_args(effective_cfg.as_ref().unwrap_or(cfg))?;
         tracing::info!(
             cluster = %cfg.cluster_name,
+            local_dev_docker_socket_exception = cfg.local_dev_docker_socket_exception,
             "Provisioning Stage 0 kind cluster"
         );
-        self.run_kind(&create_args).await?;
+        let run_result = self.run_kind(&create_args).await;
+        if let Some(path) = temp_config_path {
+            let _ = tokio::fs::remove_file(&path).await;
+        }
+        run_result?;
 
         let get_kc_args = Self::build_get_kubeconfig_args(cfg)?;
         let kubeconfig_yaml = self.run_kind(&get_kc_args).await?;
@@ -539,6 +562,10 @@ users:
         assert!(KindBootstrapTarget::build_create_args(&wrong).is_err());
         assert!(KindBootstrapTarget::build_get_kubeconfig_args(&wrong).is_err());
         assert!(KindBootstrapTarget::build_delete_args(&wrong).is_err());
+
+        let kind_cfg = KindBootstrapTarget::build_local_dev_kind_config_yaml();
+        assert!(kind_cfg.contains("kind.x-k8s.io/v1alpha4"));
+        assert!(kind_cfg.contains("/var/run/docker.sock"));
     }
 
     #[test]

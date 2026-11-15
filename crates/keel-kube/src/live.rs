@@ -113,7 +113,14 @@ pub trait LiveStatusSource: Send + Sync {
         _name: &str,
     ) -> Result<String, KubeError> {
         Err(KubeError::InvalidInput(
-            "Live Kubernetes cluster is not connected".to_string(),
+            "Live Kubernetes cluster connection required to restart stack workspace".to_string(),
+        ))
+    }
+
+    /// Annotates a Flux `HelmRelease` (or `Kustomization`) with `reconcile.fluxcd.io/requestedAt`.
+    async fn reconcile_release(&self, _namespace: &str, _name: &str) -> Result<String, KubeError> {
+        Err(KubeError::InvalidInput(
+            "Live Kubernetes cluster connection required to reconcile release".to_string(),
         ))
     }
 }
@@ -185,6 +192,20 @@ impl KubeClusterStatusReader {
             if name.is_empty() {
                 continue;
             }
+            if !is_stack
+                && kind == "Kustomization"
+                && item
+                    .data
+                    .pointer("/spec/healthChecks")
+                    .and_then(Value::as_array)
+                    .is_some_and(|checks| {
+                        checks
+                            .iter()
+                            .any(|hc| hc.get("kind").and_then(Value::as_str) == Some("Stack"))
+                    })
+            {
+                continue;
+            }
             if item.metadata.deletion_timestamp.is_some() {
                 out.insert((ns, name), LiveResourceStatus::Deleting);
             } else if let Some(status) = extract_ready_status(&item.data, is_stack) {
@@ -192,6 +213,37 @@ impl KubeClusterStatusReader {
             }
         }
         out
+    }
+
+    /// Reads `spec.backend` from a live PKO `Stack` resource, if present.
+    pub async fn read_stack_backend(&self, namespace: &str, name: &str) -> Option<String> {
+        let ar = ApiResource {
+            group: "pulumi.com".to_string(),
+            version: "v1".to_string(),
+            api_version: "pulumi.com/v1".to_string(),
+            kind: "Stack".to_string(),
+            plural: "stacks".to_string(),
+        };
+        let api: Api<DynamicObject> = Api::namespaced_with(self.client.clone(), namespace, &ar);
+        let obj = api.get(name).await.ok()?;
+        obj.data
+            .get("spec")
+            .and_then(|s| s.get("backend"))
+            .and_then(|b| b.as_str())
+            .map(str::to_string)
+    }
+
+    /// Returns `true` if `Service/keel-docker-proxy` is deployed in `flux-system` for local `kind`-in-`kind` dev.
+    pub async fn has_docker_proxy_service(&self) -> bool {
+        let ar = ApiResource {
+            group: String::new(),
+            version: "v1".to_string(),
+            api_version: "v1".to_string(),
+            kind: "Service".to_string(),
+            plural: "services".to_string(),
+        };
+        let api: Api<DynamicObject> = Api::namespaced_with(self.client.clone(), "flux-system", &ar);
+        api.get("keel-docker-proxy").await.is_ok()
     }
 }
 
@@ -504,6 +556,53 @@ impl LiveStatusSource for KubeClusterStatusReader {
         Ok(format!(
             "Triggered rollout restart for StatefulSet {namespace}/{sts_name}"
         ))
+    }
+
+    async fn reconcile_release(&self, namespace: &str, name: &str) -> Result<String, KubeError> {
+        let requested_at = Utc::now().to_rfc3339();
+        let patch = json!({
+            "metadata": {
+                "annotations": {
+                    "reconcile.fluxcd.io/requestedAt": requested_at
+                }
+            }
+        });
+
+        let hr_ar = ApiResource {
+            group: "helm.toolkit.fluxcd.io".to_string(),
+            version: "v2".to_string(),
+            api_version: "helm.toolkit.fluxcd.io/v2".to_string(),
+            kind: "HelmRelease".to_string(),
+            plural: "helmreleases".to_string(),
+        };
+        let hr_api: Api<DynamicObject> =
+            Api::namespaced_with(self.client.clone(), namespace, &hr_ar);
+        match hr_api
+            .patch(name, &PatchParams::default(), &Patch::Merge(&patch))
+            .await
+        {
+            Ok(_) => Ok(format!(
+                "Requested immediate Flux reconciliation for HelmRelease {namespace}/{name}"
+            )),
+            Err(kube::Error::Api(err)) if err.code == 404 => {
+                let ks_ar = ApiResource {
+                    group: "kustomize.toolkit.fluxcd.io".to_string(),
+                    version: "v1".to_string(),
+                    api_version: "kustomize.toolkit.fluxcd.io/v1".to_string(),
+                    kind: "Kustomization".to_string(),
+                    plural: "kustomizations".to_string(),
+                };
+                let ks_api: Api<DynamicObject> =
+                    Api::namespaced_with(self.client.clone(), namespace, &ks_ar);
+                ks_api
+                    .patch(name, &PatchParams::default(), &Patch::Merge(&patch))
+                    .await?;
+                Ok(format!(
+                    "Requested immediate Flux reconciliation for Kustomization {namespace}/{name}"
+                ))
+            }
+            Err(err) => Err(err.into()),
+        }
     }
 }
 

@@ -170,7 +170,7 @@ export interface ReleaseSummary {
   tenant: string
   namespace: string
   type: "helm" | "kustomize" | "canary"
-  status: "healthy" | "progressing" | "failed" | "degraded"
+  status: "healthy" | "progressing" | "failed" | "degraded" | string
   version: string
   chart?: string
   runtime?: string

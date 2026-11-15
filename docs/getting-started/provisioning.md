@@ -78,13 +78,14 @@ keel app install \
   --server http://127.0.0.1:8080
 ```
 
-Monitor deployment progress and live events in **GitOps & Canary Console**.
+Monitor deployment progress, Flagger canary weights, and live SSE events in **Topology Map**.
 
 > **Status Lifecycle (`Pending` → `Reconciling` → `Synced` / `Ready` → `Deleting`):** When `keel serve` is connected to a bootstrapped management cluster (via `KUBECONFIG` or in-cluster config), it overlays live Flux CD and PKO v2 CRD conditions onto the Git state. If no cluster is reachable (for example, `just serve` without a cluster) or Flux/PKO has not reconciled the resource yet, stacks and releases remain `Pending`. Resources removed from `main` whose Kubernetes objects are still terminating remain visible as `Deleting` until cluster cleanup completes.
 
-## 6. Edit or Delete Deployed Resources
+## 6. Edit, Reconcile, or Delete Deployed Resources
 
-From **Topology Map** or **GitOps & Canary Console**:
+From **Topology Map**:
 
 - **Edit:** Click **Edit** on any infrastructure stack or application release to load its persisted configuration into **Catalog & Form Wizard** and open an update PR.
+- **Restart / Reconcile:** Click **Restart Workspace** on an infrastructure stack to restart its PKO v2 `Workspace` pod, or **Reconcile Now** on an application release to trigger immediate Flux CD reconciliation (`reconcile.fluxcd.io/requestedAt`).
 - **Delete:** Click **Delete** on any stack or release to open a removal PR. After merging, the resource transitions to `Deleting` until Flux CD and PKO v2 finish tearing down the underlying cluster/cloud resources.
