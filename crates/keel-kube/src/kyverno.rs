@@ -64,8 +64,8 @@ impl Default for DockerSocketExceptionConfig {
             exception_namespace: KEEL_SYSTEM_NAMESPACE.to_string(),
             allowed_namespaces: vec![KEEL_PREVIEWS_NAMESPACE.to_string(), "tenant-*".to_string()],
             pod_match_labels: BTreeMap::from([(
-                "app.kubernetes.io/managed-by".to_string(),
-                "pulumi-kubernetes-operator".to_string(),
+                "auto.pulumi.com/component".to_string(),
+                "workspace".to_string(),
             )]),
             docker_socket_path: "/var/run/docker.sock".to_string(),
             allow_docker_host_env: true,
@@ -261,6 +261,18 @@ pub fn build_restrict_pulumi_providers_policy(
     }))
 }
 
+fn pod_spec_docker_expr(pod_spec_path: &str, socket_path: &str, allow_docker_host: bool) -> String {
+    if allow_docker_host {
+        format!(
+            "((has({pod_spec_path}.volumes) && {pod_spec_path}.volumes.exists(v, has(v.hostPath) && v.hostPath.path == '{socket_path}')) || (has({pod_spec_path}.containers) && {pod_spec_path}.containers.exists(c, has(c.env) && c.env.exists(e, e.name == 'DOCKER_HOST'))))"
+        )
+    } else {
+        format!(
+            "(has({pod_spec_path}.volumes) && {pod_spec_path}.volumes.exists(v, has(v.hostPath) && v.hostPath.path == '{socket_path}'))"
+        )
+    }
+}
+
 /// Generates an explicit `policies.kyverno.io/v1` `PolicyException` (`local-kind-docker-socket-exception`)
 /// allowing PKO workspace pods in `keel-previews` / `tenant-*` to mount `/var/run/docker.sock`
 /// (or use `DOCKER_HOST`) when `local_dev_docker_socket_exception` is enabled.
@@ -313,7 +325,7 @@ pub fn build_local_kind_docker_socket_exception(
             .iter()
             .map(|(k, v)| {
                 format!(
-                    "has(object.metadata.labels) && ('{k}' in object.metadata.labels) && object.metadata.labels['{k}'] == '{v}'"
+                    "((has(object.metadata.labels) && ('{k}' in object.metadata.labels) && object.metadata.labels['{k}'] == '{v}') || (has(object.spec.template) && has(object.spec.template.metadata) && has(object.spec.template.metadata.labels) && ('{k}' in object.spec.template.metadata.labels) && object.spec.template.metadata.labels['{k}'] == '{v}'))"
                 )
             })
             .collect::<Vec<_>>()
@@ -324,17 +336,19 @@ pub fn build_local_kind_docker_socket_exception(
         }));
     }
 
-    let socket_expr = if config.allow_docker_host_env {
-        format!(
-            "(has(object.spec.volumes) && object.spec.volumes.exists(v, has(v.hostPath) && v.hostPath.path == '{}')) || object.spec.containers.exists(c, has(c.env) && c.env.exists(e, e.name == 'DOCKER_HOST'))",
-            config.docker_socket_path
-        )
-    } else {
-        format!(
-            "has(object.spec.volumes) && object.spec.volumes.exists(v, has(v.hostPath) && v.hostPath.path == '{}')",
-            config.docker_socket_path
-        )
-    };
+    let pod_socket_expr = pod_spec_docker_expr(
+        "object.spec",
+        &config.docker_socket_path,
+        config.allow_docker_host_env,
+    );
+    let template_socket_expr = pod_spec_docker_expr(
+        "object.spec.template.spec",
+        &config.docker_socket_path,
+        config.allow_docker_host_env,
+    );
+    let socket_expr = format!(
+        "({pod_socket_expr}) || (has(object.spec.template) && has(object.spec.template.spec) && {template_socket_expr})"
+    );
     match_conditions.push(json!({
         "name": "docker-socket-or-host",
         "expression": socket_expr
@@ -490,6 +504,8 @@ mod tests {
         assert!(yaml.contains("kind: PolicyException"));
         assert!(yaml.contains("/var/run/docker.sock"));
         assert!(yaml.contains("DOCKER_HOST"));
+        assert!(yaml.contains("auto.pulumi.com/component"));
+        assert!(yaml.contains("object.spec.template.spec"));
     }
 
     #[test]
