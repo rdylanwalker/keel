@@ -1,4 +1,4 @@
-import { render, screen, fireEvent, waitFor } from "@testing-library/react"
+import { render, screen, fireEvent, waitFor, act } from "@testing-library/react"
 import { describe, it, expect, vi, beforeEach } from "vitest"
 import { TopologyView } from "./TopologyView"
 import * as api from "../lib/api"
@@ -373,21 +373,23 @@ describe("TopologyView component", () => {
 
     // Receive live SSE events
     await waitFor(() => expect(onEventCb).not.toBeNull())
-    onEventCb!({
-      kind: "HelmRelease",
-      namespace: "tenant-default",
-      name: "podinfo",
-      status: "Ready",
-      message: "Helm upgrade succeeded",
-      timestamp: "now",
-    })
-    onEventCb!({
-      kind: "Stack",
-      namespace: "tenant-default",
-      name: "kind-dev",
-      status: "Ready",
-      message: "Stack synced",
-      timestamp: "now",
+    act(() => {
+      onEventCb!({
+        kind: "HelmRelease",
+        namespace: "tenant-default",
+        name: "podinfo",
+        status: "Ready",
+        message: "Helm upgrade succeeded",
+        timestamp: "now",
+      })
+      onEventCb!({
+        kind: "Stack",
+        namespace: "tenant-default",
+        name: "kind-dev",
+        status: "Ready",
+        message: "Stack synced",
+        timestamp: "now",
+      })
     })
 
     expect(
@@ -462,8 +464,10 @@ describe("TopologyView component", () => {
       revision: "6.7.1",
       timestamp: "2026-11-15T10:00:00Z",
     }
-    onEventCb!(dupEvent)
-    onEventCb!(dupEvent)
+    act(() => {
+      onEventCb!(dupEvent)
+      onEventCb!(dupEvent)
+    })
 
     const matches = await screen.findAllByText("Reconciliation succeeded")
     expect(matches).toHaveLength(1)
