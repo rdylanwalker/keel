@@ -32,6 +32,16 @@ pub struct LiveResourceInfo {
     pub resource_count: Option<u32>,
 }
 
+/// Live status and traffic weight for a Flagger `Canary` resource.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanaryStatusInfo {
+    pub status: LiveResourceStatus,
+    pub last_synced: Option<String>,
+    pub canary_weight: Option<u32>,
+    pub canary_phase: Option<String>,
+    pub primary_version: Option<String>,
+}
+
 /// Normalized Kubernetes resource condition (`Ready`, `Reconciling`, `Stalled`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -138,6 +148,11 @@ pub trait LiveStatusSource: Send + Sync {
                 )
             })
             .collect()
+    }
+
+    /// Returns `(namespace, name) -> CanaryStatusInfo` for Flagger `Canary` resources.
+    async fn canary_statuses(&self) -> HashMap<(String, String), CanaryStatusInfo> {
+        HashMap::new()
     }
 
     /// Fetches detailed conditions, workspace pod status, events, and logs for a `Stack`.
@@ -397,6 +412,101 @@ impl LiveStatusSource for KubeClusterStatusReader {
             .await;
         for (key, info) in kustomizations {
             out.entry(key).or_insert(info);
+        }
+        out
+    }
+
+    async fn canary_statuses(&self) -> HashMap<(String, String), CanaryStatusInfo> {
+        let ar = ApiResource {
+            group: "flagger.app".to_string(),
+            version: "v1beta1".to_string(),
+            api_version: "flagger.app/v1beta1".to_string(),
+            kind: "Canary".to_string(),
+            plural: "canaries".to_string(),
+        };
+        let api: Api<DynamicObject> = Api::all_with(self.client.clone(), &ar);
+        let Ok(list) = api.list(&ListParams::default()).await else {
+            return HashMap::new();
+        };
+
+        let deploy_api: Api<k8s_openapi::api::apps::v1::Deployment> = Api::all(self.client.clone());
+        let mut primary_versions: HashMap<(String, String), String> = HashMap::new();
+        if let Ok(deploys) = deploy_api.list(&ListParams::default()).await {
+            for dep in deploys.items {
+                let Some(dep_name) = dep.metadata.name.as_deref() else {
+                    continue;
+                };
+                let Some(base_name) = dep_name.strip_suffix("-primary") else {
+                    continue;
+                };
+                let ns = dep
+                    .metadata
+                    .namespace
+                    .clone()
+                    .unwrap_or_else(|| "default".to_string());
+                let label_ver = dep
+                    .metadata
+                    .labels
+                    .as_ref()
+                    .and_then(|l| l.get("app.kubernetes.io/version"))
+                    .map(|v| v.trim().to_string())
+                    .filter(|v| !v.is_empty());
+                let image_ver = dep
+                    .spec
+                    .as_ref()
+                    .and_then(|s| s.template.spec.as_ref())
+                    .and_then(|ps| ps.containers.first())
+                    .and_then(|c| c.image.as_deref())
+                    .and_then(|img| img.rsplit_once(':').map(|(_, tag)| tag.to_string()))
+                    .filter(|v| !v.is_empty());
+                if let Some(ver) = label_ver.or(image_ver) {
+                    primary_versions.insert((ns, base_name.to_string()), ver);
+                }
+            }
+        }
+
+        let mut out = HashMap::new();
+        for item in list.items {
+            let Some(name) = item.metadata.name.clone() else {
+                continue;
+            };
+            let namespace = item
+                .metadata
+                .namespace
+                .clone()
+                .unwrap_or_else(|| "default".to_string());
+            let status_obj = item.data.get("status");
+            let phase = status_obj
+                .and_then(|s| s.get("phase"))
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let status = match phase.as_deref().unwrap_or_default() {
+                "Succeeded" | "Initialized" => LiveResourceStatus::Ready,
+                "Failed" => LiveResourceStatus::Error,
+                _ => LiveResourceStatus::Reconciling,
+            };
+            let canary_weight = status_obj
+                .and_then(|s| s.get("canaryWeight"))
+                .and_then(Value::as_u64)
+                .and_then(|w| u32::try_from(w).ok());
+            let last_synced = status_obj
+                .and_then(|s| s.get("lastTransitionTime"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .or_else(|| extract_last_synced(&item.data, None));
+            let primary_version = primary_versions
+                .get(&(namespace.clone(), name.clone()))
+                .cloned();
+            out.insert(
+                (namespace, name),
+                CanaryStatusInfo {
+                    status,
+                    last_synced,
+                    canary_weight,
+                    canary_phase: phase,
+                    primary_version,
+                },
+            );
         }
         out
     }
