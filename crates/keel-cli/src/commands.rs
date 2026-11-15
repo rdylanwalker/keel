@@ -583,7 +583,8 @@ async fn start_forgejo_port_forward(
     context: Option<&str>,
     kubeconfig: Option<&Path>,
 ) -> Result<TempPortForward, CliError> {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let listener = std::net::TcpListener::bind("127.0.0.1:3000")
+        .or_else(|_| std::net::TcpListener::bind("127.0.0.1:0"))?;
     let local_port = listener.local_addr()?.port();
     drop(listener);
 
@@ -626,6 +627,57 @@ async fn start_forgejo_port_forward(
 
     Err(CliError::Validation(format!(
         "timed out waiting for Forgejo port-forward on 127.0.0.1:{local_port}"
+    )))
+}
+
+async fn start_dex_port_forward(
+    context: Option<&str>,
+    kubeconfig: Option<&Path>,
+) -> Result<TempPortForward, CliError> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:5556")
+        .or_else(|_| std::net::TcpListener::bind("127.0.0.1:0"))?;
+    let local_port = listener.local_addr()?.port();
+    drop(listener);
+
+    let mut cmd = tokio::process::Command::new("kubectl");
+    if let Some(kc) = kubeconfig {
+        cmd.arg("--kubeconfig").arg(kc);
+    }
+    if let Some(ctx) = context {
+        cmd.arg("--context").arg(ctx);
+    }
+    cmd.args([
+        "-n",
+        KEEL_SYSTEM_NAMESPACE,
+        "port-forward",
+        "svc/dex",
+        &format!("{local_port}:5556"),
+    ])
+    .stdout(std::process::Stdio::null())
+    .stderr(std::process::Stdio::null());
+
+    let child = cmd
+        .spawn()
+        .map_err(|e| CliError::Validation(format!("failed to spawn kubectl port-forward: {e}")))?;
+    let pf = TempPortForward { local_port, child };
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .map_err(|e| CliError::Validation(e.to_string()))?;
+    let health_url = format!("http://127.0.0.1:{local_port}/dex/.well-known/openid-configuration");
+
+    for _ in 0..40 {
+        if let Ok(resp) = client.get(&health_url).send().await
+            && resp.status().is_success()
+        {
+            return Ok(pf);
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    Err(CliError::Validation(format!(
+        "timed out waiting for Dex OIDC port-forward on 127.0.0.1:{local_port}"
     )))
 }
 
@@ -1487,6 +1539,14 @@ async fn install_stage0_core_addons(
                 "--set",
                 "gitea.config.database.DB_TYPE=sqlite3",
                 "--set",
+                "gitea.config.oauth2_client.ENABLE_AUTO_REGISTRATION=true",
+                "--set",
+                "gitea.config.oauth2_client.ACCOUNT_LINKING=auto",
+                "--set",
+                "gitea.config.oauth2_client.USERNAME=userid",
+                "--set",
+                "gitea.config.oauth2_client.OPENID_CONNECT_SCOPES=openid email profile",
+                "--set",
                 "persistence.enabled=false",
                 "--set",
                 "valkey-cluster.enabled=false",
@@ -1496,6 +1556,227 @@ async fn install_stage0_core_addons(
                 "postgresql.enabled=false",
                 "--set",
                 "postgresql-ha.enabled=false",
+                "--wait",
+                "--timeout",
+                "5m",
+            ],
+        )
+        .await?;
+    }
+
+    tracing::info!("Installing Envoy Gateway into `keel-system`");
+    run_helm_install(
+        ctx,
+        kc,
+        &[
+            "upgrade",
+            "--install",
+            "envoy-gateway",
+            "oci://docker.io/envoyproxy/gateway-helm",
+            "--version",
+            "v1.3.0",
+            "--namespace",
+            KEEL_SYSTEM_NAMESPACE,
+            "--create-namespace",
+            "--wait",
+            "--timeout",
+            "5m",
+        ],
+    )
+    .await?;
+    let gateway_yaml = format!(
+        "apiVersion: gateway.networking.k8s.io/v1\n\
+         kind: GatewayClass\n\
+         metadata:\n\
+         \x20 name: keel-envoy\n\
+         \x20 labels:\n\
+         \x20   app.kubernetes.io/managed-by: keel\n\
+         spec:\n\
+         \x20 controllerName: gateway.envoyproxy.io/gatewayclass-controller\n\
+         ---\n\
+         apiVersion: gateway.networking.k8s.io/v1\n\
+         kind: Gateway\n\
+         metadata:\n\
+         \x20 name: keel-ingress\n\
+         \x20 namespace: {KEEL_SYSTEM_NAMESPACE}\n\
+         \x20 labels:\n\
+         \x20   app.kubernetes.io/managed-by: keel\n\
+         spec:\n\
+         \x20 gatewayClassName: keel-envoy\n\
+         \x20 listeners:\n\
+         \x20   - name: http\n\
+         \x20     protocol: HTTP\n\
+         \x20     port: 80\n\
+         \x20     allowedRoutes:\n\
+         \x20       namespaces:\n\
+         \x20         from: All\n\
+         \x20   - name: http-local\n\
+         \x20     protocol: HTTP\n\
+         \x20     port: 8888\n\
+         \x20     allowedRoutes:\n\
+         \x20       namespaces:\n\
+         \x20         from: All\n"
+    );
+    run_kubectl_apply(ctx, kc, &gateway_yaml).await?;
+
+    tracing::info!("Installing Prometheus into `keel-system` for Flagger canary telemetry");
+    run_helm_install(
+        ctx,
+        kc,
+        &[
+            "upgrade",
+            "--install",
+            "prometheus",
+            "prometheus",
+            "--repo",
+            "https://prometheus-community.github.io/helm-charts",
+            "--version",
+            "27.5.0",
+            "--namespace",
+            KEEL_SYSTEM_NAMESPACE,
+            "--set",
+            "alertmanager.enabled=false",
+            "--set",
+            "kube-state-metrics.enabled=true",
+            "--set",
+            "prometheus-node-exporter.enabled=false",
+            "--set",
+            "prometheus-pushgateway.enabled=false",
+            "--set",
+            "server.fullnameOverride=prometheus",
+            "--set",
+            "server.retention=7d",
+            "--set",
+            "server.persistentVolume.enabled=false",
+            "--wait",
+            "--timeout",
+            "5m",
+        ],
+    )
+    .await?;
+
+    tracing::info!("Installing Flagger into `keel-system` for Gateway API canary rollouts");
+    run_helm_install(
+        ctx,
+        kc,
+        &[
+            "upgrade",
+            "--install",
+            "flagger",
+            "flagger",
+            "--repo",
+            "https://flagger.app",
+            "--version",
+            "1.40.0",
+            "--namespace",
+            KEEL_SYSTEM_NAMESPACE,
+            "--set",
+            "meshProvider=gatewayapi:v1",
+            "--set",
+            "metricsServer=http://prometheus.keel-system:80",
+            "--set",
+            "podMonitor.enabled=false",
+            "--wait",
+            "--timeout",
+            "5m",
+        ],
+    )
+    .await?;
+
+    let metric_templates_yaml = format!(
+        "apiVersion: flagger.app/v1beta1\n\
+         kind: MetricTemplate\n\
+         metadata:\n\
+         \x20 name: envoy-gateway-request-success-rate\n\
+         \x20 namespace: {KEEL_SYSTEM_NAMESPACE}\n\
+         \x20 labels:\n\
+         \x20   app.kubernetes.io/managed-by: keel\n\
+         spec:\n\
+         \x20 provider:\n\
+         \x20   type: prometheus\n\
+         \x20   address: http://prometheus.{KEEL_SYSTEM_NAMESPACE}:80\n\
+         \x20 query: |\n\
+         \x20   sum(rate(envoy_cluster_upstream_rq{{envoy_cluster_name=~\"httproute/{{{{ namespace }}}}/{{{{ target }}}}/.*\",envoy_response_code!~\"5.*\"}}[{{{{ interval }}}}]))\n\
+         \x20   /\n\
+         \x20   sum(rate(envoy_cluster_upstream_rq{{envoy_cluster_name=~\"httproute/{{{{ namespace }}}}/{{{{ target }}}}/.*\"}}[{{{{ interval }}}}]))\n\
+         \x20   * 100\n\
+         ---\n\
+         apiVersion: flagger.app/v1beta1\n\
+         kind: MetricTemplate\n\
+         metadata:\n\
+         \x20 name: envoy-gateway-request-duration\n\
+         \x20 namespace: {KEEL_SYSTEM_NAMESPACE}\n\
+         \x20 labels:\n\
+         \x20   app.kubernetes.io/managed-by: keel\n\
+         spec:\n\
+         \x20 provider:\n\
+         \x20   type: prometheus\n\
+         \x20   address: http://prometheus.{KEEL_SYSTEM_NAMESPACE}:80\n\
+         \x20 query: |\n\
+         \x20   histogram_quantile(0.99,\n\
+         \x20     sum(rate(envoy_cluster_upstream_rq_time_bucket{{envoy_cluster_name=~\"httproute/{{{{ namespace }}}}/{{{{ target }}}}/.*\"}}[{{{{ interval }}}}])) by (le)\n\
+         \x20   )\n"
+    );
+    run_kubectl_apply(ctx, kc, &metric_templates_yaml).await?;
+
+    if let Some(ref dex_cfg) = artifacts.dex_config_yaml {
+        tracing::info!(
+            "Applying Stage 0 Dex OIDC config Secret and installing Dex into `keel-system`"
+        );
+        let dex_secret = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": {
+                "name": &artifacts.dex_secret_name,
+                "namespace": &artifacts.dex_secret_namespace,
+                "labels": {
+                    "app.kubernetes.io/managed-by": "keel",
+                    "keel.io/secret-kind": "dex-config",
+                },
+            },
+            "type": "Opaque",
+            "stringData": {
+                "config.yaml": dex_cfg,
+            },
+        });
+        let dex_secret_yaml = serde_yml::to_string(&dex_secret)?;
+        run_kubectl_apply(ctx, kc, &dex_secret_yaml).await?;
+
+        run_helm_install(
+            ctx,
+            kc,
+            &[
+                "upgrade",
+                "--install",
+                "dex",
+                "dex",
+                "--repo",
+                "https://charts.dexidp.io",
+                "--version",
+                "0.21.0",
+                "--namespace",
+                KEEL_SYSTEM_NAMESPACE,
+                "--create-namespace",
+                "--set",
+                "replicaCount=1",
+                "--set",
+                "configSecret.create=false",
+                "--set",
+                &format!("configSecret.name={}", artifacts.dex_secret_name),
+                "--set",
+                "service.ports.http.port=5556",
+                "--set",
+                "podSecurityContext.runAsNonRoot=true",
+                "--set",
+                "podSecurityContext.runAsUser=1001",
+                "--set",
+                "podSecurityContext.seccompProfile.type=RuntimeDefault",
+                "--set",
+                "securityContext.allowPrivilegeEscalation=false",
+                "--set",
+                "securityContext.runAsNonRoot=true",
+                "--set",
+                "securityContext.capabilities.drop={ALL}",
                 "--wait",
                 "--timeout",
                 "5m",
@@ -2252,7 +2533,7 @@ pub async fn build_serve_state(args: &ServeArgs) -> Result<(AppState, Option<Str
 async fn build_serve_state_with_forward(
     args: &ServeArgs,
     enable_in_cluster_port_forward: bool,
-) -> Result<(AppState, Option<String>, Option<TempPortForward>), CliError> {
+) -> Result<(AppState, Option<String>, Vec<TempPortForward>), CliError> {
     if args.bind.trim().is_empty() || !args.bind.contains(':') {
         return Err(CliError::Validation(format!(
             "bind address must be in '<host>:<port>' format, got '{}'",
@@ -2375,7 +2656,7 @@ async fn build_serve_state_with_forward(
         .as_ref()
         .map(|c| c.auth_phase)
         .unwrap_or(AuthPhase::OidcActive);
-    let oidc_cfg = parsed_keel_cfg
+    let mut oidc_cfg = parsed_keel_cfg
         .as_ref()
         .and_then(|c| c.oidc.as_ref())
         .filter(|o| o.enabled)
@@ -2416,7 +2697,7 @@ async fn build_serve_state_with_forward(
             .await;
     }
 
-    let mut forge_pf: Option<TempPortForward> = None;
+    let mut port_forwards: Vec<TempPortForward> = Vec::new();
     let mut api_url_override: Option<String> = None;
     if enable_in_cluster_port_forward
         && kube_reader.is_some()
@@ -2442,7 +2723,27 @@ async fn build_serve_state_with_forward(
                 .set_remote_url(&repo_workdir, "origin", &local_remote)
                 .await;
         }
-        forge_pf = Some(pf);
+        port_forwards.push(pf);
+    }
+
+    if enable_in_cluster_port_forward
+        && kube_reader.is_some()
+        && let Some(ref mut oidc) = oidc_cfg
+        && oidc.issuer_url.contains(".svc.cluster.local")
+    {
+        match start_dex_port_forward(None, None).await {
+            Ok(pf) => {
+                tracing::info!(
+                    local_port = pf.local_port,
+                    "Started automatic port-forward to in-cluster Dex OIDC"
+                );
+                oidc.issuer_url = format!("http://127.0.0.1:{}/dex", pf.local_port);
+                port_forwards.push(pf);
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "Failed to start automatic port-forward to in-cluster Dex OIDC");
+            }
+        }
     }
 
     let forge = build_forge_provider(
@@ -2531,7 +2832,7 @@ async fn build_serve_state_with_forward(
         )));
     }
 
-    Ok((state, None, forge_pf))
+    Ok((state, None, port_forwards))
 }
 
 /// Binds `keel-server` on `args.bind` and runs until `shutdown` resolves.

@@ -105,20 +105,45 @@ pub fn decrypt_session_token(
         .map_err(|_| ServerError::Unauthorized("Corrupted session claims".to_string()))
 }
 
-fn build_session_cookie_header(token: &str, max_age: i64) -> Result<HeaderValue, ServerError> {
-    let cookie = format!(
-        "{SESSION_COOKIE_NAME}={token}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age={max_age}"
-    );
-    HeaderValue::from_str(&cookie)
-        .map_err(|e| ServerError::Internal(format!("Invalid Set-Cookie header: {e}")))
+fn is_secure_request(headers: &HeaderMap) -> bool {
+    if headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|p| p.eq_ignore_ascii_case("https"))
+    {
+        return true;
+    }
+    let host = headers
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    !(host.starts_with("127.0.0.1") || host.starts_with("localhost") || host.starts_with("[::1]"))
 }
 
-fn build_pkce_cookie_header(token: &str, max_age: i64) -> Result<HeaderValue, ServerError> {
+fn build_session_cookie_header(
+    token: &str,
+    max_age: i64,
+    secure: bool,
+) -> Result<HeaderValue, ServerError> {
+    let secure_attr = if secure { "Secure; " } else { "" };
     let cookie = format!(
-        "{PKCE_COOKIE_NAME}={token}; HttpOnly; Secure; SameSite=Strict; Path=/api/v1/auth; Max-Age={max_age}"
+        "{SESSION_COOKIE_NAME}={token}; HttpOnly; {secure_attr}SameSite=Lax; Path=/; Max-Age={max_age}"
     );
     HeaderValue::from_str(&cookie)
-        .map_err(|e| ServerError::Internal(format!("Invalid PKCE Set-Cookie header: {e}")))
+        .map_err(|e| ServerError::Internal(format!("Invalid session cookie header: {e}")))
+}
+
+fn build_pkce_cookie_header(
+    token: &str,
+    max_age: i64,
+    secure: bool,
+) -> Result<HeaderValue, ServerError> {
+    let secure_attr = if secure { "Secure; " } else { "" };
+    let cookie = format!(
+        "{PKCE_COOKIE_NAME}={token}; HttpOnly; {secure_attr}SameSite=Lax; Path=/api/v1/auth; Max-Age={max_age}"
+    );
+    HeaderValue::from_str(&cookie)
+        .map_err(|e| ServerError::Internal(format!("Invalid PKCE cookie header: {e}")))
 }
 
 fn extract_cookie_value<'a>(headers: &'a HeaderMap, cookie_name: &str) -> Option<&'a str> {
@@ -180,6 +205,15 @@ async fn resolve_oidc_endpoints(issuer_url: &str) -> (String, String) {
         && resp.status().is_success()
         && let Ok(doc) = resp.json::<OidcDiscoveryDocument>().await
     {
+        // When `keel serve` port-forwards an in-cluster Dex instance to `127.0.0.1`,
+        // Dex's discovery document advertises its configured issuer URL (e.g.
+        // `.svc.cluster.local` or `dex.keel.local`), which a host browser without
+        // custom `/etc/hosts` entries cannot resolve.
+        if (issuer.starts_with("http://127.0.0.1:") || issuer.starts_with("http://localhost:"))
+            && !doc.authorization_endpoint.starts_with(issuer)
+        {
+            return (format!("{issuer}/auth"), format!("{issuer}/token"));
+        }
         return (doc.authorization_endpoint, doc.token_endpoint);
     }
     // Standard Dex OIDC endpoints fallback
@@ -250,9 +284,10 @@ pub struct OidcLoginQuery {
 /// `GET /api/v1/auth/login`
 ///
 /// Initiates the OIDC Authorization Code + PKCE (`S256`) flow, storing the PKCE verifier
-/// in a short-lived `AES-256-GCM` encrypted `HttpOnly; Secure; SameSite=Strict` cookie.
+/// in a short-lived `AES-256-GCM` encrypted `HttpOnly; SameSite=Lax` cookie.
 pub async fn oidc_login(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(query): Query<OidcLoginQuery>,
 ) -> Result<Response, ServerError> {
     let oidc_guard = state.oidc_config.read().await;
@@ -272,9 +307,27 @@ pub async fn oidc_login(
     let challenge_digest = Sha256::digest(code_verifier.as_bytes());
     let code_challenge = URL_SAFE_NO_PAD.encode(challenge_digest);
 
+    let secure = is_secure_request(&headers);
     let redirect_uri = query
         .redirect_uri
         .filter(|u| !u.trim().is_empty())
+        .or_else(|| {
+            let host = headers
+                .get(axum::http::header::HOST)
+                .and_then(|v| v.to_str().ok())
+                .map(str::trim)
+                .filter(|h| !h.is_empty())?;
+            let scheme = if headers
+                .get("x-forwarded-proto")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|p| p.eq_ignore_ascii_case("https"))
+            {
+                "https"
+            } else {
+                "http"
+            };
+            Some(format!("{scheme}://{host}/api/v1/auth/callback"))
+        })
         .unwrap_or_else(|| oidc.redirect_url.clone());
 
     let pkce_payload = PkceStatePayload {
@@ -292,7 +345,7 @@ pub async fn oidc_login(
             .encrypt(&pkce_json)?
             .as_bytes(),
     );
-    let pkce_cookie = build_pkce_cookie_header(&encrypted_pkce, PKCE_TTL_SECONDS)?;
+    let pkce_cookie = build_pkce_cookie_header(&encrypted_pkce, PKCE_TTL_SECONDS, secure)?;
 
     let (authorization_endpoint, _) = resolve_oidc_endpoints(&oidc.issuer_url).await;
     let scopes = oidc.scopes.join("%20");
@@ -447,9 +500,10 @@ pub async fn oidc_callback(
         exp: Utc::now().timestamp() + SESSION_TTL_SECONDS,
     };
 
+    let secure = is_secure_request(&headers);
     let session_token = encrypt_session_token(&session_key, &claims)?;
-    let session_cookie = build_session_cookie_header(&session_token, SESSION_TTL_SECONDS)?;
-    let clear_pkce_cookie = build_pkce_cookie_header("", 0)?;
+    let session_cookie = build_session_cookie_header(&session_token, SESSION_TTL_SECONDS, secure)?;
+    let clear_pkce_cookie = build_pkce_cookie_header("", 0, secure)?;
 
     let wants_html = headers
         .get(ACCEPT)

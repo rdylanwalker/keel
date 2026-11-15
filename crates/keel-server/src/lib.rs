@@ -68,6 +68,10 @@ pub fn build_router(state: AppState) -> Router {
             "/api/v1/proposals/{pr_id}/reject",
             post(routes::reject_proposal),
         )
+        .route(
+            "/api/v1/proposals/{pr_id}/reopen",
+            post(routes::reopen_proposal),
+        )
         .route("/api/v1/stacks", get(routes::list_stacks))
         .route(
             "/api/v1/stacks/{namespace}/{name}/diagnostics",

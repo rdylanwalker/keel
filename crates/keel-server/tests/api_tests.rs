@@ -1582,6 +1582,7 @@ async fn test_blueprint_merge_visibility_and_proposal_status_history() {
 
     // GET /api/v1/proposals?status=all retains both merged and closed PRs
     let all_res = app
+        .clone()
         .oneshot(
             Request::builder()
                 .uri("/api/v1/proposals?status=all")
@@ -1596,6 +1597,39 @@ async fn test_blueprint_merge_visibility_and_proposal_status_history() {
         serde_json::from_slice(&all_res.into_body().collect().await.unwrap().to_bytes()).unwrap();
     let all_prs = all_json["proposals"].as_array().unwrap();
     assert_eq!(all_prs.len(), 2);
+
+    // POST /api/v1/proposals/{pr2_id}/reopen transitions closed PR back to open
+    let reopen_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/v1/proposals/{pr2_id}/reopen"))
+                .header(COOKIE, &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reopen_res.status(), StatusCode::OK);
+    let reopen_json: Value =
+        serde_json::from_slice(&reopen_res.into_body().collect().await.unwrap().to_bytes())
+            .unwrap();
+    assert_eq!(reopen_json["proposal"]["state"], "open");
+
+    // Reopening an already-open PR returns 409 CONFLICT
+    let reopen_open_res = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/v1/proposals/{pr2_id}/reopen"))
+                .header(COOKIE, &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reopen_open_res.status(), StatusCode::CONFLICT);
 }
 
 #[tokio::test]
@@ -2478,4 +2512,134 @@ spec:
     .await
     .unwrap();
     assert!(tenants_kustomization.contains("acme/infra/my-gcp-vm/secret.enc.yaml"));
+}
+
+#[tokio::test]
+async fn test_app_proposal_with_flagger_canary_stages_canary_yaml() {
+    let fixture = setup_fixture().await;
+    let cookie = login_and_get_cookie(&fixture).await;
+    let app = build_router(fixture.state.clone());
+
+    // `grafana` in setup_fixture has flaggerSupported: true
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/proposals")
+                .header(COOKIE, &cookie)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "tenant": "acme",
+                        "catalogId": "grafana",
+                        "kind": "app",
+                        "canary": true,
+                        "values": {
+                            "replicas": 2,
+                            "ingressHost": "grafana.keel.local"
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let body: Value =
+        serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let branch = body["branch"].as_str().unwrap();
+
+    fixture
+        .state
+        .git_runner
+        .checkout_branch(&fixture.state.repo_workdir, branch)
+        .await
+        .unwrap();
+
+    let canary_yaml = tokio::fs::read_to_string(
+        fixture
+            .state
+            .repo_workdir
+            .join("tenants/acme/apps/grafana/canary.yaml"),
+    )
+    .await
+    .unwrap();
+    assert!(canary_yaml.contains("kind: Canary"));
+    assert!(canary_yaml.contains("provider: gatewayapi:v1"));
+    assert!(canary_yaml.contains("name: keel-ingress"));
+    assert!(canary_yaml.contains("grafana.keel.local"));
+
+    let tenants_kustomization = tokio::fs::read_to_string(
+        fixture
+            .state
+            .repo_workdir
+            .join("tenants/kustomization.yaml"),
+    )
+    .await
+    .unwrap();
+    assert!(tenants_kustomization.contains("acme/apps/grafana/helmrelease-canary.yaml"));
+    assert!(tenants_kustomization.contains("acme/apps/grafana/canary.yaml"));
+    assert!(tenants_kustomization.contains("acme/apps/grafana/networkpolicy-canary.yaml"));
+
+    fixture
+        .state
+        .git_runner
+        .checkout_branch(&fixture.state.repo_workdir, "main")
+        .await
+        .unwrap();
+
+    // App with flaggerSupported: false must reject canary=true
+    let no_canary_dir = fixture.state.repo_workdir.join("catalog/apps/redis");
+    tokio::fs::create_dir_all(&no_canary_dir).await.unwrap();
+    tokio::fs::write(
+        no_canary_dir.join("catalog.yaml"),
+        r#"apiVersion: keel.io/v1alpha1
+kind: CatalogApplication
+metadata:
+  id: redis
+  name: Redis
+  category: datastore
+  runtime: helm
+spec:
+  upstream:
+    chart: redis
+    repoURL: https://charts.bitnami.com/bitnami
+    version: "20.1.0"
+  progressiveDelivery:
+    flaggerSupported: false
+    defaultCanary: false
+  schema:
+    type: object
+    properties:
+      replicas:
+        type: integer
+"#,
+    )
+    .await
+    .unwrap();
+
+    let bad_res = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/proposals")
+                .header(COOKIE, &cookie)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "tenant": "acme",
+                        "catalogId": "redis",
+                        "kind": "app",
+                        "canary": true,
+                        "values": { "replicas": 1 }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(bad_res.status(), StatusCode::BAD_REQUEST);
 }
