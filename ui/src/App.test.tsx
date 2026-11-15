@@ -271,4 +271,31 @@ describe("App top-level application component", () => {
       )
     })
   })
+
+  it("transitions to Authentication Required when keel:unauthorized is dispatched", async () => {
+    vi.mocked(api.getAuthStatus).mockResolvedValue({
+      authenticated: true,
+      phase: "oidc-active",
+      tenant: "tenant-acme",
+    })
+
+    await act(async () => {
+      render(<App />)
+    })
+
+    expect(
+      await screen.findByText("Cluster & Workload Topology")
+    ).toBeInTheDocument()
+
+    act(() => {
+      window.dispatchEvent(new CustomEvent("keel:unauthorized"))
+    })
+
+    expect(
+      await screen.findByText("Authentication Required")
+    ).toBeInTheDocument()
+    expect(
+      screen.queryByText("Cluster & Workload Topology")
+    ).not.toBeInTheDocument()
+  })
 })

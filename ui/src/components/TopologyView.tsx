@@ -228,12 +228,12 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
 
   const fetchTopology = useCallback(async () => {
     setLoading(true)
-    setError(null)
     try {
       const [stacksRes, releasesData] = await Promise.all([
         getStacksWithMeta(),
         getReleases().catch(() => []),
       ])
+      setError(null)
       setStacks(ensureManagementStack(stacksRes.stacks || []))
       setClusterMeta({
         gitRepoUrl: stacksRes.gitRepoUrl,
@@ -1070,10 +1070,13 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
                   phase === "Promoting" ||
                   phase === "Finalising")
               const primaryPct = isPromoted ? 100 : Math.max(0, 100 - weight)
-              const primaryVer = canary.primaryVersion || canary.version || "—"
+              const primaryVer =
+                canary.primaryVersion ||
+                (isPromoted ? canary.version : undefined) ||
+                "—"
               const canaryVer = canary.version || "—"
-              const errRate = canary.errorRate ?? 0.01
-              const latency = canary.latencyMs ?? 15
+              const errRate = canary.errorRate
+              const latency = canary.latencyMs
 
               return (
                 <div
@@ -1152,14 +1155,30 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
                       <span className="text-slate-500 block">
                         HTTP 5xx Rate:
                       </span>
-                      <span className="text-emerald-400 font-bold">
-                        {errRate}%
+                      <span
+                        className={`font-bold ${
+                          errRate == null
+                            ? "text-slate-500"
+                            : errRate > 1
+                              ? "text-red-400"
+                              : "text-emerald-400"
+                        }`}
+                      >
+                        {errRate != null ? `${errRate}%` : "—"}
                       </span>
                     </div>
                     <div className="bg-slate-900 p-2 rounded border border-slate-800">
                       <span className="text-slate-500 block">p99 Latency:</span>
-                      <span className="text-indigo-300 font-bold">
-                        {latency}ms
+                      <span
+                        className={`font-bold ${
+                          latency == null
+                            ? "text-slate-500"
+                            : latency > 500
+                              ? "text-amber-400"
+                              : "text-indigo-300"
+                        }`}
+                      >
+                        {latency != null ? `${latency}ms` : "—"}
                       </span>
                     </div>
                   </div>

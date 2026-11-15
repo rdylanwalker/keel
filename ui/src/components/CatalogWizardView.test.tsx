@@ -1135,4 +1135,118 @@ describe("CatalogWizardView component and jsonToYaml helper", () => {
     expect(parsed.properties.GOOGLE_CREDENTIALS.writeOnly).toBe(true)
     expect(parsed.properties.GOOGLE_CREDENTIALS.format).toBe("password")
   })
+
+  it("shows Enable Flagger Canary option for Flagger-supported apps in bundle builder and submits canary: true", async () => {
+    vi.mocked(api.getCatalog).mockResolvedValue([
+      {
+        id: "kind-cluster",
+        name: "kind Cluster",
+        description: "Local cluster",
+        type: "infra",
+        category: "Infrastructure",
+        version: "1.0.0",
+        provider: "kind",
+        schema: { type: "object", properties: {} },
+      },
+      {
+        id: "podinfo",
+        name: "Podinfo",
+        description: "Canary-ready app",
+        type: "app",
+        category: "Applications",
+        version: "6.7.1",
+        flaggerSupported: true,
+        schema: { type: "object", properties: {} },
+      },
+      {
+        id: "redis",
+        name: "Redis",
+        description: "Non-canary app",
+        type: "app",
+        category: "Applications",
+        version: "20.1.0",
+        flaggerSupported: false,
+        schema: { type: "object", properties: {} },
+      },
+    ])
+    vi.mocked(api.createCatalogApp).mockResolvedValue({
+      id: "201",
+      title: "Add bundle canary-stack",
+      branch: "keel/catalog/add-canary-stack-201",
+      author: "user",
+      tenant: "catalog",
+      status: "open",
+      createdAt: "just now",
+    })
+
+    render(<CatalogWizardView />)
+
+    await waitFor(() => {
+      const list = screen.getByTestId("catalog-list")
+      expect(within(list).getByText("Podinfo")).toBeInTheDocument()
+    })
+
+    fireEvent.click(
+      screen.getByRole("button", { name: /\+ Add Catalog Item/i })
+    )
+    fireEvent.change(screen.getByLabelText(/Catalog Type \*/i), {
+      target: { value: "bundle" },
+    })
+
+    fireEvent.change(screen.getByLabelText(/Item ID \*/i), {
+      target: { value: "canary-stack" },
+    })
+    fireEvent.change(screen.getByLabelText(/Item Name \*/i), {
+      target: { value: "Canary Stack" },
+    })
+
+    // Add an app step (defaults to first app, which is podinfo with flaggerSupported: true)
+    fireEvent.click(screen.getByRole("button", { name: /Add Step/i }))
+
+    const canaryCheckbox = screen.getByLabelText(
+      /Step 2 Enable Flagger Canary/i
+    )
+    expect(canaryCheckbox).not.toBeChecked()
+    fireEvent.click(canaryCheckbox)
+    expect(canaryCheckbox).toBeChecked()
+
+    // Switching to an app without flaggerSupported hides and clears the option
+    fireEvent.change(screen.getByLabelText(/Step 2 Catalog Ref/i), {
+      target: { value: "redis" },
+    })
+    expect(
+      screen.queryByLabelText(/Step 2 Enable Flagger Canary/i)
+    ).not.toBeInTheDocument()
+
+    // Switch back to podinfo and re-enable canary
+    fireEvent.change(screen.getByLabelText(/Step 2 Catalog Ref/i), {
+      target: { value: "podinfo" },
+    })
+    const reappearedCheckbox = screen.getByLabelText(
+      /Step 2 Enable Flagger Canary/i
+    )
+    expect(reappearedCheckbox).not.toBeChecked()
+    fireEvent.click(reappearedCheckbox)
+
+    fireEvent.click(
+      screen.getByRole("button", { name: /Submit Bundle PR Proposal/i })
+    )
+
+    await waitFor(() => {
+      expect(api.createCatalogApp).toHaveBeenCalledWith(
+        expect.objectContaining({
+          kind: "bundle",
+          id: "canary-stack",
+          items: expect.arrayContaining([
+            expect.objectContaining({
+              id: "step-2",
+              kind: "app",
+              catalogRef: "podinfo",
+              canary: true,
+            }),
+          ]),
+        })
+      )
+    })
+  })
 })

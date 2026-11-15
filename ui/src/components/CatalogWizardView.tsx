@@ -595,6 +595,7 @@ export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
               ...(item.kind === "app" && item.targetNamespace?.trim()
                 ? { targetNamespace: item.targetNamespace.trim() }
                 : {}),
+              ...(item.kind === "app" && item.canary ? { canary: true } : {}),
             })),
             ...(parsedSchema ? { schema: parsedSchema } : {}),
           }
@@ -1753,6 +1754,13 @@ export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
                             ? c.type === "infra" || c.type === "infrastructure"
                             : c.type === "app"
                         )
+                        const selectedApp =
+                          item.kind === "app"
+                            ? catalog.find(
+                                (c) =>
+                                  c.type === "app" && c.id === item.catalogRef
+                              )
+                            : undefined
                         const priorItems = (appForm.items ?? []).filter(
                           (_, i) => i !== idx
                         )
@@ -1804,6 +1812,7 @@ export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
                                     catalogRef: firstRef ?? "",
                                     targetClusterFrom: undefined,
                                     targetNamespace: undefined,
+                                    canary: undefined,
                                   })
                                 }}
                                 className="col-span-3 px-2 py-1.5 bg-slate-900 border border-slate-800 rounded-lg text-[11px] text-slate-100"
@@ -1814,9 +1823,18 @@ export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
                               <select
                                 aria-label={`Step ${idx + 1} Catalog Ref`}
                                 value={item.catalogRef}
-                                onChange={(e) =>
-                                  updateItem({ catalogRef: e.target.value })
-                                }
+                                onChange={(e) => {
+                                  const nextRef = e.target.value
+                                  const nextApp = catalog.find(
+                                    (c) => c.type === "app" && c.id === nextRef
+                                  )
+                                  updateItem({
+                                    catalogRef: nextRef,
+                                    canary: nextApp?.flaggerSupported
+                                      ? item.canary
+                                      : undefined,
+                                  })
+                                }}
                                 className="col-span-5 px-2 py-1.5 bg-slate-900 border border-slate-800 rounded-lg text-[11px] font-mono text-slate-100"
                               >
                                 <option value="">Select item...</option>
@@ -1884,40 +1902,58 @@ export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
                             )}
 
                             {item.kind === "app" && (
-                              <div className="grid grid-cols-2 gap-2">
-                                <select
-                                  aria-label={`Step ${idx + 1} Target Cluster From`}
-                                  value={item.targetClusterFrom || ""}
-                                  onChange={(e) =>
-                                    updateItem({
-                                      targetClusterFrom:
-                                        e.target.value || undefined,
-                                    })
-                                  }
-                                  className="px-2 py-1 bg-slate-900 border border-slate-800 rounded-lg text-[11px] font-mono text-slate-200"
-                                >
-                                  <option value="">
-                                    Local / Tenant Cluster
-                                  </option>
-                                  {infraDeps.map((inf) => (
-                                    <option key={inf.id} value={inf.id}>
-                                      From infra: {inf.id}
+                              <div className="space-y-2">
+                                <div className="grid grid-cols-2 gap-2">
+                                  <select
+                                    aria-label={`Step ${idx + 1} Target Cluster From`}
+                                    value={item.targetClusterFrom || ""}
+                                    onChange={(e) =>
+                                      updateItem({
+                                        targetClusterFrom:
+                                          e.target.value || undefined,
+                                      })
+                                    }
+                                    className="px-2 py-1 bg-slate-900 border border-slate-800 rounded-lg text-[11px] font-mono text-slate-200"
+                                  >
+                                    <option value="">
+                                      Local / Tenant Cluster
                                     </option>
-                                  ))}
-                                </select>
-                                <input
-                                  type="text"
-                                  aria-label={`Step ${idx + 1} Target Namespace`}
-                                  placeholder="Target namespace (optional)"
-                                  value={item.targetNamespace || ""}
-                                  onChange={(e) =>
-                                    updateItem({
-                                      targetNamespace:
-                                        e.target.value || undefined,
-                                    })
-                                  }
-                                  className="px-2 py-1 bg-slate-900 border border-slate-800 rounded-lg text-[11px] font-mono text-slate-200"
-                                />
+                                    {infraDeps.map((inf) => (
+                                      <option key={inf.id} value={inf.id}>
+                                        From infra: {inf.id}
+                                      </option>
+                                    ))}
+                                  </select>
+                                  <input
+                                    type="text"
+                                    aria-label={`Step ${idx + 1} Target Namespace`}
+                                    placeholder="Target namespace (optional)"
+                                    value={item.targetNamespace || ""}
+                                    onChange={(e) =>
+                                      updateItem({
+                                        targetNamespace:
+                                          e.target.value || undefined,
+                                      })
+                                    }
+                                    className="px-2 py-1 bg-slate-900 border border-slate-800 rounded-lg text-[11px] font-mono text-slate-200"
+                                  />
+                                </div>
+                                {selectedApp?.flaggerSupported && (
+                                  <label className="inline-flex items-center gap-2 text-[11px] text-slate-300 cursor-pointer select-none">
+                                    <input
+                                      type="checkbox"
+                                      aria-label={`Step ${idx + 1} Enable Flagger Canary`}
+                                      checked={!!item.canary}
+                                      onChange={(e) =>
+                                        updateItem({
+                                          canary: e.target.checked || undefined,
+                                        })
+                                      }
+                                      className="h-3.5 w-3.5 rounded border-slate-700 bg-slate-900 text-indigo-500 focus:ring-indigo-500 cursor-pointer"
+                                    />
+                                    <span>Enable Flagger Canary</span>
+                                  </label>
+                                )}
                               </div>
                             )}
                           </div>

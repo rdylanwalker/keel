@@ -787,6 +787,7 @@ pub async fn register_catalog_app(
             }
 
             let schema = if let Some(custom_schema) = req.schema {
+                validate_bundle_items_canary(&state.repo_workdir, &items).await?;
                 custom_schema
             } else {
                 compose_bundle_schema(&state.repo_workdir, &items).await?
@@ -901,6 +902,34 @@ pub async fn register_catalog_app(
     }
 }
 
+async fn validate_bundle_items_canary(
+    repo_workdir: &std::path::Path,
+    items: &[CatalogBundleItem],
+) -> Result<(), ServerError> {
+    for item in items {
+        if !item.canary {
+            continue;
+        }
+        if item.kind != BundleItemKind::App {
+            return Err(ServerError::BadRequest(format!(
+                "Bundle item '{}' sets canary: true, which is only valid for kind: app",
+                item.id
+            )));
+        }
+        let ref_manifest =
+            load_catalog_manifest(repo_workdir, &item.catalog_ref, Some("app")).await?;
+        if let CatalogManifest::Application(app) = ref_manifest
+            && !app.spec.progressive_delivery.flagger_supported
+        {
+            return Err(ServerError::BadRequest(format!(
+                "Catalog application '{}' does not support Flagger canary rollouts (flaggerSupported=false)",
+                app.metadata.id
+            )));
+        }
+    }
+    Ok(())
+}
+
 async fn compose_bundle_schema(
     repo_workdir: &std::path::Path,
     items: &[CatalogBundleItem],
@@ -917,8 +946,24 @@ async fn compose_bundle_schema(
         let ref_manifest =
             load_catalog_manifest(repo_workdir, &item.catalog_ref, Some(kind_hint)).await?;
         let (ref_title, ref_schema) = match ref_manifest {
-            CatalogManifest::Application(a) => (a.metadata.name, a.spec.schema),
-            CatalogManifest::InfraBlueprint(b) => (b.metadata.name, b.spec.schema),
+            CatalogManifest::Application(a) => {
+                if item.canary && !a.spec.progressive_delivery.flagger_supported {
+                    return Err(ServerError::BadRequest(format!(
+                        "Catalog application '{}' does not support Flagger canary rollouts (flaggerSupported=false)",
+                        a.metadata.id
+                    )));
+                }
+                (a.metadata.name, a.spec.schema)
+            }
+            CatalogManifest::InfraBlueprint(b) => {
+                if item.canary {
+                    return Err(ServerError::BadRequest(format!(
+                        "Bundle item '{}' sets canary: true, which is only valid for kind: app",
+                        item.id
+                    )));
+                }
+                (b.metadata.name, b.spec.schema)
+            }
             CatalogManifest::Bundle(_) => {
                 return Err(ServerError::BadRequest(format!(
                     "Nested bundle '{}' is not supported inside bundle items",
@@ -1129,6 +1174,7 @@ pub async fn update_catalog_item(
                     false
                 };
                 if let Some(schema) = req.schema {
+                    validate_bundle_items_canary(&state.repo_workdir, &bundle.spec.items).await?;
                     bundle.spec.schema = schema;
                 } else if items_changed {
                     bundle.spec.schema =
@@ -2007,9 +2053,16 @@ pub async fn create_proposal(
     let timestamp = Utc::now().timestamp().max(1) as u64;
     let branch = build_preview_branch(&req.tenant, &action_label, timestamp)?;
 
+    let subdir = if is_app { "apps" } else { "infra" };
+    let resolved_dir =
+        resolve_tenant_resource_dir(&state.repo_workdir, &req.tenant, subdir, &instance_name).await;
+    let bundle_item = resolved_dir.as_ref().and_then(|r| r.bundle_item.clone());
+
     let (rel_dir, manifest_yaml, preview_resource_type) = match &manifest {
         CatalogManifest::Application(app) => {
-            let rel_dir = format!("tenants/{}/apps/{instance_name}", req.tenant);
+            let rel_dir = resolved_dir
+                .map(|r| r.rel_dir)
+                .unwrap_or_else(|| format!("tenants/{}/apps/{instance_name}", req.tenant));
             let mut hr_input = HelmReleaseSpecInput::new(
                 &req.tenant,
                 &instance_name,
@@ -2024,6 +2077,67 @@ pub async fn create_proposal(
                     namespace: Some(tenant_ns.clone()),
                 },
             );
+            if let Some((ref bundle_name, ref item_id)) = bundle_item {
+                hr_input
+                    .extra_labels
+                    .insert("keel.io/bundle".to_string(), bundle_name.clone());
+                hr_input
+                    .extra_labels
+                    .insert("keel.io/bundle-item".to_string(), item_id.clone());
+
+                // Preserve bundle-level dependsOn and valuesFrom bindings from existing HelmRelease
+                let abs_dir = state.repo_workdir.join(&rel_dir);
+                let existing_hr_path =
+                    if tokio::fs::try_exists(abs_dir.join("helmrelease-canary.yaml"))
+                        .await
+                        .unwrap_or(false)
+                    {
+                        Some(abs_dir.join("helmrelease-canary.yaml"))
+                    } else if tokio::fs::try_exists(abs_dir.join("helmrelease.yaml"))
+                        .await
+                        .unwrap_or(false)
+                    {
+                        Some(abs_dir.join("helmrelease.yaml"))
+                    } else {
+                        None
+                    };
+                if let Some(hr_path) = existing_hr_path
+                    && let Ok(raw) = tokio::fs::read_to_string(&hr_path).await
+                    && let Ok(doc) = serde_yml::from_str::<Value>(&raw)
+                {
+                    if let Some(deps) = doc.pointer("/spec/dependsOn").and_then(Value::as_array) {
+                        for dep in deps {
+                            if let Some(dep_name) = dep.get("name").and_then(Value::as_str) {
+                                hr_input.depends_on.push(FluxDependencyRef {
+                                    name: dep_name.to_string(),
+                                });
+                            }
+                        }
+                    }
+                    if let Some(vals_from) =
+                        doc.pointer("/spec/valuesFrom").and_then(Value::as_array)
+                    {
+                        for vf in vals_from {
+                            if vf.get("kind").and_then(Value::as_str) == Some("Secret")
+                                && let Some(sec_name) = vf.get("name").and_then(Value::as_str)
+                            {
+                                hr_input.values_from_secrets.push(HelmValuesSecretRef {
+                                    name: sec_name.to_string(),
+                                    values_key: vf
+                                        .get("valuesKey")
+                                        .and_then(Value::as_str)
+                                        .map(str::to_string),
+                                    target_path: vf
+                                        .get("targetPath")
+                                        .and_then(Value::as_str)
+                                        .map(str::to_string),
+                                    optional: vf.get("optional").and_then(Value::as_bool),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
             hr_input.chart_version = req
                 .version
                 .as_deref()
@@ -2037,7 +2151,7 @@ pub async fn create_proposal(
                 .map(str::trim)
                 .filter(|s| !s.is_empty() && *s != "local")
             {
-                hr_input.kube_config = Some(RemoteKubeConfigRef::new(target));
+                hr_input.kube_config = Some(RemoteKubeConfigRef::with_key(target, "kubeconfig"));
             }
             if let Some(target_ns) = req
                 .target_namespace
@@ -2066,7 +2180,9 @@ pub async fn create_proposal(
             )
         }
         CatalogManifest::InfraBlueprint(bp) => {
-            let rel_dir = format!("tenants/{}/infra/{instance_name}", req.tenant);
+            let rel_dir = resolved_dir
+                .map(|r| r.rel_dir)
+                .unwrap_or_else(|| format!("tenants/{}/infra/{instance_name}", req.tenant));
             let blueprint_pulumi_path = state
                 .repo_workdir
                 .join("catalog/infra")
@@ -2112,6 +2228,29 @@ pub async fn create_proposal(
                     "kubeconfigSecretNamespace".to_string(),
                     tenant_namespace(&req.tenant)?,
                 );
+            } else if bundle_item.is_some()
+                && let Ok(raw) =
+                    tokio::fs::read_to_string(state.repo_workdir.join(&rel_dir).join("stack.yaml"))
+                        .await
+                && let Ok(doc) = serde_yml::from_str::<Value>(&raw)
+            {
+                if let Some(secret_name) = doc
+                    .pointer("/spec/config/kubeconfigSecretName")
+                    .and_then(Value::as_str)
+                {
+                    stack_params
+                        .config
+                        .insert("kubeconfigSecretName".to_string(), secret_name.to_string());
+                }
+                if let Some(secret_ns) = doc
+                    .pointer("/spec/config/kubeconfigSecretNamespace")
+                    .and_then(Value::as_str)
+                {
+                    stack_params.config.insert(
+                        "kubeconfigSecretNamespace".to_string(),
+                        secret_ns.to_string(),
+                    );
+                }
             }
             if bp.metadata.provider == "kind" {
                 stack_params.docker_host = state.docker_proxy_url.clone();
@@ -2157,7 +2296,27 @@ pub async fn create_proposal(
         tokio::fs::write(&manifest_path, &manifest_yaml).await?;
         staged_paths.push(format!("{rel_dir}/{manifest_filename}"));
 
+        if is_app {
+            let stale_files: &[&str] = if req.canary {
+                &["helmrelease.yaml"]
+            } else {
+                &[
+                    "helmrelease-canary.yaml",
+                    "canary.yaml",
+                    "networkpolicy-canary.yaml",
+                ]
+            };
+            for stale_file in stale_files {
+                let stale_path = target_dir.join(stale_file);
+                if tokio::fs::try_exists(&stale_path).await.unwrap_or(false) {
+                    tokio::fs::remove_file(&stale_path).await?;
+                    staged_paths.push(format!("{rel_dir}/{stale_file}"));
+                }
+            }
+        }
+
         let mut extra_kustomize_resources: Vec<String> = Vec::new();
+        let mut bundle_item_kustomize_resources: Vec<String> = vec![manifest_filename.to_string()];
         if let CatalogManifest::Application(app) = &manifest {
             let repo_url = app.spec.upstream.repo_url.trim();
             if !repo_url.is_empty() {
@@ -2170,16 +2329,27 @@ pub async fn create_proposal(
                 {
                     obj.insert("type".to_string(), serde_json::json!("oci"));
                 }
+                let mut repo_labels = serde_json::Map::new();
+                repo_labels.insert(
+                    "app.kubernetes.io/managed-by".to_string(),
+                    serde_json::json!("keel"),
+                );
+                repo_labels.insert("keel.io/tenant".to_string(), serde_json::json!(req.tenant));
+                if let Some((ref bundle_name, ref item_id)) = bundle_item {
+                    repo_labels
+                        .insert("keel.io/bundle".to_string(), serde_json::json!(bundle_name));
+                    repo_labels.insert(
+                        "keel.io/bundle-item".to_string(),
+                        serde_json::json!(item_id),
+                    );
+                }
                 let helm_repo_doc = serde_json::json!({
                     "apiVersion": "source.toolkit.fluxcd.io/v1",
                     "kind": "HelmRepository",
                     "metadata": {
                         "name": format!("{instance_name}-repo"),
                         "namespace": tenant_ns,
-                        "labels": {
-                            "app.kubernetes.io/managed-by": "keel",
-                            "keel.io/tenant": req.tenant,
-                        }
+                        "labels": Value::Object(repo_labels),
                     },
                     "spec": repo_spec,
                 });
@@ -2189,6 +2359,7 @@ pub async fn create_proposal(
                 let helm_repo_path = target_dir.join("helm-repository.yaml");
                 tokio::fs::write(&helm_repo_path, helm_repo_yaml).await?;
                 staged_paths.push(format!("{rel_dir}/helm-repository.yaml"));
+                bundle_item_kustomize_resources.push("helm-repository.yaml".to_string());
                 extra_kustomize_resources.push(format!(
                     "{}/apps/{instance_name}/helm-repository.yaml",
                     req.tenant
@@ -2219,10 +2390,19 @@ pub async fn create_proposal(
                 {
                     canary_input.hosts.push(host.to_string());
                 }
+                if let Some((ref bundle_name, ref item_id)) = bundle_item {
+                    canary_input
+                        .extra_labels
+                        .insert("keel.io/bundle".to_string(), bundle_name.clone());
+                    canary_input
+                        .extra_labels
+                        .insert("keel.io/bundle-item".to_string(), item_id.clone());
+                }
                 let canary_yaml = synthesize_flagger_canary_yaml(&canary_input)?;
                 let canary_path = target_dir.join("canary.yaml");
                 tokio::fs::write(&canary_path, canary_yaml).await?;
                 staged_paths.push(format!("{rel_dir}/canary.yaml"));
+                bundle_item_kustomize_resources.push("canary.yaml".to_string());
                 extra_kustomize_resources
                     .push(format!("{}/apps/{instance_name}/canary.yaml", req.tenant));
 
@@ -2234,6 +2414,7 @@ pub async fn create_proposal(
                 let np_path = target_dir.join("networkpolicy-canary.yaml");
                 tokio::fs::write(&np_path, np_yaml).await?;
                 staged_paths.push(format!("{rel_dir}/networkpolicy-canary.yaml"));
+                bundle_item_kustomize_resources.push("networkpolicy-canary.yaml".to_string());
                 extra_kustomize_resources.push(format!(
                     "{}/apps/{instance_name}/networkpolicy-canary.yaml",
                     req.tenant
@@ -2267,6 +2448,7 @@ pub async fn create_proposal(
                 let secret_path = target_dir.join("secret.enc.yaml");
                 tokio::fs::write(&secret_path, enc_k8s_secret).await?;
                 staged_paths.push(format!("{rel_dir}/secret.enc.yaml"));
+                bundle_item_kustomize_resources.push("secret.enc.yaml".to_string());
                 extra_kustomize_resources.push(format!(
                     "{}/infra/{instance_name}/secret.enc.yaml",
                     req.tenant
@@ -2306,35 +2488,59 @@ pub async fn create_proposal(
                 resources.push(candidate);
             }
         }
-        let manifest_rel_to_tenants = format!(
-            "{}/{}/{instance_name}/{manifest_filename}",
-            req.tenant,
-            if is_app { "apps" } else { "infra" }
-        );
-        if is_app {
-            if req.canary {
-                let stale = format!("{}/apps/{instance_name}/helmrelease.yaml", req.tenant);
-                resources.retain(|r| r != &stale);
-            } else {
-                let stale_hr = format!(
-                    "{}/apps/{instance_name}/helmrelease-canary.yaml",
-                    req.tenant
-                );
-                let stale_canary = format!("{}/apps/{instance_name}/canary.yaml", req.tenant);
-                let stale_np = format!(
-                    "{}/apps/{instance_name}/networkpolicy-canary.yaml",
-                    req.tenant
-                );
-                resources.retain(|r| r != &stale_hr && r != &stale_canary && r != &stale_np);
+        if let Some((ref bundle_name, ref item_id)) = bundle_item {
+            let item_k_doc = serde_json::json!({
+                "apiVersion": "kustomize.config.k8s.io/v1beta1",
+                "kind": "Kustomization",
+                "resources": bundle_item_kustomize_resources,
+            });
+            tokio::fs::write(
+                target_dir.join("kustomization.yaml"),
+                serde_yml::to_string(&item_k_doc).map_err(|e| {
+                    ServerError::Internal(format!("failed to serialize kustomization.yaml: {e}"))
+                })?,
+            )
+            .await?;
+            staged_paths.push(format!("{rel_dir}/kustomization.yaml"));
+
+            let fk_rel = format!(
+                "{}/bundles/{bundle_name}/{item_id}/flux-kustomization.yaml",
+                req.tenant
+            );
+            if !resources.contains(&fk_rel) {
+                resources.push(fk_rel);
             }
-        }
-        for res in extra_kustomize_resources {
-            if !resources.contains(&res) {
-                resources.push(res);
+        } else {
+            let manifest_rel_to_tenants = format!(
+                "{}/{}/{instance_name}/{manifest_filename}",
+                req.tenant,
+                if is_app { "apps" } else { "infra" }
+            );
+            if is_app {
+                if req.canary {
+                    let stale = format!("{}/apps/{instance_name}/helmrelease.yaml", req.tenant);
+                    resources.retain(|r| r != &stale);
+                } else {
+                    let stale_hr = format!(
+                        "{}/apps/{instance_name}/helmrelease-canary.yaml",
+                        req.tenant
+                    );
+                    let stale_canary = format!("{}/apps/{instance_name}/canary.yaml", req.tenant);
+                    let stale_np = format!(
+                        "{}/apps/{instance_name}/networkpolicy-canary.yaml",
+                        req.tenant
+                    );
+                    resources.retain(|r| r != &stale_hr && r != &stale_canary && r != &stale_np);
+                }
             }
-        }
-        if !resources.contains(&manifest_rel_to_tenants) {
-            resources.push(manifest_rel_to_tenants);
+            for res in extra_kustomize_resources {
+                if !resources.contains(&res) {
+                    resources.push(res);
+                }
+            }
+            if !resources.contains(&manifest_rel_to_tenants) {
+                resources.push(manifest_rel_to_tenants);
+            }
         }
         let kustomization_doc = serde_json::json!({
             "apiVersion": "kustomize.config.k8s.io/v1beta1",
@@ -2627,6 +2833,12 @@ async fn create_bundle_proposal(
 
         let (primary_filename, primary_yaml, extra_files, health_check) = match ref_manifest {
             CatalogManifest::Application(app) => {
+                if item.canary && !app.spec.progressive_delivery.flagger_supported {
+                    return Err(ServerError::BadRequest(format!(
+                        "Catalog application '{}' does not support Flagger canary rollouts (flaggerSupported=false)",
+                        app.metadata.id
+                    )));
+                }
                 let mut hr_input = HelmReleaseSpecInput::new(
                     &req.tenant,
                     &item_resource_name,
@@ -2655,7 +2867,8 @@ async fn create_bundle_proposal(
                     .map(str::trim)
                     .filter(|s| !s.is_empty() && *s != "local")
                 {
-                    hr_input.kube_config = Some(RemoteKubeConfigRef::new(target));
+                    hr_input.kube_config =
+                        Some(RemoteKubeConfigRef::with_key(target, "kubeconfig"));
                 }
 
                 if let Some(target_ns) = &item.target_namespace {
@@ -2691,7 +2904,13 @@ async fn create_bundle_proposal(
                 }
 
                 let hr_yaml = synthesize_helm_release_yaml(&hr_input)?;
+                let primary_filename = if item.canary {
+                    "helmrelease-canary.yaml".to_string()
+                } else {
+                    "helmrelease.yaml".to_string()
+                };
                 let mut extras = Vec::new();
+                let mut item_k_res = vec![primary_filename.clone()];
                 let repo_url = app.spec.upstream.repo_url.trim();
                 if !repo_url.is_empty() {
                     let mut repo_spec = serde_json::json!({
@@ -2724,13 +2943,50 @@ async fn create_bundle_proposal(
                         ))
                     })?;
                     extras.push(("helm-repository.yaml".to_string(), helm_repo_yaml));
+                    item_k_res.push("helm-repository.yaml".to_string());
+                }
+
+                if item.canary {
+                    let mut canary_input =
+                        FlaggerCanarySpecInput::new(&req.tenant, &item_resource_name);
+                    let chart_name = app
+                        .spec
+                        .upstream
+                        .chart
+                        .as_deref()
+                        .unwrap_or(&app.metadata.id);
+                    canary_input.service_port = partitioned
+                        .normal_values
+                        .get("service")
+                        .and_then(|s| s.get("port"))
+                        .and_then(|p| p.as_u64())
+                        .and_then(|p| u16::try_from(p).ok())
+                        .filter(|p| *p > 0)
+                        .unwrap_or(if chart_name == "podinfo" { 9898 } else { 80 });
+                    if let Some(host) = partitioned
+                        .normal_values
+                        .get("ingressHost")
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                    {
+                        canary_input.hosts.push(host.to_string());
+                    }
+                    canary_input.extra_labels = bundle_labels.clone();
+                    let canary_yaml = synthesize_flagger_canary_yaml(&canary_input)?;
+                    extras.push(("canary.yaml".to_string(), canary_yaml));
+                    item_k_res.push("canary.yaml".to_string());
+
+                    let np_yaml = synthesize_canary_gateway_network_policy_yaml(
+                        &req.tenant,
+                        &item_resource_name,
+                        canary_input.service_port,
+                    )?;
+                    extras.push(("networkpolicy-canary.yaml".to_string(), np_yaml));
+                    item_k_res.push("networkpolicy-canary.yaml".to_string());
                 }
 
                 // Item-level kustomization.yaml so the Flux Kustomization applies only K8s manifests
-                let mut item_k_res = vec!["helmrelease.yaml".to_string()];
-                if !extras.is_empty() {
-                    item_k_res.push("helm-repository.yaml".to_string());
-                }
                 let item_k_doc = serde_json::json!({
                     "apiVersion": "kustomize.config.k8s.io/v1beta1",
                     "kind": "Kustomization",
@@ -2746,7 +3002,7 @@ async fn create_bundle_proposal(
                 ));
 
                 (
-                    "helmrelease.yaml".to_string(),
+                    primary_filename,
                     hr_yaml,
                     extras,
                     FluxHealthCheckRef {
@@ -2786,6 +3042,26 @@ async fn create_bundle_proposal(
                         "kubeconfigSecretName".to_string(),
                         format!("{item_resource_name}-kubeconfig"),
                     );
+                    stack_params
+                        .config
+                        .insert("kubeconfigSecretNamespace".to_string(), tenant_ns.clone());
+                } else if let Some(cluster_item) = &item.target_cluster_from {
+                    stack_params.config.insert(
+                        "kubeconfigSecretName".to_string(),
+                        format!("{instance_name}-{cluster_item}-kubeconfig"),
+                    );
+                    stack_params
+                        .config
+                        .insert("kubeconfigSecretNamespace".to_string(), tenant_ns.clone());
+                } else if let Some(target) = req
+                    .target_cluster
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty() && *s != "local")
+                {
+                    stack_params
+                        .config
+                        .insert("kubeconfigSecretName".to_string(), target.to_string());
                     stack_params
                         .config
                         .insert("kubeconfigSecretNamespace".to_string(), tenant_ns.clone());
@@ -2926,6 +3202,25 @@ async fn create_bundle_proposal(
 
             tokio::fs::write(item_dir.join(&item.primary_filename), &item.primary_yaml).await?;
             staged_paths.push(format!("{}/{}", item.item_rel_dir, item.primary_filename));
+
+            if item.kind == BundleItemKind::App {
+                let stale_files: &[&str] = if item.primary_filename == "helmrelease-canary.yaml" {
+                    &["helmrelease.yaml"]
+                } else {
+                    &[
+                        "helmrelease-canary.yaml",
+                        "canary.yaml",
+                        "networkpolicy-canary.yaml",
+                    ]
+                };
+                for stale_file in stale_files {
+                    let stale_path = item_dir.join(stale_file);
+                    if tokio::fs::try_exists(&stale_path).await.unwrap_or(false) {
+                        tokio::fs::remove_file(&stale_path).await?;
+                        staged_paths.push(format!("{}/{stale_file}", item.item_rel_dir));
+                    }
+                }
+            }
 
             for (fname, content) in &item.extra_files {
                 tokio::fs::write(item_dir.join(fname), content).await?;
@@ -3656,7 +3951,6 @@ async fn delete_gitops_resource_pr(
     let tenant = namespace.strip_prefix("tenant-").unwrap_or(&namespace);
     validate_dns_label(tenant, "tenant")?;
 
-    let direct_rel_dir = format!("tenants/{tenant}/{subdir}/{name}");
     let timestamp = Utc::now().timestamp().max(1) as u64;
     let action_label = format!("delete-{name}");
     let branch = build_preview_branch(tenant, &action_label, timestamp)?;
@@ -3669,43 +3963,14 @@ async fn delete_gitops_resource_pr(
             .await?;
 
         // Locate either `tenants/<tenant>/<subdir>/<name>` or a matching bundle item `<bundle>/<item>`
-        let mut target_rel_dir = None;
-        if tokio::fs::try_exists(state.repo_workdir.join(&direct_rel_dir))
-            .await
-            .unwrap_or(false)
-        {
-            target_rel_dir = Some(direct_rel_dir.clone());
-        } else {
-            let bundles_dir = state
-                .repo_workdir
-                .join("tenants")
-                .join(tenant)
-                .join("bundles");
-            if let Ok(mut b_entries) = tokio::fs::read_dir(&bundles_dir).await {
-                while let Ok(Some(b_entry)) = b_entries.next_entry().await {
-                    let b_name = b_entry.file_name();
-                    let Some(b_str) = b_name.to_str() else {
-                        continue;
-                    };
-                    if let Some(item_suffix) = name.strip_prefix(&format!("{b_str}-")) {
-                        let candidate = format!("tenants/{tenant}/bundles/{b_str}/{item_suffix}");
-                        if tokio::fs::try_exists(state.repo_workdir.join(&candidate))
-                            .await
-                            .unwrap_or(false)
-                        {
-                            target_rel_dir = Some(candidate);
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-
-        let Some(rel_dir) = target_rel_dir else {
+        let Some(resolved) =
+            resolve_tenant_resource_dir(&state.repo_workdir, tenant, subdir, &name).await
+        else {
             return Err(ServerError::NotFound(format!(
                 "Resource '{name}' not found in tenant '{tenant}'"
             )));
         };
+        let rel_dir = resolved.rel_dir;
 
         state
             .git_runner
@@ -3811,9 +4076,69 @@ async fn delete_gitops_resource_pr(
     }))
 }
 
+struct ResolvedTenantResource {
+    rel_dir: String,
+    bundle_item: Option<(String, String)>,
+}
+
+async fn resolve_tenant_resource_dir(
+    repo_workdir: &std::path::Path,
+    tenant: &str,
+    subdir: &str,
+    name: &str,
+) -> Option<ResolvedTenantResource> {
+    let direct_rel_dir = format!("tenants/{tenant}/{subdir}/{name}");
+    if tokio::fs::try_exists(repo_workdir.join(&direct_rel_dir))
+        .await
+        .unwrap_or(false)
+    {
+        return Some(ResolvedTenantResource {
+            rel_dir: direct_rel_dir,
+            bundle_item: None,
+        });
+    }
+
+    let bundles_dir = repo_workdir.join("tenants").join(tenant).join("bundles");
+    let mut b_entries = tokio::fs::read_dir(&bundles_dir).await.ok()?;
+    while let Ok(Some(b_entry)) = b_entries.next_entry().await {
+        let b_name = b_entry.file_name();
+        let Some(b_str) = b_name.to_str() else {
+            continue;
+        };
+        if let Some(item_suffix) = name.strip_prefix(&format!("{b_str}-")) {
+            let candidate = format!("tenants/{tenant}/bundles/{b_str}/{item_suffix}");
+            let candidate_abs = repo_workdir.join(&candidate);
+            if !tokio::fs::try_exists(&candidate_abs).await.unwrap_or(false) {
+                continue;
+            }
+            let kind_matches = match subdir {
+                "infra" => tokio::fs::try_exists(candidate_abs.join("stack.yaml"))
+                    .await
+                    .unwrap_or(false),
+                "apps" => {
+                    tokio::fs::try_exists(candidate_abs.join("helmrelease.yaml"))
+                        .await
+                        .unwrap_or(false)
+                        || tokio::fs::try_exists(candidate_abs.join("helmrelease-canary.yaml"))
+                            .await
+                            .unwrap_or(false)
+                }
+                _ => true,
+            };
+            if kind_matches {
+                return Some(ResolvedTenantResource {
+                    rel_dir: candidate,
+                    bundle_item: Some((b_str.to_string(), item_suffix.to_string())),
+                });
+            }
+        }
+    }
+    None
+}
+
 /// `GET /api/v1/stacks/{namespace}/{name}/config`
 ///
-/// Reads `tenants/<tenant>/infra/<name>/values.yaml` + `Pulumi.yaml` / `stack.yaml`
+/// Reads `tenants/<tenant>/infra/<name>/values.yaml` (or matching bundle item) + `Pulumi.yaml` / `stack.yaml`
 /// so the UI can pre-fill the Catalog Wizard RJSF form when editing an existing infra stack.
 pub async fn get_stack_config(
     _auth: AuthSession,
@@ -3824,18 +4149,14 @@ pub async fn get_stack_config(
     validate_dns_label(&name, "name")?;
 
     let tenant = namespace.strip_prefix("tenant-").unwrap_or(&namespace);
-    let infra_dir = state
-        .repo_workdir
-        .join("tenants")
-        .join(tenant)
-        .join("infra")
-        .join(&name);
-
-    if !tokio::fs::try_exists(&infra_dir).await.unwrap_or(false) {
+    let Some(resolved) =
+        resolve_tenant_resource_dir(&state.repo_workdir, tenant, "infra", &name).await
+    else {
         return Err(ServerError::NotFound(format!(
             "Stack '{name}' not found in tenant '{tenant}'"
         )));
-    }
+    };
+    let infra_dir = state.repo_workdir.join(&resolved.rel_dir);
 
     let values_path = infra_dir.join("values.yaml");
     let values = if tokio::fs::try_exists(&values_path).await.unwrap_or(false) {
@@ -3923,12 +4244,16 @@ pub async fn get_release_config(
     validate_dns_label(&name, "name")?;
 
     let tenant = namespace.strip_prefix("tenant-").unwrap_or(&namespace);
-    let app_dir = state
-        .repo_workdir
-        .join("tenants")
-        .join(tenant)
-        .join("apps")
-        .join(&name);
+    let app_dir =
+        match resolve_tenant_resource_dir(&state.repo_workdir, tenant, "apps", &name).await {
+            Some(resolved) => state.repo_workdir.join(&resolved.rel_dir),
+            None => state
+                .repo_workdir
+                .join("tenants")
+                .join(tenant)
+                .join("apps")
+                .join(&name),
+        };
 
     let (values, hr_doc, is_canary) = {
         let _guard = state.git_lock.lock().await;

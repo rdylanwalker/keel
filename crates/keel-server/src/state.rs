@@ -71,7 +71,7 @@ fn infer_stack_type(
 }
 
 /// Summary of a Flux `HelmRelease` / `Kustomization` / Flagger `Canary` returned by `GET /api/v1/releases`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReleaseSummary {
     pub name: String,
@@ -89,6 +89,10 @@ pub struct ReleaseSummary {
     pub canary_phase: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub primary_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_rate: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latency_ms: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_cluster: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -359,13 +363,44 @@ impl ClusterStateProvider for RepoClusterStateProvider {
         tenant: Option<&str>,
     ) -> Result<Vec<ReleaseSummary>, ServerError> {
         let mut files = Vec::new();
-        Self::collect_yaml_files(&self.repo_workdir.join("tenants"), &mut files);
+        let tenants_root = self.repo_workdir.join("tenants");
+        Self::collect_yaml_files(&tenants_root, &mut files);
         files.sort();
+
+        // Cache item-level kustomization.yaml resource allowlists so stale unreferenced
+        // manifests (e.g. a leftover helmrelease.yaml beside helmrelease-canary.yaml) are ignored.
+        let mut kustomize_allowlists: HashMap<PathBuf, Option<std::collections::HashSet<String>>> =
+            HashMap::new();
 
         let mut releases = Vec::new();
         for path in files {
             if path.file_name().and_then(|n| n.to_str()) == Some("flux-kustomization.yaml") {
                 continue;
+            }
+            if let Some(parent) = path.parent()
+                && parent != tenants_root.as_path()
+            {
+                let allowed = kustomize_allowlists
+                    .entry(parent.to_path_buf())
+                    .or_insert_with(|| {
+                        let k_path = parent.join("kustomization.yaml");
+                        let raw = std::fs::read_to_string(k_path).ok()?;
+                        let doc = serde_yml::from_str::<Value>(&raw).ok()?;
+                        let arr = doc.get("resources")?.as_array()?;
+                        Some(
+                            arr.iter()
+                                .filter_map(|v| v.as_str())
+                                .map(|s| s.trim_start_matches("./").to_string())
+                                .collect(),
+                        )
+                    });
+                if let Some(set) = allowed
+                    && let Some(fname) = path.file_name().and_then(|n| n.to_str())
+                    && fname != "kustomization.yaml"
+                    && !set.contains(fname)
+                {
+                    continue;
+                }
             }
             let Ok(content) = tokio::fs::read_to_string(&path).await else {
                 continue;
@@ -453,6 +488,8 @@ impl ClusterStateProvider for RepoClusterStateProvider {
                     canary_weight: None,
                     canary_phase: None,
                     primary_version: None,
+                    error_rate: None,
+                    latency_ms: None,
                     target_cluster,
                     bundle: doc_bundle,
                     bundle_item: doc_bundle_item,
@@ -461,6 +498,28 @@ impl ClusterStateProvider for RepoClusterStateProvider {
                 });
             }
         }
+
+        // Deduplicate paired HelmRelease + Canary (and any duplicate (namespace, name) manifests)
+        let canary_keys: std::collections::HashSet<(String, String)> = releases
+            .iter()
+            .filter(|r| r.canary)
+            .map(|r| (r.namespace.clone(), r.name.clone()))
+            .collect();
+        let has_paired_hr: std::collections::HashSet<(String, String)> = releases
+            .iter()
+            .filter(|r| !r.canary && canary_keys.contains(&(r.namespace.clone(), r.name.clone())))
+            .map(|r| (r.namespace.clone(), r.name.clone()))
+            .collect();
+        releases.retain(|r| {
+            !(r.canary && has_paired_hr.contains(&(r.namespace.clone(), r.name.clone())))
+        });
+        for rel in &mut releases {
+            if canary_keys.contains(&(rel.namespace.clone(), rel.name.clone())) {
+                rel.canary = true;
+            }
+        }
+        let mut seen = std::collections::HashSet::new();
+        releases.retain(|r| seen.insert((r.namespace.clone(), r.name.clone())));
 
         Ok(releases)
     }
@@ -578,6 +637,8 @@ impl ClusterStateProvider for KubeClusterStateProvider {
                 rel.canary = true;
             }
         }
+        let mut seen = std::collections::HashSet::new();
+        releases.retain(|r| seen.insert((r.namespace.clone(), r.name.clone())));
 
         let live_stacks = self.live.stack_statuses().await;
         let live = self.live.release_status_details().await;
@@ -598,6 +659,8 @@ impl ClusterStateProvider for KubeClusterStateProvider {
                 rel.canary_weight = cinfo.canary_weight;
                 rel.canary_phase = cinfo.canary_phase.clone();
                 rel.primary_version = cinfo.primary_version.clone();
+                rel.error_rate = cinfo.error_rate;
+                rel.latency_ms = cinfo.latency_ms;
             }
         }
         // Keep any live tenant-* release that is absent from Git `main` (awaiting Flux prune or mid-termination),
@@ -634,6 +697,8 @@ impl ClusterStateProvider for KubeClusterStateProvider {
                     canary_weight: None,
                     canary_phase: None,
                     primary_version: None,
+                    error_rate: None,
+                    latency_ms: None,
                     target_cluster: None,
                     bundle: None,
                     bundle_item: None,
@@ -857,6 +922,79 @@ mod tests {
         assert_eq!(out_releases.len(), 1);
         assert_eq!(out_releases[0].name, "podinfo");
         assert_eq!(out_releases[0].status, "Ready");
+    }
+
+    #[tokio::test]
+    async fn list_releases_deduplicates_stale_helmrelease_beside_canary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bundle_item_dir = tmp.path().join("tenants/default/bundles/test/step-2");
+        let standalone_app_dir = tmp.path().join("tenants/default/apps/podinfo");
+        std::fs::create_dir_all(&bundle_item_dir).unwrap();
+        std::fs::create_dir_all(&standalone_app_dir).unwrap();
+
+        // Bundle item directory with stale helmrelease.yaml + active helmrelease-canary.yaml + canary.yaml
+        std::fs::write(
+            bundle_item_dir.join("helmrelease.yaml"),
+            "apiVersion: helm.toolkit.fluxcd.io/v2\nkind: HelmRelease\nmetadata:\n  name: test-step-2\n  namespace: tenant-default\nspec:\n  chart:\n    spec:\n      chart: podinfo\n",
+        )
+        .unwrap();
+        std::fs::write(
+            bundle_item_dir.join("helmrelease-canary.yaml"),
+            "apiVersion: helm.toolkit.fluxcd.io/v2\nkind: HelmRelease\nmetadata:\n  name: test-step-2\n  namespace: tenant-default\nspec:\n  chart:\n    spec:\n      chart: podinfo\n",
+        )
+        .unwrap();
+        std::fs::write(
+            bundle_item_dir.join("canary.yaml"),
+            "apiVersion: flagger.app/v1beta1\nkind: Canary\nmetadata:\n  name: test-step-2\n  namespace: tenant-default\nspec:\n  targetRef:\n    name: test-step-2\n",
+        )
+        .unwrap();
+        std::fs::write(
+            bundle_item_dir.join("kustomization.yaml"),
+            "apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\nresources:\n  - helmrelease-canary.yaml\n  - canary.yaml\n",
+        )
+        .unwrap();
+
+        // Standalone app directory without item-level kustomization.yaml, also containing both manifests
+        std::fs::write(
+            standalone_app_dir.join("helmrelease.yaml"),
+            "apiVersion: helm.toolkit.fluxcd.io/v2\nkind: HelmRelease\nmetadata:\n  name: podinfo\n  namespace: tenant-default\nspec:\n  chart:\n    spec:\n      chart: podinfo\n",
+        )
+        .unwrap();
+        std::fs::write(
+            standalone_app_dir.join("helmrelease-canary.yaml"),
+            "apiVersion: helm.toolkit.fluxcd.io/v2\nkind: HelmRelease\nmetadata:\n  name: podinfo\n  namespace: tenant-default\nspec:\n  chart:\n    spec:\n      chart: podinfo\n",
+        )
+        .unwrap();
+        std::fs::write(
+            standalone_app_dir.join("canary.yaml"),
+            "apiVersion: flagger.app/v1beta1\nkind: Canary\nmetadata:\n  name: podinfo\n  namespace: tenant-default\nspec:\n  targetRef:\n    name: podinfo\n",
+        )
+        .unwrap();
+
+        let repo_provider = RepoClusterStateProvider::new(tmp.path());
+        let repo_releases = repo_provider.list_releases(None).await.unwrap();
+        assert_eq!(repo_releases.len(), 2);
+        assert!(repo_releases.iter().all(|r| r.canary));
+
+        let kube_provider = KubeClusterStateProvider::new(
+            repo_provider,
+            Arc::new(MockLiveStatus {
+                stacks: HashMap::new(),
+                releases: HashMap::new(),
+            }),
+        );
+        let kube_releases = kube_provider.list_releases(None).await.unwrap();
+        assert_eq!(kube_releases.len(), 2);
+        assert!(
+            kube_releases
+                .iter()
+                .any(|r| r.name == "test-step-2" && r.canary)
+        );
+        assert!(
+            kube_releases
+                .iter()
+                .any(|r| r.name == "podinfo" && r.canary)
+        );
     }
 
     #[test]

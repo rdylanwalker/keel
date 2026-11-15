@@ -55,6 +55,9 @@ function getHeaders(
 
 async function handleResponse<T>(res: Response): Promise<T> {
   if (!res.ok) {
+    if (res.status === 401 && typeof window !== "undefined") {
+      window.dispatchEvent(new CustomEvent("keel:unauthorized"))
+    }
     let errorText = res.statusText
     try {
       if (typeof res.text === "function") {

@@ -1,0 +1,54 @@
+# Envoy Gateway Catalog Application (`SDD.md` §5.1, §5.2)
+apiVersion: keel.io/v1alpha1
+kind: CatalogApplication
+metadata:
+  id: envoy-gateway
+  name: Envoy Gateway
+  description: Kubernetes Gateway API controller for managing HTTPRoutes and progressive canary traffic splitting on workload clusters.
+  category: networking
+  runtime: helm
+spec:
+  upstream:
+    chart: gateway-helm
+    repoURL: oci://docker.io/envoyproxy
+    version: "v1.3.0"
+  progressiveDelivery:
+    flaggerSupported: false
+    defaultCanary: false
+  schema:
+    type: object
+    properties:
+      deployment:
+        type: object
+        title: Controller Deployment
+        properties:
+          replicas:
+            type: integer
+            title: Replicas
+            default: 1
+            minimum: 1
+            maximum: 5
+      config:
+        type: object
+        title: Envoy Gateway Configuration
+        properties:
+          envoyGateway:
+            type: object
+            title: Gateway Settings
+            properties:
+              logging:
+                type: object
+                title: Logging
+                properties:
+                  level:
+                    type: object
+                    properties:
+                      default:
+                        type: string
+                        title: Log Level
+                        default: info
+                        enum:
+                          - debug
+                          - info
+                          - warn
+                          - error

@@ -138,13 +138,13 @@ export const ControlPlaneProvidersView: React.FC<
 
   const fetchData = useCallback(async () => {
     setLoading(true)
-    setError(null)
     try {
       const [stacksRes, providersData, proposalsData] = await Promise.all([
         getStacksWithMeta(),
         getProviders(),
         getProposals().catch(() => []),
       ])
+      setError(null)
       setClusterMeta({
         gitRepoUrl: stacksRes.gitRepoUrl,
         forgeProvider: stacksRes.forgeProvider,

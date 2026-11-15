@@ -1,0 +1,72 @@
+# Prometheus Catalog Application (`SDD.md` §5.1, §5.2)
+apiVersion: keel.io/v1alpha1
+kind: CatalogApplication
+metadata:
+  id: prometheus
+  name: Prometheus
+  description: Metrics server scraping Envoy Gateway and cluster workloads for Flagger canary SLO evaluation (HTTP 5xx rate and p99 latency).
+  category: observability
+  runtime: helm
+spec:
+  upstream:
+    chart: prometheus
+    repoURL: https://prometheus-community.github.io/helm-charts
+    version: "27.5.0"
+  progressiveDelivery:
+    flaggerSupported: false
+    defaultCanary: false
+  schema:
+    type: object
+    properties:
+      alertmanager:
+        type: object
+        title: Alertmanager
+        properties:
+          enabled:
+            type: boolean
+            title: Enable Alertmanager
+            default: false
+      kube-state-metrics:
+        type: object
+        title: Kube State Metrics
+        properties:
+          enabled:
+            type: boolean
+            title: Enable kube-state-metrics
+            default: true
+      prometheus-node-exporter:
+        type: object
+        title: Node Exporter
+        properties:
+          enabled:
+            type: boolean
+            title: Enable node-exporter
+            default: false
+      prometheus-pushgateway:
+        type: object
+        title: Pushgateway
+        properties:
+          enabled:
+            type: boolean
+            title: Enable pushgateway
+            default: false
+      server:
+        type: object
+        title: Prometheus Server
+        properties:
+          fullnameOverride:
+            type: string
+            title: Service Name Override
+            default: prometheus
+          retention:
+            type: string
+            title: Retention Period
+            default: 7d
+          persistentVolume:
+            type: object
+            title: Persistent Volume
+            properties:
+              enabled:
+                type: boolean
+                title: Enable Persistent Volume
+                default: false

@@ -1,0 +1,115 @@
+# Multi-Item Bundle: Local kind Workload Cluster + Progressive Delivery Platform (`SDD.md` §5.1, §5.2)
+apiVersion: keel.io/v1alpha1
+kind: CatalogBundle
+metadata:
+  id: kind-canary-platform
+  name: Local kind Cluster + Canary Platform
+  description: Provision a local kind workload cluster via PKO v2 and install Envoy Gateway, Prometheus, and Flagger into keel-system for progressive canary rollouts.
+  category: platform
+spec:
+  items:
+    - id: cluster
+      kind: infra
+      catalogRef: kind-cluster
+    - id: envoy-gateway
+      kind: app
+      catalogRef: envoy-gateway
+      dependsOn:
+        - cluster
+      targetClusterFrom: cluster
+      targetNamespace: keel-system
+    - id: prometheus
+      kind: app
+      catalogRef: prometheus
+      dependsOn:
+        - cluster
+      targetClusterFrom: cluster
+      targetNamespace: keel-system
+    - id: flagger
+      kind: app
+      catalogRef: flagger
+      dependsOn:
+        - cluster
+        - envoy-gateway
+        - prometheus
+      targetClusterFrom: cluster
+      targetNamespace: keel-system
+    - id: canary-config
+      kind: infra
+      catalogRef: canary-gateway-config
+      dependsOn:
+        - cluster
+        - envoy-gateway
+        - flagger
+      targetClusterFrom: cluster
+  schema:
+    type: object
+    required:
+      - cluster
+    properties:
+      cluster:
+        type: object
+        title: Workload Cluster (kind)
+        required:
+          - clusterName
+          - kubernetesVersion
+          - workerCount
+        properties:
+          clusterName:
+            type: string
+            title: Cluster Name
+            default: workload-dev
+          kubernetesVersion:
+            type: string
+            title: Kubernetes Version
+            default: v1.32.0
+            enum:
+              - v1.32.0
+              - v1.31.4
+              - v1.30.8
+          workerCount:
+            type: integer
+            title: Worker Node Count
+            default: 1
+            minimum: 0
+            maximum: 5
+      envoy-gateway:
+        type: object
+        title: Envoy Gateway
+        properties:
+          deployment:
+            type: object
+            properties:
+              replicas:
+                type: integer
+                title: Replicas
+                default: 1
+                minimum: 1
+                maximum: 5
+      prometheus:
+        type: object
+        title: Prometheus
+        properties:
+          server:
+            type: object
+            properties:
+              fullnameOverride:
+                type: string
+                title: Service Name Override
+                default: prometheus
+              retention:
+                type: string
+                title: Retention Period
+                default: 7d
+      flagger:
+        type: object
+        title: Flagger
+        properties:
+          meshProvider:
+            type: string
+            title: Mesh / Gateway Provider
+            default: gatewayapi:v1
+          metricsServer:
+            type: string
+            title: Prometheus Metrics Server URL
+            default: http://prometheus.keel-system:80

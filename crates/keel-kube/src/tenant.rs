@@ -536,6 +536,10 @@ pub fn synthesize_helm_release(input: &HelmReleaseSpecInput) -> Result<Value, Ku
             "targetNamespace".to_string(),
             Value::String(target_ns.clone()),
         );
+        spec.insert(
+            "storageNamespace".to_string(),
+            Value::String(target_ns.clone()),
+        );
         spec.insert("install".to_string(), json!({ "createNamespace": true }));
     }
 
