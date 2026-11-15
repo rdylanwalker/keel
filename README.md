@@ -8,7 +8,7 @@ Keel is a single-binary **Rust** control plane and **React** web portal that boo
 
 ## Core Capabilities
 
-* **Provider-Agnostic Zero-to-Cloud Self-Bootstrapping:** Start from a compiled `keel` binary on `localhost` using `kind`, an existing `kubeconfig`, Proxmox VE, or a public cloud to initialize a seed management cluster complete with **Flux CD**, **Pulumi Kubernetes Operator (PKO v2)**, **Garage/MinIO S3**, **SOPS + `age`**, and optional in-cluster **Forgejo/Gitea** and **Pocket ID/Authentik** OIDC.
+* **Provider-Agnostic Zero-to-Cloud Self-Bootstrapping:** Start from a compiled `keel` binary on `localhost` using `kind`, an existing `kubeconfig`, Proxmox VE, or a public cloud to initialize a seed management cluster complete with **Flux CD**, **Pulumi Kubernetes Operator (PKO v2)**, **SeaweedFS S3**, **SOPS + `age`**, **Dex** OIDC (or external OIDC), and optional in-cluster **Forgejo**.
 * **PR-First GitOps with Pre-Merge Previews:** Every infrastructure or application mutation after bootstrap opens a Pull Request (`Forgejo/Gitea`, `GitHub`, `GitLab`, or local Git) and spawns an ephemeral PKO v2 `preview: true` stack—surfacing exact resource diffs (`+ Create`, `~ Update`, `- Delete`, `! Replace`) in both the GUI and CLI before merge.
 * **Self-Service Catalog & Multi-Item Bundles:** Thin `catalog.yaml` sidecars supply JSON Schemas rendered dynamically in React (`@rjsf/core` + Shadcn UI) into standard `values.yaml` overrides. Add or edit Apps, Infrastructure Blueprints (including `Pulumi.yaml` programs), and dependency-chained Multi-Item Bundles directly in the GUI via Git PRs.
 * **Multi-Cloud & Arbitrary OpenTofu/Terraform Providers:** Manage **Proxmox VE** (`bpg/proxmox`), **AWS**, **GCP**, **Azure**, **Hetzner**, and **Cloudflare**—or enable any future registry provider dynamically via Pulumi's OpenTofu/Terraform bridge without recompiling Keel.
@@ -28,9 +28,9 @@ flowchart TB
 
     subgraph ControlPlane["Management Cluster (kind / Existing K8s / Proxmox / Cloud)"]
         API["keel-server (axum + kube-rs)<br/>Direct git CLI + ForgeProvider + SSE"]
-        S3["S3 State Backend (Garage / MinIO / Cloud S3)<br/>Versioned Pulumi State"]
+        S3["S3 State Backend (SeaweedFS / Cloud S3)<br/>Versioned Pulumi State"]
         FORGE["Git Forge (Forgejo / Gitea / GitHub / GitLab)<br/>Desired State + PR Previews"]
-        OIDC["OIDC Provider (Pocket ID / Authentik)"]
+        OIDC["OIDC Provider (Dex / External OIDC)"]
         FLUX["Flux CD Controllers<br/>(source / kustomize / helm / notification)"]
         PKO["Pulumi Kubernetes Operator (PKO v2)<br/>Workspace Pods + Ephemeral Previews"]
         GUARD["Kyverno Admission + SOPS/age"]

@@ -42,9 +42,11 @@ keel bootstrap init \
 By default, `keel bootstrap init` installs the core control-plane components onto the target cluster using `kubectl` and `helm`:
 
 - **Namespaces:** `flux-system`, `keel-system`, `keel-previews`
+- **SeaweedFS (`s3-state-backend`):** In-cluster S3-compatible state backend in `keel-system` with the `pulumi-state` bucket and synced `keel-s3-credentials` Secret
 - **Flux CD (`flux2`):** GitOps source, kustomize, and helm controllers in `flux-system`
-- **Kyverno:** Admission controller in `kyverno` plus Keel's seed policies (including the Docker socket `PolicyException` when `--local-dev-docker-socket-exception` is passed)
+- **Kyverno:** Admission controller in `kyverno` plus Keel's seed policies (including `local-kind-docker-socket-exception` and `keel-docker-proxy` in `flux-system` when `--local-dev-docker-socket-exception` is passed)
 - **Pulumi Kubernetes Operator (PKO v2):** Infrastructure operator in `keel-system` plus the `management-cluster-core` `Stack`
+- **Dex (`dex`):** In-cluster OIDC identity provider in `keel-system` seeded with `keel-system/dex-config` and initial admin credentials (skipped if `--oidc-issuer` is supplied for an external OIDC provider)
 
 To initialize only the cluster and GitOps repository without installing the core controllers onto the cluster, pass `--skip-core-install`:
 
@@ -58,11 +60,12 @@ keel bootstrap init \
 
 > **In-Cluster Flux Pull-Polling:** If `--repo-dir` points to a local filesystem path without a reachable HTTP/SSH Git remote (such as `--with-forge` or an external Forgejo/GitHub/GitLab repository), `keel bootstrap init` skips applying the in-cluster `GitRepository` resource because cluster pods cannot clone a host filesystem path.
 
-### Optional Stage 1 Add-ons & Git Remotes
+### Optional Add-ons, OIDC & Git Remotes
 
 - `--with-forge` — Installs an in-cluster Forgejo instance in `keel-system` and points Flux + `.keel/config.yaml` at it.
 - `--git-url <URL>` — Connects an external GitHub, GitLab, or Forgejo/Gitea repository (with `KEEL_GIT_TOKEN` / `--git-token` for private repos and PRs). See [Git Repositories & Forges](git-repositories.md).
-- `--with-oidc` — Seeds an in-cluster OIDC provider (Pocket ID / Authentik).
+- `--admin-username` / `--admin-password` — Customizes the initial admin account seeded into in-cluster Dex (`keel-system/dex-config`). When omitted, `keel bootstrap init` generates a random password and prints it in the bootstrap summary.
+- `--oidc-issuer <URL>` / `--oidc-client-id <ID>` — Connects an external OIDC provider instead of installing in-cluster Dex.
 
 ## 2. Start the Control Plane Server
 
@@ -70,16 +73,18 @@ keel bootstrap init \
 keel serve --bind 127.0.0.1:8080 --repo-dir ./keel-gitops
 ```
 
-When a Kubernetes cluster is reachable via `KUBECONFIG` (or in-cluster config), `keel serve` automatically queries live **Flux CD** (`Kustomization`, `HelmRelease`) and **PKO v2** (`Stack`) CRD conditions to display `Synced`, `Ready`, `Reconciling`, or `Error` statuses in the UI and CLI. If no cluster is reachable or a resource has not been reconciled yet, it falls back to `Pending`.
+When a Kubernetes cluster is reachable via `KUBECONFIG` (or in-cluster config), `keel serve` automatically:
+- Queries live **Flux CD** (`Kustomization`, `HelmRelease`) and **PKO v2** (`Stack`) CRD conditions to display `Synced`, `Ready`, `Reconciling`, or `Error` statuses in the UI and CLI (falling back to `Pending` when offline).
+- Opens background `kubectl port-forward` tunnels to in-cluster **Forgejo** (`--with-forge`), **SeaweedFS S3**, and **Dex** when running on `localhost`.
 
-On startup in Stage 0 mode, `keel serve` prints a **single-use 256-bit bootstrap token** to stdout:
+When running offline without OIDC configured (e.g. `just serve`), `keel serve` starts in Stage 0 Bootstrap Token mode and prints a **single-use 256-bit bootstrap token** to stdout:
 
 ```text
 Keel Control Plane listening on http://127.0.0.1:8080
 Stage 0 Bootstrap Token: <64-character-hex-token>
 ```
 
-> **Note — Single-use token:** Only the SHA-256 hash of the token is stored, and the token is invalidated immediately after its first successful login. Restart `keel serve` if you need a fresh token during local Stage 0 development.
+> **Note — Single-use token:** Only the SHA-256 hash of the token is stored, and the token is invalidated immediately after its first successful login. Restart `keel serve` if you need a fresh token during offline Stage 0 development.
 
 ### Development Shortcuts (`just`)
 
@@ -90,19 +95,18 @@ Stage 0 Bootstrap Token: <64-character-hex-token>
 
 ### Web UI
 
-1. Open `http://127.0.0.1:8080`.
-2. Click **Bootstrap Token Login**.
-3. Paste the 64-character token from stdout.
+- **With OIDC (default after `keel bootstrap init`):** Open `http://127.0.0.1:8080`, click **Sign in with OIDC**, and log in with the Dex admin username/password printed by `keel bootstrap init` (or your external OIDC account).
+- **Without OIDC (offline / `just serve`):** Open `http://127.0.0.1:8080`, click **Bootstrap Token Login**, and paste the 64-character token from stdout.
 
 ### CLI
 
-When OIDC is configured (Stage 1+), authenticate the CLI via OIDC Authorization Code + PKCE:
+Authenticate the CLI via OIDC Authorization Code + PKCE:
 
 ```bash
 keel auth login --server http://127.0.0.1:8080
 ```
 
-For Stage 0 local development before OIDC is enabled, use **Bootstrap Token Login** in the Web UI (or exchange the token via `POST /api/v1/auth/bootstrap`).
+For offline local development without OIDC, use **Bootstrap Token Login** in the Web UI (or exchange the token via `POST /api/v1/auth/bootstrap`).
 
 ## 4. Break-Glass Recovery
 

@@ -79,7 +79,7 @@ keel app install \
 ```
 
 4. Inspect the PR diff (which synthesizes both the Flux `HelmRelease` and Flagger `Canary` manifests) and merge it.
-5. Open **GitOps & Canary Console** to watch Flux reconcile the release and Envoy Gateway + Flagger manage traffic shifting.
+5. Open **Topology Map** to watch Flux reconcile the release and Envoy Gateway + Flagger manage traffic shifting.
 
 ---
 
