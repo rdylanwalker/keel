@@ -19,11 +19,12 @@ pub use stack::{
     CrObjectMeta, DEFAULT_FLUX_POLL_INTERVAL, DEFAULT_MANAGEMENT_SERVICE_ACCOUNT,
     DEFAULT_PREVIEW_SERVICE_ACCOUNT, EphemeralPreviewParams, FLUX_GIT_REPO_API_VERSION,
     FLUX_GIT_REPO_KIND, FluxGitRepository, FluxGitRepositoryRef, FluxGitRepositorySpec,
-    HelmValuesFromRef, KEEL_PREVIEWS_NAMESPACE, LocalObjectReference, MANAGEMENT_CORE_STACK_NAME,
-    ManagementCoreStackParams, PKO_STACK_API_VERSION, PKO_STACK_KIND, PkoEnvRef, PkoFluxSource,
-    PkoFluxSourceRef, PkoStack, PkoStackSpec, PkoWorkspaceTemplate, PreviewStack,
-    TenantStackParams, build_preview_branch, synthesize_ephemeral_preview,
-    synthesize_management_core_stack, synthesize_tenant_stack, validate_preview_branch,
+    HelmValuesFromRef, IN_CLUSTER_S3_BACKEND_URL, KEEL_PREVIEWS_NAMESPACE, LocalObjectReference,
+    MANAGEMENT_CORE_STACK_NAME, ManagementCoreStackParams, PKO_STACK_API_VERSION, PKO_STACK_KIND,
+    PkoEnvRef, PkoFluxSource, PkoFluxSourceRef, PkoStack, PkoStackSpec, PkoWorkspaceTemplate,
+    PreviewStack, TenantStackParams, attach_s3_credentials_env_refs, build_preview_branch,
+    synthesize_ephemeral_preview, synthesize_management_core_stack, synthesize_tenant_stack,
+    validate_preview_branch,
 };
 
 /// Errors produced by `keel-pko` synthesis and preview diff parsing.

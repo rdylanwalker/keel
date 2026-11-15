@@ -41,10 +41,16 @@ Infrastructure blueprints in `catalog/infra/` are gated by `providers/registry.y
 ### Via CLI
 
 ```bash
+cat <<'EOF' > /tmp/workload-dev.yaml
+clusterName: workload-dev
+kubernetesVersion: v1.32.0
+workerCount: 1
+EOF
+
 keel infra provision \
   --blueprint kind-cluster \
   --tenant platform-team \
-  --values-file ./deploy/catalog/infra/kind-cluster/values.example.yaml \
+  --values-file /tmp/workload-dev.yaml \
   --server http://127.0.0.1:8080
 ```
 

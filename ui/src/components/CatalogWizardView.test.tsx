@@ -130,7 +130,9 @@ describe("CatalogWizardView component and jsonToYaml helper", () => {
       expect(within(list).getByText("Test Microservice")).toBeInTheDocument()
     })
 
-    const submitBtn = screen.getByRole("button", {
+    fireEvent.click(screen.getByRole("button", { name: /^Create$/i }))
+
+    const submitBtn = await screen.findByRole("button", {
       name: /Submit & Open Git PR Proposal/i,
     })
     fireEvent.click(submitBtn)
@@ -163,7 +165,9 @@ describe("CatalogWizardView component and jsonToYaml helper", () => {
       expect(within(list).getByText("Test Microservice")).toBeInTheDocument()
     })
 
-    const submitBtn = screen.getByRole("button", {
+    fireEvent.click(screen.getByRole("button", { name: /^Create$/i }))
+
+    const submitBtn = await screen.findByRole("button", {
       name: /Submit & Open Git PR Proposal/i,
     })
     fireEvent.click(submitBtn)
@@ -202,7 +206,7 @@ describe("CatalogWizardView component and jsonToYaml helper", () => {
     window.history.replaceState({}, "", "/")
   })
 
-  it("handles keyboard navigation and tenant selection", async () => {
+  it("renders informational cards with Create and Edit buttons and supports tenant selection", async () => {
     vi.mocked(api.getCatalog).mockResolvedValue(mockCatalog)
     vi.mocked(api.getTenants).mockResolvedValue([
       { id: "default", namespace: "tenant-default" },
@@ -219,10 +223,14 @@ describe("CatalogWizardView component and jsonToYaml helper", () => {
     const tenantSelect = screen.getByLabelText(/Target Tenant:/i)
     fireEvent.change(tenantSelect, { target: { value: "acme" } })
 
+    // Clicking the card title/body does not open the deploy modal
+    fireEvent.click(screen.getByText("Test Microservice"))
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument()
+
+    // Clicking Create opens the deploy modal
     const list = screen.getByTestId("catalog-list")
-    const itemCard = within(list).getByRole("button")
-    fireEvent.keyDown(itemCard, { key: "Enter" })
-    fireEvent.keyDown(itemCard, { key: " " })
+    fireEvent.click(within(list).getByRole("button", { name: /^Create$/i }))
+    expect(await screen.findByRole("dialog")).toBeInTheDocument()
   })
 
   it("handles catalog API rejection gracefully and proposal string error", async () => {
@@ -236,7 +244,9 @@ describe("CatalogWizardView component and jsonToYaml helper", () => {
       expect(within(list).getByText("Test Microservice")).toBeInTheDocument()
     })
 
-    const submitBtn = screen.getByRole("button", {
+    fireEvent.click(screen.getByRole("button", { name: /^Create$/i }))
+
+    const submitBtn = await screen.findByRole("button", {
       name: /Submit & Open Git PR Proposal/i,
     })
     fireEvent.click(submitBtn)
@@ -649,15 +659,23 @@ describe("CatalogWizardView component and jsonToYaml helper", () => {
 
     render(<CatalogWizardView />)
 
+    const createButtons = await screen.findAllByRole("button", {
+      name: /^Create$/i,
+    })
+    fireEvent.click(createButtons[0])
+
     expect(
       await screen.findByText(/clusterName: workload-dev/)
     ).toBeInTheDocument()
 
-    // Click second item, then click first item again
-    fireEvent.click(screen.getByText("Podinfo"))
+    // Close modal and open second item's Create modal
+    fireEvent.click(screen.getByRole("button", { name: /Close modal/i }))
+    fireEvent.click(createButtons[1])
     expect(await screen.findByText(/replicaCount: 2/)).toBeInTheDocument()
 
-    fireEvent.click(screen.getByText("Local kind Cluster"))
+    // Close modal and open first item's Create modal again
+    fireEvent.click(screen.getByRole("button", { name: /Close modal/i }))
+    fireEvent.click(createButtons[0])
     expect(
       await screen.findByText(/clusterName: workload-dev/)
     ).toBeInTheDocument()
@@ -707,7 +725,9 @@ describe("CatalogWizardView component and jsonToYaml helper", () => {
       expect(within(list).getByText("Proxmox VM Stack")).toBeInTheDocument()
     })
 
-    const submitBtn = screen.getByRole("button", {
+    fireEvent.click(screen.getByRole("button", { name: /^Create$/i }))
+
+    const submitBtn = await screen.findByRole("button", {
       name: /Submit & Open Git PR Proposal/i,
     })
     fireEvent.click(submitBtn)
@@ -763,6 +783,9 @@ describe("CatalogWizardView component and jsonToYaml helper", () => {
     })
 
     render(<CatalogWizardView />)
+
+    const createBtn = await screen.findByRole("button", { name: /^Create$/i })
+    fireEvent.click(createBtn)
 
     const instanceInput = await screen.findByLabelText(/Instance Name/i)
     fireEvent.change(instanceInput, { target: { value: "podinfo-staging" } })
@@ -827,6 +850,9 @@ describe("CatalogWizardView component and jsonToYaml helper", () => {
     ])
 
     render(<CatalogWizardView />)
+
+    const createBtn = await screen.findByRole("button", { name: /^Create$/i })
+    fireEvent.click(createBtn)
 
     expect(await screen.findByText(/already exists in/i)).toBeInTheDocument()
 
@@ -1013,5 +1039,80 @@ describe("CatalogWizardView component and jsonToYaml helper", () => {
         })
       )
     })
+  })
+
+  it("toggles full-screen side-by-side mode on Deploy, Add/Edit Blueprint, and New Tenant modals", async () => {
+    vi.mocked(api.getCatalog).mockResolvedValue(mockCatalog)
+
+    render(<CatalogWizardView />)
+
+    // 1. Deploy modal full-screen toggle
+    const createBtn = await screen.findByRole("button", { name: /^Create$/i })
+    fireEvent.click(createBtn)
+
+    const deployModal = await screen.findByTestId("deploy-instance-modal")
+    expect(deployModal.className).toContain("max-w-4xl")
+
+    fireEvent.click(screen.getByRole("button", { name: /Enter full screen/i }))
+    expect(deployModal.className).toContain("w-full h-full")
+    expect(deployModal.className).toContain("rounded-none")
+
+    fireEvent.click(screen.getByRole("button", { name: /Exit full screen/i }))
+    expect(deployModal.className).toContain("max-w-4xl")
+    fireEvent.click(screen.getByRole("button", { name: /Close modal/i }))
+
+    // 2. Add/Edit Catalog Item modal full-screen toggle
+    fireEvent.click(
+      screen.getByRole("button", { name: /\+ Add Catalog Item/i })
+    )
+    fireEvent.click(screen.getByRole("button", { name: /Enter full screen/i }))
+    expect(
+      screen.getByRole("button", { name: /Exit full screen/i })
+    ).toBeInTheDocument()
+    fireEvent.click(screen.getByRole("button", { name: /Close modal/i }))
+
+    // 3. New Tenant modal full-screen toggle
+    fireEvent.click(screen.getByRole("button", { name: /\+ New Tenant/i }))
+    fireEvent.click(screen.getByRole("button", { name: /Enter full screen/i }))
+    expect(
+      screen.getByRole("button", { name: /Exit full screen/i })
+    ).toBeInTheDocument()
+    fireEvent.click(screen.getByRole("button", { name: /Close modal/i }))
+  })
+
+  it("derives JSON Schema fields from Pulumi.yaml and adds provider credentials", async () => {
+    render(<CatalogWizardView />)
+
+    fireEvent.click(
+      screen.getByRole("button", { name: /\+ Add Catalog Item/i })
+    )
+    fireEvent.change(screen.getByLabelText(/Catalog Type \*/i), {
+      target: { value: "infra" },
+    })
+    fireEvent.change(screen.getByLabelText(/^Provider/i), {
+      target: { value: "gcp" },
+    })
+
+    fireEvent.change(screen.getByLabelText(/Pulumi\.yaml Program/i), {
+      target: {
+        value:
+          "name: gcp-free-vm\nruntime: yaml\nconfig:\n  project:\n    type: string\n",
+      },
+    })
+
+    fireEvent.click(
+      screen.getByRole("button", { name: /Derive from Pulumi\.yaml/i })
+    )
+    fireEvent.click(
+      screen.getByRole("button", { name: /\+ Add gcp Credentials/i })
+    )
+
+    const schemaTextarea = screen.getByLabelText(
+      /JSON Schema/i
+    ) as HTMLTextAreaElement
+    const parsed = JSON.parse(schemaTextarea.value)
+    expect(parsed.required).toEqual(["project", "GOOGLE_CREDENTIALS"])
+    expect(parsed.properties.GOOGLE_CREDENTIALS.writeOnly).toBe(true)
+    expect(parsed.properties.GOOGLE_CREDENTIALS.format).toBe("password")
   })
 })

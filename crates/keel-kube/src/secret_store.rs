@@ -16,7 +16,7 @@ use k8s_openapi::ByteString;
 use k8s_openapi::api::core::v1::Secret;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use keel_core::KEEL_SYSTEM_NAMESPACE;
-use kube::api::{DeleteParams, PostParams, Preconditions};
+use kube::api::PostParams;
 use kube::{Api, Client};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -26,8 +26,8 @@ use tokio::sync::RwLock;
 use crate::KubeError;
 use crate::tenant::tenant_namespace;
 
-/// Secret name holding the Stage 0 single-use bootstrap token SHA-256 hash in `keel-system`.
-pub const BOOTSTRAP_TOKEN_SECRET_NAME: &str = "bootstrap-token";
+/// Secret name holding the Stage 0 Dex OIDC configuration & bcrypt admin password in `keel-system`.
+pub const DEX_CONFIG_SECRET_NAME: &str = "dex-config";
 
 /// Secret name holding the cluster-managed 256-bit session key in `keel-system`.
 pub const SESSION_KEY_SECRET_NAME: &str = "session-key";
@@ -38,13 +38,15 @@ pub const USER_GIT_CREDS_SECRET_PREFIX: &str = "user-git-creds-";
 /// Secret name holding the per-tenant SOPS `age` keypair in `tenant-<id>`.
 pub const TENANT_SOPS_AGE_SECRET_NAME: &str = "sops-age";
 
+/// Secret name holding the in-cluster S3 state backend credentials (`accessKey`, `secretKey`).
+pub const S3_CREDENTIALS_SECRET_NAME: &str = "keel-s3-credentials";
+
 /// Length in bytes of the cluster session / symmetric encryption key (256-bit).
 pub const SESSION_KEY_LEN: usize = 32;
 
 /// Length in bytes of an `AES-256-GCM` random nonce (96-bit).
 const AES_GCM_NONCE_LEN: usize = 12;
 
-const BOOTSTRAP_HASH_FIELD: &str = "token-hash";
 const SESSION_KEY_FIELD: &str = "session-key";
 const CIPHERTEXT_FIELD: &str = "ciphertext";
 const NONCE_FIELD: &str = "nonce";
@@ -53,24 +55,6 @@ const ALGORITHM_AES_256_GCM: &[u8] = b"AES-256-GCM";
 const AGE_SECRET_FILE_FIELD: &str = "age.agekey";
 const AGE_PUBLIC_KEY_FIELD: &str = "public-key";
 const AGE_SECRET_KEY_FIELD: &str = "secret-key";
-
-/// Generates a cryptographically random 256-bit Stage 0 bootstrap token.
-///
-/// Returns `(raw_token_hex, sha256_token_hash_hex)`. Only the hash should be stored in
-/// `keel-system/bootstrap-token`; the raw token is displayed once on stdout during Stage 0.
-pub fn generate_bootstrap_token() -> (String, String) {
-    let mut raw = [0u8; 32];
-    rand::rng().fill_bytes(&mut raw);
-    let raw_hex = hex::encode(raw);
-    let hash_hex = hash_bootstrap_token(&raw_hex);
-    (raw_hex, hash_hex)
-}
-
-/// Computes the lowercase hex-encoded SHA-256 digest of a raw bootstrap token.
-pub fn hash_bootstrap_token(raw_token: &str) -> String {
-    let digest = Sha256::digest(raw_token.as_bytes());
-    hex::encode(digest)
-}
 
 /// Computes the deterministic Kubernetes `Secret` name (`user-git-creds-<sub_hash>`)
 /// in `keel-system` for an authenticated OIDC `sub` subject identifier.
@@ -164,16 +148,6 @@ impl fmt::Debug for TenantAgeKey {
 /// Stateless runtime persistence interface backed exclusively by Kubernetes `Secret`s.
 #[async_trait]
 pub trait SecretStateStore: Send + Sync {
-    /// Stores the Stage 0 single-use bootstrap token SHA-256 hash in `keel-system/bootstrap-token`.
-    async fn store_bootstrap_token_hash(&self, token_hash: &str) -> Result<(), KubeError>;
-
-    /// Atomically verifies `candidate_hash` against `keel-system/bootstrap-token` and deletes
-    /// the `Secret` if and only if it matches.
-    ///
-    /// Returns `Ok(true)` if the hash matched and the token was consumed, or `Ok(false)` if the
-    /// token was missing, already consumed, or did not match.
-    async fn consume_bootstrap_token_hash(&self, candidate_hash: &str) -> Result<bool, KubeError>;
-
     /// Retrieves the 256-bit session key from `keel-system/session-key`, generating and persisting
     /// a new CSPRNG key atomically if absent.
     async fn get_or_create_session_key(&self) -> Result<[u8; SESSION_KEY_LEN], KubeError>;
@@ -203,6 +177,17 @@ pub trait SecretStateStore: Send + Sync {
 
     /// Retrieves the per-tenant SOPS `age` keypair from `tenant-<id>/sops-age`.
     async fn get_tenant_age_key(&self, tenant_id: &str) -> Result<Option<TenantAgeKey>, KubeError>;
+
+    /// Returns `true` when `keel-system/keel-s3-credentials` exists in the cluster.
+    async fn has_s3_credentials(&self) -> Result<bool, KubeError>;
+
+    /// Ensures `keel-s3-credentials` exists in `target_namespace` by copying it from
+    /// `keel-system/keel-s3-credentials` if present. Returns `Ok(true)` if propagated or already
+    /// present, or `Ok(false)` if the source secret does not exist in `keel-system`.
+    async fn ensure_s3_credentials_in_namespace(
+        &self,
+        target_namespace: &str,
+    ) -> Result<bool, KubeError>;
 }
 
 /// Internal low-level `Secret` CRUD abstraction shared between `K8sSecretStore` and `InMemorySecretStore`.
@@ -215,13 +200,6 @@ trait SecretBackend: Send + Sync {
         namespace: &str,
         secret: Secret,
     ) -> Result<Secret, KubeError>;
-    async fn delete_secret_matching(
-        &self,
-        namespace: &str,
-        name: &str,
-        uid: Option<&str>,
-        resource_version: Option<&str>,
-    ) -> Result<bool, KubeError>;
 }
 
 /// Production `SecretStateStore` backed by the Kubernetes API server (`kube::Api<Secret>`).
@@ -290,29 +268,6 @@ impl SecretBackend for K8sSecretStore {
         match api.create(&PostParams::default(), &secret).await {
             Ok(created) => Ok(created),
             Err(kube::Error::Api(err)) if err.code == 409 => Ok(api.get(&name).await?),
-            Err(err) => Err(KubeError::Kube(err)),
-        }
-    }
-
-    async fn delete_secret_matching(
-        &self,
-        namespace: &str,
-        name: &str,
-        uid: Option<&str>,
-        resource_version: Option<&str>,
-    ) -> Result<bool, KubeError> {
-        let api: Api<Secret> = Api::namespaced(self.client.clone(), namespace);
-        let dp = DeleteParams {
-            preconditions: Some(Preconditions {
-                uid: uid.map(str::to_owned),
-                resource_version: resource_version.map(str::to_owned),
-            }),
-            ..DeleteParams::default()
-        };
-
-        match api.delete(name, &dp).await {
-            Ok(_) => Ok(true),
-            Err(kube::Error::Api(err)) if err.code == 404 || err.code == 409 => Ok(false),
             Err(err) => Err(KubeError::Kube(err)),
         }
     }
@@ -408,46 +363,10 @@ impl SecretBackend for InMemorySecretStore {
         guard.secrets.insert(key, secret.clone());
         Ok(secret)
     }
-
-    async fn delete_secret_matching(
-        &self,
-        namespace: &str,
-        name: &str,
-        uid: Option<&str>,
-        resource_version: Option<&str>,
-    ) -> Result<bool, KubeError> {
-        let mut guard = self.state.write().await;
-        let key = (namespace.to_string(), name.to_string());
-        let Some(existing) = guard.secrets.get(&key) else {
-            return Ok(false);
-        };
-
-        if let Some(expected_uid) = uid
-            && existing.metadata.uid.as_deref() != Some(expected_uid)
-        {
-            return Ok(false);
-        }
-        if let Some(expected_rv) = resource_version
-            && existing.metadata.resource_version.as_deref() != Some(expected_rv)
-        {
-            return Ok(false);
-        }
-
-        guard.secrets.remove(&key);
-        Ok(true)
-    }
 }
 
 #[async_trait]
 impl SecretStateStore for K8sSecretStore {
-    async fn store_bootstrap_token_hash(&self, token_hash: &str) -> Result<(), KubeError> {
-        store_bootstrap_token_hash_impl(self, token_hash).await
-    }
-
-    async fn consume_bootstrap_token_hash(&self, candidate_hash: &str) -> Result<bool, KubeError> {
-        consume_bootstrap_token_hash_impl(self, candidate_hash).await
-    }
-
     async fn get_or_create_session_key(&self) -> Result<[u8; SESSION_KEY_LEN], KubeError> {
         get_or_create_session_key_impl(self).await
     }
@@ -479,19 +398,22 @@ impl SecretStateStore for K8sSecretStore {
 
     async fn get_tenant_age_key(&self, tenant_id: &str) -> Result<Option<TenantAgeKey>, KubeError> {
         get_tenant_age_key_impl(self, tenant_id).await
+    }
+
+    async fn has_s3_credentials(&self) -> Result<bool, KubeError> {
+        has_s3_credentials_impl(self).await
+    }
+
+    async fn ensure_s3_credentials_in_namespace(
+        &self,
+        target_namespace: &str,
+    ) -> Result<bool, KubeError> {
+        ensure_s3_credentials_in_namespace_impl(self, target_namespace).await
     }
 }
 
 #[async_trait]
 impl SecretStateStore for InMemorySecretStore {
-    async fn store_bootstrap_token_hash(&self, token_hash: &str) -> Result<(), KubeError> {
-        store_bootstrap_token_hash_impl(self, token_hash).await
-    }
-
-    async fn consume_bootstrap_token_hash(&self, candidate_hash: &str) -> Result<bool, KubeError> {
-        consume_bootstrap_token_hash_impl(self, candidate_hash).await
-    }
-
     async fn get_or_create_session_key(&self) -> Result<[u8; SESSION_KEY_LEN], KubeError> {
         get_or_create_session_key_impl(self).await
     }
@@ -523,6 +445,17 @@ impl SecretStateStore for InMemorySecretStore {
 
     async fn get_tenant_age_key(&self, tenant_id: &str) -> Result<Option<TenantAgeKey>, KubeError> {
         get_tenant_age_key_impl(self, tenant_id).await
+    }
+
+    async fn has_s3_credentials(&self) -> Result<bool, KubeError> {
+        has_s3_credentials_impl(self).await
+    }
+
+    async fn ensure_s3_credentials_in_namespace(
+        &self,
+        target_namespace: &str,
+    ) -> Result<bool, KubeError> {
+        ensure_s3_credentials_in_namespace_impl(self, target_namespace).await
     }
 }
 
@@ -537,93 +470,6 @@ fn managed_labels(secret_kind: &str) -> BTreeMap<String, String> {
 }
 
 /// Constant-time byte comparison to prevent timing side-channels on token hashes.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (&x, &y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
-}
-
-fn validate_sha256_hex(token_hash: &str) -> Result<String, KubeError> {
-    let normalized = token_hash.trim().to_ascii_lowercase();
-    if normalized.len() != 64 || !normalized.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(KubeError::InvalidInput(
-            "bootstrap token hash must be a 64-character hex-encoded SHA-256 digest".to_string(),
-        ));
-    }
-    Ok(normalized)
-}
-
-async fn store_bootstrap_token_hash_impl<B: SecretBackend>(
-    backend: &B,
-    token_hash: &str,
-) -> Result<(), KubeError> {
-    let normalized = validate_sha256_hex(token_hash)?;
-    let data = BTreeMap::from([(
-        BOOTSTRAP_HASH_FIELD.to_string(),
-        ByteString(normalized.into_bytes()),
-    )]);
-    let secret = Secret {
-        metadata: ObjectMeta {
-            name: Some(BOOTSTRAP_TOKEN_SECRET_NAME.to_string()),
-            namespace: Some(KEEL_SYSTEM_NAMESPACE.to_string()),
-            labels: Some(managed_labels("bootstrap-token")),
-            ..ObjectMeta::default()
-        },
-        type_: Some("keel.io/bootstrap-token".to_string()),
-        data: Some(data),
-        ..Secret::default()
-    };
-
-    backend.upsert_secret(KEEL_SYSTEM_NAMESPACE, secret).await?;
-    Ok(())
-}
-
-async fn consume_bootstrap_token_hash_impl<B: SecretBackend>(
-    backend: &B,
-    candidate_hash: &str,
-) -> Result<bool, KubeError> {
-    let normalized_candidate = candidate_hash.trim().to_ascii_lowercase();
-    if normalized_candidate.is_empty() {
-        return Ok(false);
-    }
-
-    let Some(secret) = backend
-        .get_secret(KEEL_SYSTEM_NAMESPACE, BOOTSTRAP_TOKEN_SECRET_NAME)
-        .await?
-    else {
-        return Ok(false);
-    };
-
-    let stored_bytes = secret
-        .data
-        .as_ref()
-        .and_then(|d| d.get(BOOTSTRAP_HASH_FIELD))
-        .map(|b| b.0.as_slice())
-        .ok_or_else(|| KubeError::CorruptedSecret {
-            namespace: KEEL_SYSTEM_NAMESPACE.to_string(),
-            name: BOOTSTRAP_TOKEN_SECRET_NAME.to_string(),
-            reason: format!("missing `{BOOTSTRAP_HASH_FIELD}` field"),
-        })?;
-
-    if !constant_time_eq(stored_bytes, normalized_candidate.as_bytes()) {
-        return Ok(false);
-    }
-
-    backend
-        .delete_secret_matching(
-            KEEL_SYSTEM_NAMESPACE,
-            BOOTSTRAP_TOKEN_SECRET_NAME,
-            secret.metadata.uid.as_deref(),
-            secret.metadata.resource_version.as_deref(),
-        )
-        .await
-}
-
 fn parse_session_key_secret(secret: &Secret) -> Result<[u8; SESSION_KEY_LEN], KubeError> {
     let raw = secret
         .data
@@ -944,94 +790,57 @@ async fn get_tenant_age_key_impl<B: SecretBackend>(
     Ok(Some(TenantAgeKey::new(public_key, secret_key)))
 }
 
+async fn has_s3_credentials_impl(backend: &impl SecretBackend) -> Result<bool, KubeError> {
+    Ok(backend
+        .get_secret(KEEL_SYSTEM_NAMESPACE, S3_CREDENTIALS_SECRET_NAME)
+        .await?
+        .is_some())
+}
+
+async fn ensure_s3_credentials_in_namespace_impl(
+    backend: &impl SecretBackend,
+    target_namespace: &str,
+) -> Result<bool, KubeError> {
+    if target_namespace == KEEL_SYSTEM_NAMESPACE {
+        return has_s3_credentials_impl(backend).await;
+    }
+
+    let Some(source) = backend
+        .get_secret(KEEL_SYSTEM_NAMESPACE, S3_CREDENTIALS_SECRET_NAME)
+        .await?
+    else {
+        return Ok(false);
+    };
+
+    if backend
+        .get_secret(target_namespace, S3_CREDENTIALS_SECRET_NAME)
+        .await?
+        .is_some()
+    {
+        return Ok(true);
+    }
+
+    let copy = Secret {
+        metadata: ObjectMeta {
+            name: Some(S3_CREDENTIALS_SECRET_NAME.to_string()),
+            namespace: Some(target_namespace.to_string()),
+            labels: Some(managed_labels("s3-credentials")),
+            ..ObjectMeta::default()
+        },
+        type_: Some("Opaque".to_string()),
+        data: source.data,
+        ..Secret::default()
+    };
+
+    backend
+        .create_secret_if_absent(target_namespace, copy)
+        .await?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[tokio::test]
-    async fn bootstrap_token_single_use_and_rejection() {
-        let store = InMemorySecretStore::new();
-        let (raw_token, token_hash) = generate_bootstrap_token();
-
-        store.store_bootstrap_token_hash(&token_hash).await.unwrap();
-
-        // Verify stored in `keel-system/bootstrap-token` and raw token is not present
-        let raw_secret = store
-            .inspect_raw_secret(KEEL_SYSTEM_NAMESPACE, BOOTSTRAP_TOKEN_SECRET_NAME)
-            .await
-            .expect("bootstrap secret must exist");
-        let serialized = serde_json::to_string(&raw_secret).unwrap();
-        assert!(!serialized.contains(&raw_token));
-
-        // Wrong token hash must be rejected WITHOUT deleting the valid token
-        let wrong_hash = hash_bootstrap_token("wrong-bootstrap-token");
-        assert!(
-            !store
-                .consume_bootstrap_token_hash(&wrong_hash)
-                .await
-                .unwrap()
-        );
-        assert!(
-            !store.consume_bootstrap_token_hash("").await.unwrap(),
-            "empty hash must return false"
-        );
-
-        // First valid consumption succeeds and deletes the secret
-        assert!(
-            store
-                .consume_bootstrap_token_hash(&token_hash)
-                .await
-                .unwrap()
-        );
-        assert!(
-            store
-                .inspect_raw_secret(KEEL_SYSTEM_NAMESPACE, BOOTSTRAP_TOKEN_SECRET_NAME)
-                .await
-                .is_none()
-        );
-
-        // Second attempt with the exact same hash must fail (single-use!)
-        assert!(
-            !store
-                .consume_bootstrap_token_hash(&token_hash)
-                .await
-                .unwrap()
-        );
-    }
-
-    #[tokio::test]
-    async fn bootstrap_token_concurrent_consumption_has_single_winner() {
-        let store = Arc::new(InMemorySecretStore::new());
-        let (_raw, token_hash) = generate_bootstrap_token();
-        store.store_bootstrap_token_hash(&token_hash).await.unwrap();
-
-        let mut handles = Vec::new();
-        for _ in 0..16 {
-            let s = Arc::clone(&store);
-            let h = token_hash.clone();
-            handles.push(tokio::spawn(async move {
-                s.consume_bootstrap_token_hash(&h).await.unwrap()
-            }));
-        }
-
-        let mut winners = 0usize;
-        for handle in handles {
-            if handle.await.unwrap() {
-                winners += 1;
-            }
-        }
-        assert_eq!(winners, 1, "exactly one caller may consume the token");
-    }
-
-    #[tokio::test]
-    async fn bootstrap_token_rejects_malformed_hash() {
-        let store = InMemorySecretStore::new();
-        let err = store
-            .store_bootstrap_token_hash("not-a-sha256-hash")
-            .await
-            .unwrap_err();
-        assert!(matches!(err, KubeError::InvalidInput(_)));
-    }
 
     #[tokio::test]
     async fn session_key_is_created_once_and_reused() {
@@ -1247,27 +1056,7 @@ mod tests {
     async fn corrupted_secret_payloads_surface_structured_errors() {
         let store = InMemorySecretStore::new();
 
-        // 1. Corrupted bootstrap-token (missing `token-hash`)
-        store
-            .upsert_secret(
-                KEEL_SYSTEM_NAMESPACE,
-                Secret {
-                    metadata: ObjectMeta {
-                        name: Some(BOOTSTRAP_TOKEN_SECRET_NAME.to_string()),
-                        ..ObjectMeta::default()
-                    },
-                    data: Some(BTreeMap::new()),
-                    ..Secret::default()
-                },
-            )
-            .await
-            .unwrap();
-        assert!(matches!(
-            store.consume_bootstrap_token_hash("abcd").await,
-            Err(KubeError::CorruptedSecret { .. })
-        ));
-
-        // 2. Corrupted session-key (wrong byte length)
+        // Corrupted session-key (wrong byte length)
         store
             .upsert_secret(
                 KEEL_SYSTEM_NAMESPACE,
@@ -1342,18 +1131,55 @@ mod tests {
                 .await,
             Err(KubeError::CorruptedSecret { .. })
         ));
+    }
 
-        // 4. Stale preconditions in `delete_secret_matching` return Ok(false)
+    #[tokio::test]
+    async fn s3_credentials_propagation_copies_from_keel_system() {
+        let store = InMemorySecretStore::new();
+        assert!(!store.has_s3_credentials().await.unwrap());
         assert!(
             !store
-                .delete_secret_matching(
-                    KEEL_SYSTEM_NAMESPACE,
-                    SESSION_KEY_SECRET_NAME,
-                    Some("wrong-uid"),
-                    None,
-                )
+                .ensure_s3_credentials_in_namespace("tenant-acme")
                 .await
                 .unwrap()
         );
+
+        store
+            .upsert_secret(
+                KEEL_SYSTEM_NAMESPACE,
+                Secret {
+                    metadata: ObjectMeta {
+                        name: Some(S3_CREDENTIALS_SECRET_NAME.to_string()),
+                        ..ObjectMeta::default()
+                    },
+                    data: Some(BTreeMap::from([
+                        ("accessKey".to_string(), ByteString(b"keel-pulumi".to_vec())),
+                        (
+                            "secretKey".to_string(),
+                            ByteString(b"super-secret".to_vec()),
+                        ),
+                    ])),
+                    ..Secret::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(store.has_s3_credentials().await.unwrap());
+        assert!(
+            store
+                .ensure_s3_credentials_in_namespace("tenant-acme")
+                .await
+                .unwrap()
+        );
+
+        let copied = store
+            .get_secret("tenant-acme", S3_CREDENTIALS_SECRET_NAME)
+            .await
+            .unwrap()
+            .expect("copied secret");
+        let data = copied.data.unwrap();
+        assert_eq!(data.get("accessKey").unwrap().0, b"keel-pulumi");
+        assert_eq!(data.get("secretKey").unwrap().0, b"super-secret");
     }
 }

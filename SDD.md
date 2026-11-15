@@ -33,7 +33,7 @@ flowchart TB
         API["keel-server (axum + kube-rs)<br/>Direct git CLI + ForgeProvider + SSE Telemetry"]
         S3["S3 State Backend (Garage / MinIO / Cloud S3)<br/>Versioned Pulumi State"]
         FORGE["Git Forge (Forgejo / Gitea / GitHub / GitLab)<br/>Desired State + PR Previews"]
-        OIDC["OIDC Provider (Pocket ID / Authentik)"]
+        OIDC["OIDC Provider (Dex / External OIDC)"]
         FLUX["Flux CD Controllers<br/>(source / kustomize / helm / notification)"]
         PKO["Pulumi Kubernetes Operator (PKO v2)<br/>Workspace Pods + Preview Mode"]
         GUARD["Kyverno Admission + SOPS/age"]
@@ -78,10 +78,10 @@ Because PKO v2 and Flux require a running Kubernetes cluster, Stage 0 executes d
 
 #### Seed Control-Plane Installation (Identical Across All Targets)
 Once the seed cluster API is reachable, `keel bootstrap init` performs the exact same installation sequence regardless of target:
-1. Installs **Garage/MinIO S3** (or binds the cloud provider's S3-compatible bucket), **Flux CD**, **PKO v2**, **Kyverno**, **Envoy Gateway**, **Prometheus**, **Flagger**, and optional in-cluster **Forgejo/Gitea** and **Pocket ID/Authentik**.
+1. Installs **Garage/MinIO S3** (or binds the cloud provider's S3-compatible bucket), **Flux CD**, **PKO v2**, **Kyverno**, **Envoy Gateway**, **Prometheus**, **Flagger**, **Dex** (Apache-2.0 in-cluster OIDC provider with username/password DB and extensible Google/Apple/Active Directory connectors, unless `--oidc-issuer` points to an external OIDC provider), and optional in-cluster **Forgejo/Gitea**.
 2. Generates a root **`age` keypair**, injects the private key into `flux-system/sops-age`, and writes `.sops.yaml` into the seed Git repository.
 3. For `proxmox` and cloud targets, uploads the Stage 0 Pulumi state to `s3://pulumi-state` and imports it into a Flux-managed PKO `Stack` CR (`management-cluster-core`) with `protect: true` enabled.
-4. Stores a single-use 256-bit `bootstrap-admin` token hash in a Kubernetes `Secret` (`keel-system/bootstrap-token`), prints the raw token to stdout, and exposes the setup portal on `http://localhost:8080` (via a local `keel-server` listener or automatic port-forward to the in-cluster `keel-server` pod).
+4. Provisions the initial Dex admin user (`--admin-username` / `--admin-password`, or auto-generated credentials printed once to stdout) as a bcrypt-hashed `staticPasswords` entry in Dex, configures OIDC PKCE for `keel-server`, and exposes the portal on `http://localhost:8080` (via automatic port-forward to the in-cluster `keel-server` pod or cluster ingress).
 
 #### NAT / Firewall & Ephemeral Local Cluster Resilience
 * **Outbound Pull-Polling:** Flux `GitRepository` resources default to outbound polling (`interval: 1m`) alongside optional webhook receivers, ensuring local `kind` and home `k3s` management clusters behind NAT/firewalls reconcile external GitHub/GitLab repositories without requiring inbound public ports.
@@ -113,14 +113,13 @@ sequenceDiagram
         CLI->>Target: Run Stage 0 Pulumi bootstrap stack (VMs / Managed K8s)
     end
     Target-->>CLI: Cluster Kubeconfig & Endpoint
-    CLI->>K8S: Install S3, Flux CD, PKO v2, Kyverno, Envoy, Flagger (+ optional Forge/OIDC)
-    CLI->>CLI: Generate root age keypair (.sops.yaml)
-    CLI->>K8S: Create Secret flux-system/sops-age
+    CLI->>K8S: Install S3, Flux CD, PKO v2, Kyverno, Envoy, Flagger, Dex OIDC (+ optional Forge)
+    CLI->>CLI: Generate root age keypair (.sops.yaml) & seed admin credentials
+    CLI->>K8S: Create Secret flux-system/sops-age & Dex admin Secret
     CLI->>S3: Upload Stage 0 Pulumi state (if infra-provisioned)
     CLI->>Git: Push baseline repo structure + protect:true Stack CRs
-    CLI-->>Op: Output one-time Bootstrap Token & Localhost URL
-    Op->>CLI: Authenticate & activate OIDC provider (PR)
-    CLI->>K8S: Transition Auth State Machine -> OIDC Enforced
+    CLI-->>Op: Output Admin Username/Password (if generated) & Portal URL
+    Op->>CLI: Authenticate via OIDC Authorization Code + PKCE (Dex)
 ```
 
 ---
@@ -301,16 +300,14 @@ spec:
 
 ## 6. Multi-Tenancy, Identity & Secrets Management
 
-### 6.1 Two-Phase Authentication State Machine
+### 6.1 OIDC-First Authentication State Machine
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Phase0_Bootstrap: First Binary Launch (No OIDC Config)
-    Phase0_Bootstrap --> Phase0_Bootstrap: Localhost Login via 256-bit CLI Token
-    Phase0_Bootstrap --> Phase1_OIDC_Active: OIDC Config PR Merged & Healthcheck Passed
-    Phase1_OIDC_Active --> Phase1_OIDC_Active: OIDC Auth Code + PKCE Login
-    Phase1_OIDC_Active --> Phase2_BreakGlass: Emergency CLI Recovery Command
-    Phase2_BreakGlass --> Phase1_OIDC_Active: Control Plane Restored & Token Revoked
+    [*] --> OidcActive: Stage 0 Bootstrap Complete (Dex or External OIDC)
+    OidcActive --> OidcActive: OIDC Auth Code + PKCE Login (Username/Password or Upstream Connector)
+    OidcActive --> BreakGlass: Emergency CLI Recovery Command (kubeconfig + S3)
+    BreakGlass --> OidcActive: Control Plane Restored
 ```
 
 ### 6.2 Multi-Tenant Isolation Model
@@ -323,7 +320,7 @@ stateDiagram-v2
 
 ### 6.3 Stateless Persistence & Secrets Management (K8s Secrets + SOPS/`age`)
 * **Zero Database Architecture:** `keel-server` is completely stateless and uses no SQLite, Postgres, or external database. All runtime state lives natively in Kubernetes `Secret`s, Git, and in-memory `kube-rs` CRD caches:
-  * **Stage 0 Bootstrap Token:** Stored as a SHA-256 hash in `keel-system/bootstrap-token` and deleted atomically upon OIDC activation.
+  * **In-Cluster OIDC Provider (Dex):** Stage 0 deploys Dex (Apache-2.0) with Kubernetes CRD storage and bcrypt-hashed `staticPasswords` (stored in a Kubernetes `Secret` in `keel-system`) for immediate username/password login, with Git-managed connector configuration for future Google, Apple, or Active Directory/LDAP federation.
   * **OIDC Sessions & PKCE State:** Signed and encrypted using a cluster-managed key `Secret` (`keel-system/session-key`) into stateless `HttpOnly`, `Secure`, `SameSite=Strict` cookies (with short-lived K8s `Secret`s or encrypted state cookies for PKCE verifiers).
   * **User Profile Credentials:** Personal Git SSH keys and Forge Personal Access Tokens stored in user profiles are encrypted with `AES-256-GCM` (backed by a cluster root/KMS `Secret` key) and persisted as Kubernetes `Secret`s in `keel-system` keyed by OIDC `sub`. They are never returned over REST APIs or written to logs.
 * **Per-Tenant Git Encryption Keys (SOPS + `age`):** Onboarding a new tenant generates a dedicated `age` keypair. The public key is registered in `.sops.yaml` scoped to `path_regex: ^tenants/<tenant-id>/.*\.enc\.yaml$`, and the private key is stored as a Kubernetes `Secret` exclusively inside `tenant-<tenant-id>`.
@@ -350,9 +347,9 @@ crates/
 
 | Command | Description | Key Flags |
 | :--- | :--- | :--- |
-| `keel bootstrap init` | Executes Stage 0 seed cluster bootstrap across local `kind`, existing `kubeconfig`, Proxmox VE, or public cloud targets, installing Flux/PKO and S3/`age`. | `--target [kind\|kubeconfig\|proxmox\|aws\|gcp\|azure\|hetzner]`, `--kubeconfig`, `--context`, `--proxmox-url`, `--region`, `--distro [k3s\|talos]`, `--with-forge`, `--with-oidc` |
-| `keel bootstrap recover` | Break-glass recovery pulling Pulumi state from S3 to repair an unreachable control plane. | `--s3-endpoint`, `--bucket`, `--stack` |
-| `keel auth login` | Authenticates the CLI against `keel-server` via OIDC Authorization Code + PKCE (localhost callback) or Stage 0 bootstrap token. | `--server`, `--bootstrap-token` |
+| `keel bootstrap init` | Executes Stage 0 seed cluster bootstrap across local `kind`, existing `kubeconfig`, Proxmox VE, or public cloud targets, installing Flux/PKO, S3/`age`, and Dex OIDC (or external OIDC). | `--target [kind\|kubeconfig\|proxmox\|aws\|gcp\|azure\|hetzner]`, `--kubeconfig`, `--context`, `--proxmox-url`, `--region`, `--distro [k3s\|talos]`, `--with-forge`, `--oidc-issuer`, `--admin-username`, `--admin-password` |
+| `keel bootstrap recover` | Break-glass recovery pulling Pulumi state from S3 via `kubeconfig` to repair an unreachable control plane. | `--s3-endpoint`, `--bucket`, `--stack` |
+| `keel auth login` | Authenticates the CLI against `keel-server` via OIDC Authorization Code + PKCE (localhost callback). | `--server` |
 | `keel serve` | Starts the stateless `axum` API server and serves the embedded React + Shadcn SPA. | `--bind 0.0.0.0:8080`, `--config` |
 | `keel infra list` | Lists all PKO `Stack` resources across providers with live drift and sync status. | `--tenant`, `--provider`, `--output [table\|json]` |
 | `keel infra provision` | Validates parameters against blueprint JSONSchema and opens a provisioning PR. | `--blueprint`, `--tenant`, `--values-file` |
@@ -363,7 +360,7 @@ crates/
 
 | Method | Endpoint | Purpose |
 | :--- | :--- | :--- |
-| `GET` | `/api/v1/auth/login` & `/callback` | OIDC Authorization Code + PKCE login flow (supports browser cookies and CLI localhost callback, plus Stage 0 bootstrap token exchange). |
+| `GET` | `/api/v1/auth/login` & `/callback` | OIDC Authorization Code + PKCE login flow (supports browser cookies and CLI localhost callback). |
 | `GET` | `/api/v1/catalog` | Returns available applications, infrastructure blueprints (filtered by enabled providers), and multi-item bundles. |
 | `POST` | `/api/v1/catalog` | Registers a new `CatalogApplication`, `CatalogInfraBlueprint`, or `CatalogBundle` via a Git PR. |
 | `PUT` | `/api/v1/catalog/{kind}/{id}` | Updates an existing `CatalogApplication`, `CatalogInfraBlueprint`, or `CatalogBundle` via a Git PR (preserving or optionally updating `Pulumi.yaml` for infra). |
@@ -396,7 +393,7 @@ crates/
 
 | ID | Requirement | Verification Criteria & Technical Control |
 | :--- | :--- | :--- |
-| **NFR-SEC-01** | **Two-Phase Auth & Session Hardening** | Stage 0 uses a single-use 256-bit CLI token invalidated immediately upon OIDC activation. Post-bootstrap sessions enforce OIDC PKCE and `HttpOnly`, `Secure`, `SameSite=Strict` cookies with automatic token rotation. |
+| **NFR-SEC-01** | **OIDC-First Auth & Session Hardening** | Stage 0 provisions an in-cluster Dex OIDC provider (or binds an external OIDC issuer) with bcrypt-hashed admin credentials. All API/UI/CLI sessions enforce OIDC Authorization Code + PKCE and `HttpOnly`, `Secure`, `SameSite=Strict` cookies encrypted with `AES-256-GCM`. |
 | **NFR-SEC-02** | **Strict Tenant Blast-Radius Isolation** | Each tenant is confined to `tenants/<tenant>/` and `tenant-<tenant>` namespace. Flux runs with `--no-cross-namespace-refs=true` and tenant `ServiceAccount` impersonation. |
 | **NFR-SEC-03** | **PKO Workspace Pod Sandboxing** | All PKO v2 `Workspace` pods enforce Kubernetes `restricted` Pod Security Standards (non-root UID, `drop: ["ALL"]` capabilities, read-only root filesystem, `RuntimeDefault` seccomp) and RBAC-authenticated workspace gRPC endpoints. |
 | **NFR-SEC-04** | **Admission Policy Guardrails** | Kyverno policies block privileged workloads, enforce resource quotas, restrict permitted Pulumi/OpenTofu providers per tenant, and protect control-plane stacks from non-admin mutation. |

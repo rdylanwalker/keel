@@ -2,7 +2,6 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest"
 import {
   setStoredToken,
   getStoredToken,
-  bootstrapLogin,
   getAuthStatus,
   getCatalog,
   getProposals,
@@ -17,6 +16,16 @@ import {
   deleteTenant,
   createCatalogApp,
   updateCatalogItem,
+  fetchCatalogSchema,
+  getStackDiagnostics,
+  getReleaseDiagnostics,
+  getStackConfig,
+  getReleaseConfig,
+  deleteStack,
+  deleteRelease,
+  getBundleConfig,
+  restartStackWorkspace,
+  reconcileRelease,
   getProviders,
   toggleProvider,
   createEventSourceStream,
@@ -59,40 +68,6 @@ describe("api client module", () => {
     setItemSpy.mockRestore()
   })
 
-  it("calls bootstrapLogin successfully and saves token", async () => {
-    const mockResponse = { success: true, token: "returned-token-abc" }
-    vi.stubGlobal(
-      "fetch",
-      vi.fn().mockResolvedValue({
-        ok: true,
-        json: async () => mockResponse,
-      })
-    )
-
-    const result = await bootstrapLogin("my-token")
-    expect(result).toEqual(mockResponse)
-    expect(getStoredToken()).toBe("returned-token-abc")
-    expect(fetch).toHaveBeenCalledWith("/api/v1/auth/bootstrap-login", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ token: "my-token" }),
-    })
-  })
-
-  it("does not store raw single-use bootstrap token when server uses HttpOnly session cookie", async () => {
-    const mockResponse = { authenticated: true }
-    vi.stubGlobal(
-      "fetch",
-      vi.fn().mockResolvedValue({
-        ok: true,
-        json: async () => mockResponse,
-      })
-    )
-
-    await bootstrapLogin("single-use-token")
-    expect(getStoredToken()).toBeNull()
-  })
-
   it("throws error on API HTTP failure with text response", async () => {
     vi.stubGlobal(
       "fetch",
@@ -104,7 +79,7 @@ describe("api client module", () => {
       })
     )
 
-    await expect(bootstrapLogin("invalid")).rejects.toThrow(
+    await expect(getAuthStatus()).rejects.toThrow(
       "API error (400): Validation error occurred"
     )
 
@@ -120,14 +95,14 @@ describe("api client module", () => {
       })
     )
 
-    await expect(bootstrapLogin("invalid")).rejects.toThrow(
+    await expect(getAuthStatus()).rejects.toThrow(
       "API error (502): Bad Gateway"
     )
   })
 
   it("fetches auth status with Authorization header if token exists", async () => {
     setStoredToken("bearer-secret")
-    const mockStatus = { authenticated: true, phase: "bootstrap" }
+    const mockStatus = { authenticated: true, phase: "oidc-active" }
     vi.stubGlobal(
       "fetch",
       vi.fn().mockResolvedValue({
@@ -644,5 +619,45 @@ describe("api client module", () => {
       title: "feat(catalog): update infra kind-cluster",
       branch: "keel/catalog/update-kind-cluster-305",
     })
+  })
+
+  it("calls stack, release, bundle, and schema diagnostic/config/lifecycle endpoints", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        ok: true,
+        proposal: { id: "1", title: "delete" },
+      }),
+    })
+    vi.stubGlobal("fetch", fetchMock)
+
+    await fetchCatalogSchema({
+      repoUrl: "https://charts.example.com",
+      chart: "podinfo",
+      version: "6.5.0",
+    })
+    await getStackDiagnostics("tenant-acme", "dev-kind")
+    await getReleaseDiagnostics("tenant-acme", "podinfo")
+    await getStackConfig("tenant-acme", "dev-kind")
+    await getReleaseConfig("tenant-acme", "podinfo")
+    await deleteStack("tenant-acme", "dev-kind")
+    await deleteRelease("tenant-acme", "podinfo")
+    await getBundleConfig("tenant-acme", "kind-with-podinfo")
+    await restartStackWorkspace("tenant-acme", "dev-kind")
+    await reconcileRelease("tenant-acme", "podinfo")
+
+    expect(fetchMock).toHaveBeenCalledTimes(10)
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/v1/catalog/fetch-schema",
+      expect.objectContaining({ method: "POST" })
+    )
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/v1/stacks/tenant-acme/dev-kind/diagnostics",
+      expect.any(Object)
+    )
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/v1/releases/tenant-acme/podinfo/reconcile",
+      expect.objectContaining({ method: "POST" })
+    )
   })
 })

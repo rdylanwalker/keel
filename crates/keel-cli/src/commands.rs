@@ -11,10 +11,11 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use keel_core::{
     AuthPhase, BootstrapConfig, BootstrapTarget, CatalogApplication, CatalogInfraBlueprint,
-    ClusterConnection, CoreError, DEFAULT_POLL_INTERVAL, EntityMeta, EnvelopeCrypto,
-    FLUX_SYSTEM_NAMESPACE, ForgeConfig, ForgeKind, KEEL_PREVIEWS_NAMESPACE, KEEL_SYSTEM_NAMESPACE,
-    KeelConfig, OidcConfig, PreparedHelmValues, ProviderRegistry, SopsConfig, SopsManager,
-    bootstrap_target_factory, prepare_helm_values, validate_dns_label, validate_schema_values,
+    ClusterConnection, CoreError, DEFAULT_POLL_INTERVAL, EnvelopeCrypto, FLUX_SYSTEM_NAMESPACE,
+    ForgeConfig, ForgeKind, KEEL_PREVIEWS_NAMESPACE, KEEL_SYSTEM_NAMESPACE, KeelConfig, OidcConfig,
+    PreparedHelmValues, ProviderRegistry, SopsConfig, SopsManager, bootstrap_target_factory,
+    generate_admin_password, hash_dex_password_bcrypt, prepare_helm_values, validate_dns_label,
+    validate_schema_values,
 };
 use keel_git::{
     CommitAuthor, ForgeError, ForgeProvider, ForgejoGiteaProvider, GitCredentials, GitError,
@@ -22,21 +23,22 @@ use keel_git::{
     parse_remote_repo_url,
 };
 use keel_kube::{
-    BOOTSTRAP_TOKEN_SECRET_NAME, CrdReconcileStatus, CrdWatchEvent, DockerSocketExceptionConfig,
+    CrdReconcileStatus, CrdWatchEvent, DEX_CONFIG_SECRET_NAME, DockerSocketExceptionConfig,
     InMemorySecretStore, KubeClusterStatusReader, KubeError, KyvernoManifestBundle,
-    KyvernoPolicyConfig, SecretStateStore, TelemetryMux, TenantIsolationConfig,
-    TenantManifestBundle, WatchedCrdKind, create_secret_manifest, hash_bootstrap_token,
+    KyvernoPolicyConfig, S3_CREDENTIALS_SECRET_NAME, SecretStateStore, TelemetryMux,
+    TenantIsolationConfig, TenantManifestBundle, WatchedCrdKind,
 };
 use keel_pko::{
     CrObjectMeta, DEFAULT_FLUX_POLL_INTERVAL, FLUX_GIT_REPO_API_VERSION, FLUX_GIT_REPO_KIND,
-    FluxGitRepository, FluxGitRepositoryRef, FluxGitRepositorySpec, LocalObjectReference,
-    ManagementCoreStackParams, PkoError, PkoStack, PreviewReport, synthesize_management_core_stack,
+    FluxGitRepository, FluxGitRepositoryRef, FluxGitRepositorySpec, IN_CLUSTER_S3_BACKEND_URL,
+    LocalObjectReference, ManagementCoreStackParams, PkoError, PkoStack, PreviewReport,
+    attach_s3_credentials_env_refs, synthesize_management_core_stack,
 };
 use keel_server::{
     AppState, KubeClusterStateProvider, RepoClusterStateProvider, SESSION_COOKIE_NAME,
     StackSummary, build_router,
 };
-use reqwest::header::{AUTHORIZATION, COOKIE, LOCATION, SET_COOKIE};
+use reqwest::header::{AUTHORIZATION, COOKIE, LOCATION};
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -283,26 +285,30 @@ pub struct SeedControlPlaneArtifacts {
     pub flux_git_repository: FluxGitRepository,
     pub kyverno_bundle: KyvernoManifestBundle,
     pub management_stack: PkoStack,
-    /// Raw single-use 256-bit Stage 0 bootstrap token (returned to operator stdout, never logged).
-    pub bootstrap_token: String,
-    /// SHA-256 hex digest persisted inside `keel-system/bootstrap-token`.
-    pub bootstrap_token_sha256: String,
-    /// Kubernetes `Secret` metadata for `keel-system/bootstrap-token`.
-    pub bootstrap_secret_namespace: String,
-    pub bootstrap_secret_name: String,
+    /// Initial admin username/email for Stage 0 Dex seeding.
+    pub admin_username: String,
+    /// Initial admin password for Stage 0 Dex seeding (never logged in `Debug`).
+    pub admin_password: String,
+    /// `true` if `admin_password` was auto-generated rather than supplied via CLI flags.
+    pub admin_password_generated: bool,
+    /// Rendered Dex `config.yaml` payload for `keel-system/dex-config` (`None` when using external OIDC).
+    pub dex_config_yaml: Option<String>,
+    /// Kubernetes `Secret` metadata for `keel-system/dex-config`.
+    pub dex_secret_namespace: String,
+    pub dex_secret_name: String,
+    /// Optional generated `age` keyfile contents for `flux-system/sops-age` (never logged).
+    pub sops_age_keyfile: Option<String>,
 }
 
 impl std::fmt::Debug for SeedControlPlaneArtifacts {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SeedControlPlaneArtifacts")
             .field("keel_config", &self.keel_config)
-            .field("bootstrap_token", &"[REDACTED]")
-            .field("bootstrap_token_sha256", &self.bootstrap_token_sha256)
-            .field(
-                "bootstrap_secret_namespace",
-                &self.bootstrap_secret_namespace,
-            )
-            .field("bootstrap_secret_name", &self.bootstrap_secret_name)
+            .field("admin_username", &self.admin_username)
+            .field("admin_password", &"[REDACTED]")
+            .field("admin_password_generated", &self.admin_password_generated)
+            .field("dex_secret_namespace", &self.dex_secret_namespace)
+            .field("dex_secret_name", &self.dex_secret_name)
             .finish()
     }
 }
@@ -355,10 +361,25 @@ pub async fn synthesize_seed_control_plane(
         }
     });
 
-    let mut keel_config = KeelConfig {
+    let oidc_issuer = cfg
+        .oidc_issuer
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| "http://dex.keel-system.svc.cluster.local:5556/dex".to_string());
+    let oidc_client_id = cfg
+        .oidc_client_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| "keel-server".to_string());
+
+    let keel_config = KeelConfig {
         cluster_name: cfg.cluster_name.clone(),
         bootstrap_target: cfg.target,
-        auth_phase: AuthPhase::Bootstrap,
+        auth_phase: AuthPhase::OidcActive,
         enabled_providers: enabled_provider_ids.clone(),
         forge: ForgeConfig {
             provider: if cfg.with_forge {
@@ -376,32 +397,27 @@ pub async fn synthesize_seed_control_plane(
             // Mandatory outbound pull-polling interval (`1m`) for NAT/firewall resilience (`AGENTS.md` §3.1)
             poll_interval: DEFAULT_POLL_INTERVAL.to_string(),
         },
-        oidc: if cfg.with_oidc {
-            Some(OidcConfig {
-                enabled: true,
-                issuer_url: "https://oidc.keel.internal".to_string(),
-                client_id: "keel-portal".to_string(),
-                redirect_url: "http://127.0.0.1:8080/api/v1/auth/callback".to_string(),
-                scopes: vec![
-                    "openid".to_string(),
-                    "profile".to_string(),
-                    "email".to_string(),
-                    "groups".to_string(),
-                ],
-            })
-        } else {
-            None
-        },
+        oidc: Some(OidcConfig {
+            enabled: true,
+            issuer_url: oidc_issuer.clone(),
+            client_id: oidc_client_id.clone(),
+            redirect_url: "http://127.0.0.1:8080/api/v1/auth/callback".to_string(),
+            scopes: vec![
+                "openid".to_string(),
+                "profile".to_string(),
+                "email".to_string(),
+                "groups".to_string(),
+            ],
+        }),
         ..KeelConfig::default()
     };
-    if keel_config.oidc.as_ref().is_some_and(|o| o.enabled) {
-        keel_config.auth_phase = AuthPhase::OidcActive;
-    }
     keel_config.validate()?;
 
     // Generate root SOPS config (populate root age rule if `age-keygen` is installed on PATH)
     let mut sops_config = SopsConfig::default();
+    let mut sops_age_keyfile = None;
     if let Ok(keypair) = SopsManager::new().generate_age_keypair().await {
+        sops_age_keyfile = Some(keypair.to_keyfile_contents());
         sops_config
             .creation_rules
             .push(keel_core::SopsCreationRule {
@@ -443,38 +459,46 @@ pub async fn synthesize_seed_control_plane(
     let kyverno_bundle = kyverno_gen.generate()?;
 
     // Protected anti-lockout `management-cluster-core` PKO v2 Stack (`protect: true`)
-    let mgmt_backend = if cfg.target == keel_core::BootstrapTargetKind::Kind {
-        "file:///tmp".to_string()
+    let use_in_cluster_s3 = keel_config.s3.is_none();
+    let mgmt_backend = if let Some(s3) = keel_config.s3.as_ref() {
+        format!("s3://{}", s3.bucket)
     } else {
-        let s3_bucket = keel_config
-            .s3
-            .as_ref()
-            .map(|s| s.bucket.as_str())
-            .unwrap_or("pulumi-state");
-        format!("s3://{s3_bucket}")
+        IN_CLUSTER_S3_BACKEND_URL.to_string()
     };
-    let mgmt_params =
+    let mut mgmt_params =
         ManagementCoreStackParams::new(mgmt_backend, FLUX_SYSTEM_NAMESPACE, "clusters/management");
+    if use_in_cluster_s3 {
+        attach_s3_credentials_env_refs(&mut mgmt_params.env_refs, S3_CREDENTIALS_SECRET_NAME);
+    }
     let management_stack = synthesize_management_core_stack(&mgmt_params)?;
 
-    // Single-use 256-bit Stage 0 bootstrap token (`NFR-SEC-01`, `NFR-SEC-05`)
-    let bootstrap_token = EnvelopeCrypto::generate_bootstrap_token();
-    let bootstrap_token_sha256 = EnvelopeCrypto::sha256_hex(bootstrap_token.as_bytes());
-    debug_assert_eq!(
-        bootstrap_token_sha256,
-        hash_bootstrap_token(&bootstrap_token)
-    );
+    // Stage 0 Dex OIDC admin credentials & config (`SDD.md` §2.1, §6.1, `NFR-SEC-01`)
+    let admin_username = cfg
+        .admin_username
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| "admin@keel.local".to_string());
 
-    let secret_meta = EntityMeta::new(BOOTSTRAP_TOKEN_SECRET_NAME, KEEL_SYSTEM_NAMESPACE);
-    let secret_manifest = create_secret_manifest(&secret_meta);
-    let bootstrap_secret_namespace = secret_manifest
-        .metadata
-        .namespace
-        .unwrap_or_else(|| KEEL_SYSTEM_NAMESPACE.to_string());
-    let bootstrap_secret_name = secret_manifest
-        .metadata
-        .name
-        .unwrap_or_else(|| BOOTSTRAP_TOKEN_SECRET_NAME.to_string());
+    let (admin_password, admin_password_generated) = match cfg
+        .admin_password
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(provided) => (provided.to_string(), false),
+        None => (generate_admin_password(), true),
+    };
+
+    let dex_config_yaml = if cfg.oidc_issuer.is_none() {
+        let bcrypt_hash = hash_dex_password_bcrypt(&admin_password)?;
+        Some(format!(
+            "issuer: {oidc_issuer}\nstorage:\n  type: kubernetes\n  config:\n    inCluster: true\nweb:\n  http: 0.0.0.0:5556\nenablePasswordDB: true\nstaticPasswords:\n  - email: {admin_username}\n    hash: \"{bcrypt_hash}\"\n    username: admin\n    userID: \"keel-admin\"\nstaticClients:\n  - id: {oidc_client_id}\n    public: true\n    name: \"Keel Control Plane\"\n    redirectURIs:\n      - http://127.0.0.1:8080/api/v1/auth/callback\n      - http://localhost:8080/api/v1/auth/callback\n"
+        ))
+    } else {
+        None
+    };
 
     Ok(SeedControlPlaneArtifacts {
         keel_config,
@@ -483,10 +507,13 @@ pub async fn synthesize_seed_control_plane(
         flux_git_repository,
         kyverno_bundle,
         management_stack,
-        bootstrap_token,
-        bootstrap_token_sha256,
-        bootstrap_secret_namespace,
-        bootstrap_secret_name,
+        admin_username,
+        admin_password,
+        admin_password_generated,
+        dex_config_yaml,
+        dex_secret_namespace: KEEL_SYSTEM_NAMESPACE.to_string(),
+        dex_secret_name: DEX_CONFIG_SECRET_NAME.to_string(),
+        sops_age_keyfile,
     })
 }
 
@@ -1124,6 +1151,153 @@ fn infer_forge_config(
 
 /// Installs Stage 0 core control-plane controllers (Flux CD, Kyverno, PKO v2, and optional Forgejo)
 /// and seed manifests onto the bootstrapped cluster unless `--skip-core-install` was specified.
+async fn read_secret_key(
+    context: Option<&str>,
+    kubeconfig: Option<&Path>,
+    namespace: &str,
+    secret_name: &str,
+    key: &str,
+) -> Option<String> {
+    let mut cmd = tokio::process::Command::new("kubectl");
+    if let Some(kc) = kubeconfig {
+        cmd.arg("--kubeconfig").arg(kc);
+    }
+    if let Some(ctx) = context {
+        cmd.arg("--context").arg(ctx);
+    }
+    let tmpl = format!("{{{{.data.{key} | base64decode}}}}");
+    let out = cmd
+        .args([
+            "-n",
+            namespace,
+            "get",
+            "secret",
+            secret_name,
+            "-o",
+            &format!("go-template={tmpl}"),
+        ])
+        .output()
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let val = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if val.is_empty() { None } else { Some(val) }
+}
+
+async fn sync_in_cluster_s3_credentials_from_seaweedfs(
+    context: Option<&str>,
+    kubeconfig: Option<&Path>,
+) -> Result<(), CliError> {
+    const SEAWEEDFS_S3_SECRET: &str = "s3-state-backend-seaweedfs-s3-secret";
+    let access_key = read_secret_key(
+        context,
+        kubeconfig,
+        KEEL_SYSTEM_NAMESPACE,
+        SEAWEEDFS_S3_SECRET,
+        "admin_access_key_id",
+    )
+    .await
+    .ok_or_else(|| {
+        CliError::Validation(format!(
+            "missing `admin_access_key_id` in `{KEEL_SYSTEM_NAMESPACE}/{SEAWEEDFS_S3_SECRET}`"
+        ))
+    })?;
+    let secret_key = read_secret_key(
+        context,
+        kubeconfig,
+        KEEL_SYSTEM_NAMESPACE,
+        SEAWEEDFS_S3_SECRET,
+        "admin_secret_access_key",
+    )
+    .await
+    .ok_or_else(|| {
+        CliError::Validation(format!(
+            "missing `admin_secret_access_key` in `{KEEL_SYSTEM_NAMESPACE}/{SEAWEEDFS_S3_SECRET}`"
+        ))
+    })?;
+
+    let default_tenant_rbac =
+        TenantManifestBundle::synthesize(&TenantIsolationConfig::new("default"))?
+            .to_multi_doc_yaml()?;
+    run_kubectl_apply(context, kubeconfig, &default_tenant_rbac).await?;
+
+    for ns in [
+        KEEL_SYSTEM_NAMESPACE,
+        FLUX_SYSTEM_NAMESPACE,
+        KEEL_PREVIEWS_NAMESPACE,
+        "tenant-default",
+    ] {
+        let secret_doc = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": {
+                "name": S3_CREDENTIALS_SECRET_NAME,
+                "namespace": ns,
+                "labels": {
+                    "app.kubernetes.io/managed-by": "keel",
+                    "keel.io/secret-kind": "s3-credentials",
+                },
+            },
+            "type": "Opaque",
+            "stringData": {
+                "accessKey": access_key,
+                "secretKey": secret_key,
+            },
+        });
+        let secret_yaml = serde_yml::to_string(&secret_doc)?;
+        run_kubectl_apply(context, kubeconfig, &secret_yaml).await?;
+    }
+
+    Ok(())
+}
+
+async fn ensure_seaweedfs_pulumi_bucket(
+    context: Option<&str>,
+    kubeconfig: Option<&Path>,
+) -> Result<(), CliError> {
+    use tokio::io::AsyncWriteExt;
+
+    let mut cmd = tokio::process::Command::new("kubectl");
+    if let Some(kc) = kubeconfig {
+        cmd.arg("--kubeconfig").arg(kc);
+    }
+    if let Some(ctx) = context {
+        cmd.arg("--context").arg(ctx);
+    }
+    cmd.args([
+        "-n",
+        KEEL_SYSTEM_NAMESPACE,
+        "exec",
+        "-i",
+        "sts/s3-state-backend-seaweedfs-filer",
+        "--",
+        "weed",
+        "shell",
+        "-master=s3-state-backend-seaweedfs-master:9333",
+    ])
+    .stdin(std::process::Stdio::piped())
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped());
+
+    let mut child = cmd.spawn()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(b"s3.bucket.create -name pulumi-state\n")
+            .await?;
+        drop(stdin);
+    }
+    let out = child.wait_with_output().await?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return Err(CliError::Validation(format!(
+            "failed to create `pulumi-state` bucket in SeaweedFS: {stderr}"
+        )));
+    }
+    Ok(())
+}
+
 async fn install_stage0_core_addons(
     connection: &ClusterConnection,
     artifacts: &SeedControlPlaneArtifacts,
@@ -1135,6 +1309,31 @@ async fn install_stage0_core_addons(
 
     tracing::info!(context = ?ctx, "Applying seed namespaces (`flux-system`, `keel-system`, `keel-previews`)");
     run_kubectl_apply(ctx, kc, SEED_NAMESPACES_YAML).await?;
+
+    if let Some(ref keyfile) = artifacts.sops_age_keyfile
+        && read_secret_key(ctx, kc, FLUX_SYSTEM_NAMESPACE, "sops-age", "age.agekey")
+            .await
+            .is_none()
+    {
+        let sops_secret = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": {
+                "name": "sops-age",
+                "namespace": FLUX_SYSTEM_NAMESPACE,
+                "labels": {
+                    "app.kubernetes.io/managed-by": "keel",
+                    "keel.io/secret-kind": "sops-age",
+                },
+            },
+            "type": "Opaque",
+            "stringData": {
+                "age.agekey": keyfile,
+            },
+        });
+        let sops_yaml = serde_yml::to_string(&sops_secret)?;
+        run_kubectl_apply(ctx, kc, &sops_yaml).await?;
+    }
 
     tracing::info!("Installing Flux CD (`flux2`) into `flux-system`");
     run_helm_install(
@@ -1198,6 +1397,73 @@ async fn install_stage0_core_addons(
         ],
     )
     .await?;
+
+    if artifacts
+        .management_stack
+        .spec
+        .backend
+        .as_deref()
+        .is_some_and(|b| b.contains("s3-state-backend-seaweedfs-s3.keel-system.svc.cluster.local"))
+    {
+        tracing::info!(
+            "Installing in-cluster FOSS S3 state backend (SeaweedFS) into `keel-system`"
+        );
+        run_helm_install(
+            ctx,
+            kc,
+            &[
+                "upgrade",
+                "--install",
+                "s3-state-backend",
+                "seaweedfs",
+                "--repo",
+                "https://seaweedfs.github.io/seaweedfs/helm",
+                "--version",
+                "4.53.0",
+                "--namespace",
+                "keel-system",
+                "--create-namespace",
+                "--set",
+                "s3.enabled=true",
+                "--set",
+                "s3.enableAuth=true",
+                "--set",
+                "master.logs.type=emptyDir",
+                "--set",
+                "volume.logs.type=emptyDir",
+                "--set",
+                "filer.logs.type=emptyDir",
+                "--set",
+                "s3.logs.type=emptyDir",
+                "--set",
+                "master.data.type=persistentVolumeClaim",
+                "--set",
+                "master.data.size=1Gi",
+                "--set",
+                "filer.data.type=persistentVolumeClaim",
+                "--set",
+                "filer.data.size=2Gi",
+                "--set",
+                "volume.dataDirs[0].name=data1",
+                "--set",
+                "volume.dataDirs[0].type=persistentVolumeClaim",
+                "--set",
+                "volume.dataDirs[0].size=10Gi",
+                "--set",
+                "volume.dataDirs[0].maxVolumes=0",
+                "--set",
+                "volume.idx.type=persistentVolumeClaim",
+                "--set",
+                "volume.idx.size=2Gi",
+                "--wait",
+                "--timeout",
+                "5m",
+            ],
+        )
+        .await?;
+        sync_in_cluster_s3_credentials_from_seaweedfs(ctx, kc).await?;
+        ensure_seaweedfs_pulumi_bucket(ctx, kc).await?;
+    }
 
     if with_forge {
         tracing::info!("Installing in-cluster Forgejo Git forge into `keel-system`");
@@ -1628,11 +1894,20 @@ fn format_bootstrap_init_summary(
             repo.initial_commit_sha
         ));
     }
-    out.push_str(&format!(
-        "Token Secret:    {}/{}\n",
-        artifacts.bootstrap_secret_namespace, artifacts.bootstrap_secret_name
-    ));
-    out.push_str(&format!("Bootstrap Token: {}\n", artifacts.bootstrap_token));
+    if artifacts.dex_config_yaml.is_some() {
+        out.push_str(&format!(
+            "OIDC Provider:   Dex ({}/{})\n",
+            artifacts.dex_secret_namespace, artifacts.dex_secret_name
+        ));
+        out.push_str(&format!("Admin Username:  {}\n", artifacts.admin_username));
+        if artifacts.admin_password_generated {
+            out.push_str(&format!("Admin Password:  {}\n", artifacts.admin_password));
+        } else {
+            out.push_str("Admin Password:  [PROVIDED VIA CLI]\n");
+        }
+    } else if let Some(ref oidc) = artifacts.keel_config.oidc {
+        out.push_str(&format!("OIDC Issuer:     {}\n", oidc.issuer_url));
+    }
     out.push_str("Portal URL:      http://127.0.0.1:8080\n");
     out
 }
@@ -1792,11 +2067,6 @@ pub fn generate_pkce_pair() -> PkceChallenge {
 /// Outcome of `keel auth login`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthLoginOutcome {
-    BootstrapSession {
-        sub: String,
-        phase: AuthPhase,
-        output: String,
-    },
     OidcRedirect {
         authorize_url: String,
         output: String,
@@ -1806,73 +2076,20 @@ pub enum AuthLoginOutcome {
 impl AuthLoginOutcome {
     pub fn output(&self) -> &str {
         match self {
-            Self::BootstrapSession { output, .. } | Self::OidcRedirect { output, .. } => output,
+            Self::OidcRedirect { output, .. } => output,
         }
     }
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct BootstrapLoginApiResponse {
-    authenticated: bool,
-    sub: String,
-    phase: AuthPhase,
-}
-
-/// Executes `keel auth login` against `keel-server` via Stage 0 bootstrap token or OIDC PKCE (`SDD.md` §6.1).
+/// Executes `keel auth login` against `keel-server` via OIDC Authorization Code + PKCE (`SDD.md` §6.1).
 pub async fn execute_auth_login(
     args: &AuthLoginArgs,
     ctx: &CliContext,
 ) -> Result<AuthLoginOutcome, CliError> {
     let base_url = normalize_server_url(&args.server)?;
 
-    if let Some(raw_token) = &args.bootstrap_token {
-        let trimmed = raw_token.trim();
-        if trimmed.is_empty() {
-            return Err(CliError::Validation(
-                "bootstrap_token must not be empty".to_string(),
-            ));
-        }
-
-        let endpoint = format!("{base_url}/api/v1/auth/bootstrap-login");
-        let resp = ctx
-            .http
-            .post(&endpoint)
-            .json(&json!({ "token": trimmed }))
-            .send()
-            .await?;
-
-        if !resp.status().is_success() {
-            return Err(extract_api_error(resp).await);
-        }
-
-        let session_cookie =
-            extract_session_cookie_from_headers(resp.headers()).ok_or_else(|| {
-                CliError::Execution(
-                    "keel-server did not return a session Set-Cookie header".to_string(),
-                )
-            })?;
-
-        let login_body: BootstrapLoginApiResponse = resp.json().await?;
-        if !login_body.authenticated {
-            return Err(CliError::Execution(
-                "Bootstrap authentication rejected by server".to_string(),
-            ));
-        }
-
-        ctx.save_session_token(&base_url, &session_cookie)?;
-
-        let output = format!(
-            "Authenticated with {base_url} as '{}' (phase: {:?}). Session saved.",
-            login_body.sub, login_body.phase
-        );
-        Ok(AuthLoginOutcome::BootstrapSession {
-            sub: login_body.sub,
-            phase: login_body.phase,
-            output,
-        })
-    } else {
-        // OIDC Authorization Code + PKCE flow
+    // OIDC Authorization Code + PKCE flow
+    {
         let pkce = generate_pkce_pair();
         let endpoint = format!("{base_url}/api/v1/auth/login");
         let resp = ctx.no_redirect_http.get(&endpoint).send().await?;
@@ -1901,22 +2118,6 @@ pub async fn execute_auth_login(
             Err(extract_api_error(resp).await)
         }
     }
-}
-
-fn extract_session_cookie_from_headers(headers: &reqwest::header::HeaderMap) -> Option<String> {
-    for val in headers.get_all(SET_COOKIE) {
-        let raw = val.to_str().ok()?;
-        for segment in raw.split(';') {
-            let trimmed = segment.trim();
-            if let Some((k, v)) = trimmed.split_once('=')
-                && k.trim() == SESSION_COOKIE_NAME
-                && !v.trim().is_empty()
-            {
-                return Some(v.trim().to_string());
-            }
-        }
-    }
-    None
 }
 
 async fn extract_api_error(resp: reqwest::Response) -> CliError {
@@ -2130,11 +2331,12 @@ async fn build_serve_state_with_forward(
             .await
             .unwrap_or(false)
         {
-            let mgmt_params = ManagementCoreStackParams::new(
-                "s3://pulumi-state",
+            let mut mgmt_params = ManagementCoreStackParams::new(
+                IN_CLUSTER_S3_BACKEND_URL,
                 FLUX_SYSTEM_NAMESPACE,
                 "clusters/management",
             );
+            attach_s3_credentials_env_refs(&mut mgmt_params.env_refs, S3_CREDENTIALS_SECRET_NAME);
             let mgmt_stack = synthesize_management_core_stack(&mgmt_params)?;
             tokio::fs::write(&mgmt_stack_path, mgmt_stack.to_yaml()?).await?;
         }
@@ -2172,7 +2374,7 @@ async fn build_serve_state_with_forward(
     let auth_phase = parsed_keel_cfg
         .as_ref()
         .map(|c| c.auth_phase)
-        .unwrap_or(AuthPhase::Bootstrap);
+        .unwrap_or(AuthPhase::OidcActive);
     let oidc_cfg = parsed_keel_cfg
         .as_ref()
         .and_then(|c| c.oidc.as_ref())
@@ -2268,14 +2470,6 @@ async fn build_serve_state_with_forward(
     };
 
     let secret_store: Arc<dyn SecretStateStore> = Arc::new(InMemorySecretStore::new());
-    let mut generated_token = None;
-
-    if auth_phase != AuthPhase::OidcActive {
-        let token = EnvelopeCrypto::generate_bootstrap_token();
-        let hash = EnvelopeCrypto::sha256_hex(token.as_bytes());
-        secret_store.store_bootstrap_token_hash(&hash).await?;
-        generated_token = Some(token);
-    }
 
     let live_mgmt_backend = if let Some(ref reader) = kube_reader {
         reader
@@ -2309,6 +2503,17 @@ async fn build_serve_state_with_forward(
     if let Some(backend) = mgmt_stack_backend {
         state.backend_url = backend;
     }
+    if state
+        .backend_url
+        .contains("s3-state-backend-seaweedfs-s3.keel-system.svc.cluster.local")
+        || state
+            .secret_store
+            .has_s3_credentials()
+            .await
+            .unwrap_or(false)
+    {
+        state = state.with_s3_credentials_secret(Some(S3_CREDENTIALS_SECRET_NAME.to_string()));
+    }
 
     if let Some(reader) = kube_reader {
         tracing::info!("Connected to Kubernetes cluster for live Flux/PKO status reconciliation");
@@ -2326,7 +2531,7 @@ async fn build_serve_state_with_forward(
         )));
     }
 
-    Ok((state, generated_token, forge_pf))
+    Ok((state, None, forge_pf))
 }
 
 /// Binds `keel-server` on `args.bind` and runs until `shutdown` resolves.
@@ -2334,15 +2539,12 @@ pub async fn execute_serve_until<F>(args: &ServeArgs, shutdown: F) -> Result<Soc
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    let (state, generated_token, _forge_pf) = build_serve_state_with_forward(args, true).await?;
+    let (state, _unused, _forge_pf) = build_serve_state_with_forward(args, true).await?;
     let router = build_router(state);
     let listener = tokio::net::TcpListener::bind(&args.bind).await?;
     let local_addr = listener.local_addr()?;
 
-    if let Some(ref token) = generated_token {
-        println!("Keel Control Plane listening on http://{local_addr}");
-        println!("Stage 0 Bootstrap Token: {token}");
-    }
+    println!("Keel Control Plane listening on http://{local_addr}");
     tracing::info!(%local_addr, "Listening for Keel HTTP/SSE connections");
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
     tokio::spawn(async move {
@@ -3222,7 +3424,10 @@ spec:
             region: Some("us-east-1".to_string()),
             distro: None,
             with_forge: false,
-            with_oidc: false,
+            oidc_issuer: None,
+            oidc_client_id: None,
+            admin_username: None,
+            admin_password: None,
             local_dev_docker_socket_exception: true,
             repo_dir: None,
             skip_core_install: true,
@@ -3252,7 +3457,10 @@ spec:
             region: None,
             distro: None,
             with_forge: false,
-            with_oidc: true,
+            oidc_issuer: None,
+            oidc_client_id: None,
+            admin_username: None,
+            admin_password: None,
             local_dev_docker_socket_exception: true,
             repo_dir: None,
             skip_core_install: true,
@@ -3272,8 +3480,41 @@ spec:
             outcome.artifacts.keel_config.auth_phase,
             AuthPhase::OidcActive
         );
-        assert_eq!(outcome.artifacts.bootstrap_token.len(), 64);
-        assert!(!format!("{:?}", outcome.artifacts).contains(&outcome.artifacts.bootstrap_token));
+        assert_eq!(outcome.artifacts.admin_username, "admin@keel.local");
+        assert_eq!(outcome.artifacts.admin_password.len(), 20);
+        assert!(outcome.artifacts.admin_password_generated);
+        assert!(
+            outcome
+                .artifacts
+                .dex_config_yaml
+                .as_deref()
+                .is_some_and(|y| y.contains("enablePasswordDB: true"))
+        );
+        assert!(!format!("{:?}", outcome.artifacts).contains(&outcome.artifacts.admin_password));
+        assert_eq!(
+            outcome.artifacts.management_stack.spec.backend.as_deref(),
+            Some(IN_CLUSTER_S3_BACKEND_URL)
+        );
+        assert_eq!(
+            outcome
+                .artifacts
+                .management_stack
+                .spec
+                .env_refs
+                .get("AWS_ACCESS_KEY_ID")
+                .map(|r| (r.secret.name.as_str(), r.secret.key.as_str())),
+            Some((S3_CREDENTIALS_SECRET_NAME, "accessKey"))
+        );
+        assert_eq!(
+            outcome
+                .artifacts
+                .management_stack
+                .spec
+                .env_refs
+                .get("AWS_SECRET_ACCESS_KEY")
+                .map(|r| (r.secret.name.as_str(), r.secret.key.as_str())),
+            Some((S3_CREDENTIALS_SECRET_NAME, "secretKey"))
+        );
     }
 
     #[tokio::test]
@@ -3451,8 +3692,7 @@ spec:
             config: None,
             git_token: None,
         };
-        let (state, bootstrap_token) = build_serve_state(&serve_args).await.unwrap();
-        let raw_token = bootstrap_token.expect("Stage 0 token should be generated");
+        let (state, _) = build_serve_state(&serve_args).await.unwrap();
 
         // Commit enabled provider registry + catalog items onto `main`
         let mut reg = ProviderRegistry::default_day1();
@@ -3498,6 +3738,21 @@ spec:
             .await
             .unwrap();
 
+        let session_key = state
+            .secret_store
+            .get_or_create_session_key()
+            .await
+            .unwrap();
+        let claims = keel_server::SessionClaims {
+            sub: "admin@keel.local".to_string(),
+            email: Some("admin@keel.local".to_string()),
+            name: Some("Keel Admin".to_string()),
+            groups: vec!["keel-admins".to_string()],
+            auth_phase: AuthPhase::OidcActive,
+            exp: chrono::Utc::now().timestamp() + 3600,
+        };
+        let session_token = keel_server::encrypt_session_token(&session_key, &claims).unwrap();
+
         let telemetry = state.telemetry.clone();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let bound_addr = listener.local_addr().unwrap();
@@ -3521,19 +3776,8 @@ spec:
         let unconf_err = dispatch(&oidc_unconfigured_cli, &ctx).await.unwrap_err();
         assert!(unconf_err.to_string().contains("503"));
 
-        // 2. Stage 0 bootstrap login succeeds and persists session token
-        let login_cli = Cli::try_parse_from([
-            "keel",
-            "auth",
-            "login",
-            "--server",
-            &server_url,
-            "--bootstrap-token",
-            &raw_token,
-        ])
-        .unwrap();
-        let login_out = dispatch(&login_cli, &ctx).await.unwrap();
-        assert!(login_out.contains("bootstrap-admin"));
+        // 2. Save OIDC session token in CLI context
+        ctx.save_session_token(&server_url, &session_token).unwrap();
 
         // 3. `keel infra provision` opens PR #1 and prints PKO preview diff table
         let db_values_file = tmp.path().join("db-values.yaml");
@@ -3737,22 +3981,15 @@ spec:
         let ctx = CliContext::with_credentials_path(tmp.path().join("creds.json"));
         let args = AuthLoginArgs {
             server: format!("http://{addr}"),
-            bootstrap_token: None,
         };
         let outcome = execute_auth_login(&args, &ctx).await.unwrap();
-        match outcome {
-            AuthLoginOutcome::OidcRedirect {
-                authorize_url,
-                output,
-            } => {
-                assert!(
-                    authorize_url.starts_with("https://idp.acme.io/protocol/openid-connect/auth")
-                );
-                assert!(authorize_url.contains("code_challenge_method=S256"));
-                assert!(output.contains("OIDC PKCE URL"));
-            }
-            other => panic!("expected OidcRedirect, got {other:?}"),
-        }
+        let AuthLoginOutcome::OidcRedirect {
+            authorize_url,
+            output,
+        } = outcome;
+        assert!(authorize_url.starts_with("https://idp.acme.io/auth"));
+        assert!(authorize_url.contains("code_challenge_method=S256"));
+        assert!(output.contains("OIDC PKCE URL"));
 
         let _ = tx.send(());
         handle.await.unwrap();
@@ -3824,17 +4061,6 @@ spec:
                 .to_string()
                 .contains("invalid pull request identifier")
         );
-
-        let err_empty_tok = execute_auth_login(
-            &AuthLoginArgs {
-                server: "http://127.0.0.1:8080".to_string(),
-                bootstrap_token: Some("   ".to_string()),
-            },
-            &overridden_ctx,
-        )
-        .await
-        .unwrap_err();
-        assert!(err_empty_tok.to_string().contains("must not be empty"));
     }
 
     #[tokio::test]
@@ -3906,7 +4132,10 @@ spec:
             region: None,
             distro: None,
             with_forge: false,
-            with_oidc: false,
+            oidc_issuer: None,
+            oidc_client_id: None,
+            admin_username: None,
+            admin_password: None,
             local_dev_docker_socket_exception: true,
             repo_dir: Some(repo_dir.clone()),
             skip_core_install: true,

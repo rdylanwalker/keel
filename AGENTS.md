@@ -66,7 +66,7 @@ AI agents **MUST NOT** violate the following constraints from `SDD.md`:
 
 8. **Progressive Delivery & Stateless Control Plane:**
    * Use **Flagger + Envoy Gateway + Prometheus** for opt-in Kubernetes HTTP/gRPC canary rollouts.
-   * Keep `keel-server` **stateless** with no embedded or external database (no SQLite/Postgres). Store bootstrap tokens, user Git credentials, and OIDC/session keys natively in Kubernetes `Secret`s and read live state from Git, Forge APIs, and `kube-rs` CRD caches.
+   * Keep `keel-server` **stateless** with no embedded or external database (no SQLite/Postgres). Store OIDC/session keys and user Git credentials natively in Kubernetes `Secret`s and read live state from Git, Forge APIs, and `kube-rs` CRD caches.
 
 9. **Strict Multi-Tenancy & Secret Hygiene:**
    * Enforce namespace-per-tenant isolation (`tenant-<id>`), Flux `--no-cross-namespace-refs=true`, Kyverno policies, and `restricted` Pod Security Standards (`NFR-SEC-02`, `NFR-SEC-03`, `NFR-SEC-04`).

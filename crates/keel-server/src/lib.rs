@@ -1,6 +1,6 @@
 //! `keel-server`
 //!
-//! Stateless Axum HTTP and SSE REST API server, OIDC PKCE & Stage 0 bootstrap
+//! Stateless Axum HTTP and SSE REST API server, OIDC PKCE
 //! authentication handler, and embedded React SPA static asset host (`SDD.md` §6.1, §6.3, §7.3).
 
 pub mod auth;
@@ -14,8 +14,8 @@ use axum::routing::{delete, get, post, put};
 use tower_http::trace::TraceLayer;
 
 pub use auth::{
-    AuthLoginResponse, AuthSession, AuthStatusResponse, BootstrapLoginRequest, PKCE_COOKIE_NAME,
-    SESSION_COOKIE_NAME, SessionClaims, decrypt_session_token, encrypt_session_token,
+    AuthLoginResponse, AuthSession, AuthStatusResponse, PKCE_COOKIE_NAME, SESSION_COOKIE_NAME,
+    SessionClaims, decrypt_session_token, encrypt_session_token,
 };
 pub use error::{ErrorResponse, ServerError};
 pub use routes::healthz as health_check;
@@ -30,8 +30,7 @@ pub fn build_router(state: AppState) -> Router {
         // Operational endpoints
         .route("/healthz", get(routes::healthz))
         .route("/metrics", get(routes::metrics))
-        // Authentication (Phase 0 bootstrap + Phase 1 OIDC PKCE)
-        .route("/api/v1/auth/bootstrap-login", post(auth::bootstrap_login))
+        // Authentication (OIDC Authorization Code + PKCE)
         .route("/api/v1/auth/status", get(auth::auth_status))
         .route("/api/v1/auth/login", get(auth::oidc_login))
         .route("/api/v1/auth/callback", get(auth::oidc_callback))

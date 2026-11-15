@@ -142,7 +142,7 @@ impl FromStr for BootstrapDistro {
 }
 
 /// Configuration for Stage 0 cluster bootstrapping (`keel bootstrap init`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BootstrapConfig {
     pub target: BootstrapTargetKind,
@@ -154,8 +154,21 @@ pub struct BootstrapConfig {
     pub context: Option<String>,
     #[serde(default)]
     pub with_forge: bool,
-    #[serde(default)]
+    /// Deploy in-cluster Dex OIDC provider during Stage 0 (default `true`; skipped when `oidc_issuer` is set).
+    #[serde(default = "default_true")]
     pub with_oidc: bool,
+    /// Optional external OIDC issuer URL (disables in-cluster Dex deployment when provided).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oidc_issuer: Option<String>,
+    /// Optional OIDC client ID (defaults to `keel-server`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oidc_client_id: Option<String>,
+    /// Optional initial admin username/email for Stage 0 Dex seeding (defaults to `admin@keel.local`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admin_username: Option<String>,
+    /// Optional initial admin password for Stage 0 Dex seeding (auto-generated if omitted).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admin_password: Option<String>,
     /// Explicit opt-in for generating a Kyverno `PolicyException` allowing local container/Docker
     /// socket mounts strictly on local `kind` management clusters. Rejected on all non-`kind` targets.
     #[serde(default)]
@@ -168,6 +181,38 @@ pub struct BootstrapConfig {
     pub distro: Option<BootstrapDistro>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind_config_path: Option<PathBuf>,
+}
+
+impl std::fmt::Debug for BootstrapConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BootstrapConfig")
+            .field("target", &self.target)
+            .field("cluster_name", &self.cluster_name)
+            .field("kubeconfig", &self.kubeconfig)
+            .field("context", &self.context)
+            .field("with_forge", &self.with_forge)
+            .field("with_oidc", &self.with_oidc)
+            .field("oidc_issuer", &self.oidc_issuer)
+            .field("oidc_client_id", &self.oidc_client_id)
+            .field("admin_username", &self.admin_username)
+            .field(
+                "admin_password",
+                &self.admin_password.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field(
+                "local_dev_docker_socket_exception",
+                &self.local_dev_docker_socket_exception,
+            )
+            .field("proxmox_url", &self.proxmox_url)
+            .field("region", &self.region)
+            .field("distro", &self.distro)
+            .field("kind_config_path", &self.kind_config_path)
+            .finish()
+    }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_cluster_name() -> String {
@@ -183,7 +228,11 @@ impl BootstrapConfig {
             kubeconfig: None,
             context: None,
             with_forge: false,
-            with_oidc: false,
+            with_oidc: true,
+            oidc_issuer: None,
+            oidc_client_id: None,
+            admin_username: None,
+            admin_password: None,
             local_dev_docker_socket_exception: false,
             proxmox_url: None,
             region: None,
@@ -238,6 +287,39 @@ impl BootstrapConfig {
             ));
         }
 
+        if let Some(issuer) = &self.oidc_issuer {
+            let trimmed = issuer.trim();
+            if !(trimmed.starts_with("https://") || trimmed.starts_with("http://")) {
+                return Err(CoreError::Validation(
+                    "oidc_issuer must start with 'https://' or 'http://'".to_string(),
+                ));
+            }
+        }
+
+        if let Some(client_id) = &self.oidc_client_id
+            && client_id.trim().is_empty()
+        {
+            return Err(CoreError::Validation(
+                "oidc_client_id must not be empty".to_string(),
+            ));
+        }
+
+        if let Some(username) = &self.admin_username
+            && username.trim().is_empty()
+        {
+            return Err(CoreError::Validation(
+                "admin_username must not be empty".to_string(),
+            ));
+        }
+
+        if let Some(password) = &self.admin_password
+            && password.trim().is_empty()
+        {
+            return Err(CoreError::Validation(
+                "admin_password must not be empty".to_string(),
+            ));
+        }
+
         Ok(())
     }
 }
@@ -248,12 +330,11 @@ impl Default for BootstrapConfig {
     }
 }
 
-/// Two-phase authentication state machine (`SDD.md` §6.1).
+/// Authentication state machine (`SDD.md` §6.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum AuthPhase {
     #[default]
-    Bootstrap,
     OidcActive,
     BreakGlass,
 }
@@ -451,7 +532,7 @@ impl Default for KeelConfig {
             kind: default_keel_config_kind(),
             cluster_name: default_cluster_name(),
             bootstrap_target: BootstrapTargetKind::Kind,
-            auth_phase: AuthPhase::Bootstrap,
+            auth_phase: AuthPhase::OidcActive,
             enabled_providers: Vec::new(),
             forge: ForgeConfig::default(),
             oidc: None,

@@ -8,9 +8,11 @@ use keel_core::{AuthPhase, OidcConfig};
 use keel_git::{CommitAuthor, GitRunner, LocalGitProvider};
 use keel_kube::{
     CrdReconcileStatus, CrdWatchEvent, InMemorySecretStore, SecretStateStore, TelemetryMux,
-    WatchedCrdKind, generate_bootstrap_token, user_git_creds_secret_name,
+    WatchedCrdKind, user_git_creds_secret_name,
 };
-use keel_server::{AppState, SESSION_COOKIE_NAME, build_router};
+use keel_server::{
+    AppState, SESSION_COOKIE_NAME, SessionClaims, build_router, encrypt_session_token,
+};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tower::ServiceExt;
@@ -19,7 +21,6 @@ struct TestFixture {
     _temp_dir: TempDir,
     state: AppState,
     secret_store: Arc<InMemorySecretStore>,
-    raw_bootstrap_token: String,
 }
 
 async fn setup_fixture() -> TestFixture {
@@ -208,11 +209,6 @@ spec:
 
     let forge = Arc::new(LocalGitProvider::new(&bare_repo));
     let secret_store = Arc::new(InMemorySecretStore::new());
-    let (raw_token, token_hash) = generate_bootstrap_token();
-    secret_store
-        .store_bootstrap_token_hash(&token_hash)
-        .await
-        .unwrap();
 
     let state = AppState::new(
         forge,
@@ -221,48 +217,32 @@ spec:
         git,
         &workdir,
         bare_repo.to_string_lossy().to_string(),
-        AuthPhase::Bootstrap,
+        AuthPhase::OidcActive,
     );
 
     TestFixture {
         _temp_dir: temp_dir,
         state,
         secret_store,
-        raw_bootstrap_token: raw_token,
     }
 }
 
 async fn login_and_get_cookie(fixture: &TestFixture) -> String {
-    let app = build_router(fixture.state.clone());
-    let resp = app
-        .oneshot(
-            Request::builder()
-                .method(Method::POST)
-                .uri("/api/v1/auth/bootstrap-login")
-                .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(
-                    json!({ "token": fixture.raw_bootstrap_token }).to_string(),
-                ))
-                .unwrap(),
-        )
+    let session_key = fixture
+        .secret_store
+        .get_or_create_session_key()
         .await
         .unwrap();
-
-    assert_eq!(resp.status(), StatusCode::OK);
-    let set_cookie = resp
-        .headers()
-        .get(SET_COOKIE)
-        .expect("Set-Cookie header")
-        .to_str()
-        .unwrap()
-        .to_string();
-    assert!(set_cookie.contains("HttpOnly"));
-    assert!(set_cookie.contains("Secure"));
-    assert!(set_cookie.contains("SameSite=Strict"));
-
-    let kv = set_cookie.split(';').next().unwrap().trim().to_string();
-    assert!(kv.starts_with(&format!("{SESSION_COOKIE_NAME}=")));
-    kv
+    let claims = SessionClaims {
+        sub: "admin@keel.local".to_string(),
+        email: Some("admin@keel.local".to_string()),
+        name: Some("Keel Admin".to_string()),
+        groups: vec!["keel-admins".to_string()],
+        auth_phase: AuthPhase::OidcActive,
+        exp: chrono::Utc::now().timestamp() + 3600,
+    };
+    let token = encrypt_session_token(&session_key, &claims).unwrap();
+    format!("{SESSION_COOKIE_NAME}={token}")
 }
 
 #[tokio::test]
@@ -312,7 +292,7 @@ async fn test_healthz_metrics_and_spa_fallback() {
 }
 
 #[tokio::test]
-async fn test_bootstrap_login_rejection_single_use_and_auth_middleware() {
+async fn test_session_cookie_auth_middleware_and_status() {
     let fixture = setup_fixture().await;
     let app = build_router(fixture.state.clone());
 
@@ -329,42 +309,26 @@ async fn test_bootstrap_login_rejection_single_use_and_auth_middleware() {
         .unwrap();
     assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
 
-    // Invalid bootstrap token is rejected
-    let bad_login = app
+    // Tampered session cookie is rejected
+    let bad_auth = app
         .clone()
         .oneshot(
             Request::builder()
-                .method(Method::POST)
-                .uri("/api/v1/auth/bootstrap-login")
-                .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(json!({ "token": "wrong-token" }).to_string()))
+                .uri("/api/v1/catalog")
+                .header(
+                    COOKIE,
+                    format!("{SESSION_COOKIE_NAME}=invalid-tampered-cookie"),
+                )
+                .body(Body::empty())
                 .unwrap(),
         )
         .await
         .unwrap();
-    assert_eq!(bad_login.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(bad_auth.status(), StatusCode::UNAUTHORIZED);
 
-    // Valid bootstrap login succeeds and issues HttpOnly; Secure; SameSite=Strict cookie
+    // Valid encrypted OIDC session cookie grants access
     let cookie = login_and_get_cookie(&fixture).await;
 
-    // Single-use token cannot be reused
-    let replay = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method(Method::POST)
-                .uri("/api/v1/auth/bootstrap-login")
-                .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(
-                    json!({ "token": fixture.raw_bootstrap_token }).to_string(),
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(replay.status(), StatusCode::UNAUTHORIZED);
-
-    // Auth status reports authenticated when cookie is sent
     let status_res = app
         .oneshot(
             Request::builder()
@@ -380,7 +344,7 @@ async fn test_bootstrap_login_rejection_single_use_and_auth_middleware() {
         serde_json::from_slice(&status_res.into_body().collect().await.unwrap().to_bytes())
             .unwrap();
     assert_eq!(status_json["authenticated"], true);
-    assert_eq!(status_json["sub"], "bootstrap-admin");
+    assert_eq!(status_json["sub"], "admin@keel.local");
 }
 
 #[tokio::test]
@@ -773,7 +737,7 @@ async fn test_put_git_credentials_encrypts_and_never_leaks_secret() {
     assert_eq!(body_json["hasSshKey"], false);
 
     // Inspect raw Secret in InMemorySecretStore to confirm AES-256-GCM encryption
-    let secret_name = user_git_creds_secret_name("bootstrap-admin").unwrap();
+    let secret_name = user_git_creds_secret_name("admin@keel.local").unwrap();
     let raw_secret = fixture
         .secret_store
         .inspect_raw_secret("keel-system", &secret_name)
@@ -795,7 +759,7 @@ async fn test_put_git_credentials_encrypts_and_never_leaks_secret() {
         .unwrap();
     let decrypted = fixture
         .secret_store
-        .get_user_git_creds("bootstrap-admin", &key)
+        .get_user_git_creds("admin@keel.local", &key)
         .await
         .unwrap()
         .unwrap();
