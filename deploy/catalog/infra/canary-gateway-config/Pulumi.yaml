@@ -10,21 +10,21 @@ config:
   kubeconfigSecretNamespace:
     type: string
     default: tenant-default
+  kubeconfigPath:
+    type: string
+    default: /etc/keel/kubeconfig/kubeconfig
   gatewayNamespace:
     type: string
     default: keel-system
 
 resources:
-  targetKubeconfigSecret:
-    type: kubernetes:core/v1:Secret
-    get:
-      id: ${kubeconfigSecretNamespace}/${kubeconfigSecretName}
-
   targetCluster:
     type: pulumi:providers:kubernetes
     properties:
       kubeconfig:
-        fn::fromBase64: ${targetKubeconfigSecret.data.kubeconfig}
+        fn::readFile: ${kubeconfigPath}
+      enableServerSideApply: true
+      upsertExistingObjects: true
 
   canaryGatewayManifests:
     type: kubernetes:yaml/v2:ConfigGroup

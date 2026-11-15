@@ -323,13 +323,16 @@ impl KubeClusterStatusReader {
                         .cloned()
                 });
             let metric_key = (namespace.clone(), name.clone());
+            let prefixed_key = (namespace.clone(), format!("{namespace}-{name}"));
             let target_key = target_ref_name.map(|t| (namespace.clone(), t));
             let error_rate = error_rates
                 .get(&metric_key)
+                .or_else(|| error_rates.get(&prefixed_key))
                 .or_else(|| target_key.as_ref().and_then(|k| error_rates.get(k)))
                 .map(|v| (v * 100.0).round() / 100.0);
             let latency_ms = latencies_ms
                 .get(&metric_key)
+                .or_else(|| latencies_ms.get(&prefixed_key))
                 .or_else(|| target_key.as_ref().and_then(|k| latencies_ms.get(k)))
                 .map(|v| (v * 10.0).round() / 10.0);
             out.insert(

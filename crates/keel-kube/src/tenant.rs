@@ -801,6 +801,10 @@ pub struct FluxKustomizationSpecInput {
     pub prune: bool,
     pub wait: bool,
     #[serde(default)]
+    pub kube_config: Option<RemoteKubeConfigRef>,
+    #[serde(default)]
+    pub target_namespace: Option<String>,
+    #[serde(default)]
     pub extra_labels: BTreeMap<String, String>,
 }
 
@@ -822,6 +826,8 @@ impl FluxKustomizationSpecInput {
             health_checks: Vec::new(),
             prune: true,
             wait: true,
+            kube_config: None,
+            target_namespace: None,
             extra_labels: BTreeMap::new(),
         }
     }
@@ -858,7 +864,30 @@ pub fn synthesize_flux_kustomization(
     spec.insert("path".to_string(), Value::String(input.path.clone()));
     spec.insert("prune".to_string(), Value::Bool(input.prune));
     spec.insert("wait".to_string(), Value::Bool(input.wait));
-    spec.insert("serviceAccountName".to_string(), Value::String(sa_name));
+    if input.kube_config.is_none() {
+        spec.insert("serviceAccountName".to_string(), Value::String(sa_name));
+    }
+    if let Some(kc) = &input.kube_config {
+        validate_resource_name("kube_config.secret_name", &kc.secret_name)?;
+        let mut secret_ref = serde_json::Map::new();
+        secret_ref.insert("name".to_string(), Value::String(kc.secret_name.clone()));
+        if let Some(key) = &kc.key {
+            secret_ref.insert("key".to_string(), Value::String(key.clone()));
+        }
+        spec.insert("kubeConfig".to_string(), json!({ "secretRef": secret_ref }));
+    }
+    if let Some(target_ns) = &input.target_namespace {
+        validate_resource_name("target_namespace", target_ns)?;
+        if input.kube_config.is_none() && target_ns != &namespace {
+            return Err(KubeError::InvalidInput(format!(
+                "target_namespace (`{target_ns}`) requires remote kube_config; local Kustomizations are confined to `{namespace}`"
+            )));
+        }
+        spec.insert(
+            "targetNamespace".to_string(),
+            Value::String(target_ns.clone()),
+        );
+    }
     spec.insert(
         "sourceRef".to_string(),
         json!({
