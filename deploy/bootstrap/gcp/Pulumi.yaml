@@ -1,0 +1,61 @@
+# Stage 0 GCP Seed Management Cluster & Versioned GCS State Bucket (`SDD.md` §2.1, `NFR-REL-01`)
+name: keel-stage0-gcp
+runtime: yaml
+description: Stage 0 GCP seed management cluster with versioned GCS state backend
+
+config:
+  clusterName:
+    type: string
+    default: keel-mgmt
+  region:
+    type: string
+    default: us-central1
+  zone:
+    type: string
+    default: us-central1-a
+  stateBucketName:
+    type: string
+  machineType:
+    type: string
+    default: e2-standard-4
+
+resources:
+  pulumiStateBucket:
+    type: gcp:storage:Bucket
+    options:
+      protect: true
+    properties:
+      name: ${stateBucketName}
+      location: ${region}
+      uniformBucketLevelAccess: true
+      publicAccessPrevention: enforced
+      versioning:
+        enabled: true
+      labels:
+        managed-by: keel
+        keel-protect: "true"
+
+  seedControlPlaneVm:
+    type: gcp:compute:Instance
+    options:
+      protect: true
+    properties:
+      name: ${clusterName}-cp-01
+      machineType: ${machineType}
+      zone: ${zone}
+      deletionProtection: true
+      bootDisk:
+        initializeParams:
+          image: debian-cloud/debian-12
+          size: 64
+          type: pd-ssd
+      networkInterfaces:
+        - network: default
+      labels:
+        managed-by: keel
+        keel-protect: "true"
+
+outputs:
+  clusterName: ${clusterName}
+  stateBucketUrl: ${pulumiStateBucket.url}
+  controlPlaneInternalIp: ${seedControlPlaneVm.networkInterfaces[0].networkIp}

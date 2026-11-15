@@ -1,0 +1,74 @@
+# Stage 0 Hetzner Cloud Seed Management Cluster Bootstrap (`SDD.md` §2.1, `NFR-REL-01`)
+name: keel-stage0-hetzner
+runtime: yaml
+description: Stage 0 Hetzner Cloud seed management cluster with protected server and firewall
+
+config:
+  clusterName:
+    type: string
+    default: keel-mgmt
+  location:
+    type: string
+    default: fsn1
+  serverType:
+    type: string
+    default: cx32
+  image:
+    type: string
+    default: ubuntu-24.04
+  sshKeyName:
+    type: string
+
+resources:
+  controlPlaneFirewall:
+    type: hcloud:index:Firewall
+    options:
+      protect: true
+    properties:
+      name: ${clusterName}-cp-fw
+      labels:
+        managed-by: keel
+        keel-protect: "true"
+      rules:
+        - direction: in
+          protocol: tcp
+          port: "22"
+          sourceIps:
+            - 0.0.0.0/0
+            - ::/0
+        - direction: in
+          protocol: tcp
+          port: "6443"
+          sourceIps:
+            - 0.0.0.0/0
+            - ::/0
+        - direction: in
+          protocol: tcp
+          port: "443"
+          sourceIps:
+            - 0.0.0.0/0
+            - ::/0
+
+  seedControlPlaneServer:
+    type: hcloud:index:Server
+    options:
+      protect: true
+    properties:
+      name: ${clusterName}-cp-01
+      serverType: ${serverType}
+      location: ${location}
+      image: ${image}
+      deleteProtection: true
+      rebuildProtection: true
+      sshKeys:
+        - ${sshKeyName}
+      firewallIds:
+        - ${controlPlaneFirewall.id}
+      labels:
+        managed-by: keel
+        keel-protect: "true"
+
+outputs:
+  clusterName: ${clusterName}
+  ipv4Address: ${seedControlPlaneServer.ipv4Address}
+  ipv6Address: ${seedControlPlaneServer.ipv6Address}

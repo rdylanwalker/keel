@@ -1,0 +1,10 @@
+# Root Seed Control-Plane Kustomization (`SDD.md` §2.1, §3.1)
+# Installed identically across all Stage 0 BootstrapTargets (`kind`, `kubeconfig`, `proxmox`, `aws`, `gcp`, `azure`, `hetzner`).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - namespaces.yaml
+  - flux-system
+  - core-addons
+  - kyverno-policies
+  - management-stack.yaml

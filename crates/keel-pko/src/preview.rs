@@ -1,0 +1,879 @@
+//! Pulumi `preview --json` and PKO v2 preview step diff parser and Markdown report formatter.
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use crate::PkoError;
+
+/// Resource-level operation reported by `pulumi preview --json` or PKO v2 preview execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ChangeOp {
+    Create,
+    Update,
+    Delete,
+    Replace,
+    Same,
+    Drift,
+}
+
+impl ChangeOp {
+    /// Returns the human-readable badge rendered in Markdown tables and CLI summaries.
+    pub fn badge(self) -> &'static str {
+        match self {
+            Self::Create => "+ Create",
+            Self::Update => "~ Update",
+            Self::Delete => "- Delete",
+            Self::Replace => "! Replace",
+            Self::Same => "= Same",
+            Self::Drift => "! Drift",
+        }
+    }
+
+    /// Returns `true` if this operation mutates or flags divergence from desired state.
+    pub fn is_actionable(self) -> bool {
+        !matches!(self, Self::Same)
+    }
+}
+
+/// Parsed diff for an individual Pulumi resource.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourceDiff {
+    pub urn: String,
+    pub resource_type: String,
+    pub name: String,
+    pub op: ChangeOp,
+    pub changed_fields: Vec<String>,
+}
+
+/// Aggregated counts across all `ChangeOp` variants in a `PreviewReport`.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreviewSummary {
+    pub create: usize,
+    pub update: usize,
+    pub delete: usize,
+    pub replace: usize,
+    pub same: usize,
+    pub drift: usize,
+}
+
+impl PreviewSummary {
+    /// Total number of evaluated resources.
+    pub fn total(&self) -> usize {
+        self.create + self.update + self.delete + self.replace + self.same + self.drift
+    }
+
+    /// Returns `true` if any resource will be created, updated, deleted, replaced, or has drifted.
+    pub fn has_changes(&self) -> bool {
+        (self.create + self.update + self.delete + self.replace + self.drift) > 0
+    }
+
+    /// Returns `true` if any resource will be deleted or replaced.
+    pub fn has_destructive_changes(&self) -> bool {
+        (self.delete + self.replace) > 0
+    }
+
+    fn increment(&mut self, op: ChangeOp) {
+        match op {
+            ChangeOp::Create => self.create += 1,
+            ChangeOp::Update => self.update += 1,
+            ChangeOp::Delete => self.delete += 1,
+            ChangeOp::Replace => self.replace += 1,
+            ChangeOp::Same => self.same += 1,
+            ChangeOp::Drift => self.drift += 1,
+        }
+    }
+}
+
+/// Structured Pulumi preview report consumed by Forge PR comments, CLI, and React GUI.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreviewReport {
+    pub resources: Vec<ResourceDiff>,
+    pub summary: PreviewSummary,
+}
+
+/// Parses raw `pulumi preview --json` output (standard JSON object, PKO `Stack` status JSON,
+/// step array, or streaming NDJSON engine events) into a structured `PreviewReport`.
+pub fn parse_preview_json(raw_json: &str) -> Result<PreviewReport, PkoError> {
+    let trimmed = raw_json.trim();
+    if trimmed.is_empty() {
+        return Err(PkoError::PreviewParse(
+            "preview JSON payload is empty".to_string(),
+        ));
+    }
+
+    if let Ok(single_val) = serde_json::from_str::<Value>(trimmed) {
+        return parse_preview_value(&single_val);
+    }
+
+    // Fallback to streaming NDJSON (`pulumi preview --json` event stream).
+    let mut step_values = Vec::new();
+    for (idx, line) in trimmed.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let event: Value = serde_json::from_str(line).map_err(|err| {
+            PkoError::PreviewParse(format!("invalid JSON on line {}: {err}", idx + 1))
+        })?;
+        if let Some(meta) = event
+            .get("resourcePreEvent")
+            .and_then(|ev| ev.get("metadata"))
+        {
+            step_values.push(meta.clone());
+        } else if event.get("op").is_some() && event.get("urn").is_some() {
+            step_values.push(event);
+        }
+    }
+
+    if step_values.is_empty() {
+        // Verify whether NDJSON contained valid Pulumi events with zero resource steps (e.g., only summaryEvent/preludeEvent).
+        let has_engine_event = trimmed.lines().any(|line| {
+            serde_json::from_str::<Value>(line.trim())
+                .ok()
+                .is_some_and(|v| {
+                    v.get("summaryEvent").is_some()
+                        || v.get("preludeEvent").is_some()
+                        || v.get("diagnosticEvent").is_some()
+                })
+        });
+        if has_engine_event {
+            return Ok(PreviewReport::default());
+        }
+        return Err(PkoError::PreviewParse(
+            "unrecognized Pulumi preview JSON stream".to_string(),
+        ));
+    }
+
+    build_report_from_steps(&step_values, &[])
+}
+
+/// Parses an already-deserialized `serde_json::Value` representing `pulumi preview --json`
+/// or PKO v2 preview status output into a `PreviewReport`.
+pub fn parse_preview_value(value: &Value) -> Result<PreviewReport, PkoError> {
+    if let Some(arr) = value.as_array() {
+        return build_report_from_steps(arr, &[]);
+    }
+
+    let Some(obj) = value.as_object() else {
+        return Err(PkoError::PreviewParse(
+            "expected JSON object or array for preview payload".to_string(),
+        ));
+    };
+
+    // Support single Pulumi streaming event envelopes directly (`resourcePreEvent`, `summaryEvent`, etc.).
+    if let Some(meta) = obj
+        .get("resourcePreEvent")
+        .and_then(|ev| ev.get("metadata"))
+    {
+        return build_report_from_steps(std::slice::from_ref(meta), &[]);
+    }
+    if obj.contains_key("summaryEvent")
+        || obj.contains_key("preludeEvent")
+        || obj.contains_key("diagnosticEvent")
+    {
+        return Ok(PreviewReport::default());
+    }
+    if obj.contains_key("op") && obj.contains_key("urn") {
+        return build_report_from_steps(std::slice::from_ref(value), &[]);
+    }
+
+    // Unwrap PKO Stack CR or nested status object if present (`status.preview` or `preview`).
+    if let Some(nested) = obj
+        .get("status")
+        .and_then(|s| s.get("preview"))
+        .or_else(|| obj.get("preview"))
+        && (nested.is_object() || nested.is_array())
+    {
+        return parse_preview_value(nested);
+    }
+
+    let steps = obj
+        .get("steps")
+        .or_else(|| obj.get("resources"))
+        .and_then(Value::as_array)
+        .map(Vec::as_slice);
+
+    let drift_steps = obj
+        .get("drift")
+        .or_else(|| obj.get("driftChanges"))
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+
+    match steps {
+        Some(step_slice) => build_report_from_steps(step_slice, drift_steps),
+        None if !drift_steps.is_empty() => build_report_from_steps(&[], drift_steps),
+        None if obj.contains_key("changeSummary") => Ok(PreviewReport::default()),
+        None => Err(PkoError::PreviewParse(
+            "preview JSON object does not contain 'steps', 'resources', or 'changeSummary'"
+                .to_string(),
+        )),
+    }
+}
+
+/// Formats a `PreviewReport` into a clean Markdown report suitable for Forge PR comments
+/// (`ForgeProvider::post_preview_comment`) and terminal output (`keel preview status`).
+pub fn format_markdown_report(report: &PreviewReport, pr_id: &str) -> String {
+    let display_pr = format_pr_label(pr_id);
+    let s = &report.summary;
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "### Keel Infrastructure Preview — {display_pr}\n\n"
+    ));
+
+    out.push_str(&format!(
+        "**Summary:** `+ {} Create` | `~ {} Update` | `- {} Delete` | `! {} Replace` | `= {} Same`",
+        s.create, s.update, s.delete, s.replace, s.same
+    ));
+    if s.drift > 0 {
+        out.push_str(&format!(" | `! {} Drift`", s.drift));
+    }
+    out.push_str("\n\n");
+
+    if s.drift > 0 {
+        out.push_str(&format!(
+            "> **Warning:** Live infrastructure drift detected on **{}** resource(s).\n\n",
+            s.drift
+        ));
+    }
+
+    let actionable: Vec<&ResourceDiff> = report
+        .resources
+        .iter()
+        .filter(|r| r.op.is_actionable())
+        .collect();
+
+    if actionable.is_empty() {
+        out.push_str(&format!(
+            "_No infrastructure mutations planned ({} resource(s) unchanged)._\n",
+            s.same
+        ));
+        return out;
+    }
+
+    out.push_str("| Operation | Resource Type | Name | Changed Fields |\n");
+    out.push_str("| :--- | :--- | :--- | :--- |\n");
+
+    for res in actionable {
+        let fields = if res.changed_fields.is_empty() {
+            "-".to_string()
+        } else {
+            res.changed_fields
+                .iter()
+                .map(|f| format!("`{}`", sanitize_md_cell(f)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+
+        out.push_str(&format!(
+            "| `{}` | `{}` | `{}` | {} |\n",
+            res.op.badge(),
+            sanitize_md_cell(&res.resource_type),
+            sanitize_md_cell(&res.name),
+            fields
+        ));
+    }
+
+    out
+}
+
+#[derive(Debug)]
+struct AggregatedResource {
+    urn: String,
+    resource_type: String,
+    name: String,
+    op: ChangeOp,
+    changed_fields: BTreeSet<String>,
+}
+
+fn build_report_from_steps(
+    steps: &[Value],
+    explicit_drift_steps: &[Value],
+) -> Result<PreviewReport, PkoError> {
+    let mut order: Vec<String> = Vec::new();
+    let mut by_urn: BTreeMap<String, AggregatedResource> = BTreeMap::new();
+
+    for step in steps {
+        ingest_step(step, false, &mut order, &mut by_urn)?;
+    }
+    for drift_step in explicit_drift_steps {
+        ingest_step(drift_step, true, &mut order, &mut by_urn)?;
+    }
+
+    let mut summary = PreviewSummary::default();
+    let mut resources = Vec::with_capacity(order.len());
+
+    for urn in order {
+        if let Some(entry) = by_urn.remove(&urn) {
+            summary.increment(entry.op);
+            resources.push(ResourceDiff {
+                urn: entry.urn,
+                resource_type: entry.resource_type,
+                name: entry.name,
+                op: entry.op,
+                changed_fields: entry.changed_fields.into_iter().collect(),
+            });
+        }
+    }
+
+    Ok(PreviewReport { resources, summary })
+}
+
+fn ingest_step(
+    step: &Value,
+    force_drift: bool,
+    order: &mut Vec<String>,
+    by_urn: &mut BTreeMap<String, AggregatedResource>,
+) -> Result<(), PkoError> {
+    let Some(obj) = step.as_object() else {
+        return Err(PkoError::PreviewParse(
+            "preview step entry must be a JSON object".to_string(),
+        ));
+    };
+
+    let urn = obj
+        .get("urn")
+        .and_then(Value::as_str)
+        .ok_or_else(|| PkoError::PreviewParse("preview step missing 'urn' string".to_string()))?;
+
+    if urn.trim().is_empty() {
+        return Err(PkoError::PreviewParse(
+            "preview step 'urn' must not be empty".to_string(),
+        ));
+    }
+
+    let raw_op = if force_drift {
+        "drift"
+    } else {
+        obj.get("op").and_then(Value::as_str).ok_or_else(|| {
+            PkoError::PreviewParse(format!("preview step for '{urn}' missing 'op' string"))
+        })?
+    };
+
+    let fields = extract_changed_fields(obj);
+    let Some(mapped_op) = classify_op(raw_op, obj, &fields)? else {
+        // Non-mutating auxiliary step (e.g., clean refresh before diff)
+        return Ok(());
+    };
+
+    let (urn_type, urn_name) = parse_urn(urn);
+    let explicit_type = obj
+        .get("resource_type")
+        .or_else(|| obj.get("type"))
+        .and_then(Value::as_str)
+        .or_else(|| {
+            obj.get("newState")
+                .and_then(|s| s.get("type"))
+                .and_then(Value::as_str)
+        })
+        .or_else(|| {
+            obj.get("oldState")
+                .and_then(|s| s.get("type"))
+                .and_then(Value::as_str)
+        });
+
+    let explicit_name = obj.get("name").and_then(Value::as_str);
+
+    let resource_type = explicit_type
+        .filter(|s| !s.is_empty())
+        .unwrap_or(&urn_type)
+        .to_string();
+    let name = explicit_name
+        .filter(|s| !s.is_empty())
+        .unwrap_or(&urn_name)
+        .to_string();
+
+    if let Some(existing) = by_urn.get_mut(urn) {
+        existing.op = merge_ops(existing.op, mapped_op);
+        existing.changed_fields.extend(fields);
+        if existing.resource_type == "unknown" && resource_type != "unknown" {
+            existing.resource_type = resource_type;
+        }
+    } else {
+        order.push(urn.to_string());
+        by_urn.insert(
+            urn.to_string(),
+            AggregatedResource {
+                urn: urn.to_string(),
+                resource_type,
+                name,
+                op: mapped_op,
+                changed_fields: fields,
+            },
+        );
+    }
+
+    Ok(())
+}
+
+fn classify_op(
+    raw_op: &str,
+    obj: &serde_json::Map<String, Value>,
+    changed_fields: &BTreeSet<String>,
+) -> Result<Option<ChangeOp>, PkoError> {
+    let is_drifted_flag = obj.get("drifted").and_then(Value::as_bool).unwrap_or(false);
+
+    match raw_op {
+        "create" if is_drifted_flag => Ok(Some(ChangeOp::Drift)),
+        "create" | "import" => Ok(Some(ChangeOp::Create)),
+        "update" if is_drifted_flag => Ok(Some(ChangeOp::Drift)),
+        "update" => Ok(Some(ChangeOp::Update)),
+        "delete" => Ok(Some(ChangeOp::Delete)),
+        "replace" | "create-replacement" | "delete-replaced" | "discard-replaced"
+        | "import-replacement" => Ok(Some(ChangeOp::Replace)),
+        "same" | "read" => {
+            if is_drifted_flag {
+                Ok(Some(ChangeOp::Drift))
+            } else {
+                Ok(Some(ChangeOp::Same))
+            }
+        }
+        "drift" => Ok(Some(ChangeOp::Drift)),
+        "refresh" => {
+            if is_drifted_flag || !changed_fields.is_empty() || states_diverged(obj) {
+                Ok(Some(ChangeOp::Drift))
+            } else {
+                Ok(None)
+            }
+        }
+        "discard" | "remove-pending-replace" => Ok(None),
+        other => Err(PkoError::PreviewParse(format!(
+            "unsupported Pulumi change op '{other}'"
+        ))),
+    }
+}
+
+fn merge_ops(current: ChangeOp, incoming: ChangeOp) -> ChangeOp {
+    // Replace sub-steps (`create-replacement`, `replace`, `delete-replaced`) always coalesce to `Replace`.
+    if current == ChangeOp::Replace || incoming == ChangeOp::Replace {
+        return ChangeOp::Replace;
+    }
+    // Create + Delete on the same URN in a single plan is a replacement.
+    if (current == ChangeOp::Create && incoming == ChangeOp::Delete)
+        || (current == ChangeOp::Delete && incoming == ChangeOp::Create)
+    {
+        return ChangeOp::Replace;
+    }
+    // An explicit planned mutation supersedes `Same`, while explicit `Drift` overrides `Same`.
+    match (current, incoming) {
+        (ChangeOp::Same, other) => other,
+        (other, ChangeOp::Same) => other,
+        (_, ChangeOp::Drift) => ChangeOp::Drift,
+        (ChangeOp::Drift, other) => other,
+        (_, latest) => latest,
+    }
+}
+
+fn extract_changed_fields(obj: &serde_json::Map<String, Value>) -> BTreeSet<String> {
+    let mut fields = BTreeSet::new();
+
+    if let Some(detailed) = obj.get("detailedDiff").and_then(Value::as_object) {
+        fields.extend(detailed.keys().cloned());
+    }
+
+    for array_key in [
+        "diffReasons",
+        "diffs",
+        "replaceKeys",
+        "changedFields",
+        "changed_fields",
+    ] {
+        if let Some(arr) = obj.get(array_key).and_then(Value::as_array) {
+            for item in arr {
+                if let Some(s) = item.as_str()
+                    && !s.is_empty()
+                {
+                    fields.insert(s.to_string());
+                }
+            }
+        }
+    }
+
+    if fields.is_empty()
+        && let (Some(old_inputs), Some(new_inputs)) = (
+            obj.get("oldState")
+                .and_then(|s| s.get("inputs"))
+                .and_then(Value::as_object),
+            obj.get("newState")
+                .and_then(|s| s.get("inputs"))
+                .and_then(Value::as_object),
+        )
+    {
+        let all_keys: BTreeSet<&String> = old_inputs.keys().chain(new_inputs.keys()).collect();
+        for key in all_keys {
+            if key.starts_with("__") {
+                continue;
+            }
+            if old_inputs.get(key) != new_inputs.get(key) {
+                fields.insert(key.clone());
+            }
+        }
+    }
+
+    fields
+}
+
+fn states_diverged(obj: &serde_json::Map<String, Value>) -> bool {
+    let old_outputs = obj.get("oldState").and_then(|s| s.get("outputs"));
+    let new_outputs = obj.get("newState").and_then(|s| s.get("outputs"));
+    match (old_outputs, new_outputs) {
+        (Some(old_v), Some(new_v)) => old_v != new_v,
+        _ => false,
+    }
+}
+
+fn parse_urn(urn: &str) -> (String, String) {
+    // Standard Pulumi URN: `urn:pulumi:<stack>::<project>::<type>::<name>`
+    let parts: Vec<&str> = urn.split("::").collect();
+    if parts.len() >= 4 {
+        let raw_type = parts[2];
+        // For component-parented types (`pkg:mod:Parent$aws:s3/bucket:Bucket`), extract leaf resource type.
+        let leaf_type = raw_type.rsplit('$').next().unwrap_or(raw_type);
+        let name = parts[3..].join("::");
+        (leaf_type.to_string(), name)
+    } else {
+        ("unknown".to_string(), urn.to_string())
+    }
+}
+
+fn format_pr_label(pr_id: &str) -> String {
+    let trimmed = pr_id.trim();
+    if trimmed.is_empty() {
+        "Proposal".to_string()
+    } else if let Some(num) = trimmed.strip_prefix('#') {
+        format!("PR #{num}")
+    } else if trimmed.chars().all(|c| c.is_ascii_digit()) {
+        format!("PR #{trimmed}")
+    } else {
+        format!("PR {trimmed}")
+    }
+}
+
+fn sanitize_md_cell(input: &str) -> String {
+    input.replace('|', "\\|").replace(['\r', '\n'], " ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_all_change_ops_and_coalesces_replacements() {
+        let raw = r#"
+        {
+          "steps": [
+            {
+              "op": "same",
+              "urn": "urn:pulumi:prod::infra::pulumi:pulumi:Stack::infra-prod",
+              "oldState": { "type": "pulumi:pulumi:Stack" },
+              "newState": { "type": "pulumi:pulumi:Stack" }
+            },
+            {
+              "op": "create",
+              "urn": "urn:pulumi:prod::infra::proxmoxve:vm:VirtualMachine::worker-01",
+              "newState": { "type": "proxmoxve:vm:VirtualMachine" },
+              "detailedDiff": {
+                "cpu": { "kind": "ADD" },
+                "memory": { "kind": "ADD" }
+              }
+            },
+            {
+              "op": "update",
+              "urn": "urn:pulumi:prod::infra::aws:rds/instance:Instance::app-db",
+              "oldState": {
+                "type": "aws:rds/instance:Instance",
+                "inputs": { "allocatedStorage": 20, "engineVersion": "16.1", "__defaults": [] }
+              },
+              "newState": {
+                "type": "aws:rds/instance:Instance",
+                "inputs": { "allocatedStorage": 50, "engineVersion": "16.1", "__defaults": ["a"] }
+              }
+            },
+            {
+              "op": "create-replacement",
+              "urn": "urn:pulumi:prod::infra::keel:net:Vpc$hcloud:index/server:Server::edge-01",
+              "replaceKeys": ["location"]
+            },
+            {
+              "op": "replace",
+              "urn": "urn:pulumi:prod::infra::keel:net:Vpc$hcloud:index/server:Server::edge-01",
+              "diffReasons": ["location", "serverType"]
+            },
+            {
+              "op": "delete-replaced",
+              "urn": "urn:pulumi:prod::infra::keel:net:Vpc$hcloud:index/server:Server::edge-01"
+            },
+            {
+              "op": "delete",
+              "urn": "urn:pulumi:prod::infra::aws:s3/bucket:Bucket::legacy-logs"
+            },
+            {
+              "op": "refresh",
+              "urn": "urn:pulumi:prod::infra::cloudflare:index/record:Record::api-dns",
+              "oldState": { "outputs": { "value": "10.0.0.1" } },
+              "newState": { "outputs": { "value": "10.0.0.99" } },
+              "diffs": ["value"]
+            }
+          ],
+          "changeSummary": {
+            "create": 1,
+            "update": 1,
+            "delete": 1,
+            "replace": 1,
+            "same": 1
+          }
+        }
+        "#;
+
+        let report = parse_preview_json(raw).expect("parse preview json");
+        assert_eq!(report.summary.create, 1);
+        assert_eq!(report.summary.update, 1);
+        assert_eq!(report.summary.delete, 1);
+        assert_eq!(report.summary.replace, 1);
+        assert_eq!(report.summary.same, 1);
+        assert_eq!(report.summary.drift, 1);
+        assert_eq!(report.summary.total(), 6);
+        assert!(report.summary.has_changes());
+        assert!(report.summary.has_destructive_changes());
+
+        // Check replacement coalescing and component-parented URN parsing
+        let replaced = report
+            .resources
+            .iter()
+            .find(|r| r.name == "edge-01")
+            .expect("edge-01 present");
+        assert_eq!(replaced.op, ChangeOp::Replace);
+        assert_eq!(replaced.resource_type, "hcloud:index/server:Server");
+        assert_eq!(
+            replaced.changed_fields,
+            vec!["location".to_string(), "serverType".to_string()]
+        );
+
+        // Check fallback oldState/newState input diff on `app-db`
+        let updated = report
+            .resources
+            .iter()
+            .find(|r| r.name == "app-db")
+            .expect("app-db present");
+        assert_eq!(updated.op, ChangeOp::Update);
+        assert_eq!(updated.changed_fields, vec!["allocatedStorage".to_string()]);
+
+        // Check refresh drift detection
+        let drifted = report
+            .resources
+            .iter()
+            .find(|r| r.name == "api-dns")
+            .expect("api-dns present");
+        assert_eq!(drifted.op, ChangeOp::Drift);
+        assert_eq!(drifted.changed_fields, vec!["value".to_string()]);
+    }
+
+    #[test]
+    fn parses_streaming_ndjson_and_pko_status_wrappers() {
+        let ndjson = r#"
+{"sequence":1,"preludeEvent":{"config":{}}}
+{"sequence":2,"resourcePreEvent":{"metadata":{"op":"create","urn":"urn:pulumi:dev::app::kubernetes:core/v1:Namespace::tenant-acme","type":"kubernetes:core/v1:Namespace","diffs":["metadata"]}}}
+{"sequence":3,"resourcePreEvent":{"metadata":{"op":"drift","urn":"urn:pulumi:dev::app::kubernetes:core/v1:ConfigMap::cfg","diffs":["data"]}}}
+{"sequence":4,"summaryEvent":{"resourceChanges":{"create":1}}}
+"#;
+
+        let report = parse_preview_json(ndjson).expect("ndjson parse");
+        assert_eq!(report.summary.create, 1);
+        assert_eq!(report.summary.drift, 1);
+        assert_eq!(report.resources.len(), 2);
+
+        // Empty NDJSON stream with only summaryEvent
+        let empty_ndjson = r#"{"sequence":1,"summaryEvent":{"resourceChanges":{"same":0}}}"#;
+        let empty_report = parse_preview_json(empty_ndjson).expect("empty ndjson");
+        assert!(!empty_report.summary.has_changes());
+        assert_eq!(empty_report.summary.total(), 0);
+
+        // PKO Stack status wrapper
+        let pko_status = serde_json::json!({
+            "apiVersion": "pulumi.com/v1",
+            "kind": "Stack",
+            "status": {
+                "preview": {
+                    "steps": [
+                        {
+                            "op": "refresh",
+                            "urn": "urn:pulumi:prod::db::aws:rds/instance:Instance::clean-refresh"
+                        },
+                        {
+                            "op": "same",
+                            "urn": "urn:pulumi:prod::db::aws:rds/instance:Instance::clean-refresh",
+                            "drifted": false
+                        }
+                    ],
+                    "drift": [
+                        {
+                            "urn": "urn:pulumi:prod::db::aws:ec2/securityGroup:SecurityGroup::db-sg",
+                            "changedFields": ["ingress"]
+                        }
+                    ]
+                }
+            }
+        });
+        let pko_report = parse_preview_value(&pko_status).expect("pko status parse");
+        assert_eq!(pko_report.summary.same, 1);
+        assert_eq!(pko_report.summary.drift, 1);
+        assert!(!pko_report.summary.has_destructive_changes());
+    }
+
+    #[test]
+    fn formats_markdown_report_for_actionable_and_noop_plans() {
+        let raw = r#"
+        [
+          {
+            "op": "create",
+            "urn": "urn:pulumi:prod::infra::proxmoxve:vm:VirtualMachine::vm-01",
+            "diffReasons": ["cpu", "memory"]
+          },
+          {
+            "op": "update",
+            "urn": "urn:pulumi:prod::infra::aws:rds/instance:Instance::pg-01",
+            "diffReasons": ["allocatedStorage"]
+          },
+          {
+            "op": "replace",
+            "urn": "urn:pulumi:prod::infra::hcloud:index/server:Server::gw-01",
+            "replaceKeys": ["location"]
+          },
+          {
+            "op": "delete",
+            "urn": "urn:pulumi:prod::infra::aws:s3/bucket:Bucket::old-bucket"
+          },
+          {
+            "op": "drift",
+            "urn": "urn:pulumi:prod::infra::cloudflare:index/record:Record::dns-01",
+            "diffs": ["content"]
+          },
+          {
+            "op": "same",
+            "urn": "urn:pulumi:prod::infra::pulumi:pulumi:Stack::infra-prod"
+          }
+        ]
+        "#;
+
+        let report = parse_preview_json(raw).expect("parse array");
+        let md = format_markdown_report(&report, "42");
+
+        assert!(md.contains("### Keel Infrastructure Preview — PR #42"));
+        assert!(md.contains("`+ 1 Create`"));
+        assert!(md.contains("`~ 1 Update`"));
+        assert!(md.contains("`- 1 Delete`"));
+        assert!(md.contains("`! 1 Replace`"));
+        assert!(md.contains("`= 1 Same`"));
+        assert!(md.contains("`! 1 Drift`"));
+        assert!(md.contains("Live infrastructure drift detected"));
+        assert!(md.contains(
+            "| `+ Create` | `proxmoxve:vm:VirtualMachine` | `vm-01` | `cpu`, `memory` |"
+        ));
+        assert!(md.contains(
+            "| `~ Update` | `aws:rds/instance:Instance` | `pg-01` | `allocatedStorage` |"
+        ));
+        assert!(
+            md.contains("| `! Replace` | `hcloud:index/server:Server` | `gw-01` | `location` |")
+        );
+        assert!(md.contains("| `- Delete` | `aws:s3/bucket:Bucket` | `old-bucket` | - |"));
+        assert!(
+            md.contains("| `! Drift` | `cloudflare:index/record:Record` | `dns-01` | `content` |")
+        );
+        // Unchanged `Same` stack resource should not clutter table rows
+        assert!(!md.contains("| `= Same` |"));
+
+        // Verify no-op report formatting
+        let noop_report = PreviewReport {
+            resources: vec![ResourceDiff {
+                urn: "urn:pulumi:prod::infra::pulumi:pulumi:Stack::infra-prod".to_string(),
+                resource_type: "pulumi:pulumi:Stack".to_string(),
+                name: "infra-prod".to_string(),
+                op: ChangeOp::Same,
+                changed_fields: vec![],
+            }],
+            summary: PreviewSummary {
+                same: 1,
+                ..PreviewSummary::default()
+            },
+        };
+        let noop_md = format_markdown_report(&noop_report, "#99");
+        assert!(noop_md.contains("PR #99"));
+        assert!(noop_md.contains("No infrastructure mutations planned (1 resource(s) unchanged)"));
+        assert!(!noop_md.contains("| Operation |"));
+    }
+
+    #[test]
+    fn rejects_malformed_or_unsupported_preview_json() {
+        assert!(parse_preview_json("   ").is_err());
+        assert!(parse_preview_json("not-json").is_err());
+        assert!(parse_preview_json("42").is_err());
+        assert!(parse_preview_json("[123]").is_err());
+        assert!(parse_preview_json(r#"{"unexpected": true}"#).is_err());
+        assert!(parse_preview_json(r#"{"steps": [{"op": "create"}]}"#).is_err());
+        assert!(parse_preview_json(r#"{"steps": [{"op": "create", "urn": "   "}]}"#).is_err());
+        assert!(
+            parse_preview_json(
+                r#"{"steps": [{"op": "unknown-op", "urn": "urn:pulumi:a::b::c::d"}]}"#
+            )
+            .is_err()
+        );
+        // Multi-line NDJSON with invalid second line
+        let bad_ndjson = "{\"sequence\":1,\"preludeEvent\":{}}\n{bad_json}";
+        assert!(parse_preview_json(bad_ndjson).is_err());
+        // Multi-line NDJSON with unrecognized objects
+        let unknown_ndjson = "{\"foo\":1}\n{\"bar\":2}";
+        assert!(parse_preview_json(unknown_ndjson).is_err());
+    }
+
+    #[test]
+    fn covers_drift_flags_single_events_merge_ops_and_markdown_edge_cases() {
+        // Single resourcePreEvent object
+        let single_event = r#"{"resourcePreEvent":{"metadata":{"op":"import","urn":"short-urn","type":"custom:Mod:Res","name":"res|1","diffs":["field|a"]}}}"#;
+        let single_rep = parse_preview_json(single_event).expect("single event");
+        assert_eq!(single_rep.summary.create, 1);
+        assert_eq!(single_rep.resources[0].resource_type, "custom:Mod:Res");
+        assert_eq!(single_rep.resources[0].name, "res|1");
+
+        let md_escaped = format_markdown_report(&single_rep, "  ");
+        assert!(md_escaped.contains("### Keel Infrastructure Preview — Proposal"));
+        assert!(md_escaped.contains("`res\\|1`"));
+        assert!(md_escaped.contains("`field\\|a`"));
+
+        let md_named_pr = format_markdown_report(&single_rep, "proposal-alpha");
+        assert!(md_named_pr.contains("PR proposal-alpha"));
+
+        // Single bare step object + changeSummary-only object + driftChanges-only object
+        let bare_step =
+            r#"{"op":"read","drifted":true,"urn":"urn:pulumi:dev::p::aws:s3/bucket:Bucket::b1"}"#;
+        assert_eq!(parse_preview_json(bare_step).unwrap().summary.drift, 1);
+
+        let summary_only = r#"{"changeSummary":{"same":0}}"#;
+        assert_eq!(parse_preview_json(summary_only).unwrap().summary.total(), 0);
+
+        let drift_only =
+            r#"{"driftChanges":[{"urn":"urn:pulumi:dev::p::aws:s3/bucket:Bucket::b2"}]}"#;
+        assert_eq!(parse_preview_json(drift_only).unwrap().summary.drift, 1);
+
+        // Merge transitions: same -> update -> drift, create + delete -> replace, discard ignored
+        let transitions = r#"
+        {
+          "steps": [
+            { "op": "discard", "urn": "urn:pulumi:dev::p::pkg:m:T::ignored" },
+            { "op": "same", "urn": "urn:pulumi:dev::p::pkg:m:T::r1" },
+            { "op": "update", "urn": "urn:pulumi:dev::p::pkg:m:T::r1", "drifted": true },
+            { "op": "same", "urn": "urn:pulumi:dev::p::pkg:m:T::r1" },
+            { "op": "create", "urn": "urn:pulumi:dev::p::pkg:m:T::r2" },
+            { "op": "delete", "urn": "urn:pulumi:dev::p::pkg:m:T::r2" },
+            { "op": "create", "drifted": true, "urn": "urn:pulumi:dev::p::pkg:m:T::r3" }
+          ]
+        }
+        "#;
+        let merged = parse_preview_json(transitions).expect("merge transitions");
+        assert_eq!(merged.summary.drift, 2);
+        assert_eq!(merged.summary.replace, 1);
+    }
+}

@@ -1,0 +1,58 @@
+# Unmodified Pulumi YAML Blueprint bridging OpenTofu/Terraform provider `tehcyx/kind` (`SDD.md` §4.1, `NFR-EXT-02`)
+# Provider SDK generated via: pulumi package add terraform-provider tehcyx/kind 0.9.0
+name: kind-cluster
+runtime: yaml
+description: Provision a local workload kind cluster via Pulumi's OpenTofu/Terraform provider bridge (tehcyx/kind)
+
+packages:
+  kind:
+    source: terraform-provider
+    version: 0.16.0
+    parameters:
+      - tehcyx/kind
+      - 0.9.0
+
+config:
+  clusterName:
+    type: string
+    default: workload-dev
+  kubernetesVersion:
+    type: string
+    default: v1.32.0
+  workerCount:
+    type: integer
+    default: 1
+
+variables:
+  nodeTopologies:
+    - - role: control-plane
+    - - role: control-plane
+      - role: worker
+    - - role: control-plane
+      - role: worker
+      - role: worker
+    - - role: control-plane
+      - role: worker
+      - role: worker
+      - role: worker
+
+resources:
+  workloadCluster:
+    type: kind:index:Cluster
+    properties:
+      name: ${clusterName}
+      nodeImage: kindest/node:${kubernetesVersion}
+      waitForReady: true
+      kindConfig:
+        apiVersion: kind.x-k8s.io/v1alpha4
+        kind: Cluster
+        nodes:
+          fn::select:
+            - ${workerCount}
+            - ${nodeTopologies}
+
+outputs:
+  clusterName: ${workloadCluster.name}
+  endpoint: ${workloadCluster.endpoint}
+  kubeconfig:
+    fn::secret: ${workloadCluster.kubeconfig}

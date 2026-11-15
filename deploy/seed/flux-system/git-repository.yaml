@@ -1,0 +1,17 @@
+# Flux CD Root GitRepository with Outbound Pull-Polling (`interval: 1m`)
+# Ensures local `kind` and home `k3s` clusters behind NAT/firewalls reconcile without inbound webhooks (`SDD.md` §2.1).
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: GitRepository
+metadata:
+  name: flux-system
+  namespace: flux-system
+  labels:
+    app.kubernetes.io/managed-by: keel
+spec:
+  interval: 1m
+  url: https://forge.keel.internal/keel/infra-gitops.git
+  ref:
+    branch: main
+  secretRef:
+    name: flux-system
+  timeout: 60s

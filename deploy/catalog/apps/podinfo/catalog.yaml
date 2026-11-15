@@ -1,0 +1,50 @@
+# Out-of-the-Box Upstream Podinfo Catalog Application (`SDD.md` §5.1, §5.2, §6.3, `NFR-EXT-01`, `NFR-SEC-05`)
+apiVersion: keel.io/v1alpha1
+kind: CatalogApplication
+metadata:
+  id: podinfo
+  name: Podinfo Microservice
+  description: Lightweight Go web application for verifying Flux HelmReleases, SOPS + age secret encryption, and Flagger + Envoy Gateway canary rollouts.
+  category: demo-microservice
+  runtime: helm
+spec:
+  upstream:
+    chart: podinfo
+    repoURL: https://stefanprodan.github.io/podinfo
+    version: "6.7.1"
+  progressiveDelivery:
+    flaggerSupported: true
+    defaultCanary: false
+  schema:
+    type: object
+    required:
+      - replicaCount
+      - ingressHost
+      - apiToken
+    properties:
+      replicaCount:
+        type: integer
+        title: Replica Count
+        description: Number of podinfo pod replicas managed by the Deployment.
+        default: 2
+        minimum: 1
+        maximum: 10
+      ingressHost:
+        type: string
+        title: Ingress Hostname
+        description: DNS hostname exposed through Envoy Gateway HTTPRoute and monitored by Flagger.
+        format: hostname
+        default: podinfo.keel.local
+      apiToken:
+        type: string
+        title: API Secret Token
+        description: Sensitive bearer token partitioned out of plaintext values.yaml and encrypted via SOPS + tenant age key.
+        writeOnly: true
+        minLength: 8
+  uiSchema:
+    ingressHost:
+      ui:placeholder: "podinfo.keel.local"
+      ui:help: "Routed via Envoy Gateway HTTPRoute; traffic shifts progressively when Flagger canary delivery is enabled."
+    apiToken:
+      ui:widget: password
+      ui:help: "Marked writeOnly: true — automatically encrypted with SOPS + per-tenant age key before git staging (never stored in plaintext)."

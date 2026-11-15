@@ -1,0 +1,47 @@
+name: Playwright E2E
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  e2e:
+    name: Playwright E2E Suite
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: 'pnpm'
+          cache-dependency-path: e2e/pnpm-lock.yaml
+      - name: Build UI & Keel Binary
+        run: |
+          pnpm --dir ui install
+          pnpm --dir ui build
+          cargo build --bin keel
+      - name: Install E2E dependencies
+        run: pnpm --dir e2e install
+      - name: Install Playwright Browsers
+        run: pnpm --dir e2e exec playwright install --with-deps
+      - name: Format Check
+        run: pnpm --dir e2e format:check
+      - name: Lint
+        run: pnpm --dir e2e lint
+      - name: Typecheck
+        run: pnpm --dir e2e typecheck
+      - name: Playwright Tests
+        run: pnpm --dir e2e test
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: playwright-report
+          path: e2e/playwright-report/
+          retention-days: 14

@@ -1,0 +1,76 @@
+# Multi-Item Bundle: Local kind Workload Cluster + Podinfo Microservice (`SDD.md` §5.1)
+apiVersion: keel.io/v1alpha1
+kind: CatalogBundle
+metadata:
+  id: kind-with-podinfo
+  name: Local kind Cluster + Podinfo Stack
+  description: Provision a local kind workload cluster via PKO v2 and deploy Podinfo onto it once the cluster Stack is Ready.
+  category: platform
+spec:
+  items:
+    - id: cluster
+      kind: infra
+      catalogRef: kind-cluster
+    - id: app
+      kind: app
+      catalogRef: podinfo
+      dependsOn:
+        - cluster
+      targetClusterFrom: cluster
+      targetNamespace: apps-dev
+  schema:
+    type: object
+    required:
+      - cluster
+      - app
+    properties:
+      cluster:
+        type: object
+        title: Workload Cluster (kind)
+        required:
+          - clusterName
+          - kubernetesVersion
+          - workerCount
+        properties:
+          clusterName:
+            type: string
+            title: Cluster Name
+            default: workload-dev
+          kubernetesVersion:
+            type: string
+            title: Kubernetes Version
+            default: v1.32.0
+            enum:
+              - v1.32.0
+              - v1.31.4
+              - v1.30.8
+          workerCount:
+            type: integer
+            title: Worker Node Count
+            default: 1
+            minimum: 0
+            maximum: 5
+      app:
+        type: object
+        title: Podinfo Application
+        required:
+          - replicaCount
+          - ingressHost
+          - apiToken
+        properties:
+          replicaCount:
+            type: integer
+            title: Replica Count
+            default: 2
+            minimum: 1
+            maximum: 10
+          ingressHost:
+            type: string
+            title: Ingress Hostname
+            format: hostname
+            default: podinfo.keel.local
+          apiToken:
+            type: string
+            title: API Secret Token
+            writeOnly: true
+            minLength: 8

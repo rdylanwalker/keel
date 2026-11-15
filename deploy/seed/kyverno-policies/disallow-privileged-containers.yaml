@@ -1,0 +1,60 @@
+# Enforces Kubernetes `restricted` Pod Security Standards and blocks hostPath / Docker socket
+# mounts across PKO workspace pods and tenant workloads (`SDD.md` §6.2, `NFR-SEC-03`, `NFR-SEC-04`).
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: disallow-privileged-containers
+  labels:
+    app.kubernetes.io/managed-by: keel
+    keel.io/policy-tier: baseline-security
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: disallow-privileged
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              namespaces:
+                - keel-previews
+                - tenant-*
+      validate:
+        message: "Privileged containers and privilege escalation are prohibited; pods must adhere to restricted PSS."
+        pattern:
+          spec:
+            =(initContainers):
+              - =(securityContext):
+                  =(privileged): false
+                  =(allowPrivilegeEscalation): false
+                  =(runAsNonRoot): true
+                  =(capabilities):
+                    drop:
+                      - ALL
+            containers:
+              - securityContext:
+                  =(privileged): false
+                  allowPrivilegeEscalation: false
+                  runAsNonRoot: true
+                  capabilities:
+                    drop:
+                      - ALL
+    - name: disallow-host-path-and-docker-socket
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              namespaces:
+                - keel-previews
+                - tenant-*
+      validate:
+        message: "Mounting hostPath volumes (such as /var/run/docker.sock) or injecting DOCKER_HOST is forbidden in production."
+        pattern:
+          spec:
+            =(volumes):
+              - X(hostPath): "null"
+            containers:
+              - =(env):
+                  - name: "!DOCKER_HOST"

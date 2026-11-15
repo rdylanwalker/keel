@@ -1,0 +1,55 @@
+# Proxmox VE k3s Workload Cluster Blueprint (`SDD.md` §4.1)
+apiVersion: keel.io/v1alpha1
+kind: CatalogInfraBlueprint
+metadata:
+  id: proxmox-k3s-cluster
+  name: Proxmox VE k3s Workload Cluster
+  description: Provision a multi-node k3s workload cluster on Proxmox VE via bpg/proxmox OpenTofu/Terraform bridge.
+  category: kubernetes-cluster
+  provider: proxmox
+spec:
+  pulumiRuntime: yaml
+  entrypoint: Pulumi.yaml
+  protectByDefault: true
+  outputs:
+    - clusterName
+    - controlPlaneIp
+  schema:
+    type: object
+    required:
+      - clusterName
+      - nodeName
+      - templateVmId
+      - sshPublicKey
+    properties:
+      clusterName:
+        type: string
+        title: Cluster Name
+        pattern: "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"
+      nodeName:
+        type: string
+        title: Proxmox Target Node
+        default: pve1
+      templateVmId:
+        type: integer
+        title: Cloud-Init Template VM ID
+        default: 900
+        minimum: 100
+      cores:
+        type: integer
+        title: vCPU Cores per Node
+        default: 4
+        minimum: 2
+        maximum: 32
+      memoryMb:
+        type: integer
+        title: Memory (MiB) per Node
+        default: 8192
+        minimum: 2048
+      sshPublicKey:
+        type: string
+        title: Operator SSH Public Key
+  uiSchema:
+    sshPublicKey:
+      ui:widget: textarea
+      ui:help: "ed25519 or RSA public key injected via cloud-init."

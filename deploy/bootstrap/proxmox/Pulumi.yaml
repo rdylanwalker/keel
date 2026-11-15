@@ -1,0 +1,93 @@
+# Stage 0 Proxmox VE Seed Management Cluster Bootstrap (`SDD.md` §2.1, `NFR-REL-01`)
+# Provisions a protected k3s/Talos management control-plane VM via bpg/proxmox OpenTofu/Terraform bridge.
+name: keel-stage0-proxmox
+runtime: yaml
+description: Stage 0 seed management cluster bootstrap on Proxmox VE (bpg/proxmox)
+
+packages:
+  proxmox:
+    source: terraform-provider
+    version: 0.16.0
+    parameters:
+      - bpg/proxmox
+      - 0.71.0
+
+config:
+  clusterName:
+    type: string
+    default: keel-mgmt
+  nodeName:
+    type: string
+    default: pve1
+  vmId:
+    type: integer
+    default: 9000
+  templateVmId:
+    type: integer
+    default: 900
+  datastoreId:
+    type: string
+    default: local-lvm
+  cores:
+    type: integer
+    default: 4
+  memoryMb:
+    type: integer
+    default: 8192
+  diskSizeGb:
+    type: integer
+    default: 64
+  sshPublicKey:
+    type: string
+  distro:
+    type: string
+    default: k3s
+
+resources:
+  seedControlPlaneVm:
+    type: proxmox:Vm/virtualMachine:VirtualMachine
+    options:
+      protect: true
+    properties:
+      name: ${clusterName}-cp-01
+      nodeName: ${nodeName}
+      vmId: ${vmId}
+      description: Keel Stage 0 protected management control-plane VM (${distro})
+      tags:
+        - keel-management
+        - protect
+        - ${distro}
+      onBoot: true
+      agent:
+        enabled: true
+      clone:
+        vmId: ${templateVmId}
+        full: true
+      cpu:
+        cores: ${cores}
+        type: x86-64-v2-AES
+      memory:
+        dedicated: ${memoryMb}
+      disks:
+        - datastoreId: ${datastoreId}
+          interface: virtio0
+          size: ${diskSizeGb}
+          iothread: true
+          discard: "on"
+      networkDevices:
+        - bridge: vmbr0
+          model: virtio
+      initialization:
+        datastoreId: ${datastoreId}
+        ipConfigs:
+          - ipv4:
+              address: dhcp
+        userAccount:
+          username: keel
+          keys:
+            - ${sshPublicKey}
+
+outputs:
+  clusterName: ${clusterName}
+  vmId: ${seedControlPlaneVm.vmId}
+  ipv4Addresses: ${seedControlPlaneVm.ipv4Addresses}

@@ -1,0 +1,76 @@
+# Stage 0 AWS Seed Management Cluster & Versioned S3 State Backend (`SDD.md` §2.1, `NFR-REL-01`)
+name: keel-stage0-aws
+runtime: yaml
+description: Stage 0 AWS seed management cluster with versioned S3 Pulumi state backend
+
+config:
+  clusterName:
+    type: string
+    default: keel-mgmt
+  stateBucketName:
+    type: string
+    default: keel-pulumi-state
+  instanceType:
+    type: string
+    default: t3.large
+  amiId:
+    type: string
+  subnetId:
+    type: string
+
+resources:
+  pulumiStateBucket:
+    type: aws:s3:BucketV2
+    options:
+      protect: true
+    properties:
+      bucketPrefix: ${stateBucketName}-
+      tags:
+        app.kubernetes.io/managed-by: keel
+        keel.io/protect: "true"
+
+  pulumiStateBucketVersioning:
+    type: aws:s3:BucketVersioningV2
+    options:
+      protect: true
+    properties:
+      bucket: ${pulumiStateBucket.id}
+      versioningConfiguration:
+        status: Enabled
+
+  pulumiStateBucketPublicAccessBlock:
+    type: aws:s3:BucketPublicAccessBlock
+    options:
+      protect: true
+    properties:
+      bucket: ${pulumiStateBucket.id}
+      blockPublicAcls: true
+      blockPublicPolicy: true
+      ignorePublicAcls: true
+      restrictPublicBuckets: true
+
+  seedControlPlaneNode:
+    type: aws:ec2:Instance
+    options:
+      protect: true
+    properties:
+      ami: ${amiId}
+      instanceType: ${instanceType}
+      subnetId: ${subnetId}
+      rootBlockDevice:
+        volumeSize: 64
+        volumeType: gp3
+        encrypted: true
+      metadataOptions:
+        httpEndpoint: enabled
+        httpTokens: required
+      tags:
+        Name: ${clusterName}-cp-01
+        app.kubernetes.io/managed-by: keel
+        keel.io/protect: "true"
+
+outputs:
+  clusterName: ${clusterName}
+  stateBucket: ${pulumiStateBucket.bucket}
+  controlPlanePrivateIp: ${seedControlPlaneNode.privateIp}
+  controlPlanePublicIp: ${seedControlPlaneNode.publicIp}

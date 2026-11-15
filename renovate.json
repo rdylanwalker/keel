@@ -1,0 +1,47 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    ":dependencyDashboard",
+    ":semanticCommits",
+    ":enableVulnerabilityAlerts"
+  ],
+  "schedule": ["before 5am on monday"],
+  "timezone": "UTC",
+  "prConcurrentLimit": 5,
+  "automerge": true,
+  "automergeType": "pr",
+  "platformAutomerge": true,
+  "lockFileMaintenance": {
+    "enabled": true,
+    "schedule": ["before 5am on monday"],
+    "automerge": true
+  },
+  "packageRules": [
+    {
+      "description": "Group Rust workspace crate updates",
+      "matchManagers": ["cargo"],
+      "groupName": "rust-dependencies",
+      "matchUpdateTypes": ["minor", "patch"],
+      "automerge": true
+    },
+    {
+      "description": "Group React, Shadcn, Tailwind, and Playwright updates",
+      "matchManagers": ["npm"],
+      "groupName": "frontend-dependencies",
+      "matchUpdateTypes": ["minor", "patch"],
+      "automerge": true
+    },
+    {
+      "description": "Group GitHub Actions updates",
+      "matchManagers": ["github-actions"],
+      "groupName": "github-actions",
+      "automerge": true
+    },
+    {
+      "description": "Require manual review for major breaking dependency upgrades",
+      "matchUpdateTypes": ["major"],
+      "automerge": false
+    }
+  ]
+}

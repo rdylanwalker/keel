@@ -1,0 +1,56 @@
+# Stage 0 Azure Seed Management Cluster & State Storage (`SDD.md` §2.1, `NFR-REL-01`)
+name: keel-stage0-azure
+runtime: yaml
+description: Stage 0 Azure seed management cluster with protected Resource Group and Blob state storage
+
+config:
+  clusterName:
+    type: string
+    default: keel-mgmt
+  location:
+    type: string
+    default: eastus
+  storageAccountName:
+    type: string
+
+resources:
+  managementResourceGroup:
+    type: azure-native:resources:ResourceGroup
+    options:
+      protect: true
+    properties:
+      resourceGroupName: rg-${clusterName}
+      location: ${location}
+      tags:
+        app.kubernetes.io/managed-by: keel
+        keel.io/protect: "true"
+
+  stateStorageAccount:
+    type: azure-native:storage:StorageAccount
+    options:
+      protect: true
+    properties:
+      accountName: ${storageAccountName}
+      resourceGroupName: ${managementResourceGroup.name}
+      location: ${location}
+      kind: StorageV2
+      sku:
+        name: Standard_LRS
+      allowBlobPublicAccess: false
+      minimumTlsVersion: TLS1_2
+      enableHttpsTrafficOnly: true
+
+  pulumiStateContainer:
+    type: azure-native:storage:BlobContainer
+    options:
+      protect: true
+    properties:
+      accountName: ${stateStorageAccount.name}
+      resourceGroupName: ${managementResourceGroup.name}
+      containerName: pulumi-state
+      publicAccess: None
+
+outputs:
+  clusterName: ${clusterName}
+  resourceGroupName: ${managementResourceGroup.name}
+  stateContainerName: ${pulumiStateContainer.name}

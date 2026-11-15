@@ -1,0 +1,54 @@
+# Day-1 Infrastructure Provider Registry (`SDD.md` §3.1, §4.1)
+# Toggling `enabled: true|false` via Pull Request controls catalog visibility and Kyverno admission.
+apiVersion: keel.io/v1alpha1
+kind: ProviderRegistry
+providers:
+  - id: proxmox
+    name: Proxmox VE
+    enabled: false
+    version: "0.71.0"
+    plugin: bpg/proxmox
+    terraformBridge: true
+    description: Proxmox VE VMs, LXC containers, and SDN networks
+  - id: aws
+    name: Amazon Web Services
+    enabled: false
+    version: "6.68.0"
+    plugin: pulumi/aws
+    terraformBridge: false
+    description: AWS compute, EKS, RDS, and S3 infrastructure
+  - id: gcp
+    name: Google Cloud Platform
+    enabled: false
+    version: "8.18.0"
+    plugin: pulumi/gcp
+    terraformBridge: false
+    description: GCP Compute Engine, GKE, Cloud SQL, and GCS
+  - id: azure
+    name: Microsoft Azure
+    enabled: false
+    version: "2.86.0"
+    plugin: pulumi/azure-native
+    terraformBridge: false
+    description: Azure VMs, AKS, PostgreSQL, and Blob Storage
+  - id: hetzner
+    name: Hetzner Cloud
+    enabled: false
+    version: "1.21.0"
+    plugin: pulumi/hcloud
+    terraformBridge: false
+    description: Hetzner Cloud servers, networks, volumes, and firewalls
+  - id: cloudflare
+    name: Cloudflare
+    enabled: false
+    version: "5.49.0"
+    plugin: pulumi/cloudflare
+    terraformBridge: false
+    description: Cloudflare DNS, Tunnels, and edge security
+  - id: kind
+    name: Kubernetes IN Docker (kind)
+    enabled: true
+    version: "0.9.0"
+    plugin: tehcyx/kind
+    terraformBridge: true
+    description: Local Docker-backed Kubernetes workload clusters via tehcyx/kind OpenTofu/Terraform bridge

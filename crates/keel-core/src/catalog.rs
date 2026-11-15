@@ -1,0 +1,808 @@
+//! `catalog.yaml` parser (`keel.io/v1alpha1`), `jsonschema` validator with structured field
+//! error reporting, secret field path extraction (`writeOnly: true` / `format: "password"`),
+//! and unmodified Helm `values.yaml` renderer (`SDD.md` §5.1, §6.3, `NFR-EXT-01`).
+
+use std::collections::BTreeSet;
+use std::fmt;
+
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
+
+use crate::CoreError;
+use crate::models::{
+    CATALOG_API_VERSION, CATALOG_APPLICATION_KIND, CATALOG_BUNDLE_KIND,
+    CATALOG_INFRA_BLUEPRINT_KIND, CatalogApplication, CatalogBundle, CatalogInfraBlueprint,
+    CatalogManifest,
+};
+
+/// Structured JSON Schema validation error tied to a specific instance field path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SchemaFieldError {
+    /// JSON Pointer path to the invalid field (e.g. `"/adminEmail"` or `""` for root object).
+    pub field_path: String,
+    /// JSON Pointer path inside `spec.schema` that failed validation.
+    pub schema_path: String,
+    /// Human-readable validation failure description.
+    pub message: String,
+}
+
+impl fmt::Display for SchemaFieldError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let target = if self.field_path.is_empty() {
+            "<root>"
+        } else {
+            self.field_path.as_str()
+        };
+        write!(f, "{}: {}", target, self.message)
+    }
+}
+
+/// Result of splitting user-submitted form values into plaintext Helm values and secret values.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PartitionedValues {
+    /// Non-secret configuration values safe to commit as plaintext `values.yaml`.
+    pub normal_values: Value,
+    /// Secret fields (`writeOnly: true` or `format: "password"`) requiring SOPS + `age` encryption.
+    pub secret_values: Value,
+    /// Sorted dot-separated paths of secret fields declared in `spec.schema`.
+    pub secret_field_paths: Vec<String>,
+}
+
+/// Validated, partitioned, and YAML-rendered payload ready for a GitOps PR.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreparedHelmValues {
+    /// Unmodified Helm `values.yaml` containing non-secret values.
+    pub values_yaml: String,
+    /// Plaintext YAML of extracted secret values to be passed into `SopsManager::encrypt_yaml`, if any.
+    pub plaintext_secrets_yaml: Option<String>,
+    /// Partitioned JSON structures and detected secret field paths.
+    pub partitioned: PartitionedValues,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CatalogHeader {
+    api_version: String,
+    kind: String,
+}
+
+/// Parses a `catalog.yaml` document into either a `CatalogApplication` or `CatalogInfraBlueprint`.
+pub fn parse_catalog(yaml: &str) -> Result<CatalogManifest, CoreError> {
+    let header: CatalogHeader = serde_yml::from_str(yaml)?;
+    if header.api_version != CATALOG_API_VERSION {
+        return Err(CoreError::Validation(format!(
+            "Unsupported catalog apiVersion '{}', expected '{}'",
+            header.api_version, CATALOG_API_VERSION
+        )));
+    }
+
+    match header.kind.as_str() {
+        CATALOG_APPLICATION_KIND => {
+            let app = parse_catalog_application(yaml)?;
+            Ok(CatalogManifest::Application(Box::new(app)))
+        }
+        CATALOG_INFRA_BLUEPRINT_KIND => {
+            let bp = parse_catalog_blueprint(yaml)?;
+            Ok(CatalogManifest::InfraBlueprint(Box::new(bp)))
+        }
+        CATALOG_BUNDLE_KIND => {
+            let bundle = parse_catalog_bundle(yaml)?;
+            Ok(CatalogManifest::Bundle(Box::new(bundle)))
+        }
+        other => Err(CoreError::Validation(format!(
+            "Unsupported catalog kind '{}', expected '{}', '{}', or '{}'",
+            other, CATALOG_APPLICATION_KIND, CATALOG_INFRA_BLUEPRINT_KIND, CATALOG_BUNDLE_KIND
+        ))),
+    }
+}
+
+/// Parses and validates a `CatalogApplication` from YAML, including compiling `spec.schema`.
+pub fn parse_catalog_application(yaml: &str) -> Result<CatalogApplication, CoreError> {
+    let app: CatalogApplication = serde_yml::from_str(yaml)?;
+    app.validate()?;
+    compile_schema(&app.spec.schema)?;
+    Ok(app)
+}
+
+/// Parses and validates a `CatalogInfraBlueprint` from YAML, including compiling `spec.schema`.
+pub fn parse_catalog_blueprint(yaml: &str) -> Result<CatalogInfraBlueprint, CoreError> {
+    let bp: CatalogInfraBlueprint = serde_yml::from_str(yaml)?;
+    bp.validate()?;
+    compile_schema(&bp.spec.schema)?;
+    Ok(bp)
+}
+
+/// Parses and validates a `CatalogBundle` from YAML, including compiling `spec.schema` and DAG checks.
+pub fn parse_catalog_bundle(yaml: &str) -> Result<CatalogBundle, CoreError> {
+    let bundle: CatalogBundle = serde_yml::from_str(yaml)?;
+    bundle.validate()?;
+    compile_schema(&bundle.spec.schema)?;
+    Ok(bundle)
+}
+
+fn compile_schema(schema: &Value) -> Result<jsonschema::Validator, CoreError> {
+    jsonschema::options()
+        .should_validate_formats(true)
+        .build(schema)
+        .map_err(|e| CoreError::Validation(format!("Invalid JSON Schema in catalog: {e}")))
+}
+
+/// Validates user input `values` against a JSON Schema, returning structured `SchemaFieldError`s on failure.
+pub fn validate_schema_values(schema: &Value, values: &Value) -> Result<(), CoreError> {
+    let validator = compile_schema(schema)?;
+    let mut errors: Vec<SchemaFieldError> = validator
+        .iter_errors(values)
+        .map(|err| SchemaFieldError {
+            field_path: err.instance_path.to_string(),
+            schema_path: err.schema_path.to_string(),
+            message: err.to_string(),
+        })
+        .collect();
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        errors.sort_by(|a, b| {
+            a.field_path
+                .cmp(&b.field_path)
+                .then_with(|| a.schema_path.cmp(&b.schema_path))
+                .then_with(|| a.message.cmp(&b.message))
+        });
+        Err(CoreError::SchemaValidation(errors))
+    }
+}
+
+/// Returns `true` if a JSON Schema property node marks a field as secret (`writeOnly: true` or `format: "password"`).
+pub fn is_secret_schema_node(schema_node: &Value) -> bool {
+    let Some(obj) = schema_node.as_object() else {
+        return false;
+    };
+
+    if obj.get("writeOnly").and_then(Value::as_bool) == Some(true) {
+        return true;
+    }
+    if obj.get("format").and_then(Value::as_str) == Some("password") {
+        return true;
+    }
+
+    for combinator in ["allOf", "anyOf", "oneOf"] {
+        if let Some(subschemas) = obj.get(combinator).and_then(Value::as_array)
+            && subschemas.iter().any(is_secret_schema_node)
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Extracts sorted, deduplicated dot-notated paths of all secret fields (`writeOnly: true` or `format: "password"`)
+/// defined in a JSON Schema.
+pub fn extract_secret_field_paths(schema: &Value) -> Vec<String> {
+    let mut paths = BTreeSet::new();
+    collect_secret_paths(schema, "", &mut paths);
+    paths.into_iter().collect()
+}
+
+fn collect_secret_paths(schema_node: &Value, prefix: &str, out: &mut BTreeSet<String>) {
+    let Some(obj) = schema_node.as_object() else {
+        return;
+    };
+
+    if !prefix.is_empty() && is_secret_schema_node(schema_node) {
+        out.insert(prefix.to_string());
+        return;
+    }
+
+    if let Some(props) = obj.get("properties").and_then(Value::as_object) {
+        for (prop_name, prop_schema) in props {
+            let next_prefix = if prefix.is_empty() {
+                prop_name.clone()
+            } else {
+                format!("{prefix}.{prop_name}")
+            };
+            collect_secret_paths(prop_schema, &next_prefix, out);
+        }
+    }
+
+    if let Some(items_schema) = obj.get("items") {
+        let next_prefix = if prefix.is_empty() {
+            "[]".to_string()
+        } else {
+            format!("{prefix}[]")
+        };
+        collect_secret_paths(items_schema, &next_prefix, out);
+    }
+
+    for combinator in ["allOf", "anyOf", "oneOf"] {
+        if let Some(subschemas) = obj.get(combinator).and_then(Value::as_array) {
+            for sub in subschemas {
+                collect_secret_paths(sub, prefix, out);
+            }
+        }
+    }
+}
+
+/// Partitions a JSON object of user values into `normal_values` and `secret_values` according to `schema`.
+pub fn partition_values_by_schema(
+    schema: &Value,
+    values: &Value,
+) -> Result<PartitionedValues, CoreError> {
+    if !values.is_object() {
+        return Err(CoreError::Validation(
+            "Input catalog values must be a JSON object".to_string(),
+        ));
+    }
+
+    let secret_field_paths = extract_secret_field_paths(schema);
+    let (normal_opt, secret_opt) = split_node(Some(schema), values);
+
+    let normal_values = normal_opt.unwrap_or_else(|| Value::Object(Map::new()));
+    let secret_values = secret_opt.unwrap_or_else(|| Value::Object(Map::new()));
+
+    Ok(PartitionedValues {
+        normal_values,
+        secret_values,
+        secret_field_paths,
+    })
+}
+
+fn find_property_schema<'a>(schema: &'a Value, prop_name: &str) -> Option<&'a Value> {
+    let obj = schema.as_object()?;
+    if let Some(prop) = obj
+        .get("properties")
+        .and_then(Value::as_object)
+        .and_then(|p| p.get(prop_name))
+    {
+        return Some(prop);
+    }
+
+    for combinator in ["allOf", "anyOf", "oneOf"] {
+        if let Some(subschemas) = obj.get(combinator).and_then(Value::as_array) {
+            for sub in subschemas {
+                if let Some(found) = find_property_schema(sub, prop_name) {
+                    return Some(found);
+                }
+            }
+        }
+    }
+
+    obj.get("additionalProperties").filter(|v| v.is_object())
+}
+
+fn split_node(schema: Option<&Value>, value: &Value) -> (Option<Value>, Option<Value>) {
+    if let Some(s) = schema
+        && is_secret_schema_node(s)
+    {
+        return (None, Some(value.clone()));
+    }
+
+    match value {
+        Value::Object(map) => {
+            if map.is_empty() {
+                return (Some(Value::Object(Map::new())), None);
+            }
+            let mut normal_map = Map::new();
+            let mut secret_map = Map::new();
+
+            for (k, v) in map {
+                let child_schema = schema.and_then(|s| find_property_schema(s, k));
+                let (n_part, s_part) = split_node(child_schema, v);
+                if let Some(nv) = n_part {
+                    normal_map.insert(k.clone(), nv);
+                }
+                if let Some(sv) = s_part {
+                    secret_map.insert(k.clone(), sv);
+                }
+            }
+
+            let normal_res = if normal_map.is_empty() {
+                None
+            } else {
+                Some(Value::Object(normal_map))
+            };
+            let secret_res = if secret_map.is_empty() {
+                None
+            } else {
+                Some(Value::Object(secret_map))
+            };
+            (normal_res, secret_res)
+        }
+        Value::Array(items) => {
+            let item_schema = schema
+                .and_then(Value::as_object)
+                .and_then(|o| o.get("items"));
+            if let Some(is) = item_schema
+                && is_secret_schema_node(is)
+            {
+                return (None, Some(value.clone()));
+            }
+
+            let mut normal_arr = Vec::new();
+            let mut secret_arr = Vec::new();
+            let mut any_secret = false;
+
+            for item in items {
+                let (n_part, s_part) = split_node(item_schema, item);
+                if let Some(nv) = n_part {
+                    normal_arr.push(nv);
+                }
+                if let Some(sv) = s_part {
+                    any_secret = true;
+                    secret_arr.push(sv);
+                }
+            }
+
+            let normal_res = if normal_arr.is_empty() && any_secret {
+                None
+            } else {
+                Some(Value::Array(normal_arr))
+            };
+            let secret_res = if any_secret {
+                Some(Value::Array(secret_arr))
+            } else {
+                None
+            };
+            (normal_res, secret_res)
+        }
+        _ => (Some(value.clone()), None),
+    }
+}
+
+/// Renders an unmodified upstream Helm `values.yaml` string directly from a JSON value (`serde_yml::to_string`).
+pub fn render_helm_values_yaml(values: &Value) -> Result<String, CoreError> {
+    if !values.is_object() {
+        return Err(CoreError::Validation(
+            "Helm values root must be a JSON/YAML mapping object".to_string(),
+        ));
+    }
+    Ok(serde_yml::to_string(values)?)
+}
+
+/// Validates form input against `app.spec.schema`, partitions secret vs. normal fields,
+/// and renders unmodified Helm `values.yaml` (plus optional plaintext secrets YAML for SOPS).
+pub fn prepare_helm_values(
+    app: &CatalogApplication,
+    raw_values: &Value,
+) -> Result<PreparedHelmValues, CoreError> {
+    validate_schema_values(&app.spec.schema, raw_values)?;
+    let partitioned = partition_values_by_schema(&app.spec.schema, raw_values)?;
+    let values_yaml = render_helm_values_yaml(&partitioned.normal_values)?;
+
+    let plaintext_secrets_yaml = match partitioned.secret_values.as_object() {
+        Some(map) if !map.is_empty() => Some(serde_yml::to_string(&partitioned.secret_values)?),
+        _ => None,
+    };
+
+    Ok(PreparedHelmValues {
+        values_yaml,
+        plaintext_secrets_yaml,
+        partitioned,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+    use crate::models::AppRuntime;
+
+    const AUTHENTIK_CATALOG_YAML: &str = r#"
+apiVersion: keel.io/v1alpha1
+kind: CatalogApplication
+metadata:
+  id: authentik
+  name: Authentik Identity Provider
+  category: security-identity
+  runtime: helm
+spec:
+  upstream:
+    chart: authentik
+    repoURL: https://charts.goauthentik.io
+    version: "2026.10.1"
+  progressiveDelivery:
+    flaggerSupported: true
+    defaultCanary: false
+  companionInfrastructure:
+    - blueprint: postgres-managed
+      bindValues:
+        postgresql.enabled: false
+        authentik.postgresql.host: "${outputs.db_host}"
+        authentik.postgresql.password: "${secrets.db_password}"
+  schema:
+    type: object
+    required: [domain, adminEmail, secretKey]
+    properties:
+      domain:
+        type: string
+        title: Ingress Hostname
+        format: hostname
+      adminEmail:
+        type: string
+        title: Bootstrap Admin Email
+        format: email
+      secretKey:
+        type: string
+        title: Authentik Secret Key
+        writeOnly: true
+      smtp:
+        type: object
+        properties:
+          host:
+            type: string
+          password:
+            type: string
+            format: password
+      replicas:
+        type: integer
+        title: Worker Replicas
+        default: 2
+        minimum: 1
+        maximum: 10
+  uiSchema:
+    adminEmail:
+      ui:help: "Used for initial administrator recovery notifications."
+"#;
+
+    const POSTGRES_BLUEPRINT_YAML: &str = r#"
+apiVersion: keel.io/v1alpha1
+kind: CatalogInfraBlueprint
+metadata:
+  id: postgres-managed
+  name: Managed PostgreSQL Cluster
+  category: database
+  provider: proxmox
+spec:
+  pulumiRuntime: yaml
+  entrypoint: Pulumi.yaml
+  protectByDefault: true
+  outputs:
+    - db_host
+    - db_port
+  schema:
+    type: object
+    required: [storageGb, superuserPassword]
+    properties:
+      storageGb:
+        type: integer
+        minimum: 10
+      superuserPassword:
+        type: string
+        writeOnly: true
+"#;
+
+    #[test]
+    fn test_parse_catalog_application_and_blueprint() {
+        let manifest = parse_catalog(AUTHENTIK_CATALOG_YAML).unwrap();
+        let CatalogManifest::Application(app) = manifest else {
+            panic!("expected CatalogApplication");
+        };
+        assert_eq!(app.metadata.id, "authentik");
+        assert_eq!(app.metadata.runtime, AppRuntime::Helm);
+        assert_eq!(app.spec.upstream.chart.as_deref(), Some("authentik"));
+        assert!(app.spec.progressive_delivery.flagger_supported);
+        assert!(!app.spec.progressive_delivery.default_canary);
+        assert_eq!(app.spec.companion_infrastructure.len(), 1);
+        assert_eq!(
+            app.spec.companion_infrastructure[0].blueprint,
+            "postgres-managed"
+        );
+        assert_eq!(
+            app.spec.companion_infrastructure[0]
+                .bind_values
+                .get("postgresql.enabled"),
+            Some(&json!(false))
+        );
+        assert!(app.spec.ui_schema.is_some());
+
+        let bp_manifest = parse_catalog(POSTGRES_BLUEPRINT_YAML).unwrap();
+        let CatalogManifest::InfraBlueprint(bp) = bp_manifest else {
+            panic!("expected CatalogInfraBlueprint");
+        };
+        assert_eq!(bp.metadata.id, "postgres-managed");
+        assert_eq!(bp.metadata.provider, "proxmox");
+        assert!(bp.spec.protect_by_default);
+        assert_eq!(bp.spec.outputs, vec!["db_host", "db_port"]);
+    }
+
+    #[test]
+    fn test_parse_catalog_rejects_invalid_headers_and_invariants() {
+        let bad_api = AUTHENTIK_CATALOG_YAML.replace("keel.io/v1alpha1", "v1");
+        assert!(parse_catalog(&bad_api).is_err());
+
+        let bad_kind = AUTHENTIK_CATALOG_YAML.replace("CatalogApplication", "Deployment");
+        assert!(parse_catalog(&bad_kind).is_err());
+
+        // Helm app without chart
+        let missing_chart = AUTHENTIK_CATALOG_YAML.replace("chart: authentik\n", "");
+        assert!(parse_catalog_application(&missing_chart).is_err());
+
+        // defaultCanary true when flaggerSupported false
+        let bad_canary = AUTHENTIK_CATALOG_YAML
+            .replace("flaggerSupported: true", "flaggerSupported: false")
+            .replace("defaultCanary: false", "defaultCanary: true");
+        assert!(parse_catalog_application(&bad_canary).is_err());
+    }
+
+    #[test]
+    fn test_validate_schema_structured_field_errors() {
+        let app = parse_catalog_application(AUTHENTIK_CATALOG_YAML).unwrap();
+
+        let invalid_input = json!({
+            "domain": "id.example.com",
+            "adminEmail": "not-an-email",
+            "replicas": 99
+        });
+
+        let err = validate_schema_values(&app.spec.schema, &invalid_input).unwrap_err();
+        let CoreError::SchemaValidation(field_errors) = err else {
+            panic!("expected SchemaValidation error, got {err:?}");
+        };
+
+        // Missing secretKey (root ""), invalid email ("/adminEmail"), replicas > 10 ("/replicas")
+        assert!(field_errors.len() >= 3);
+        assert!(field_errors.iter().any(|e| e.field_path == "/adminEmail"));
+        assert!(field_errors.iter().any(|e| e.field_path == "/replicas"));
+        assert!(
+            field_errors
+                .iter()
+                .any(|e| e.field_path.is_empty() && e.message.contains("secretKey"))
+        );
+
+        let display_str = field_errors[0].to_string();
+        assert!(!display_str.is_empty());
+    }
+
+    #[test]
+    fn test_secret_extraction_partitioning_and_helm_values_rendering() {
+        let app = parse_catalog_application(AUTHENTIK_CATALOG_YAML).unwrap();
+
+        let paths = extract_secret_field_paths(&app.spec.schema);
+        assert_eq!(paths, vec!["secretKey", "smtp.password"]);
+
+        let valid_input = json!({
+            "domain": "auth.keel.internal",
+            "adminEmail": "admin@keel.internal",
+            "secretKey": "top-secret-signing-key",
+            "replicas": 3,
+            "smtp": {
+                "host": "smtp.keel.internal",
+                "password": "smtp-secret-password"
+            }
+        });
+
+        let prepared = prepare_helm_values(&app, &valid_input).unwrap();
+        assert_eq!(
+            prepared.partitioned.normal_values,
+            json!({
+                "domain": "auth.keel.internal",
+                "adminEmail": "admin@keel.internal",
+                "replicas": 3,
+                "smtp": {
+                    "host": "smtp.keel.internal"
+                }
+            })
+        );
+        assert_eq!(
+            prepared.partitioned.secret_values,
+            json!({
+                "secretKey": "top-secret-signing-key",
+                "smtp": {
+                    "password": "smtp-secret-password"
+                }
+            })
+        );
+
+        // Verify unmodified Helm values.yaml does NOT leak any secret values
+        assert!(prepared.values_yaml.contains("auth.keel.internal"));
+        assert!(prepared.values_yaml.contains("smtp.keel.internal"));
+        assert!(!prepared.values_yaml.contains("top-secret-signing-key"));
+        assert!(!prepared.values_yaml.contains("smtp-secret-password"));
+
+        let secrets_yaml = prepared.plaintext_secrets_yaml.unwrap();
+        assert!(secrets_yaml.contains("top-secret-signing-key"));
+        assert!(secrets_yaml.contains("smtp-secret-password"));
+
+        // Non-object values rejected
+        assert!(partition_values_by_schema(&app.spec.schema, &json!(["not-an-object"])).is_err());
+        assert!(render_helm_values_yaml(&json!("scalar")).is_err());
+    }
+
+    #[test]
+    fn test_combinators_and_array_secret_extraction() {
+        let complex_schema = json!({
+            "type": "object",
+            "allOf": [
+                {
+                    "properties": {
+                        "apiToken": {
+                            "type": "string",
+                            "writeOnly": true
+                        }
+                    }
+                }
+            ],
+            "properties": {
+                "webhooks": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "format": "password"
+                    }
+                }
+            }
+        });
+
+        let paths = extract_secret_field_paths(&complex_schema);
+        assert_eq!(paths, vec!["apiToken", "webhooks[]"]);
+
+        let partitioned = partition_values_by_schema(
+            &complex_schema,
+            &json!({
+                "apiToken": "tok_123",
+                "webhooks": ["wh_sec_1", "wh_sec_2"],
+                "publicFlag": true
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(partitioned.normal_values, json!({ "publicFlag": true }));
+        assert_eq!(
+            partitioned.secret_values,
+            json!({
+                "apiToken": "tok_123",
+                "webhooks": ["wh_sec_1", "wh_sec_2"]
+            })
+        );
+
+        // Kustomize app without secrets produces plaintext_secrets_yaml == None
+        let kustomize_yaml = r#"
+apiVersion: keel.io/v1alpha1
+kind: CatalogApplication
+metadata:
+  id: podinfo
+  name: Podinfo
+  category: demo
+  runtime: kustomize
+spec:
+  upstream:
+    repoURL: https://github.com/stefanprodan/podinfo
+    path: ./kustomize
+    ref: main
+  schema:
+    type: object
+    properties:
+      replicas:
+        type: integer
+        minimum: 1
+      extraEnv:
+        type: object
+      endpoints:
+        type: array
+        items:
+          type: object
+          properties:
+            url:
+              type: string
+            token:
+              type: string
+              writeOnly: true
+"#;
+        let kust_app = parse_catalog_application(kustomize_yaml).unwrap();
+        assert_eq!(kust_app.metadata.runtime, AppRuntime::Kustomize);
+
+        let no_secret_prepared = prepare_helm_values(
+            &kust_app,
+            &json!({
+                "replicas": 2,
+                "extraEnv": {}
+            }),
+        )
+        .unwrap();
+        assert!(no_secret_prepared.plaintext_secrets_yaml.is_none());
+
+        let nested_array_prepared = prepare_helm_values(
+            &kust_app,
+            &json!({
+                "replicas": 1,
+                "endpoints": [
+                    { "url": "https://hook.example.com", "token": "sec-1" }
+                ]
+            }),
+        )
+        .unwrap();
+        assert!(nested_array_prepared.plaintext_secrets_yaml.is_some());
+        assert!(!nested_array_prepared.values_yaml.contains("sec-1"));
+
+        // Blueprint validation failure checks
+        let bad_bp = POSTGRES_BLUEPRINT_YAML.replace("entrypoint: Pulumi.yaml", "entrypoint: \"\"");
+        assert!(parse_catalog_blueprint(&bad_bp).is_err());
+    }
+
+    #[test]
+    fn test_parse_catalog_bundle_and_dag_validation() {
+        let valid_bundle_yaml = r#"
+apiVersion: keel.io/v1alpha1
+kind: CatalogBundle
+metadata:
+  id: k3s-platform
+  name: K3s Cluster + Platform Stack
+  category: platform
+spec:
+  items:
+    - id: app
+      kind: app
+      catalogRef: podinfo
+      dependsOn: [cluster, ingress]
+      targetClusterFrom: cluster
+      targetNamespace: default
+      bindValues:
+        ingress.host: "${items.cluster.outputs.ingress_domain}"
+    - id: ingress
+      kind: app
+      catalogRef: envoy-gateway
+      dependsOn: [cluster]
+      targetClusterFrom: cluster
+      targetNamespace: envoy-gateway-system
+    - id: cluster
+      kind: infra
+      catalogRef: proxmox-k3s
+  schema:
+    type: object
+    properties:
+      cluster:
+        type: object
+        properties:
+          nodeCount:
+            type: integer
+            default: 3
+      ingress:
+        type: object
+      app:
+        type: object
+"#;
+        let parsed = parse_catalog(valid_bundle_yaml).unwrap();
+        let CatalogManifest::Bundle(bundle) = parsed else {
+            panic!("Expected CatalogBundle");
+        };
+        assert_eq!(bundle.metadata.id, "k3s-platform");
+        let order: Vec<&str> = bundle
+            .topological_order()
+            .unwrap()
+            .into_iter()
+            .map(|i| i.id.as_str())
+            .collect();
+        assert_eq!(order, vec!["cluster", "ingress", "app"]);
+
+        // Cycle detection
+        let cycle_yaml = r#"
+apiVersion: keel.io/v1alpha1
+kind: CatalogBundle
+metadata:
+  id: cycle-bundle
+  name: Cycle Bundle
+  category: platform
+spec:
+  items:
+    - id: a
+      kind: infra
+      catalogRef: kind-cluster
+      dependsOn: [b]
+    - id: b
+      kind: infra
+      catalogRef: kind-cluster
+      dependsOn: [a]
+  schema:
+    type: object
+"#;
+        assert!(parse_catalog_bundle(cycle_yaml).is_err());
+
+        // targetClusterFrom must be in dependsOn and reference an infra item
+        let missing_dep_yaml = valid_bundle_yaml.replace("dependsOn: [cluster]", "dependsOn: []");
+        assert!(parse_catalog_bundle(&missing_dep_yaml).is_err());
+    }
+}

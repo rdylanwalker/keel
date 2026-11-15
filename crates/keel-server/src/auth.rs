@@ -1,0 +1,538 @@
+//! Authentication & stateless session cookie management (`SDD.md` §6.1, §6.3, §7.3).
+//!
+//! - Stage 0 / Break-Glass: `POST /api/v1/auth/bootstrap-login` verifies a 256-bit token
+//!   via `SecretStateStore::consume_bootstrap_token_hash` and issues an `AES-256-GCM`
+//!   encrypted/authenticated `HttpOnly; Secure; SameSite=Strict` session cookie.
+//! - Stage 1+: `GET /api/v1/auth/login` & `/callback` implement OIDC Authorization Code + PKCE
+//!   using stateless encrypted `keel_pkce` cookies.
+
+use axum::Json;
+use axum::extract::{FromRequestParts, Query, State};
+use axum::http::header::{AUTHORIZATION, COOKIE, LOCATION, SET_COOKIE};
+use axum::http::request::Parts;
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::response::{IntoResponse, Response};
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use chrono::Utc;
+use keel_core::{AuthPhase, EnvelopeCrypto};
+use keel_kube::hash_bootstrap_token;
+use rand::RngCore;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+use crate::error::ServerError;
+use crate::state::AppState;
+
+/// Cookie holding the stateless `AES-256-GCM` encrypted [`SessionClaims`].
+pub const SESSION_COOKIE_NAME: &str = "keel_session";
+
+/// Short-lived cookie holding the encrypted OIDC PKCE verifier & state nonce.
+pub const PKCE_COOKIE_NAME: &str = "keel_pkce";
+
+const SESSION_TTL_SECONDS: i64 = 3600;
+const PKCE_TTL_SECONDS: i64 = 300;
+
+/// Authenticated session claims encrypted inside `keel_session`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionClaims {
+    pub sub: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub groups: Vec<String>,
+    pub auth_phase: AuthPhase,
+    pub exp: i64,
+}
+
+/// Axum extractor enforcing a valid authenticated session cookie (or Bearer session token).
+#[derive(Debug, Clone)]
+pub struct AuthSession {
+    pub claims: SessionClaims,
+}
+
+impl FromRequestParts<AppState> for AuthSession {
+    type Rejection = ServerError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let token = extract_session_token(&parts.headers).ok_or_else(|| {
+            ServerError::Unauthorized("Missing or invalid authentication session".to_string())
+        })?;
+
+        let session_key = state.secret_store.get_or_create_session_key().await?;
+        let claims = decrypt_session_token(&session_key, &token)?;
+
+        if claims.exp <= Utc::now().timestamp() {
+            return Err(ServerError::Unauthorized(
+                "Authentication session has expired".to_string(),
+            ));
+        }
+
+        Ok(Self { claims })
+    }
+}
+
+/// Encrypts [`SessionClaims`] into an opaque URL-safe token using `AES-256-GCM`.
+pub fn encrypt_session_token(
+    session_key: &[u8; 32],
+    claims: &SessionClaims,
+) -> Result<String, ServerError> {
+    let json = serde_json::to_vec(claims)
+        .map_err(|e| ServerError::Internal(format!("Failed to serialize session claims: {e}")))?;
+    let cipher = EnvelopeCrypto::new(*session_key);
+    let b64_cipher = cipher.encrypt(&json)?;
+    Ok(URL_SAFE_NO_PAD.encode(b64_cipher.as_bytes()))
+}
+
+/// Decrypts and authenticates an opaque `keel_session` token using `AES-256-GCM`.
+pub fn decrypt_session_token(
+    session_key: &[u8; 32],
+    token: &str,
+) -> Result<SessionClaims, ServerError> {
+    let raw_bytes = URL_SAFE_NO_PAD
+        .decode(token.trim())
+        .map_err(|_| ServerError::Unauthorized("Malformed session token".to_string()))?;
+    let b64_cipher = std::str::from_utf8(&raw_bytes)
+        .map_err(|_| ServerError::Unauthorized("Malformed session token".to_string()))?;
+    let cipher = EnvelopeCrypto::new(*session_key);
+    let plaintext = cipher
+        .decrypt(b64_cipher)
+        .map_err(|_| ServerError::Unauthorized("Invalid or tampered session token".to_string()))?;
+    serde_json::from_slice(&plaintext)
+        .map_err(|_| ServerError::Unauthorized("Corrupted session claims".to_string()))
+}
+
+fn build_session_cookie_header(token: &str, max_age: i64) -> Result<HeaderValue, ServerError> {
+    let cookie = format!(
+        "{SESSION_COOKIE_NAME}={token}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age={max_age}"
+    );
+    HeaderValue::from_str(&cookie)
+        .map_err(|e| ServerError::Internal(format!("Invalid Set-Cookie header: {e}")))
+}
+
+fn build_pkce_cookie_header(token: &str, max_age: i64) -> Result<HeaderValue, ServerError> {
+    let cookie = format!(
+        "{PKCE_COOKIE_NAME}={token}; HttpOnly; Secure; SameSite=Strict; Path=/api/v1/auth; Max-Age={max_age}"
+    );
+    HeaderValue::from_str(&cookie)
+        .map_err(|e| ServerError::Internal(format!("Invalid PKCE Set-Cookie header: {e}")))
+}
+
+fn extract_cookie_value<'a>(headers: &'a HeaderMap, cookie_name: &str) -> Option<&'a str> {
+    for val in headers.get_all(COOKIE) {
+        let Ok(raw) = val.to_str() else {
+            continue;
+        };
+        for pair in raw.split(';') {
+            let trimmed = pair.trim();
+            if let Some((name, value)) = trimmed.split_once('=')
+                && name.trim() == cookie_name
+            {
+                return Some(value.trim());
+            }
+        }
+    }
+    None
+}
+
+fn extract_session_token(headers: &HeaderMap) -> Option<String> {
+    if let Some(cookie_val) = extract_cookie_value(headers, SESSION_COOKIE_NAME)
+        && !cookie_val.is_empty()
+    {
+        return Some(cookie_val.to_string());
+    }
+    if let Some(auth_hdr) = headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok())
+        && let Some(bearer) = auth_hdr.strip_prefix("Bearer ")
+    {
+        let trimmed = bearer.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    None
+}
+
+/// Request body for `POST /api/v1/auth/bootstrap-login`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BootstrapLoginRequest {
+    pub token: String,
+}
+
+/// Response body for `POST /api/v1/auth/bootstrap-login`.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthLoginResponse {
+    pub authenticated: bool,
+    pub sub: String,
+    pub phase: AuthPhase,
+}
+
+/// `POST /api/v1/auth/bootstrap-login`
+///
+/// Verifies the single-use 256-bit Stage 0 bootstrap token against `SecretStateStore::consume_bootstrap_token_hash`
+/// and issues an `AES-256-GCM` encrypted `HttpOnly; Secure; SameSite=Strict` session cookie.
+pub async fn bootstrap_login(
+    State(state): State<AppState>,
+    Json(req): Json<BootstrapLoginRequest>,
+) -> Result<Response, ServerError> {
+    let phase = *state.auth_phase.read().await;
+    if phase == AuthPhase::OidcActive {
+        return Err(ServerError::Forbidden(
+            "Bootstrap login is disabled while OIDC authentication is active".to_string(),
+        ));
+    }
+
+    let trimmed = req.token.trim();
+    if trimmed.is_empty() {
+        return Err(ServerError::Unauthorized(
+            "Bootstrap token must not be empty".to_string(),
+        ));
+    }
+
+    let candidate_hash = hash_bootstrap_token(trimmed);
+    let consumed = state
+        .secret_store
+        .consume_bootstrap_token_hash(&candidate_hash)
+        .await?;
+
+    if !consumed {
+        return Err(ServerError::Unauthorized(
+            "Invalid or already consumed bootstrap token".to_string(),
+        ));
+    }
+
+    let session_key = state.secret_store.get_or_create_session_key().await?;
+    let claims = SessionClaims {
+        sub: "bootstrap-admin".to_string(),
+        email: None,
+        name: Some("Bootstrap Administrator".to_string()),
+        groups: vec!["keel-admins".to_string()],
+        auth_phase: phase,
+        exp: Utc::now().timestamp() + SESSION_TTL_SECONDS,
+    };
+
+    let token = encrypt_session_token(&session_key, &claims)?;
+    let set_cookie = build_session_cookie_header(&token, SESSION_TTL_SECONDS)?;
+
+    let mut resp = (
+        StatusCode::OK,
+        Json(AuthLoginResponse {
+            authenticated: true,
+            sub: claims.sub,
+            phase,
+        }),
+    )
+        .into_response();
+    resp.headers_mut().insert(SET_COOKIE, set_cookie);
+    Ok(resp)
+}
+
+/// Response body for `GET /api/v1/auth/status`.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthStatusResponse {
+    pub phase: AuthPhase,
+    pub oidc_enabled: bool,
+    pub authenticated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sub: Option<String>,
+}
+
+/// `GET /api/v1/auth/status`
+///
+/// Reports the current authentication phase (`Bootstrap`, `OidcActive`, `BreakGlass`),
+/// whether OIDC is enabled, and whether the caller holds a valid session cookie.
+pub async fn auth_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<AuthStatusResponse>, ServerError> {
+    let phase = *state.auth_phase.read().await;
+    let oidc_enabled = state
+        .oidc_config
+        .read()
+        .await
+        .as_ref()
+        .is_some_and(|c| c.enabled);
+
+    let mut authenticated = false;
+    let mut sub = None;
+
+    if let Some(token) = extract_session_token(&headers)
+        && let Ok(session_key) = state.secret_store.get_or_create_session_key().await
+        && let Ok(claims) = decrypt_session_token(&session_key, &token)
+        && claims.exp > Utc::now().timestamp()
+    {
+        authenticated = true;
+        sub = Some(claims.sub);
+    }
+
+    Ok(Json(AuthStatusResponse {
+        phase,
+        oidc_enabled,
+        authenticated,
+        sub,
+    }))
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PkceStatePayload {
+    state: String,
+    code_verifier: String,
+    redirect_uri: String,
+    exp: i64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct OidcLoginQuery {
+    #[serde(default)]
+    pub redirect_uri: Option<String>,
+}
+
+/// `GET /api/v1/auth/login`
+///
+/// Initiates the OIDC Authorization Code + PKCE (`S256`) flow, storing the PKCE verifier
+/// in a short-lived `AES-256-GCM` encrypted `HttpOnly; Secure; SameSite=Strict` cookie.
+pub async fn oidc_login(
+    State(state): State<AppState>,
+    Query(query): Query<OidcLoginQuery>,
+) -> Result<Response, ServerError> {
+    let oidc_guard = state.oidc_config.read().await;
+    let Some(oidc) = oidc_guard.as_ref().filter(|c| c.enabled) else {
+        return Err(ServerError::ServiceUnavailable(
+            "OIDC is not configured; use /api/v1/auth/bootstrap-login during Stage 0".to_string(),
+        ));
+    };
+
+    let mut verifier_bytes = [0u8; 32];
+    let mut state_bytes = [0u8; 16];
+    rand::rng().fill_bytes(&mut verifier_bytes);
+    rand::rng().fill_bytes(&mut state_bytes);
+
+    let code_verifier = URL_SAFE_NO_PAD.encode(verifier_bytes);
+    let state_nonce = URL_SAFE_NO_PAD.encode(state_bytes);
+    let challenge_digest = Sha256::digest(code_verifier.as_bytes());
+    let code_challenge = URL_SAFE_NO_PAD.encode(challenge_digest);
+
+    let redirect_uri = query
+        .redirect_uri
+        .filter(|u| !u.trim().is_empty())
+        .unwrap_or_else(|| oidc.redirect_url.clone());
+
+    let pkce_payload = PkceStatePayload {
+        state: state_nonce.clone(),
+        code_verifier,
+        redirect_uri: redirect_uri.clone(),
+        exp: Utc::now().timestamp() + PKCE_TTL_SECONDS,
+    };
+
+    let session_key = state.secret_store.get_or_create_session_key().await?;
+    let pkce_json = serde_json::to_vec(&pkce_payload)
+        .map_err(|e| ServerError::Internal(format!("Failed to serialize PKCE state: {e}")))?;
+    let encrypted_pkce = URL_SAFE_NO_PAD.encode(
+        EnvelopeCrypto::new(session_key)
+            .encrypt(&pkce_json)?
+            .as_bytes(),
+    );
+    let pkce_cookie = build_pkce_cookie_header(&encrypted_pkce, PKCE_TTL_SECONDS)?;
+
+    let issuer = oidc.issuer_url.trim_end_matches('/');
+    let scopes = oidc.scopes.join("%20");
+    let auth_url = format!(
+        "{issuer}/protocol/openid-connect/auth?response_type=code&client_id={}&redirect_uri={}&scope={scopes}&state={state_nonce}&code_challenge={code_challenge}&code_challenge_method=S256",
+        url_encode_component(&oidc.client_id),
+        url_encode_component(&redirect_uri),
+    );
+
+    let location = HeaderValue::from_str(&auth_url)
+        .map_err(|e| ServerError::Internal(format!("Invalid OIDC redirect URL: {e}")))?;
+
+    let mut resp = StatusCode::FOUND.into_response();
+    resp.headers_mut().insert(LOCATION, location);
+    resp.headers_mut().insert(SET_COOKIE, pkce_cookie);
+    Ok(resp)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct OidcCallbackQuery {
+    #[serde(default)]
+    pub code: Option<String>,
+    #[serde(default)]
+    pub state: Option<String>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OidcTokenResponse {
+    #[serde(default)]
+    id_token: Option<String>,
+    #[serde(default)]
+    access_token: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct JwtClaimsSubset {
+    sub: String,
+    #[serde(default)]
+    email: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    groups: Vec<String>,
+}
+
+/// `GET /api/v1/auth/callback`
+///
+/// Validates the OIDC PKCE state cookie, exchanges the authorization code at the
+/// OIDC token endpoint, and issues a stateless `keel_session` cookie.
+pub async fn oidc_callback(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<OidcCallbackQuery>,
+) -> Result<Response, ServerError> {
+    if let Some(err) = query.error {
+        return Err(ServerError::Unauthorized(format!(
+            "OIDC provider returned error: {err}"
+        )));
+    }
+
+    let code = query
+        .code
+        .filter(|c| !c.trim().is_empty())
+        .ok_or_else(|| ServerError::BadRequest("Missing OIDC authorization code".to_string()))?;
+    let returned_state = query
+        .state
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| ServerError::BadRequest("Missing OIDC state parameter".to_string()))?;
+
+    let oidc_guard = state.oidc_config.read().await;
+    let Some(oidc) = oidc_guard.as_ref().filter(|c| c.enabled) else {
+        return Err(ServerError::ServiceUnavailable(
+            "OIDC is not configured".to_string(),
+        ));
+    };
+
+    let pkce_cookie_raw = extract_cookie_value(&headers, PKCE_COOKIE_NAME)
+        .ok_or_else(|| ServerError::Unauthorized("Missing OIDC PKCE state cookie".to_string()))?;
+    let session_key = state.secret_store.get_or_create_session_key().await?;
+
+    let pkce_b64 = URL_SAFE_NO_PAD
+        .decode(pkce_cookie_raw)
+        .map_err(|_| ServerError::Unauthorized("Malformed PKCE cookie".to_string()))?;
+    let pkce_b64_str = std::str::from_utf8(&pkce_b64)
+        .map_err(|_| ServerError::Unauthorized("Malformed PKCE cookie".to_string()))?;
+    let pkce_plaintext = EnvelopeCrypto::new(session_key)
+        .decrypt(pkce_b64_str)
+        .map_err(|_| ServerError::Unauthorized("Invalid PKCE state cookie".to_string()))?;
+    let pkce: PkceStatePayload = serde_json::from_slice(&pkce_plaintext)
+        .map_err(|_| ServerError::Unauthorized("Corrupted PKCE state cookie".to_string()))?;
+
+    if pkce.exp <= Utc::now().timestamp() {
+        return Err(ServerError::Unauthorized(
+            "OIDC PKCE state has expired".to_string(),
+        ));
+    }
+    if pkce.state != returned_state {
+        return Err(ServerError::Unauthorized(
+            "OIDC state mismatch (possible CSRF)".to_string(),
+        ));
+    }
+
+    let token_endpoint = format!(
+        "{}/protocol/openid-connect/token",
+        oidc.issuer_url.trim_end_matches('/')
+    );
+    let client = reqwest::Client::new();
+    let token_res = client
+        .post(&token_endpoint)
+        .form(&[
+            ("grant_type", "authorization_code"),
+            ("code", code.as_str()),
+            ("redirect_uri", pkce.redirect_uri.as_str()),
+            ("client_id", oidc.client_id.as_str()),
+            ("code_verifier", pkce.code_verifier.as_str()),
+        ])
+        .send()
+        .await
+        .map_err(|e| ServerError::Internal(format!("OIDC token exchange failed: {e}")))?;
+
+    if !token_res.status().is_success() {
+        return Err(ServerError::Unauthorized(format!(
+            "OIDC token endpoint rejected authorization code (HTTP {})",
+            token_res.status()
+        )));
+    }
+
+    let token_body: OidcTokenResponse = token_res
+        .json()
+        .await
+        .map_err(|e| ServerError::Internal(format!("Invalid OIDC token response: {e}")))?;
+
+    let jwt = token_body
+        .id_token
+        .or(token_body.access_token)
+        .ok_or_else(|| {
+            ServerError::Unauthorized("OIDC token response missing id_token".to_string())
+        })?;
+
+    let jwt_claims = decode_jwt_payload_claims(&jwt)?;
+    let phase = *state.auth_phase.read().await;
+    let claims = SessionClaims {
+        sub: jwt_claims.sub.clone(),
+        email: jwt_claims.email,
+        name: jwt_claims.name,
+        groups: jwt_claims.groups,
+        auth_phase: phase,
+        exp: Utc::now().timestamp() + SESSION_TTL_SECONDS,
+    };
+
+    let session_token = encrypt_session_token(&session_key, &claims)?;
+    let session_cookie = build_session_cookie_header(&session_token, SESSION_TTL_SECONDS)?;
+    let clear_pkce_cookie = build_pkce_cookie_header("", 0)?;
+
+    let mut resp = (
+        StatusCode::OK,
+        Json(AuthLoginResponse {
+            authenticated: true,
+            sub: jwt_claims.sub,
+            phase,
+        }),
+    )
+        .into_response();
+    resp.headers_mut().append(SET_COOKIE, session_cookie);
+    resp.headers_mut().append(SET_COOKIE, clear_pkce_cookie);
+    Ok(resp)
+}
+
+fn decode_jwt_payload_claims(jwt: &str) -> Result<JwtClaimsSubset, ServerError> {
+    let mut parts = jwt.split('.');
+    let _header = parts.next();
+    let payload_b64 = parts
+        .next()
+        .ok_or_else(|| ServerError::Unauthorized("Invalid JWT format".to_string()))?;
+    let payload_bytes = URL_SAFE_NO_PAD
+        .decode(payload_b64)
+        .map_err(|_| ServerError::Unauthorized("Invalid JWT payload encoding".to_string()))?;
+    serde_json::from_slice(&payload_bytes)
+        .map_err(|_| ServerError::Unauthorized("Invalid JWT claims".to_string()))
+}
+
+fn url_encode_component(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for byte in input.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char);
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
