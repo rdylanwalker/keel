@@ -1482,7 +1482,7 @@ pub async fn execute_bootstrap_init_with_target(
     let mut push_url_override: Option<String> = None;
     let mut push_creds: Option<GitCredentials> = None;
 
-    if cfg.with_forge && !args.skip_core_install && args.repo_dir.is_some() {
+    if cfg.with_forge && !args.skip_core_install {
         tracing::info!("Provisioning `keel/infra-gitops` repository and API token in Forgejo");
         let pf = start_forgejo_port_forward(
             connection.context.as_deref(),
