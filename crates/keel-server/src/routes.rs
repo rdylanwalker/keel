@@ -1768,6 +1768,21 @@ pub struct CreateProposalResponse {
     pub report: PreviewReport,
 }
 
+async fn read_pulumi_project_name(pulumi_yaml_path: &std::path::Path, fallback: &str) -> String {
+    let Ok(raw) = tokio::fs::read_to_string(pulumi_yaml_path).await else {
+        return fallback.to_string();
+    };
+    let Ok(doc) = serde_yml::from_str::<serde_json::Value>(&raw) else {
+        return fallback.to_string();
+    };
+    doc.get("name")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(fallback)
+        .to_string()
+}
+
 /// `POST /api/v1/proposals`
 ///
 /// Validates payload against `catalog.yaml` JSONSchema, splits secrets (`writeOnly`/`format: password`),
@@ -1911,10 +1926,20 @@ pub async fn create_proposal(
         }
         CatalogManifest::InfraBlueprint(bp) => {
             let rel_dir = format!("tenants/{}/infra/{instance_name}", req.tenant);
+            let blueprint_pulumi_path = state
+                .repo_workdir
+                .join("catalog/infra")
+                .join(&req.catalog_id)
+                .join("Pulumi.yaml");
+            let pulumi_project =
+                read_pulumi_project_name(&blueprint_pulumi_path, &bp.metadata.name).await;
             let mut stack_params = TenantStackParams::new(
                 &req.tenant,
                 &instance_name,
-                format!("organization/{instance_name}/{}", req.tenant),
+                format!(
+                    "organization/{pulumi_project}/{}-{instance_name}",
+                    req.tenant
+                ),
                 &state.backend_url,
                 "keel-gitops",
                 &rel_dir,
@@ -2495,10 +2520,20 @@ async fn create_bundle_proposal(
                 )
             }
             CatalogManifest::InfraBlueprint(bp) => {
+                let blueprint_pulumi_path = state
+                    .repo_workdir
+                    .join("catalog/infra")
+                    .join(&item.catalog_ref)
+                    .join("Pulumi.yaml");
+                let pulumi_project =
+                    read_pulumi_project_name(&blueprint_pulumi_path, &bp.metadata.name).await;
                 let mut stack_params = TenantStackParams::new(
                     &req.tenant,
                     &item_resource_name,
-                    format!("organization/{item_resource_name}/{}", req.tenant),
+                    format!(
+                        "organization/{pulumi_project}/{}-{item_resource_name}",
+                        req.tenant
+                    ),
                     &state.backend_url,
                     "keel-gitops",
                     &item_rel_dir,

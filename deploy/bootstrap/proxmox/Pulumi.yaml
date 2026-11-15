@@ -7,7 +7,6 @@ description: Stage 0 seed management cluster bootstrap on Proxmox VE (bpg/proxmo
 packages:
   proxmox:
     source: terraform-provider
-    version: 0.16.0
     parameters:
       - bpg/proxmox
       - 0.71.0

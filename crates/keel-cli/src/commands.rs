@@ -1156,27 +1156,29 @@ async fn install_stage0_core_addons(
     .await?;
 
     tracing::info!("Installing Kyverno admission controller into `kyverno`");
-    run_helm_install(
-        ctx,
-        kc,
-        &[
-            "upgrade",
-            "--install",
-            "kyverno",
-            "kyverno",
-            "--repo",
-            "https://kyverno.github.io/kyverno/",
-            "--namespace",
-            "kyverno",
-            "--create-namespace",
+    let mut kyverno_helm_args = vec![
+        "upgrade",
+        "--install",
+        "kyverno",
+        "kyverno",
+        "--repo",
+        "https://kyverno.github.io/kyverno/",
+        "--namespace",
+        "kyverno",
+        "--create-namespace",
+        "--set",
+        "admissionController.replicas=1",
+    ];
+    if artifacts.kyverno_bundle.policy_exception.is_some() {
+        kyverno_helm_args.extend_from_slice(&[
             "--set",
-            "admissionController.replicas=1",
-            "--wait",
-            "--timeout",
-            "5m",
-        ],
-    )
-    .await?;
+            "features.policyExceptions.enabled=true",
+            "--set",
+            "features.policyExceptions.namespace=keel-system",
+        ]);
+    }
+    kyverno_helm_args.extend_from_slice(&["--wait", "--timeout", "5m"]);
+    run_helm_install(ctx, kc, &kyverno_helm_args).await?;
 
     tracing::info!("Installing Pulumi Kubernetes Operator (PKO v2) into `keel-system`");
     run_helm_install(
@@ -1265,6 +1267,8 @@ async fn install_stage0_core_addons(
              \x20       - name: socat\n\
              \x20         image: alpine/socat:latest\n\
              \x20         args:\n\
+             \x20           - -t\n\
+             \x20           - \"600\"\n\
              \x20           - TCP-LISTEN:2375,fork,reuseaddr\n\
              \x20           - UNIX-CONNECT:/var/run/docker.sock\n\
              \x20         ports:\n\
@@ -1291,7 +1295,31 @@ async fn install_stage0_core_addons(
              \x20   app: keel-docker-proxy\n\
              \x20 ports:\n\
              \x20   - port: 2375\n\
-             \x20     targetPort: 2375\n"
+             \x20     targetPort: 2375\n\
+             ---\n\
+             apiVersion: networking.k8s.io/v1\n\
+             kind: NetworkPolicy\n\
+             metadata:\n\
+             \x20 name: allow-keel-docker-proxy\n\
+             \x20 namespace: {FLUX_SYSTEM_NAMESPACE}\n\
+             \x20 labels:\n\
+             \x20   app.kubernetes.io/managed-by: keel\n\
+             \x20   keel.io/local-dev-only: \"true\"\n\
+             spec:\n\
+             \x20 podSelector:\n\
+             \x20   matchLabels:\n\
+             \x20     app: keel-docker-proxy\n\
+             \x20 policyTypes:\n\
+             \x20   - Ingress\n\
+             \x20 ingress:\n\
+             \x20   - from:\n\
+             \x20       - namespaceSelector: {{}}\n\
+             \x20         podSelector:\n\
+             \x20           matchLabels:\n\
+             \x20             auto.pulumi.com/component: workspace\n\
+             \x20     ports:\n\
+             \x20       - port: 2375\n\
+             \x20         protocol: TCP\n"
         );
         run_kubectl_apply(ctx, kc, &docker_proxy_yaml).await?;
     }

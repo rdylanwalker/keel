@@ -491,7 +491,9 @@ pub fn synthesize_helm_release(input: &HelmReleaseSpecInput) -> Result<Value, Ku
         "interval".to_string(),
         Value::String(input.interval.clone()),
     );
-    spec.insert("serviceAccountName".to_string(), Value::String(sa_name));
+    if input.kube_config.is_none() {
+        spec.insert("serviceAccountName".to_string(), Value::String(sa_name));
+    }
     spec.insert("chart".to_string(), json!({ "spec": chart_spec }));
 
     if !input.depends_on.is_empty() {
@@ -514,6 +516,13 @@ pub fn synthesize_helm_release(input: &HelmReleaseSpecInput) -> Result<Value, Ku
             secret_ref.insert("key".to_string(), Value::String(key.clone()));
         }
         spec.insert("kubeConfig".to_string(), json!({ "secretRef": secret_ref }));
+        spec.insert("install".to_string(), json!({ "createNamespace": true }));
+        if input.target_namespace.is_none() {
+            spec.insert(
+                "targetNamespace".to_string(),
+                Value::String(namespace.clone()),
+            );
+        }
     }
 
     if let Some(target_ns) = &input.target_namespace {
@@ -861,7 +870,7 @@ mod tests {
         assert_eq!(manifest["apiVersion"], "helm.toolkit.fluxcd.io/v2");
         assert_eq!(manifest["kind"], "HelmRelease");
         assert_eq!(manifest["metadata"]["namespace"], "tenant-fintech");
-        assert_eq!(manifest["spec"]["serviceAccountName"], "tenant-fintech-sa");
+        assert!(manifest["spec"].get("serviceAccountName").is_none());
         assert_eq!(
             manifest["spec"]["chart"]["spec"]["sourceRef"]["namespace"],
             "tenant-fintech"
@@ -923,9 +932,14 @@ mod tests {
         );
         minimal.service_account_name = Some("custom-ops-reconciler".to_string());
         minimal.values_from_secrets = vec![HelmValuesSecretRef::new("grafana-companion-secret")];
+        let local_hr = synthesize_helm_release(&minimal).unwrap();
+        assert_eq!(
+            local_hr["spec"]["serviceAccountName"],
+            "custom-ops-reconciler"
+        );
         minimal.kube_config = Some(RemoteKubeConfigRef::new("remote-k3s"));
         let hr = synthesize_helm_release(&minimal).unwrap();
-        assert_eq!(hr["spec"]["serviceAccountName"], "custom-ops-reconciler");
+        assert!(hr["spec"].get("serviceAccountName").is_none());
         assert_eq!(
             hr["spec"]["valuesFrom"][0]["name"],
             "grafana-companion-secret"
