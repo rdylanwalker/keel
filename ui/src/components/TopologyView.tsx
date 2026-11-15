@@ -1368,14 +1368,36 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
                 aria-label="Filter events by CRD kind"
                 value={eventFilterKind}
                 onChange={(e) => setEventFilterKind(e.target.value)}
-                className="bg-transparent border-0 text-xs text-slate-300 focus:outline-none focus:ring-0 py-0.5 px-2"
+                style={{ colorScheme: "dark" }}
+                className="bg-slate-950 border-0 text-xs text-slate-200 rounded focus:outline-none focus:ring-0 py-0.5 px-2"
               >
-                <option value="all">All CRDs</option>
-                <option value="GitRepository">GitRepository</option>
-                <option value="Kustomization">Kustomization</option>
-                <option value="HelmRelease">HelmRelease</option>
-                <option value="Stack">Stack</option>
-                <option value="Canary">Canary</option>
+                <option value="all" className="bg-slate-950 text-slate-200">
+                  All CRDs
+                </option>
+                <option
+                  value="GitRepository"
+                  className="bg-slate-950 text-slate-200"
+                >
+                  GitRepository
+                </option>
+                <option
+                  value="Kustomization"
+                  className="bg-slate-950 text-slate-200"
+                >
+                  Kustomization
+                </option>
+                <option
+                  value="HelmRelease"
+                  className="bg-slate-950 text-slate-200"
+                >
+                  HelmRelease
+                </option>
+                <option value="Stack" className="bg-slate-950 text-slate-200">
+                  Stack
+                </option>
+                <option value="Canary" className="bg-slate-950 text-slate-200">
+                  Canary
+                </option>
               </select>
             </div>
 
