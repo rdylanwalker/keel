@@ -24,17 +24,17 @@ spec:
   resyncFrequencySeconds: 300
   envRefs:
     PULUMI_CONFIG_PASSPHRASE:
-      selectorType: Resource
+      type: Secret
       secret:
         name: keel-pulumi-backend
         key: passphrase
     AWS_ACCESS_KEY_ID:
-      selectorType: Resource
+      type: Secret
       secret:
         name: keel-pulumi-backend
         key: accessKeyId
     AWS_SECRET_ACCESS_KEY:
-      selectorType: Resource
+      type: Secret
       secret:
         name: keel-pulumi-backend
         key: secretAccessKey
