@@ -223,6 +223,34 @@ pub struct WorkspaceEnvVar {
     pub value: String,
 }
 
+/// Volume mount entry on a PKO workspace container.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceVolumeMount {
+    pub name: String,
+    pub mount_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_only: Option<bool>,
+}
+
+/// Secret volume source for mounting namespace-local Secrets into a PKO workspace pod.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceSecretVolumeSource {
+    pub secret_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub optional: Option<bool>,
+}
+
+/// Volume entry on a PKO workspace pod spec.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceVolume {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret: Option<WorkspaceSecretVolumeSource>,
+}
+
 /// Container entry inside `WorkspacePodSpec` enforcing `restricted` PSS on the `pulumi` container.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -230,6 +258,8 @@ pub struct WorkspaceContainer {
     pub name: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub env: Vec<WorkspaceEnvVar>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub volume_mounts: Vec<WorkspaceVolumeMount>,
     pub security_context: ContainerSecurityContext,
 }
 
@@ -240,6 +270,8 @@ pub struct WorkspacePodSpec {
     pub termination_grace_period_seconds: u64,
     pub security_context: PodSecurityContext,
     pub containers: Vec<WorkspaceContainer>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub volumes: Vec<WorkspaceVolume>,
 }
 
 /// Pod template wrapper inside `PkoWorkspaceTemplate`.
@@ -284,6 +316,7 @@ impl PkoWorkspaceTemplate {
                                 name: "PULUMI_CONFIG_PASSPHRASE".to_string(),
                                 value: String::new(),
                             }],
+                            volume_mounts: Vec::new(),
                             security_context: ContainerSecurityContext {
                                 allow_privilege_escalation: false,
                                 read_only_root_filesystem: false,
@@ -292,6 +325,7 @@ impl PkoWorkspaceTemplate {
                                 },
                             },
                         }],
+                        volumes: Vec::new(),
                     },
                 },
             },
@@ -311,6 +345,38 @@ impl PkoWorkspaceTemplate {
             container.env.push(WorkspaceEnvVar {
                 name: name.into(),
                 value: value.into(),
+            });
+        }
+        self
+    }
+
+    /// Mounts a namespace-local Kubernetes `Secret` read-only into the `pulumi` workspace container.
+    pub fn with_secret_volume(
+        mut self,
+        volume_name: impl Into<String>,
+        secret_name: impl Into<String>,
+        mount_path: impl Into<String>,
+    ) -> Self {
+        let volume_name = volume_name.into();
+        self.spec.pod_template.spec.volumes.push(WorkspaceVolume {
+            name: volume_name.clone(),
+            secret: Some(WorkspaceSecretVolumeSource {
+                secret_name: secret_name.into(),
+                optional: Some(true),
+            }),
+        });
+        if let Some(container) = self
+            .spec
+            .pod_template
+            .spec
+            .containers
+            .iter_mut()
+            .find(|c| c.name == "pulumi")
+        {
+            container.volume_mounts.push(WorkspaceVolumeMount {
+                name: volume_name,
+                mount_path: mount_path.into(),
+                read_only: Some(true),
             });
         }
         self
@@ -833,7 +899,7 @@ pub fn synthesize_tenant_stack(params: &TenantStackParams) -> Result<PkoStack, P
         kind: PKO_STACK_KIND.to_string(),
         metadata: CrObjectMeta {
             name: params.name.clone(),
-            namespace: tenant_namespace,
+            namespace: tenant_namespace.clone(),
             labels,
             annotations: BTreeMap::new(),
         },
@@ -852,11 +918,27 @@ pub fn synthesize_tenant_stack(params: &TenantStackParams) -> Result<PkoStack, P
             output_secret_name,
             config: params.config.clone(),
             env_refs: params.env_refs.clone(),
-            workspace_template: Some(match &params.docker_host {
-                Some(host) => {
-                    PkoWorkspaceTemplate::restricted_default().with_env_var("DOCKER_HOST", host)
+            workspace_template: Some({
+                let mut tpl = match &params.docker_host {
+                    Some(host) => {
+                        PkoWorkspaceTemplate::restricted_default().with_env_var("DOCKER_HOST", host)
+                    }
+                    None => PkoWorkspaceTemplate::restricted_default(),
+                };
+                if let Some(secret_name) = params.config.get("kubeconfigSecretName") {
+                    let ns_matches = params
+                        .config
+                        .get("kubeconfigSecretNamespace")
+                        .is_none_or(|ns| ns == &tenant_namespace);
+                    if !secret_name.trim().is_empty() && ns_matches {
+                        tpl = tpl.with_secret_volume(
+                            "target-kubeconfig",
+                            secret_name,
+                            "/etc/keel/kubeconfig",
+                        );
+                    }
                 }
-                None => PkoWorkspaceTemplate::restricted_default(),
+                tpl
             }),
         },
     })
@@ -1167,6 +1249,35 @@ mod tests {
             e["name"] == "DOCKER_HOST"
                 && e["value"] == "tcp://keel-docker-proxy.flux-system.svc.cluster.local:2375"
         }));
+
+        // Verify kubeconfigSecretName in same tenant namespace mounts secret volume
+        params.config.insert(
+            "kubeconfigSecretName".to_string(),
+            "workload-dev-kubeconfig".to_string(),
+        );
+        params.config.insert(
+            "kubeconfigSecretNamespace".to_string(),
+            "tenant-analytics".to_string(),
+        );
+        let stack_kc =
+            synthesize_tenant_stack(&params).expect("valid tenant stack with kubeconfig");
+        let kc_json = stack_kc.to_json_value().expect("json value");
+        let volumes =
+            kc_json["spec"]["workspaceTemplate"]["spec"]["podTemplate"]["spec"]["volumes"]
+                .as_array()
+                .unwrap();
+        assert_eq!(volumes[0]["name"], "target-kubeconfig");
+        assert_eq!(
+            volumes[0]["secret"]["secretName"],
+            "workload-dev-kubeconfig"
+        );
+        let mounts = kc_json["spec"]["workspaceTemplate"]["spec"]["podTemplate"]["spec"]
+            ["containers"][0]["volumeMounts"]
+            .as_array()
+            .unwrap();
+        assert_eq!(mounts[0]["name"], "target-kubeconfig");
+        assert_eq!(mounts[0]["mountPath"], "/etc/keel/kubeconfig");
+        assert_eq!(mounts[0]["readOnly"], true);
     }
 
     #[test]

@@ -420,6 +420,51 @@ async fn test_catalog_listing_filters_by_provider_registry() {
     assert_eq!(blueprints.len(), 1);
     assert_eq!(blueprints[0]["metadata"]["id"], "proxmox-vm");
     assert_eq!(body["enabledProviders"], json!(["proxmox"]));
+
+    // Built-in `kubernetes` blueprints are returned even when omitted from registry.yaml
+    let k8s_dir = fixture
+        .state
+        .repo_workdir
+        .join("catalog/infra/canary-gateway-config");
+    tokio::fs::create_dir_all(&k8s_dir).await.unwrap();
+    tokio::fs::write(
+        k8s_dir.join("catalog.yaml"),
+        r#"apiVersion: keel.io/v1alpha1
+kind: CatalogInfraBlueprint
+metadata:
+  id: canary-gateway-config
+  name: Canary Gateway & MetricTemplates
+  category: progressive-delivery
+  provider: kubernetes
+spec:
+  pulumiRuntime: yaml
+  entrypoint: Pulumi.yaml
+  schema:
+    type: object
+    properties: {}
+"#,
+    )
+    .await
+    .unwrap();
+    let res2 = build_router(fixture.state.clone())
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/catalog")
+                .header(COOKIE, &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res2.status(), StatusCode::OK);
+    let body2: Value =
+        serde_json::from_slice(&res2.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let blueprints2 = body2["blueprints"].as_array().unwrap();
+    assert!(
+        blueprints2
+            .iter()
+            .any(|bp| bp["metadata"]["id"] == "canary-gateway-config")
+    );
 }
 
 #[tokio::test]

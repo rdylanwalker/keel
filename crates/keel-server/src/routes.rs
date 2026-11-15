@@ -134,7 +134,9 @@ pub async fn get_catalog(
         let yaml = tokio::fs::read_to_string(&path).await?;
         match parse_catalog_blueprint(&yaml) {
             Ok(bp) => {
-                if registry.is_enabled(&bp.metadata.provider) {
+                let is_kubernetes_builtin = bp.metadata.provider == "kubernetes"
+                    && !registry.providers.iter().any(|p| p.id == "kubernetes");
+                if registry.is_enabled(&bp.metadata.provider) || is_kubernetes_builtin {
                     if let Some(dir) = path.parent() {
                         let entrypoint = if bp.spec.entrypoint.trim().is_empty() {
                             "Pulumi.yaml"
@@ -2058,7 +2060,13 @@ pub async fn create_proposal(
         resolve_tenant_resource_dir(&state.repo_workdir, &req.tenant, subdir, &instance_name).await;
     let bundle_item = resolved_dir.as_ref().and_then(|r| r.bundle_item.clone());
 
-    let (rel_dir, manifest_yaml, preview_resource_type) = match &manifest {
+    let (
+        rel_dir,
+        manifest_yaml,
+        preview_resource_type,
+        remote_app_kube_config,
+        remote_app_target_ns,
+    ) = match &manifest {
         CatalogManifest::Application(app) => {
             let rel_dir = resolved_dir
                 .map(|r| r.rel_dir)
@@ -2176,7 +2184,9 @@ pub async fn create_proposal(
             (
                 rel_dir,
                 hr_yaml,
-                "flux:helm.toolkit.fluxcd.io/v2:HelmRelease",
+                "helm:helm.toolkit.fluxcd.io/v2:HelmRelease",
+                hr_input.kube_config,
+                hr_input.target_namespace,
             )
         }
         CatalogManifest::InfraBlueprint(bp) => {
@@ -2257,7 +2267,13 @@ pub async fn create_proposal(
             }
             let stack = synthesize_tenant_stack(&stack_params)?;
             let stack_yaml = stack.to_yaml()?;
-            (rel_dir, stack_yaml, "pulumi:pulumi.com/v1:Stack")
+            (
+                rel_dir,
+                stack_yaml,
+                "pulumi:pulumi.com/v1:Stack",
+                None,
+                None,
+            )
         }
         CatalogManifest::Bundle(_) => unreachable!("handled above"),
     };
@@ -2399,26 +2415,68 @@ pub async fn create_proposal(
                         .insert("keel.io/bundle-item".to_string(), item_id.clone());
                 }
                 let canary_yaml = synthesize_flagger_canary_yaml(&canary_input)?;
-                let canary_path = target_dir.join("canary.yaml");
-                tokio::fs::write(&canary_path, canary_yaml).await?;
-                staged_paths.push(format!("{rel_dir}/canary.yaml"));
-                bundle_item_kustomize_resources.push("canary.yaml".to_string());
-                extra_kustomize_resources
-                    .push(format!("{}/apps/{instance_name}/canary.yaml", req.tenant));
-
                 let np_yaml = synthesize_canary_gateway_network_policy_yaml(
                     &req.tenant,
                     &instance_name,
                     canary_input.service_port,
                 )?;
-                let np_path = target_dir.join("networkpolicy-canary.yaml");
-                tokio::fs::write(&np_path, np_yaml).await?;
-                staged_paths.push(format!("{rel_dir}/networkpolicy-canary.yaml"));
-                bundle_item_kustomize_resources.push("networkpolicy-canary.yaml".to_string());
-                extra_kustomize_resources.push(format!(
-                    "{}/apps/{instance_name}/networkpolicy-canary.yaml",
-                    req.tenant
-                ));
+                if let Some(ref remote_kc) = remote_app_kube_config {
+                    let canary_dir = target_dir.join("canary");
+                    tokio::fs::create_dir_all(&canary_dir).await?;
+                    tokio::fs::write(canary_dir.join("canary.yaml"), canary_yaml).await?;
+                    tokio::fs::write(canary_dir.join("networkpolicy-canary.yaml"), np_yaml).await?;
+                    let canary_k_doc = serde_json::json!({
+                        "apiVersion": "kustomize.config.k8s.io/v1beta1",
+                        "kind": "Kustomization",
+                        "resources": ["canary.yaml", "networkpolicy-canary.yaml"],
+                    });
+                    let canary_k_yaml = serde_yml::to_string(&canary_k_doc).map_err(|e| {
+                        ServerError::Internal(format!(
+                            "failed to serialize canary/kustomization.yaml: {e}"
+                        ))
+                    })?;
+                    tokio::fs::write(canary_dir.join("kustomization.yaml"), canary_k_yaml).await?;
+                    staged_paths.push(format!("{rel_dir}/canary/canary.yaml"));
+                    staged_paths.push(format!("{rel_dir}/canary/networkpolicy-canary.yaml"));
+                    staged_paths.push(format!("{rel_dir}/canary/kustomization.yaml"));
+
+                    let mut fk_input = FluxKustomizationSpecInput::new(
+                        &req.tenant,
+                        format!("{instance_name}-canary"),
+                        "keel-gitops",
+                        format!("./{rel_dir}/canary"),
+                    );
+                    fk_input.kube_config = Some(remote_kc.clone());
+                    fk_input.target_namespace = Some(
+                        remote_app_target_ns
+                            .clone()
+                            .unwrap_or_else(|| tenant_ns.clone()),
+                    );
+                    let fk_yaml = synthesize_flux_kustomization_yaml(&fk_input)?;
+                    tokio::fs::write(target_dir.join("canary-kustomization.yaml"), fk_yaml).await?;
+                    staged_paths.push(format!("{rel_dir}/canary-kustomization.yaml"));
+                    bundle_item_kustomize_resources.push("canary-kustomization.yaml".to_string());
+                    extra_kustomize_resources.push(format!(
+                        "{}/apps/{instance_name}/canary-kustomization.yaml",
+                        req.tenant
+                    ));
+                } else {
+                    let canary_path = target_dir.join("canary.yaml");
+                    tokio::fs::write(&canary_path, canary_yaml).await?;
+                    staged_paths.push(format!("{rel_dir}/canary.yaml"));
+                    bundle_item_kustomize_resources.push("canary.yaml".to_string());
+                    extra_kustomize_resources
+                        .push(format!("{}/apps/{instance_name}/canary.yaml", req.tenant));
+
+                    let np_path = target_dir.join("networkpolicy-canary.yaml");
+                    tokio::fs::write(&np_path, np_yaml).await?;
+                    staged_paths.push(format!("{rel_dir}/networkpolicy-canary.yaml"));
+                    bundle_item_kustomize_resources.push("networkpolicy-canary.yaml".to_string());
+                    extra_kustomize_resources.push(format!(
+                        "{}/apps/{instance_name}/networkpolicy-canary.yaml",
+                        req.tenant
+                    ));
+                }
             }
         }
 
