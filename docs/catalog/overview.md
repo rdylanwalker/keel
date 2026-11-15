@@ -123,6 +123,6 @@ spec:
 You can register or update blueprints, applications, and bundles in two ways:
 
 1. **Web UI (+ Add Catalog Item / Edit):**
-   - In **Catalog & Form Wizard**, click **+ Add Catalog Item**, choose **Application (Helm / Kustomize)**, **Infrastructure Blueprint (PKO v2)**, or **Multi-Item Bundle (Infra + Apps)**, fill in the fields, and merge the generated PR.
-   - Select any existing catalog item and click **Edit** in the item header to update its metadata, upstream/provider settings, bundle steps, or optional JSON Schema via a Git PR (`PUT /api/v1/catalog/{kind}/{id}`). For infrastructure blueprints, existing `Pulumi.yaml` files are preserved.
+   - In **Catalog & Form Wizard**, click **+ Add Catalog Item**, choose **Application (Helm / Kustomize)**, **Infrastructure Blueprint (PKO v2)**, or **Multi-Item Bundle (Infra + Apps)**, fill in the fields (optionally authoring `Pulumi.yaml` directly in the **Pulumi.yaml Program** editor or inserting a starter template for infrastructure blueprints), and merge the generated PR.
+   - Select any existing catalog item and click **Edit** in the item header to update its metadata, upstream/provider settings, bundle steps, optional JSON Schema, or—for infrastructure blueprints—its `Pulumi.yaml` program via a Git PR (`PUT /api/v1/catalog/{kind}/{id}`). Leave **Pulumi.yaml Program** blank when editing to preserve the existing `Pulumi.yaml`.
 2. **Direct Git PR:** Commit `catalog/infra/<id>/catalog.yaml` (+ `Pulumi.yaml`), `catalog/apps/<id>/catalog.yaml`, or `catalog/bundles/<id>/catalog.yaml` (see [Provider Blueprint Examples](provider-examples.md)) on a feature branch and open a PR.
