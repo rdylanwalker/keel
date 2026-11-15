@@ -125,6 +125,7 @@ interface RawCatalogResponse {
   applications?: RawCatalogEntry[]
   blueprints?: RawCatalogEntry[]
   bundles?: RawCatalogEntry[]
+  pulumiYaml?: Record<string, string>
 }
 
 export async function getCatalog(): Promise<CatalogItem[]> {
@@ -169,6 +170,7 @@ export async function getCatalog(): Promise<CatalogItem[]> {
     pulumiRuntime: bp.spec?.pulumiRuntime ?? "yaml",
     entrypoint: bp.spec?.entrypoint ?? "Pulumi.yaml",
     protectByDefault: bp.spec?.protectByDefault ?? false,
+    pulumiYaml: raw.pulumiYaml?.[bp.metadata?.id ?? ""],
     schema: bp.spec?.schema ?? { type: "object", properties: {} },
     uiSchema: bp.spec?.uiSchema,
   }))

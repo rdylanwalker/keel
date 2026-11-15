@@ -24,9 +24,9 @@ pub use kyverno::{
     build_protect_control_plane_policy, build_restrict_pulumi_providers_policy,
 };
 pub use live::{
-    ClusterEventSummary, KubeClusterStatusReader, LiveResourceStatus, LiveStatusSource,
-    ResourceCondition, ResourceMetadata, StackDiagnostics, extract_conditions,
-    extract_ready_status,
+    ClusterEventSummary, KubeClusterStatusReader, LiveResourceInfo, LiveResourceStatus,
+    LiveStatusSource, ResourceCondition, ResourceMetadata, StackDiagnostics, extract_conditions,
+    extract_last_synced, extract_ready_status, extract_resource_count,
 };
 pub use secret_store::{
     BOOTSTRAP_TOKEN_SECRET_NAME, InMemorySecretStore, K8sSecretStore, SESSION_KEY_LEN,

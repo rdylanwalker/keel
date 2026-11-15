@@ -1,5 +1,6 @@
 //! REST and Server-Sent Events (SSE) API handlers (`SDD.md` §7.3).
 
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::path::{Path, PathBuf};
 
@@ -88,6 +89,8 @@ pub struct CatalogResponse {
     #[serde(default)]
     pub bundles: Vec<CatalogBundle>,
     pub enabled_providers: Vec<String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub pulumi_yaml: HashMap<String, String>,
 }
 
 /// `GET /api/v1/catalog`
@@ -125,11 +128,23 @@ pub async fn get_catalog(
     applications.sort_by(|a, b| a.metadata.id.cmp(&b.metadata.id));
 
     let mut blueprints = Vec::new();
+    let mut pulumi_yaml = HashMap::new();
     for path in find_catalog_files(&state.repo_workdir.join("catalog/infra")).await {
         let yaml = tokio::fs::read_to_string(&path).await?;
         match parse_catalog_blueprint(&yaml) {
             Ok(bp) => {
                 if registry.is_enabled(&bp.metadata.provider) {
+                    if let Some(dir) = path.parent() {
+                        let entrypoint = if bp.spec.entrypoint.trim().is_empty() {
+                            "Pulumi.yaml"
+                        } else {
+                            bp.spec.entrypoint.as_str()
+                        };
+                        let pulumi_path = dir.join(entrypoint);
+                        if let Ok(content) = tokio::fs::read_to_string(&pulumi_path).await {
+                            pulumi_yaml.insert(bp.metadata.id.clone(), content);
+                        }
+                    }
                     blueprints.push(bp);
                 }
             }
@@ -157,6 +172,7 @@ pub async fn get_catalog(
         blueprints,
         bundles,
         enabled_providers,
+        pulumi_yaml,
     }))
 }
 
@@ -383,6 +399,8 @@ pub struct RegisterCatalogAppRequest {
     pub protect_by_default: bool,
     #[serde(default)]
     pub terraform_provider: Option<String>,
+    #[serde(default)]
+    pub pulumi_yaml: Option<String>,
     #[serde(default)]
     pub description: Option<String>,
     #[serde(default)]
@@ -627,37 +645,50 @@ pub async fn register_catalog_app(
             let catalog_yaml = serde_yml::to_string(&blueprint)
                 .map_err(|e| ServerError::Internal(e.to_string()))?;
 
-            let mut pulumi_doc = serde_json::Map::new();
-            pulumi_doc.insert("name".to_string(), json!(req.id));
-            pulumi_doc.insert("runtime".to_string(), json!(pulumi_runtime));
-            pulumi_doc.insert(
-                "description".to_string(),
-                json!(format!("{} ({})", blueprint.metadata.name, provider)),
-            );
-            if let Some(tf_provider) = req.terraform_provider.filter(|s| !s.trim().is_empty()) {
+            let pulumi_yaml = if let Some(custom_yaml) =
+                req.pulumi_yaml.filter(|s| !s.trim().is_empty())
+            {
+                serde_yml::from_str::<Value>(&custom_yaml).map_err(|e| {
+                    ServerError::BadRequest(format!("Invalid Pulumi.yaml YAML syntax: {e}"))
+                })?;
+                if custom_yaml.ends_with('\n') {
+                    custom_yaml
+                } else {
+                    format!("{custom_yaml}\n")
+                }
+            } else {
+                let mut pulumi_doc = serde_json::Map::new();
+                pulumi_doc.insert("name".to_string(), json!(req.id));
+                pulumi_doc.insert("runtime".to_string(), json!(pulumi_runtime));
                 pulumi_doc.insert(
-                    "packages".to_string(),
+                    "description".to_string(),
+                    json!(format!("{} ({})", blueprint.metadata.name, provider)),
+                );
+                if let Some(tf_provider) = req.terraform_provider.filter(|s| !s.trim().is_empty()) {
+                    pulumi_doc.insert(
+                        "packages".to_string(),
+                        json!({
+                            provider.clone(): {
+                                "source": "terraform-provider",
+                                "parameters": [tf_provider]
+                            }
+                        }),
+                    );
+                }
+                pulumi_doc.insert(
+                    "config".to_string(),
                     json!({
-                        provider.clone(): {
-                            "source": "terraform-provider",
-                            "parameters": [tf_provider]
+                        "name": {
+                            "type": "string",
+                            "default": "workload-1"
                         }
                     }),
                 );
-            }
-            pulumi_doc.insert(
-                "config".to_string(),
-                json!({
-                    "name": {
-                        "type": "string",
-                        "default": "workload-1"
-                    }
-                }),
-            );
-            pulumi_doc.insert("resources".to_string(), json!({}));
-            pulumi_doc.insert("outputs".to_string(), json!({}));
-            let pulumi_yaml = serde_yml::to_string(&Value::Object(pulumi_doc))
-                .map_err(|e| ServerError::Internal(e.to_string()))?;
+                pulumi_doc.insert("resources".to_string(), json!({}));
+                pulumi_doc.insert("outputs".to_string(), json!({}));
+                serde_yml::to_string(&Value::Object(pulumi_doc))
+                    .map_err(|e| ServerError::Internal(e.to_string()))?
+            };
 
             let rel_dir = format!("catalog/infra/{}", req.id);
             let rel_catalog = format!("{rel_dir}/catalog.yaml");
@@ -941,6 +972,8 @@ pub struct UpdateCatalogItemRequest {
     #[serde(default)]
     pub protect_by_default: Option<bool>,
     #[serde(default)]
+    pub pulumi_yaml: Option<String>,
+    #[serde(default)]
     pub items: Option<Vec<CatalogBundleItem>>,
     #[serde(default)]
     pub schema: Option<Value>,
@@ -1109,14 +1142,36 @@ pub async fn update_catalog_item(
             _ => unreachable!(),
         };
 
+        let validated_pulumi_yaml = if normalized_kind == "infra"
+            && let Some(raw_pulumi) = req.pulumi_yaml.filter(|s| !s.trim().is_empty())
+        {
+            serde_yml::from_str::<Value>(&raw_pulumi).map_err(|e| {
+                ServerError::BadRequest(format!("Invalid Pulumi.yaml YAML syntax: {e}"))
+            })?;
+            Some(if raw_pulumi.ends_with('\n') {
+                raw_pulumi
+            } else {
+                format!("{raw_pulumi}\n")
+            })
+        } else {
+            None
+        };
+
         state
             .git_runner
             .checkout_new_branch(&state.repo_workdir, &branch)
             .await?;
         tokio::fs::write(&abs_file, &catalog_yaml).await?;
+        let mut staged = vec![rel_file.clone()];
+        if let Some(ref pulumi_content) = validated_pulumi_yaml {
+            let rel_pulumi = format!("catalog/infra/{id}/Pulumi.yaml");
+            let abs_pulumi = state.repo_workdir.join(&rel_pulumi);
+            tokio::fs::write(&abs_pulumi, pulumi_content).await?;
+            staged.push(rel_pulumi);
+        }
         state
             .git_runner
-            .add(&state.repo_workdir, [&rel_file])
+            .add(&state.repo_workdir, staged.iter().map(String::as_str))
             .await?;
 
         let author = CommitAuthor::new(

@@ -409,4 +409,63 @@ describe("TopologyView component", () => {
       screen.getByRole("button", { name: /Resume Stream/i })
     ).toBeInTheDocument()
   })
+
+  it("renders Last Synced for releases and deduplicates identical SSE events", async () => {
+    vi.mocked(api.getStacksWithMeta).mockResolvedValue({
+      stacks: [
+        {
+          id: "s-1",
+          name: "workload-cluster",
+          tenant: "acme",
+          provider: "aws",
+          type: "cloud",
+          status: "synced",
+          resourceCount: 14,
+          lastSynced: new Date(Date.now() - 120_000).toISOString(),
+        },
+      ],
+    })
+    vi.mocked(api.getReleases).mockResolvedValue([
+      {
+        id: "rel-1",
+        name: "podinfo",
+        tenant: "acme",
+        namespace: "tenant-acme",
+        type: "helm",
+        status: "healthy",
+        version: "6.7.1",
+        lastSynced: new Date(Date.now() - 180_000).toISOString(),
+      },
+    ])
+
+    let onEventCb:
+      ((evt: import("../types/api").CrdWatchEvent) => void) | null = null
+    vi.mocked(api.createEventSourceStream).mockImplementation((onEvent) => {
+      onEventCb = onEvent
+      return { close: vi.fn() } as unknown as EventSource
+    })
+
+    render(<TopologyView />)
+
+    expect(await screen.findByText("14")).toBeInTheDocument()
+    expect(screen.getByText("cloud")).toBeInTheDocument()
+    expect(screen.getByText("2m ago")).toBeInTheDocument()
+    expect(screen.getByText("3m ago")).toBeInTheDocument()
+
+    await waitFor(() => expect(onEventCb).not.toBeNull())
+    const dupEvent = {
+      kind: "HelmRelease" as const,
+      namespace: "tenant-acme",
+      name: "podinfo",
+      status: "Ready",
+      message: "Reconciliation succeeded",
+      revision: "6.7.1",
+      timestamp: "2026-11-15T10:00:00Z",
+    }
+    onEventCb!(dupEvent)
+    onEventCb!(dupEvent)
+
+    const matches = await screen.findAllByText("Reconciliation succeeded")
+    expect(matches).toHaveLength(1)
+  })
 })

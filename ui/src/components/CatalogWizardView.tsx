@@ -412,6 +412,7 @@ export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
     entrypoint: "Pulumi.yaml",
     protectByDefault: false,
     terraformProvider: "",
+    pulumiYaml: "",
   })
 
   useEffect(() => {
@@ -720,6 +721,7 @@ export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
       entrypoint: "Pulumi.yaml",
       protectByDefault: false,
       terraformProvider: "",
+      pulumiYaml: "",
       items: [],
     })
     setIsAddAppModalOpen(true)
@@ -761,6 +763,7 @@ export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
       entrypoint: item.entrypoint || "Pulumi.yaml",
       protectByDefault: !!item.protectByDefault,
       terraformProvider: "",
+      pulumiYaml: item.pulumiYaml || "",
       items: item.bundleItems
         ? item.bundleItems.map((b) => ({
             ...b,
@@ -842,6 +845,9 @@ export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
               entrypoint: appForm.entrypoint?.trim() || "Pulumi.yaml",
               terraformProvider: appForm.terraformProvider?.trim() || undefined,
               protectByDefault: !!appForm.protectByDefault,
+              ...(appForm.pulumiYaml?.trim()
+                ? { pulumiYaml: appForm.pulumiYaml }
+                : {}),
               ...(parsedSchema ? { schema: parsedSchema } : {}),
             }
           : {
@@ -889,6 +895,7 @@ export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
               pulumiRuntime: payload.pulumiRuntime,
               entrypoint: payload.entrypoint,
               protectByDefault: payload.protectByDefault,
+              ...(payload.pulumiYaml ? { pulumiYaml: payload.pulumiYaml } : {}),
               items: payload.items,
               schema: payload.schema,
             }
@@ -916,6 +923,7 @@ export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
         entrypoint: "Pulumi.yaml",
         protectByDefault: false,
         terraformProvider: "",
+        pulumiYaml: "",
         items: [],
       })
     } catch (err) {
@@ -2104,6 +2112,56 @@ export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
                         }))
                       }
                       className="w-full px-3 py-2 bg-slate-950 border border-slate-800 rounded-lg text-xs text-slate-100 placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                    />
+                  </div>
+
+                  <div>
+                    <div className="flex items-center justify-between mb-1">
+                      <label
+                        htmlFor="infra-pulumi-yaml"
+                        className="block text-xs text-slate-300 font-medium"
+                      >
+                        Pulumi.yaml Program
+                      </label>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const bpId = appForm.id.trim() || "my-blueprint"
+                          const bpName = appForm.name.trim() || bpId
+                          const runtime = appForm.pulumiRuntime || "yaml"
+                          const provider = appForm.provider || "kind"
+                          const tf = appForm.terraformProvider?.trim()
+                          const pkgBlock = tf
+                            ? `packages:\n  ${provider}:\n    source: terraform-provider\n    parameters:\n      - ${tf}\n`
+                            : ""
+                          const starter = `name: ${bpId}\nruntime: ${runtime}\ndescription: ${bpName} (${provider})\n${pkgBlock}config:\n  name:\n    type: string\n    default: workload-1\nresources: {}\noutputs: {}\n`
+                          setAppForm((prev) => ({
+                            ...prev,
+                            pulumiYaml: starter,
+                          }))
+                        }}
+                        className="text-[11px] text-indigo-400 hover:text-indigo-300 transition-colors cursor-pointer"
+                      >
+                        Insert Starter Template
+                      </button>
+                    </div>
+                    <textarea
+                      id="infra-pulumi-yaml"
+                      rows={10}
+                      spellCheck={false}
+                      placeholder={
+                        editingCatalogItem
+                          ? "Leave blank to preserve existing Pulumi.yaml, or paste/edit YAML..."
+                          : "Optional — leave blank to auto-generate a starter Pulumi.yaml"
+                      }
+                      value={appForm.pulumiYaml || ""}
+                      onChange={(e) =>
+                        setAppForm((prev) => ({
+                          ...prev,
+                          pulumiYaml: e.target.value,
+                        }))
+                      }
+                      className="w-full px-3 py-2 bg-slate-950 border border-slate-800 rounded-lg text-xs text-slate-100 placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-indigo-500 font-mono leading-relaxed"
                     />
                   </div>
                 </>

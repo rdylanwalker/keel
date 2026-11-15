@@ -29,6 +29,7 @@ export interface CreateCatalogItemPayload {
   entrypoint?: string
   protectByDefault?: boolean
   terraformProvider?: string
+  pulumiYaml?: string
   items?: CatalogBundleItem[]
   schema?: RJSFSchema
 }
@@ -60,6 +61,7 @@ export interface CatalogItem {
   pulumiRuntime?: "yaml" | "hcl" | "opentofu-bridge"
   entrypoint?: string
   protectByDefault?: boolean
+  pulumiYaml?: string
   bundleItems?: CatalogBundleItem[]
   schema: RJSFSchema
   defaultValues?: Record<string, unknown>
@@ -114,8 +116,8 @@ export interface StackSummary {
   provider: "proxmox" | "aws" | "gcp" | "azure" | "hetzner" | "kind" | string
   type: "management" | "workload" | "cloud"
   status: "synced" | "reconciling" | "pending" | "error" | "drift"
-  resourceCount: number
-  lastSynced: string
+  resourceCount?: number
+  lastSynced?: string
   bundle?: string
   bundleItem?: string
 }
@@ -178,6 +180,7 @@ export interface ReleaseSummary {
   targetCluster?: string
   bundle?: string
   bundleItem?: string
+  lastSynced?: string
   canaryWeight?: number
   errorRate?: number
   latencyMs?: number

@@ -24,6 +24,14 @@ pub enum LiveResourceStatus {
     Error,
 }
 
+/// Live status plus reconciliation metadata (`last_synced`, `resource_count`) for topology views.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveResourceInfo {
+    pub status: LiveResourceStatus,
+    pub last_synced: Option<String>,
+    pub resource_count: Option<u32>,
+}
+
 /// Normalized Kubernetes resource condition (`Ready`, `Reconciling`, `Stalled`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -96,6 +104,42 @@ pub trait LiveStatusSource: Send + Sync {
     /// Returns `(namespace, name) -> LiveResourceStatus` for Flux `HelmRelease` and `Kustomization` resources.
     async fn release_statuses(&self) -> HashMap<(String, String), LiveResourceStatus>;
 
+    /// Returns `(namespace, name) -> LiveResourceInfo` for PKO v2 `Stack` resources.
+    async fn stack_status_details(&self) -> HashMap<(String, String), LiveResourceInfo> {
+        self.stack_statuses()
+            .await
+            .into_iter()
+            .map(|(k, status)| {
+                (
+                    k,
+                    LiveResourceInfo {
+                        status,
+                        last_synced: None,
+                        resource_count: None,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// Returns `(namespace, name) -> LiveResourceInfo` for Flux `HelmRelease` and `Kustomization` resources.
+    async fn release_status_details(&self) -> HashMap<(String, String), LiveResourceInfo> {
+        self.release_statuses()
+            .await
+            .into_iter()
+            .map(|(k, status)| {
+                (
+                    k,
+                    LiveResourceInfo {
+                        status,
+                        last_synced: None,
+                        resource_count: None,
+                    },
+                )
+            })
+            .collect()
+    }
+
     /// Fetches detailed conditions, workspace pod status, events, and logs for a `Stack`.
     async fn stack_diagnostics(&self, _namespace: &str, _name: &str) -> Option<StackDiagnostics> {
         None
@@ -158,14 +202,14 @@ impl KubeClusterStatusReader {
         String::from_utf8(bytes.0.clone()).ok()
     }
 
-    async fn list_dynamic_statuses(
+    async fn list_dynamic_status_details(
         &self,
         group: &str,
         version: &str,
         kind: &str,
         plural: &str,
         is_stack: bool,
-    ) -> HashMap<(String, String), LiveResourceStatus> {
+    ) -> HashMap<(String, String), LiveResourceInfo> {
         let ar = ApiResource {
             group: group.to_string(),
             version: version.to_string(),
@@ -206,13 +250,50 @@ impl KubeClusterStatusReader {
             {
                 continue;
             }
+            let creation_ts = item
+                .metadata
+                .creation_timestamp
+                .as_ref()
+                .map(|t| t.0.to_rfc3339());
+            let last_synced = extract_last_synced(&item.data, creation_ts.as_deref());
+            let resource_count = extract_resource_count(&item.data);
+
             if item.metadata.deletion_timestamp.is_some() {
-                out.insert((ns, name), LiveResourceStatus::Deleting);
+                out.insert(
+                    (ns, name),
+                    LiveResourceInfo {
+                        status: LiveResourceStatus::Deleting,
+                        last_synced,
+                        resource_count,
+                    },
+                );
             } else if let Some(status) = extract_ready_status(&item.data, is_stack) {
-                out.insert((ns, name), status);
+                out.insert(
+                    (ns, name),
+                    LiveResourceInfo {
+                        status,
+                        last_synced,
+                        resource_count,
+                    },
+                );
             }
         }
         out
+    }
+
+    async fn list_dynamic_statuses(
+        &self,
+        group: &str,
+        version: &str,
+        kind: &str,
+        plural: &str,
+        is_stack: bool,
+    ) -> HashMap<(String, String), LiveResourceStatus> {
+        self.list_dynamic_status_details(group, version, kind, plural, is_stack)
+            .await
+            .into_iter()
+            .map(|(k, info)| (k, info.status))
+            .collect()
     }
 
     /// Reads `spec.backend` from a live PKO `Stack` resource, if present.
@@ -268,6 +349,54 @@ impl LiveStatusSource for KubeClusterStatusReader {
             if key.0 == "flux-system" {
                 out.entry(key).or_insert(st);
             }
+        }
+        out
+    }
+
+    async fn stack_status_details(&self) -> HashMap<(String, String), LiveResourceInfo> {
+        let mut out = self
+            .list_dynamic_status_details("pulumi.com", "v1", "Stack", "stacks", true)
+            .await;
+
+        let kustomizations = self
+            .list_dynamic_status_details(
+                "kustomize.toolkit.fluxcd.io",
+                "v1",
+                "Kustomization",
+                "kustomizations",
+                true,
+            )
+            .await;
+        for (key, info) in kustomizations {
+            if key.0 == "flux-system" {
+                out.entry(key).or_insert(info);
+            }
+        }
+        out
+    }
+
+    async fn release_status_details(&self) -> HashMap<(String, String), LiveResourceInfo> {
+        let mut out = self
+            .list_dynamic_status_details(
+                "helm.toolkit.fluxcd.io",
+                "v2",
+                "HelmRelease",
+                "helmreleases",
+                false,
+            )
+            .await;
+
+        let kustomizations = self
+            .list_dynamic_status_details(
+                "kustomize.toolkit.fluxcd.io",
+                "v1",
+                "Kustomization",
+                "kustomizations",
+                false,
+            )
+            .await;
+        for (key, info) in kustomizations {
+            out.entry(key).or_insert(info);
         }
         out
     }
@@ -745,6 +874,72 @@ pub fn extract_ready_status(data: &Value, is_stack: bool) -> Option<LiveResource
     }
 }
 
+/// Extracts the most recent sync/reconciliation timestamp (RFC3339) from a Flux or PKO resource.
+pub fn extract_last_synced(data: &Value, creation_timestamp: Option<&str>) -> Option<String> {
+    if let Some(ts) = data
+        .pointer("/status/lastUpdate/lastResyncTime")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+    {
+        return Some(ts.to_string());
+    }
+    if let Some(ts) = data
+        .pointer("/status/history/0/lastDeployed")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+    {
+        return Some(ts.to_string());
+    }
+    if let Some(ts) = data
+        .pointer("/status/lastHandledReconcileAt")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+    {
+        return Some(ts.to_string());
+    }
+    if let Some(conditions) = data.pointer("/status/conditions").and_then(Value::as_array)
+        && let Some(ts) = conditions
+            .iter()
+            .find(|c| c.get("type").and_then(Value::as_str) == Some("Ready"))
+            .and_then(|c| c.get("lastTransitionTime"))
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+    {
+        return Some(ts.to_string());
+    }
+    creation_timestamp
+        .filter(|s| !s.trim().is_empty())
+        .map(str::to_string)
+}
+
+/// Extracts the managed resource count from a Flux `Kustomization` or PKO v2 `Stack` status.
+pub fn extract_resource_count(data: &Value) -> Option<u32> {
+    if let Some(entries) = data
+        .pointer("/status/inventory/entries")
+        .and_then(Value::as_array)
+    {
+        return Some(entries.len() as u32);
+    }
+    if let Some(changes) = data
+        .pointer("/status/lastUpdate/resourceChanges")
+        .and_then(Value::as_object)
+    {
+        let total: u64 = changes
+            .iter()
+            .filter(|(op, _)| op.as_str() != "delete")
+            .filter_map(|(_, v)| v.as_u64())
+            .sum();
+        return Some(total as u32);
+    }
+    if let Some(count) = data
+        .pointer("/status/resourceCount")
+        .and_then(Value::as_u64)
+    {
+        return Some(count as u32);
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -794,5 +989,55 @@ mod tests {
 
         let no_status = json!({ "metadata": { "name": "foo" } });
         assert_eq!(extract_ready_status(&no_status, true), None);
+    }
+
+    #[test]
+    fn extracts_last_synced_and_resource_count() {
+        let pko_stack = json!({
+            "status": {
+                "lastUpdate": {
+                    "lastResyncTime": "2026-11-15T10:15:00Z",
+                    "resourceChanges": { "create": 2, "same": 4, "delete": 1 }
+                }
+            }
+        });
+        assert_eq!(
+            extract_last_synced(&pko_stack, None).as_deref(),
+            Some("2026-11-15T10:15:00Z")
+        );
+        assert_eq!(extract_resource_count(&pko_stack), Some(6));
+
+        let flux_ks = json!({
+            "status": {
+                "inventory": {
+                    "entries": [
+                        { "id": "a" },
+                        { "id": "b" },
+                        { "id": "c" }
+                    ]
+                },
+                "conditions": [
+                    { "type": "Ready", "status": "True", "lastTransitionTime": "2026-11-15T09:00:00Z" }
+                ]
+            }
+        });
+        assert_eq!(
+            extract_last_synced(&flux_ks, None).as_deref(),
+            Some("2026-11-15T09:00:00Z")
+        );
+        assert_eq!(extract_resource_count(&flux_ks), Some(3));
+
+        let helm_release = json!({
+            "status": {
+                "history": [
+                    { "lastDeployed": "2026-11-15T08:30:00Z" }
+                ]
+            }
+        });
+        assert_eq!(
+            extract_last_synced(&helm_release, Some("2026-11-15T08:00:00Z")).as_deref(),
+            Some("2026-11-15T08:30:00Z")
+        );
+        assert_eq!(extract_resource_count(&helm_release), None);
     }
 }

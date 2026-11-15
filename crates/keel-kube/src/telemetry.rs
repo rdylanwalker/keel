@@ -468,16 +468,26 @@ impl TelemetryMux {
         tokio::spawn(async move {
             let stream = watcher::watcher(api, watcher::Config::default());
             futures::pin_mut!(stream);
+            let mut last_published: std::collections::HashMap<
+                (String, String),
+                (CrdReconcileStatus, String, Option<String>),
+            > = std::collections::HashMap::new();
 
             while let Some(item) = stream.next().await {
                 match item {
                     Ok(WatcherEvent::Apply(obj) | WatcherEvent::InitApply(obj)) => {
                         if let Some(ev) = CrdWatchEvent::from_dynamic_object(kind, &obj) {
-                            mux.publish(ev);
+                            let key = (ev.namespace.clone(), ev.name.clone());
+                            let sig = (ev.status, ev.message.clone(), ev.revision.clone());
+                            if last_published.get(&key) != Some(&sig) {
+                                last_published.insert(key, sig);
+                                mux.publish(ev);
+                            }
                         }
                     }
                     Ok(WatcherEvent::Delete(obj)) => {
                         if let Some(ev) = CrdWatchEvent::deleted_from_dynamic_object(kind, &obj) {
+                            last_published.remove(&(ev.namespace.clone(), ev.name.clone()));
                             mux.publish(ev);
                         }
                     }
