@@ -204,22 +204,15 @@ export interface CrdWatchEvent {
 
 export interface AuthStatus {
   authenticated: boolean
-  phase: "bootstrap" | "oidc" | "breakglass"
+  phase: "oidc-active" | "break-glass" | "oidc"
+  oidcEnabled?: boolean
+  sub?: string
   username?: string
   tenant?: string
 }
 
 export interface BootstrapLoginRequest {
   token: string
-}
-
-export interface BootstrapLoginResponse {
-  authenticated?: boolean
-  sub?: string
-  phase?: string
-  success?: boolean
-  token?: string
-  message?: string
 }
 
 export interface ReleaseConfig {

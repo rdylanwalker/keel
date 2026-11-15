@@ -6,7 +6,7 @@ Every tenant maps to a dedicated Kubernetes namespace (`tenant-<tenant-id>`) and
 
 - **Flux Isolation:** Flux controllers run with `--no-cross-namespace-refs=true`, preventing one tenant from referencing another tenant's `GitRepository`, `Secret`, or `Kustomization`.
 - **Pod Security Standards:** Tenant namespaces enforce the Kubernetes `restricted` Pod Security Standard.
-- **Per-Tenant SOPS + `age` Keys:** Secrets submitted through catalog forms (`x-keel-secret: true`) are encrypted with the tenant's `age` public key before being committed to Git.
+- **Per-Tenant SOPS + `age` Keys:** Secrets submitted through catalog forms (`writeOnly: true` or `format: password`) are encrypted with the tenant's `age` public key before being committed to Git.
 
 ## Kyverno Admission Guardrails
 

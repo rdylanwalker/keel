@@ -656,6 +656,7 @@ pub struct AppState {
     pub oidc_config: Arc<RwLock<Option<OidcConfig>>>,
     pub state_provider: Arc<dyn ClusterStateProvider>,
     pub backend_url: String,
+    pub s3_credentials_secret: Option<String>,
     pub docker_proxy_url: Option<String>,
     pub git_lock: Arc<Mutex<()>>,
     pub preview_cache: Arc<RwLock<HashMap<String, CachedPreview>>>,
@@ -686,6 +687,7 @@ impl AppState {
             oidc_config: Arc::new(RwLock::new(None)),
             state_provider,
             backend_url: "s3://pulumi-state".to_string(),
+            s3_credentials_secret: None,
             docker_proxy_url: None,
             git_lock: Arc::new(Mutex::new(())),
             preview_cache: Arc::new(RwLock::new(HashMap::new())),
@@ -695,6 +697,11 @@ impl AppState {
     /// Configures an optional `DOCKER_HOST` proxy endpoint for local `kind`-in-`kind` PKO workspaces.
     pub fn with_docker_proxy_url(mut self, url: Option<String>) -> Self {
         self.docker_proxy_url = url;
+        self
+    }
+
+    pub fn with_s3_credentials_secret(mut self, secret_name: Option<String>) -> Self {
+        self.s3_credentials_secret = secret_name;
         self
     }
 
@@ -724,7 +731,7 @@ impl AppState {
             GitRunner::new(),
             &tmp_dir,
             tmp_dir.to_string_lossy().to_string(),
-            AuthPhase::Bootstrap,
+            AuthPhase::OidcActive,
         )
     }
 }

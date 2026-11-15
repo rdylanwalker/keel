@@ -1,5 +1,5 @@
 //! Cryptographic primitives (`AES-256-GCM` envelope encryption, SHA-256 hashing,
-//! 256-bit Stage 0 bootstrap tokens) and SOPS + `age` secrets management (`SDD.md` §6.3, `NFR-SEC-05`, `NFR-SEC-06`).
+//! bcrypt password hashing for Dex) and SOPS + `age` secrets management (`SDD.md` §6.3, `NFR-SEC-05`, `NFR-SEC-06`).
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -31,27 +31,27 @@ pub fn sha256_hex(data: &[u8]) -> String {
     hex::encode(digest)
 }
 
-/// Generates a cryptographically random 256-bit (32-byte) Stage 0 bootstrap token encoded as 64 hex chars.
-pub fn generate_bootstrap_token() -> String {
-    let mut bytes = [0u8; 32];
-    rand::rng().fill(&mut bytes);
-    hex::encode(bytes)
+/// Generates a cryptographically random 20-character alphanumeric admin password for Stage 0 Dex seeding.
+pub fn generate_admin_password() -> String {
+    const CHARSET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
+    let mut rng = rand::rng();
+    (0..20)
+        .map(|_| {
+            let idx = rng.random_range(0..CHARSET.len());
+            CHARSET[idx] as char
+        })
+        .collect()
 }
 
-/// Verifies a raw Stage 0 bootstrap token against its stored SHA-256 hex digest in constant time.
-pub fn verify_bootstrap_token(raw_token: &str, expected_sha256_hex: &str) -> bool {
-    let Ok(expected_bytes) = hex::decode(expected_sha256_hex.trim()) else {
-        return false;
-    };
-    if expected_bytes.len() != 32 {
-        return false;
+/// Hashes a plaintext password using bcrypt for Dex `staticPasswords` (`NFR-SEC-01`).
+pub fn hash_dex_password_bcrypt(password: &str) -> Result<String, CoreError> {
+    if password.trim().is_empty() {
+        return Err(CoreError::Validation(
+            "admin password must not be empty".to_string(),
+        ));
     }
-    let actual = Sha256::digest(raw_token.as_bytes());
-    let mut diff = 0u8;
-    for (a, b) in actual.iter().zip(expected_bytes.iter()) {
-        diff |= a ^ b;
-    }
-    diff == 0
+    bcrypt::hash(password, bcrypt::DEFAULT_COST)
+        .map_err(|e| CoreError::Crypto(format!("bcrypt hash failed: {e}")))
 }
 
 /// `AES-256-GCM` envelope cipher for encrypting user SSH private keys and Forge PATs at rest (`NFR-SEC-05`).
@@ -112,11 +112,6 @@ impl EnvelopeCrypto {
     /// Computes SHA-256 hex digest (associated helper convenience).
     pub fn sha256_hex(data: &[u8]) -> String {
         sha256_hex(data)
-    }
-
-    /// Generates a 256-bit random hex bootstrap token (associated helper convenience).
-    pub fn generate_bootstrap_token() -> String {
-        generate_bootstrap_token()
     }
 
     /// Encrypts `plaintext` with `AES-256-GCM` using a fresh 96-bit random nonce and returns Base64(`nonce || ciphertext`).
@@ -614,19 +609,19 @@ mod tests {
     }
 
     #[test]
-    fn test_sha256_and_bootstrap_token_verification() {
-        let digest = EnvelopeCrypto::sha256_hex(b"keel-bootstrap");
+    fn test_sha256_and_dex_bcrypt_password_hashing() {
+        let digest = EnvelopeCrypto::sha256_hex(b"keel-oidc");
         assert_eq!(digest.len(), 64);
 
-        let token = EnvelopeCrypto::generate_bootstrap_token();
-        assert_eq!(token.len(), 64);
-        assert!(token.chars().all(|c| c.is_ascii_hexdigit()));
+        let password = generate_admin_password();
+        assert_eq!(password.len(), 20);
+        assert!(password.chars().all(|c| c.is_ascii_alphanumeric()));
 
-        let token_hash = sha256_hex(token.as_bytes());
-        assert!(verify_bootstrap_token(&token, &token_hash));
-        assert!(!verify_bootstrap_token("wrong-token", &token_hash));
-        assert!(!verify_bootstrap_token(&token, "not-hex"));
-        assert!(!verify_bootstrap_token(&token, "abcd"));
+        let hashed = hash_dex_password_bcrypt(&password).unwrap();
+        assert!(hashed.starts_with("$2"));
+        assert!(bcrypt::verify(&password, &hashed).unwrap());
+        assert!(!bcrypt::verify("wrong-password", &hashed).unwrap());
+        assert!(hash_dex_password_bcrypt("   ").is_err());
     }
 
     #[test]

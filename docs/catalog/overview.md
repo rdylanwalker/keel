@@ -53,15 +53,17 @@ spec:
         type: string
         title: API Token
         format: password
-        x-keel-secret: true # encrypted with SOPS + age before committing
+        writeOnly: true # encrypted with SOPS + age before committing
   uiSchema:
     apiToken:
       ui:widget: password
 ```
 
-### Secret Partitioning (`x-keel-secret: true`)
+### Secret Partitioning (`writeOnly: true` / `format: password`)
 
-Any schema property marked with `"x-keel-secret": true` (or `format: password`) is automatically partitioned out of plaintext `spec.config` and encrypted into a SOPS-encrypted Kubernetes `Secret` using the tenant's `age` public key before staging to Git.
+Any schema property marked with `writeOnly: true` or `format: password` is automatically partitioned out of plaintext `values.yaml` / `Stack.spec.config` and encrypted into a SOPS-encrypted Kubernetes `Secret` (`secret.enc.yaml`, named `<instance-name>-secrets`) using the tenant's `age` public key before staging to Git.
+
+For infrastructure blueprints (`CatalogInfraBlueprint`), Keel also binds each partitioned secret key to `Stack.spec.envRefs` using the **exact schema property name** as the environment variable name inside the PKO v2 workspace pod. Name credential properties after the environment variable expected by the Pulumi/OpenTofu provider (for example, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `GOOGLE_CREDENTIALS`, `HCLOUD_TOKEN`, or `CLOUDFLARE_API_TOKEN`).
 
 ## `CatalogApplication` Schema (`keel.io/v1alpha1`)
 
@@ -123,6 +125,6 @@ spec:
 You can register or update blueprints, applications, and bundles in two ways:
 
 1. **Web UI (+ Add Catalog Item / Edit):**
-   - In **Catalog & Form Wizard**, click **+ Add Catalog Item**, choose **Application (Helm / Kustomize)**, **Infrastructure Blueprint (PKO v2)**, or **Multi-Item Bundle (Infra + Apps)**, fill in the fields (optionally authoring `Pulumi.yaml` directly in the **Pulumi.yaml Program** editor or inserting a starter template for infrastructure blueprints), and merge the generated PR.
+   - In **Catalog & Form Wizard**, click **+ Add Catalog Item**, choose **Application (Helm / Kustomize)**, **Infrastructure Blueprint (PKO v2)**, or **Multi-Item Bundle (Infra + Apps)**, and fill in the fields. For infrastructure blueprints, you can paste or generate `Pulumi.yaml`, click **Derive from Pulumi.yaml** to auto-populate form fields from `config:`, click **+ Add \<provider\> Credentials** to add `writeOnly: true` / `format: password` credential fields, and customize fields in the **Form Fields** builder or **JSON Schema** editor before opening the PR.
    - Select any existing catalog item and click **Edit** in the item header to update its metadata, upstream/provider settings, bundle steps, optional JSON Schema, or—for infrastructure blueprints—its `Pulumi.yaml` program via a Git PR (`PUT /api/v1/catalog/{kind}/{id}`). Leave **Pulumi.yaml Program** blank when editing to preserve the existing `Pulumi.yaml`.
 2. **Direct Git PR:** Commit `catalog/infra/<id>/catalog.yaml` (+ `Pulumi.yaml`), `catalog/apps/<id>/catalog.yaml`, or `catalog/bundles/<id>/catalog.yaml` (see [Provider Blueprint Examples](provider-examples.md)) on a feature branch and open a PR.

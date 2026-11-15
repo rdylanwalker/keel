@@ -4,6 +4,8 @@ Each example below provides a ready-to-use `catalog.yaml` (`CatalogInfraBlueprin
 
 Remember to enable the corresponding provider on the **Topology Map** (or in `providers/registry.yaml`) so the blueprint appears in **Catalog & Form Wizard**.
 
+> **Credential & API Key Secrets:** Properties marked with `writeOnly: true` (and `format: password`) are partitioned out of plaintext `Stack.spec.config`, encrypted with SOPS + `age` into `secret.enc.yaml`, and injected into the PKO v2 workspace pod via `Stack.spec.envRefs` using the exact property name as the environment variable name.
+
 ---
 
 ## Local `kind` Workload Cluster (`kind`)
@@ -27,6 +29,7 @@ spec:
   protectByDefault: false
   outputs:
     - clusterName
+    - endpoint
     - kubeconfig
   schema:
     type: object
@@ -36,6 +39,7 @@ spec:
         type: string
         title: Cluster Name
         default: workload-dev
+        pattern: "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"
       kubernetesVersion:
         type: string
         title: Kubernetes Version
@@ -60,6 +64,7 @@ packages:
     source: terraform-provider
     parameters:
       - tehcyx/kind
+      - 0.13.0
 config:
   clusterName:
     type: string
@@ -67,19 +72,42 @@ config:
   kubernetesVersion:
     type: string
     default: v1.32.0
+  workerCount:
+    type: integer
+    default: 1
   kubeconfigSecretName:
     type: string
     default: workload-dev-kubeconfig
   kubeconfigSecretNamespace:
     type: string
     default: tenant-default
+variables:
+  nodeTopologies:
+    - - role: control-plane
+    - - role: control-plane
+      - role: worker
+    - - role: control-plane
+      - role: worker
+      - role: worker
+    - - role: control-plane
+      - role: worker
+      - role: worker
+      - role: worker
 resources:
   workloadCluster:
     type: kind:index:Cluster
     properties:
       name: ${clusterName}
       nodeImage: kindest/node:${kubernetesVersion}
+      kubeconfigPath: /tmp/${clusterName}-kubeconfig
       waitForReady: false
+      kindConfig:
+        apiVersion: kind.x-k8s.io/v1alpha4
+        kind: Cluster
+        nodes:
+          fn::select:
+            - ${workerCount}
+            - ${nodeTopologies}
   kubeconfigSecret:
     type: kubernetes:core/v1:Secret
     properties:
@@ -126,7 +154,13 @@ spec:
     - clusterEndpoint
   schema:
     type: object
-    required: [clusterName, region, instanceType, desiredCapacity]
+    required:
+      - clusterName
+      - region
+      - instanceType
+      - desiredCapacity
+      - AWS_ACCESS_KEY_ID
+      - AWS_SECRET_ACCESS_KEY
     properties:
       clusterName:
         type: string
@@ -147,6 +181,23 @@ spec:
         default: 2
         minimum: 1
         maximum: 10
+      AWS_ACCESS_KEY_ID:
+        type: string
+        title: AWS Access Key ID
+        format: password
+        writeOnly: true
+      AWS_SECRET_ACCESS_KEY:
+        type: string
+        title: AWS Secret Access Key
+        format: password
+        writeOnly: true
+  uiSchema:
+    AWS_ACCESS_KEY_ID:
+      ui:widget: password
+      ui:help: "Encrypted via SOPS + age and bound to Stack.spec.envRefs."
+    AWS_SECRET_ACCESS_KEY:
+      ui:widget: password
+      ui:help: "Encrypted via SOPS + age and bound to Stack.spec.envRefs."
 ```
 
 ### `Pulumi.yaml`
@@ -155,7 +206,7 @@ spec:
 name: aws-eks
 runtime: yaml
 description: Managed Amazon EKS cluster
-configuration:
+config:
   clusterName:
     type: string
   region:
@@ -168,12 +219,20 @@ configuration:
     type: integer
     default: 2
 resources:
+  awsProvider:
+    type: pulumi:providers:aws
+    properties:
+      region: ${region}
   vpc:
     type: awsx:ec2:Vpc
+    options:
+      provider: ${awsProvider}
     properties:
       cidrBlock: 10.20.0.0/16
   cluster:
     type: eks:Cluster
+    options:
+      provider: ${awsProvider}
     properties:
       name: ${clusterName}
       vpcId: ${vpc.vpcId}
@@ -209,17 +268,30 @@ spec:
     - endpoint
   schema:
     type: object
-    required: [clusterName, location]
+    required: [clusterName, project, location, GOOGLE_CREDENTIALS]
     properties:
       clusterName:
         type: string
         title: Cluster Name
         default: gke-workload
+        pattern: "^[a-z]([a-z0-9-]{0,38}[a-z0-9])?$"
+      project:
+        type: string
+        title: GCP Project ID
       location:
         type: string
         title: GCP Region
         default: us-central1
         enum: [us-central1, us-east1, europe-west1]
+      GOOGLE_CREDENTIALS:
+        type: string
+        title: GCP Service Account JSON Key
+        format: password
+        writeOnly: true
+  uiSchema:
+    GOOGLE_CREDENTIALS:
+      ui:widget: password
+      ui:help: "Service account JSON key encrypted via SOPS + age and bound to Stack.spec.envRefs."
 ```
 
 ### `Pulumi.yaml`
@@ -228,8 +300,10 @@ spec:
 name: gcp-gke
 runtime: yaml
 description: Google Kubernetes Engine Autopilot cluster
-configuration:
+config:
   clusterName:
+    type: string
+  project:
     type: string
   location:
     type: string
@@ -239,10 +313,107 @@ resources:
     type: gcp:container:Cluster
     properties:
       name: ${clusterName}
+      project: ${project}
       location: ${location}
       enableAutopilot: true
 outputs:
   endpoint: ${gke.endpoint}
+```
+
+---
+
+## Always-Free GCP Compute Engine VM (`gcp`)
+
+Place in `catalog/infra/gcp-free-vm/`.
+
+### `catalog.yaml`
+
+```yaml
+apiVersion: keel.io/v1alpha1
+kind: CatalogInfraBlueprint
+metadata:
+  id: gcp-free-vm
+  name: Always-Free GCP Compute Engine VM
+  description: Provision an Always Free e2-micro Compute Engine VM on Google Cloud.
+  category: compute
+  provider: gcp
+spec:
+  pulumiRuntime: yaml
+  entrypoint: Pulumi.yaml
+  protectByDefault: false
+  outputs:
+    - instanceName
+    - internalIp
+  schema:
+    type: object
+    required: [vmName, project, zone, GOOGLE_CREDENTIALS]
+    properties:
+      vmName:
+        type: string
+        title: VM Name
+        default: keel-free-vm
+        pattern: "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"
+      project:
+        type: string
+        title: GCP Project ID
+      zone:
+        type: string
+        title: GCP Zone (Always Free Eligible)
+        default: us-east1-b
+        enum:
+          - us-central1-a
+          - us-central1-b
+          - us-central1-c
+          - us-east1-b
+          - us-east1-c
+          - us-west1-a
+          - us-west1-b
+      GOOGLE_CREDENTIALS:
+        type: string
+        title: GCP Service Account JSON Key
+        format: password
+        writeOnly: true
+  uiSchema:
+    GOOGLE_CREDENTIALS:
+      ui:widget: password
+      ui:help: "Service account JSON key encrypted via SOPS + age and bound to Stack.spec.envRefs."
+```
+
+### `Pulumi.yaml`
+
+```yaml
+name: gcp-free-vm
+runtime: yaml
+description: Always Free GCP e2-micro Compute Engine VM
+config:
+  vmName:
+    type: string
+    default: keel-free-vm
+  project:
+    type: string
+  zone:
+    type: string
+    default: us-east1-b
+resources:
+  freeVm:
+    type: gcp:compute:Instance
+    properties:
+      name: ${vmName}
+      project: ${project}
+      machineType: e2-micro
+      zone: ${zone}
+      bootDisk:
+        initializeParams:
+          image: debian-cloud/debian-12
+          size: 10
+          type: pd-standard
+      networkInterfaces:
+        - network: default
+      labels:
+        managed-by: keel
+outputs:
+  instanceName: ${freeVm.name}
+  internalIp: ${freeVm.networkInterfaces[0].networkIp}
 ```
 
 ---
@@ -270,7 +441,15 @@ spec:
     - fqdn
   schema:
     type: object
-    required: [clusterName, location, nodeCount, vmSize]
+    required:
+      - clusterName
+      - location
+      - nodeCount
+      - vmSize
+      - ARM_CLIENT_ID
+      - ARM_CLIENT_SECRET
+      - ARM_TENANT_ID
+      - ARM_SUBSCRIPTION_ID
     properties:
       clusterName:
         type: string
@@ -290,6 +469,35 @@ spec:
         type: string
         title: Node VM Size
         default: Standard_D2s_v3
+      ARM_CLIENT_ID:
+        type: string
+        title: Azure Service Principal Client ID
+        format: password
+        writeOnly: true
+      ARM_CLIENT_SECRET:
+        type: string
+        title: Azure Service Principal Client Secret
+        format: password
+        writeOnly: true
+      ARM_TENANT_ID:
+        type: string
+        title: Azure Tenant ID
+        format: password
+        writeOnly: true
+      ARM_SUBSCRIPTION_ID:
+        type: string
+        title: Azure Subscription ID
+        format: password
+        writeOnly: true
+  uiSchema:
+    ARM_CLIENT_ID:
+      ui:widget: password
+    ARM_CLIENT_SECRET:
+      ui:widget: password
+    ARM_TENANT_ID:
+      ui:widget: password
+    ARM_SUBSCRIPTION_ID:
+      ui:widget: password
 ```
 
 ### `Pulumi.yaml`
@@ -298,7 +506,7 @@ spec:
 name: azure-aks
 runtime: yaml
 description: Azure Kubernetes Service cluster
-configuration:
+config:
   clusterName:
     type: string
   location:
@@ -359,7 +567,13 @@ spec:
     - vmId
   schema:
     type: object
-    required: [vmName, nodeName, cores, memoryMb]
+    required:
+      - vmName
+      - nodeName
+      - cores
+      - memoryMb
+      - PROXMOX_VE_ENDPOINT
+      - PROXMOX_VE_API_TOKEN
     properties:
       vmName:
         type: string
@@ -380,6 +594,22 @@ spec:
         title: Memory (MB)
         default: 8192
         minimum: 1024
+      PROXMOX_VE_ENDPOINT:
+        type: string
+        title: Proxmox VE API Endpoint
+        writeOnly: true
+      PROXMOX_VE_API_TOKEN:
+        type: string
+        title: Proxmox VE API Token
+        format: password
+        writeOnly: true
+  uiSchema:
+    PROXMOX_VE_ENDPOINT:
+      ui:placeholder: "https://pve.example.local:8006/api2/json"
+      ui:help: "Injected as PROXMOX_VE_ENDPOINT via Stack.spec.envRefs."
+    PROXMOX_VE_API_TOKEN:
+      ui:widget: password
+      ui:help: "Format: user@realm!tokenid=uuid. Encrypted via SOPS + age."
 ```
 
 ### `Pulumi.yaml`
@@ -393,7 +623,7 @@ packages:
     source: terraform-provider
     parameters:
       - bpg/proxmox
-configuration:
+config:
   vmName:
     type: string
   nodeName:
@@ -444,7 +674,7 @@ spec:
     - ipv4Address
   schema:
     type: object
-    required: [serverName, serverType, location]
+    required: [serverName, serverType, location, HCLOUD_TOKEN]
     properties:
       serverName:
         type: string
@@ -460,6 +690,15 @@ spec:
         title: Datacenter Location
         default: fsn1
         enum: [fsn1, nbg1, hel1, ash]
+      HCLOUD_TOKEN:
+        type: string
+        title: Hetzner Cloud API Token
+        format: password
+        writeOnly: true
+  uiSchema:
+    HCLOUD_TOKEN:
+      ui:widget: password
+      ui:help: "Encrypted via SOPS + age and bound to Stack.spec.envRefs."
 ```
 
 ### `Pulumi.yaml`
@@ -468,7 +707,7 @@ spec:
 name: hetzner-node
 runtime: yaml
 description: Hetzner Cloud server via pulumi/hcloud
-configuration:
+config:
   serverName:
     type: string
   serverType:
@@ -514,7 +753,7 @@ spec:
     - hostname
   schema:
     type: object
-    required: [zoneId, recordName, targetIp]
+    required: [zoneId, recordName, targetIp, CLOUDFLARE_API_TOKEN]
     properties:
       zoneId:
         type: string
@@ -526,6 +765,15 @@ spec:
       targetIp:
         type: string
         title: Target IPv4 Address
+      CLOUDFLARE_API_TOKEN:
+        type: string
+        title: Cloudflare API Token
+        format: password
+        writeOnly: true
+  uiSchema:
+    CLOUDFLARE_API_TOKEN:
+      ui:widget: password
+      ui:help: "Encrypted via SOPS + age and bound to Stack.spec.envRefs."
 ```
 
 ### `Pulumi.yaml`
@@ -534,7 +782,7 @@ spec:
 name: cloudflare-dns
 runtime: yaml
 description: Cloudflare DNS A record
-configuration:
+config:
   zoneId:
     type: string
   recordName:

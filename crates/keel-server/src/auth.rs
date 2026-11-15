@@ -1,14 +1,12 @@
 //! Authentication & stateless session cookie management (`SDD.md` §6.1, §6.3, §7.3).
 //!
-//! - Stage 0 / Break-Glass: `POST /api/v1/auth/bootstrap-login` verifies a 256-bit token
-//!   via `SecretStateStore::consume_bootstrap_token_hash` and issues an `AES-256-GCM`
-//!   encrypted/authenticated `HttpOnly; Secure; SameSite=Strict` session cookie.
-//! - Stage 1+: `GET /api/v1/auth/login` & `/callback` implement OIDC Authorization Code + PKCE
-//!   using stateless encrypted `keel_pkce` cookies.
+//! - Stage 0+: `GET /api/v1/auth/login` & `/callback` implement OIDC Authorization Code + PKCE
+//!   against the in-cluster Dex OIDC provider (or external OIDC issuer) using stateless encrypted
+//!   `keel_pkce` and `keel_session` cookies.
 
 use axum::Json;
 use axum::extract::{FromRequestParts, Query, State};
-use axum::http::header::{AUTHORIZATION, COOKIE, LOCATION, SET_COOKIE};
+use axum::http::header::{ACCEPT, AUTHORIZATION, COOKIE, LOCATION, SET_COOKIE};
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -16,7 +14,6 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::Utc;
 use keel_core::{AuthPhase, EnvelopeCrypto};
-use keel_kube::hash_bootstrap_token;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -158,14 +155,7 @@ fn extract_session_token(headers: &HeaderMap) -> Option<String> {
     None
 }
 
-/// Request body for `POST /api/v1/auth/bootstrap-login`.
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct BootstrapLoginRequest {
-    pub token: String,
-}
-
-/// Response body for `POST /api/v1/auth/bootstrap-login`.
+/// Response body for OIDC login callback.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AuthLoginResponse {
@@ -174,64 +164,26 @@ pub struct AuthLoginResponse {
     pub phase: AuthPhase,
 }
 
-/// `POST /api/v1/auth/bootstrap-login`
-///
-/// Verifies the single-use 256-bit Stage 0 bootstrap token against `SecretStateStore::consume_bootstrap_token_hash`
-/// and issues an `AES-256-GCM` encrypted `HttpOnly; Secure; SameSite=Strict` session cookie.
-pub async fn bootstrap_login(
-    State(state): State<AppState>,
-    Json(req): Json<BootstrapLoginRequest>,
-) -> Result<Response, ServerError> {
-    let phase = *state.auth_phase.read().await;
-    if phase == AuthPhase::OidcActive {
-        return Err(ServerError::Forbidden(
-            "Bootstrap login is disabled while OIDC authentication is active".to_string(),
-        ));
+#[derive(Debug, Deserialize)]
+struct OidcDiscoveryDocument {
+    authorization_endpoint: String,
+    token_endpoint: String,
+}
+
+async fn resolve_oidc_endpoints(issuer_url: &str) -> (String, String) {
+    let issuer = issuer_url.trim_end_matches('/');
+    let discovery_url = format!("{issuer}/.well-known/openid-configuration");
+    if let Ok(client) = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+        && let Ok(resp) = client.get(&discovery_url).send().await
+        && resp.status().is_success()
+        && let Ok(doc) = resp.json::<OidcDiscoveryDocument>().await
+    {
+        return (doc.authorization_endpoint, doc.token_endpoint);
     }
-
-    let trimmed = req.token.trim();
-    if trimmed.is_empty() {
-        return Err(ServerError::Unauthorized(
-            "Bootstrap token must not be empty".to_string(),
-        ));
-    }
-
-    let candidate_hash = hash_bootstrap_token(trimmed);
-    let consumed = state
-        .secret_store
-        .consume_bootstrap_token_hash(&candidate_hash)
-        .await?;
-
-    if !consumed {
-        return Err(ServerError::Unauthorized(
-            "Invalid or already consumed bootstrap token".to_string(),
-        ));
-    }
-
-    let session_key = state.secret_store.get_or_create_session_key().await?;
-    let claims = SessionClaims {
-        sub: "bootstrap-admin".to_string(),
-        email: None,
-        name: Some("Bootstrap Administrator".to_string()),
-        groups: vec!["keel-admins".to_string()],
-        auth_phase: phase,
-        exp: Utc::now().timestamp() + SESSION_TTL_SECONDS,
-    };
-
-    let token = encrypt_session_token(&session_key, &claims)?;
-    let set_cookie = build_session_cookie_header(&token, SESSION_TTL_SECONDS)?;
-
-    let mut resp = (
-        StatusCode::OK,
-        Json(AuthLoginResponse {
-            authenticated: true,
-            sub: claims.sub,
-            phase,
-        }),
-    )
-        .into_response();
-    resp.headers_mut().insert(SET_COOKIE, set_cookie);
-    Ok(resp)
+    // Standard Dex OIDC endpoints fallback
+    (format!("{issuer}/auth"), format!("{issuer}/token"))
 }
 
 /// Response body for `GET /api/v1/auth/status`.
@@ -306,7 +258,7 @@ pub async fn oidc_login(
     let oidc_guard = state.oidc_config.read().await;
     let Some(oidc) = oidc_guard.as_ref().filter(|c| c.enabled) else {
         return Err(ServerError::ServiceUnavailable(
-            "OIDC is not configured; use /api/v1/auth/bootstrap-login during Stage 0".to_string(),
+            "OIDC is not configured".to_string(),
         ));
     };
 
@@ -342,10 +294,15 @@ pub async fn oidc_login(
     );
     let pkce_cookie = build_pkce_cookie_header(&encrypted_pkce, PKCE_TTL_SECONDS)?;
 
-    let issuer = oidc.issuer_url.trim_end_matches('/');
+    let (authorization_endpoint, _) = resolve_oidc_endpoints(&oidc.issuer_url).await;
     let scopes = oidc.scopes.join("%20");
+    let sep = if authorization_endpoint.contains('?') {
+        '&'
+    } else {
+        '?'
+    };
     let auth_url = format!(
-        "{issuer}/protocol/openid-connect/auth?response_type=code&client_id={}&redirect_uri={}&scope={scopes}&state={state_nonce}&code_challenge={code_challenge}&code_challenge_method=S256",
+        "{authorization_endpoint}{sep}response_type=code&client_id={}&redirect_uri={}&scope={scopes}&state={state_nonce}&code_challenge={code_challenge}&code_challenge_method=S256",
         url_encode_component(&oidc.client_id),
         url_encode_component(&redirect_uri),
     );
@@ -445,10 +402,7 @@ pub async fn oidc_callback(
         ));
     }
 
-    let token_endpoint = format!(
-        "{}/protocol/openid-connect/token",
-        oidc.issuer_url.trim_end_matches('/')
-    );
+    let (_, token_endpoint) = resolve_oidc_endpoints(&oidc.issuer_url).await;
     let client = reqwest::Client::new();
     let token_res = client
         .post(&token_endpoint)
@@ -497,15 +451,28 @@ pub async fn oidc_callback(
     let session_cookie = build_session_cookie_header(&session_token, SESSION_TTL_SECONDS)?;
     let clear_pkce_cookie = build_pkce_cookie_header("", 0)?;
 
-    let mut resp = (
-        StatusCode::OK,
-        Json(AuthLoginResponse {
-            authenticated: true,
-            sub: jwt_claims.sub,
-            phase,
-        }),
-    )
-        .into_response();
+    let wants_html = headers
+        .get(ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|a| a.contains("text/html"));
+
+    let mut resp = if wants_html {
+        let mut redirect = StatusCode::FOUND.into_response();
+        redirect
+            .headers_mut()
+            .insert(LOCATION, HeaderValue::from_static("/"));
+        redirect
+    } else {
+        (
+            StatusCode::OK,
+            Json(AuthLoginResponse {
+                authenticated: true,
+                sub: jwt_claims.sub,
+                phase,
+            }),
+        )
+            .into_response()
+    };
     resp.headers_mut().append(SET_COOKIE, session_cookie);
     resp.headers_mut().append(SET_COOKIE, clear_pkce_cookie);
     Ok(resp)

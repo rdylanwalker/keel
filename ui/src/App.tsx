@@ -7,11 +7,32 @@ import {
   ShieldAlert,
   Key,
   LogOut,
+  CheckCircle2,
+  ArrowRight,
+  X,
 } from "lucide-react"
-import { AuthStatus } from "./types/api"
-import { getAuthStatus, setStoredToken } from "./lib/api"
+import {
+  AuthStatus,
+  CatalogItem,
+  Proposal,
+  ReleaseSummary,
+  StackSummary,
+} from "./types/api"
+import {
+  getAuthStatus,
+  getCatalog,
+  getReleaseConfig,
+  getReleases,
+  getStackConfig,
+  getStacks,
+  setStoredToken,
+  startOidcLogin,
+} from "./lib/api"
 import { isDemoMode } from "./lib/utils"
-import { BootstrapLoginModal } from "./components/BootstrapLoginModal"
+import {
+  DeployInstanceInitialConfig,
+  DeployInstanceModal,
+} from "./components/DeployInstanceModal"
 
 const TopologyView = React.lazy(() =>
   import("./components/TopologyView").then((m) => ({ default: m.TopologyView }))
@@ -40,11 +61,19 @@ export const App: React.FC = () => {
   const [activeTab, setActiveTab] = useState<ActiveTab>(() =>
     parseHashTab(window.location.hash)
   )
-  const [editReleaseTarget, setEditReleaseTarget] = useState<{
-    namespace: string
-    name: string
-    kind?: "app" | "infra"
-  } | null>(null)
+  const [editModalOpen, setEditModalOpen] = useState(false)
+  const [editModalLoading, setEditModalLoading] = useState(false)
+  const [editModalError, setEditModalError] = useState<string | null>(null)
+  const [editCatalogItem, setEditCatalogItem] = useState<CatalogItem | null>(
+    null
+  )
+  const [editInitialConfig, setEditInitialConfig] =
+    useState<DeployInstanceInitialConfig | null>(null)
+  const [editStacks, setEditStacks] = useState<StackSummary[]>([])
+  const [editReleases, setEditReleases] = useState<ReleaseSummary[]>([])
+  const [topologyProposal, setTopologyProposal] = useState<Proposal | null>(
+    null
+  )
 
   const navigateToTab = (tab: ActiveTab) => {
     setActiveTab(tab)
@@ -54,14 +83,68 @@ export const App: React.FC = () => {
     }
   }
 
+  const openEditInstanceModal = async (
+    namespace: string,
+    name: string,
+    kind: "app" | "infra"
+  ) => {
+    setEditModalOpen(true)
+    setEditModalLoading(true)
+    setEditModalError(null)
+    setEditCatalogItem(null)
+    setEditInitialConfig({ name })
+
+    try {
+      const [cfg, catalogItems, stackList, releaseList] = await Promise.all([
+        kind === "infra"
+          ? getStackConfig(namespace, name)
+          : getReleaseConfig(namespace, name),
+        getCatalog().catch(() => [] as CatalogItem[]),
+        typeof getStacks === "function"
+          ? getStacks().catch(() => [] as StackSummary[])
+          : Promise.resolve([] as StackSummary[]),
+        typeof getReleases === "function"
+          ? getReleases().catch(() => [] as ReleaseSummary[])
+          : Promise.resolve([] as ReleaseSummary[]),
+      ])
+
+      const matched =
+        (catalogItems || []).find((item) => item.id === cfg.catalogId) ?? null
+      setEditStacks(
+        (stackList || []).filter((s) => s.name !== "management-cluster-core")
+      )
+      setEditReleases(releaseList || [])
+      setEditCatalogItem(matched)
+      setEditInitialConfig({
+        values: cfg.values,
+        name: cfg.name || name,
+        version: cfg.version || matched?.version || "",
+        tenant: cfg.tenant || "default",
+        targetCluster: cfg.targetCluster,
+        targetNamespace: cfg.targetNamespace,
+      })
+      if (!matched) {
+        setEditModalError(
+          `Catalog blueprint "${cfg.catalogId}" was not found for this instance.`
+        )
+      }
+    } catch (err) {
+      setEditModalError(
+        err instanceof Error
+          ? err.message
+          : "Failed to load instance configuration"
+      )
+    } finally {
+      setEditModalLoading(false)
+    }
+  }
+
   const handleEditRelease = (namespace: string, name: string) => {
-    setEditReleaseTarget({ namespace, name, kind: "app" })
-    navigateToTab("catalog")
+    void openEditInstanceModal(namespace, name, "app")
   }
 
   const handleEditStack = (namespace: string, name: string) => {
-    setEditReleaseTarget({ namespace, name, kind: "infra" })
-    navigateToTab("catalog")
+    void openEditInstanceModal(namespace, name, "infra")
   }
 
   useEffect(() => {
@@ -78,10 +161,9 @@ export const App: React.FC = () => {
   }, [])
   const [authStatus, setAuthStatus] = useState<AuthStatus>({
     authenticated: false,
-    phase: "bootstrap",
+    phase: "oidc-active",
     tenant: "tenant-default",
   })
-  const [isLoginModalOpen, setIsLoginModalOpen] = useState(false)
 
   useEffect(() => {
     let cancelled = false
@@ -104,21 +186,24 @@ export const App: React.FC = () => {
     }
   }, [])
 
-  const handleLoginSuccess = () => {
-    setAuthStatus({
-      authenticated: true,
-      phase: "bootstrap",
-      username: "Stage 0 Bootstrap Admin",
-      tenant: "tenant-default",
-    })
-    setIsLoginModalOpen(false)
+  const handleLogin = () => {
+    if (isDemoMode()) {
+      setAuthStatus({
+        authenticated: true,
+        phase: "oidc-active",
+        username: "Demo Admin (admin@keel.local)",
+        tenant: "tenant-default",
+      })
+      return
+    }
+    startOidcLogin()
   }
 
   const handleLogout = () => {
     setStoredToken(null)
     setAuthStatus({
       authenticated: false,
-      phase: "bootstrap",
+      phase: "oidc-active",
       tenant: "tenant-default",
     })
   }
@@ -163,8 +248,8 @@ export const App: React.FC = () => {
               <span className="flex items-center space-x-1.5 text-xs bg-emerald-500/10 text-emerald-300 border border-emerald-500/20 px-3 py-1.5 rounded-lg font-medium">
                 <ShieldCheck className="h-3.5 w-3.5 text-emerald-400" />
                 <span>
-                  {authStatus.phase === "bootstrap"
-                    ? "Stage 0 Auth"
+                  {authStatus.phase === "break-glass"
+                    ? "Break-Glass"
                     : "OIDC Auth"}
                 </span>
               </span>
@@ -179,11 +264,11 @@ export const App: React.FC = () => {
             </div>
           ) : (
             <button
-              onClick={() => setIsLoginModalOpen(true)}
+              onClick={handleLogin}
               className="flex items-center space-x-1.5 px-3.5 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg text-xs font-semibold transition-colors shadow-lg shadow-indigo-600/20"
             >
               <Key className="h-3.5 w-3.5" />
-              <span>Bootstrap Token Login</span>
+              <span>{isDemoMode() ? "Demo Login" : "Sign in with OIDC"}</span>
             </button>
           )}
         </div>
@@ -235,17 +320,17 @@ export const App: React.FC = () => {
               <div className="bg-slate-950 border border-slate-800 p-4 rounded-xl space-y-2">
                 <div className="flex items-center space-x-2 text-amber-400 text-xs font-medium">
                   <ShieldAlert className="h-4 w-4" />
-                  <span>Stage 0 Unauthenticated</span>
+                  <span>Unauthenticated</span>
                 </div>
                 <p className="text-[11px] text-slate-400 leading-normal">
-                  Authenticating via 256-bit token unlocks mutating PR synthesis
-                  and merge actions.
+                  Signing in via OIDC unlocks mutating PR synthesis and merge
+                  actions.
                 </p>
                 <button
-                  onClick={() => setIsLoginModalOpen(true)}
+                  onClick={handleLogin}
                   className="w-full py-1.5 bg-slate-800 hover:bg-slate-700 text-indigo-300 rounded text-xs font-medium transition-colors"
                 >
-                  Enter Token
+                  {isDemoMode() ? "Demo Login" : "Sign in with OIDC"}
                 </button>
               </div>
             </div>
@@ -263,24 +348,17 @@ export const App: React.FC = () => {
                 Authentication Required
               </h2>
               <p className="text-xs text-slate-400 leading-relaxed">
-                Sign in with the single-use Stage 0 bootstrap token printed by{" "}
-                <code className="font-mono text-slate-200 bg-slate-950 px-1.5 py-0.5 rounded">
-                  keel serve
-                </code>{" "}
-                or{" "}
-                <code className="font-mono text-slate-200 bg-slate-950 px-1.5 py-0.5 rounded">
-                  keel bootstrap init
-                </code>{" "}
-                to view cluster topology, enabled providers, catalog blueprints,
-                and open pull requests.
+                Sign in with your cluster OIDC identity provider (Dex or your
+                configured external IdP) to view cluster topology, enabled
+                providers, catalog blueprints, and open pull requests.
               </p>
               <button
                 type="button"
-                onClick={() => setIsLoginModalOpen(true)}
+                onClick={handleLogin}
                 className="inline-flex items-center space-x-2 px-5 py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-xs font-semibold transition-colors shadow-lg shadow-indigo-600/20 cursor-pointer"
               >
                 <Key className="h-4 w-4" />
-                <span>Enter Bootstrap Token</span>
+                <span>Sign in with OIDC</span>
               </button>
             </div>
           ) : (
@@ -303,8 +381,6 @@ export const App: React.FC = () => {
               {activeTab === "catalog" && (
                 <CatalogWizardView
                   onNavigateToPreview={() => navigateToTab("preview")}
-                  initialReleaseTarget={editReleaseTarget}
-                  onClearReleaseTarget={() => setEditReleaseTarget(null)}
                 />
               )}
               {activeTab === "preview" && <PreviewInspectorView />}
@@ -313,12 +389,77 @@ export const App: React.FC = () => {
         </main>
       </div>
 
-      {/* Stage 0 Bootstrap Login Modal */}
-      <BootstrapLoginModal
-        isOpen={isLoginModalOpen}
-        onSuccess={handleLoginSuccess}
-        onClose={() => setIsLoginModalOpen(false)}
+      {/* In-Place Instance Edit Modal (from Topology) */}
+      <DeployInstanceModal
+        isOpen={editModalOpen}
+        onClose={() => {
+          setEditModalOpen(false)
+          setEditCatalogItem(null)
+          setEditInitialConfig(null)
+          setEditModalError(null)
+        }}
+        catalogItem={editCatalogItem}
+        tenant={editInitialConfig?.tenant || "default"}
+        stacks={editStacks}
+        releases={editReleases}
+        initialConfig={editInitialConfig}
+        isEditMode={true}
+        loadingConfig={editModalLoading}
+        configError={editModalError}
+        onProposalCreated={(proposal) => setTopologyProposal(proposal)}
       />
+
+      {topologyProposal && (
+        <div
+          aria-label="Proposal Floating Toast"
+          className="fixed bottom-6 right-6 z-50 max-w-md bg-slate-900/95 backdrop-blur-md border border-emerald-500/40 shadow-2xl shadow-black/60 rounded-2xl p-4 text-slate-200 space-y-3"
+        >
+          <div className="flex items-start justify-between gap-3">
+            <div className="flex items-start space-x-2.5 min-w-0">
+              <CheckCircle2 className="h-5 w-5 text-emerald-400 shrink-0 mt-0.5" />
+              <div className="min-w-0">
+                <p className="text-xs font-bold text-white">
+                  PR #{topologyProposal.id} Opened
+                </p>
+                <p className="text-[11px] text-slate-400 truncate font-mono mt-0.5">
+                  {topologyProposal.branch}
+                </p>
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={() => setTopologyProposal(null)}
+              aria-label="Dismiss notification"
+              className="p-1 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 transition-colors cursor-pointer shrink-0"
+            >
+              <X className="h-3.5 w-3.5" />
+            </button>
+          </div>
+          <div className="flex items-center justify-end gap-2">
+            {topologyProposal.prUrl && (
+              <a
+                href={topologyProposal.prUrl}
+                target="_blank"
+                rel="noreferrer"
+                className="inline-flex items-center space-x-1 px-2.5 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 rounded-lg text-xs font-medium transition-colors"
+              >
+                <span>View on Forge</span>
+              </a>
+            )}
+            <button
+              type="button"
+              onClick={() => {
+                setTopologyProposal(null)
+                navigateToTab("preview")
+              }}
+              className="inline-flex items-center space-x-1.5 px-3 py-1.5 bg-purple-600 hover:bg-purple-500 text-white rounded-lg text-xs font-semibold transition-colors cursor-pointer"
+            >
+              <span>Go to PR</span>
+              <ArrowRight className="h-3.5 w-3.5" />
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

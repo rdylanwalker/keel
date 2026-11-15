@@ -23,8 +23,8 @@ pub use catalog::{
     validate_schema_values,
 };
 pub use crypto::{
-    AgeKeyPair, EnvelopeCrypto, SopsConfig, SopsCreationRule, SopsManager,
-    generate_bootstrap_token, sha256_hex, verify_bootstrap_token,
+    AgeKeyPair, EnvelopeCrypto, SopsConfig, SopsCreationRule, SopsManager, generate_admin_password,
+    hash_dex_password_bcrypt, sha256_hex,
 };
 pub use models::{
     AppRuntime, AuthPhase, BootstrapConfig, BootstrapDistro, BootstrapTargetKind, BundleItemKind,

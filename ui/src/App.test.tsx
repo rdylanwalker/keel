@@ -16,7 +16,9 @@ vi.mock("./lib/api", () => ({
     summary: { create: 0, update: 0, delete: 0, replace: 0, same: 0, drift: 0 },
   }),
   getReleases: vi.fn().mockResolvedValue([]),
-  bootstrapLogin: vi.fn(),
+  getReleaseConfig: vi.fn(),
+  getStackConfig: vi.fn(),
+  startOidcLogin: vi.fn(),
   setStoredToken: vi.fn(),
   createEventSourceStream: vi.fn(() => ({ close: vi.fn() })),
 }))
@@ -30,7 +32,7 @@ describe("App top-level application component", () => {
   it("renders header, default topology tab, and checks auth status", async () => {
     vi.mocked(api.getAuthStatus).mockResolvedValue({
       authenticated: false,
-      phase: "bootstrap",
+      phase: "oidc-active",
       tenant: "tenant-default",
     })
 
@@ -55,7 +57,7 @@ describe("App top-level application component", () => {
   it("switches navigation tabs across all 3 views", async () => {
     vi.mocked(api.getAuthStatus).mockResolvedValue({
       authenticated: true,
-      phase: "bootstrap",
+      phase: "oidc-active",
       tenant: "tenant-acme",
     })
 
@@ -100,47 +102,35 @@ describe("App top-level application component", () => {
     expect(window.location.hash).toBe("#topology")
   })
 
-  it("opens login modal, handles successful token authentication, and allows logout", async () => {
+  it("triggers OIDC PKCE login redirect when unauthenticated and supports demo mock login", async () => {
     vi.mocked(api.getAuthStatus).mockResolvedValue({
       authenticated: false,
-      phase: "bootstrap",
+      phase: "oidc-active",
       tenant: "tenant-default",
     })
-    vi.mocked(api.bootstrapLogin).mockResolvedValue({ success: true })
 
     await act(async () => {
       render(<App />)
     })
 
-    const loginBtn = screen.getByRole("button", {
-      name: /Bootstrap Token Login/i,
+    const loginBtns = screen.getAllByRole("button", {
+      name: /Sign in with OIDC/i,
     })
-    fireEvent.click(loginBtn)
+    fireEvent.click(loginBtns[0])
+    expect(api.startOidcLogin).toHaveBeenCalled()
 
-    expect(screen.getByText("Stage 0 Bootstrap Auth")).toBeInTheDocument()
-
-    const tokenInput = screen.getByPlaceholderText(/Enter 256-bit token/i)
-    fireEvent.change(tokenInput, { target: { value: "token-secret-256" } })
-
-    const authBtn = screen.getByRole("button", { name: /Authenticate Token/i })
+    // In demo mode, Demo Login sets authenticated state locally without OIDC redirect
+    window.history.replaceState({}, "", "/?demo=true")
     await act(async () => {
-      fireEvent.click(authBtn)
+      render(<App />)
     })
+    const demoBtn = screen.getAllByRole("button", { name: /Demo Login/i })[0]
+    fireEvent.click(demoBtn)
+    expect(screen.getAllByText("OIDC Auth").length).toBeGreaterThan(0)
 
-    await waitFor(() => {
-      expect(screen.getByText("Stage 0 Auth")).toBeInTheDocument()
-    })
-
-    // Click logout
-    const logoutBtn = screen.getByLabelText("Logout")
-    await act(async () => {
-      fireEvent.click(logoutBtn)
-    })
-
+    const logoutBtn = screen.getAllByRole("button", { name: /Logout/i })[0]
+    fireEvent.click(logoutBtn)
     expect(api.setStoredToken).toHaveBeenCalledWith(null)
-    expect(
-      screen.getByRole("button", { name: /Bootstrap Token Login/i })
-    ).toBeInTheDocument()
   })
 
   it("handles auth status failure gracefully on mount", async () => {
@@ -151,7 +141,7 @@ describe("App top-level application component", () => {
     })
 
     await waitFor(() => {
-      expect(screen.getByText("Stage 0 Unauthenticated")).toBeInTheDocument()
+      expect(screen.getByText("Unauthenticated")).toBeInTheDocument()
     })
   })
 
@@ -159,7 +149,7 @@ describe("App top-level application component", () => {
     window.history.replaceState({}, "", "/?demo=true")
     vi.mocked(api.getAuthStatus).mockResolvedValue({
       authenticated: true,
-      phase: "bootstrap",
+      phase: "oidc-active",
       tenant: "tenant-acme",
     })
 
@@ -192,7 +182,7 @@ describe("App top-level application component", () => {
     window.history.replaceState(null, "", "/#preview")
     vi.mocked(api.getAuthStatus).mockResolvedValue({
       authenticated: true,
-      phase: "bootstrap",
+      phase: "oidc-active",
       tenant: "tenant-acme",
     })
 
@@ -209,5 +199,64 @@ describe("App top-level application component", () => {
       await screen.findByText("Cluster & Provider Topology Map")
     ).toBeInTheDocument()
     expect(window.location.hash).toBe("#topology")
+  })
+
+  it("opens in-place edit modal when editing a release from TopologyView", async () => {
+    vi.mocked(api.getAuthStatus).mockResolvedValue({
+      authenticated: true,
+      phase: "oidc-active",
+      tenant: "tenant-acme",
+    })
+    vi.mocked(api.getReleases).mockResolvedValue([
+      {
+        id: "tenant-acme/podinfo",
+        name: "podinfo",
+        namespace: "tenant-acme",
+        tenant: "acme",
+        type: "helm",
+        chart: "podinfo",
+        version: "6.5.0",
+        status: "synced",
+      },
+    ])
+    vi.mocked(api.getReleaseConfig).mockResolvedValue({
+      catalogId: "podinfo",
+      name: "podinfo",
+      version: "6.5.0",
+      tenant: "acme",
+      values: { replicaCount: 2 },
+    })
+    vi.mocked(api.getCatalog).mockResolvedValue([
+      {
+        id: "podinfo",
+        name: "Podinfo App",
+        description: "Test",
+        category: "apps",
+        type: "app",
+        version: "6.5.0",
+        schema: {
+          type: "object",
+          properties: { replicaCount: { type: "integer" } },
+        },
+      },
+    ])
+
+    await act(async () => {
+      render(<App />)
+    })
+
+    const editBtn = await screen.findByRole("button", {
+      name: /Edit release podinfo/i,
+    })
+    await act(async () => {
+      fireEvent.click(editBtn)
+    })
+
+    await waitFor(() => {
+      expect(api.getReleaseConfig).toHaveBeenCalledWith(
+        "tenant-acme",
+        "podinfo"
+      )
+    })
   })
 })

@@ -1,7 +1,6 @@
 import { RJSFSchema } from "@rjsf/utils"
 import {
   AuthStatus,
-  BootstrapLoginResponse,
   CatalogBundleItem,
   CatalogItem,
   CreateCatalogItemPayload,
@@ -70,20 +69,8 @@ async function handleResponse<T>(res: Response): Promise<T> {
   return res.json() as Promise<T>
 }
 
-export async function bootstrapLogin(
-  token: string
-): Promise<BootstrapLoginResponse> {
-  const res = await fetch("/api/v1/auth/bootstrap-login", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ token }),
-  })
-
-  const data = await handleResponse<BootstrapLoginResponse>(res)
-  if ((data.authenticated || data.success) && data.token) {
-    setStoredToken(data.token)
-  }
-  return data
+export function startOidcLogin(): void {
+  window.location.assign("/api/v1/auth/login")
 }
 
 export async function getAuthStatus(): Promise<AuthStatus> {

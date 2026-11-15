@@ -29,10 +29,9 @@ pub use live::{
     extract_last_synced, extract_ready_status, extract_resource_count,
 };
 pub use secret_store::{
-    BOOTSTRAP_TOKEN_SECRET_NAME, InMemorySecretStore, K8sSecretStore, SESSION_KEY_LEN,
-    SESSION_KEY_SECRET_NAME, SecretStateStore, TENANT_SOPS_AGE_SECRET_NAME, TenantAgeKey,
-    USER_GIT_CREDS_SECRET_PREFIX, UserGitCredentials, generate_bootstrap_token,
-    hash_bootstrap_token, user_git_creds_secret_name,
+    DEX_CONFIG_SECRET_NAME, InMemorySecretStore, K8sSecretStore, S3_CREDENTIALS_SECRET_NAME,
+    SESSION_KEY_LEN, SESSION_KEY_SECRET_NAME, SecretStateStore, TENANT_SOPS_AGE_SECRET_NAME,
+    TenantAgeKey, USER_GIT_CREDS_SECRET_PREFIX, UserGitCredentials, user_git_creds_secret_name,
 };
 pub use telemetry::{
     CrdReconcileStatus, CrdWatchEvent, DEFAULT_TELEMETRY_BUFFER_CAPACITY, TelemetryMux,

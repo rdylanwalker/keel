@@ -1,0 +1,37 @@
+# Dex OIDC Identity Provider (`SDD.md` §2.1, §6.1, §6.3, `NFR-SEC-01`)
+# Apache-2.0 licensed, Kubernetes CRD-backed OIDC provider with username/password DB
+# and extensible upstream connectors (Google, Apple, LDAP/Active Directory, etc.).
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: dex
+  namespace: keel-system
+  labels:
+    app.kubernetes.io/managed-by: keel
+spec:
+  interval: 10m
+  chart:
+    spec:
+      chart: dex
+      version: "0.21.0"
+      sourceRef:
+        kind: HelmRepository
+        name: dex
+        namespace: keel-system
+  install:
+    crds: CreateReplace
+  upgrade:
+    crds: CreateReplace
+  values:
+    replicaCount: 1
+    configSecret:
+      create: false
+      name: dex-config
+    # Stage 0 seeds `keel-system/dex-config` with `enablePasswordDB: true`,
+    # bcrypt-hashed `staticPasswords` for the initial admin user, and the
+    # `keel-server` public PKCE client. Additional connectors (Google, Apple,
+    # Active Directory / LDAP) can be added via Git PR under `config.connectors`.
+    service:
+      ports:
+        http:
+          port: 5556

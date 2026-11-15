@@ -56,6 +56,7 @@ pub struct BootstrapArgs {
 
 /// Subcommands under `keel bootstrap`.
 #[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
 pub enum BootstrapCommands {
     /// Execute Stage 0 seed cluster bootstrap across local kind, kubeconfig, Proxmox, or cloud targets
     Init(BootstrapInitArgs),
@@ -98,9 +99,21 @@ pub struct BootstrapInitArgs {
     #[arg(long, default_value_t = false)]
     pub with_forge: bool,
 
-    /// Deploy an in-cluster OIDC identity provider during Stage 0
-    #[arg(long, default_value_t = false)]
-    pub with_oidc: bool,
+    /// External OIDC issuer URL (disables in-cluster Dex OIDC deployment when provided)
+    #[arg(long)]
+    pub oidc_issuer: Option<String>,
+
+    /// OIDC client ID (defaults to `keel-server`)
+    #[arg(long)]
+    pub oidc_client_id: Option<String>,
+
+    /// Initial admin username/email for Stage 0 Dex seeding (defaults to `admin@keel.local`)
+    #[arg(long)]
+    pub admin_username: Option<String>,
+
+    /// Initial admin password for Stage 0 Dex seeding (auto-generated if omitted)
+    #[arg(long, env = "KEEL_ADMIN_PASSWORD")]
+    pub admin_password: Option<String>,
 
     /// Explicitly enable Kyverno `PolicyException` allowing Docker socket access on local `kind` clusters
     #[arg(long, default_value_t = false)]
@@ -140,7 +153,11 @@ impl BootstrapInitArgs {
             kubeconfig: self.kubeconfig.clone(),
             context: self.context.clone(),
             with_forge: self.with_forge,
-            with_oidc: self.with_oidc,
+            with_oidc: self.oidc_issuer.is_none(),
+            oidc_issuer: self.oidc_issuer.clone(),
+            oidc_client_id: self.oidc_client_id.clone(),
+            admin_username: self.admin_username.clone(),
+            admin_password: self.admin_password.clone(),
             local_dev_docker_socket_exception: self.local_dev_docker_socket_exception,
             proxmox_url: self.proxmox_url.clone(),
             region: self.region.clone(),
@@ -176,32 +193,16 @@ pub struct AuthArgs {
 /// Subcommands under `keel auth`.
 #[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
 pub enum AuthCommands {
-    /// Authenticate the CLI against keel-server via OIDC PKCE or Stage 0 bootstrap token
+    /// Authenticate the CLI against keel-server via OIDC Authorization Code + PKCE
     Login(AuthLoginArgs),
 }
 
-/// Arguments for `keel auth login` (`SDD.md` §6.1, §7.2, `NFR-SEC-01`, `NFR-SEC-05`).
-#[derive(Args, Clone, PartialEq, Eq)]
+/// Arguments for `keel auth login` (`SDD.md` §6.1, §7.2, `NFR-SEC-01`).
+#[derive(Args, Debug, Clone, PartialEq, Eq)]
 pub struct AuthLoginArgs {
     /// Keel server base URL
     #[arg(long, default_value = DEFAULT_SERVER_URL)]
     pub server: String,
-
-    /// Single-use 256-bit Stage 0 bootstrap token (initiates OIDC PKCE flow when omitted)
-    #[arg(long)]
-    pub bootstrap_token: Option<String>,
-}
-
-impl fmt::Debug for AuthLoginArgs {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("AuthLoginArgs")
-            .field("server", &self.server)
-            .field(
-                "bootstrap_token",
-                &self.bootstrap_token.as_ref().map(|_| "[REDACTED]"),
-            )
-            .finish()
-    }
 }
 
 /// Arguments for `keel serve` (`SDD.md` §7.2).
@@ -415,7 +416,10 @@ mod tests {
                     assert!(args.region.is_none());
                     assert!(args.distro.is_none());
                     assert!(!args.with_forge);
-                    assert!(!args.with_oidc);
+                    assert!(args.oidc_issuer.is_none());
+                    assert!(args.oidc_client_id.is_none());
+                    assert!(args.admin_username.is_none());
+                    assert!(args.admin_password.is_none());
                     assert!(!args.local_dev_docker_socket_exception);
                     assert!(args.repo_dir.is_none());
                     assert!(!args.skip_core_install);
@@ -446,7 +450,12 @@ mod tests {
             "--distro",
             "talos",
             "--with-forge",
-            "--with-oidc",
+            "--oidc-issuer",
+            "https://idp.example.com",
+            "--oidc-client-id",
+            "keel-custom",
+            "--admin-username",
+            "ops@example.com",
             "--local-dev-docker-socket-exception",
             "--skip-core-install",
             "--repo-dir",
@@ -469,7 +478,9 @@ mod tests {
         assert_eq!(args.region.as_deref(), Some("us-east-1"));
         assert_eq!(args.distro, Some(BootstrapDistro::Talos));
         assert!(args.with_forge);
-        assert!(args.with_oidc);
+        assert_eq!(args.oidc_issuer.as_deref(), Some("https://idp.example.com"));
+        assert_eq!(args.oidc_client_id.as_deref(), Some("keel-custom"));
+        assert_eq!(args.admin_username.as_deref(), Some("ops@example.com"));
         assert!(args.local_dev_docker_socket_exception);
         assert!(args.skip_core_install);
         assert_eq!(args.repo_dir, Some(PathBuf::from("/tmp/keel-gitops")));
@@ -546,7 +557,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_auth_login_and_redact_debug_token() {
+    fn parse_auth_login() {
         let oidc_cli = Cli::try_parse_from(["keel", "auth", "login"]).unwrap();
         let Commands::Auth(AuthArgs {
             command: AuthCommands::Login(oidc_args),
@@ -555,33 +566,17 @@ mod tests {
             panic!("expected auth login");
         };
         assert_eq!(oidc_args.server, "http://127.0.0.1:8080");
-        assert!(oidc_args.bootstrap_token.is_none());
 
-        let token_cli = Cli::try_parse_from([
-            "keel",
-            "auth",
-            "login",
-            "--server",
-            "https://keel.internal",
-            "--bootstrap-token",
-            "super-secret-bootstrap-token-hex",
-        ])
-        .unwrap();
+        let custom_cli =
+            Cli::try_parse_from(["keel", "auth", "login", "--server", "https://keel.internal"])
+                .unwrap();
         let Commands::Auth(AuthArgs {
-            command: AuthCommands::Login(token_args),
-        }) = token_cli.command
+            command: AuthCommands::Login(custom_args),
+        }) = custom_cli.command
         else {
             panic!("expected auth login");
         };
-        assert_eq!(token_args.server, "https://keel.internal");
-        assert_eq!(
-            token_args.bootstrap_token.as_deref(),
-            Some("super-secret-bootstrap-token-hex")
-        );
-
-        let dbg = format!("{token_args:?}");
-        assert!(!dbg.contains("super-secret-bootstrap-token-hex"));
-        assert!(dbg.contains("[REDACTED]"));
+        assert_eq!(custom_args.server, "https://keel.internal");
     }
 
     #[test]

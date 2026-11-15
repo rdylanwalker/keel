@@ -96,9 +96,13 @@ Stage 0 Bootstrap Token: <64-character-hex-token>
 
 ### CLI
 
+When OIDC is configured (Stage 1+), authenticate the CLI via OIDC Authorization Code + PKCE:
+
 ```bash
-keel auth login --server http://127.0.0.1:8080 --bootstrap-token <TOKEN>
+keel auth login --server http://127.0.0.1:8080
 ```
+
+For Stage 0 local development before OIDC is enabled, use **Bootstrap Token Login** in the Web UI (or exchange the token via `POST /api/v1/auth/bootstrap`).
 
 ## 4. Break-Glass Recovery
 

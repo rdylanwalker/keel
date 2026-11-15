@@ -35,8 +35,8 @@ use keel_kube::{
 use keel_pko::{
     ChangeOp, EphemeralPreviewParams, GcPlan, PkoEnvRef, PkoStack, PreviewReport,
     PreviewResourceCandidate, PreviewSummary, ResourceDiff, TenantStackParams,
-    build_preview_branch, format_markdown_report, plan_preview_gc, synthesize_ephemeral_preview,
-    synthesize_tenant_stack,
+    attach_s3_credentials_env_refs, build_preview_branch, format_markdown_report, plan_preview_gc,
+    synthesize_ephemeral_preview, synthesize_tenant_stack,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -54,7 +54,6 @@ pub async fn healthz() -> &'static str {
 pub async fn metrics(State(state): State<AppState>) -> Response {
     let phase = *state.auth_phase.read().await;
     let phase_label = match phase {
-        keel_core::AuthPhase::Bootstrap => "bootstrap",
         keel_core::AuthPhase::OidcActive => "oidc-active",
         keel_core::AuthPhase::BreakGlass => "break-glass",
     };
@@ -2089,6 +2088,14 @@ pub async fn create_proposal(
                     PkoEnvRef::from_secret(&infra_secret_name, secret_key),
                 );
             }
+            if let Some(ref s3_secret) = state.s3_credentials_secret {
+                let tenant_ns = tenant_namespace(&req.tenant)?;
+                let _ = state
+                    .secret_store
+                    .ensure_s3_credentials_in_namespace(&tenant_ns)
+                    .await;
+                attach_s3_credentials_env_refs(&mut stack_params.env_refs, s3_secret);
+            }
             if bp.spec.outputs.iter().any(|o| o == "kubeconfig") {
                 stack_params.config.insert(
                     "kubeconfigSecretName".to_string(),
@@ -2364,6 +2371,13 @@ pub async fn create_proposal(
     )?;
     if !is_app {
         populate_stack_config_from_values(&mut preview_params.config, &partitioned.normal_values);
+        if let Some(ref s3_secret) = state.s3_credentials_secret {
+            let _ = state
+                .secret_store
+                .ensure_s3_credentials_in_namespace(KEEL_PREVIEWS_NAMESPACE)
+                .await;
+            attach_s3_credentials_env_refs(&mut preview_params.env_refs, s3_secret);
+        }
     }
     let preview_stack = synthesize_ephemeral_preview(&preview_params)?;
 
@@ -2710,6 +2724,13 @@ async fn create_bundle_proposal(
                 if bp.metadata.provider == "kind" {
                     stack_params.docker_host = state.docker_proxy_url.clone();
                 }
+                if let Some(ref s3_secret) = state.s3_credentials_secret {
+                    let _ = state
+                        .secret_store
+                        .ensure_s3_credentials_in_namespace(&tenant_ns)
+                        .await;
+                    attach_s3_credentials_env_refs(&mut stack_params.env_refs, s3_secret);
+                }
                 if let Some(obj) = partitioned.normal_values.as_object() {
                     for (k, v) in obj {
                         let str_val = match v {
@@ -2971,6 +2992,13 @@ async fn create_bundle_proposal(
         &state.backend_url,
     )?;
     preview_params.docker_host = state.docker_proxy_url.clone();
+    if let Some(ref s3_secret) = state.s3_credentials_secret {
+        let _ = state
+            .secret_store
+            .ensure_s3_credentials_in_namespace(KEEL_PREVIEWS_NAMESPACE)
+            .await;
+        attach_s3_credentials_env_refs(&mut preview_params.env_refs, s3_secret);
+    }
     let preview_stack = synthesize_ephemeral_preview(&preview_params)?;
 
     let resources: Vec<ResourceDiff> = prepared_items

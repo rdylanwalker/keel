@@ -21,6 +21,9 @@ pub const FLUX_GIT_REPO_KIND: &str = "GitRepository";
 /// Canonical resource name for the protected Stage 0/1 seed management cluster stack.
 pub const MANAGEMENT_CORE_STACK_NAME: &str = "management-cluster-core";
 
+/// Default in-cluster S3-compatible Pulumi state backend URL (`keel-system/s3-state-backend-seaweedfs-s3`).
+pub const IN_CLUSTER_S3_BACKEND_URL: &str = "s3://pulumi-state?endpoint=s3-state-backend-seaweedfs-s3.keel-system.svc.cluster.local:8333&region=us-east-1&s3ForcePathStyle=true&disableSSL=true";
+
 pub use keel_core::{FLUX_SYSTEM_NAMESPACE, KEEL_PREVIEWS_NAMESPACE};
 
 /// Default outbound pull-polling interval for NAT/firewall resilience (`AGENTS.md` §3.1).
@@ -857,6 +860,21 @@ pub fn synthesize_tenant_stack(params: &TenantStackParams) -> Result<PkoStack, P
             }),
         },
     })
+}
+
+/// Attaches `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` `envRefs` pointing to `secret_name`.
+pub fn attach_s3_credentials_env_refs(
+    env_refs: &mut BTreeMap<String, PkoEnvRef>,
+    secret_name: &str,
+) {
+    env_refs.insert(
+        "AWS_ACCESS_KEY_ID".to_string(),
+        PkoEnvRef::from_secret(secret_name, "accessKey"),
+    );
+    env_refs.insert(
+        "AWS_SECRET_ACCESS_KEY".to_string(),
+        PkoEnvRef::from_secret(secret_name, "secretKey"),
+    );
 }
 
 fn ensure_trailing_newline(s: &str) -> String {

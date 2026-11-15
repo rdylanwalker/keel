@@ -1,26 +1,20 @@
 import React, { useEffect, useState } from "react"
-import Form from "@rjsf/core"
-import validator from "@rjsf/validator-ajv8"
-import { IconButtonProps, RJSFSchema, ValidatorType } from "@rjsf/utils"
+import type { RJSFSchema } from "@rjsf/utils"
 import {
   Search,
   Layers,
-  FileCode2,
   CheckCircle2,
   AlertCircle,
   Loader2,
   ArrowRight,
-  ArrowUp,
-  ArrowDown,
-  Copy,
   GitPullRequest,
   Box,
   Plus,
   Trash2,
   X,
-  RefreshCw,
-  AlertTriangle,
   Pencil,
+  Maximize2,
+  Minimize2,
 } from "lucide-react"
 import {
   CatalogBundleItem,
@@ -33,10 +27,8 @@ import {
 } from "../types/api"
 import {
   createCatalogApp,
-  createProposal,
   createTenant,
   deleteTenant,
-  fetchCatalogSchema,
   getCatalog,
   getReleaseConfig,
   getReleases,
@@ -45,7 +37,19 @@ import {
   getTenants,
   updateCatalogItem,
 } from "../lib/api"
-import { jsonToYaml, isDemoMode } from "../lib/utils"
+import { isDemoMode } from "../lib/utils"
+import {
+  PROVIDER_CREDENTIAL_PRESETS,
+  SchemaFieldDraft,
+  SchemaFieldType,
+  deriveFieldsFromPulumiYaml,
+  fieldsToSchemaJson,
+  schemaJsonToFields,
+} from "../lib/schemaBuilder"
+import {
+  DeployInstanceInitialConfig,
+  DeployInstanceModal,
+} from "./DeployInstanceModal"
 
 const DEMO_TENANTS: TenantSummary[] = [
   { id: "default", namespace: "tenant-default" },
@@ -202,47 +206,6 @@ const DEFAULT_CATALOG: CatalogItem[] = [
   },
 ]
 
-function extractSchemaDefaults(
-  schema?: Record<string, unknown>,
-  defaultValues?: Record<string, unknown>
-): Record<string, unknown> {
-  const result: Record<string, unknown> = { ...(defaultValues ?? {}) }
-  const properties = schema?.properties
-  if (
-    !properties ||
-    typeof properties !== "object" ||
-    Array.isArray(properties)
-  ) {
-    return result
-  }
-  for (const [key, rawProp] of Object.entries(
-    properties as Record<string, unknown>
-  )) {
-    if (!rawProp || typeof rawProp !== "object" || Array.isArray(rawProp)) {
-      continue
-    }
-    const prop = rawProp as Record<string, unknown>
-    if (result[key] === undefined && prop.default !== undefined) {
-      result[key] = prop.default
-    } else if (
-      prop.type === "object" &&
-      prop.properties &&
-      typeof prop.properties === "object"
-    ) {
-      const nested = extractSchemaDefaults(
-        prop,
-        result[key] && typeof result[key] === "object"
-          ? (result[key] as Record<string, unknown>)
-          : undefined
-      )
-      if (Object.keys(nested).length > 0) {
-        result[key] = nested
-      }
-    }
-  }
-  return result
-}
-
 export interface CatalogWizardViewProps {
   onNavigateToPreview?: () => void
   initialReleaseTarget?: {
@@ -251,99 +214,6 @@ export interface CatalogWizardViewProps {
     kind?: "app" | "infra"
   } | null
   onClearReleaseTarget?: () => void
-}
-
-const RjsfAddButton: React.FC<IconButtonProps> = ({
-  onClick,
-  disabled,
-  className,
-}) => (
-  <button
-    type="button"
-    onClick={onClick}
-    disabled={disabled}
-    className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium bg-indigo-600/20 hover:bg-indigo-600/30 text-indigo-300 border border-indigo-500/30 transition-colors cursor-pointer disabled:opacity-50 ${className ?? ""}`}
-    title="Add item"
-  >
-    <Plus className="h-3.5 w-3.5" />
-    <span>Add</span>
-  </button>
-)
-
-const RjsfRemoveButton: React.FC<IconButtonProps> = ({
-  onClick,
-  disabled,
-  className,
-}) => (
-  <button
-    type="button"
-    onClick={onClick}
-    disabled={disabled}
-    className={`inline-flex items-center justify-center p-1.5 rounded-lg text-xs bg-red-500/10 hover:bg-red-500/20 text-red-400 border border-red-500/25 transition-colors cursor-pointer disabled:opacity-50 ${className ?? ""}`}
-    title="Remove item"
-    aria-label="Remove item"
-  >
-    <Trash2 className="h-3.5 w-3.5" />
-  </button>
-)
-
-const RjsfMoveUpButton: React.FC<IconButtonProps> = ({
-  onClick,
-  disabled,
-  className,
-}) => (
-  <button
-    type="button"
-    onClick={onClick}
-    disabled={disabled}
-    className={`inline-flex items-center justify-center p-1.5 rounded-lg text-xs bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 transition-colors cursor-pointer disabled:opacity-40 ${className ?? ""}`}
-    title="Move up"
-    aria-label="Move up"
-  >
-    <ArrowUp className="h-3.5 w-3.5" />
-  </button>
-)
-
-const RjsfMoveDownButton: React.FC<IconButtonProps> = ({
-  onClick,
-  disabled,
-  className,
-}) => (
-  <button
-    type="button"
-    onClick={onClick}
-    disabled={disabled}
-    className={`inline-flex items-center justify-center p-1.5 rounded-lg text-xs bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 transition-colors cursor-pointer disabled:opacity-40 ${className ?? ""}`}
-    title="Move down"
-    aria-label="Move down"
-  >
-    <ArrowDown className="h-3.5 w-3.5" />
-  </button>
-)
-
-const RjsfCopyButton: React.FC<IconButtonProps> = ({
-  onClick,
-  disabled,
-  className,
-}) => (
-  <button
-    type="button"
-    onClick={onClick}
-    disabled={disabled}
-    className={`inline-flex items-center justify-center p-1.5 rounded-lg text-xs bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 transition-colors cursor-pointer disabled:opacity-40 ${className ?? ""}`}
-    title="Duplicate item"
-    aria-label="Duplicate item"
-  >
-    <Copy className="h-3.5 w-3.5" />
-  </button>
-)
-
-const RJSF_BUTTON_TEMPLATES = {
-  AddButton: RjsfAddButton,
-  RemoveButton: RjsfRemoveButton,
-  MoveUpButton: RjsfMoveUpButton,
-  MoveDownButton: RjsfMoveDownButton,
-  CopyButton: RjsfCopyButton,
 }
 
 export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
@@ -355,47 +225,39 @@ export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
     isDemoMode() ? DEFAULT_CATALOG : []
   )
   const [searchQuery, setSearchQuery] = useState("")
-  const [selectedItem, setSelectedItem] = useState<CatalogItem | null>(() =>
-    isDemoMode() ? DEFAULT_CATALOG[0] : null
+  const [deployModalItem, setDeployModalItem] = useState<CatalogItem | null>(
+    null
   )
-  const [formData, setFormData] = useState<Record<string, unknown>>(() =>
-    isDemoMode()
-      ? (DEFAULT_CATALOG[0].defaultValues as Record<string, unknown>) || {}
-      : {}
-  )
+  const [deployInitialConfig, setDeployInitialConfig] =
+    useState<DeployInstanceInitialConfig | null>(null)
+  const [isDeployModalOpen, setIsDeployModalOpen] = useState(false)
+  const [isDeployEditMode, setIsDeployEditMode] = useState(false)
+
   const [tenant, setTenant] = useState("default")
   const [stacks, setStacks] = useState<StackSummary[]>([])
   const [releases, setReleases] = useState<ReleaseSummary[]>([])
-  const [targetCluster, setTargetCluster] = useState("")
-  const [customClusterSecret, setCustomClusterSecret] = useState("")
-  const [instanceName, setInstanceName] = useState<string>(() =>
-    isDemoMode() ? DEFAULT_CATALOG[0].id : ""
-  )
-  const [chartVersion, setChartVersion] = useState<string>(() =>
-    isDemoMode() ? DEFAULT_CATALOG[0].version || "" : ""
-  )
-  const [targetNamespace, setTargetNamespace] = useState<string>("")
   const [tenants, setTenants] = useState<TenantSummary[]>(() =>
     isDemoMode()
       ? DEMO_TENANTS
       : [{ id: "default", namespace: "tenant-default" }]
   )
-  const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [createdProposal, setCreatedProposal] = useState<Proposal | null>(null)
 
   const [isNewTenantModalOpen, setIsNewTenantModalOpen] = useState(false)
+  const [isTenantModalFullscreen, setIsTenantModalFullscreen] = useState(false)
   const [newTenantId, setNewTenantId] = useState("")
   const [tenantLoading, setTenantLoading] = useState(false)
   const [tenantError, setTenantError] = useState<string | null>(null)
 
   const [isAddAppModalOpen, setIsAddAppModalOpen] = useState(false)
+  const [isAddModalFullscreen, setIsAddModalFullscreen] = useState(false)
   const [editingCatalogItem, setEditingCatalogItem] =
     useState<CatalogItem | null>(null)
   const [schemaJsonText, setSchemaJsonText] = useState("")
+  const [schemaFields, setSchemaFields] = useState<SchemaFieldDraft[]>([])
   const [showSchemaEditor, setShowSchemaEditor] = useState(false)
   const [appLoading, setAppLoading] = useState(false)
-  const [syncingSchema, setSyncingSchema] = useState(false)
   const [appError, setAppError] = useState<string | null>(null)
   const [appForm, setAppForm] = useState<CreateCatalogItemPayload>({
     kind: "app",
@@ -464,30 +326,13 @@ export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
         const items = await getCatalog()
         if (items && items.length > 0) {
           setCatalog(items)
-          setSelectedItem((prev) => {
-            if (prev && items.some((i) => i.id === prev.id)) return prev
-            return items[0]
-          })
-          setInstanceName((prev) => prev || items[0].id)
-          setChartVersion((prev) => prev || items[0].version || "")
-          setFormData((prev) => {
-            if (Object.keys(prev).length > 0) return prev
-            return extractSchemaDefaults(
-              items[0].schema as Record<string, unknown>,
-              items[0].defaultValues as Record<string, unknown> | undefined
-            )
-          })
         } else if (!isDemoMode()) {
           setCatalog([])
-          setSelectedItem(null)
-          setFormData({})
         }
       } catch (err) {
         setError(err instanceof Error ? err.message : "Failed to load catalog")
         if (!isDemoMode()) {
           setCatalog([])
-          setSelectedItem(null)
-          setFormData({})
         }
       }
     }
@@ -514,38 +359,20 @@ export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
               initialReleaseTarget.name
             )
         if (cancelled) return
-        const matched = catalog.find((item) => item.id === cfg.catalogId)
-        if (matched) {
-          setSelectedItem(matched)
-          setFormData(
-            extractSchemaDefaults(
-              matched.schema as Record<string, unknown>,
-              cfg.values
-            )
-          )
-          setChartVersion(cfg.version || matched.version || "")
-        } else {
-          setFormData(cfg.values || {})
-          setChartVersion(cfg.version || "")
-        }
+        const matched =
+          catalog.find((item) => item.id === cfg.catalogId) ?? null
         setTenant(cfg.tenant || "default")
-        setInstanceName(cfg.name || initialReleaseTarget.name)
-        if (cfg.targetCluster) {
-          const matchesStack = stacks.some(
-            (s) => `${s.name}-kubeconfig` === cfg.targetCluster
-          )
-          if (matchesStack) {
-            setTargetCluster(cfg.targetCluster)
-            setCustomClusterSecret("")
-          } else {
-            setTargetCluster("__custom__")
-            setCustomClusterSecret(cfg.targetCluster)
-          }
-        } else {
-          setTargetCluster("")
-          setCustomClusterSecret("")
-        }
-        setTargetNamespace(cfg.targetNamespace || "")
+        setDeployModalItem(matched)
+        setDeployInitialConfig({
+          values: cfg.values,
+          name: cfg.name || initialReleaseTarget.name,
+          version: cfg.version || matched?.version || "",
+          tenant: cfg.tenant || "default",
+          targetCluster: cfg.targetCluster,
+          targetNamespace: cfg.targetNamespace,
+        })
+        setIsDeployEditMode(true)
+        setIsDeployModalOpen(Boolean(matched))
         setCreatedProposal(null)
         setError(null)
       } catch (err) {
@@ -566,76 +393,13 @@ export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
     return () => {
       cancelled = true
     }
-  }, [initialReleaseTarget, catalog, stacks, onClearReleaseTarget])
+  }, [initialReleaseTarget, catalog, onClearReleaseTarget])
 
-  const handleFormChange = (data: { formData?: Record<string, unknown> }) => {
-    if (data.formData) {
-      setFormData(data.formData)
-    }
-  }
-
-  const handleSyncUpstreamSchema = async () => {
-    if (!selectedItem?.repoUrl) return
-    const chartName = selectedItem.chart || selectedItem.id
-    setSyncingSchema(true)
-    setError(null)
-    try {
-      const { schema: upstreamSchema } = await fetchCatalogSchema({
-        repoUrl: selectedItem.repoUrl,
-        chart: chartName,
-        version: selectedItem.version,
-      })
-      const existingSchema = (selectedItem.schema ?? {}) as Record<
-        string,
-        unknown
-      >
-      const existingProps =
-        (existingSchema.properties as Record<string, unknown> | undefined) ?? {}
-      const upstreamProps =
-        (upstreamSchema.properties as Record<string, unknown> | undefined) ?? {}
-      const mergedSchema: RJSFSchema = {
-        ...upstreamSchema,
-        required: Array.isArray(existingSchema.required)
-          ? (existingSchema.required as string[])
-          : (upstreamSchema.required as string[] | undefined),
-        properties: {
-          ...upstreamProps,
-          ...existingProps,
-        } as RJSFSchema["properties"],
-      }
-      const updatedItem: CatalogItem = { ...selectedItem, schema: mergedSchema }
-      setSelectedItem(updatedItem)
-      setCatalog((prev) =>
-        prev.map((item) => (item.id === updatedItem.id ? updatedItem : item))
-      )
-      setFormData(
-        extractSchemaDefaults(
-          mergedSchema as Record<string, unknown>,
-          updatedItem.defaultValues as Record<string, unknown> | undefined
-        )
-      )
-    } catch (err: unknown) {
-      setError(
-        err instanceof Error
-          ? err.message
-          : "Failed to sync upstream Helm values schema"
-      )
-    } finally {
-      setSyncingSchema(false)
-    }
-  }
-
-  const handleSelectCatalogItem = (item: CatalogItem) => {
-    setSelectedItem(item)
-    setInstanceName(item.id)
-    setChartVersion(item.version || "")
-    setTargetNamespace("")
-    setFormData(
-      extractSchemaDefaults(
-        item.schema as Record<string, unknown>,
-        item.defaultValues as Record<string, unknown> | undefined
-      )
-    )
+  const openDeployModal = (item: CatalogItem) => {
+    setDeployModalItem(item)
+    setDeployInitialConfig(null)
+    setIsDeployEditMode(false)
+    setIsDeployModalOpen(true)
     setCreatedProposal(null)
     setError(null)
   }
@@ -703,6 +467,7 @@ export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
     setEditingCatalogItem(null)
     setAppError(null)
     setSchemaJsonText("")
+    setSchemaFields([])
     setShowSchemaEditor(false)
     setAppForm({
       kind: "app",
@@ -736,9 +501,13 @@ export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
           : "app"
     setEditingCatalogItem(item)
     setAppError(null)
-    setSchemaJsonText(
-      JSON.stringify(item.schema ?? { type: "object", properties: {} }, null, 2)
+    const initialSchemaJson = JSON.stringify(
+      item.schema ?? { type: "object", properties: {} },
+      null,
+      2
     )
+    setSchemaJsonText(initialSchemaJson)
+    setSchemaFields(schemaJsonToFields(initialSchemaJson) ?? [])
     setShowSchemaEditor(false)
     setAppForm({
       kind: normalizedKind,
@@ -939,72 +708,6 @@ export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
     }
   }
 
-  const handleSubmit = async (
-    data?: { formData?: Record<string, unknown> } | React.FormEvent
-  ) => {
-    if (!selectedItem) return
-    if (
-      data &&
-      "preventDefault" in data &&
-      typeof data.preventDefault === "function"
-    ) {
-      data.preventDefault()
-    }
-    const valuesToSubmit =
-      data && "formData" in data && data.formData ? data.formData : formData
-
-    setLoading(true)
-    setError(null)
-    setCreatedProposal(null)
-
-    try {
-      const resolvedTargetCluster =
-        selectedItem.type === "app"
-          ? targetCluster === "__custom__"
-            ? customClusterSecret.trim() || undefined
-            : targetCluster || undefined
-          : undefined
-
-      const trimmedInstanceName = instanceName.trim()
-      const trimmedChartVersion = chartVersion.trim()
-      const trimmedTargetNs = resolvedTargetCluster
-        ? targetNamespace.trim()
-        : ""
-      const isCustomName =
-        Boolean(trimmedInstanceName) && trimmedInstanceName !== selectedItem.id
-
-      const proposal = await createProposal({
-        catalogId: selectedItem.id,
-        tenant,
-        values: valuesToSubmit,
-        ...(isCustomName ? { name: trimmedInstanceName } : {}),
-        ...(selectedItem.type === "app" &&
-        trimmedChartVersion &&
-        trimmedChartVersion !== selectedItem.version
-          ? { version: trimmedChartVersion }
-          : {}),
-        ...(trimmedTargetNs ? { targetNamespace: trimmedTargetNs } : {}),
-        title: `Deploy ${isCustomName ? trimmedInstanceName : selectedItem.name} for ${tenant}`,
-        kind:
-          selectedItem.type === "infrastructure"
-            ? "infra"
-            : (selectedItem.type as "app" | "infra" | "bundle"),
-        ...(resolvedTargetCluster
-          ? { targetCluster: resolvedTargetCluster }
-          : {}),
-      })
-      setCreatedProposal(proposal)
-    } catch (err) {
-      setError(
-        err instanceof Error ? err.message : "Failed to create Git PR proposal"
-      )
-    } finally {
-      setLoading(false)
-    }
-  }
-
-  const yamlPreview = jsonToYaml(formData).trim()
-
   return (
     <div className="space-y-6">
       {/* Header */}
@@ -1169,425 +872,184 @@ export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
         </div>
       )}
 
-      {/* Main Catalog layout: Left catalog cards, Right RJSF form + YAML preview (independently scrollable panes) */}
-      <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 lg:h-[calc(100vh-14rem)] lg:min-h-[560px]">
-        {/* Left Column: Search & Catalog List */}
-        <div className="lg:col-span-4 flex flex-col lg:h-full min-h-0 space-y-4">
-          <div className="flex items-center justify-between gap-2 shrink-0">
-            <div className="relative flex-1">
-              <Search className="absolute left-3 top-2.5 h-4 w-4 text-slate-500" />
-              <input
-                type="text"
-                placeholder="Search catalog blueprints..."
-                value={searchQuery}
-                onChange={(e) => setSearchQuery(e.target.value)}
-                className="w-full pl-9 pr-4 py-2 bg-slate-900 border border-slate-800 rounded-xl text-xs text-slate-100 placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
-              />
-            </div>
-            <button
-              type="button"
-              onClick={openAddCatalogModal}
-              className="px-3 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-xs font-semibold transition-colors shrink-0 flex items-center gap-1.5 shadow-md shadow-indigo-600/20"
-            >
-              <Plus className="h-4 w-4" />
-              <span>+ Add Catalog Item</span>
-            </button>
-          </div>
-
-          <div
-            data-testid="catalog-list"
-            className="space-y-3 flex-1 min-h-0 max-h-[640px] lg:max-h-none overflow-y-auto pr-1"
-          >
-            {filteredCatalog.map((item) => {
-              const isSelected =
-                selectedItem?.id === item.id && selectedItem?.type === item.type
-              return (
-                <div
-                  key={`${item.type}-${item.id}`}
-                  onClick={() => handleSelectCatalogItem(item)}
-                  role="button"
-                  tabIndex={0}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter" || e.key === " ") {
-                      handleSelectCatalogItem(item)
-                    }
-                  }}
-                  className={`p-4 rounded-xl border text-left cursor-pointer transition-all ${
-                    isSelected
-                      ? "bg-indigo-950/30 border-indigo-500/50 shadow-lg shadow-indigo-950/40"
-                      : "bg-slate-900 border-slate-800 hover:border-slate-700 hover:bg-slate-800/40"
-                  }`}
-                >
-                  <div className="flex items-center justify-between mb-1">
-                    <span className="text-xs font-bold text-white flex items-center gap-1.5">
-                      <Box className="h-3.5 w-3.5 text-indigo-400" />
-                      {item.name}
-                    </span>
-                    <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-slate-800 text-slate-400">
-                      {item.type === "bundle" ? "bundle" : `v${item.version}`}
-                    </span>
-                  </div>
-                  <p className="text-[11px] text-slate-400 line-clamp-2 mb-2">
-                    {item.description}
-                  </p>
-                  <div className="flex items-center justify-between text-[10px]">
-                    <span className="px-2 py-0.5 rounded-full bg-slate-800 text-slate-300 font-medium">
-                      {item.category}
-                    </span>
-                    {item.provider && (
-                      <span className="uppercase font-mono text-indigo-400">
-                        {item.provider}
-                      </span>
-                    )}
-                  </div>
-                </div>
-              )
-            })}
-            {filteredCatalog.length === 0 && (
-              <div className="p-4 rounded-xl bg-slate-900 border border-slate-800 text-xs text-slate-500 text-center">
-                {catalog.length === 0
-                  ? "No catalog blueprints available — check server configuration or authenticate."
-                  : `No catalog blueprints matching "${searchQuery}".`}
-              </div>
-            )}
-          </div>
+      {/* Search & Add Catalog Item Bar */}
+      <div className="flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3">
+        <div className="relative flex-1">
+          <Search className="absolute left-3 top-2.5 h-4 w-4 text-slate-500" />
+          <input
+            type="text"
+            placeholder="Search catalog blueprints..."
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+            className="w-full pl-9 pr-4 py-2 bg-slate-900 border border-slate-800 rounded-xl text-xs text-slate-100 placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+          />
         </div>
-
-        {/* Right Column: Dynamic JSONSchema Form + Live values.yaml Preview */}
-        <div className="lg:col-span-8 flex flex-col lg:h-full min-h-0">
-          {selectedItem ? (
-            <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 flex flex-col lg:h-full min-h-0">
-              <div className="flex items-center justify-between border-b border-slate-800 pb-4 shrink-0">
-                <div>
-                  <h3 className="text-lg font-semibold text-white flex items-center gap-2">
-                    <span>{selectedItem.name}</span>
-                    <span className="text-xs font-normal text-slate-400">
-                      ({selectedItem.type})
-                    </span>
-                  </h3>
-                  <p className="text-xs text-slate-400 mt-0.5">
-                    {selectedItem.description}
-                  </p>
-                </div>
-                <div className="flex items-center space-x-2">
-                  <button
-                    type="button"
-                    onClick={() => openEditCatalogModal(selectedItem)}
-                    className="flex items-center space-x-1.5 px-2.5 py-1 rounded-lg text-xs font-medium bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition-colors cursor-pointer"
-                    title="Edit catalog item definition via Git PR"
-                  >
-                    <Pencil className="h-3 w-3" />
-                    <span>Edit</span>
-                  </button>
-                  {selectedItem.type === "app" && selectedItem.repoUrl && (
-                    <button
-                      type="button"
-                      onClick={handleSyncUpstreamSchema}
-                      disabled={syncingSchema}
-                      className="flex items-center space-x-1.5 px-2.5 py-1 rounded-lg text-xs font-medium bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition-colors cursor-pointer disabled:opacity-50"
-                      title="Pull values.schema.json or values.yaml from upstream Helm chart"
-                    >
-                      <RefreshCw
-                        className={`h-3 w-3 ${syncingSchema ? "animate-spin" : ""}`}
-                      />
-                      <span>
-                        {syncingSchema ? "Syncing..." : "Sync Upstream Schema"}
-                      </span>
-                    </button>
-                  )}
-                  <span className="text-xs font-mono px-3 py-1 rounded-lg bg-indigo-500/10 text-indigo-400 border border-indigo-500/20">
-                    {selectedItem.id}
-                  </span>
-                </div>
-              </div>
-
-              <div className="flex-1 min-h-0 overflow-y-auto pr-2 space-y-5 mt-5">
-                {selectedItem.type === "bundle" &&
-                  selectedItem.bundleItems &&
-                  selectedItem.bundleItems.length > 0 && (
-                    <div className="bg-indigo-950/20 border border-indigo-500/30 rounded-xl p-3.5 space-y-2">
-                      <div className="text-[11px] font-semibold uppercase tracking-wider text-indigo-300">
-                        Bundle Execution Graph (
-                        {selectedItem.bundleItems.length} items)
-                      </div>
-                      <div className="flex flex-wrap gap-2">
-                        {selectedItem.bundleItems.map((bi) => (
-                          <div
-                            key={bi.id}
-                            className="text-[11px] font-mono bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1.5 text-slate-200 flex items-center gap-1.5"
-                          >
-                            <span className="px-1.5 py-0.5 rounded bg-indigo-500/20 text-indigo-300 text-[10px] uppercase">
-                              {bi.kind}
-                            </span>
-                            <span className="font-semibold text-white">
-                              {bi.id}
-                            </span>
-                            <span className="text-slate-500">
-                              ({bi.catalogRef})
-                            </span>
-                            {bi.dependsOn && bi.dependsOn.length > 0 && (
-                              <span className="text-amber-300 text-[10px]">
-                                ← {bi.dependsOn.join(", ")}
-                              </span>
-                            )}
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-                  )}
-
-                {/* Deployment Instance Metadata */}
-                <div
-                  className={`grid grid-cols-1 gap-3 ${
-                    selectedItem.type === "app"
-                      ? "sm:grid-cols-2"
-                      : "sm:grid-cols-1"
-                  }`}
-                >
-                  <div>
-                    <label
-                      htmlFor="instance-name-input"
-                      className="block text-[11px] font-medium text-slate-300 mb-1"
-                    >
-                      Instance Name
-                    </label>
-                    <input
-                      id="instance-name-input"
-                      type="text"
-                      value={instanceName}
-                      onChange={(e) => setInstanceName(e.target.value)}
-                      placeholder={selectedItem.id}
-                      className="w-full bg-slate-950 border border-slate-800 text-xs text-slate-200 rounded-lg px-3 py-1.5 focus:outline-none focus:ring-1 focus:ring-indigo-500 font-mono"
-                    />
-                  </div>
-                  {selectedItem.type === "app" && (
-                    <>
-                      <div>
-                        <label
-                          htmlFor="chart-version-input"
-                          className="block text-[11px] font-medium text-slate-300 mb-1"
-                        >
-                          Chart Version
-                        </label>
-                        <input
-                          id="chart-version-input"
-                          type="text"
-                          value={chartVersion}
-                          onChange={(e) => setChartVersion(e.target.value)}
-                          placeholder={selectedItem.version || "latest"}
-                          className="w-full bg-slate-950 border border-slate-800 text-xs text-slate-200 rounded-lg px-3 py-1.5 focus:outline-none focus:ring-1 focus:ring-indigo-500 font-mono"
-                        />
-                      </div>
-                      <div>
-                        <label
-                          htmlFor="cluster-select-catalog"
-                          className="block text-[11px] font-medium text-slate-300 mb-1"
-                        >
-                          Target Cluster
-                        </label>
-                        <select
-                          id="cluster-select-catalog"
-                          value={targetCluster}
-                          onChange={(e) => setTargetCluster(e.target.value)}
-                          className="w-full bg-slate-950 border border-slate-800 text-xs text-slate-200 rounded-lg px-3 py-1.5 focus:outline-none focus:ring-1 focus:ring-indigo-500 font-mono"
-                        >
-                          <option value="">Management Cluster (local)</option>
-                          {stacks.map((s) => (
-                            <option key={s.id} value={`${s.name}-kubeconfig`}>
-                              {s.name} ({s.tenant})
-                            </option>
-                          ))}
-                          <option value="__custom__">
-                            Custom kubeconfig Secret...
-                          </option>
-                        </select>
-                        {targetCluster === "__custom__" && (
-                          <input
-                            type="text"
-                            value={customClusterSecret}
-                            onChange={(e) =>
-                              setCustomClusterSecret(e.target.value)
-                            }
-                            placeholder="e.g. workload-kubeconfig"
-                            aria-label="Custom kubeconfig Secret name"
-                            className="mt-2 w-full bg-slate-950 border border-slate-800 text-xs text-slate-200 rounded-lg px-3 py-1.5 focus:outline-none focus:ring-1 focus:ring-indigo-500 font-mono"
-                          />
-                        )}
-                      </div>
-                      <div>
-                        <label
-                          htmlFor="target-namespace-input"
-                          className="block text-[11px] font-medium text-slate-300 mb-1"
-                        >
-                          Target Namespace
-                        </label>
-                        <input
-                          id="target-namespace-input"
-                          type="text"
-                          value={targetCluster ? targetNamespace : ""}
-                          onChange={(e) => setTargetNamespace(e.target.value)}
-                          disabled={!targetCluster}
-                          placeholder={
-                            targetCluster
-                              ? "e.g. apps-prod (optional)"
-                              : `tenant-${tenant} (local)`
-                          }
-                          title={
-                            targetCluster
-                              ? "Destination namespace on the remote workload cluster"
-                              : "Management cluster apps are isolated to the tenant namespace; select a remote Target Cluster to override"
-                          }
-                          className="w-full bg-slate-950 border border-slate-800 text-xs text-slate-200 rounded-lg px-3 py-1.5 focus:outline-none focus:ring-1 focus:ring-indigo-500 font-mono disabled:opacity-50 disabled:cursor-not-allowed"
-                        />
-                      </div>
-                    </>
-                  )}
-                </div>
-
-                {(() => {
-                  const effectiveInstanceName =
-                    instanceName.trim() || selectedItem.id
-                  const isExistingInstance =
-                    selectedItem.type === "app"
-                      ? releases.some(
-                          (r) =>
-                            r.name === effectiveInstanceName &&
-                            r.namespace === `tenant-${tenant}`
-                        )
-                      : stacks.some(
-                          (s) =>
-                            s.name === effectiveInstanceName &&
-                            s.tenant === tenant
-                        )
-                  if (!isExistingInstance) return null
-                  return (
-                    <div
-                      role="status"
-                      className="flex items-start space-x-2 p-3 rounded-xl bg-amber-950/30 border border-amber-500/30 text-amber-200 text-xs"
-                    >
-                      <AlertTriangle className="h-4 w-4 text-amber-400 shrink-0 mt-0.5" />
-                      <span>
-                        Instance{" "}
-                        <code className="font-mono font-semibold">
-                          {effectiveInstanceName}
-                        </code>{" "}
-                        already exists in{" "}
-                        <code className="font-mono">tenant-{tenant}</code> —
-                        submitting will propose an update to it. Change{" "}
-                        <strong>Instance Name</strong> to deploy a separate
-                        copy.
-                      </span>
-                    </div>
-                  )
-                })()}
-
-                {/* RJSF Form Container */}
-                <div className="rjsf-container bg-slate-950 p-5 rounded-xl border border-slate-800">
-                  <Form
-                    key={selectedItem.id}
-                    schema={selectedItem.schema as RJSFSchema}
-                    templates={{ ButtonTemplates: RJSF_BUTTON_TEMPLATES }}
-                    validator={
-                      validator as unknown as ValidatorType<
-                        Record<string, unknown>,
-                        RJSFSchema
-                      >
-                    }
-                    formData={formData}
-                    onChange={handleFormChange}
-                    onSubmit={handleSubmit}
-                  >
-                    <div className="mt-4 pt-4 border-t border-slate-800 flex items-center justify-end">
-                      <button
-                        type="submit"
-                        disabled={loading}
-                        className="flex items-center space-x-2 px-6 py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold rounded-lg transition-colors shadow-lg shadow-indigo-600/20 disabled:opacity-50"
-                      >
-                        {loading ? (
-                          <>
-                            <Loader2 className="h-4 w-4 animate-spin" />
-                            <span>Opening PR Proposal...</span>
-                          </>
-                        ) : (
-                          <>
-                            <span>Submit &amp; Open Git PR Proposal</span>
-                            <ArrowRight className="h-4 w-4" />
-                          </>
-                        )}
-                      </button>
-                    </div>
-                  </Form>
-                </div>
-
-                {error && (
-                  <div
-                    role="alert"
-                    className="p-4 bg-red-950/40 border border-red-500/30 rounded-xl text-red-300 text-xs flex items-start space-x-2"
-                  >
-                    <AlertCircle className="h-4 w-4 text-red-400 shrink-0 mt-0.5" />
-                    <span>{error}</span>
-                  </div>
-                )}
-
-                {/* Live values.yaml Diff Preview */}
-                <div className="space-y-2">
-                  <div className="flex items-center justify-between">
-                    <h4 className="text-xs font-semibold text-slate-300 flex items-center gap-1.5 uppercase tracking-wider">
-                      <FileCode2 className="h-4 w-4 text-emerald-400" />
-                      Live values.yaml Preview
-                    </h4>
-                    <span className="text-[10px] text-slate-500 font-mono">
-                      SOPS + age encrypted on secret fields before git commit
-                    </span>
-                  </div>
-                  <pre
-                    aria-label="values.yaml preview"
-                    className="bg-slate-950 border border-slate-800 rounded-xl p-4 text-xs font-mono text-emerald-400 overflow-x-auto max-h-56 leading-relaxed"
-                  >
-                    {yamlPreview}
-                  </pre>
-                </div>
-              </div>
-            </div>
-          ) : (
-            <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 text-center text-slate-400 text-xs space-y-4">
-              {error && (
-                <div
-                  role="alert"
-                  className="p-4 bg-red-950/40 border border-red-500/30 rounded-xl text-red-300 text-xs flex items-start space-x-2 text-left"
-                >
-                  <AlertCircle className="h-4 w-4 text-red-400 shrink-0 mt-0.5" />
-                  <span>{error}</span>
-                </div>
-              )}
-              <p>
-                No catalog blueprint selected. Select an item from the catalog
-                or authenticate to view available blueprints.
-              </p>
-            </div>
-          )}
-        </div>
+        <button
+          type="button"
+          onClick={openAddCatalogModal}
+          className="px-3.5 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-xs font-semibold transition-colors shrink-0 flex items-center justify-center gap-1.5 shadow-md shadow-indigo-600/20 cursor-pointer"
+        >
+          <Plus className="h-4 w-4" />
+          <span>+ Add Catalog Item</span>
+        </button>
       </div>
+
+      {error && (
+        <div
+          role="alert"
+          className="p-4 bg-red-950/40 border border-red-500/30 rounded-xl text-red-300 text-xs flex items-start space-x-2"
+        >
+          <AlertCircle className="h-4 w-4 text-red-400 shrink-0 mt-0.5" />
+          <span>{error}</span>
+        </div>
+      )}
+
+      {/* Catalog Grid */}
+      <div
+        data-testid="catalog-list"
+        className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4"
+      >
+        {filteredCatalog.map((item) => (
+          <div
+            key={`${item.type}-${item.id}`}
+            className="p-5 rounded-2xl border border-slate-800 bg-slate-900 flex flex-col justify-between gap-4 text-left"
+          >
+            <div className="space-y-2.5">
+              <div className="flex items-start justify-between gap-2">
+                <span className="text-sm font-bold text-white flex items-center gap-2">
+                  <Box className="h-4 w-4 text-indigo-400 shrink-0" />
+                  <span>{item.name}</span>
+                </span>
+                <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-slate-800 text-slate-400 shrink-0">
+                  {item.type === "bundle" ? "bundle" : `v${item.version}`}
+                </span>
+              </div>
+              <p className="text-xs text-slate-400 line-clamp-2">
+                {item.description}
+              </p>
+              <div className="flex items-center justify-between text-[10px] pt-1">
+                <span className="px-2 py-0.5 rounded-full bg-slate-800 text-slate-300 font-medium">
+                  {item.category}
+                </span>
+                <div className="flex items-center gap-2">
+                  {item.provider && (
+                    <span className="uppercase font-mono text-indigo-400">
+                      {item.provider}
+                    </span>
+                  )}
+                  <span className="font-mono text-slate-500">{item.id}</span>
+                </div>
+              </div>
+            </div>
+
+            <div className="flex items-center justify-end gap-2 pt-3 border-t border-slate-800/80">
+              <button
+                type="button"
+                onClick={() => openEditCatalogModal(item)}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition-colors cursor-pointer"
+                title="Edit catalog item definition via Git PR"
+              >
+                <Pencil className="h-3.5 w-3.5" />
+                <span>Edit</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => openDeployModal(item)}
+                className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg text-xs font-semibold bg-indigo-600 hover:bg-indigo-500 text-white transition-colors shadow-sm shadow-indigo-600/20 cursor-pointer"
+              >
+                <Plus className="h-3.5 w-3.5" />
+                <span>Create</span>
+              </button>
+            </div>
+          </div>
+        ))}
+        {filteredCatalog.length === 0 && (
+          <div className="col-span-full p-6 rounded-2xl bg-slate-900 border border-slate-800 text-xs text-slate-500 text-center">
+            {catalog.length === 0
+              ? "No catalog blueprints available — check server configuration or authenticate."
+              : `No catalog blueprints matching "${searchQuery}".`}
+          </div>
+        )}
+      </div>
+
+      {/* Deploy / Edit Instance Modal */}
+      <DeployInstanceModal
+        isOpen={isDeployModalOpen}
+        onClose={() => {
+          setIsDeployModalOpen(false)
+          setDeployModalItem(null)
+          setDeployInitialConfig(null)
+          setIsDeployEditMode(false)
+        }}
+        catalogItem={deployModalItem}
+        tenant={tenant}
+        tenants={tenants}
+        onTenantChange={setTenant}
+        stacks={stacks}
+        releases={releases}
+        initialConfig={deployInitialConfig}
+        isEditMode={isDeployEditMode}
+        onProposalCreated={(proposal) => setCreatedProposal(proposal)}
+        onCatalogItemUpdated={(updatedItem) => {
+          setDeployModalItem(updatedItem)
+          setCatalog((prev) =>
+            prev.map((c) => (c.id === updatedItem.id ? updatedItem : c))
+          )
+        }}
+      />
 
       {/* New Tenant Modal */}
       {isNewTenantModalOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4">
-          <div className="bg-slate-900 border border-slate-800 rounded-2xl max-w-md w-full p-6 space-y-4 shadow-2xl">
-            <div className="flex items-center justify-between border-b border-slate-800 pb-3">
+        <div
+          className={`fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm ${
+            isTenantModalFullscreen ? "p-0" : "p-4"
+          }`}
+        >
+          <div
+            className={`bg-slate-900 border-slate-800 flex flex-col space-y-4 shadow-2xl ${
+              isTenantModalFullscreen
+                ? "w-full h-full rounded-none border-0 p-6"
+                : "border rounded-2xl max-w-md w-full p-6"
+            }`}
+          >
+            <div className="flex items-center justify-between border-b border-slate-800 pb-3 shrink-0">
               <h3 className="text-base font-bold text-white flex items-center gap-2">
                 <Plus className="h-4 w-4 text-indigo-400" />
                 Create New Tenant
               </h3>
-              <button
-                type="button"
-                onClick={() => {
-                  setIsNewTenantModalOpen(false)
-                  setTenantError(null)
-                }}
-                className="text-slate-400 hover:text-white transition-colors"
-              >
-                <X className="h-5 w-5" />
-              </button>
+              <div className="flex items-center gap-1.5">
+                <button
+                  type="button"
+                  onClick={() => setIsTenantModalFullscreen((prev) => !prev)}
+                  aria-label={
+                    isTenantModalFullscreen
+                      ? "Exit full screen"
+                      : "Enter full screen"
+                  }
+                  title={
+                    isTenantModalFullscreen ? "Exit full screen" : "Full screen"
+                  }
+                  className="p-1 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 transition-colors cursor-pointer"
+                >
+                  {isTenantModalFullscreen ? (
+                    <Minimize2 className="h-4 w-4" />
+                  ) : (
+                    <Maximize2 className="h-4 w-4" />
+                  )}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setIsNewTenantModalOpen(false)
+                    setIsTenantModalFullscreen(false)
+                    setTenantError(null)
+                  }}
+                  aria-label="Close modal"
+                  className="p-1 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 transition-colors cursor-pointer"
+                >
+                  <X className="h-5 w-5" />
+                </button>
+              </div>
             </div>
 
             <form onSubmit={handleCreateTenant} className="space-y-4">
@@ -1649,25 +1111,57 @@ export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
 
       {/* Add Catalog Item Modal */}
       {isAddAppModalOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4 overflow-y-auto">
-          <div className="bg-slate-900 border border-slate-800 rounded-2xl max-w-lg w-full p-6 space-y-4 shadow-2xl my-8">
-            <div className="flex items-center justify-between border-b border-slate-800 pb-3">
+        <div
+          className={`fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm ${
+            isAddModalFullscreen ? "p-0" : "p-4 overflow-y-auto"
+          }`}
+        >
+          <div
+            className={`bg-slate-900 border-slate-800 flex flex-col space-y-4 shadow-2xl ${
+              isAddModalFullscreen
+                ? "w-full h-full rounded-none border-0 p-6 overflow-y-auto"
+                : "border rounded-2xl max-w-lg w-full p-6 my-8"
+            }`}
+          >
+            <div className="flex items-center justify-between border-b border-slate-800 pb-3 shrink-0">
               <h3 className="text-base font-bold text-white flex items-center gap-2">
                 <Box className="h-4 w-4 text-indigo-400" />
                 {editingCatalogItem ? "Edit Catalog Item" : "Add Catalog Item"}
               </h3>
-              <button
-                type="button"
-                onClick={() => {
-                  setIsAddAppModalOpen(false)
-                  setEditingCatalogItem(null)
-                  setAppError(null)
-                }}
-                aria-label="Close modal"
-                className="text-slate-400 hover:text-white transition-colors"
-              >
-                <X className="h-5 w-5" />
-              </button>
+              <div className="flex items-center gap-1.5">
+                <button
+                  type="button"
+                  onClick={() => setIsAddModalFullscreen((prev) => !prev)}
+                  aria-label={
+                    isAddModalFullscreen
+                      ? "Exit full screen"
+                      : "Enter full screen"
+                  }
+                  title={
+                    isAddModalFullscreen ? "Exit full screen" : "Full screen"
+                  }
+                  className="p-1 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 transition-colors cursor-pointer"
+                >
+                  {isAddModalFullscreen ? (
+                    <Minimize2 className="h-4 w-4" />
+                  ) : (
+                    <Maximize2 className="h-4 w-4" />
+                  )}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setIsAddAppModalOpen(false)
+                    setIsAddModalFullscreen(false)
+                    setEditingCatalogItem(null)
+                    setAppError(null)
+                  }}
+                  aria-label="Close modal"
+                  className="p-1 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 transition-colors cursor-pointer"
+                >
+                  <X className="h-5 w-5" />
+                </button>
+              </div>
             </div>
 
             <form onSubmit={handleCreateCatalogApp} className="space-y-4">
@@ -2433,41 +1927,284 @@ export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
               )}
 
               <div className="pt-1 border-t border-slate-800/80">
-                <button
-                  type="button"
-                  onClick={() => {
-                    if (!showSchemaEditor && !schemaJsonText) {
-                      setSchemaJsonText(
-                        JSON.stringify(
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (!showSchemaEditor && !schemaJsonText) {
+                        const empty = JSON.stringify(
                           { type: "object", properties: {} },
                           null,
                           2
                         )
-                      )
-                    }
-                    setShowSchemaEditor((prev) => !prev)
-                  }}
-                  className="text-[11px] font-medium text-indigo-400 hover:text-indigo-300 transition-colors cursor-pointer"
-                >
-                  {showSchemaEditor
-                    ? "Hide JSON Schema Editor"
-                    : "Edit JSON Schema (Optional)"}
-                </button>
+                        setSchemaJsonText(empty)
+                        setSchemaFields([])
+                      }
+                      setShowSchemaEditor((prev) => !prev)
+                    }}
+                    className="text-[11px] font-medium text-indigo-400 hover:text-indigo-300 transition-colors cursor-pointer"
+                  >
+                    {showSchemaEditor
+                      ? "Hide JSON Schema Editor"
+                      : "Edit JSON Schema (Optional)"}
+                  </button>
+                  {appForm.kind === "infra" && (
+                    <div className="flex flex-wrap items-center gap-2">
+                      {appForm.pulumiYaml?.trim() && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const derived = deriveFieldsFromPulumiYaml(
+                              appForm.pulumiYaml || ""
+                            )
+                            const existingSecrets = schemaFields.filter(
+                              (f) =>
+                                f.secret &&
+                                !derived.some((d) => d.name === f.name)
+                            )
+                            const next = [...derived, ...existingSecrets]
+                            setSchemaFields(next)
+                            setSchemaJsonText(
+                              fieldsToSchemaJson(next, schemaJsonText)
+                            )
+                            setShowSchemaEditor(true)
+                          }}
+                          className="text-[11px] font-medium text-emerald-400 hover:text-emerald-300 transition-colors cursor-pointer"
+                        >
+                          Derive from Pulumi.yaml
+                        </button>
+                      )}
+                      {PROVIDER_CREDENTIAL_PRESETS[appForm.provider || ""] && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const presets =
+                              PROVIDER_CREDENTIAL_PRESETS[
+                                appForm.provider || ""
+                              ] ?? []
+                            const existingNames = new Set(
+                              schemaFields.map((f) => f.name)
+                            )
+                            const toAdd = presets.filter(
+                              (p) => !existingNames.has(p.name)
+                            )
+                            const next = [...schemaFields, ...toAdd]
+                            setSchemaFields(next)
+                            setSchemaJsonText(
+                              fieldsToSchemaJson(next, schemaJsonText)
+                            )
+                            setShowSchemaEditor(true)
+                          }}
+                          className="text-[11px] font-medium text-amber-400 hover:text-amber-300 transition-colors cursor-pointer"
+                        >
+                          + Add {appForm.provider} Credentials
+                        </button>
+                      )}
+                    </div>
+                  )}
+                </div>
                 {showSchemaEditor && (
-                  <div className="mt-2">
-                    <label
-                      htmlFor="catalog-schema-json"
-                      className="block text-xs text-slate-300 font-medium mb-1"
-                    >
-                      JSON Schema
-                    </label>
-                    <textarea
-                      id="catalog-schema-json"
-                      rows={6}
-                      value={schemaJsonText}
-                      onChange={(e) => setSchemaJsonText(e.target.value)}
-                      className="w-full px-3 py-2 bg-slate-950 border border-slate-800 rounded-lg text-[11px] text-slate-100 font-mono focus:outline-none focus:ring-1 focus:ring-indigo-500"
-                    />
+                  <div className="mt-2.5 space-y-3">
+                    <div className="space-y-2">
+                      <div className="flex items-center justify-between">
+                        <span className="text-xs text-slate-300 font-medium">
+                          Form Fields
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const next: SchemaFieldDraft[] = [
+                              ...schemaFields,
+                              {
+                                name: "",
+                                title: "",
+                                type: "string",
+                                defaultValue: "",
+                                required: false,
+                                secret: false,
+                              },
+                            ]
+                            setSchemaFields(next)
+                            setSchemaJsonText(
+                              fieldsToSchemaJson(next, schemaJsonText)
+                            )
+                          }}
+                          className="text-[11px] font-medium text-indigo-400 hover:text-indigo-300 cursor-pointer"
+                        >
+                          + Add Field
+                        </button>
+                      </div>
+                      {schemaFields.length > 0 && (
+                        <div className="space-y-1.5 max-h-52 overflow-y-auto pr-1">
+                          {schemaFields.map((field, idx) => (
+                            <div
+                              key={idx}
+                              className="grid grid-cols-12 gap-1.5 items-center bg-slate-950/70 border border-slate-800/80 rounded-lg p-1.5"
+                            >
+                              <input
+                                type="text"
+                                aria-label={`Field ${idx + 1} name`}
+                                placeholder="fieldName"
+                                value={field.name}
+                                onChange={(e) => {
+                                  const next = schemaFields.map((f, i) =>
+                                    i === idx
+                                      ? { ...f, name: e.target.value }
+                                      : f
+                                  )
+                                  setSchemaFields(next)
+                                  setSchemaJsonText(
+                                    fieldsToSchemaJson(next, schemaJsonText)
+                                  )
+                                }}
+                                className="col-span-3 px-2 py-1 bg-slate-900 border border-slate-800 rounded text-[11px] text-slate-100 font-mono"
+                              />
+                              <input
+                                type="text"
+                                aria-label={`Field ${idx + 1} title`}
+                                placeholder="Label"
+                                value={field.title}
+                                onChange={(e) => {
+                                  const next = schemaFields.map((f, i) =>
+                                    i === idx
+                                      ? { ...f, title: e.target.value }
+                                      : f
+                                  )
+                                  setSchemaFields(next)
+                                  setSchemaJsonText(
+                                    fieldsToSchemaJson(next, schemaJsonText)
+                                  )
+                                }}
+                                className="col-span-3 px-2 py-1 bg-slate-900 border border-slate-800 rounded text-[11px] text-slate-100"
+                              />
+                              <select
+                                aria-label={`Field ${idx + 1} type`}
+                                value={field.type}
+                                onChange={(e) => {
+                                  const next = schemaFields.map((f, i) =>
+                                    i === idx
+                                      ? {
+                                          ...f,
+                                          type: e.target
+                                            .value as SchemaFieldType,
+                                        }
+                                      : f
+                                  )
+                                  setSchemaFields(next)
+                                  setSchemaJsonText(
+                                    fieldsToSchemaJson(next, schemaJsonText)
+                                  )
+                                }}
+                                className="col-span-2 px-1.5 py-1 bg-slate-900 border border-slate-800 rounded text-[11px] text-slate-100"
+                              >
+                                <option value="string">string</option>
+                                <option value="integer">integer</option>
+                                <option value="number">number</option>
+                                <option value="boolean">boolean</option>
+                              </select>
+                              <input
+                                type="text"
+                                aria-label={`Field ${idx + 1} default`}
+                                placeholder="default"
+                                value={field.defaultValue}
+                                onChange={(e) => {
+                                  const next = schemaFields.map((f, i) =>
+                                    i === idx
+                                      ? { ...f, defaultValue: e.target.value }
+                                      : f
+                                  )
+                                  setSchemaFields(next)
+                                  setSchemaJsonText(
+                                    fieldsToSchemaJson(next, schemaJsonText)
+                                  )
+                                }}
+                                className="col-span-2 px-2 py-1 bg-slate-900 border border-slate-800 rounded text-[11px] text-slate-100"
+                              />
+                              <div className="col-span-2 flex items-center justify-end gap-2">
+                                <label
+                                  className="flex items-center gap-0.5 text-[10px] text-slate-400 cursor-pointer"
+                                  title="Required"
+                                >
+                                  <input
+                                    type="checkbox"
+                                    checked={field.required}
+                                    onChange={(e) => {
+                                      const next = schemaFields.map((f, i) =>
+                                        i === idx
+                                          ? { ...f, required: e.target.checked }
+                                          : f
+                                      )
+                                      setSchemaFields(next)
+                                      setSchemaJsonText(
+                                        fieldsToSchemaJson(next, schemaJsonText)
+                                      )
+                                    }}
+                                  />
+                                  <span>Req</span>
+                                </label>
+                                <label
+                                  className="flex items-center gap-0.5 text-[10px] text-amber-400 cursor-pointer"
+                                  title="Secret (SOPS + age encrypted, bound to envRefs)"
+                                >
+                                  <input
+                                    type="checkbox"
+                                    checked={field.secret}
+                                    onChange={(e) => {
+                                      const next = schemaFields.map((f, i) =>
+                                        i === idx
+                                          ? { ...f, secret: e.target.checked }
+                                          : f
+                                      )
+                                      setSchemaFields(next)
+                                      setSchemaJsonText(
+                                        fieldsToSchemaJson(next, schemaJsonText)
+                                      )
+                                    }}
+                                  />
+                                  <span>Sec</span>
+                                </label>
+                                <button
+                                  type="button"
+                                  aria-label={`Remove field ${idx + 1}`}
+                                  onClick={() => {
+                                    const next = schemaFields.filter(
+                                      (_, i) => i !== idx
+                                    )
+                                    setSchemaFields(next)
+                                    setSchemaJsonText(
+                                      fieldsToSchemaJson(next, schemaJsonText)
+                                    )
+                                  }}
+                                  className="text-slate-500 hover:text-red-400 cursor-pointer"
+                                >
+                                  <Trash2 className="h-3.5 w-3.5" />
+                                </button>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                    <div>
+                      <label
+                        htmlFor="catalog-schema-json"
+                        className="block text-xs text-slate-300 font-medium mb-1"
+                      >
+                        JSON Schema
+                      </label>
+                      <textarea
+                        id="catalog-schema-json"
+                        rows={6}
+                        value={schemaJsonText}
+                        onChange={(e) => {
+                          const text = e.target.value
+                          setSchemaJsonText(text)
+                          const parsed = schemaJsonToFields(text)
+                          if (parsed) setSchemaFields(parsed)
+                        }}
+                        className="w-full px-3 py-2 bg-slate-950 border border-slate-800 rounded-lg text-[11px] text-slate-100 font-mono focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                      />
+                    </div>
                   </div>
                 )}
               </div>
