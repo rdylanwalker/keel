@@ -118,7 +118,125 @@ When you are done testing, open a PR that removes `tenants/dev-team/infra/eks-sa
 
 ---
 
-## 4. Add Your Own Blueprint (`cloudflare` or `hetzner`)
+## 4. Provision an Always-Free GCP Compute Engine VM (`e2-micro`)
+
+GCP's **Always Free** tier includes 1 `e2-micro` VM per month with up to 30 GB `pd-standard` disk in `us-central1`, `us-east1`, or `us-west1` (omitting a public IPv4 address avoids external IP charges).
+
+### Step 1: Prepare a GCP Service Account Key
+
+1. In the Google Cloud Console, select or create a **Project** and enable the **Compute Engine API** (`compute.googleapis.com`).
+2. Under **IAM & Admin → Service Accounts**, create a service account with **Compute Admin** (`roles/compute.admin`) and download a **JSON key**.
+
+### Step 2: Enable the `gcp` Provider
+
+1. Open **Topology Map** in the web portal and enable **Google Cloud Platform (`gcp`)**.
+2. Merge the generated PR updating `providers/registry.yaml`.
+
+### Step 3: Add the `gcp-free-vm` Blueprint in the GUI
+
+1. In **Catalog & Form Wizard**, click **+ Add Catalog Item** and select **Kind:** `infra`.
+2. Set **ID** to `gcp-free-vm`, **Provider** to `gcp`, **Pulumi Runtime** to `yaml`, **Entrypoint** to `Pulumi.yaml`, and leave **Protect By Default** unchecked.
+3. Paste the `Pulumi.yaml`:
+
+```yaml
+name: gcp-free-vm
+runtime: yaml
+description: Always Free GCP e2-micro Compute Engine VM
+
+config:
+  vmName:
+    type: string
+    default: keel-free-vm
+  project:
+    type: string
+  zone:
+    type: string
+    default: us-east1-b
+
+resources:
+  freeVm:
+    type: gcp:compute:Instance
+    properties:
+      name: ${vmName}
+      project: ${project}
+      machineType: e2-micro
+      zone: ${zone}
+      bootDisk:
+        initializeParams:
+          image: debian-cloud/debian-12
+          size: 10
+          type: pd-standard
+      networkInterfaces:
+        - network: default
+      labels:
+        managed-by: keel
+
+outputs:
+  instanceName: ${freeVm.name}
+  internalIp: ${freeVm.networkInterfaces[0].networkIp}
+```
+
+4. Expand the **JSON Schema** editor and paste:
+
+```json
+{
+  "type": "object",
+  "required": ["vmName", "project", "zone", "GOOGLE_CREDENTIALS"],
+  "properties": {
+    "vmName": {
+      "type": "string",
+      "title": "VM Name",
+      "default": "keel-free-vm",
+      "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"
+    },
+    "project": {
+      "type": "string",
+      "title": "GCP Project ID"
+    },
+    "zone": {
+      "type": "string",
+      "title": "GCP Zone (Always Free Eligible)",
+      "default": "us-east1-b",
+      "enum": [
+        "us-central1-a",
+        "us-central1-b",
+        "us-central1-c",
+        "us-east1-b",
+        "us-east1-c",
+        "us-west1-a",
+        "us-west1-b"
+      ]
+    },
+    "GOOGLE_CREDENTIALS": {
+      "type": "string",
+      "title": "GCP Service Account JSON Key",
+      "writeOnly": true
+    }
+  }
+}
+```
+
+5. Submit and merge the catalog PR.
+
+### Step 4: Provision via GUI or CLI
+
+Submit the form in **Catalog & Form Wizard**, or format your downloaded `.json` key as a single-line string into `gcp-vm-values.yaml` and run:
+
+```bash
+keel infra provision \
+  --blueprint gcp-free-vm \
+  --tenant default \
+  --values-file ./gcp-vm-values.yaml \
+  --server http://127.0.0.1:8080
+
+keel preview status --pr <PR_NUMBER> --watch --server http://127.0.0.1:8080
+```
+
+`GOOGLE_CREDENTIALS` (marked `"writeOnly": true`) is encrypted with SOPS + `age` into `secret.enc.yaml` and bound to `Stack.spec.envRefs`, while `vmName`, `project`, and `zone` populate `Stack.spec.config`. Merge the PR to create the VM, and remove `tenants/default/infra/<instance>/` via PR when done so PKO v2 runs `pulumi destroy`.
+
+---
+
+## 5. Add Your Own Blueprint (`cloudflare` or `hetzner`)
 
 Try extending the self-service catalog with another provider from [Provider Blueprint Examples](../catalog/provider-examples.md):
 
