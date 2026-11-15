@@ -3373,10 +3373,13 @@ spec:
             tenant: Some("acme".to_string()),
             stack: "keel/acme/postgres-main".to_string(),
             provider: Some("aws".to_string()),
+            stack_type: "cloud".to_string(),
             preview: false,
             protect: true,
             bundle: None,
             bundle_item: None,
+            resource_count: Some(12),
+            last_synced: Some("2026-11-15T10:00:00Z".to_string()),
             status: "Ready".to_string(),
         }];
 

@@ -192,6 +192,30 @@ function ensureManagementStack(stackList: StackSummary[]): StackSummary[] {
   return [BOOTSTRAP_MANAGEMENT_STACK, ...stackList]
 }
 
+function formatLastSynced(value?: string): string {
+  if (!value || !value.trim()) {
+    return "—"
+  }
+  const parsed = Date.parse(value)
+  if (Number.isNaN(parsed)) {
+    return value
+  }
+  const diffSec = Math.max(0, Math.floor((Date.now() - parsed) / 1000))
+  if (diffSec < 60) {
+    return "just now"
+  }
+  const diffMin = Math.floor(diffSec / 60)
+  if (diffMin < 60) {
+    return `${diffMin}m ago`
+  }
+  const diffHr = Math.floor(diffMin / 60)
+  if (diffHr < 24) {
+    return `${diffHr}h ago`
+  }
+  const diffDays = Math.floor(diffHr / 24)
+  return `${diffDays}d ago`
+}
+
 function mergeProviders(liveEntries: ProviderRegistryEntry[]): ProviderInfo[] {
   if (!liveEntries || liveEntries.length === 0) {
     return DEFAULT_PROVIDERS
@@ -488,13 +512,31 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
     try {
       eventSource = createEventSourceStream(
         (newEvent) => {
-          setEvents((prev) => [
-            {
+          setEvents((prev) => {
+            const formattedTimestamp =
+              newEvent.timestamp &&
+              !Number.isNaN(Date.parse(newEvent.timestamp))
+                ? new Date(newEvent.timestamp).toLocaleTimeString()
+                : newEvent.timestamp || new Date().toLocaleTimeString()
+            const normalized: CrdWatchEvent = {
               ...newEvent,
-              timestamp: new Date().toLocaleTimeString(),
-            },
-            ...prev.slice(0, 99),
-          ])
+              timestamp: formattedTimestamp,
+            }
+            const isDuplicate = prev.some(
+              (e) =>
+                e.kind === normalized.kind &&
+                e.namespace === normalized.namespace &&
+                e.name === normalized.name &&
+                e.status === normalized.status &&
+                e.message === normalized.message &&
+                (e.revision ?? null) === (normalized.revision ?? null) &&
+                e.timestamp === normalized.timestamp
+            )
+            if (isDuplicate) {
+              return prev
+            }
+            return [normalized, ...prev.slice(0, 99)]
+          })
         },
         () => {
           // Stream error handler
@@ -570,7 +612,9 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
         accessorKey: "type",
         header: "Type",
         cell: ({ row }) => (
-          <span className="capitalize text-slate-400">{row.original.type}</span>
+          <span className="capitalize text-slate-400">
+            {row.original.type || "workload"}
+          </span>
         ),
       },
       {
@@ -593,7 +637,7 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
         header: "Resources",
         cell: ({ row }) => (
           <span className="font-bold text-slate-200">
-            {row.original.resourceCount}
+            {row.original.resourceCount ?? "—"}
           </span>
         ),
       },
@@ -606,7 +650,12 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
         accessorKey: "lastSynced",
         header: "Last Synced",
         cell: ({ row }) => (
-          <span className="text-slate-500">{row.original.lastSynced}</span>
+          <span
+            className="text-slate-400 whitespace-nowrap"
+            title={row.original.lastSynced || undefined}
+          >
+            {formatLastSynced(row.original.lastSynced)}
+          </span>
         ),
       },
       {
@@ -785,6 +834,18 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
         accessorKey: "status",
         header: "Status",
         cell: ({ row }) => <StatusBadge status={row.original.status} />,
+      },
+      {
+        accessorKey: "lastSynced",
+        header: "Last Synced",
+        cell: ({ row }) => (
+          <span
+            className="text-slate-400 whitespace-nowrap"
+            title={row.original.lastSynced || undefined}
+          >
+            {formatLastSynced(row.original.lastSynced)}
+          </span>
+        ),
       },
       {
         id: "actions",

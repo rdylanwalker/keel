@@ -955,4 +955,63 @@ describe("CatalogWizardView component and jsonToYaml helper", () => {
     })
     expect(await screen.findByText(/PR #112 Opened/i)).toBeInTheDocument()
   })
+
+  it("supports adding and editing Pulumi.yaml on infrastructure blueprints", async () => {
+    vi.mocked(api.getCatalog).mockResolvedValue([
+      {
+        id: "infra-pko-vm",
+        name: "Proxmox VM Stack",
+        description: "Provision a VM",
+        type: "infra",
+        category: "Infrastructure",
+        version: "1.0.0",
+        provider: "proxmox",
+        pulumiRuntime: "yaml",
+        entrypoint: "Pulumi.yaml",
+        pulumiYaml: "name: proxmox-vm\nruntime: yaml\nresources: {}\n",
+        schema: { type: "object", properties: {} },
+      },
+    ])
+    vi.mocked(api.updateCatalogItem).mockResolvedValue({
+      id: "115",
+      title: "Update infra infra-pko-vm",
+      branch: "keel/catalog/update-infra-pko-vm-115",
+      author: "user",
+      tenant: "catalog",
+      status: "open",
+      createdAt: "just now",
+    })
+
+    render(<CatalogWizardView />)
+
+    const editBtn = await screen.findByRole("button", {
+      name: /^Edit$/i,
+    })
+    fireEvent.click(editBtn)
+
+    const pulumiInput = screen.getByLabelText(/Pulumi\.yaml Program/i)
+    expect(pulumiInput).toHaveValue(
+      "name: proxmox-vm\nruntime: yaml\nresources: {}\n"
+    )
+
+    fireEvent.change(pulumiInput, {
+      target: {
+        value:
+          "name: proxmox-vm\nruntime: yaml\ndescription: Edited\nresources: {}\n",
+      },
+    })
+
+    fireEvent.click(screen.getByRole("button", { name: /Submit Update PR/i }))
+
+    await waitFor(() => {
+      expect(api.updateCatalogItem).toHaveBeenCalledWith(
+        "infra",
+        "infra-pko-vm",
+        expect.objectContaining({
+          pulumiYaml:
+            "name: proxmox-vm\nruntime: yaml\ndescription: Edited\nresources: {}\n",
+        })
+      )
+    })
+  })
 })

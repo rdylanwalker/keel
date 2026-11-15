@@ -33,13 +33,41 @@ pub struct StackSummary {
     pub stack: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
+    #[serde(rename = "type", default = "default_stack_type")]
+    pub stack_type: String,
     pub preview: bool,
     pub protect: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bundle: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bundle_item: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resource_count: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_synced: Option<String>,
     pub status: String,
+}
+
+fn default_stack_type() -> String {
+    "workload".to_string()
+}
+
+fn infer_stack_type(
+    name: &str,
+    namespace: &str,
+    provider: Option<&str>,
+    label_type: Option<&str>,
+) -> String {
+    if let Some(t) = label_type.map(str::trim).filter(|s| !s.is_empty()) {
+        return t.to_string();
+    }
+    if name == "management-cluster-core" || namespace == "flux-system" {
+        return "management".to_string();
+    }
+    if matches!(provider, Some("aws" | "gcp" | "azure" | "cloudflare")) {
+        return "cloud".to_string();
+    }
+    "workload".to_string()
 }
 
 /// Summary of a Flux `HelmRelease` / `Kustomization` / Flagger `Canary` returned by `GET /api/v1/releases`.
@@ -61,6 +89,8 @@ pub struct ReleaseSummary {
     pub bundle: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bundle_item: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_synced: Option<String>,
     pub status: String,
 }
 
@@ -267,16 +297,25 @@ impl ClusterStateProvider for RepoClusterStateProvider {
                     continue;
                 }
 
+                let label_type = val
+                    .pointer("/metadata/labels/keel.io~1type")
+                    .and_then(Value::as_str);
+                let stack_type =
+                    infer_stack_type(&name, &namespace, doc_provider.as_deref(), label_type);
+
                 stacks.push(StackSummary {
                     name,
                     namespace,
                     tenant: doc_tenant,
                     stack: stack_name,
                     provider: doc_provider,
+                    stack_type,
                     preview,
                     protect,
                     bundle: doc_bundle,
                     bundle_item: doc_bundle_item,
+                    resource_count: None,
+                    last_synced: None,
                     status: "Pending".to_string(),
                 });
             }
@@ -294,10 +333,13 @@ impl ClusterStateProvider for RepoClusterStateProvider {
                     tenant: None,
                     stack: "keel/management/core".to_string(),
                     provider: None,
+                    stack_type: "management".to_string(),
                     preview: false,
                     protect: true,
                     bundle: None,
                     bundle_item: None,
+                    resource_count: None,
+                    last_synced: None,
                     status: "Pending".to_string(),
                 },
             );
@@ -405,6 +447,7 @@ impl ClusterStateProvider for RepoClusterStateProvider {
                     target_cluster,
                     bundle: doc_bundle,
                     bundle_item: doc_bundle_item,
+                    last_synced: None,
                     status: "Pending".to_string(),
                 });
             }
@@ -445,20 +488,28 @@ impl ClusterStateProvider for KubeClusterStateProvider {
         provider: Option<&str>,
     ) -> Result<Vec<StackSummary>, ServerError> {
         let mut stacks = self.repo.list_stacks(tenant, provider).await?;
-        let live = self.live.stack_statuses().await;
+        let live = self.live.stack_status_details().await;
         for stack in &mut stacks {
-            if let Some(status) = live.get(&(stack.namespace.clone(), stack.name.clone())) {
-                stack.status = Self::status_label(status);
+            if let Some(info) = live.get(&(stack.namespace.clone(), stack.name.clone())) {
+                stack.status = Self::status_label(&info.status);
+                stack.last_synced = info.last_synced.clone();
+                if info.resource_count.is_some() {
+                    stack.resource_count = info.resource_count;
+                }
             } else if stack.name == "management-cluster-core"
-                && let Some(status) = live
+                && let Some(info) = live
                     .get(&("flux-system".to_string(), "core-addons".to_string()))
                     .or_else(|| live.get(&("flux-system".to_string(), "flux-system".to_string())))
             {
-                stack.status = Self::status_label(status);
+                stack.status = Self::status_label(&info.status);
+                stack.last_synced = info.last_synced.clone();
+                if info.resource_count.is_some() {
+                    stack.resource_count = info.resource_count;
+                }
             }
         }
         // Keep any live tenant-* stack that is absent from Git `main` (awaiting Flux prune or mid-termination)
-        for (ns, name) in live.keys() {
+        for ((ns, name), info) in &live {
             if !ns.starts_with("tenant-") {
                 continue;
             }
@@ -475,10 +526,13 @@ impl ClusterStateProvider for KubeClusterStateProvider {
                     tenant: inferred_tenant.map(str::to_owned),
                     stack: name.clone(),
                     provider: None,
+                    stack_type: infer_stack_type(name, ns, None, None),
                     preview: false,
                     protect: false,
                     bundle: None,
                     bundle_item: None,
+                    resource_count: info.resource_count,
+                    last_synced: info.last_synced.clone(),
                     status: "Deleting".to_string(),
                 });
             }
@@ -497,15 +551,16 @@ impl ClusterStateProvider for KubeClusterStateProvider {
             .await
             .unwrap_or_default();
         let live_stacks = self.live.stack_statuses().await;
-        let live = self.live.release_statuses().await;
+        let live = self.live.release_status_details().await;
         for rel in &mut releases {
-            if let Some(status) = live.get(&(rel.namespace.clone(), rel.name.clone())) {
-                rel.status = Self::status_label(status);
+            if let Some(info) = live.get(&(rel.namespace.clone(), rel.name.clone())) {
+                rel.status = Self::status_label(&info.status);
+                rel.last_synced = info.last_synced.clone();
             }
         }
         // Keep any live tenant-* release that is absent from Git `main` (awaiting Flux prune or mid-termination),
         // but ignore Flux `Kustomization` wrappers that back PKO `Stack`s (e.g. bundle infra steps).
-        for (ns, name) in live.keys() {
+        for ((ns, name), info) in &live {
             if !ns.starts_with("tenant-") {
                 continue;
             }
@@ -537,6 +592,7 @@ impl ClusterStateProvider for KubeClusterStateProvider {
                     target_cluster: None,
                     bundle: None,
                     bundle_item: None,
+                    last_synced: info.last_synced.clone(),
                     status: "Deleting".to_string(),
                 });
             }
@@ -739,13 +795,35 @@ mod tests {
 
         let out_stacks = provider.list_stacks(None, None).await.unwrap();
         assert_eq!(out_stacks[0].name, "management-cluster-core");
+        assert_eq!(out_stacks[0].stack_type, "management");
         assert_eq!(out_stacks[0].status, "Synced");
         assert_eq!(out_stacks[1].name, "dev-kind");
+        assert_eq!(out_stacks[1].stack_type, "workload");
         assert_eq!(out_stacks[1].status, "Reconciling");
 
         let out_releases = provider.list_releases(None).await.unwrap();
         assert_eq!(out_releases.len(), 1);
         assert_eq!(out_releases[0].name, "podinfo");
         assert_eq!(out_releases[0].status, "Ready");
+    }
+
+    #[test]
+    fn infers_stack_type_from_labels_and_providers() {
+        assert_eq!(
+            infer_stack_type("management-cluster-core", "flux-system", None, None),
+            "management"
+        );
+        assert_eq!(
+            infer_stack_type("eks-prod", "tenant-acme", Some("aws"), None),
+            "cloud"
+        );
+        assert_eq!(
+            infer_stack_type("pve-nodes", "tenant-acme", Some("proxmox"), None),
+            "workload"
+        );
+        assert_eq!(
+            infer_stack_type("custom", "tenant-acme", Some("aws"), Some("workload")),
+            "workload"
+        );
     }
 }

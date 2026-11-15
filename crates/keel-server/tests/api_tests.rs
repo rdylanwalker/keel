@@ -487,7 +487,8 @@ async fn test_proposal_create_preview_merge_and_stacks_releases() {
         .unwrap();
     assert_eq!(invalid_res.status(), StatusCode::UNPROCESSABLE_ENTITY);
 
-    // 2. Secret field without tenant age key -> 400 (never commits plaintext!)
+    // 2. Secret field without tenant age key: either auto-generates SOPS age key & encrypts (201)
+    //    when sops/age-keygen are installed, or rejects with 400 when unavailable (never commits plaintext!).
     let no_age_res = app
         .clone()
         .oneshot(
@@ -500,6 +501,7 @@ async fn test_proposal_create_preview_merge_and_stacks_releases() {
                     json!({
                         "tenant": "acme",
                         "catalogId": "grafana",
+                        "name": "grafana-secret-test",
                         "values": { "replicas": 2, "adminPassword": "super-secret-password" }
                     })
                     .to_string(),
@@ -508,7 +510,49 @@ async fn test_proposal_create_preview_merge_and_stacks_releases() {
         )
         .await
         .unwrap();
-    assert_eq!(no_age_res.status(), StatusCode::BAD_REQUEST);
+    let no_age_status = no_age_res.status();
+    assert!(
+        no_age_status == StatusCode::CREATED || no_age_status == StatusCode::BAD_REQUEST,
+        "unexpected status for secret proposal without pre-existing age key: {no_age_status}"
+    );
+    if no_age_status == StatusCode::CREATED {
+        let secret_body: Value =
+            serde_json::from_slice(&no_age_res.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert!(
+            fixture
+                .state
+                .secret_store
+                .get_tenant_age_key("acme")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let secret_branch = secret_body["branch"].as_str().unwrap();
+        fixture
+            .state
+            .git_runner
+            .checkout_branch(&fixture.state.repo_workdir, secret_branch)
+            .await
+            .unwrap();
+        let enc_yaml = tokio::fs::read_to_string(
+            fixture
+                .state
+                .repo_workdir
+                .join("tenants/acme/apps/grafana-secret-test/secrets.enc.yaml"),
+        )
+        .await
+        .unwrap();
+        assert!(enc_yaml.contains("ENC[AES256_GCM,"));
+        assert!(!enc_yaml.contains("super-secret-password"));
+        fixture
+            .state
+            .git_runner
+            .checkout_branch(&fixture.state.repo_workdir, "main")
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
 
     // 3. Valid proposal -> 201 Created, PR opened, preview synthesized
     let create_res = app
@@ -561,7 +605,15 @@ async fn test_proposal_create_preview_merge_and_stacks_releases() {
     assert_eq!(list_res.status(), StatusCode::OK);
     let list_json: Value =
         serde_json::from_slice(&list_res.into_body().collect().await.unwrap().to_bytes()).unwrap();
-    assert_eq!(list_json["proposals"].as_array().unwrap().len(), 1);
+    let expected_open_prs = if no_age_status == StatusCode::CREATED {
+        2
+    } else {
+        1
+    };
+    assert_eq!(
+        list_json["proposals"].as_array().unwrap().len(),
+        expected_open_prs
+    );
 
     // 5. Get proposal preview
     let preview_res = app
@@ -2151,4 +2203,161 @@ async fn test_update_catalog_item_endpoint() {
         .await
         .unwrap();
     assert_eq!(missing_res.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_create_and_update_infra_blueprint_pulumi_yaml() {
+    let fixture = setup_fixture().await;
+    let cookie = login_and_get_cookie(&fixture).await;
+    let app = build_router(fixture.state.clone());
+
+    let custom_pulumi_v1 = "name: custom-vm\nruntime: yaml\nresources:\n  vm:\n    type: proxmoxve:vm:VirtualMachine\n";
+
+    // 1. Invalid YAML in pulumiYaml returns 400 Bad Request
+    let invalid_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/catalog")
+                .header(COOKIE, &cookie)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "kind": "infra",
+                        "id": "bad-yaml-bp",
+                        "name": "Bad YAML",
+                        "category": "Compute",
+                        "provider": "proxmox",
+                        "pulumiYaml": "name: [unclosed"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(invalid_res.status(), StatusCode::BAD_REQUEST);
+
+    // 2. Create blueprint with custom Pulumi.yaml
+    let create_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/catalog")
+                .header(COOKIE, &cookie)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "kind": "infra",
+                        "id": "custom-vm",
+                        "name": "Custom VM",
+                        "category": "Compute",
+                        "provider": "proxmox",
+                        "pulumiYaml": custom_pulumi_v1
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_res.status(), StatusCode::CREATED);
+    let created: Value =
+        serde_json::from_slice(&create_res.into_body().collect().await.unwrap().to_bytes())
+            .unwrap();
+    let create_branch = created["branch"].as_str().unwrap();
+
+    fixture
+        .state
+        .git_runner
+        .checkout_branch(&fixture.state.repo_workdir, create_branch)
+        .await
+        .unwrap();
+    let stored_v1 = tokio::fs::read_to_string(
+        fixture
+            .state
+            .repo_workdir
+            .join("catalog/infra/custom-vm/Pulumi.yaml"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(stored_v1, custom_pulumi_v1);
+    fixture
+        .state
+        .git_runner
+        .checkout_branch(&fixture.state.repo_workdir, "main")
+        .await
+        .unwrap();
+
+    // 3. Seed Pulumi.yaml on main and verify GET /api/v1/catalog returns pulumiYaml map
+    tokio::fs::write(
+        fixture
+            .state
+            .repo_workdir
+            .join("catalog/infra/proxmox-vm/Pulumi.yaml"),
+        "name: proxmox-vm\nruntime: yaml\nresources: {}\n",
+    )
+    .await
+    .unwrap();
+    let cat_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/catalog")
+                .header(COOKIE, &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cat_res.status(), StatusCode::OK);
+    let cat_json: Value =
+        serde_json::from_slice(&cat_res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert!(cat_json["pulumiYaml"]["proxmox-vm"].is_string());
+
+    // 4. PUT /api/v1/catalog/infra/proxmox-vm with pulumiYaml updates Pulumi.yaml
+    let updated_pulumi =
+        "name: proxmox-vm\nruntime: yaml\ndescription: Updated via GUI\nresources: {}\n";
+    let update_res = app
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri("/api/v1/catalog/infra/proxmox-vm")
+                .header(COOKIE, &cookie)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "name": "Proxmox VM",
+                        "category": "Compute",
+                        "pulumiYaml": updated_pulumi
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(update_res.status(), StatusCode::OK);
+    let updated: Value =
+        serde_json::from_slice(&update_res.into_body().collect().await.unwrap().to_bytes())
+            .unwrap();
+    let update_branch = updated["branch"].as_str().unwrap();
+
+    fixture
+        .state
+        .git_runner
+        .checkout_branch(&fixture.state.repo_workdir, update_branch)
+        .await
+        .unwrap();
+    let stored_v2 = tokio::fs::read_to_string(
+        fixture
+            .state
+            .repo_workdir
+            .join("catalog/infra/proxmox-vm/Pulumi.yaml"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(stored_v2, updated_pulumi);
 }
