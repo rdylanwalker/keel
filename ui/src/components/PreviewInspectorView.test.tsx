@@ -9,6 +9,7 @@ vi.mock("../lib/api", () => ({
   getProposalPreview: vi.fn(),
   mergeProposal: vi.fn(),
   rejectProposal: vi.fn(),
+  reopenProposal: vi.fn(),
 }))
 
 const mockProposals: Proposal[] = [
@@ -89,8 +90,14 @@ describe("PreviewInspectorView component", () => {
         screen.getByText("PR #101: Deploy Redis Cache")
       ).toBeInTheDocument()
       expect(screen.getByText("redis-master")).toBeInTheDocument()
-      expect(screen.getAllByText("+ Create").length).toBeGreaterThan(0)
-      expect(screen.getAllByText("~ Update").length).toBeGreaterThan(0)
+      expect(screen.getAllByText("Create").length).toBeGreaterThan(0)
+      expect(screen.getAllByText("Update").length).toBeGreaterThan(0)
+      expect(
+        screen.getByRole("link", { name: /Forge Link/i })
+      ).toBeInTheDocument()
+      expect(
+        screen.getAllByRole("tooltip").map((el) => el.textContent)
+      ).toEqual(["Forge Link", "Reject PR", "Merge PR Proposal"])
     })
   })
 
@@ -117,7 +124,7 @@ describe("PreviewInspectorView component", () => {
       expect(api.mergeProposal).toHaveBeenCalledWith("101")
       expect(screen.getByText("Merged cleanly into main")).toBeInTheDocument()
       const rejectBtn = screen.getByRole("button", { name: /Reject PR/i })
-      expect(mergeBtn).toHaveTextContent("Merged")
+      expect(mergeBtn).toHaveAttribute("aria-label", "Merged")
       expect(mergeBtn).toBeDisabled()
       expect(rejectBtn).toBeDisabled()
       expect(mergeBtn.className).toContain("disabled:cursor-not-allowed")
@@ -190,6 +197,35 @@ describe("PreviewInspectorView component", () => {
     fireEvent.click(screen.getByRole("button", { name: /Reject PR/i }))
     await waitFor(() => {
       expect(screen.getByText("Cannot reject merged PR")).toBeInTheDocument()
+    })
+  })
+
+  it("reopens a closed PR when Reopen PR button is clicked", async () => {
+    vi.mocked(api.getProposals).mockResolvedValue([
+      { ...mockProposals[0], status: "closed" },
+    ])
+    vi.mocked(api.getProposalPreview).mockResolvedValue(mockPreview)
+    vi.mocked(api.reopenProposal).mockResolvedValueOnce({
+      success: true,
+      message: "PR #101 reopened.",
+    })
+
+    render(<PreviewInspectorView />)
+
+    await waitFor(() => {
+      expect(screen.getAllByText(/Deploy Redis Cache/i)[0]).toBeInTheDocument()
+    })
+
+    const reopenBtn = screen.getByRole("button", { name: /Reopen PR/i })
+    fireEvent.click(reopenBtn)
+
+    await waitFor(() => {
+      expect(api.reopenProposal).toHaveBeenCalledWith("101")
+      expect(screen.getByText("PR #101 reopened.")).toBeInTheDocument()
+      expect(
+        screen.getByRole("button", { name: /Merge PR Proposal/i })
+      ).toBeEnabled()
+      expect(screen.getByRole("button", { name: /Reject PR/i })).toBeEnabled()
     })
   })
 

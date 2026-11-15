@@ -12,6 +12,8 @@ import {
   ShieldCheck,
   GitMerge,
   Layers,
+  XCircle,
+  RotateCcw,
 } from "lucide-react"
 import { PreviewReport, Proposal, ResourceDiff } from "../types/api"
 import { GitDiffViewer } from "./GitDiffViewer"
@@ -20,6 +22,7 @@ import {
   getProposals,
   mergeProposal,
   rejectProposal,
+  reopenProposal,
 } from "../lib/api"
 import { isDemoMode } from "../lib/utils"
 
@@ -120,6 +123,7 @@ export const PreviewInspectorView: React.FC = () => {
   const [loadingPreview, setLoadingPreview] = useState(false)
   const [merging, setMerging] = useState(false)
   const [rejecting, setRejecting] = useState(false)
+  const [reopening, setReopening] = useState(false)
   const [mergeSuccess, setMergeSuccess] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [statusFilter, setStatusFilter] = useState<
@@ -268,34 +272,59 @@ export const PreviewInspectorView: React.FC = () => {
     }
   }
 
+  const handleReopenPR = async () => {
+    if (!selectedPR) return
+    setReopening(true)
+    setMergeSuccess(null)
+    setError(null)
+    try {
+      const result = await reopenProposal(selectedPR.id)
+      if (result.success) {
+        setMergeSuccess(result.message || `PR #${selectedPR.id} reopened.`)
+        setProposals((prev) =>
+          prev.map((p) =>
+            p.id === selectedPR.id ? { ...p, status: "open" } : p
+          )
+        )
+        setSelectedPR((prev) => (prev ? { ...prev, status: "open" } : null))
+      } else {
+        setError(result.message || "Failed to reopen PR proposal")
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Reopen operation failed")
+    } finally {
+      setReopening(false)
+    }
+  }
+
   const renderOpBadge = (op: ResourceDiff["op"]) => {
     switch ((op ?? "").toLowerCase()) {
       case "create":
         return (
           <span className="inline-flex items-center space-x-1 px-2.5 py-0.5 rounded-full text-xs font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
             <PlusCircle className="h-3 w-3" />
-            <span>+ Create</span>
+            <span>Create</span>
           </span>
         )
       case "update":
         return (
           <span className="inline-flex items-center space-x-1 px-2.5 py-0.5 rounded-full text-xs font-semibold bg-blue-500/10 text-blue-400 border border-blue-500/20">
             <RefreshCcw className="h-3 w-3" />
-            <span>~ Update</span>
+            <span>Update</span>
           </span>
         )
       case "delete":
         return (
           <span className="inline-flex items-center space-x-1 px-2.5 py-0.5 rounded-full text-xs font-semibold bg-red-500/10 text-red-400 border border-red-500/20">
             <MinusCircle className="h-3 w-3" />
-            <span>- Delete</span>
+            <span>Delete</span>
           </span>
         )
       case "replace":
         return (
           <span className="inline-flex items-center space-x-1 px-2.5 py-0.5 rounded-full text-xs font-semibold bg-amber-500/10 text-amber-400 border border-amber-500/20">
             <AlertOctagon className="h-3 w-3" />
-            <span>! Replace</span>
+            <span>Replace</span>
           </span>
         )
       case "drift":
@@ -308,7 +337,7 @@ export const PreviewInspectorView: React.FC = () => {
       default:
         return (
           <span className="inline-flex items-center space-x-1 px-2.5 py-0.5 rounded-full text-xs font-semibold bg-slate-800 text-slate-400">
-            <span>= {op}</span>
+            <span>{op}</span>
           </span>
         )
     }
@@ -334,7 +363,7 @@ export const PreviewInspectorView: React.FC = () => {
         </div>
       </div>
 
-      <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 lg:h-[calc(100vh-14rem)] lg:min-h-[560px]">
+      <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 lg:h-[calc(100vh-14rem)] lg:min-h-140">
         {/* Left PR Selector List */}
         <div className="lg:col-span-4 flex flex-col lg:h-full min-h-0 space-y-4">
           <div className="flex items-center justify-between shrink-0">
@@ -365,7 +394,7 @@ export const PreviewInspectorView: React.FC = () => {
 
           <div
             data-testid="pr-list"
-            className="space-y-3 flex-1 min-h-0 max-h-[640px] lg:max-h-none overflow-y-auto pr-1"
+            className="space-y-3 flex-1 min-h-0 max-h-160 lg:max-h-none overflow-y-auto pr-1"
           >
             {proposals.map((pr) => {
               const isSelected = selectedPR?.id === pr.id
@@ -442,63 +471,122 @@ export const PreviewInspectorView: React.FC = () => {
                   </p>
                 </div>
 
-                <div className="flex items-center space-x-3">
+                <div className="flex items-center space-x-2">
                   {selectedPR.prUrl && (
-                    <a
-                      href={selectedPR.prUrl}
-                      target="_blank"
-                      rel="noreferrer"
-                      className="flex items-center space-x-1.5 px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 rounded-lg text-xs font-medium transition-colors"
-                    >
-                      <span>Forge Link</span>
-                      <ExternalLink className="h-3.5 w-3.5" />
-                    </a>
+                    <div className="relative group inline-flex">
+                      <a
+                        href={selectedPR.prUrl}
+                        target="_blank"
+                        rel="noreferrer"
+                        aria-label="Forge Link"
+                        className="inline-flex items-center justify-center p-2 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 rounded-lg transition-colors"
+                      >
+                        <ExternalLink className="h-4 w-4" />
+                      </a>
+                      <span
+                        role="tooltip"
+                        className="pointer-events-none absolute top-full left-1/2 -translate-x-1/2 mt-2 px-2 py-1 rounded-md bg-slate-950 border border-slate-700 text-[11px] font-medium text-slate-200 whitespace-nowrap opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 transition-opacity shadow-lg z-20"
+                      >
+                        Forge Link
+                      </span>
+                    </div>
                   )}
 
-                  <button
-                    onClick={handleRejectPR}
-                    disabled={
-                      merging || rejecting || selectedPR.status !== "open"
-                    }
-                    className="flex items-center space-x-2 px-3.5 py-1.5 bg-rose-600/20 enabled:hover:bg-rose-600/30 text-rose-300 border border-rose-500/30 rounded-lg text-xs font-semibold transition-colors disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer"
-                  >
-                    {rejecting ? (
-                      <>
-                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                        <span>Rejecting...</span>
-                      </>
-                    ) : (
-                      <span>
-                        {selectedPR.status === "closed"
-                          ? "Rejected"
-                          : "Reject PR"}
-                      </span>
-                    )}
-                  </button>
+                  {selectedPR.status === "closed"
+                    ? (() => {
+                        const reopenLabel = reopening
+                          ? "Reopening..."
+                          : "Reopen PR"
+                        return (
+                          <div className="relative group inline-flex">
+                            <button
+                              onClick={handleReopenPR}
+                              disabled={merging || rejecting || reopening}
+                              aria-label={reopenLabel}
+                              className="inline-flex items-center justify-center p-2 bg-emerald-600/20 enabled:hover:bg-emerald-600/30 text-emerald-300 border border-emerald-500/30 rounded-lg transition-colors disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer"
+                            >
+                              {reopening ? (
+                                <Loader2 className="h-4 w-4 animate-spin" />
+                              ) : (
+                                <RotateCcw className="h-4 w-4" />
+                              )}
+                            </button>
+                            <span
+                              role="tooltip"
+                              className="pointer-events-none absolute top-full left-1/2 -translate-x-1/2 mt-2 px-2 py-1 rounded-md bg-slate-950 border border-slate-700 text-[11px] font-medium text-slate-200 whitespace-nowrap opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 transition-opacity shadow-lg z-20"
+                            >
+                              {reopenLabel}
+                            </span>
+                          </div>
+                        )
+                      })()
+                    : (() => {
+                        const rejectLabel = rejecting
+                          ? "Rejecting..."
+                          : "Reject PR"
+                        return (
+                          <div className="relative group inline-flex">
+                            <button
+                              onClick={handleRejectPR}
+                              disabled={
+                                merging ||
+                                rejecting ||
+                                reopening ||
+                                selectedPR.status !== "open"
+                              }
+                              aria-label={rejectLabel}
+                              className="inline-flex items-center justify-center p-2 bg-rose-600/20 enabled:hover:bg-rose-600/30 text-rose-300 border border-rose-500/30 rounded-lg transition-colors disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer"
+                            >
+                              {rejecting ? (
+                                <Loader2 className="h-4 w-4 animate-spin" />
+                              ) : (
+                                <XCircle className="h-4 w-4" />
+                              )}
+                            </button>
+                            <span
+                              role="tooltip"
+                              className="pointer-events-none absolute top-full left-1/2 -translate-x-1/2 mt-2 px-2 py-1 rounded-md bg-slate-950 border border-slate-700 text-[11px] font-medium text-slate-200 whitespace-nowrap opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 transition-opacity shadow-lg z-20"
+                            >
+                              {rejectLabel}
+                            </span>
+                          </div>
+                        )
+                      })()}
 
-                  <button
-                    onClick={handleMergePR}
-                    disabled={
-                      merging || rejecting || selectedPR.status !== "open"
-                    }
-                    className="flex items-center space-x-2 px-4 py-1.5 bg-purple-600 enabled:hover:bg-purple-500 text-white rounded-lg text-xs font-semibold transition-colors disabled:opacity-40 disabled:cursor-not-allowed disabled:shadow-none shadow-lg shadow-purple-600/20 cursor-pointer"
-                  >
-                    {merging ? (
-                      <>
-                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                        <span>Merging...</span>
-                      </>
-                    ) : (
-                      <>
-                        <GitMerge className="h-3.5 w-3.5" />
-                        <span>
-                          {selectedPR.status === "merged"
-                            ? "Merged"
-                            : "Merge PR Proposal"}
+                  {(() => {
+                    const mergeLabel = merging
+                      ? "Merging..."
+                      : selectedPR.status === "merged"
+                        ? "Merged"
+                        : "Merge PR Proposal"
+                    return (
+                      <div className="relative group inline-flex">
+                        <button
+                          onClick={handleMergePR}
+                          disabled={
+                            merging ||
+                            rejecting ||
+                            reopening ||
+                            selectedPR.status !== "open"
+                          }
+                          aria-label={mergeLabel}
+                          className="inline-flex items-center justify-center p-2 bg-purple-600 enabled:hover:bg-purple-500 text-white rounded-lg transition-colors disabled:opacity-40 disabled:cursor-not-allowed disabled:shadow-none shadow-lg shadow-purple-600/20 cursor-pointer"
+                        >
+                          {merging ? (
+                            <Loader2 className="h-4 w-4 animate-spin" />
+                          ) : (
+                            <GitMerge className="h-4 w-4" />
+                          )}
+                        </button>
+                        <span
+                          role="tooltip"
+                          className="pointer-events-none absolute top-full right-0 mt-2 px-2 py-1 rounded-md bg-slate-950 border border-slate-700 text-[11px] font-medium text-slate-200 whitespace-nowrap opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 transition-opacity shadow-lg z-20"
+                        >
+                          {mergeLabel}
                         </span>
-                      </>
-                    )}
-                  </button>
+                      </div>
+                    )
+                  })()}
                 </div>
               </div>
 

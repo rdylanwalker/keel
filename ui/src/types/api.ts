@@ -58,6 +58,7 @@ export interface CatalogItem {
   path?: string
   runtime?: string
   flaggerSupported?: boolean
+  defaultCanary?: boolean
   pulumiRuntime?: "yaml" | "hcl" | "opentofu-bridge"
   entrypoint?: string
   protectByDefault?: boolean
@@ -182,6 +183,8 @@ export interface ReleaseSummary {
   bundleItem?: string
   lastSynced?: string
   canaryWeight?: number
+  canaryPhase?: string
+  primaryVersion?: string
   errorRate?: number
   latencyMs?: number
 }
@@ -222,6 +225,7 @@ export interface ReleaseConfig {
   version?: string
   targetCluster?: string
   targetNamespace?: string
+  canary?: boolean
   values: Record<string, unknown>
 }
 
@@ -235,4 +239,5 @@ export interface CreateProposalPayload {
   title?: string
   kind?: "app" | "infra" | "bundle"
   targetCluster?: string
+  canary?: boolean
 }

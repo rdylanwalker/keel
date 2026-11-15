@@ -1065,17 +1065,31 @@ describe("CatalogWizardView component and jsonToYaml helper", () => {
     fireEvent.click(
       screen.getByRole("button", { name: /\+ Add Catalog Item/i })
     )
+    const catalogItemModal = screen.getByTestId("catalog-item-modal")
+    expect(catalogItemModal.className).toContain("max-w-4xl")
+    expect(catalogItemModal.className).toContain("w-full")
     fireEvent.click(screen.getByRole("button", { name: /Enter full screen/i }))
+    expect(catalogItemModal.className).toContain("w-full h-full")
+    expect(catalogItemModal.className).toContain("rounded-none")
+    fireEvent.click(screen.getByRole("button", { name: /Exit full screen/i }))
+    expect(catalogItemModal.className).toContain("max-w-4xl")
     expect(
-      screen.getByRole("button", { name: /Exit full screen/i })
+      screen.getByRole("button", { name: /Enter full screen/i })
     ).toBeInTheDocument()
     fireEvent.click(screen.getByRole("button", { name: /Close modal/i }))
 
     // 3. New Tenant modal full-screen toggle
     fireEvent.click(screen.getByRole("button", { name: /\+ New Tenant/i }))
+    const tenantModal = screen.getByTestId("new-tenant-modal")
+    expect(tenantModal.className).toContain("max-w-4xl")
+    expect(tenantModal.className).toContain("w-full")
     fireEvent.click(screen.getByRole("button", { name: /Enter full screen/i }))
+    expect(tenantModal.className).toContain("w-full h-full")
+    expect(tenantModal.className).toContain("rounded-none")
+    fireEvent.click(screen.getByRole("button", { name: /Exit full screen/i }))
+    expect(tenantModal.className).toContain("max-w-4xl")
     expect(
-      screen.getByRole("button", { name: /Exit full screen/i })
+      screen.getByRole("button", { name: /Enter full screen/i })
     ).toBeInTheDocument()
     fireEvent.click(screen.getByRole("button", { name: /Close modal/i }))
   })

@@ -9,6 +9,7 @@ import {
   getProposalPreview,
   mergeProposal,
   rejectProposal,
+  reopenProposal,
   getStacks,
   getReleases,
   getTenants,
@@ -251,6 +252,16 @@ describe("api client module", () => {
     )
     const wrappedReject = await rejectProposal(7)
     expect(wrappedReject.success).toBe(true)
+
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ proposal: { id: "7", state: "open" } }),
+      })
+    )
+    const wrappedReopen = await reopenProposal(7)
+    expect(wrappedReopen.success).toBe(true)
   })
 
   it("fetches stacks and releases", async () => {

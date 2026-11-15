@@ -99,9 +99,16 @@ test.describe('06 - Full Localhost GUI GitOps Workflow', () => {
     // 6. Verify status & reconciliation in Topology Map
     await page.getByRole('button', { name: /Topology Map/i }).click();
     await page.getByRole('button', { name: /Refresh Map/i }).click();
+    await expect(page.getByText('Cluster & Workload Topology')).toBeVisible();
+    await expect(page.getByText('Management Control Plane')).toBeVisible();
     await expect(page.getByText('management-cluster-core', { exact: true })).toBeVisible();
     await expect(page.getByText('e2e-team').first()).toBeVisible({ timeout: 10000 });
     await expect(page.getByText(/Live Reconciler Event Stream/i)).toBeVisible();
     await expect(page.getByText(/podinfo/i).first()).toBeVisible({ timeout: 10000 });
+
+    // 7. Verify Control Plane & Providers 4th sidebar tab
+    await page.getByRole('button', { name: /Control Plane & Providers/i }).click();
+    await expect(page.getByText('Management Control Plane Cluster')).toBeVisible();
+    await expect(page.getByText('Enabled Provider Mesh')).toBeVisible();
   });
 });

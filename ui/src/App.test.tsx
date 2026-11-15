@@ -46,7 +46,7 @@ describe("App top-level application component", () => {
       await screen.findByText("Authentication Required")
     ).toBeInTheDocument()
     expect(
-      screen.queryByText("Cluster & Provider Topology Map")
+      screen.queryByText("Cluster & Workload Topology")
     ).not.toBeInTheDocument()
 
     await waitFor(() => {
@@ -54,7 +54,7 @@ describe("App top-level application component", () => {
     })
   })
 
-  it("switches navigation tabs across all 3 views", async () => {
+  it("switches navigation tabs across all 4 views", async () => {
     vi.mocked(api.getAuthStatus).mockResolvedValue({
       authenticated: true,
       phase: "oidc-active",
@@ -89,6 +89,18 @@ describe("App top-level application component", () => {
     ).toBeInTheDocument()
     expect(window.location.hash).toBe("#preview")
 
+    // Tab 4: Control Plane & Providers
+    const providersTabBtn = screen.getByRole("button", {
+      name: /Control Plane & Providers/i,
+    })
+    await act(async () => {
+      fireEvent.click(providersTabBtn)
+    })
+    expect(
+      await screen.findByText("Management Control Plane Cluster")
+    ).toBeInTheDocument()
+    expect(window.location.hash).toBe("#providers")
+
     // Back to Tab 1: Topology
     const topologyTabBtn = screen.getByRole("button", {
       name: /Topology Map/i,
@@ -97,7 +109,7 @@ describe("App top-level application component", () => {
       fireEvent.click(topologyTabBtn)
     })
     expect(
-      await screen.findByText("Cluster & Provider Topology Map")
+      await screen.findByText("Cluster & Workload Topology")
     ).toBeInTheDocument()
     expect(window.location.hash).toBe("#topology")
   })
@@ -196,7 +208,7 @@ describe("App top-level application component", () => {
     window.history.replaceState(null, "", "/#unknown-page")
     render(<App />)
     expect(
-      await screen.findByText("Cluster & Provider Topology Map")
+      await screen.findByText("Cluster & Workload Topology")
     ).toBeInTheDocument()
     expect(window.location.hash).toBe("#topology")
   })

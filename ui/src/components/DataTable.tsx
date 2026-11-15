@@ -1,17 +1,42 @@
 import { useState } from "react"
-import { flexRender, RowData, SortingState } from "@tanstack/react-table"
 import {
-  getCoreRowModel,
-  getFilteredRowModel,
-  getSortedRowModel,
-  LegacyColumnDef,
-  useLegacyTable,
-} from "@tanstack/react-table/legacy"
+  ColumnDef,
+  columnFilteringFeature,
+  createFilteredRowModel,
+  createSortedRowModel,
+  filterFns,
+  flexRender,
+  globalFilteringFeature,
+  RowData,
+  rowSortingFeature,
+  sortFns,
+  SortingState,
+  tableFeatures,
+  useTable,
+} from "@tanstack/react-table"
 import { ArrowDown, ArrowUp, ArrowUpDown, Search, X } from "lucide-react"
+
+const dataTableFeatures = tableFeatures({
+  rowSortingFeature,
+  columnFilteringFeature,
+  globalFilteringFeature,
+  filteredRowModel: createFilteredRowModel(),
+  sortedRowModel: createSortedRowModel(),
+  filterFns,
+  sortFns,
+})
+
+export type DataTableFeatures = typeof dataTableFeatures
+
+export type DataTableColumnDef<TData extends RowData> = ColumnDef<
+  DataTableFeatures,
+  TData,
+  unknown
+>
 
 interface DataTableProps<TData extends RowData> {
   data: TData[]
-  columns: LegacyColumnDef<TData, unknown>[]
+  columns: DataTableColumnDef<TData>[]
   filterPlaceholder?: string
   emptyMessage?: string
   noResultsMessage?: string
@@ -29,8 +54,8 @@ export function DataTable<TData extends RowData>({
   const [sorting, setSorting] = useState<SortingState>([])
   const [globalFilter, setGlobalFilter] = useState("")
 
-  // eslint-disable-next-line react-hooks/incompatible-library
-  const table = useLegacyTable({
+  const table = useTable<DataTableFeatures, TData>({
+    features: dataTableFeatures,
     data,
     columns,
     state: {
@@ -39,9 +64,6 @@ export function DataTable<TData extends RowData>({
     },
     onSortingChange: setSorting,
     onGlobalFilterChange: setGlobalFilter,
-    getCoreRowModel: getCoreRowModel(),
-    getSortedRowModel: getSortedRowModel(),
-    getFilteredRowModel: getFilteredRowModel(),
     getRowId,
   })
 
@@ -136,7 +158,7 @@ export function DataTable<TData extends RowData>({
                 key={row.id}
                 className="hover:bg-slate-800/40 transition-colors"
               >
-                {row.getVisibleCells().map((cell) => {
+                {row.getAllCells().map((cell) => {
                   const alignRight =
                     (cell.column.columnDef.meta as { align?: string })
                       ?.align === "right"

@@ -169,6 +169,7 @@ export interface DeployInstanceInitialConfig {
   tenant?: string
   targetCluster?: string
   targetNamespace?: string
+  canary?: boolean
 }
 
 export interface DeployInstanceModalProps {
@@ -244,6 +245,11 @@ const DeployInstanceModalBody: React.FC<DeployInstanceModalProps> = ({
   })
   const [targetNamespace, setTargetNamespace] = useState<string>(
     () => initialConfig?.targetNamespace ?? ""
+  )
+  const [enableCanary, setEnableCanary] = useState<boolean>(() =>
+    initialConfig?.canary !== undefined
+      ? Boolean(initialConfig.canary)
+      : Boolean(catalogItem?.flaggerSupported && catalogItem?.defaultCanary)
   )
   const [localTenant, setLocalTenant] = useState<string>(
     () => initialConfig?.tenant ?? tenant
@@ -361,6 +367,11 @@ const DeployInstanceModalBody: React.FC<DeployInstanceModalProps> = ({
             : (activeItem.type as "app" | "infra" | "bundle"),
         ...(resolvedTargetCluster
           ? { targetCluster: resolvedTargetCluster }
+          : {}),
+        ...(activeItem.type === "app" &&
+        activeItem.flaggerSupported &&
+        enableCanary
+          ? { canary: true }
           : {}),
       })
       onProposalCreated?.(proposal)
@@ -545,6 +556,29 @@ const DeployInstanceModalBody: React.FC<DeployInstanceModalProps> = ({
                 className="w-full bg-slate-950 border border-slate-800 text-xs text-slate-200 rounded-lg px-3 py-1.5 focus:outline-none focus:ring-1 focus:ring-indigo-500 font-mono disabled:opacity-50 disabled:cursor-not-allowed"
               />
             </div>
+            {activeItem.flaggerSupported && (
+              <div className="sm:col-span-2 flex items-start space-x-2.5 bg-slate-950/70 border border-slate-800 rounded-lg px-3 py-2.5">
+                <input
+                  id="deploy-enable-canary"
+                  type="checkbox"
+                  checked={enableCanary}
+                  onChange={(e) => setEnableCanary(e.target.checked)}
+                  className="mt-0.5 h-3.5 w-3.5 rounded border-slate-700 bg-slate-900 text-indigo-500 focus:ring-indigo-500 cursor-pointer"
+                />
+                <label
+                  htmlFor="deploy-enable-canary"
+                  className="text-xs text-slate-200 cursor-pointer select-none"
+                >
+                  <span className="font-medium block">
+                    Enable Flagger Canary
+                  </span>
+                  <span className="text-[11px] text-slate-400">
+                    Generates a Flagger Canary CR for progressive traffic
+                    shifting via Envoy Gateway &amp; Prometheus.
+                  </span>
+                </label>
+              </div>
+            )}
           </>
         )}
       </div>

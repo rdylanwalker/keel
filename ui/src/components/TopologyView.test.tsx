@@ -11,6 +11,30 @@ vi.mock("../lib/api", () => ({
   getProviders: vi.fn(),
   getProposals: vi.fn().mockResolvedValue([]),
   toggleProvider: vi.fn(),
+  restartStackWorkspace: vi.fn(),
+  reconcileRelease: vi.fn(),
+  deleteStack: vi.fn(),
+  deleteRelease: vi.fn(),
+  getStackDiagnostics: vi.fn().mockResolvedValue({
+    name: "live-proxmox-stack",
+    namespace: "tenant-acme",
+    kind: "stack",
+    status: "Ready",
+    conditions: [],
+    events: [],
+    logs: [],
+    outputs: {},
+  }),
+  getReleaseDiagnostics: vi.fn().mockResolvedValue({
+    name: "podinfo",
+    namespace: "tenant-acme",
+    kind: "release",
+    status: "Ready",
+    conditions: [],
+    events: [],
+    logs: [],
+    outputs: {},
+  }),
   createEventSourceStream: vi.fn(() => ({ close: vi.fn() })),
 }))
 
@@ -48,21 +72,13 @@ describe("TopologyView component", () => {
     vi.mocked(api.getReleases).mockResolvedValue([])
   })
 
-  it("renders cluster & provider topology map and loads live stacks and providers", async () => {
+  it("renders cluster & workload topology and loads live stacks", async () => {
     vi.mocked(api.getStacks).mockResolvedValueOnce(mockLiveStacks)
-    vi.mocked(api.getProviders).mockResolvedValueOnce([
-      { id: "aws", enabled: true },
-      { id: "gcp", enabled: true, description: "Google Cloud Platform" },
-    ])
 
     render(<TopologyView />)
 
-    expect(
-      screen.getByText("Cluster & Provider Topology Map")
-    ).toBeInTheDocument()
-    expect(
-      screen.getByText("Management Control Plane Cluster")
-    ).toBeInTheDocument()
+    expect(screen.getByText("Cluster & Workload Topology")).toBeInTheDocument()
+    expect(screen.getByText("Management Control Plane")).toBeInTheDocument()
 
     await waitFor(() => {
       expect(screen.getByText("live-proxmox-stack")).toBeInTheDocument()
@@ -72,81 +88,33 @@ describe("TopologyView component", () => {
     })
   })
 
-  it("toggles provider enable state and displays PR notification banner", async () => {
-    const onNavigateToCatalog = vi.fn()
-    vi.mocked(api.getStacks).mockResolvedValueOnce([])
-    vi.mocked(api.getProviders).mockResolvedValueOnce([
-      { id: "gcp", enabled: false, description: "Google Cloud Platform" },
-      {
-        id: "custom-cloud",
-        enabled: true,
-        description: "Custom Cloud Provider",
-        package: "custom-package",
-      },
-    ])
-    vi.mocked(api.toggleProvider).mockResolvedValueOnce({
-      id: "789",
-      title: "Enable GCP",
-      branch: "feature/enable-gcp",
-      author: "user",
-      tenant: "keel-system",
-      status: "open",
-      createdAt: "now",
+  it("expands compact control plane strip details and navigates to providers tab", async () => {
+    const onNavigateToProviders = vi.fn()
+    vi.mocked(api.getStacksWithMeta).mockResolvedValueOnce({
+      stacks: mockLiveStacks,
+      gitRepoUrl: "https://git.example.com/org/infra.git",
+      forgeProvider: "forgejo",
+      stateBackend: "s3://keel-state",
     })
 
-    render(<TopologyView onNavigateToCatalog={onNavigateToCatalog} />)
+    render(<TopologyView onNavigateToProviders={onNavigateToProviders} />)
 
     await waitFor(() => {
-      expect(api.getProviders).toHaveBeenCalled()
-      expect(screen.getByText("Custom Cloud Provider")).toBeInTheDocument()
+      expect(screen.getByText("live-proxmox-stack")).toBeInTheDocument()
     })
 
-    // Click Provision -> on enabled card
-    const provisionBtn = screen.getAllByRole("button", {
-      name: /Provision →/i,
-    })[0]
-    fireEvent.click(provisionBtn)
-    expect(onNavigateToCatalog).toHaveBeenCalled()
-
-    const gcpEnableBtn = screen.getAllByRole("button", { name: /^Enable$/i })[0]
-    fireEvent.click(gcpEnableBtn)
-
-    await waitFor(() => {
-      expect(api.toggleProvider).toHaveBeenCalledWith("gcp", true)
-      expect(
-        screen.getByText("PR #789 opened on branch feature/enable-gcp")
-      ).toBeInTheDocument()
-    })
-
-    // Dismiss PR banner
-    const closeBannerBtn = screen.getByRole("button", { name: /Dismiss/i })
-    fireEvent.click(closeBannerBtn)
+    expect(screen.queryByText("Git Forge & Repo")).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole("button", { name: /Details/i }))
+    expect(screen.getByText("Git Forge & Repo")).toBeInTheDocument()
     expect(
-      screen.queryByText("PR #789 opened on branch feature/enable-gcp")
-    ).not.toBeInTheDocument()
-  })
+      screen.getByText("forgejo: https://git.example.com/org/infra.git")
+    ).toBeInTheDocument()
 
-  it("handles failure during provider toggle cleanly", async () => {
-    vi.mocked(api.getStacks).mockResolvedValueOnce([])
-    vi.mocked(api.getProviders).mockResolvedValueOnce([
-      { id: "aws", enabled: true },
-    ])
-    vi.mocked(api.toggleProvider).mockRejectedValueOnce("Toggle error string")
+    fireEvent.click(screen.getByRole("button", { name: /Hide/i }))
+    expect(screen.queryByText("Git Forge & Repo")).not.toBeInTheDocument()
 
-    render(<TopologyView />)
-
-    await waitFor(() => {
-      expect(api.getProviders).toHaveBeenCalled()
-    })
-
-    const disableBtn = screen.getAllByRole("button", { name: /^Disable$/i })[0]
-    fireEvent.click(disableBtn)
-
-    await waitFor(() => {
-      expect(screen.getByRole("alert")).toHaveTextContent(
-        "Failed to toggle provider proxmox"
-      )
-    })
+    fireEvent.click(screen.getByRole("button", { name: /Providers →/i }))
+    expect(onNavigateToProviders).toHaveBeenCalled()
   })
 
   it("filters and sorts stacks via TanStack DataTable", async () => {
@@ -471,5 +439,242 @@ describe("TopologyView component", () => {
 
     const matches = await screen.findAllByText("Reconciliation succeeded")
     expect(matches).toHaveLength(1)
+  })
+
+  it("handles stack and release quick actions (edit, inspect, restart, reconcile, delete)", async () => {
+    const onEditStack = vi.fn()
+    const onEditRelease = vi.fn()
+    const onNavigateToCatalog = vi.fn()
+
+    vi.mocked(api.getStacksWithMeta).mockResolvedValue({
+      stacks: mockLiveStacks,
+    })
+    vi.mocked(api.getReleases).mockResolvedValue([
+      {
+        id: "tenant-acme/podinfo",
+        name: "podinfo",
+        namespace: "tenant-acme",
+        tenant: "acme",
+        chart: "podinfo",
+        version: "6.7.0",
+        type: "helm",
+        status: "Ready",
+        lastSynced: new Date(Date.now() - 120000).toISOString(),
+        targetCluster: "workload-01-kubeconfig",
+      },
+    ])
+    vi.mocked(api.restartStackWorkspace).mockResolvedValueOnce({
+      restarted: true,
+      namespace: "tenant-acme",
+      name: "live-proxmox-stack",
+      message: "Workspace restarted for live-proxmox-stack",
+    })
+    vi.mocked(api.reconcileRelease).mockResolvedValueOnce({
+      reconciled: true,
+      namespace: "tenant-acme",
+      name: "podinfo",
+      message: "Reconciliation requested for podinfo",
+    })
+    vi.mocked(api.deleteStack).mockResolvedValueOnce({
+      id: "live-proxmox-stack",
+      namespace: "tenant-acme",
+      branch: "keel/delete/live-proxmox-stack",
+      proposal: {
+        id: "901",
+        title: "Delete stack",
+        branch: "keel/delete/live-proxmox-stack",
+        author: "user",
+        tenant: "tenant-acme",
+        status: "open",
+        createdAt: "now",
+      },
+    })
+    vi.mocked(api.deleteRelease).mockResolvedValueOnce({
+      id: "podinfo",
+      namespace: "tenant-acme",
+      branch: "keel/delete/podinfo",
+      proposal: {
+        id: "902",
+        title: "Delete release",
+        branch: "keel/delete/podinfo",
+        author: "user",
+        tenant: "tenant-acme",
+        status: "open",
+        createdAt: "now",
+      },
+    })
+
+    render(
+      <TopologyView
+        onEditStack={onEditStack}
+        onEditRelease={onEditRelease}
+        onNavigateToCatalog={onNavigateToCatalog}
+      />
+    )
+
+    await waitFor(() => {
+      expect(screen.getByText("live-proxmox-stack")).toBeInTheDocument()
+      expect(screen.getAllByText("podinfo").length).toBeGreaterThan(0)
+    })
+
+    // Edit stack & release
+    fireEvent.click(
+      screen.getByRole("button", { name: "Edit stack live-proxmox-stack" })
+    )
+    expect(onEditStack).toHaveBeenCalledWith(
+      "tenant-acme",
+      "live-proxmox-stack"
+    )
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Edit release podinfo" })
+    )
+    expect(onEditRelease).toHaveBeenCalledWith("tenant-acme", "podinfo")
+
+    // Restart stack
+    fireEvent.click(
+      screen.getByRole("button", { name: "Restart stack live-proxmox-stack" })
+    )
+    await waitFor(() => {
+      expect(
+        screen.getByText("Workspace restarted for live-proxmox-stack")
+      ).toBeInTheDocument()
+    })
+
+    // Reconcile release
+    fireEvent.click(
+      screen.getByRole("button", { name: "Reconcile release podinfo" })
+    )
+    await waitFor(() => {
+      expect(
+        screen.getByText("Reconciliation requested for podinfo")
+      ).toBeInTheDocument()
+    })
+
+    // Delete stack & release PR banners
+    fireEvent.click(
+      screen.getByRole("button", { name: "Delete stack live-proxmox-stack" })
+    )
+    await waitFor(() => {
+      expect(
+        screen.getByText(/Opened Delete PR #901.*live-proxmox-stack/)
+      ).toBeInTheDocument()
+    })
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Delete release podinfo" })
+    )
+    await waitFor(() => {
+      expect(
+        screen.getByText(/Opened Delete PR #902.*podinfo/)
+      ).toBeInTheDocument()
+    })
+
+    // Dismiss banners
+    const dismissButtons = screen.getAllByRole("button", { name: /Dismiss/i })
+    dismissButtons.forEach((btn) => fireEvent.click(btn))
+
+    // Toggle Auto refresh & + Deploy buttons
+    fireEvent.click(screen.getByRole("button", { name: "Auto: 5s" }))
+    expect(
+      screen.getByRole("button", { name: "Auto: Off" })
+    ).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole("button", { name: "+ Deploy Stack" }))
+    fireEvent.click(screen.getByRole("button", { name: "+ Deploy App" }))
+    expect(onNavigateToCatalog).toHaveBeenCalledTimes(2)
+
+    // Inspect stack modal open & close
+    fireEvent.click(
+      screen.getByRole("button", { name: "Inspect stack live-proxmox-stack" })
+    )
+    await waitFor(() => {
+      expect(screen.getByRole("dialog")).toBeInTheDocument()
+    })
+  })
+
+  it("handles errors on restart, reconcile, delete, and clears event stream", async () => {
+    vi.mocked(api.getStacksWithMeta).mockResolvedValue({
+      stacks: mockLiveStacks,
+    })
+    vi.mocked(api.getReleases).mockResolvedValue([
+      {
+        id: "tenant-acme/podinfo",
+        name: "podinfo",
+        namespace: "tenant-acme",
+        tenant: "acme",
+        chart: "podinfo",
+        version: "6.7.0",
+        type: "helm",
+        status: "Ready",
+        lastSynced: new Date(Date.now() - 3 * 3600 * 1000).toISOString(),
+      },
+      {
+        id: "tenant-acme/redis",
+        name: "redis",
+        namespace: "tenant-acme",
+        tenant: "acme",
+        chart: "redis",
+        version: "1.0.0",
+        type: "helm",
+        status: "Ready",
+        lastSynced: new Date(Date.now() - 2 * 86400 * 1000).toISOString(),
+      },
+    ])
+    vi.mocked(api.restartStackWorkspace).mockRejectedValueOnce(
+      new Error("Restart failed")
+    )
+    vi.mocked(api.reconcileRelease).mockRejectedValueOnce(
+      new Error("Reconcile failed")
+    )
+    vi.mocked(api.deleteStack).mockRejectedValueOnce(
+      new Error("Delete stack failed")
+    )
+    vi.mocked(api.deleteRelease).mockRejectedValueOnce(
+      new Error("Delete release failed")
+    )
+
+    render(<TopologyView />)
+
+    await waitFor(() => {
+      expect(screen.getByText("live-proxmox-stack")).toBeInTheDocument()
+      expect(screen.getAllByText("podinfo").length).toBeGreaterThan(0)
+    })
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Restart stack live-proxmox-stack" })
+    )
+    await waitFor(() => {
+      expect(screen.getByRole("alert")).toHaveTextContent("Restart failed")
+    })
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Reconcile release podinfo" })
+    )
+    await waitFor(() => {
+      expect(screen.getByRole("alert")).toHaveTextContent("Reconcile failed")
+    })
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Delete stack live-proxmox-stack" })
+    )
+    await waitFor(() => {
+      expect(screen.getByRole("alert")).toHaveTextContent("Delete stack failed")
+    })
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Delete release podinfo" })
+    )
+    await waitFor(() => {
+      expect(screen.getByRole("alert")).toHaveTextContent(
+        "Delete release failed"
+      )
+    })
+
+    // Clear event logs
+    fireEvent.click(screen.getByTitle("Clear event logs"))
+    expect(
+      screen.getByText("No CRD events received yet or stream cleared.")
+    ).toBeInTheDocument()
   })
 })
