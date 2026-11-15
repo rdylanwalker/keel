@@ -14,6 +14,7 @@ import {
   Layers,
 } from "lucide-react"
 import { PreviewReport, Proposal, ResourceDiff } from "../types/api"
+import { GitDiffViewer } from "./GitDiffViewer"
 import {
   getProposalPreview,
   getProposals,
@@ -268,33 +269,40 @@ export const PreviewInspectorView: React.FC = () => {
   }
 
   const renderOpBadge = (op: ResourceDiff["op"]) => {
-    switch (op) {
-      case "Create":
+    switch ((op ?? "").toLowerCase()) {
+      case "create":
         return (
           <span className="inline-flex items-center space-x-1 px-2.5 py-0.5 rounded-full text-xs font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
             <PlusCircle className="h-3 w-3" />
             <span>+ Create</span>
           </span>
         )
-      case "Update":
+      case "update":
         return (
           <span className="inline-flex items-center space-x-1 px-2.5 py-0.5 rounded-full text-xs font-semibold bg-blue-500/10 text-blue-400 border border-blue-500/20">
             <RefreshCcw className="h-3 w-3" />
             <span>~ Update</span>
           </span>
         )
-      case "Delete":
+      case "delete":
         return (
           <span className="inline-flex items-center space-x-1 px-2.5 py-0.5 rounded-full text-xs font-semibold bg-red-500/10 text-red-400 border border-red-500/20">
             <MinusCircle className="h-3 w-3" />
             <span>- Delete</span>
           </span>
         )
-      case "Replace":
+      case "replace":
         return (
           <span className="inline-flex items-center space-x-1 px-2.5 py-0.5 rounded-full text-xs font-semibold bg-amber-500/10 text-amber-400 border border-amber-500/20">
             <AlertOctagon className="h-3 w-3" />
             <span>! Replace</span>
+          </span>
+        )
+      case "drift":
+        return (
+          <span className="inline-flex items-center space-x-1 px-2.5 py-0.5 rounded-full text-xs font-semibold bg-amber-500/10 text-amber-400 border border-amber-500/20">
+            <AlertOctagon className="h-3 w-3" />
+            <span>Drift</span>
           </span>
         )
       default:
@@ -326,10 +334,10 @@ export const PreviewInspectorView: React.FC = () => {
         </div>
       </div>
 
-      <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+      <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 lg:h-[calc(100vh-14rem)] lg:min-h-[560px]">
         {/* Left PR Selector List */}
-        <div className="lg:col-span-4 space-y-4">
-          <div className="flex items-center justify-between">
+        <div className="lg:col-span-4 flex flex-col lg:h-full min-h-0 space-y-4">
+          <div className="flex items-center justify-between shrink-0">
             <h3 className="text-xs font-semibold text-slate-400 uppercase tracking-wider">
               Pull Requests ({proposals.length})
             </h3>
@@ -338,7 +346,7 @@ export const PreviewInspectorView: React.FC = () => {
             )}
           </div>
 
-          <div className="flex items-center gap-1.5">
+          <div className="flex items-center gap-1.5 shrink-0">
             {(["all", "open", "merged", "closed"] as const).map((st) => (
               <button
                 key={st}
@@ -355,7 +363,10 @@ export const PreviewInspectorView: React.FC = () => {
             ))}
           </div>
 
-          <div className="space-y-3">
+          <div
+            data-testid="pr-list"
+            className="space-y-3 flex-1 min-h-0 max-h-[640px] lg:max-h-none overflow-y-auto pr-1"
+          >
             {proposals.map((pr) => {
               const isSelected = selectedPR?.id === pr.id
               return (
@@ -413,9 +424,9 @@ export const PreviewInspectorView: React.FC = () => {
         </div>
 
         {/* Right Preview Inspector Tree & Details */}
-        <div className="lg:col-span-8 space-y-6">
+        <div className="lg:col-span-8 flex flex-col lg:h-full min-h-0">
           {selectedPR ? (
-            <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 space-y-6">
+            <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 space-y-6 lg:h-full min-h-0 overflow-y-auto">
               {/* Selected PR header */}
               <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-slate-800 pb-4">
                 <div>
@@ -585,9 +596,7 @@ export const PreviewInspectorView: React.FC = () => {
                     <GitPullRequest className="h-4 w-4 text-emerald-400" />
                     Git Diff (vs. main)
                   </h4>
-                  <pre className="bg-slate-950 border border-slate-800 rounded-xl p-4 text-xs font-mono text-slate-200 overflow-x-auto max-h-72 leading-relaxed">
-                    {preview.gitDiff}
-                  </pre>
+                  <GitDiffViewer diff={preview.gitDiff} />
                 </div>
               )}
 

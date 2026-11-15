@@ -60,24 +60,45 @@ packages:
     source: terraform-provider
     parameters:
       - tehcyx/kind
-configuration:
+config:
   clusterName:
     type: string
     default: workload-dev
   kubernetesVersion:
     type: string
     default: v1.32.0
+  kubeconfigSecretName:
+    type: string
+    default: workload-dev-kubeconfig
+  kubeconfigSecretNamespace:
+    type: string
+    default: tenant-default
 resources:
-  cluster:
+  workloadCluster:
     type: kind:index:Cluster
     properties:
       name: ${clusterName}
       nodeImage: kindest/node:${kubernetesVersion}
-      waitForReady: true
+      waitForReady: false
+  kubeconfigSecret:
+    type: kubernetes:core/v1:Secret
+    properties:
+      metadata:
+        name: ${kubeconfigSecretName}
+        namespace: ${kubeconfigSecretNamespace}
+      stringData:
+        kubeconfig:
+          fn::secret:
+            fn::join:
+              - https://${clusterName}-control-plane:6443
+              - fn::split:
+                  - ${workloadCluster.endpoint}
+                  - ${workloadCluster.kubeconfig}
 outputs:
-  clusterName: ${cluster.name}
+  clusterName: ${workloadCluster.name}
+  endpoint: ${workloadCluster.endpoint}
   kubeconfig:
-    fn::secret: ${cluster.kubeconfig}
+    fn::secret: ${workloadCluster.kubeconfig}
 ```
 
 ---

@@ -1922,6 +1922,19 @@ pub async fn create_proposal(
             stack_params
                 .config
                 .insert("keel:provider".to_string(), bp.metadata.provider.clone());
+            if bp.spec.outputs.iter().any(|o| o == "kubeconfig") {
+                stack_params.config.insert(
+                    "kubeconfigSecretName".to_string(),
+                    format!("{instance_name}-kubeconfig"),
+                );
+                stack_params.config.insert(
+                    "kubeconfigSecretNamespace".to_string(),
+                    tenant_namespace(&req.tenant)?,
+                );
+            }
+            if bp.metadata.provider == "kind" {
+                stack_params.docker_host = state.docker_proxy_url.clone();
+            }
             let stack = synthesize_tenant_stack(&stack_params)?;
             let stack_yaml = stack.to_yaml()?;
             (rel_dir, stack_yaml, "pulumi:pulumi.com/v1:Stack")
@@ -2268,8 +2281,12 @@ async fn create_bundle_proposal(
     }
 
     let mut item_kinds = std::collections::BTreeMap::new();
+    let mut target_cluster_sources = std::collections::HashSet::new();
     for item in &ordered_items {
         item_kinds.insert(item.id.as_str(), item.kind);
+        if let Some(src) = &item.target_cluster_from {
+            target_cluster_sources.insert(src.as_str());
+        }
     }
 
     let mut prepared_items = Vec::with_capacity(ordered_items.len());
@@ -2365,9 +2382,10 @@ async fn create_bundle_proposal(
                 hr_input.extra_labels = bundle_labels.clone();
 
                 if let Some(cluster_item) = &item.target_cluster_from {
-                    hr_input.kube_config = Some(RemoteKubeConfigRef::new(format!(
-                        "{instance_name}-{cluster_item}-kubeconfig"
-                    )));
+                    hr_input.kube_config = Some(RemoteKubeConfigRef::with_key(
+                        format!("{instance_name}-{cluster_item}-kubeconfig"),
+                        "kubeconfig",
+                    ));
                 } else if let Some(target) = req
                     .target_cluster
                     .as_deref()
@@ -2488,6 +2506,31 @@ async fn create_bundle_proposal(
                 stack_params
                     .config
                     .insert("keel:provider".to_string(), bp.metadata.provider.clone());
+                if bp.spec.outputs.iter().any(|o| o == "kubeconfig")
+                    || target_cluster_sources.contains(item.id.as_str())
+                {
+                    stack_params.config.insert(
+                        "kubeconfigSecretName".to_string(),
+                        format!("{item_resource_name}-kubeconfig"),
+                    );
+                    stack_params
+                        .config
+                        .insert("kubeconfigSecretNamespace".to_string(), tenant_ns.clone());
+                }
+                if bp.metadata.provider == "kind" {
+                    stack_params.docker_host = state.docker_proxy_url.clone();
+                }
+                if let Some(obj) = partitioned.normal_values.as_object() {
+                    for (k, v) in obj {
+                        let str_val = match v {
+                            Value::String(s) => s.clone(),
+                            Value::Number(n) => n.to_string(),
+                            Value::Bool(b) => b.to_string(),
+                            _ => continue,
+                        };
+                        stack_params.config.insert(k.clone(), str_val);
+                    }
+                }
                 let stack = synthesize_tenant_stack(&stack_params)?;
                 let stack_yaml = stack.to_yaml()?;
 
@@ -2727,7 +2770,7 @@ async fn create_bundle_proposal(
         ));
     let pr = state.forge.create_pull_request(pr_req).await?;
 
-    let preview_params = EphemeralPreviewParams::for_action(
+    let mut preview_params = EphemeralPreviewParams::for_action(
         &pr.id,
         &req.tenant,
         &action_label,
@@ -2737,6 +2780,7 @@ async fn create_bundle_proposal(
         format!("organization/{instance_name}-pr-{}/{}", pr.id, req.tenant),
         &state.backend_url,
     )?;
+    preview_params.docker_host = state.docker_proxy_url.clone();
     let preview_stack = synthesize_ephemeral_preview(&preview_params)?;
 
     let resources: Vec<ResourceDiff> = prepared_items
@@ -2875,6 +2919,129 @@ pub struct ProposalPreviewResponse {
     pub git_diff: Option<String>,
 }
 
+fn synthesize_report_from_git_diff(pr_id: &str, git_diff: &str) -> PreviewReport {
+    let mut resources = Vec::new();
+    let mut summary = PreviewSummary::default();
+
+    let mut current_path: Option<String> = None;
+    let mut current_op = ChangeOp::Update;
+
+    let flush = |path_opt: Option<String>,
+                 op: ChangeOp,
+                 resources: &mut Vec<ResourceDiff>,
+                 summary: &mut PreviewSummary| {
+        let Some(path) = path_opt else { return };
+        let parts: Vec<&str> = path.split('/').collect();
+        let (tenant, resource_type, name) = if parts.first() == Some(&"tenants") && parts.len() >= 4
+        {
+            let tenant = parts[1];
+            let file_name = parts.last().copied().unwrap_or("");
+            if parts[2] == "infra" {
+                let res_name = if parts.len() >= 5 {
+                    parts[3].to_string()
+                } else {
+                    file_name.trim_end_matches(".yaml").to_string()
+                };
+                if file_name == "stack.yaml" || parts.len() == 4 {
+                    (tenant, "pulumi:pulumi.com/v1:Stack", res_name)
+                } else {
+                    return;
+                }
+            } else if parts[2] == "apps" {
+                let res_name = if parts.len() >= 5 {
+                    parts[3].to_string()
+                } else {
+                    file_name.trim_end_matches(".yaml").to_string()
+                };
+                if file_name == "helmrelease.yaml" || parts.len() == 4 {
+                    (
+                        tenant,
+                        "flux:helm.toolkit.fluxcd.io/v2:HelmRelease",
+                        res_name,
+                    )
+                } else {
+                    return;
+                }
+            } else if parts[2] == "bundles" && parts.len() >= 6 {
+                let res_name = format!("{}-{}", parts[3], parts[4]);
+                if file_name == "stack.yaml" {
+                    (tenant, "pulumi:pulumi.com/v1:Stack", res_name)
+                } else if file_name == "helmrelease.yaml" {
+                    (
+                        tenant,
+                        "flux:helm.toolkit.fluxcd.io/v2:HelmRelease",
+                        res_name,
+                    )
+                } else {
+                    return;
+                }
+            } else if file_name == "rbac.yaml" {
+                (
+                    tenant,
+                    "k8s:rbac.authorization.k8s.io/v1:RoleBinding",
+                    format!("tenant-{tenant}"),
+                )
+            } else {
+                (tenant, "gitops:manifest", path.clone())
+            }
+        } else if parts.first() == Some(&"catalog") && parts.len() >= 4 {
+            let kind = match parts[1] {
+                "apps" => "keel.io/v1alpha1:CatalogApplication",
+                "infra" => "keel.io/v1alpha1:CatalogInfraBlueprint",
+                "bundles" => "keel.io/v1alpha1:CatalogBundle",
+                _ => "keel.io/v1alpha1:CatalogItem",
+            };
+            ("catalog", kind, parts[2].to_string())
+        } else {
+            ("system", "gitops:manifest", path.clone())
+        };
+
+        match op {
+            ChangeOp::Create => summary.create += 1,
+            ChangeOp::Update => summary.update += 1,
+            ChangeOp::Delete => summary.delete += 1,
+            ChangeOp::Replace => summary.replace += 1,
+            ChangeOp::Same => summary.same += 1,
+            ChangeOp::Drift => summary.drift += 1,
+        }
+
+        resources.push(ResourceDiff {
+            urn: format!("urn:pulumi:pr-{pr_id}::{tenant}::{resource_type}::{name}"),
+            resource_type: resource_type.to_string(),
+            name,
+            op,
+            changed_fields: vec!["spec".to_string()],
+        });
+    };
+
+    for line in git_diff.lines() {
+        if let Some(rest) = line.strip_prefix("diff --git a/") {
+            flush(
+                current_path.take(),
+                current_op,
+                &mut resources,
+                &mut summary,
+            );
+            current_op = ChangeOp::Update;
+            if let Some((_, b_path)) = rest.split_once(" b/") {
+                current_path = Some(b_path.to_string());
+            }
+        } else if line.starts_with("new file mode ") {
+            current_op = ChangeOp::Create;
+        } else if line.starts_with("deleted file mode ") {
+            current_op = ChangeOp::Delete;
+        }
+    }
+    flush(
+        current_path.take(),
+        current_op,
+        &mut resources,
+        &mut summary,
+    );
+
+    PreviewReport { resources, summary }
+}
+
 /// `GET /api/v1/proposals/{pr_id}/preview`
 pub async fn get_proposal_preview(
     _auth: AuthSession,
@@ -2882,13 +3049,12 @@ pub async fn get_proposal_preview(
     AxumPath(pr_id): AxumPath<String>,
 ) -> Result<Json<ProposalPreviewResponse>, ServerError> {
     let pr = state.forge.get_pull_request(&pr_id).await?;
-    let report = state
+    let cached_report = state
         .preview_cache
         .read()
         .await
         .get(&pr_id)
-        .map(|c| c.report.clone())
-        .unwrap_or_default();
+        .map(|c| c.report.clone());
 
     let git_diff = if tokio::fs::try_exists(state.repo_workdir.join(".git"))
         .await
@@ -2906,6 +3072,14 @@ pub async fn get_proposal_preview(
             .filter(|d| !d.is_empty())
     } else {
         None
+    };
+
+    let report = match cached_report {
+        Some(r) => r,
+        None => match git_diff.as_deref() {
+            Some(diff) => synthesize_report_from_git_diff(&pr_id, diff),
+            None => PreviewReport::default(),
+        },
     };
 
     Ok(Json(ProposalPreviewResponse {
@@ -3640,6 +3814,40 @@ pub async fn restart_stack_workspace(
         .await?;
     Ok(Json(RestartStackResponse {
         restarted: true,
+        namespace,
+        name,
+        message,
+    }))
+}
+
+/// Response body for `POST /api/v1/releases/{namespace}/{name}/reconcile`.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReconcileReleaseResponse {
+    pub reconciled: bool,
+    pub namespace: String,
+    pub name: String,
+    pub message: String,
+}
+
+/// `POST /api/v1/releases/{namespace}/{name}/reconcile`
+///
+/// Annotates a Flux `HelmRelease` (or `Kustomization`) with `reconcile.fluxcd.io/requestedAt`
+/// to trigger immediate reconciliation.
+pub async fn reconcile_release(
+    _auth: AuthSession,
+    State(state): State<AppState>,
+    AxumPath((namespace, name)): AxumPath<(String, String)>,
+) -> Result<Json<ReconcileReleaseResponse>, ServerError> {
+    validate_dns_label(&namespace, "namespace")?;
+    validate_dns_label(&name, "name")?;
+
+    let message = state
+        .state_provider
+        .reconcile_release(&namespace, &name)
+        .await?;
+    Ok(Json(ReconcileReleaseResponse {
+        reconciled: true,
         namespace,
         name,
         message,

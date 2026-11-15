@@ -1921,6 +1921,17 @@ spec:
     assert!(app_hr.contains("targetNamespace: apps-prod"));
     assert!(app_hr.contains("keel.io/bundle: prod-stack"));
 
+    let cluster_stack = tokio::fs::read_to_string(
+        fixture
+            .state
+            .repo_workdir
+            .join("tenants/acme/bundles/prod-stack/cluster/stack.yaml"),
+    )
+    .await
+    .unwrap();
+    assert!(cluster_stack.contains("kubeconfigSecretName: prod-stack-cluster-kubeconfig"));
+    assert!(cluster_stack.contains("kubeconfigSecretNamespace: tenant-acme"));
+
     let app_fk = tokio::fs::read_to_string(
         fixture
             .state

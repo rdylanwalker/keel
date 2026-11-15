@@ -11,6 +11,7 @@ vi.mock("../lib/api", () => ({
   getProviders: vi.fn(),
   getProposals: vi.fn().mockResolvedValue([]),
   toggleProvider: vi.fn(),
+  createEventSourceStream: vi.fn(() => ({ close: vi.fn() })),
 }))
 
 const mockLiveStacks: StackSummary[] = [
@@ -118,7 +119,7 @@ describe("TopologyView component", () => {
     })
 
     // Dismiss PR banner
-    const closeBannerBtn = screen.getByRole("button", { name: "×" })
+    const closeBannerBtn = screen.getByRole("button", { name: /Dismiss/i })
     fireEvent.click(closeBannerBtn)
     expect(
       screen.queryByText("PR #789 opened on branch feature/enable-gcp")
@@ -148,7 +149,7 @@ describe("TopologyView component", () => {
     })
   })
 
-  it("handles filter by provider", async () => {
+  it("filters and sorts stacks via TanStack DataTable", async () => {
     vi.mocked(api.getStacks).mockResolvedValueOnce(mockLiveStacks)
 
     render(<TopologyView />)
@@ -157,16 +158,27 @@ describe("TopologyView component", () => {
       expect(screen.getByText("live-proxmox-stack")).toBeInTheDocument()
     })
 
-    const filterSelect = screen.getByLabelText(/Filter Provider/i)
-    fireEvent.change(filterSelect, { target: { value: "proxmox" } })
+    // Sort by Stack Name
+    const stackNameHeader = screen.getByRole("button", { name: /Stack Name/i })
+    fireEvent.click(stackNameHeader)
+    expect(stackNameHeader.closest("th")).toHaveAttribute(
+      "aria-sort",
+      "ascending"
+    )
+
+    // Filter by provider via table search input
+    const filterInput = screen.getByLabelText(
+      /Filter stacks by name, tenant, provider, status/i
+    )
+    fireEvent.change(filterInput, { target: { value: "proxmox" } })
 
     expect(screen.getByText("live-proxmox-stack")).toBeInTheDocument()
     expect(screen.queryByText("live-aws-stack")).not.toBeInTheDocument()
 
-    // Filter by provider with no matching stacks
-    fireEvent.change(filterSelect, { target: { value: "hetzner" } })
+    // Filter with no matching stacks
+    fireEvent.change(filterInput, { target: { value: "hetzner" } })
     expect(
-      screen.getByText('No stacks matching provider filter "hetzner".')
+      screen.getByText("No stacks matching your filter.")
     ).toBeInTheDocument()
   })
 
@@ -253,5 +265,148 @@ describe("TopologyView component", () => {
     await waitFor(() => {
       expect(screen.getByRole("alert")).toHaveTextContent("Refresh failed")
     })
+  })
+
+  it("counts both stacks and application releases in header status cards", async () => {
+    vi.mocked(api.getStacks).mockResolvedValueOnce([
+      {
+        id: "stack-1",
+        name: "kind-dev",
+        tenant: "default",
+        provider: "kind",
+        type: "workload",
+        status: "synced",
+        resourceCount: 3,
+        lastSynced: "just now",
+      },
+      {
+        id: "stack-2",
+        name: "broken-stack",
+        tenant: "default",
+        provider: "kind",
+        type: "workload",
+        status: "error",
+        resourceCount: 1,
+        lastSynced: "just now",
+      },
+    ])
+    vi.mocked(api.getReleases).mockResolvedValueOnce([
+      {
+        id: "rel-1",
+        name: "podinfo",
+        namespace: "tenant-default",
+        tenant: "default",
+        type: "helm",
+        status: "Ready",
+        version: "6.7.1",
+      },
+      {
+        id: "rel-2",
+        name: "grafana",
+        namespace: "tenant-default",
+        tenant: "default",
+        type: "helm",
+        status: "Reconciling",
+        version: "8.0.0",
+      },
+      {
+        id: "rel-3",
+        name: "old-app",
+        namespace: "tenant-default",
+        tenant: "default",
+        type: "helm",
+        status: "Deleting",
+        version: "1.0.0",
+      },
+    ])
+
+    render(<TopologyView />)
+
+    await waitFor(() => {
+      expect(screen.getByText("kind-dev")).toBeInTheDocument()
+      expect(screen.getAllByText("podinfo").length).toBeGreaterThan(0)
+    })
+
+    const totalCard = screen.getByText("Total Stacks & Apps").parentElement!
+    const syncedCard = screen.getByText("Synced & Healthy").parentElement!
+    const reconcilingCard = screen.getAllByText("Reconciling")[0].parentElement!
+    const driftCard = screen.getByText(
+      "Drifted / Error / Deleting"
+    ).parentElement!
+
+    // Includes auto-prepended management-cluster-core (synced)
+    expect(totalCard).toHaveTextContent("6")
+    expect(syncedCard).toHaveTextContent("3")
+    expect(reconcilingCard).toHaveTextContent("1")
+    expect(driftCard).toHaveTextContent("2")
+  })
+
+  it("renders static SSE Live Stream badge, canary rollouts, and filters/pauses live events", async () => {
+    vi.mocked(api.getStacks).mockResolvedValueOnce([])
+    vi.mocked(api.getReleases).mockResolvedValueOnce([
+      {
+        id: "rel-canary-1",
+        name: "podinfo-canary",
+        namespace: "tenant-default",
+        tenant: "default",
+        type: "canary",
+        status: "progressing",
+        version: "6.7.1",
+        canaryWeight: 35,
+        errorRate: 0.01,
+        latencyMs: 14,
+      },
+    ])
+
+    let onEventCb:
+      ((evt: import("../types/api").CrdWatchEvent) => void) | null = null
+    vi.mocked(api.createEventSourceStream).mockImplementation((onEvent) => {
+      onEventCb = onEvent
+      return { close: vi.fn() } as unknown as EventSource
+    })
+
+    render(<TopologyView />)
+
+    expect(await screen.findByText("SSE Live Stream")).toBeInTheDocument()
+    expect(screen.getAllByText("podinfo-canary").length).toBeGreaterThan(0)
+    expect(screen.getByText("35%")).toBeInTheDocument()
+
+    // Receive live SSE events
+    await waitFor(() => expect(onEventCb).not.toBeNull())
+    onEventCb!({
+      kind: "HelmRelease",
+      namespace: "tenant-default",
+      name: "podinfo",
+      status: "Ready",
+      message: "Helm upgrade succeeded",
+      timestamp: "now",
+    })
+    onEventCb!({
+      kind: "Stack",
+      namespace: "tenant-default",
+      name: "kind-dev",
+      status: "Ready",
+      message: "Stack synced",
+      timestamp: "now",
+    })
+
+    expect(
+      await screen.findByText("Helm upgrade succeeded")
+    ).toBeInTheDocument()
+    expect(screen.getByText("Stack synced")).toBeInTheDocument()
+
+    // Filter events by CRD kind
+    fireEvent.change(screen.getByLabelText(/Filter events by CRD kind/i), {
+      target: { value: "Stack" },
+    })
+    expect(screen.getByText("Stack synced")).toBeInTheDocument()
+    expect(screen.queryByText("Helm upgrade succeeded")).not.toBeInTheDocument()
+
+    // Pause stream updates header badge
+    fireEvent.click(screen.getByRole("button", { name: /Pause Stream/i }))
+    expect(screen.getByText("SSE Paused")).toBeInTheDocument()
+    expect(
+      screen.getByRole("button", { name: /Resume Stream/i })
+    ).toBeInTheDocument()
   })
 })

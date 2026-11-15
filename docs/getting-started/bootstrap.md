@@ -17,7 +17,7 @@ All Stage 0 targets produce the same seed control-plane layout (Flux CD, PKO v2,
 
 ### Local `kind` Management Cluster
 
-Pass `--local-dev-docker-socket-exception` on local `kind` clusters so PKO v2 workspace pods can access the Docker socket via an explicit Kyverno `PolicyException` to provision workload `kind` clusters:
+Pass `--local-dev-docker-socket-exception` on local `kind` clusters so Stage 0 mounts `/var/run/docker.sock` into the management node, deploys `keel-docker-proxy` in `flux-system`, and injects `DOCKER_HOST` into `kind` PKO v2 workspace pods (via an explicit Kyverno `PolicyException`) while keeping tenant namespaces `restricted` PSS compliant:
 
 ```bash
 keel bootstrap init \

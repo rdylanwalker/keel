@@ -100,6 +100,10 @@ pub fn build_router(state: AppState) -> Router {
             get(routes::get_release_config),
         )
         .route(
+            "/api/v1/releases/{namespace}/{name}/reconcile",
+            post(routes::reconcile_release),
+        )
+        .route(
             "/api/v1/bundles/{namespace}/{name}/config",
             get(routes::get_bundle_config),
         )

@@ -99,7 +99,17 @@ pub trait ClusterStateProvider: Send + Sync {
         _name: &str,
     ) -> Result<String, ServerError> {
         Err(ServerError::BadRequest(
-            "Live Kubernetes cluster is not connected".to_string(),
+            "Live Kubernetes cluster connection required to restart stack workspace".to_string(),
+        ))
+    }
+
+    async fn reconcile_release(
+        &self,
+        _namespace: &str,
+        _name: &str,
+    ) -> Result<String, ServerError> {
+        Err(ServerError::BadRequest(
+            "Live Kubernetes cluster connection required to reconcile release".to_string(),
         ))
     }
 }
@@ -481,13 +491,20 @@ impl ClusterStateProvider for KubeClusterStateProvider {
         tenant: Option<&str>,
     ) -> Result<Vec<ReleaseSummary>, ServerError> {
         let mut releases = self.repo.list_releases(tenant).await?;
+        let known_stacks = self
+            .repo
+            .list_stacks(tenant, None)
+            .await
+            .unwrap_or_default();
+        let live_stacks = self.live.stack_statuses().await;
         let live = self.live.release_statuses().await;
         for rel in &mut releases {
             if let Some(status) = live.get(&(rel.namespace.clone(), rel.name.clone())) {
                 rel.status = Self::status_label(status);
             }
         }
-        // Keep any live tenant-* release that is absent from Git `main` (awaiting Flux prune or mid-termination)
+        // Keep any live tenant-* release that is absent from Git `main` (awaiting Flux prune or mid-termination),
+        // but ignore Flux `Kustomization` wrappers that back PKO `Stack`s (e.g. bundle infra steps).
         for (ns, name) in live.keys() {
             if !ns.starts_with("tenant-") {
                 continue;
@@ -495,6 +512,13 @@ impl ClusterStateProvider for KubeClusterStateProvider {
             let inferred_tenant = ns.strip_prefix("tenant-");
             if let Some(t_filter) = tenant
                 && inferred_tenant != Some(t_filter)
+            {
+                continue;
+            }
+            if live_stacks.contains_key(&(ns.clone(), name.clone()))
+                || known_stacks
+                    .iter()
+                    .any(|s| s.namespace == *ns && s.name == *name)
             {
                 continue;
             }
@@ -546,6 +570,13 @@ impl ClusterStateProvider for KubeClusterStateProvider {
             .await
             .map_err(|e| ServerError::Internal(format!("Rollout restart failed: {e}")))
     }
+
+    async fn reconcile_release(&self, namespace: &str, name: &str) -> Result<String, ServerError> {
+        self.live
+            .reconcile_release(namespace, name)
+            .await
+            .map_err(|e| ServerError::Internal(format!("Flux reconcile failed: {e}")))
+    }
 }
 
 /// Cached ephemeral preview state for a PR (in-memory view of `keel-previews` CRs & diff report).
@@ -569,6 +600,7 @@ pub struct AppState {
     pub oidc_config: Arc<RwLock<Option<OidcConfig>>>,
     pub state_provider: Arc<dyn ClusterStateProvider>,
     pub backend_url: String,
+    pub docker_proxy_url: Option<String>,
     pub git_lock: Arc<Mutex<()>>,
     pub preview_cache: Arc<RwLock<HashMap<String, CachedPreview>>>,
 }
@@ -598,9 +630,16 @@ impl AppState {
             oidc_config: Arc::new(RwLock::new(None)),
             state_provider,
             backend_url: "s3://pulumi-state".to_string(),
+            docker_proxy_url: None,
             git_lock: Arc::new(Mutex::new(())),
             preview_cache: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    /// Configures an optional `DOCKER_HOST` proxy endpoint for local `kind`-in-`kind` PKO workspaces.
+    pub fn with_docker_proxy_url(mut self, url: Option<String>) -> Self {
+        self.docker_proxy_url = url;
+        self
     }
 
     /// Overrides the OIDC configuration used by `/api/v1/auth/login` and `/callback`.
@@ -687,6 +726,11 @@ mod tests {
             ("tenant-acme".to_string(), "podinfo".to_string()),
             LiveResourceStatus::Ready,
         );
+        // Simulate a Flux Kustomization wrapper for the `dev-kind` Stack appearing in release_statuses()
+        releases.insert(
+            ("tenant-acme".to_string(), "dev-kind".to_string()),
+            LiveResourceStatus::Ready,
+        );
 
         let provider = KubeClusterStateProvider::new(
             RepoClusterStateProvider::new(tmp.path()),
@@ -700,6 +744,7 @@ mod tests {
         assert_eq!(out_stacks[1].status, "Reconciling");
 
         let out_releases = provider.list_releases(None).await.unwrap();
+        assert_eq!(out_releases.len(), 1);
         assert_eq!(out_releases[0].name, "podinfo");
         assert_eq!(out_releases[0].status, "Ready");
     }

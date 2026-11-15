@@ -527,6 +527,30 @@ export async function restartStackWorkspace(
   return handleResponse<RestartStackResponse>(res)
 }
 
+export async function reconcileRelease(
+  namespace: string,
+  name: string
+): Promise<{
+  reconciled: boolean
+  namespace: string
+  name: string
+  message: string
+}> {
+  const res = await fetch(
+    `/api/v1/releases/${encodeURIComponent(namespace)}/${encodeURIComponent(name)}/reconcile`,
+    {
+      method: "POST",
+      headers: getHeaders(),
+    }
+  )
+  return handleResponse<{
+    reconciled: boolean
+    namespace: string
+    name: string
+    message: string
+  }>(res)
+}
+
 export async function getReleases(): Promise<ReleaseSummary[]> {
   const res = await fetch("/api/v1/releases", {
     headers: getHeaders(),
