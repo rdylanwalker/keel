@@ -161,4 +161,165 @@ config:
       "us-east-1"
     )
   })
+
+  it("round-trips nested object fields and preserves nested required/secrets", () => {
+    const fields = [
+      {
+        name: "database",
+        title: "Database",
+        type: "object" as const,
+        defaultValue: "",
+        required: true,
+        secret: false,
+        children: [
+          {
+            name: "host",
+            title: "Host",
+            type: "string" as const,
+            defaultValue: "localhost",
+            required: true,
+            secret: false,
+          },
+          {
+            name: "password",
+            title: "Password",
+            type: "string" as const,
+            defaultValue: "",
+            required: true,
+            secret: true,
+          },
+        ],
+      },
+    ]
+
+    const json = fieldsToSchemaJson(fields)
+    const parsed = JSON.parse(json)
+    expect(parsed.required).toEqual(["database"])
+    expect(parsed.properties.database.type).toBe("object")
+    expect(parsed.properties.database.required).toEqual(["host", "password"])
+    expect(parsed.properties.database.properties.host.default).toBe("localhost")
+    expect(parsed.properties.database.properties.password.writeOnly).toBe(true)
+
+    expect(schemaJsonToFields(json)).toEqual(fields)
+  })
+
+  it("round-trips array fields of primitives and objects", () => {
+    const fields = [
+      {
+        name: "hosts",
+        title: "Allowed Hosts",
+        type: "array" as const,
+        itemsType: "string" as const,
+        defaultValue: "a.example.com, b.example.com",
+        required: true,
+        secret: false,
+      },
+      {
+        name: "ports",
+        title: "Ports",
+        type: "array" as const,
+        itemsType: "integer" as const,
+        defaultValue: "80, 443",
+        required: false,
+        secret: false,
+      },
+      {
+        name: "routes",
+        title: "Routes",
+        type: "array" as const,
+        itemsType: "object" as const,
+        defaultValue: "",
+        required: false,
+        secret: false,
+        children: [
+          {
+            name: "path",
+            title: "Path",
+            type: "string" as const,
+            defaultValue: "/",
+            required: true,
+            secret: false,
+          },
+          {
+            name: "port",
+            title: "Port",
+            type: "integer" as const,
+            defaultValue: "8080",
+            required: false,
+            secret: false,
+          },
+        ],
+      },
+    ]
+
+    const json = fieldsToSchemaJson(fields)
+    const parsed = JSON.parse(json)
+    expect(parsed.required).toEqual(["hosts"])
+    expect(parsed.properties.hosts.type).toBe("array")
+    expect(parsed.properties.hosts.items).toEqual({ type: "string" })
+    expect(parsed.properties.hosts.default).toEqual([
+      "a.example.com",
+      "b.example.com",
+    ])
+    expect(parsed.properties.ports.items).toEqual({ type: "integer" })
+    expect(parsed.properties.ports.default).toEqual([80, 443])
+    expect(parsed.properties.routes.items.type).toBe("object")
+    expect(parsed.properties.routes.items.required).toEqual(["path"])
+    expect(parsed.properties.routes.items.properties.path.default).toBe("/")
+    expect(parsed.properties.routes.items.properties.port.default).toBe(8080)
+
+    expect(schemaJsonToFields(json)).toEqual(fields)
+  })
+
+  it("cleans up stale object/array schema keys when switching field types", () => {
+    const existing = JSON.stringify({
+      type: "object",
+      properties: {
+        config: {
+          type: "object",
+          required: ["a"],
+          properties: { a: { type: "string" } },
+        },
+        tags: {
+          type: "array",
+          items: { type: "string" },
+          default: ["x"],
+        },
+      },
+    })
+
+    const json = fieldsToSchemaJson(
+      [
+        {
+          name: "config",
+          title: "Config",
+          type: "string",
+          defaultValue: "plain",
+          required: false,
+          secret: false,
+        },
+        {
+          name: "tags",
+          title: "Tags",
+          type: "object",
+          defaultValue: "",
+          required: false,
+          secret: false,
+          children: [],
+        },
+      ],
+      existing
+    )
+    const parsed = JSON.parse(json)
+    expect(parsed.properties.config).toEqual({
+      type: "string",
+      title: "Config",
+      default: "plain",
+    })
+    expect(parsed.properties.tags).toEqual({
+      type: "object",
+      title: "Tags",
+      properties: {},
+    })
+  })
 })

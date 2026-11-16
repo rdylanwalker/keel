@@ -41,11 +41,11 @@ import { isDemoMode } from "../lib/utils"
 import {
   PROVIDER_CREDENTIAL_PRESETS,
   SchemaFieldDraft,
-  SchemaFieldType,
   deriveFieldsFromPulumiYaml,
   fieldsToSchemaJson,
   schemaJsonToFields,
 } from "../lib/schemaBuilder"
+import { SchemaFieldsEditor } from "./SchemaFieldsEditor"
 import {
   DeployInstanceInitialConfig,
   DeployInstanceModal,
@@ -2073,153 +2073,16 @@ export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
                         </button>
                       </div>
                       {schemaFields.length > 0 && (
-                        <div className="space-y-1.5 max-h-52 overflow-y-auto pr-1">
-                          {schemaFields.map((field, idx) => (
-                            <div
-                              key={idx}
-                              className="grid grid-cols-12 gap-1.5 items-center bg-slate-950/70 border border-slate-800/80 rounded-lg p-1.5"
-                            >
-                              <input
-                                type="text"
-                                aria-label={`Field ${idx + 1} name`}
-                                placeholder="fieldName"
-                                value={field.name}
-                                onChange={(e) => {
-                                  const next = schemaFields.map((f, i) =>
-                                    i === idx
-                                      ? { ...f, name: e.target.value }
-                                      : f
-                                  )
-                                  setSchemaFields(next)
-                                  setSchemaJsonText(
-                                    fieldsToSchemaJson(next, schemaJsonText)
-                                  )
-                                }}
-                                className="col-span-3 px-2 py-1 bg-slate-900 border border-slate-800 rounded text-[11px] text-slate-100 font-mono"
-                              />
-                              <input
-                                type="text"
-                                aria-label={`Field ${idx + 1} title`}
-                                placeholder="Label"
-                                value={field.title}
-                                onChange={(e) => {
-                                  const next = schemaFields.map((f, i) =>
-                                    i === idx
-                                      ? { ...f, title: e.target.value }
-                                      : f
-                                  )
-                                  setSchemaFields(next)
-                                  setSchemaJsonText(
-                                    fieldsToSchemaJson(next, schemaJsonText)
-                                  )
-                                }}
-                                className="col-span-3 px-2 py-1 bg-slate-900 border border-slate-800 rounded text-[11px] text-slate-100"
-                              />
-                              <select
-                                aria-label={`Field ${idx + 1} type`}
-                                value={field.type}
-                                onChange={(e) => {
-                                  const next = schemaFields.map((f, i) =>
-                                    i === idx
-                                      ? {
-                                          ...f,
-                                          type: e.target
-                                            .value as SchemaFieldType,
-                                        }
-                                      : f
-                                  )
-                                  setSchemaFields(next)
-                                  setSchemaJsonText(
-                                    fieldsToSchemaJson(next, schemaJsonText)
-                                  )
-                                }}
-                                className="col-span-2 px-1.5 py-1 bg-slate-900 border border-slate-800 rounded text-[11px] text-slate-100"
-                              >
-                                <option value="string">string</option>
-                                <option value="integer">integer</option>
-                                <option value="number">number</option>
-                                <option value="boolean">boolean</option>
-                              </select>
-                              <input
-                                type="text"
-                                aria-label={`Field ${idx + 1} default`}
-                                placeholder="default"
-                                value={field.defaultValue}
-                                onChange={(e) => {
-                                  const next = schemaFields.map((f, i) =>
-                                    i === idx
-                                      ? { ...f, defaultValue: e.target.value }
-                                      : f
-                                  )
-                                  setSchemaFields(next)
-                                  setSchemaJsonText(
-                                    fieldsToSchemaJson(next, schemaJsonText)
-                                  )
-                                }}
-                                className="col-span-2 px-2 py-1 bg-slate-900 border border-slate-800 rounded text-[11px] text-slate-100"
-                              />
-                              <div className="col-span-2 flex items-center justify-end gap-2">
-                                <label
-                                  className="flex items-center gap-0.5 text-[10px] text-slate-400 cursor-pointer"
-                                  title="Required"
-                                >
-                                  <input
-                                    type="checkbox"
-                                    checked={field.required}
-                                    onChange={(e) => {
-                                      const next = schemaFields.map((f, i) =>
-                                        i === idx
-                                          ? { ...f, required: e.target.checked }
-                                          : f
-                                      )
-                                      setSchemaFields(next)
-                                      setSchemaJsonText(
-                                        fieldsToSchemaJson(next, schemaJsonText)
-                                      )
-                                    }}
-                                  />
-                                  <span>Req</span>
-                                </label>
-                                <label
-                                  className="flex items-center gap-0.5 text-[10px] text-amber-400 cursor-pointer"
-                                  title="Secret (SOPS + age encrypted, bound to envRefs)"
-                                >
-                                  <input
-                                    type="checkbox"
-                                    checked={field.secret}
-                                    onChange={(e) => {
-                                      const next = schemaFields.map((f, i) =>
-                                        i === idx
-                                          ? { ...f, secret: e.target.checked }
-                                          : f
-                                      )
-                                      setSchemaFields(next)
-                                      setSchemaJsonText(
-                                        fieldsToSchemaJson(next, schemaJsonText)
-                                      )
-                                    }}
-                                  />
-                                  <span>Sec</span>
-                                </label>
-                                <button
-                                  type="button"
-                                  aria-label={`Remove field ${idx + 1}`}
-                                  onClick={() => {
-                                    const next = schemaFields.filter(
-                                      (_, i) => i !== idx
-                                    )
-                                    setSchemaFields(next)
-                                    setSchemaJsonText(
-                                      fieldsToSchemaJson(next, schemaJsonText)
-                                    )
-                                  }}
-                                  className="text-slate-500 hover:text-red-400 cursor-pointer"
-                                >
-                                  <Trash2 className="h-3.5 w-3.5" />
-                                </button>
-                              </div>
-                            </div>
-                          ))}
+                        <div className="max-h-80 overflow-y-auto pr-1">
+                          <SchemaFieldsEditor
+                            fields={schemaFields}
+                            onChange={(next) => {
+                              setSchemaFields(next)
+                              setSchemaJsonText(
+                                fieldsToSchemaJson(next, schemaJsonText)
+                              )
+                            }}
+                          />
                         </div>
                       )}
                     </div>

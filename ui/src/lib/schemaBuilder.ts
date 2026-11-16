@@ -1,6 +1,7 @@
 import type { RJSFSchema } from "@rjsf/utils"
 
-export type SchemaFieldType = "string" | "integer" | "number" | "boolean"
+export type SchemaFieldType =
+  "string" | "integer" | "number" | "boolean" | "object" | "array"
 
 export interface SchemaFieldDraft {
   name: string
@@ -9,6 +10,8 @@ export interface SchemaFieldDraft {
   defaultValue: string
   required: boolean
   secret: boolean
+  itemsType?: SchemaFieldType
+  children?: SchemaFieldDraft[]
 }
 
 export const PROVIDER_CREDENTIAL_PRESETS: Record<string, SchemaFieldDraft[]> = {
@@ -123,10 +126,134 @@ export function humanizeFieldName(name: string): string {
 }
 
 function normalizeSchemaType(raw: unknown): SchemaFieldType {
-  if (raw === "integer" || raw === "number" || raw === "boolean") {
+  if (
+    raw === "integer" ||
+    raw === "number" ||
+    raw === "boolean" ||
+    raw === "object" ||
+    raw === "array"
+  ) {
     return raw
   }
   return "string"
+}
+
+function formatArrayDefault(raw: unknown, itemsType: SchemaFieldType): string {
+  if (!Array.isArray(raw)) return ""
+  if (
+    itemsType === "object" ||
+    itemsType === "array" ||
+    raw.some((item) => typeof item === "object" && item !== null)
+  ) {
+    return JSON.stringify(raw)
+  }
+  if (
+    itemsType === "string" &&
+    raw.some((item) => String(item).includes(","))
+  ) {
+    return JSON.stringify(raw)
+  }
+  return raw.map(String).join(", ")
+}
+
+function parseArrayDefault(
+  raw: string,
+  itemsType: SchemaFieldType
+): unknown[] | undefined {
+  const trimmed = raw.trim()
+  if (!trimmed) return undefined
+  if (trimmed.startsWith("[")) {
+    try {
+      const parsed = JSON.parse(trimmed)
+      if (Array.isArray(parsed)) return parsed
+    } catch {
+      // fall through to comma-separated parsing
+    }
+  }
+  const parts = trimmed
+    .split(",")
+    .map((p) => p.trim())
+    .filter((p) => p.length > 0)
+  if (parts.length === 0) return undefined
+  if (itemsType === "integer") {
+    return parts.map((p) => parseInt(p, 10)).filter((n) => !Number.isNaN(n))
+  }
+  if (itemsType === "number") {
+    return parts.map((p) => parseFloat(p)).filter((n) => !Number.isNaN(n))
+  }
+  if (itemsType === "boolean") {
+    return parts.map((p) => p.toLowerCase() === "true")
+  }
+  return parts
+}
+
+function parsePropertiesToFields(
+  rawProps: unknown,
+  rawRequired: unknown
+): SchemaFieldDraft[] {
+  if (!rawProps || typeof rawProps !== "object" || Array.isArray(rawProps)) {
+    return []
+  }
+  const props = rawProps as Record<string, Record<string, unknown>>
+  const requiredSet = new Set(
+    Array.isArray(rawRequired)
+      ? rawRequired.filter((x): x is string => typeof x === "string")
+      : []
+  )
+  return Object.entries(props).map(([name, prop]) => {
+    const type = normalizeSchemaType(prop?.type)
+    const title =
+      typeof prop?.title === "string" ? prop.title : humanizeFieldName(name)
+    const required = requiredSet.has(name)
+
+    if (type === "object") {
+      return {
+        name,
+        title,
+        type,
+        defaultValue: "",
+        required,
+        secret: false,
+        children: parsePropertiesToFields(prop?.properties, prop?.required),
+      }
+    }
+
+    if (type === "array") {
+      const rawItems =
+        prop?.items &&
+        typeof prop.items === "object" &&
+        !Array.isArray(prop.items)
+          ? (prop.items as Record<string, unknown>)
+          : undefined
+      const itemsType = normalizeSchemaType(rawItems?.type)
+      const draft: SchemaFieldDraft = {
+        name,
+        title,
+        type,
+        itemsType,
+        defaultValue: formatArrayDefault(prop?.default, itemsType),
+        required,
+        secret: false,
+      }
+      if (itemsType === "object") {
+        draft.children = parsePropertiesToFields(
+          rawItems?.properties,
+          rawItems?.required
+        )
+      }
+      return draft
+    }
+
+    const hasDefault = prop && prop.default !== undefined
+    return {
+      name,
+      title,
+      type,
+      defaultValue: hasDefault ? String(prop.default) : "",
+      required,
+      secret: prop?.writeOnly === true || prop?.format === "password",
+    }
+  })
 }
 
 export function schemaJsonToFields(
@@ -136,58 +263,19 @@ export function schemaJsonToFields(
   try {
     const parsed = JSON.parse(schemaText) as Record<string, unknown>
     if (!parsed || typeof parsed !== "object") return null
-    const props = (parsed.properties ?? {}) as Record<
-      string,
-      Record<string, unknown>
-    >
-    const requiredSet = new Set(
-      Array.isArray(parsed.required)
-        ? parsed.required.filter((x): x is string => typeof x === "string")
-        : []
-    )
-    return Object.entries(props).map(([name, prop]) => {
-      const type = normalizeSchemaType(prop?.type)
-      const hasDefault = prop && prop.default !== undefined
-      return {
-        name,
-        title:
-          typeof prop?.title === "string"
-            ? prop.title
-            : humanizeFieldName(name),
-        type,
-        defaultValue: hasDefault ? String(prop.default) : "",
-        required: requiredSet.has(name),
-        secret: prop?.writeOnly === true || prop?.format === "password",
-      }
-    })
+    return parsePropertiesToFields(parsed.properties, parsed.required)
   } catch {
     return null
   }
 }
 
-export function fieldsToSchemaJson(
+function buildPropertiesAndRequired(
   fields: SchemaFieldDraft[],
-  existingSchemaText?: string
-): string {
-  let base: Record<string, unknown> = { type: "object" }
-  let existingProps: Record<string, Record<string, unknown>> = {}
-  if (existingSchemaText?.trim()) {
-    try {
-      const parsed = JSON.parse(existingSchemaText) as Record<string, unknown>
-      if (parsed && typeof parsed === "object") {
-        base = { ...parsed, type: "object" }
-        if (parsed.properties && typeof parsed.properties === "object") {
-          existingProps = parsed.properties as Record<
-            string,
-            Record<string, unknown>
-          >
-        }
-      }
-    } catch {
-      // ignore invalid existing JSON
-    }
-  }
-
+  existingProps: Record<string, Record<string, unknown>> = {}
+): {
+  properties: Record<string, Record<string, unknown>>
+  required: string[]
+} {
   const required: string[] = []
   const properties: Record<string, Record<string, unknown>> = {}
 
@@ -202,6 +290,94 @@ export function fieldsToSchemaJson(
       type: field.type,
       title: field.title.trim() || humanizeFieldName(name),
     }
+
+    if (field.type === "object") {
+      delete nextProp.items
+      delete nextProp.default
+      delete nextProp.writeOnly
+      if (nextProp.format === "password") {
+        delete nextProp.format
+      }
+      const prevNestedProps =
+        prevProp.properties &&
+        typeof prevProp.properties === "object" &&
+        !Array.isArray(prevProp.properties)
+          ? (prevProp.properties as Record<string, Record<string, unknown>>)
+          : {}
+      const nested = buildPropertiesAndRequired(
+        field.children ?? [],
+        prevNestedProps
+      )
+      nextProp.properties = nested.properties
+      if (nested.required.length > 0) {
+        nextProp.required = nested.required
+      } else {
+        delete nextProp.required
+      }
+      properties[name] = nextProp
+      continue
+    }
+
+    if (field.type === "array") {
+      delete nextProp.properties
+      delete nextProp.required
+      delete nextProp.writeOnly
+      if (nextProp.format === "password") {
+        delete nextProp.format
+      }
+      const itemsType = field.itemsType ?? "string"
+      const prevItems =
+        prevProp.items &&
+        typeof prevProp.items === "object" &&
+        !Array.isArray(prevProp.items)
+          ? (prevProp.items as Record<string, unknown>)
+          : {}
+      if (itemsType === "object") {
+        const prevItemProps =
+          prevItems.properties &&
+          typeof prevItems.properties === "object" &&
+          !Array.isArray(prevItems.properties)
+            ? (prevItems.properties as Record<string, Record<string, unknown>>)
+            : {}
+        const nested = buildPropertiesAndRequired(
+          field.children ?? [],
+          prevItemProps
+        )
+        const nextItems: Record<string, unknown> = {
+          ...prevItems,
+          type: "object",
+          properties: nested.properties,
+        }
+        if (nested.required.length > 0) {
+          nextItems.required = nested.required
+        } else {
+          delete nextItems.required
+        }
+        nextProp.items = nextItems
+      } else {
+        const nextItems: Record<string, unknown> =
+          prevItems.type === itemsType
+            ? { ...prevItems, type: itemsType }
+            : { type: itemsType }
+        delete nextItems.properties
+        delete nextItems.required
+        nextProp.items = nextItems
+      }
+
+      const parsedDefault = parseArrayDefault(field.defaultValue, itemsType)
+      if (parsedDefault !== undefined) {
+        nextProp.default = parsedDefault
+      } else {
+        delete nextProp.default
+      }
+
+      properties[name] = nextProp
+      continue
+    }
+
+    delete nextProp.properties
+    delete nextProp.required
+    delete nextProp.items
 
     if (field.defaultValue !== "") {
       if (field.type === "integer") {
@@ -231,6 +407,37 @@ export function fieldsToSchemaJson(
 
     properties[name] = nextProp
   }
+
+  return { properties, required }
+}
+
+export function fieldsToSchemaJson(
+  fields: SchemaFieldDraft[],
+  existingSchemaText?: string
+): string {
+  let base: Record<string, unknown> = { type: "object" }
+  let existingProps: Record<string, Record<string, unknown>> = {}
+  if (existingSchemaText?.trim()) {
+    try {
+      const parsed = JSON.parse(existingSchemaText) as Record<string, unknown>
+      if (parsed && typeof parsed === "object") {
+        base = { ...parsed, type: "object" }
+        if (parsed.properties && typeof parsed.properties === "object") {
+          existingProps = parsed.properties as Record<
+            string,
+            Record<string, unknown>
+          >
+        }
+      }
+    } catch {
+      // ignore invalid existing JSON
+    }
+  }
+
+  const { properties, required } = buildPropertiesAndRequired(
+    fields,
+    existingProps
+  )
 
   const result: RJSFSchema & Record<string, unknown> = {
     ...base,

@@ -1343,6 +1343,88 @@ describe("CatalogWizardView component and jsonToYaml helper", () => {
     expect(screen.queryByTestId("catalog-item-modal")).not.toBeInTheDocument()
   })
 
+  it("supports nested object fields and array/list fields in the JSON Schema Form Builder", async () => {
+    vi.mocked(api.getCatalog).mockResolvedValue(mockCatalog)
+    render(<CatalogWizardView />)
+
+    await waitFor(() => {
+      const list = screen.getByTestId("catalog-list")
+      expect(within(list).getByText("Test Microservice")).toBeInTheDocument()
+    })
+
+    fireEvent.click(screen.getByRole("button", { name: /^Add Catalog Item$/i }))
+    fireEvent.click(screen.getByRole("button", { name: /Edit JSON Schema/i }))
+
+    const addFieldBtn = screen.getByRole("button", { name: /\+ Add Field/i })
+    fireEvent.click(addFieldBtn)
+    fireEvent.click(addFieldBtn)
+    fireEvent.click(addFieldBtn)
+
+    // Field 1: nested object "db" with child "host"
+    fireEvent.change(screen.getByLabelText("Field 1 name"), {
+      target: { value: "db" },
+    })
+    fireEvent.change(screen.getByLabelText("Field 1 type"), {
+      target: { value: "object" },
+    })
+    fireEvent.click(
+      screen.getByRole("button", { name: "Add nested field to 1" })
+    )
+    fireEvent.change(screen.getByLabelText("Field 1.1 name"), {
+      target: { value: "host" },
+    })
+    fireEvent.change(screen.getByLabelText("Field 1.1 default"), {
+      target: { value: "localhost" },
+    })
+
+    // Field 2: array of integers "ports"
+    fireEvent.change(screen.getByLabelText("Field 2 name"), {
+      target: { value: "ports" },
+    })
+    fireEvent.change(screen.getByLabelText("Field 2 type"), {
+      target: { value: "array" },
+    })
+    fireEvent.change(screen.getByLabelText("Field 2 item type"), {
+      target: { value: "integer" },
+    })
+    fireEvent.change(screen.getByLabelText("Field 2 default"), {
+      target: { value: "80, 443" },
+    })
+
+    // Field 3: array of objects "routes" with child "path"
+    fireEvent.change(screen.getByLabelText("Field 3 name"), {
+      target: { value: "routes" },
+    })
+    fireEvent.change(screen.getByLabelText("Field 3 type"), {
+      target: { value: "array" },
+    })
+    fireEvent.change(screen.getByLabelText("Field 3 item type"), {
+      target: { value: "object" },
+    })
+    fireEvent.click(
+      screen.getByRole("button", { name: "Add nested field to 3" })
+    )
+    fireEvent.change(screen.getByLabelText("Field 3.1 name"), {
+      target: { value: "path" },
+    })
+    fireEvent.change(screen.getByLabelText("Field 3.1 default"), {
+      target: { value: "/" },
+    })
+
+    const schemaTextarea = screen.getByLabelText(
+      /JSON Schema/i
+    ) as HTMLTextAreaElement
+    const parsed = JSON.parse(schemaTextarea.value)
+    expect(parsed.properties.db.type).toBe("object")
+    expect(parsed.properties.db.properties.host.default).toBe("localhost")
+    expect(parsed.properties.ports.type).toBe("array")
+    expect(parsed.properties.ports.items).toEqual({ type: "integer" })
+    expect(parsed.properties.ports.default).toEqual([80, 443])
+    expect(parsed.properties.routes.type).toBe("array")
+    expect(parsed.properties.routes.items.type).toBe("object")
+    expect(parsed.properties.routes.items.properties.path.default).toBe("/")
+  })
+
   it("shows validation error on invalid JSON Schema and supports editing a bundle item", async () => {
     const onNavigateToPreview = vi.fn()
     const bundleItem: CatalogItem = {
