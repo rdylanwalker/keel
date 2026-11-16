@@ -1,3 +1,23 @@
+# [0.3.0](https://github.com/rdylanwalker/keel/compare/v0.2.0...v0.3.0) (2026-11-16)
+
+
+### Bug Fixes
+
+* **bootstrap:** use pulumi:providers:kubernetes and --plaintext config ([1cdb8e5](https://github.com/rdylanwalker/keel/commit/1cdb8e5253e55009854080352a3dd836ace7023e))
+
+
+### Features
+
+* **bootstrap:** install Stage 0 control-plane addons via Pulumi ([1d55572](https://github.com/rdylanwalker/keel/commit/1d555724af7747ab0994d77306ba00045e0f7bc0))
+* **catalog:** add curated schemas for management core-addons ([bf4d234](https://github.com/rdylanwalker/keel/commit/bf4d2341ba33d09577b643e22ee31aa8d6382ce4))
+* **cli:** seed core-addons and catalog/core into GitOps repo ([7f28bc2](https://github.com/rdylanwalker/keel/commit/7f28bc27b591dc273cdb46b1fac646b77f3959af))
+* **cli:** wire --pulumi-program-dir into bootstrap init ([4647d9e](https://github.com/rdylanwalker/keel/commit/4647d9e7570121c0842004a5ac16d2485ac57057))
+* **core:** unify Stage 0 targets under PulumiBootstrapTarget ([fc40d00](https://github.com/rdylanwalker/keel/commit/fc40d00187ac69187706c8d400ebafc0496935c5))
+* **deploy:** replace kind-config with Stage 0 Pulumi.yaml ([88a2c0d](https://github.com/rdylanwalker/keel/commit/88a2c0d3e60032b1c7d3fd3da6c9d54876199890))
+* **seed:** protect core-addons with auto-rollback and prune=false ([3935245](https://github.com/rdylanwalker/keel/commit/39352457ca8df29822ada20542de2aee2782bad3))
+* **server:** add management core-addons upgrade, rollback, and delete guard ([2e18d19](https://github.com/rdylanwalker/keel/commit/2e18d191d238f9605e623842c9d9dc734d799277))
+* **ui:** manage protected core-addons with sync-upstream and rollback ([06d28c4](https://github.com/rdylanwalker/keel/commit/06d28c44964541a5e5ff9df3c92fcf80b361f94f))
+
 # [0.2.0](https://github.com/rdylanwalker/keel/compare/v0.1.0...v0.2.0) (2026-11-16)
 
 
