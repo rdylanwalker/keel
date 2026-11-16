@@ -1,6 +1,6 @@
 //! Provider-agnostic Stage 0 cluster bootstrap trait and drivers (`SDD.md` §2.1).
 //!
-//! External CLI invocations (`kind`) strictly use `tokio::process::Command` with explicit
+//! External CLI invocations (`pulumi`) strictly use `tokio::process::Command` with explicit
 //! argument vectors and never invoke a shell (`NFR-SEC-06`).
 
 use std::path::{Path, PathBuf};
@@ -45,127 +45,257 @@ pub trait BootstrapTarget: Send + Sync {
 }
 
 /// Instantiates a Stage 0 `BootstrapTarget` driver for the requested `BootstrapTargetKind`.
-///
-/// Cloud and hypervisor targets (`proxmox`, `aws`, `gcp`, `azure`, `hetzner`) return
-/// `CoreError::NotImplemented` until the Stage 0 Pulumi runner is wired, preserving a
-/// unified provider-agnostic interface.
 pub fn factory(kind: BootstrapTargetKind) -> Result<Box<dyn BootstrapTarget>, CoreError> {
     match kind {
-        BootstrapTargetKind::Kind => Ok(Box::new(KindBootstrapTarget::new())),
         BootstrapTargetKind::Kubeconfig => Ok(Box::new(KubeconfigBootstrapTarget::new())),
-        BootstrapTargetKind::Proxmox
+        BootstrapTargetKind::Kind
+        | BootstrapTargetKind::Proxmox
         | BootstrapTargetKind::Aws
         | BootstrapTargetKind::Gcp
         | BootstrapTargetKind::Azure
-        | BootstrapTargetKind::Hetzner => Err(CoreError::NotImplemented(format!(
-            "Stage 0 bootstrap driver for '{}' requires the Stage 0 Pulumi runner",
-            kind
-        ))),
+        | BootstrapTargetKind::Hetzner => Ok(Box::new(PulumiBootstrapTarget::new(kind))),
     }
 }
 
-/// Local workstation Stage 0 driver backed by `kind` (`Kubernetes IN Docker`).
+/// Unified Stage 0 driver backed by the `pulumi` CLI for `kind`, `proxmox`, `aws`, `gcp`,
+/// `azure`, and `hetzner` bootstrap targets (`SDD.md` §2.1, `NFR-SEC-06`).
 #[derive(Debug, Clone)]
-pub struct KindBootstrapTarget {
-    kind_bin: PathBuf,
+pub struct PulumiBootstrapTarget {
+    target: BootstrapTargetKind,
+    pulumi_bin: PathBuf,
 }
 
-impl Default for KindBootstrapTarget {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl KindBootstrapTarget {
-    /// Creates a `KindBootstrapTarget` resolving `kind` from `PATH`.
-    pub fn new() -> Self {
+impl PulumiBootstrapTarget {
+    /// Creates a `PulumiBootstrapTarget` resolving `pulumi` from `PATH`.
+    pub fn new(target: BootstrapTargetKind) -> Self {
         Self {
-            kind_bin: PathBuf::from("kind"),
+            target,
+            pulumi_bin: PathBuf::from("pulumi"),
         }
     }
 
-    /// Creates a `KindBootstrapTarget` using an explicit path to the `kind` binary.
-    pub fn with_binary(kind_bin: impl Into<PathBuf>) -> Self {
+    /// Creates a `PulumiBootstrapTarget` using an explicit path to the `pulumi` binary.
+    pub fn with_binary(target: BootstrapTargetKind, pulumi_bin: impl Into<PathBuf>) -> Self {
         Self {
-            kind_bin: kind_bin.into(),
+            target,
+            pulumi_bin: pulumi_bin.into(),
         }
     }
 
-    /// Builds the `kind` cluster config YAML mounting `/var/run/docker.sock` for local-dev nested `kind`.
-    pub fn build_local_dev_kind_config_yaml() -> &'static str {
-        "kind: Cluster\napiVersion: kind.x-k8s.io/v1alpha4\nnodes:\n  - role: control-plane\n    extraMounts:\n      - hostPath: /var/run/docker.sock\n        containerPath: /var/run/docker.sock\n"
+    /// Resolves the Stage 0 Pulumi program directory from `cfg.pulumi_program_dir` or the
+    /// default `deploy/bootstrap/<target>` path.
+    pub fn resolve_program_dir(&self, cfg: &BootstrapConfig) -> PathBuf {
+        cfg.pulumi_program_dir
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("deploy/bootstrap").join(self.target.to_string()))
     }
 
-    /// Builds explicit CLI arguments for `kind create cluster`.
-    pub fn build_create_args(cfg: &BootstrapConfig) -> Result<Vec<String>, CoreError> {
-        Self::ensure_kind_target(cfg)?;
+    /// Returns the embedded Stage 0 `Pulumi.yaml` template for this target, if available.
+    pub fn embedded_pulumi_yaml(&self) -> Option<&'static str> {
+        match self.target {
+            BootstrapTargetKind::Kind => {
+                Some(include_str!("../../../deploy/bootstrap/kind/Pulumi.yaml"))
+            }
+            BootstrapTargetKind::Proxmox => Some(include_str!(
+                "../../../deploy/bootstrap/proxmox/Pulumi.yaml"
+            )),
+            BootstrapTargetKind::Aws => {
+                Some(include_str!("../../../deploy/bootstrap/aws/Pulumi.yaml"))
+            }
+            BootstrapTargetKind::Gcp => {
+                Some(include_str!("../../../deploy/bootstrap/gcp/Pulumi.yaml"))
+            }
+            BootstrapTargetKind::Azure => {
+                Some(include_str!("../../../deploy/bootstrap/azure/Pulumi.yaml"))
+            }
+            BootstrapTargetKind::Hetzner => Some(include_str!(
+                "../../../deploy/bootstrap/hetzner/Pulumi.yaml"
+            )),
+            BootstrapTargetKind::Kubeconfig => None,
+        }
+    }
+
+    async fn materialize_program_dir(
+        &self,
+        cfg: &BootstrapConfig,
+        state_dir: &Path,
+    ) -> Result<PathBuf, CoreError> {
+        if let Some(explicit) = &cfg.pulumi_program_dir {
+            if !explicit.is_dir() {
+                return Err(CoreError::Validation(format!(
+                    "Pulumi program directory does not exist: {}",
+                    explicit.display()
+                )));
+            }
+            return Ok(explicit.clone());
+        }
+
+        let rel = PathBuf::from("deploy/bootstrap").join(self.target.to_string());
+        if rel.join("Pulumi.yaml").is_file() {
+            return Ok(rel);
+        }
+        let parent_rel = PathBuf::from("..").join(&rel);
+        if parent_rel.join("Pulumi.yaml").is_file() {
+            return Ok(parent_rel);
+        }
+
+        if let Some(yaml) = self.embedded_pulumi_yaml() {
+            let embedded_dir = state_dir.join("program");
+            tokio::fs::create_dir_all(&embedded_dir).await?;
+            tokio::fs::write(embedded_dir.join("Pulumi.yaml"), yaml).await?;
+            return Ok(embedded_dir);
+        }
+
+        Err(CoreError::Validation(format!(
+            "No Stage 0 Pulumi program found for target '{}'",
+            self.target
+        )))
+    }
+
+    /// Returns the isolated local Pulumi state directory for this Stage 0 target and cluster.
+    pub fn state_dir(&self, cfg: &BootstrapConfig) -> PathBuf {
+        std::env::temp_dir()
+            .join("keel-stage0-pulumi")
+            .join(format!("{}-{}", self.target, cfg.cluster_name))
+    }
+
+    /// Returns the Pulumi stack name for this Stage 0 target and cluster.
+    pub fn stack_name(&self, cfg: &BootstrapConfig) -> String {
+        format!("stage0-{}-{}", self.target, cfg.cluster_name)
+    }
+
+    /// Builds explicit CLI arguments for `pulumi login file://<state_dir>`.
+    pub fn build_login_args(state_dir: &Path) -> Vec<String> {
+        vec![
+            "login".to_string(),
+            format!("file://{}", state_dir.display()),
+        ]
+    }
+
+    /// Builds explicit CLI arguments for `pulumi stack select <stack> [--create]`.
+    pub fn build_stack_select_args(
+        &self,
+        cfg: &BootstrapConfig,
+        create: bool,
+    ) -> Result<Vec<String>, CoreError> {
+        self.ensure_target(cfg)?;
         let mut args = vec![
-            "create".to_string(),
-            "cluster".to_string(),
-            "--name".to_string(),
-            cfg.cluster_name.clone(),
+            "stack".to_string(),
+            "select".to_string(),
+            self.stack_name(cfg),
         ];
-        if let Some(config_path) = &cfg.kind_config_path {
-            args.push("--config".to_string());
-            args.push(config_path.to_string_lossy().into_owned());
-        }
-        if let Some(kubeconfig) = &cfg.kubeconfig {
-            args.push("--kubeconfig".to_string());
-            args.push(kubeconfig.to_string_lossy().into_owned());
+        if create {
+            args.push("--create".to_string());
         }
         Ok(args)
     }
 
-    /// Builds explicit CLI arguments for `kind get kubeconfig`.
-    pub fn build_get_kubeconfig_args(cfg: &BootstrapConfig) -> Result<Vec<String>, CoreError> {
-        Self::ensure_kind_target(cfg)?;
-        Ok(vec![
-            "get".to_string(),
+    /// Builds explicit CLI arguments for `pulumi install` (materializing parameterized providers).
+    pub fn build_install_args() -> Vec<String> {
+        vec!["install".to_string()]
+    }
+
+    /// Builds `(key, value)` Pulumi configuration pairs for the Stage 0 stack.
+    pub fn build_config_set_pairs(
+        &self,
+        cfg: &BootstrapConfig,
+    ) -> Result<Vec<(String, String)>, CoreError> {
+        self.ensure_target(cfg)?;
+        let mut pairs = vec![("clusterName".to_string(), cfg.cluster_name.clone())];
+
+        if self.target == BootstrapTargetKind::Kind {
+            let mount_idx = if cfg.local_dev_docker_socket_exception {
+                "1"
+            } else {
+                "0"
+            };
+            pairs.push(("dockerSocketMountIndex".to_string(), mount_idx.to_string()));
+        }
+
+        if let Some(region) = &cfg.region {
+            pairs.push(("region".to_string(), region.clone()));
+        }
+        if let Some(proxmox_url) = &cfg.proxmox_url {
+            pairs.push(("proxmoxUrl".to_string(), proxmox_url.clone()));
+        }
+        if let Some(distro) = &cfg.distro {
+            pairs.push(("distro".to_string(), distro.to_string()));
+        }
+
+        Ok(pairs)
+    }
+
+    /// Builds explicit CLI arguments for `pulumi config set <key> <value>`.
+    pub fn build_config_set_args(key: &str, value: &str) -> Vec<String> {
+        vec![
+            "config".to_string(),
+            "set".to_string(),
+            key.to_string(),
+            value.to_string(),
+        ]
+    }
+
+    /// Builds explicit CLI arguments for `pulumi up --yes --non-interactive`.
+    pub fn build_up_args() -> Vec<String> {
+        vec![
+            "up".to_string(),
+            "--yes".to_string(),
+            "--non-interactive".to_string(),
+        ]
+    }
+
+    /// Builds explicit CLI arguments for `pulumi stack output kubeconfig --show-secrets`.
+    pub fn build_stack_output_kubeconfig_args() -> Vec<String> {
+        vec![
+            "stack".to_string(),
+            "output".to_string(),
             "kubeconfig".to_string(),
-            "--name".to_string(),
-            cfg.cluster_name.clone(),
-        ])
+            "--show-secrets".to_string(),
+        ]
     }
 
-    /// Builds explicit CLI arguments for `kind delete cluster`.
-    pub fn build_delete_args(cfg: &BootstrapConfig) -> Result<Vec<String>, CoreError> {
-        Self::ensure_kind_target(cfg)?;
-        let mut args = vec![
-            "delete".to_string(),
-            "cluster".to_string(),
-            "--name".to_string(),
-            cfg.cluster_name.clone(),
-        ];
-        if let Some(kubeconfig) = &cfg.kubeconfig {
-            args.push("--kubeconfig".to_string());
-            args.push(kubeconfig.to_string_lossy().into_owned());
+    /// Builds explicit CLI arguments for `pulumi destroy --yes --non-interactive`.
+    pub fn build_destroy_args() -> Vec<String> {
+        vec![
+            "destroy".to_string(),
+            "--yes".to_string(),
+            "--non-interactive".to_string(),
+        ]
+    }
+
+    fn ensure_target(&self, cfg: &BootstrapConfig) -> Result<(), CoreError> {
+        if self.target == BootstrapTargetKind::Kubeconfig {
+            return Err(CoreError::Validation(
+                "PulumiBootstrapTarget does not support the 'kubeconfig' target; use KubeconfigBootstrapTarget".to_string(),
+            ));
         }
-        Ok(args)
-    }
-
-    fn ensure_kind_target(cfg: &BootstrapConfig) -> Result<(), CoreError> {
-        if cfg.target != BootstrapTargetKind::Kind {
+        if cfg.target != self.target {
             return Err(CoreError::Validation(format!(
-                "KindBootstrapTarget expected target 'kind', got '{}'",
-                cfg.target
+                "PulumiBootstrapTarget expected target '{}', got '{}'",
+                self.target, cfg.target
             )));
         }
         cfg.validate()
     }
 
-    async fn run_kind(&self, args: &[String]) -> Result<String, CoreError> {
-        let program_label = self.kind_bin.display().to_string();
-        let output = Command::new(&self.kind_bin)
-            .args(args)
+    async fn run_pulumi(&self, program_dir: &Path, args: &[String]) -> Result<String, CoreError> {
+        let program_label = self.pulumi_bin.display().to_string();
+        let mut cmd = Command::new(&self.pulumi_bin);
+        cmd.args(args)
+            .current_dir(program_dir)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .output()
-            .await
-            .map_err(|e| CoreError::CommandFailed {
-                program: program_label.clone(),
-                message: e.to_string(),
-            })?;
+            .env("PULUMI_SKIP_UPDATE_CHECK", "true");
+
+        if std::env::var_os("PULUMI_CONFIG_PASSPHRASE").is_none() {
+            cmd.env("PULUMI_CONFIG_PASSPHRASE", "");
+        }
+
+        let output = cmd.output().await.map_err(|e| CoreError::CommandFailed {
+            program: program_label.clone(),
+            message: e.to_string(),
+        })?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -182,46 +312,49 @@ impl KindBootstrapTarget {
 }
 
 #[async_trait]
-impl BootstrapTarget for KindBootstrapTarget {
+impl BootstrapTarget for PulumiBootstrapTarget {
     fn kind(&self) -> BootstrapTargetKind {
-        BootstrapTargetKind::Kind
+        self.target
     }
 
     async fn provision_cluster(
         &self,
         cfg: &BootstrapConfig,
     ) -> Result<ClusterConnection, CoreError> {
-        let mut temp_config_path: Option<PathBuf> = None;
-        let effective_cfg =
-            if cfg.kind_config_path.is_none() && cfg.local_dev_docker_socket_exception {
-                let path = std::env::temp_dir()
-                    .join(format!("keel-kind-config-{}.yaml", cfg.cluster_name));
-                tokio::fs::write(&path, Self::build_local_dev_kind_config_yaml()).await?;
-                temp_config_path = Some(path.clone());
-                let mut cloned = cfg.clone();
-                cloned.kind_config_path = Some(path);
-                Some(cloned)
-            } else {
-                None
-            };
-        let create_args = Self::build_create_args(effective_cfg.as_ref().unwrap_or(cfg))?;
-        tracing::info!(
-            cluster = %cfg.cluster_name,
-            local_dev_docker_socket_exception = cfg.local_dev_docker_socket_exception,
-            "Provisioning Stage 0 kind cluster"
-        );
-        let run_result = self.run_kind(&create_args).await;
-        if let Some(path) = temp_config_path {
-            let _ = tokio::fs::remove_file(&path).await;
-        }
-        run_result?;
+        self.ensure_target(cfg)?;
+        let state_dir = self.state_dir(cfg);
+        tokio::fs::create_dir_all(&state_dir).await?;
+        let program_dir = self.materialize_program_dir(cfg, &state_dir).await?;
 
-        let get_kc_args = Self::build_get_kubeconfig_args(cfg)?;
-        let kubeconfig_yaml = self.run_kind(&get_kc_args).await?;
+        tracing::info!(
+            target = %self.target,
+            cluster = %cfg.cluster_name,
+            program_dir = %program_dir.display(),
+            "Provisioning Stage 0 cluster via Pulumi"
+        );
+
+        self.run_pulumi(&program_dir, &Self::build_login_args(&state_dir))
+            .await?;
+        let select_args = self.build_stack_select_args(cfg, true)?;
+        self.run_pulumi(&program_dir, &select_args).await?;
+        self.run_pulumi(&program_dir, &Self::build_install_args())
+            .await?;
+
+        for (key, value) in self.build_config_set_pairs(cfg)? {
+            let set_args = Self::build_config_set_args(&key, &value);
+            self.run_pulumi(&program_dir, &set_args).await?;
+        }
+
+        self.run_pulumi(&program_dir, &Self::build_up_args())
+            .await?;
+
+        let kubeconfig_yaml = self
+            .run_pulumi(&program_dir, &Self::build_stack_output_kubeconfig_args())
+            .await?;
         let validated = validate_kubeconfig_yaml(&kubeconfig_yaml, cfg.context.as_deref())?;
 
         Ok(ClusterConnection {
-            target: BootstrapTargetKind::Kind,
+            target: self.target,
             cluster_name: cfg.cluster_name.clone(),
             kubeconfig_yaml,
             kubeconfig_path: cfg.kubeconfig.clone(),
@@ -231,12 +364,25 @@ impl BootstrapTarget for KindBootstrapTarget {
     }
 
     async fn teardown(&self, cfg: &BootstrapConfig) -> Result<(), CoreError> {
-        let delete_args = Self::build_delete_args(cfg)?;
+        self.ensure_target(cfg)?;
+        let state_dir = self.state_dir(cfg);
+        tokio::fs::create_dir_all(&state_dir).await?;
+        let program_dir = self.materialize_program_dir(cfg, &state_dir).await?;
+
         tracing::info!(
+            target = %self.target,
             cluster = %cfg.cluster_name,
-            "Tearing down Stage 0 kind cluster"
+            program_dir = %program_dir.display(),
+            "Tearing down Stage 0 cluster via Pulumi"
         );
-        self.run_kind(&delete_args).await?;
+
+        self.run_pulumi(&program_dir, &Self::build_login_args(&state_dir))
+            .await?;
+        let select_args = self.build_stack_select_args(cfg, false)?;
+        self.run_pulumi(&program_dir, &select_args).await?;
+        self.run_pulumi(&program_dir, &Self::build_destroy_args())
+            .await?;
+
         Ok(())
     }
 }
@@ -497,75 +643,113 @@ users:
 
     #[test]
     fn test_factory_provider_agnostic_targets() {
-        let kind_driver = factory(BootstrapTargetKind::Kind).unwrap();
-        assert_eq!(kind_driver.kind(), BootstrapTargetKind::Kind);
-
-        let kc_driver = factory(BootstrapTargetKind::Kubeconfig).unwrap();
-        assert_eq!(kc_driver.kind(), BootstrapTargetKind::Kubeconfig);
-
-        for unimplemented in [
-            BootstrapTargetKind::Proxmox,
-            BootstrapTargetKind::Aws,
-            BootstrapTargetKind::Gcp,
-            BootstrapTargetKind::Azure,
-            BootstrapTargetKind::Hetzner,
-        ] {
-            let err = match factory(unimplemented) {
-                Ok(_) => panic!("expected NotImplemented for {unimplemented}"),
-                Err(err) => err,
-            };
-            assert!(matches!(err, CoreError::NotImplemented(_)));
-            assert!(err.to_string().contains(unimplemented.as_str()));
+        for kind in BootstrapTargetKind::all() {
+            let driver = factory(*kind).unwrap();
+            assert_eq!(driver.kind(), *kind);
         }
     }
 
     #[test]
-    fn test_kind_command_arg_vectors() {
+    fn test_pulumi_command_arg_vectors_and_validation() {
+        let driver = PulumiBootstrapTarget::new(BootstrapTargetKind::Kind);
         let mut cfg = BootstrapConfig::new(BootstrapTargetKind::Kind);
         cfg.cluster_name = "keel-dev".to_string();
-        cfg.kind_config_path = Some(PathBuf::from("/tmp/kind-config.yaml"));
-        cfg.kubeconfig = Some(PathBuf::from("/tmp/kubeconfig"));
 
-        let create_args = KindBootstrapTarget::build_create_args(&cfg).unwrap();
         assert_eq!(
-            create_args,
+            driver.resolve_program_dir(&cfg),
+            PathBuf::from("deploy/bootstrap/kind")
+        );
+        cfg.pulumi_program_dir = Some(PathBuf::from("/custom/pulumi/kind"));
+        assert_eq!(
+            driver.resolve_program_dir(&cfg),
+            PathBuf::from("/custom/pulumi/kind")
+        );
+
+        let state_dir = driver.state_dir(&cfg);
+        assert!(state_dir.ends_with("keel-stage0-pulumi/kind-keel-dev"));
+        assert_eq!(
+            PulumiBootstrapTarget::build_login_args(&state_dir),
+            vec!["login", &format!("file://{}", state_dir.display())]
+        );
+
+        assert_eq!(
+            driver.build_stack_select_args(&cfg, true).unwrap(),
+            vec!["stack", "select", "stage0-kind-keel-dev", "--create"]
+        );
+        assert_eq!(
+            driver.build_stack_select_args(&cfg, false).unwrap(),
+            vec!["stack", "select", "stage0-kind-keel-dev"]
+        );
+
+        assert_eq!(
+            driver.build_config_set_pairs(&cfg).unwrap(),
             vec![
-                "create",
-                "cluster",
-                "--name",
-                "keel-dev",
-                "--config",
-                "/tmp/kind-config.yaml",
-                "--kubeconfig",
-                "/tmp/kubeconfig",
+                ("clusterName".to_string(), "keel-dev".to_string()),
+                ("dockerSocketMountIndex".to_string(), "0".to_string()),
             ]
         );
 
-        let get_kc_args = KindBootstrapTarget::build_get_kubeconfig_args(&cfg).unwrap();
-        assert_eq!(get_kc_args, vec!["get", "kubeconfig", "--name", "keel-dev"]);
-
-        let delete_args = KindBootstrapTarget::build_delete_args(&cfg).unwrap();
+        cfg.local_dev_docker_socket_exception = true;
         assert_eq!(
-            delete_args,
+            driver.build_config_set_pairs(&cfg).unwrap(),
             vec![
-                "delete",
-                "cluster",
-                "--name",
-                "keel-dev",
-                "--kubeconfig",
-                "/tmp/kubeconfig",
+                ("clusterName".to_string(), "keel-dev".to_string()),
+                ("dockerSocketMountIndex".to_string(), "1".to_string()),
+            ]
+        );
+
+        assert_eq!(
+            PulumiBootstrapTarget::build_config_set_args("clusterName", "keel-dev"),
+            vec!["config", "set", "clusterName", "keel-dev"]
+        );
+        assert_eq!(
+            PulumiBootstrapTarget::build_up_args(),
+            vec!["up", "--yes", "--non-interactive"]
+        );
+        assert_eq!(
+            PulumiBootstrapTarget::build_stack_output_kubeconfig_args(),
+            vec!["stack", "output", "kubeconfig", "--show-secrets"]
+        );
+        assert_eq!(
+            PulumiBootstrapTarget::build_destroy_args(),
+            vec!["destroy", "--yes", "--non-interactive"]
+        );
+
+        // Optional region / proxmoxUrl / distro config pairs
+        let pve_driver = PulumiBootstrapTarget::new(BootstrapTargetKind::Proxmox);
+        let mut pve_cfg = BootstrapConfig::new(BootstrapTargetKind::Proxmox);
+        pve_cfg.cluster_name = "pve-mgmt".to_string();
+        pve_cfg.region = Some("eu-central".to_string());
+        pve_cfg.proxmox_url = Some("https://pve.example.com:8006".to_string());
+        pve_cfg.distro = Some(crate::models::BootstrapDistro::Talos);
+        assert_eq!(
+            pve_driver.build_config_set_pairs(&pve_cfg).unwrap(),
+            vec![
+                ("clusterName".to_string(), "pve-mgmt".to_string()),
+                ("region".to_string(), "eu-central".to_string()),
+                (
+                    "proxmoxUrl".to_string(),
+                    "https://pve.example.com:8006".to_string()
+                ),
+                ("distro".to_string(), "talos".to_string()),
             ]
         );
 
         // Wrong target rejected
         let wrong = BootstrapConfig::new(BootstrapTargetKind::Aws);
-        assert!(KindBootstrapTarget::build_create_args(&wrong).is_err());
-        assert!(KindBootstrapTarget::build_get_kubeconfig_args(&wrong).is_err());
-        assert!(KindBootstrapTarget::build_delete_args(&wrong).is_err());
+        assert!(driver.build_stack_select_args(&wrong, true).is_err());
+        assert!(driver.build_config_set_pairs(&wrong).is_err());
 
-        let kind_cfg = KindBootstrapTarget::build_local_dev_kind_config_yaml();
-        assert!(kind_cfg.contains("kind.x-k8s.io/v1alpha4"));
-        assert!(kind_cfg.contains("/var/run/docker.sock"));
+        // Kubeconfig target rejected by PulumiBootstrapTarget
+        let kc_driver = PulumiBootstrapTarget::new(BootstrapTargetKind::Kubeconfig);
+        let kc_cfg = BootstrapConfig::new(BootstrapTargetKind::Kubeconfig);
+        assert!(kc_driver.build_stack_select_args(&kc_cfg, true).is_err());
+        assert!(kc_driver.build_config_set_pairs(&kc_cfg).is_err());
+
+        // Flag injection rejected via BootstrapConfig::validate
+        let mut bad_cfg = BootstrapConfig::new(BootstrapTargetKind::Kind);
+        bad_cfg.pulumi_program_dir = Some(PathBuf::from("-evil"));
+        assert!(driver.build_stack_select_args(&bad_cfg, true).is_err());
     }
 
     #[test]
@@ -699,34 +883,41 @@ contexts:
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn test_kind_bootstrap_driver_with_mock_binary() {
+    async fn test_pulumi_bootstrap_driver_with_mock_binary() {
         use std::os::unix::fs::PermissionsExt;
 
         let temp_dir =
-            std::env::temp_dir().join(format!("keel-kind-test-{}", uuid::Uuid::new_v4()));
-        tokio::fs::create_dir_all(&temp_dir).await.unwrap();
-        let mock_kind = temp_dir.join("mock-kind");
+            std::env::temp_dir().join(format!("keel-pulumi-test-{}", uuid::Uuid::new_v4()));
+        let program_dir = temp_dir.join("program");
+        tokio::fs::create_dir_all(&program_dir).await.unwrap();
+        let mock_pulumi = temp_dir.join("mock-pulumi");
+        let log_file = temp_dir.join("invocations.log");
 
         let script = format!(
-            "#!/bin/sh\nif [ \"$1\" = \"get\" ] && [ \"$2\" = \"kubeconfig\" ]; then\ncat << 'EOF'\n{}\nEOF\nexit 0\nfi\nif [ \"$1\" = \"create\" ] || [ \"$1\" = \"delete\" ]; then\nexit 0\nfi\nexit 1\n",
+            "#!/bin/sh\necho \"$@\" >> \"{}\"\nif [ \"$1\" = \"login\" ] || [ \"$1\" = \"install\" ] || [ \"$1\" = \"up\" ] || [ \"$1\" = \"destroy\" ]; then\n  exit 0\nfi\nif [ \"$1\" = \"stack\" ] && [ \"$2\" = \"select\" ]; then\n  exit 0\nfi\nif [ \"$1\" = \"config\" ] && [ \"$2\" = \"set\" ]; then\n  exit 0\nfi\nif [ \"$1\" = \"stack\" ] && [ \"$2\" = \"output\" ] && [ \"$3\" = \"kubeconfig\" ]; then\n  cat << 'EOF'\n{}\nEOF\n  exit 0\nfi\nexit 1\n",
+            log_file.display(),
             SAMPLE_KUBECONFIG
         );
         // Write atomically via temp file + rename to avoid ETXTBSY with parallel test forks
-        let mock_kind_tmp = temp_dir.join("mock-kind.tmp");
-        std::fs::write(&mock_kind_tmp, script.as_bytes()).unwrap();
-        let mut perms = std::fs::metadata(&mock_kind_tmp).unwrap().permissions();
+        let mock_pulumi_tmp = temp_dir.join("mock-pulumi.tmp");
+        std::fs::write(&mock_pulumi_tmp, script.as_bytes()).unwrap();
+        let mut perms = std::fs::metadata(&mock_pulumi_tmp).unwrap().permissions();
         perms.set_mode(0o755);
-        std::fs::set_permissions(&mock_kind_tmp, perms).unwrap();
-        std::fs::rename(&mock_kind_tmp, &mock_kind).unwrap();
+        std::fs::set_permissions(&mock_pulumi_tmp, perms).unwrap();
+        std::fs::rename(&mock_pulumi_tmp, &mock_pulumi).unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
 
-        let driver = KindBootstrapTarget::with_binary(&mock_kind);
+        let driver = PulumiBootstrapTarget::with_binary(BootstrapTargetKind::Kind, &mock_pulumi);
         assert_eq!(driver.kind(), BootstrapTargetKind::Kind);
 
-        let cfg = BootstrapConfig::new(BootstrapTargetKind::Kind);
+        let mut cfg = BootstrapConfig::new(BootstrapTargetKind::Kind);
+        cfg.cluster_name = format!("test-{}", uuid::Uuid::new_v4().simple());
+        cfg.pulumi_program_dir = Some(program_dir.clone());
+        cfg.local_dev_docker_socket_exception = true;
+
         let conn = driver.provision_cluster(&cfg).await.unwrap();
         assert_eq!(conn.target, BootstrapTargetKind::Kind);
-        assert_eq!(conn.cluster_name, "keel-mgmt");
+        assert_eq!(conn.cluster_name, cfg.cluster_name);
         assert_eq!(conn.context.as_deref(), Some("kind-keel-mgmt"));
         assert_eq!(
             conn.server_endpoint.as_deref(),
@@ -735,40 +926,71 @@ contexts:
 
         driver.teardown(&cfg).await.unwrap();
 
+        let logged = tokio::fs::read_to_string(&log_file).await.unwrap();
+        let lines: Vec<&str> = logged.lines().collect();
+        assert!(lines.iter().any(|l| l.starts_with("login file://")));
+        assert!(lines.contains(&"install"));
+        assert!(
+            lines
+                .iter()
+                .any(|l| *l == format!("stack select stage0-kind-{} --create", cfg.cluster_name))
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| *l == format!("config set clusterName {}", cfg.cluster_name))
+        );
+        assert!(lines.contains(&"config set dockerSocketMountIndex 1"));
+        assert!(lines.contains(&"up --yes --non-interactive"));
+        assert!(lines.contains(&"stack output kubeconfig --show-secrets"));
+        assert!(
+            lines
+                .iter()
+                .any(|l| *l == format!("stack select stage0-kind-{}", cfg.cluster_name))
+        );
+        assert!(lines.contains(&"destroy --yes --non-interactive"));
+
+        // Clean up isolated state dir created by test
+        let _ = tokio::fs::remove_dir_all(driver.state_dir(&cfg)).await;
+
         // Non-existent binary error handling
-        let bad_driver = KindBootstrapTarget::with_binary(temp_dir.join("missing-kind-bin"));
+        let bad_driver = PulumiBootstrapTarget::with_binary(
+            BootstrapTargetKind::Kind,
+            temp_dir.join("missing-pulumi-bin"),
+        );
         assert!(bad_driver.provision_cluster(&cfg).await.is_err());
 
         // Non-zero exit code error handling
-        let failing_kind = temp_dir.join("failing-kind");
+        let failing_pulumi = temp_dir.join("failing-pulumi");
         {
             use tokio::io::AsyncWriteExt;
-            let mut file = tokio::fs::File::create(&failing_kind).await.unwrap();
-            file.write_all(b"#!/bin/sh\necho 'docker daemon unavailable' >&2\nexit 1\n")
+            let mut file = tokio::fs::File::create(&failing_pulumi).await.unwrap();
+            file.write_all(b"#!/bin/sh\necho 'pulumi login failed' >&2\nexit 1\n")
                 .await
                 .unwrap();
             file.sync_all().await.unwrap();
         }
-        let mut fail_perms = tokio::fs::metadata(&failing_kind)
+        let mut fail_perms = tokio::fs::metadata(&failing_pulumi)
             .await
             .unwrap()
             .permissions();
         fail_perms.set_mode(0o755);
-        tokio::fs::set_permissions(&failing_kind, fail_perms)
+        tokio::fs::set_permissions(&failing_pulumi, fail_perms)
             .await
             .unwrap();
 
-        let failing_driver = KindBootstrapTarget::with_binary(&failing_kind);
+        let failing_driver =
+            PulumiBootstrapTarget::with_binary(BootstrapTargetKind::Kind, &failing_pulumi);
         let err = failing_driver.provision_cluster(&cfg).await.unwrap_err();
-        assert!(err.to_string().contains("docker daemon unavailable"));
+        assert!(err.to_string().contains("pulumi login failed"));
 
-        // Default constructors & resolve_kubeconfig_path fallback
-        let _default_kind = KindBootstrapTarget::default();
+        // Default constructor & resolve_kubeconfig_path fallback
         let _default_kc = KubeconfigBootstrapTarget;
         let fallback_cfg = BootstrapConfig::new(BootstrapTargetKind::Kubeconfig);
         let resolved = KubeconfigBootstrapTarget::resolve_kubeconfig_path(&fallback_cfg);
         assert!(resolved.is_ok());
 
+        let _ = tokio::fs::remove_dir_all(driver.state_dir(&cfg)).await;
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }
 }

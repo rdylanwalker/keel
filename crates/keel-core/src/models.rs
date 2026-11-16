@@ -180,7 +180,7 @@ pub struct BootstrapConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub distro: Option<BootstrapDistro>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub kind_config_path: Option<PathBuf>,
+    pub pulumi_program_dir: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for BootstrapConfig {
@@ -206,7 +206,7 @@ impl std::fmt::Debug for BootstrapConfig {
             .field("proxmox_url", &self.proxmox_url)
             .field("region", &self.region)
             .field("distro", &self.distro)
-            .field("kind_config_path", &self.kind_config_path)
+            .field("pulumi_program_dir", &self.pulumi_program_dir)
             .finish()
     }
 }
@@ -237,7 +237,7 @@ impl BootstrapConfig {
             proxmox_url: None,
             region: None,
             distro: None,
-            kind_config_path: None,
+            pulumi_program_dir: None,
         }
     }
 
@@ -270,11 +270,11 @@ impl BootstrapConfig {
             }
         }
 
-        if let Some(path) = &self.kind_config_path {
+        if let Some(path) = &self.pulumi_program_dir {
             let path_str = path.to_string_lossy();
             if path_str.trim().is_empty() || path_str.starts_with('-') {
                 return Err(CoreError::Validation(
-                    "kind_config_path must be non-empty and must not start with '-'".to_string(),
+                    "pulumi_program_dir must be non-empty and must not start with '-'".to_string(),
                 ));
             }
         }
@@ -1399,7 +1399,7 @@ mod tests {
         let err = aws_cfg.validate().unwrap_err().to_string();
         assert!(err.contains("only permitted for the 'kind' bootstrap target"));
 
-        // Reject flag smuggling in cluster_name, context, kubeconfig, kind_config_path
+        // Reject flag smuggling in cluster_name, context, kubeconfig, pulumi_program_dir
         let bad_name = BootstrapConfig {
             cluster_name: "--evil".to_string(),
             ..Default::default()
@@ -1414,11 +1414,17 @@ mod tests {
         bad_kc.kubeconfig = Some(PathBuf::from("-bad-path"));
         assert!(bad_kc.validate().is_err());
 
-        let bad_kind_cfg = BootstrapConfig {
-            kind_config_path: Some(PathBuf::from("-inject")),
+        let bad_pulumi_dir = BootstrapConfig {
+            pulumi_program_dir: Some(PathBuf::from("-inject")),
             ..Default::default()
         };
-        assert!(bad_kind_cfg.validate().is_err());
+        assert!(bad_pulumi_dir.validate().is_err());
+
+        let empty_pulumi_dir = BootstrapConfig {
+            pulumi_program_dir: Some(PathBuf::from("   ")),
+            ..Default::default()
+        };
+        assert!(empty_pulumi_dir.validate().is_err());
 
         let mut bad_pve = BootstrapConfig::new(BootstrapTargetKind::Proxmox);
         bad_pve.proxmox_url = Some("ftp://pve.local".to_string());

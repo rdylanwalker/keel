@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub use bootstrap::{
-    BootstrapTarget, ClusterConnection, KindBootstrapTarget, KubeconfigBootstrapTarget,
+    BootstrapTarget, ClusterConnection, KubeconfigBootstrapTarget, PulumiBootstrapTarget,
     ValidatedKubeconfig, factory as bootstrap_target_factory, validate_kubeconfig_yaml,
 };
 pub use catalog::{
