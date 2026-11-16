@@ -424,6 +424,10 @@ impl KubeClusterStatusReader {
         if !std::path::Path::new("/var/run/secrets/kubernetes.io/serviceaccount/token").exists()
             && let Some(host) = cfg.cluster_url.host()
             && host.ends_with("-control-plane")
+            && !host.starts_with('-')
+            && host
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
             && let Ok(Ok(out)) = tokio::time::timeout(
                 std::time::Duration::from_secs(2),
                 tokio::process::Command::new("docker")
