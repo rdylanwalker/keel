@@ -26,10 +26,6 @@
       "@semantic-release/github",
       {
         "assets": [
-          { "path": "dist/keel-linux-amd64.tar.gz", "label": "Linux amd64 Binary" },
-          { "path": "dist/keel-linux-arm64.tar.gz", "label": "Linux arm64 Binary" },
-          { "path": "dist/keel-darwin-arm64.tar.gz", "label": "macOS Apple Silicon Binary" },
-          { "path": "dist/keel-windows-amd64.zip", "label": "Windows amd64 Binary" },
           { "path": "dist/sbom.cdx.json", "label": "CycloneDX SBOM" },
           { "path": "dist/keel-docs.tar.gz", "label": "Documentation (HTML)" }
         ]
