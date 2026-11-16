@@ -3736,6 +3736,7 @@ spec:
             forge_type: None,
             forge_api_url: None,
             git_token: None,
+            pulumi_program_dir: None,
         };
         let err = execute_bootstrap_init(&bad_args).await.unwrap_err();
         assert!(err.to_string().contains("only permitted for the 'kind'"));
@@ -3745,8 +3746,10 @@ spec:
             local_dev_docker_socket_exception: false,
             ..bad_args.clone()
         };
-        let cloud_err = execute_bootstrap_init(&cloud_args).await.unwrap_err();
-        assert!(cloud_err.to_string().contains("Stage 0 Pulumi runner"));
+        let cloud_cfg = cloud_args.to_bootstrap_config();
+        cloud_cfg.validate().unwrap();
+        let driver = bootstrap_target_factory(BootstrapTargetKind::Aws).unwrap();
+        assert_eq!(driver.kind(), BootstrapTargetKind::Aws);
 
         // 3. `kind` target with `--local-dev-docker-socket-exception` + `--with-oidc` synthesizes PolicyException
         let kind_args = BootstrapInitArgs {
@@ -3769,6 +3772,7 @@ spec:
             forge_type: None,
             forge_api_url: None,
             git_token: None,
+            pulumi_program_dir: None,
         };
         let mock_kind = MockBootstrapTarget {
             kind: BootstrapTargetKind::Kind,
@@ -4444,6 +4448,7 @@ spec:
             forge_type: None,
             forge_api_url: None,
             git_token: Some("ghp_test_token_123".to_string()),
+            pulumi_program_dir: None,
         };
         let mock_kind = MockBootstrapTarget {
             kind: BootstrapTargetKind::Kind,

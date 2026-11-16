@@ -32,6 +32,7 @@ pub struct Cli {
 
 /// Top-level subcommand groups for `keel`.
 #[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
 pub enum Commands {
     /// Stage 0 seed cluster bootstrap and break-glass S3 recovery
     Bootstrap(BootstrapArgs),
@@ -142,6 +143,10 @@ pub struct BootstrapInitArgs {
     /// Personal access token for external/private Git repository & Forge API access (or set `KEEL_GIT_TOKEN`)
     #[arg(long, env = "KEEL_GIT_TOKEN")]
     pub git_token: Option<String>,
+
+    /// Optional override directory containing the Stage 0 Pulumi.yaml program
+    #[arg(long)]
+    pub pulumi_program_dir: Option<PathBuf>,
 }
 
 impl BootstrapInitArgs {
@@ -162,7 +167,7 @@ impl BootstrapInitArgs {
             proxmox_url: self.proxmox_url.clone(),
             region: self.region.clone(),
             distro: self.distro,
-            kind_config_path: None,
+            pulumi_program_dir: self.pulumi_program_dir.clone(),
         }
     }
 }
@@ -423,6 +428,7 @@ mod tests {
                     assert!(!args.local_dev_docker_socket_exception);
                     assert!(args.repo_dir.is_none());
                     assert!(!args.skip_core_install);
+                    assert!(args.pulumi_program_dir.is_none());
                 }
                 other => panic!("unexpected command: {other:?}"),
             }
@@ -460,6 +466,8 @@ mod tests {
             "--skip-core-install",
             "--repo-dir",
             "/tmp/keel-gitops",
+            "--pulumi-program-dir",
+            "/tmp/pulumi-kind",
         ])
         .unwrap();
 
@@ -484,12 +492,20 @@ mod tests {
         assert!(args.local_dev_docker_socket_exception);
         assert!(args.skip_core_install);
         assert_eq!(args.repo_dir, Some(PathBuf::from("/tmp/keel-gitops")));
+        assert_eq!(
+            args.pulumi_program_dir,
+            Some(PathBuf::from("/tmp/pulumi-kind"))
+        );
 
         let cfg = args.to_bootstrap_config();
         assert_eq!(cfg.target, BootstrapTargetKind::Kind);
         assert_eq!(cfg.cluster_name, "dev-seed");
         assert!(cfg.local_dev_docker_socket_exception);
         assert_eq!(cfg.distro, Some(BootstrapDistro::Talos));
+        assert_eq!(
+            cfg.pulumi_program_dir,
+            Some(PathBuf::from("/tmp/pulumi-kind"))
+        );
         assert!(cfg.validate().is_ok());
     }
 
