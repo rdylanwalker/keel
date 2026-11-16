@@ -95,8 +95,83 @@ stop-serve:
         echo "No running keel serve process found."
     fi
 
+# Build UI + keel binary, bootstrap a local kind cluster (--with-forge), and start serve in background
+build-init-serve *ARGS: build
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    just stop-serve
+
+    extra_args=({{ARGS}})
+    repo_dir="./keel-gitops"
+    cluster_name="keel-mgmt"
+    bind_addr="127.0.0.1:8080"
+    init_args=()
+
+    i=0
+    while [ "$i" -lt "${#extra_args[@]}" ]; do
+        arg="${extra_args[$i]}"
+        case "$arg" in
+            --repo-dir)
+                i=$((i + 1))
+                repo_dir="${extra_args[$i]}"
+                ;;
+            --repo-dir=*)
+                repo_dir="${arg#*=}"
+                ;;
+            --cluster-name)
+                i=$((i + 1))
+                cluster_name="${extra_args[$i]}"
+                ;;
+            --cluster-name=*)
+                cluster_name="${arg#*=}"
+                ;;
+            --bind)
+                i=$((i + 1))
+                bind_addr="${extra_args[$i]}"
+                ;;
+            --bind=*)
+                bind_addr="${arg#*=}"
+                ;;
+            *)
+                init_args+=("$arg")
+                ;;
+        esac
+        i=$((i + 1))
+    done
+
+    mkdir -p target
+    init_log=$(mktemp)
+    trap 'rm -f "$init_log"' EXIT
+
+    ./target/debug/keel bootstrap init \
+        --target kind \
+        --cluster-name "$cluster_name" \
+        --with-forge \
+        --local-dev-docker-socket-exception \
+        --repo-dir "$repo_dir" \
+        "${init_args[@]+"${init_args[@]}"}" | tee "$init_log"
+
+    if [ -n "${KEEL_ADMIN_PASSWORD:-}" ]; then
+        printf '%s' "$KEEL_ADMIN_PASSWORD" > target/keel-dex-password
+        chmod 600 target/keel-dex-password
+    else
+        init_pass=$(awk -F'Admin Password:[[:space:]]*' '/^Admin Password:/ {print $2; exit}' "$init_log" || true)
+        if [ -n "$init_pass" ] && [ "$init_pass" != "[PROVIDED VIA CLI]" ]; then
+            printf '%s' "$init_pass" > target/keel-dex-password
+            chmod 600 target/keel-dex-password
+        fi
+    fi
+
+    just _start-serve --bind "$bind_addr" --repo-dir "$repo_dir"
+
 # Build UI + keel binary, kill any previous serve, start serve in background, and report credentials
 build-serve *ARGS: build
+    just _start-serve {{ARGS}}
+
+# Internal helper: kill any previous serve, start serve in background, and report credentials (no build)
+[private]
+_start-serve *ARGS:
     #!/usr/bin/env bash
     set -euo pipefail
     pid_file="target/keel-serve.pid"
