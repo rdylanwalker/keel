@@ -225,6 +225,9 @@ impl PreparedAuthEnv {
                         "-o StrictHostKeyChecking=yes -o UserKnownHostsFile={quoted_hosts_path}"
                     )
                 } else {
+                    tracing::warn!(
+                        "SSH known_hosts not provided; using StrictHostKeyChecking=accept-new (TOFU)"
+                    );
                     "-o StrictHostKeyChecking=accept-new".to_string()
                 };
 
@@ -801,8 +804,33 @@ impl GitRunner {
         Ok(out.trim().to_string())
     }
 
+    /// Lists up to `limit` commit SHAs touching `repo_rel_path` in `repo_dir`.
+    pub async fn log_file_commits(
+        &self,
+        repo_dir: &Path,
+        repo_rel_path: &str,
+        limit: usize,
+    ) -> Result<Vec<String>, GitError> {
+        validate_non_option_arg(repo_rel_path, "repo_rel_path")?;
+        let limit_str = limit.max(1).to_string();
+        let out = self
+            .exec(
+                Some(repo_dir),
+                "log",
+                &["log", "-n", &limit_str, "--format=%H", "--", repo_rel_path],
+                &[],
+            )
+            .await?;
+        Ok(out
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(ToOwned::to_owned)
+            .collect())
+    }
+
     /// Reads the UTF-8 contents of an object `<rev>:<repo_rel_path>` from a bare or non-bare repo.
-    pub(crate) async fn show_file_at_ref(
+    pub async fn show_file_at_ref(
         &self,
         repo_dir: &Path,
         rev: &str,
