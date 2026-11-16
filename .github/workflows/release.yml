@@ -21,7 +21,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@v2
         with:
-          tool: mdbook,mdbook-mermaid
+          tool: mdbook,mdbook-mermaid,cargo-edit
       - uses: pnpm/action-setup@v6
         with:
           version: 12
@@ -32,7 +32,7 @@ jobs:
           cache-dependency-path: ui/pnpm-lock.yaml
       - name: Install Release Dependencies
         run: |
-          npm install -g semantic-release @semantic-release/commit-analyzer @semantic-release/release-notes-generator @semantic-release/changelog @semantic-release/exec @semantic-release/git @semantic-release/github cargo-edit
+          npm install -g semantic-release @semantic-release/commit-analyzer @semantic-release/release-notes-generator @semantic-release/changelog @semantic-release/exec @semantic-release/git @semantic-release/github
       - name: Build Documentation Archive
         run: |
           mdbook build

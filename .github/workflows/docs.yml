@@ -30,6 +30,8 @@ jobs:
           tool: mdbook,mdbook-mermaid
       - name: Setup Pages
         uses: actions/configure-pages@v6
+        with:
+          enablement: true
       - name: Build mdBook
         run: mdbook build
       - name: Upload Pages Artifact

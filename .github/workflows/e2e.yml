@@ -64,14 +64,15 @@ jobs:
           cache-dependency-path: e2e/pnpm-lock.yaml
       - name: Install kind, kubectl, helm, sops, age
         run: |
-          curl -fsSL https://kind.sigs.k8s.io/dl/latest/kind-linux-amd64 -o /usr/local/bin/kind
-          chmod +x /usr/local/bin/kind
-          curl -fsSL "https://dl.k8s.io/release/$(curl -fsSL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl" -o /usr/local/bin/kubectl
-          chmod +x /usr/local/bin/kubectl
+          curl -fsSL https://kind.sigs.k8s.io/dl/latest/kind-linux-amd64 -o /tmp/kind
+          sudo install -m 0755 /tmp/kind /usr/local/bin/kind
+          curl -fsSL "https://dl.k8s.io/release/$(curl -fsSL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl" -o /tmp/kubectl
+          sudo install -m 0755 /tmp/kubectl /usr/local/bin/kubectl
           curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
           sudo apt-get update && sudo apt-get install -y age
-          curl -fsSL https://github.com/getsops/sops/releases/download/v3.9.4/sops-v3.9.4.linux.amd64 -o /usr/local/bin/sops
-          chmod +x /usr/local/bin/sops
+          curl -fsSL https://github.com/getsops/sops/releases/download/v3.9.4/sops-v3.9.4.linux.amd64 -o /tmp/sops
+          sudo install -m 0755 /tmp/sops /usr/local/bin/sops
+          rm -f /tmp/kind /tmp/kubectl /tmp/sops
       - name: Build UI & Keel Binary
         run: |
           pnpm --dir ui install
