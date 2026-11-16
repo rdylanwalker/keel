@@ -1409,7 +1409,7 @@ dependencies = [
 
 [[package]]
 name = "keel-cli"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1436,7 +1436,7 @@ dependencies = [
 
 [[package]]
 name = "keel-core"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -1459,7 +1459,7 @@ dependencies = [
 
 [[package]]
 name = "keel-git"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1476,7 +1476,7 @@ dependencies = [
 
 [[package]]
 name = "keel-kube"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "aes-gcm",
  "async-trait",
@@ -1501,7 +1501,7 @@ dependencies = [
 
 [[package]]
 name = "keel-pko"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "keel-core",
  "serde",
@@ -1512,7 +1512,7 @@ dependencies = [
 
 [[package]]
 name = "keel-server"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "aes-gcm",
  "async-trait",

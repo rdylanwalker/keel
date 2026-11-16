@@ -1,3 +1,15 @@
+# [0.5.0](https://github.com/rdylanwalker/keel/compare/v0.4.1...v0.5.0) (2026-11-16)
+
+
+### Bug Fixes
+
+* **ui:** suppress 401 errors in demo mode ([2cc518d](https://github.com/rdylanwalker/keel/commit/2cc518d5eb133fe6161497ff2e9c57d9512d20c8))
+
+
+### Features
+
+* **e2e:** add screenshot capture script and just recipe ([ce72d5a](https://github.com/rdylanwalker/keel/commit/ce72d5a84ab22541090703bb1c91cdecc0789b19))
+
 ## [0.4.1](https://github.com/rdylanwalker/keel/compare/v0.4.0...v0.4.1) (2026-11-16)
 
 
