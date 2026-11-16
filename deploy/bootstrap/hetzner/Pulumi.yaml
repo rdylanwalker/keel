@@ -18,6 +18,14 @@ config:
     default: ubuntu-24.04
   sshKeyName:
     type: string
+  allowedManagementCidrs:
+    type: array
+    items:
+      type: string
+    # Restrict via `pulumi config set-all --path allowedManagementCidrs[0]=<your-cidr>` for production
+    default:
+      - 0.0.0.0/0
+      - ::/0
 
 resources:
   controlPlaneFirewall:
@@ -33,15 +41,11 @@ resources:
         - direction: in
           protocol: tcp
           port: "22"
-          sourceIps:
-            - 0.0.0.0/0
-            - ::/0
+          sourceIps: ${allowedManagementCidrs}
         - direction: in
           protocol: tcp
           port: "6443"
-          sourceIps:
-            - 0.0.0.0/0
-            - ::/0
+          sourceIps: ${allowedManagementCidrs}
         - direction: in
           protocol: tcp
           port: "443"
