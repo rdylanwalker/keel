@@ -25,7 +25,11 @@ import {
   StackSummary,
   TenantSummary,
 } from "../types/api"
-import { createProposal, fetchCatalogSchema } from "../lib/api"
+import {
+  createProposal,
+  fetchCatalogSchema,
+  upgradeManagementAddon,
+} from "../lib/api"
 import { extractSchemaDefaults } from "../lib/schemaBuilder"
 import { jsonToYaml } from "../lib/utils"
 
@@ -136,6 +140,7 @@ export interface DeployInstanceModalProps {
   isOpen: boolean
   onClose: () => void
   catalogItem: CatalogItem | null
+  managementAddon?: CatalogItem | null
   tenant: string
   tenants?: TenantSummary[]
   onTenantChange?: (tenant: string) => void
@@ -153,13 +158,15 @@ export const DeployInstanceModal: React.FC<DeployInstanceModalProps> = (
   props
 ) => {
   if (!props.isOpen) return null
-  const modalKey = `${props.catalogItem?.id ?? "none"}-${props.initialConfig?.name ?? "new"}-${props.loadingConfig ? "loading" : "ready"}`
+  const effectiveItem = props.managementAddon ?? props.catalogItem
+  const modalKey = `${effectiveItem?.id ?? "none"}-${props.managementAddon ? "mgmt" : (props.initialConfig?.name ?? "new")}-${props.loadingConfig ? "loading" : "ready"}`
   return <DeployInstanceModalBody key={modalKey} {...props} />
 }
 
 const DeployInstanceModalBody: React.FC<DeployInstanceModalProps> = ({
   onClose,
   catalogItem,
+  managementAddon = null,
   tenant,
   tenants,
   onTenantChange,
@@ -172,22 +179,26 @@ const DeployInstanceModalBody: React.FC<DeployInstanceModalProps> = ({
   onProposalCreated,
   onCatalogItemUpdated,
 }) => {
-  const [activeItem, setActiveItem] = useState<CatalogItem | null>(catalogItem)
+  const isManagementAddon = Boolean(managementAddon)
+  const resolvedCatalogItem = managementAddon ?? catalogItem
+  const [activeItem, setActiveItem] = useState<CatalogItem | null>(
+    resolvedCatalogItem
+  )
   const [formData, setFormData] = useState<Record<string, unknown>>(() => {
-    if (!catalogItem) return initialConfig?.values ?? {}
+    if (!resolvedCatalogItem) return initialConfig?.values ?? {}
     const baseValues =
       initialConfig?.values ??
-      (catalogItem.defaultValues as Record<string, unknown> | undefined)
+      (resolvedCatalogItem.defaultValues as Record<string, unknown> | undefined)
     return extractSchemaDefaults(
-      catalogItem.schema as Record<string, unknown>,
+      resolvedCatalogItem.schema as Record<string, unknown>,
       baseValues
     )
   })
   const [instanceName, setInstanceName] = useState<string>(
-    () => initialConfig?.name ?? catalogItem?.id ?? ""
+    () => initialConfig?.name ?? resolvedCatalogItem?.id ?? ""
   )
   const [chartVersion, setChartVersion] = useState<string>(
-    () => initialConfig?.version ?? catalogItem?.version ?? ""
+    () => initialConfig?.version ?? resolvedCatalogItem?.version ?? ""
   )
   const [targetCluster, setTargetCluster] = useState<string>(() => {
     if (!initialConfig?.targetCluster) return ""
@@ -294,6 +305,17 @@ const DeployInstanceModalBody: React.FC<DeployInstanceModalProps> = ({
     setError(null)
 
     try {
+      if (isManagementAddon) {
+        const trimmedChartVersion = chartVersion.trim()
+        const proposal = await upgradeManagementAddon(activeItem.id, {
+          ...(trimmedChartVersion ? { version: trimmedChartVersion } : {}),
+          values: valuesToSubmit,
+        })
+        onProposalCreated?.(proposal)
+        onClose()
+        return
+      }
+
       const resolvedTargetCluster =
         activeItem.type === "app"
           ? targetCluster === "__custom__"
@@ -401,10 +423,12 @@ const DeployInstanceModalBody: React.FC<DeployInstanceModalProps> = ({
       {/* Deployment Instance Metadata */}
       <div
         className={`grid grid-cols-1 gap-3 ${
-          activeItem.type === "app" ? "sm:grid-cols-2" : "sm:grid-cols-1"
+          !isManagementAddon && activeItem.type === "app"
+            ? "sm:grid-cols-2"
+            : "sm:grid-cols-1"
         }`}
       >
-        {tenants && tenants.length > 0 && (
+        {!isManagementAddon && tenants && tenants.length > 0 && (
           <div>
             <label
               htmlFor="deploy-modal-tenant-select"
@@ -429,40 +453,44 @@ const DeployInstanceModalBody: React.FC<DeployInstanceModalProps> = ({
             </select>
           </div>
         )}
-        <div>
-          <label
-            htmlFor="instance-name-input"
-            className="block text-[11px] font-medium text-slate-300 mb-1"
-          >
-            Instance Name
-          </label>
-          <input
-            id="instance-name-input"
-            type="text"
-            value={instanceName}
-            onChange={(e) => setInstanceName(e.target.value)}
-            placeholder={activeItem.id}
-            className="w-full bg-slate-950 border border-slate-800 text-xs text-slate-200 rounded-lg px-3 py-1.5 focus:outline-none focus:ring-1 focus:ring-indigo-500 font-mono"
-          />
-        </div>
-        {activeItem.type === "app" && (
+        {!isManagementAddon && (
+          <div>
+            <label
+              htmlFor="instance-name-input"
+              className="block text-[11px] font-medium text-slate-300 mb-1"
+            >
+              Instance Name
+            </label>
+            <input
+              id="instance-name-input"
+              type="text"
+              value={instanceName}
+              onChange={(e) => setInstanceName(e.target.value)}
+              placeholder={activeItem.id}
+              className="w-full bg-slate-950 border border-slate-800 text-xs text-slate-200 rounded-lg px-3 py-1.5 focus:outline-none focus:ring-1 focus:ring-indigo-500 font-mono"
+            />
+          </div>
+        )}
+        {(isManagementAddon || activeItem.type === "app") && (
+          <div>
+            <label
+              htmlFor="chart-version-input"
+              className="block text-[11px] font-medium text-slate-300 mb-1"
+            >
+              Chart Version
+            </label>
+            <input
+              id="chart-version-input"
+              type="text"
+              value={chartVersion}
+              onChange={(e) => setChartVersion(e.target.value)}
+              placeholder={activeItem.version || "latest"}
+              className="w-full bg-slate-950 border border-slate-800 text-xs text-slate-200 rounded-lg px-3 py-1.5 focus:outline-none focus:ring-1 focus:ring-indigo-500 font-mono"
+            />
+          </div>
+        )}
+        {!isManagementAddon && activeItem.type === "app" && (
           <>
-            <div>
-              <label
-                htmlFor="chart-version-input"
-                className="block text-[11px] font-medium text-slate-300 mb-1"
-              >
-                Chart Version
-              </label>
-              <input
-                id="chart-version-input"
-                type="text"
-                value={chartVersion}
-                onChange={(e) => setChartVersion(e.target.value)}
-                placeholder={activeItem.version || "latest"}
-                className="w-full bg-slate-950 border border-slate-800 text-xs text-slate-200 rounded-lg px-3 py-1.5 focus:outline-none focus:ring-1 focus:ring-indigo-500 font-mono"
-              />
-            </div>
             <div>
               <label
                 htmlFor="cluster-select-catalog"
@@ -548,7 +576,7 @@ const DeployInstanceModalBody: React.FC<DeployInstanceModalProps> = ({
         )}
       </div>
 
-      {isExistingInstance && (
+      {!isManagementAddon && isExistingInstance && (
         <div
           role="status"
           className="flex items-start space-x-2 p-3 rounded-xl bg-amber-950/30 border border-amber-500/30 text-amber-200 text-xs"
@@ -656,7 +684,7 @@ const DeployInstanceModalBody: React.FC<DeployInstanceModalProps> = ({
       aria-modal="true"
       aria-label={
         activeItem
-          ? `${isEditMode ? "Edit" : "Create"} ${activeItem.name}`
+          ? `${isManagementAddon ? "Upgrade" : isEditMode ? "Edit" : "Create"} ${activeItem.name}`
           : "Instance Configuration"
       }
       className={`fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm ${
@@ -685,7 +713,12 @@ const DeployInstanceModalBody: React.FC<DeployInstanceModalProps> = ({
                   ({activeItem.type})
                 </span>
               )}
-              {isEditMode && (
+              {isManagementAddon && (
+                <span className="text-[10px] font-semibold uppercase tracking-wider px-2 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">
+                  Management Addon
+                </span>
+              )}
+              {!isManagementAddon && isEditMode && (
                 <span className="text-[10px] font-semibold uppercase tracking-wider px-2 py-0.5 rounded bg-indigo-500/20 text-indigo-300 border border-indigo-500/30">
                   Editing Instance
                 </span>
@@ -699,22 +732,23 @@ const DeployInstanceModalBody: React.FC<DeployInstanceModalProps> = ({
           </div>
 
           <div className="flex items-center space-x-2 shrink-0">
-            {activeItem?.type === "app" && activeItem.repoUrl && (
-              <button
-                type="button"
-                onClick={handleSyncUpstreamSchema}
-                disabled={syncingSchema}
-                className="flex items-center space-x-1.5 px-2.5 py-1 rounded-lg text-xs font-medium bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition-colors cursor-pointer disabled:opacity-50"
-                title="Pull values.schema.json or values.yaml from upstream Helm chart"
-              >
-                <RefreshCw
-                  className={`h-3 w-3 ${syncingSchema ? "animate-spin" : ""}`}
-                />
-                <span>
-                  {syncingSchema ? "Syncing..." : "Sync Upstream Schema"}
-                </span>
-              </button>
-            )}
+            {(activeItem?.type === "app" || isManagementAddon) &&
+              activeItem?.repoUrl && (
+                <button
+                  type="button"
+                  onClick={handleSyncUpstreamSchema}
+                  disabled={syncingSchema}
+                  className="flex items-center space-x-1.5 px-2.5 py-1 rounded-lg text-xs font-medium bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition-colors cursor-pointer disabled:opacity-50"
+                  title="Pull values.schema.json or values.yaml from upstream Helm chart"
+                >
+                  <RefreshCw
+                    className={`h-3 w-3 ${syncingSchema ? "animate-spin" : ""}`}
+                  />
+                  <span>
+                    {syncingSchema ? "Syncing..." : "Sync Upstream Schema"}
+                  </span>
+                </button>
+              )}
             {activeItem && (
               <span className="text-xs font-mono px-3 py-1 rounded-lg bg-indigo-500/10 text-indigo-400 border border-indigo-500/20">
                 {activeItem.id}

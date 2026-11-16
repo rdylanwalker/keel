@@ -66,6 +66,7 @@ export interface CatalogItem {
   pulumiYaml?: string
   bundleItems?: CatalogBundleItem[]
   schema: RJSFSchema
+  uiSchema?: Record<string, unknown>
   defaultValues?: Record<string, unknown>
 }
 
@@ -241,4 +242,9 @@ export interface CreateProposalPayload {
   kind?: "app" | "infra" | "bundle"
   targetCluster?: string
   canary?: boolean
+}
+
+export interface UpgradeManagementAddonPayload {
+  version?: string
+  values: Record<string, unknown>
 }

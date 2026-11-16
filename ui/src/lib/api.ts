@@ -15,6 +15,7 @@ import {
   StackDiagnostics,
   StackSummary,
   TenantSummary,
+  UpgradeManagementAddonPayload,
 } from "../types/api"
 
 const TOKEN_KEY = "keel_bootstrap_token"
@@ -116,18 +117,13 @@ interface RawCatalogResponse {
   applications?: RawCatalogEntry[]
   blueprints?: RawCatalogEntry[]
   bundles?: RawCatalogEntry[]
+  coreAddons?: RawCatalogEntry[]
+  core_addons?: RawCatalogEntry[]
   pulumiYaml?: Record<string, string>
 }
 
-export async function getCatalog(): Promise<CatalogItem[]> {
-  const res = await fetch("/api/v1/catalog", {
-    headers: getHeaders(),
-  })
-  const raw = await handleResponse<CatalogItem[] | RawCatalogResponse>(res)
-  if (Array.isArray(raw)) {
-    return raw
-  }
-  const apps: CatalogItem[] = (raw.applications ?? []).map((app) => ({
+function mapCatalogApplication(app: RawCatalogEntry): CatalogItem {
+  return {
     id: app.metadata?.id ?? "unknown-app",
     name: app.metadata?.name ?? app.metadata?.id ?? "Application",
     description:
@@ -146,7 +142,20 @@ export async function getCatalog(): Promise<CatalogItem[]> {
     defaultCanary: app.spec?.progressiveDelivery?.defaultCanary ?? false,
     schema: app.spec?.schema ?? { type: "object", properties: {} },
     uiSchema: app.spec?.uiSchema,
-  }))
+  }
+}
+
+export async function getCatalog(): Promise<CatalogItem[]> {
+  const res = await fetch("/api/v1/catalog", {
+    headers: getHeaders(),
+  })
+  const raw = await handleResponse<CatalogItem[] | RawCatalogResponse>(res)
+  if (Array.isArray(raw)) {
+    return raw
+  }
+  const apps: CatalogItem[] = (raw.applications ?? []).map(
+    mapCatalogApplication
+  )
   const blueprints: CatalogItem[] = (raw.blueprints ?? []).map((bp) => ({
     id: bp.metadata?.id ?? "unknown-blueprint",
     name: bp.metadata?.name ?? bp.metadata?.id ?? "Infrastructure Blueprint",
@@ -182,6 +191,50 @@ export async function getCatalog(): Promise<CatalogItem[]> {
     uiSchema: b.spec?.uiSchema,
   }))
   return [...bundles, ...blueprints, ...apps]
+}
+
+export async function getCoreAddons(): Promise<CatalogItem[]> {
+  const res = await fetch("/api/v1/catalog", {
+    headers: getHeaders(),
+  })
+  const raw = await handleResponse<CatalogItem[] | RawCatalogResponse>(res)
+  if (Array.isArray(raw)) {
+    return []
+  }
+  const coreAddons = raw.coreAddons ?? raw.core_addons ?? []
+  return coreAddons.map(mapCatalogApplication)
+}
+
+export async function upgradeManagementAddon(
+  id: string,
+  payload: UpgradeManagementAddonPayload
+): Promise<Proposal> {
+  const res = await fetch(
+    `/api/v1/management/addons/${encodeURIComponent(id)}/upgrade`,
+    {
+      method: "POST",
+      headers: getHeaders(),
+      body: JSON.stringify(payload),
+    }
+  )
+  const raw = await handleResponse<
+    RawProposal | { proposal: RawProposal; branch?: string }
+  >(res)
+  return unwrapProposalResponse(raw)
+}
+
+export async function rollbackManagementAddon(id: string): Promise<Proposal> {
+  const res = await fetch(
+    `/api/v1/management/addons/${encodeURIComponent(id)}/rollback`,
+    {
+      method: "POST",
+      headers: getHeaders(),
+    }
+  )
+  const raw = await handleResponse<
+    RawProposal | { proposal: RawProposal; branch?: string }
+  >(res)
+  return unwrapProposalResponse(raw)
 }
 
 export async function fetchCatalogSchema(payload: {

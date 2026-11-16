@@ -7,7 +7,11 @@ vi.mock("../lib/api", () => ({
   getStacksWithMeta: vi.fn(),
   getProviders: vi.fn(),
   getProposals: vi.fn().mockResolvedValue([]),
+  getCoreAddons: vi.fn().mockResolvedValue([]),
+  getReleases: vi.fn().mockResolvedValue([]),
   toggleProvider: vi.fn(),
+  rollbackManagementAddon: vi.fn(),
+  upgradeManagementAddon: vi.fn(),
 }))
 
 describe("ControlPlaneProvidersView component", () => {
@@ -21,6 +25,8 @@ describe("ControlPlaneProvidersView component", () => {
     })
     vi.mocked(api.getProviders).mockResolvedValue([])
     vi.mocked(api.getProposals).mockResolvedValue([])
+    vi.mocked(api.getCoreAddons).mockResolvedValue([])
+    vi.mocked(api.getReleases).mockResolvedValue([])
   })
 
   it("renders management control plane cluster and live providers", async () => {
@@ -183,6 +189,110 @@ describe("ControlPlaneProvidersView component", () => {
     await waitFor(() => {
       expect(screen.getByRole("alert")).toHaveTextContent(
         "Failed to load control plane & provider state"
+      )
+    })
+  })
+
+  it("renders management plane base addons with live status, upgrade modal, and rollback PR", async () => {
+    vi.mocked(api.getCoreAddons).mockResolvedValueOnce([
+      {
+        id: "kyverno",
+        name: "Kyverno",
+        description: "Policy engine",
+        type: "app",
+        category: "Management Addons",
+        repoUrl: "https://kyverno.github.io/kyverno/",
+        chart: "kyverno",
+        version: "3.3.4",
+        schema: {
+          type: "object",
+          properties: {
+            replicaCount: { type: "integer", default: 1 },
+          },
+        },
+      },
+      {
+        id: "flagger",
+        name: "Flagger",
+        description: "Canary operator",
+        type: "app",
+        category: "Management Addons",
+        chart: "flagger",
+        version: "1.40.0",
+        schema: { type: "object", properties: {} },
+      },
+    ])
+    vi.mocked(api.getReleases).mockResolvedValueOnce([
+      {
+        id: "kyverno",
+        name: "kyverno",
+        tenant: "keel-system",
+        namespace: "kyverno",
+        type: "helm",
+        status: "healthy",
+        version: "3.3.4",
+        chart: "kyverno",
+      },
+    ])
+    vi.mocked(api.rollbackManagementAddon)
+      .mockResolvedValueOnce({
+        id: "501",
+        title: "Rollback kyverno",
+        branch: "keel/mgmt/rollback-kyverno",
+        author: "admin",
+        tenant: "keel-system",
+        status: "open",
+        createdAt: "now",
+      })
+      .mockRejectedValueOnce(
+        new Error("No previous revision found for flagger")
+      )
+
+    render(<ControlPlaneProvidersView />)
+
+    await waitFor(() => {
+      expect(
+        screen.getByText("Management Plane Base Addons")
+      ).toBeInTheDocument()
+      expect(screen.getByTestId("core-addon-kyverno")).toBeInTheDocument()
+      expect(screen.getByTestId("core-addon-flagger")).toBeInTheDocument()
+    })
+
+    // Status badges, Protected badge, and no Delete button
+    expect(screen.getByText("Ready")).toBeInTheDocument()
+    expect(screen.getByText("Unknown")).toBeInTheDocument()
+    expect(screen.getAllByText("Protected")).toHaveLength(2)
+    expect(
+      screen.queryByRole("button", { name: /Delete/i })
+    ).not.toBeInTheDocument()
+
+    // Upgrade / Configure opens DeployInstanceModal in managementAddon mode
+    const upgradeBtns = screen.getAllByRole("button", {
+      name: /Upgrade \/ Configure/i,
+    })
+    fireEvent.click(upgradeBtns[0])
+    expect(
+      screen.getByRole("dialog", { name: /Upgrade Kyverno/i })
+    ).toBeInTheDocument()
+    fireEvent.click(screen.getByRole("button", { name: /Close modal/i }))
+
+    // Rollback PR succeeds and shows PrNotificationBanner
+    const rollbackBtns = screen.getAllByRole("button", {
+      name: /Rollback PR/i,
+    })
+    fireEvent.click(rollbackBtns[0])
+    await waitFor(() => {
+      expect(api.rollbackManagementAddon).toHaveBeenCalledWith("kyverno")
+      expect(
+        screen.getByText("PR #501 opened on branch keel/mgmt/rollback-kyverno")
+      ).toBeInTheDocument()
+    })
+
+    // Rollback PR failure shows error alert
+    fireEvent.click(rollbackBtns[1])
+    await waitFor(() => {
+      expect(screen.getByRole("alert")).toHaveTextContent(
+        "No previous revision found for flagger"
       )
     })
   })

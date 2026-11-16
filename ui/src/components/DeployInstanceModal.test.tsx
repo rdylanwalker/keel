@@ -8,6 +8,7 @@ import { CatalogItem } from "../types/api"
 vi.mock("../lib/api", () => ({
   createProposal: vi.fn(),
   fetchCatalogSchema: vi.fn(),
+  upgradeManagementAddon: vi.fn(),
 }))
 
 const sampleAppItem: CatalogItem = {
@@ -293,6 +294,96 @@ describe("DeployInstanceModal component", () => {
           targetNamespace: "web-prod",
         })
       )
+    })
+  })
+
+  it("supports managementAddon mode with chart version, Sync Upstream Schema, and upgradeManagementAddon submit", async () => {
+    vi.mocked(api.fetchCatalogSchema).mockResolvedValueOnce({
+      schema: {
+        type: "object",
+        properties: {
+          replicaCount: { type: "integer", default: 3 },
+        },
+      },
+      source: "values.yaml",
+    })
+    vi.mocked(api.upgradeManagementAddon).mockResolvedValueOnce({
+      id: "88",
+      title: "Upgrade kyverno",
+      branch: "keel/mgmt/upgrade-kyverno",
+      status: "open",
+      author: "admin@keel.local",
+      tenant: "keel-system",
+      createdAt: "2026-11-16T12:00:00Z",
+    })
+
+    const mgmtAddon: CatalogItem = {
+      id: "kyverno",
+      name: "Kyverno",
+      description: "Policy engine",
+      category: "Management Addons",
+      type: "app",
+      repoUrl: "https://kyverno.github.io/kyverno/",
+      chart: "kyverno",
+      version: "3.3.4",
+      flaggerSupported: true,
+      schema: {
+        type: "object",
+        properties: {
+          replicaCount: { type: "integer", default: 1 },
+        },
+      },
+    }
+
+    render(
+      <DeployInstanceModal
+        isOpen={true}
+        onClose={onClose}
+        catalogItem={mgmtAddon}
+        managementAddon={mgmtAddon}
+        tenant="keel-system"
+        tenants={[{ id: "acme", namespace: "tenant-acme" }]}
+        onProposalCreated={onProposalCreated}
+      />
+    )
+
+    // Tenant selector, Instance Name, and Canary toggle should be hidden
+    expect(screen.queryByLabelText(/Target Tenant/i)).not.toBeInTheDocument()
+    expect(screen.queryByLabelText(/Instance Name/i)).not.toBeInTheDocument()
+    expect(
+      screen.queryByLabelText(/Enable Flagger Canary/i)
+    ).not.toBeInTheDocument()
+
+    // Chart Version input is pre-populated and editable
+    const versionInput = screen.getByLabelText(
+      /Chart Version/i
+    ) as HTMLInputElement
+    expect(versionInput.value).toBe("3.3.4")
+    fireEvent.change(versionInput, { target: { value: "3.3.5" } })
+
+    // Sync Upstream Schema button is available and works
+    fireEvent.click(screen.getByRole("button", { name: /Sync Upstream/i }))
+    await waitFor(() => {
+      expect(api.fetchCatalogSchema).toHaveBeenCalledWith({
+        repoUrl: "https://kyverno.github.io/kyverno/",
+        chart: "kyverno",
+        version: "3.3.4",
+      })
+    })
+
+    // Submit triggers upgradeManagementAddon
+    fireEvent.click(
+      screen.getByRole("button", { name: /Submit & Open Git PR Proposal/i })
+    )
+    await waitFor(() => {
+      expect(api.upgradeManagementAddon).toHaveBeenCalledWith("kyverno", {
+        version: "3.3.5",
+        values: { replicaCount: 1 },
+      })
+      expect(onProposalCreated).toHaveBeenCalledWith(
+        expect.objectContaining({ id: "88" })
+      )
+      expect(onClose).toHaveBeenCalled()
     })
   })
 })

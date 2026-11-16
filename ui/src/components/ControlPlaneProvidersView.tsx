@@ -9,15 +9,26 @@ import {
   Shield,
   GitBranch,
   AlertTriangle,
+  Package,
+  RotateCcw,
+  SlidersHorizontal,
 } from "lucide-react"
-import { ProviderRegistryEntry } from "../types/api"
 import {
+  CatalogItem,
+  ProviderRegistryEntry,
+  ReleaseSummary,
+} from "../types/api"
+import {
+  getCoreAddons,
   getProposals,
   getProviders,
+  getReleases,
   getStacksWithMeta,
+  rollbackManagementAddon,
   toggleProvider,
 } from "../lib/api"
 import { isDemoMode } from "../lib/utils"
+import { DeployInstanceModal } from "./DeployInstanceModal"
 import { PrNotificationBanner } from "./PrNotificationBanner"
 
 interface ProviderInfo {
@@ -65,6 +76,137 @@ const DEFAULT_PROVIDERS: ProviderInfo[] = [
     nodesOrRegions: "1 Control Plane Node",
   },
 ]
+
+const DEFAULT_CORE_ADDONS: CatalogItem[] = [
+  {
+    id: "s3-state-backend",
+    name: "S3 State Backend",
+    description: "MinIO / S3-compatible state and artifact storage",
+    type: "app",
+    category: "Management Addons",
+    chart: "minio",
+    version: "5.4.0",
+    schema: { type: "object", properties: {} },
+  },
+  {
+    id: "kyverno",
+    name: "Kyverno",
+    description: "Kubernetes native policy engine",
+    type: "app",
+    category: "Management Addons",
+    chart: "kyverno",
+    version: "3.3.4",
+    schema: { type: "object", properties: {} },
+  },
+  {
+    id: "dex",
+    name: "Dex OIDC",
+    description: "OpenID Connect identity provider",
+    type: "app",
+    category: "Management Addons",
+    chart: "dex",
+    version: "0.19.1",
+    schema: { type: "object", properties: {} },
+  },
+  {
+    id: "envoy-gateway",
+    name: "Envoy Gateway",
+    description: "Kubernetes Gateway API ingress controller",
+    type: "app",
+    category: "Management Addons",
+    chart: "gateway-helm",
+    version: "1.2.4",
+    schema: { type: "object", properties: {} },
+  },
+  {
+    id: "prometheus",
+    name: "Prometheus",
+    description: "Metrics collection and alerting for progressive delivery",
+    type: "app",
+    category: "Management Addons",
+    chart: "kube-prometheus-stack",
+    version: "67.4.0",
+    schema: { type: "object", properties: {} },
+  },
+  {
+    id: "flagger",
+    name: "Flagger",
+    description: "Progressive delivery canary operator",
+    type: "app",
+    category: "Management Addons",
+    chart: "flagger",
+    version: "1.40.0",
+    schema: { type: "object", properties: {} },
+  },
+  {
+    id: "pulumi-kubernetes-operator",
+    name: "Pulumi Kubernetes Operator",
+    description: "PKO v2 infrastructure stack reconciler",
+    type: "app",
+    category: "Management Addons",
+    chart: "pulumi-kubernetes-operator",
+    version: "2.1.0",
+    schema: { type: "object", properties: {} },
+  },
+]
+
+function findAddonRelease(
+  addon: CatalogItem,
+  releases: ReleaseSummary[]
+): ReleaseSummary | undefined {
+  return releases.find(
+    (r) =>
+      r.name === addon.id ||
+      r.id === addon.id ||
+      (addon.chart && (r.name === addon.chart || r.chart === addon.chart))
+  )
+}
+
+function getAddonStatusBadge(release?: ReleaseSummary): {
+  label: "Ready" | "Pending" | "Failed" | "Unknown"
+  className: string
+} {
+  const raw = release?.status?.toLowerCase()
+  if (raw === "healthy" || raw === "ready") {
+    return {
+      label: "Ready",
+      className:
+        "bg-emerald-500/10 text-emerald-400 border border-emerald-500/20",
+    }
+  }
+  if (raw === "progressing" || raw === "pending") {
+    return {
+      label: "Pending",
+      className: "bg-amber-500/10 text-amber-400 border border-amber-500/20",
+    }
+  }
+  if (raw === "failed" || raw === "degraded") {
+    return {
+      label: "Failed",
+      className: "bg-red-500/10 text-red-400 border border-red-500/20",
+    }
+  }
+  return {
+    label: "Unknown",
+    className: "bg-slate-800 text-slate-400 border border-slate-700",
+  }
+}
+
+async function safeGetCoreAddons(): Promise<CatalogItem[]> {
+  try {
+    return await getCoreAddons()
+  } catch {
+    return []
+  }
+}
+
+async function safeGetReleases(): Promise<ReleaseSummary[]> {
+  try {
+    return await getReleases()
+  } catch {
+    return []
+  }
+}
 
 function mergeProviders(liveEntries: ProviderRegistryEntry[]): ProviderInfo[] {
   if (!liveEntries || liveEntries.length === 0) {
@@ -124,11 +266,17 @@ export const ControlPlaneProvidersView: React.FC<
   const [providers, setProviders] = useState<ProviderInfo[]>(() =>
     isDemoMode() ? DEFAULT_PROVIDERS : []
   )
+  const [coreAddons, setCoreAddons] = useState<CatalogItem[]>(() =>
+    isDemoMode() ? DEFAULT_CORE_ADDONS : []
+  )
+  const [releases, setReleases] = useState<ReleaseSummary[]>([])
   const [pendingProviderPrs, setPendingProviderPrs] = useState<
     Record<string, { id: string; branch: string }>
   >({})
   const [loading, setLoading] = useState(false)
   const [togglingId, setTogglingId] = useState<string | null>(null)
+  const [rollingBackId, setRollingBackId] = useState<string | null>(null)
+  const [selectedAddon, setSelectedAddon] = useState<CatalogItem | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [prNotification, setPrNotification] = useState<{
     id: string
@@ -139,10 +287,18 @@ export const ControlPlaneProvidersView: React.FC<
   const fetchData = useCallback(async () => {
     setLoading(true)
     try {
-      const [stacksRes, providersData, proposalsData] = await Promise.all([
+      const [
+        stacksRes,
+        providersData,
+        proposalsData,
+        coreAddonsData,
+        releasesData,
+      ] = await Promise.all([
         getStacksWithMeta(),
         getProviders(),
         getProposals().catch(() => []),
+        safeGetCoreAddons(),
+        safeGetReleases(),
       ])
       setError(null)
       setClusterMeta({
@@ -153,6 +309,14 @@ export const ControlPlaneProvidersView: React.FC<
       if (providersData) {
         setProviders(mergeProviders(providersData))
       }
+      if (coreAddonsData && coreAddonsData.length > 0) {
+        setCoreAddons(coreAddonsData)
+      } else if (isDemoMode()) {
+        setCoreAddons(DEFAULT_CORE_ADDONS)
+      } else {
+        setCoreAddons([])
+      }
+      setReleases(releasesData || [])
       setPendingProviderPrs(extractPendingProviderPrs(proposalsData || []))
     } catch (err) {
       setError(
@@ -174,21 +338,41 @@ export const ControlPlaneProvidersView: React.FC<
       getStacksWithMeta(),
       getProviders(),
       getProposals().catch(() => []),
+      safeGetCoreAddons(),
+      safeGetReleases(),
     ])
-      .then(([stacksRes, providersData, proposalsData]) => {
-        if (!cancelled) {
-          setError(null)
-          setClusterMeta({
-            gitRepoUrl: stacksRes.gitRepoUrl,
-            forgeProvider: stacksRes.forgeProvider,
-            stateBackend: stacksRes.stateBackend,
-          })
-          if (providersData) {
-            setProviders(mergeProviders(providersData))
+      .then(
+        ([
+          stacksRes,
+          providersData,
+          proposalsData,
+          coreAddonsData,
+          releasesData,
+        ]) => {
+          if (!cancelled) {
+            setError(null)
+            setClusterMeta({
+              gitRepoUrl: stacksRes.gitRepoUrl,
+              forgeProvider: stacksRes.forgeProvider,
+              stateBackend: stacksRes.stateBackend,
+            })
+            if (providersData) {
+              setProviders(mergeProviders(providersData))
+            }
+            if (coreAddonsData && coreAddonsData.length > 0) {
+              setCoreAddons(coreAddonsData)
+            } else if (isDemoMode()) {
+              setCoreAddons(DEFAULT_CORE_ADDONS)
+            } else {
+              setCoreAddons([])
+            }
+            setReleases(releasesData || [])
+            setPendingProviderPrs(
+              extractPendingProviderPrs(proposalsData || [])
+            )
           }
-          setPendingProviderPrs(extractPendingProviderPrs(proposalsData || []))
         }
-      })
+      )
       .catch((err) => {
         if (!cancelled) {
           setError(
@@ -231,6 +415,27 @@ export const ControlPlaneProvidersView: React.FC<
       )
     } finally {
       setTogglingId(null)
+    }
+  }
+
+  const handleRollbackAddon = async (id: string) => {
+    setRollingBackId(id)
+    setError(null)
+    try {
+      const proposal = await rollbackManagementAddon(id)
+      setPrNotification({
+        id: proposal.id,
+        branch: proposal.branch || "main",
+        prUrl: proposal.prUrl,
+      })
+    } catch (err) {
+      setError(
+        err instanceof Error
+          ? err.message
+          : `Failed to create rollback PR for ${id}`
+      )
+    } finally {
+      setRollingBackId(null)
     }
   }
 
@@ -444,6 +649,129 @@ export const ControlPlaneProvidersView: React.FC<
           ))}
         </div>
       </div>
+
+      {/* Management Plane Base Addons */}
+      <div className="space-y-3">
+        <div className="flex items-center justify-between">
+          <h3 className="text-sm font-semibold text-slate-300 uppercase tracking-wider flex items-center gap-2">
+            <Package className="h-4 w-4 text-emerald-400" /> Management Plane
+            Base Addons
+          </h3>
+          <span className="text-[11px] text-slate-500">
+            Protected core HelmReleases (PR-driven upgrades &amp; rollbacks)
+          </span>
+        </div>
+
+        {coreAddons.length === 0 ? (
+          <div className="bg-slate-900 border border-slate-800 rounded-xl p-6 text-center text-xs text-slate-400">
+            No management plane base addons found.
+          </div>
+        ) : (
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+            {coreAddons.map((addon) => {
+              const release = findAddonRelease(addon, releases)
+              const statusBadge = getAddonStatusBadge(release)
+              const displayChart = release?.chart || addon.chart || addon.id
+              const displayVersion = release?.version || addon.version
+              return (
+                <div
+                  key={addon.id}
+                  data-testid={`core-addon-${addon.id}`}
+                  className="flex flex-col justify-between bg-slate-900 border border-slate-800 hover:border-indigo-500/50 p-4 rounded-xl transition-all space-y-3"
+                >
+                  <div className="space-y-2">
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="min-w-0">
+                        <h4 className="text-sm font-semibold text-white truncate">
+                          {addon.name}
+                        </h4>
+                        <p className="text-[11px] font-mono text-slate-500 truncate">
+                          {addon.id}
+                        </p>
+                      </div>
+                      <div className="flex items-center gap-1.5 shrink-0">
+                        <span
+                          title="keel.io/protect: true"
+                          className="text-[10px] px-2 py-0.5 rounded-full font-medium bg-indigo-500/10 text-indigo-300 border border-indigo-500/30"
+                        >
+                          Protected
+                        </span>
+                        <span
+                          className={`text-[10px] px-2 py-0.5 rounded-full font-medium ${statusBadge.className}`}
+                        >
+                          {statusBadge.label}
+                        </span>
+                      </div>
+                    </div>
+
+                    {addon.description && (
+                      <p className="text-[11px] text-slate-400 line-clamp-2">
+                        {addon.description}
+                      </p>
+                    )}
+
+                    <div className="flex items-center gap-2 text-[11px] font-mono text-slate-400 pt-1">
+                      <span className="px-2 py-0.5 rounded bg-slate-950 border border-slate-800 truncate">
+                        {displayChart}
+                      </span>
+                      <span className="px-2 py-0.5 rounded bg-slate-950 border border-slate-800 text-slate-300 shrink-0">
+                        v{displayVersion}
+                      </span>
+                    </div>
+                  </div>
+
+                  <div className="pt-3 border-t border-slate-800/60 flex items-center justify-between gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setSelectedAddon(addon)}
+                      className="flex items-center gap-1.5 text-[11px] px-2.5 py-1.5 rounded-lg font-medium bg-indigo-600/20 hover:bg-indigo-600/30 text-indigo-300 border border-indigo-500/30 transition-colors cursor-pointer"
+                    >
+                      <SlidersHorizontal className="h-3 w-3" />
+                      <span>Upgrade / Configure</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleRollbackAddon(addon.id)}
+                      disabled={rollingBackId === addon.id}
+                      className="flex items-center gap-1.5 text-[11px] px-2.5 py-1.5 rounded-lg font-medium bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition-colors cursor-pointer disabled:opacity-50"
+                    >
+                      <RotateCcw
+                        className={`h-3 w-3 ${rollingBackId === addon.id ? "animate-spin" : ""}`}
+                      />
+                      <span>
+                        {rollingBackId === addon.id
+                          ? "Rolling back..."
+                          : "Rollback PR"}
+                      </span>
+                    </button>
+                  </div>
+                </div>
+              )
+            })}
+          </div>
+        )}
+      </div>
+
+      <DeployInstanceModal
+        isOpen={Boolean(selectedAddon)}
+        onClose={() => setSelectedAddon(null)}
+        catalogItem={selectedAddon}
+        managementAddon={selectedAddon}
+        tenant="keel-system"
+        onProposalCreated={(proposal) => {
+          setPrNotification({
+            id: proposal.id,
+            branch: proposal.branch || "main",
+            prUrl: proposal.prUrl,
+          })
+        }}
+        onCatalogItemUpdated={(updated) => {
+          setCoreAddons((prev) =>
+            prev.map((a) => (a.id === updated.id ? updated : a))
+          )
+          setSelectedAddon(updated)
+        }}
+      />
     </div>
   )
 }

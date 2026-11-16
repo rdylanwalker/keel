@@ -29,6 +29,9 @@ import {
   reconcileRelease,
   getProviders,
   toggleProvider,
+  getCoreAddons,
+  upgradeManagementAddon,
+  rollbackManagementAddon,
   createEventSourceStream,
 } from "./api"
 
@@ -692,5 +695,116 @@ describe("api client module", () => {
     expect(onUnauthorized).toHaveBeenCalledTimes(1)
 
     window.removeEventListener("keel:unauthorized", onUnauthorized)
+  })
+
+  it("fetches coreAddons and core_addons from /api/v1/catalog", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn()
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({
+            coreAddons: [
+              {
+                metadata: { id: "kyverno", name: "Kyverno" },
+                spec: {
+                  upstream: {
+                    repoURL: "https://kyverno.github.io/kyverno/",
+                    chart: "kyverno",
+                    version: "3.3.4",
+                  },
+                  schema: { type: "object", properties: {} },
+                },
+              },
+            ],
+          }),
+        })
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({
+            core_addons: [
+              {
+                metadata: { id: "flagger", name: "Flagger" },
+                spec: {
+                  upstream: {
+                    repoURL: "https://flagger.app",
+                    chart: "flagger",
+                    version: "1.40.0",
+                  },
+                },
+              },
+            ],
+          }),
+        })
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => [],
+        })
+    )
+
+    const addons1 = await getCoreAddons()
+    expect(addons1).toHaveLength(1)
+    expect(addons1[0]).toMatchObject({
+      id: "kyverno",
+      name: "Kyverno",
+      repoUrl: "https://kyverno.github.io/kyverno/",
+      chart: "kyverno",
+      version: "3.3.4",
+    })
+
+    const addons2 = await getCoreAddons()
+    expect(addons2).toHaveLength(1)
+    expect(addons2[0]).toMatchObject({
+      id: "flagger",
+      chart: "flagger",
+      version: "1.40.0",
+    })
+
+    const addons3 = await getCoreAddons()
+    expect(addons3).toEqual([])
+  })
+
+  it("calls upgradeManagementAddon and rollbackManagementAddon endpoints", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        proposal: {
+          id: "401",
+          title: "chore(mgmt): upgrade kyverno",
+          branch: "keel/mgmt/upgrade-kyverno",
+          state: "open",
+        },
+      }),
+    })
+    vi.stubGlobal("fetch", fetchMock)
+
+    const upgradeProposal = await upgradeManagementAddon("kyverno", {
+      version: "3.3.5",
+      values: { replicaCount: 3 },
+    })
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/v1/management/addons/kyverno/upgrade",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({
+          version: "3.3.5",
+          values: { replicaCount: 3 },
+        }),
+      })
+    )
+    expect(upgradeProposal).toMatchObject({
+      id: "401",
+      branch: "keel/mgmt/upgrade-kyverno",
+    })
+
+    const rollbackProposal = await rollbackManagementAddon("kyverno")
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/v1/management/addons/kyverno/rollback",
+      expect.objectContaining({ method: "POST" })
+    )
+    expect(rollbackProposal).toMatchObject({
+      id: "401",
+    })
   })
 })
