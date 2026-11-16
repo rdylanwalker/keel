@@ -293,8 +293,13 @@ describe("App top-level application component", () => {
       expect(screen.getByText(/View on Forge/i)).toBeInTheDocument()
     })
 
-    fireEvent.click(screen.getByRole("button", { name: /Go to PR/i }))
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /Go to PR/i }))
+    })
     expect(screen.queryByText(/PR #88 Opened/i)).not.toBeInTheDocument()
+    await waitFor(() => {
+      expect(api.getProposals).toHaveBeenCalled()
+    })
   })
 
   it("transitions to Authentication Required when keel:unauthorized is dispatched", async () => {
