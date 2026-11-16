@@ -6,6 +6,7 @@ metadata:
   namespace: keel-system
   labels:
     app.kubernetes.io/managed-by: keel
+    keel.io/protect: "true"
 spec:
   interval: 10m
   dependsOn:
@@ -23,6 +24,10 @@ spec:
     crds: CreateReplace
   upgrade:
     crds: CreateReplace
+    timeout: 5m
+    remediation:
+      retries: 1
+      strategy: rollback
   values:
     meshProvider: gatewayapi:v1
     metricsServer: http://prometheus.keel-system:9090

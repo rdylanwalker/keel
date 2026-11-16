@@ -66,20 +66,19 @@ flowchart TB
 ## 2. Two-Stage Self-Bootstrapping & Anti-Lockout Architecture
 
 ### 2.1 Stage 0: Provider-Agnostic Localhost Bootstrap (PR-Free Initialization)
-Because PKO v2 and Flux require a running Kubernetes cluster, Stage 0 executes directly from the `keel` binary on `localhost` without requiring an existing Git forge or PR workflow. Operators select one of three `BootstrapTarget` drivers:
+Because PKO v2 and Flux require a running Kubernetes cluster, Stage 0 executes directly from the `keel` binary on `localhost` without requiring an existing Git forge or PR workflow. Stage 0 executes as a two-stack Pulumi sequence (`deploy/bootstrap/<target>/Pulumi.yaml` + `deploy/bootstrap/control-plane/Pulumi.yaml`):
 
-1. **Local Container Cluster (`--target kind`):**
-   * Executes the built-in Stage 0 Pulumi program (`deploy/bootstrap/kind/Pulumi.yaml`) using `tehcyx/kind` to provision the `keel-mgmt` management cluster with local ingress port mappings for zero-dependency workstation bootstrapping.
-2. **Existing Cluster (`--target kubeconfig`):**
-   * Connects directly to any pre-existing Kubernetes cluster (`k3s`, `Talos`, `microk8s`, or pre-provisioned cloud cluster) via `--kubeconfig` / `--context`.
-3. **On-Premises Hypervisor (`--target proxmox`):**
-   * Executes the built-in Stage 0 Pulumi program (`deploy/bootstrap/proxmox/`) using `bpg/proxmox` to provision `k3s` or `Talos Linux` VMs via `cloud-init`.
-4. **Public Cloud (`--target aws|gcp|azure|hetzner`):**
-   * Executes a built-in Stage 0 Pulumi program (`deploy/bootstrap/<cloud>/`) to provision either cost-optimized VMs (`k3s`/`Talos`) or a managed Kubernetes cluster (`EKS`/`GKE`/`AKS`) alongside native S3-compatible object storage.
+1. **Infrastructure Provisioning Stack (`deploy/bootstrap/<target>/Pulumi.yaml`):**
+   * **Local Container Cluster (`--target kind`):** Uses `tehcyx/kind` (`deploy/bootstrap/kind/Pulumi.yaml`) to provision the `keel-mgmt` management cluster with local ingress port mappings for zero-dependency workstation bootstrapping.
+   * **Existing Cluster (`--target kubeconfig`):** Connects directly to any pre-existing Kubernetes cluster (`k3s`, `Talos`, `microk8s`, or pre-provisioned cloud cluster) via `--kubeconfig` / `--context` (skips infrastructure provisioning).
+   * **On-Premises Hypervisor (`--target proxmox`):** Uses `bpg/proxmox` (`deploy/bootstrap/proxmox/`) to provision `k3s` or `Talos Linux` VMs via `cloud-init`.
+   * **Public Cloud (`--target aws|gcp|azure|hetzner`):** Uses provider-specific Pulumi programs (`deploy/bootstrap/<cloud>/`) to provision cost-optimized VMs (`k3s`/`Talos`) or managed Kubernetes (`EKS`/`GKE`/`AKS`) alongside native S3-compatible object storage.
+2. **Control-Plane Seed Stack (`deploy/bootstrap/control-plane/Pulumi.yaml`):**
+   * Installs seed control-plane components as baseline Helm v3 releases directly into the seed cluster API. Once Flux CD is bootstrapped, these Helm v3 releases are handed over in-place to Flux CD (`deploy/seed/core-addons/`) for continuous reconciliation without resource recreation or downtime.
 
 #### Seed Control-Plane Installation (Identical Across All Targets)
 Once the seed cluster API is reachable, `keel bootstrap init` performs the exact same installation sequence regardless of target:
-1. Installs **Garage/MinIO S3** (or binds the cloud provider's S3-compatible bucket), **Flux CD**, **PKO v2**, **Kyverno**, **Envoy Gateway**, **Prometheus**, **Flagger**, **Dex** (Apache-2.0 in-cluster OIDC provider with username/password DB and extensible Google/Apple/Active Directory connectors, unless `--oidc-issuer` points to an external OIDC provider), and optional in-cluster **Forgejo/Gitea**.
+1. Runs `deploy/bootstrap/control-plane/Pulumi.yaml` to install **Garage/MinIO S3** (or binds the cloud provider's S3-compatible bucket), **Flux CD**, **PKO v2**, **Kyverno**, **Envoy Gateway**, **Prometheus**, **Flagger**, **Dex** (Apache-2.0 in-cluster OIDC provider with username/password DB and extensible Google/Apple/Active Directory connectors, unless `--oidc-issuer` points to an external OIDC provider), and optional in-cluster **Forgejo/Gitea**, handing management over in-place to Flux CD (`deploy/seed/core-addons/`).
 2. Generates a root **`age` keypair**, injects the private key into `flux-system/sops-age`, and writes `.sops.yaml` into the seed Git repository.
 3. For `kind`, `proxmox`, and cloud targets, uploads the Stage 0 Pulumi state to `s3://pulumi-state` and imports it into a Flux-managed PKO `Stack` CR (`management-cluster-core`) with `protect: true` enabled.
 4. Provisions the initial Dex admin user (`--admin-username` / `--admin-password`, or auto-generated credentials printed once to stdout) as a bcrypt-hashed `staticPasswords` entry in Dex, configures OIDC PKCE for `keel-server`, and exposes the portal on `http://localhost:8080` (via automatic port-forward to the in-cluster `keel-server` pod or cluster ingress).
@@ -91,7 +90,12 @@ Once the seed cluster API is reachable, `keel bootstrap init` performs the exact
 ### 2.2 Stage 1: Self-Hosted Pivot & Anti-Lockout Guardrails
 Once the management cluster is healthy:
 1. **PR Enforcement Activation:** All subsequent infrastructure or application changes—whether triggered via GUI or CLI—create a Git branch, commit encrypted secrets via SOPS, open a PR via `ForgeProvider`, and spin up an ephemeral PKO preview.
-2. **Control-Plane Protection:** On `kind`, `proxmox`, and cloud targets, the seed cluster's core PKO `Stack` (`management-cluster-core`) carries `protect: true` flags on all control-plane VMs, clusters, and storage volumes.
+2. **Control-Plane Protection & Base Addon Self-Mutation Guardrails:**
+   * **Protection Labeling:** Control-plane PKO `Stack` (`management-cluster-core`) and management-plane base addon `HelmRelease` CRs (`dex`, `envoy-gateway`, `flagger`, `kyverno`, `pulumi-kubernetes-operator`, `prometheus`, `s3-state-backend`) carry the `keel.io/protect: "true"` label.
+   * **No-Prune Seed Sync:** The `core-addons` Flux `Kustomization` operates with `prune: false` (`deploy/seed/flux-system/gotk-sync.yaml`) ensuring that removing a base addon manifest from Git never uninstalls live control-plane base addons.
+   * **Kyverno Admission Deletion Guard:** The `protect-control-plane` Kyverno `ClusterPolicy` denies `DELETE` operations on protected `Stack` and `HelmRelease` resources in `flux-system`, `keel-system`, and `kyverno` namespaces via standard admission.
+   * **Automated Upgrade Rollback:** Every base addon `HelmRelease` configures `spec.upgrade` with `timeout: 5m` and `remediation.strategy: rollback` (`retries: 1`), automatically reverting failed release upgrades in-cluster.
+   * **Revert PR Generation:** If an attempted base addon mutation fails preview validation or health checks, Keel GUI/CLI automatically generates a revert PR to restore the known-good Git state.
 3. **Break-Glass Recovery:** If an operator ever damages the management cluster or in-cluster Git forge, `keel bootstrap recover --s3-endpoint <url>` pulls the versioned Pulumi state directly from S3 and executes a local recovery reconciliation.
 
 ### 2.3 Bootstrap & Handover Sequence
@@ -287,6 +291,7 @@ spec:
 ```
 
 * **Dynamic Form Rendering:** The React frontend feeds `spec.schema` and `spec.uiSchema` directly into **`@rjsf/core` (`react-jsonschema-form`)** mapped to **Shadcn UI** widgets (`Input`, `Select`, `Switch`, `Slider`, `SecretInput`). Form submission serializes directly into an unmodified Helm `values.yaml` override.
+* **Base Addon Catalog Schemas & Upstream Sync Escape Hatch:** Management-plane base addons (`dex`, `envoy-gateway`, `flagger`, `kyverno`, `pulumi-kubernetes-operator`, `prometheus`, `s3-state-backend`) ship with curated minimal `catalog.yaml` JSON schemas exposing high-frequency operational fields for simplified UI configuration. For advanced Helm `values.yaml` tuning, the GUI provides a "Sync Upstream Schema" escape hatch that fetches the full upstream chart `values.schema.json` (or parses raw `values.yaml` defaults) to dynamically expand `@rjsf/core` dynamic forms with complete upstream chart parameters.
 * **Companion Infrastructure Hooks:** If an app declares `companionInfrastructure` (e.g., an external PostgreSQL database or S3 bucket), submitting the form bundles both the companion PKO `Stack` manifest and the Flux `HelmRelease` into the **same atomic PR**, ordered via Flux `dependsOn`. The PKO `Stack` exports its outputs into a tenant-scoped Kubernetes `Secret` (via PKO output `Secret` bindings), and Keel generates `spec.valuesFrom` (`kind: Secret`) entries on the `HelmRelease` so `bindValues` keys (`${outputs.*}`, `${secrets.*}`) resolve natively inside the cluster without intermediate templating.
 * **Multi-Item Bundles (`CatalogBundle`):** For multi-step workflows (e.g., provisioning a workload cluster and installing platform + application charts onto it), `catalog/bundles/<bundle-id>/catalog.yaml` defines `kind: CatalogBundle` (`apiVersion: keel.io/v1alpha1`) with `spec.items[]` (`id`, `kind: infra | app`, `catalogRef`, `dependsOn`, `targetClusterFrom`, `targetNamespace`, `canary`, `bindValues`) and a composite `spec.schema`. Keel validates that `dependsOn` forms an acyclic DAG, synthesizes all item manifests under `tenants/<tenant>/bundles/<instance>/` in a single atomic PR, orders cross-kind dependencies via tenant-scoped Flux `Kustomization` `healthChecks` + `dependsOn` (and `HelmRelease.spec.dependsOn`), wires `targetClusterFrom` to the upstream infra `Stack`'s output `kubeconfig` `Secret`, and marks dependent PKO `Stack` previews as deferred until upstream outputs exist.
 

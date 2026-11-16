@@ -25,8 +25,18 @@ spec:
               selector:
                 matchLabels:
                   keel.io/protect: "true"
+          - resources:
+              kinds:
+                - helm.toolkit.fluxcd.io/v2/HelmRelease
+              namespaces:
+                - flux-system
+                - keel-system
+                - kyverno
+              selector:
+                matchLabels:
+                  keel.io/protect: "true"
       validate:
-        message: "Protected control-plane Stack `management-cluster-core` cannot be deleted via standard admission; use `keel bootstrap recover` for break-glass maintenance."
+        message: "Protected control-plane Stack or HelmRelease cannot be deleted via standard admission; use `keel bootstrap recover` for break-glass maintenance."
         deny:
           conditions:
             any:

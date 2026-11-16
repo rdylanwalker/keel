@@ -8,6 +8,7 @@ metadata:
   namespace: keel-system
   labels:
     app.kubernetes.io/managed-by: keel
+    keel.io/protect: "true"
 spec:
   interval: 10m
   chart:
@@ -22,6 +23,10 @@ spec:
     crds: CreateReplace
   upgrade:
     crds: CreateReplace
+    timeout: 5m
+    remediation:
+      retries: 1
+      strategy: rollback
   values:
     replicaCount: 1
     configSecret:

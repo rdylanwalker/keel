@@ -29,7 +29,7 @@ metadata:
 spec:
   interval: 5m
   path: ./clusters/management/core-addons
-  prune: true
+  prune: false
   wait: true
   sourceRef:
     kind: GitRepository
