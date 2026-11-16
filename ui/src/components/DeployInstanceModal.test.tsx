@@ -1,9 +1,7 @@
 import { render, screen, fireEvent, waitFor } from "@testing-library/react"
 import { describe, it, expect, vi, beforeEach } from "vitest"
-import {
-  DeployInstanceModal,
-  extractSchemaDefaults,
-} from "./DeployInstanceModal"
+import { DeployInstanceModal } from "./DeployInstanceModal"
+import { extractSchemaDefaults } from "../lib/schemaBuilder"
 import * as api from "../lib/api"
 import { CatalogItem } from "../types/api"
 
