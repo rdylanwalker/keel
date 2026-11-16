@@ -1228,6 +1228,21 @@ describe("CatalogWizardView component and jsonToYaml helper", () => {
     expect(reappearedCheckbox).not.toBeChecked()
     fireEvent.click(reappearedCheckbox)
 
+    // Configure Depends on, Target Cluster From, and Target Namespace on Step 2
+    const depCheckbox = screen.getByRole("checkbox", { name: /step-1/i })
+    expect(depCheckbox).toBeChecked()
+    fireEvent.click(depCheckbox)
+    expect(depCheckbox).not.toBeChecked()
+    fireEvent.click(depCheckbox)
+    expect(depCheckbox).toBeChecked()
+
+    fireEvent.change(screen.getByLabelText(/Step 2 Target Cluster From/i), {
+      target: { value: "step-1" },
+    })
+    fireEvent.change(screen.getByLabelText(/Step 2 Target Namespace/i), {
+      target: { value: "canary-ns" },
+    })
+
     fireEvent.click(
       screen.getByRole("button", { name: /Submit Bundle PR Proposal/i })
     )
@@ -1248,5 +1263,222 @@ describe("CatalogWizardView component and jsonToYaml helper", () => {
         })
       )
     })
+  })
+
+  it("supports interactive Schema Editor field management, raw JSON editing, and cancel", async () => {
+    vi.mocked(api.getCatalog).mockResolvedValue(mockCatalog)
+    render(<CatalogWizardView />)
+
+    await waitFor(() => {
+      const list = screen.getByTestId("catalog-list")
+      expect(within(list).getByText("Test Microservice")).toBeInTheDocument()
+    })
+
+    fireEvent.click(
+      screen.getByRole("button", { name: /\+ Add Catalog Item/i })
+    )
+
+    // Expand the Schema Editor
+    fireEvent.click(screen.getByRole("button", { name: /Edit JSON Schema/i }))
+
+    // Add two schema fields
+    const addFieldBtn = screen.getByRole("button", { name: /\+ Add Field/i })
+    fireEvent.click(addFieldBtn)
+    fireEvent.click(addFieldBtn)
+
+    // Edit first field's name, title, type, default, required, and secret
+    fireEvent.change(screen.getByLabelText("Field 1 name"), {
+      target: { value: "replicas" },
+    })
+    fireEvent.change(screen.getByLabelText("Field 1 title"), {
+      target: { value: "Replicas" },
+    })
+    fireEvent.change(screen.getByLabelText("Field 1 type"), {
+      target: { value: "integer" },
+    })
+    fireEvent.change(screen.getByLabelText("Field 1 default"), {
+      target: { value: "3" },
+    })
+
+    const reqCheckboxes = screen.getAllByTitle("Required")
+    const secCheckboxes = screen.getAllByTitle(/Secret/i)
+    fireEvent.click(within(reqCheckboxes[0]).getByRole("checkbox"))
+    fireEvent.click(within(secCheckboxes[0]).getByRole("checkbox"))
+
+    // Remove second field
+    fireEvent.click(screen.getByRole("button", { name: "Remove field 2" }))
+
+    const schemaTextarea = screen.getByLabelText(
+      /JSON Schema/i
+    ) as HTMLTextAreaElement
+    const parsed = JSON.parse(schemaTextarea.value)
+    expect(parsed.required).toContain("replicas")
+    expect(parsed.properties.replicas.type).toBe("integer")
+    expect(parsed.properties.replicas.writeOnly).toBe(true)
+
+    // Edit raw JSON Schema directly
+    fireEvent.change(schemaTextarea, {
+      target: {
+        value: JSON.stringify(
+          {
+            type: "object",
+            properties: {
+              domain: { type: "string", default: "example.com" },
+            },
+          },
+          null,
+          2
+        ),
+      },
+    })
+    expect(
+      (screen.getByLabelText("Field 1 name") as HTMLInputElement).value
+    ).toBe("domain")
+
+    // Cancel closes the modal
+    fireEvent.click(screen.getByRole("button", { name: /^Cancel$/i }))
+    expect(screen.queryByTestId("catalog-item-modal")).not.toBeInTheDocument()
+  })
+
+  it("shows validation error on invalid JSON Schema and supports editing a bundle item", async () => {
+    const onNavigateToPreview = vi.fn()
+    const bundleItem: CatalogItem = {
+      id: "web-bundle",
+      name: "Web Bundle",
+      description: "Full web bundle",
+      type: "bundle",
+      category: "Platform",
+      version: "1.0.0",
+      schema: { type: "object", properties: {} },
+      bundleItems: [
+        { id: "db", kind: "infra", catalogRef: "postgres-db" },
+        {
+          id: "api",
+          kind: "app",
+          catalogRef: "test-app",
+          dependsOn: ["db"],
+          canary: true,
+        },
+      ],
+    }
+    vi.mocked(api.getCatalog).mockResolvedValue([...mockCatalog, bundleItem])
+    vi.mocked(api.updateCatalogItem).mockResolvedValue({
+      id: "301",
+      title: "Update bundle web-bundle",
+      branch: "keel/catalog/update-web-bundle-301",
+      author: "user",
+      tenant: "catalog",
+      status: "open",
+      createdAt: "just now",
+      prUrl: "https://git.internal/pr/301",
+    })
+
+    render(<CatalogWizardView onNavigateToPreview={onNavigateToPreview} />)
+
+    await waitFor(() => {
+      const list = screen.getByTestId("catalog-list")
+      expect(within(list).getByText("Web Bundle")).toBeInTheDocument()
+    })
+
+    // Click Edit on Web Bundle
+    const bundleCard = screen
+      .getByText("Web Bundle")
+      .closest("div.bg-slate-900") as HTMLElement
+    fireEvent.click(within(bundleCard).getByRole("button", { name: /^Edit$/i }))
+
+    fireEvent.change(screen.getByLabelText(/Category \*/i), {
+      target: { value: "Core Platform" },
+    })
+    fireEvent.change(screen.getByLabelText(/Description/i), {
+      target: { value: "Updated bundle description" },
+    })
+
+    // Expand JSON Schema editor and enter invalid JSON
+    fireEvent.click(screen.getByRole("button", { name: /Edit JSON Schema/i }))
+    const schemaTextarea = screen.getByLabelText(/JSON Schema/i)
+    fireEvent.change(schemaTextarea, { target: { value: "{invalid json" } })
+    fireEvent.click(screen.getByRole("button", { name: /Submit Update PR/i }))
+
+    expect(await screen.findByText(/Invalid JSON Schema:/i)).toBeInTheDocument()
+
+    // Fix JSON Schema and submit
+    fireEvent.change(schemaTextarea, {
+      target: { value: '{"type":"object","properties":{}}' },
+    })
+    fireEvent.click(screen.getByRole("button", { name: /Submit Update PR/i }))
+
+    await waitFor(() => {
+      expect(api.updateCatalogItem).toHaveBeenCalledWith(
+        "bundle",
+        "web-bundle",
+        expect.objectContaining({ name: "Web Bundle" })
+      )
+    })
+
+    // Banner with Go to PR -> and View on Forge
+    const goToPrBtns = await screen.findAllByRole("button", {
+      name: /Go to PR/i,
+    })
+    fireEvent.click(goToPrBtns[0])
+    expect(onNavigateToPreview).toHaveBeenCalled()
+  })
+
+  it("removes a bundle step and toggles Hide JSON Schema Editor", async () => {
+    vi.mocked(api.getCatalog).mockResolvedValue(mockCatalog)
+    render(<CatalogWizardView />)
+
+    await waitFor(() => {
+      const list = screen.getByTestId("catalog-list")
+      expect(within(list).getByText("Test Microservice")).toBeInTheDocument()
+    })
+
+    fireEvent.click(
+      screen.getByRole("button", { name: /\+ Add Catalog Item/i })
+    )
+    fireEvent.change(screen.getByLabelText(/Catalog Type \*/i), {
+      target: { value: "bundle" },
+    })
+
+    fireEvent.click(screen.getByRole("button", { name: /Add Step/i }))
+    const step2Id = screen.getByLabelText("Step 2 ID")
+    fireEvent.change(step2Id, { target: { value: "worker-step" } })
+    expect((step2Id as HTMLInputElement).value).toBe("worker-step")
+    fireEvent.change(screen.getByLabelText("Step 2 Kind"), {
+      target: { value: "infra" },
+    })
+    fireEvent.change(screen.getByLabelText("Step 2 Kind"), {
+      target: { value: "app" },
+    })
+    fireEvent.click(screen.getByRole("button", { name: "Remove step 2" }))
+    expect(screen.queryByLabelText("Step 2 ID")).not.toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole("button", { name: /Edit JSON Schema/i }))
+    expect(
+      screen.getByRole("button", { name: /Hide JSON Schema Editor/i })
+    ).toBeInTheDocument()
+    fireEvent.click(
+      screen.getByRole("button", { name: /Hide JSON Schema Editor/i })
+    )
+    expect(
+      screen.getByRole("button", { name: /Edit JSON Schema/i })
+    ).toBeInTheDocument()
+
+    // Switch to infra and test Insert Starter Template + description
+    fireEvent.change(screen.getByLabelText(/Catalog Type \*/i), {
+      target: { value: "infra" },
+    })
+    fireEvent.change(screen.getByLabelText(/Description/i), {
+      target: { value: "Starter infra" },
+    })
+    fireEvent.change(screen.getByLabelText(/Terraform Provider/i), {
+      target: { value: "hashicorp/aws" },
+    })
+    fireEvent.click(
+      screen.getByRole("button", { name: /Insert Starter Template/i })
+    )
+    expect(
+      (screen.getByLabelText(/Pulumi\.yaml Program/i) as HTMLTextAreaElement)
+        .value
+    ).toContain("terraform-provider")
   })
 })

@@ -107,4 +107,58 @@ resources:
   it("returns null for invalid JSON schema text", () => {
     expect(schemaJsonToFields("{not valid json")).toBeNull()
   })
+
+  it("handles number, boolean, non-secret password cleanup, and quoted YAML scalars", () => {
+    const existing = JSON.stringify({
+      type: "object",
+      properties: {
+        token: { type: "string", format: "password", writeOnly: true },
+      },
+    })
+    const json = fieldsToSchemaJson(
+      [
+        {
+          name: "ratio",
+          title: "",
+          type: "number",
+          defaultValue: "1.5",
+          required: false,
+          secret: false,
+        },
+        {
+          name: "enabled",
+          title: "Enabled",
+          type: "boolean",
+          defaultValue: "true",
+          required: false,
+          secret: false,
+        },
+        {
+          name: "token",
+          title: "Token",
+          type: "string",
+          defaultValue: "",
+          required: false,
+          secret: false,
+        },
+      ],
+      existing
+    )
+    const parsed = JSON.parse(json)
+    expect(parsed.required).toBeUndefined()
+    expect(parsed.properties.ratio.default).toBe(1.5)
+    expect(parsed.properties.enabled.default).toBe(true)
+    expect(parsed.properties.token.format).toBeUndefined()
+    expect(parsed.properties.token.writeOnly).toBeUndefined()
+
+    const quotedYaml = `
+config:
+  region:
+    type: string
+    default: 'us-east-1'
+`
+    expect(deriveFieldsFromPulumiYaml(quotedYaml)[0].defaultValue).toBe(
+      "us-east-1"
+    )
+  })
 })

@@ -439,10 +439,34 @@ describe("TopologyView component", () => {
     act(() => {
       onEventCb!(dupEvent)
       onEventCb!(dupEvent)
+      onEventCb!({
+        kind: "Stack",
+        namespace: "tenant-acme",
+        name: "acme-net",
+        status: "Progressing",
+        message: "Updating stack",
+        timestamp: "2026-11-15T10:01:00Z",
+      })
+      onEventCb!({
+        kind: "Stack",
+        namespace: "tenant-acme",
+        name: "acme-db",
+        status: "Failed",
+        message: "Stack error",
+        timestamp: "2026-11-15T10:02:00Z",
+      })
     })
 
     const matches = await screen.findAllByText("Reconciliation succeeded")
     expect(matches).toHaveLength(1)
+    expect(screen.getByText("Progressing")).toBeInTheDocument()
+    expect(screen.getByText("Failed")).toBeInTheDocument()
+
+    // Click Inspect on a Stack event in the live stream and then close modal
+    const inspectButtons = screen.getAllByRole("button", { name: /^Inspect$/i })
+    fireEvent.click(inspectButtons[0])
+    const closeBtn = await screen.findByRole("button", { name: /Close/i })
+    fireEvent.click(closeBtn)
   })
 
   it("handles stack and release quick actions (edit, inspect, restart, reconcile, delete)", async () => {
@@ -463,6 +487,8 @@ describe("TopologyView component", () => {
         version: "6.7.0",
         type: "helm",
         status: "Ready",
+        bundle: "web-stack",
+        bundleItem: "api",
         lastSynced: new Date(Date.now() - 120000).toISOString(),
         targetCluster: "workload-01-kubeconfig",
       },

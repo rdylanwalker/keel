@@ -171,4 +171,19 @@ describe("ControlPlaneProvidersView component", () => {
       expect(screen.getByRole("alert")).toHaveTextContent("Backend unreachable")
     })
   })
+
+  it("handles unauthenticated state and initial load rejection", async () => {
+    const { rerender } = render(
+      <ControlPlaneProvidersView authenticated={false} />
+    )
+    expect(api.getStacksWithMeta).not.toHaveBeenCalled()
+
+    vi.mocked(api.getStacksWithMeta).mockRejectedValueOnce("String failure")
+    rerender(<ControlPlaneProvidersView authenticated={true} />)
+    await waitFor(() => {
+      expect(screen.getByRole("alert")).toHaveTextContent(
+        "Failed to load control plane & provider state"
+      )
+    })
+  })
 })
