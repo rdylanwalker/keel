@@ -165,12 +165,16 @@ async function main() {
   const providersDir = path.join(workDir, 'providers');
   const kindCatalogDir = path.join(workDir, 'catalog', 'infra', 'kind-cluster');
   const podinfoCatalogDir = path.join(workDir, 'catalog', 'apps', 'podinfo');
+  const s3CatalogDir = path.join(workDir, 'catalog', 'core', 's3-state-backend');
+  const coreAddonsDir = path.join(workDir, 'clusters', 'management', 'core-addons');
   const tenantAcmeInfra = path.join(workDir, 'tenants', 'acme', 'infra', 'net');
 
   fs.mkdirSync(keelDir, { recursive: true });
   fs.mkdirSync(providersDir, { recursive: true });
   fs.mkdirSync(kindCatalogDir, { recursive: true });
   fs.mkdirSync(podinfoCatalogDir, { recursive: true });
+  fs.mkdirSync(s3CatalogDir, { recursive: true });
+  fs.mkdirSync(coreAddonsDir, { recursive: true });
   fs.mkdirSync(tenantAcmeInfra, { recursive: true });
 
   fs.writeFileSync(
@@ -280,6 +284,54 @@ spec:
         title: Admin Secret Password
         format: password
         writeOnly: true
+`,
+  );
+
+  fs.writeFileSync(
+    path.join(s3CatalogDir, 'catalog.yaml'),
+    `apiVersion: keel.io/v1alpha1
+kind: CatalogApplication
+metadata:
+  id: s3-state-backend
+  name: SeaweedFS S3 State Backend
+  category: management-core
+  runtime: helm
+spec:
+  upstream:
+    repoURL: https://seaweedfs.github.io/seaweedfs/helm
+    chart: seaweedfs
+    version: "4.53.0"
+  progressiveDelivery:
+    flaggerSupported: false
+    defaultCanary: false
+  schema:
+    type: object
+    properties:
+      s3EnableAuth:
+        type: boolean
+        title: Enable S3 Auth
+        default: true
+      masterDataSize:
+        type: string
+        title: Master PVC Data Size
+        default: 1Gi
+`,
+  );
+
+  fs.writeFileSync(
+    path.join(coreAddonsDir, 's3-seaweedfs.yaml'),
+    `apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: s3-state-backend
+  namespace: keel-system
+  labels:
+    keel.io/protect: "true"
+spec:
+  chart:
+    spec:
+      chart: seaweedfs
+      version: "4.53.0"
 `,
   );
 

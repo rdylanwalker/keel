@@ -106,9 +106,22 @@ test.describe('06 - Full Localhost GUI GitOps Workflow', () => {
     await expect(page.getByText(/Live Reconciler Event Stream/i)).toBeVisible();
     await expect(page.getByText(/podinfo/i).first()).toBeVisible({ timeout: 10000 });
 
-    // 7. Verify Control Plane & Providers 4th sidebar tab
+    // 7. Verify Control Plane & Providers 4th sidebar tab & base addon upgrade workflow
     await page.getByRole('button', { name: /Control Plane & Providers/i }).click();
     await expect(page.getByText('Management Control Plane Cluster')).toBeVisible();
     await expect(page.getByText('Enabled Provider Mesh')).toBeVisible();
+    await expect(page.getByRole('heading', { name: 'Management Plane Base Addons' })).toBeVisible();
+    await expect(page.getByText('s3-state-backend').first()).toBeVisible();
+    await expect(page.getByText('Protected').first()).toBeVisible();
+
+    await page
+      .getByTestId('core-addon-s3-state-backend')
+      .getByRole('button', { name: /Upgrade \/ Configure/i })
+      .click();
+    await expect(page.getByRole('button', { name: /Sync Upstream Schema/i })).toBeVisible();
+    await page.getByRole('button', { name: /Submit & Open Git PR Proposal/i }).click();
+    await expect(page.getByText(/opened on branch/i)).toBeVisible({
+      timeout: 10000,
+    });
   });
 });
