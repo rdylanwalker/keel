@@ -1,0 +1,40 @@
+# Dex OIDC Identity Provider Core Addon Catalog Application
+apiVersion: keel.io/v1alpha1
+kind: CatalogApplication
+metadata:
+  id: dex
+  name: Dex OIDC Provider
+  description: OpenID Connect identity provider providing authentication and federated user management for Keel control plane.
+  category: management-core
+  runtime: helm
+spec:
+  upstream:
+    chart: dex
+    repoURL: https://charts.dexidp.io
+    version: "0.21.0"
+  progressiveDelivery:
+    flaggerSupported: false
+    defaultCanary: false
+  schema:
+    type: object
+    properties:
+      replicaCount:
+        type: integer
+        title: Replica Count
+        default: 1
+        minimum: 1
+        maximum: 5
+      service:
+        type: object
+        title: Service Settings
+        properties:
+          ports:
+            type: object
+            properties:
+              http:
+                type: object
+                properties:
+                  port:
+                    type: integer
+                    title: HTTP Port
+                    default: 5556

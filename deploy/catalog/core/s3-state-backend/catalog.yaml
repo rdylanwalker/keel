@@ -1,0 +1,54 @@
+# S3 State Backend (SeaweedFS) Core Addon Catalog Application
+apiVersion: keel.io/v1alpha1
+kind: CatalogApplication
+metadata:
+  id: s3-state-backend
+  name: SeaweedFS S3 State Backend
+  description: S3-compatible blob storage backend for cluster state, break-glass backups, and Pulumi PKO state storage.
+  category: management-core
+  runtime: helm
+spec:
+  upstream:
+    chart: seaweedfs
+    repoURL: https://seaweedfs.github.io/seaweedfs/helm
+    version: "4.53.0"
+  progressiveDelivery:
+    flaggerSupported: false
+    defaultCanary: false
+  schema:
+    type: object
+    properties:
+      s3:
+        type: object
+        title: S3 API Settings
+        properties:
+          enabled:
+            type: boolean
+            title: Enable S3 API
+            default: true
+          enableAuth:
+            type: boolean
+            title: Enable S3 Authentication
+            default: true
+      master:
+        type: object
+        title: Master Server
+        properties:
+          data:
+            type: object
+            properties:
+              size:
+                type: string
+                title: Master PVC Size
+                default: 1Gi
+      filer:
+        type: object
+        title: Filer Server
+        properties:
+          data:
+            type: object
+            properties:
+              size:
+                type: string
+                title: Filer PVC Size
+                default: 2Gi

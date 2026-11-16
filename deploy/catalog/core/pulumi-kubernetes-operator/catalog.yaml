@@ -1,0 +1,38 @@
+# Pulumi Kubernetes Operator Core Addon Catalog Application
+apiVersion: keel.io/v1alpha1
+kind: CatalogApplication
+metadata:
+  id: pulumi-kubernetes-operator
+  name: Pulumi Kubernetes Operator
+  description: Infrastructure-as-Code operator executing Pulumi Stacks for cloud infrastructure provisioning and ephemeral preview environments.
+  category: management-core
+  runtime: helm
+spec:
+  upstream:
+    chart: oci://ghcr.io/pulumi/helm-charts/pulumi-kubernetes-operator
+    repoURL: oci://ghcr.io/pulumi/helm-charts/pulumi-kubernetes-operator
+    version: "2.1.0"
+  progressiveDelivery:
+    flaggerSupported: false
+    defaultCanary: false
+  schema:
+    type: object
+    properties:
+      controller:
+        type: object
+        title: Operator Controller Settings
+        properties:
+          replicas:
+            type: integer
+            title: Controller Replicas
+            default: 2
+            minimum: 1
+            maximum: 10
+          securityContext:
+            type: object
+            title: Security Context
+            properties:
+              runAsNonRoot:
+                type: boolean
+                title: Run As Non-Root
+                default: true

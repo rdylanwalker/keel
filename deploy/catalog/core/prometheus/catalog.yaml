@@ -1,0 +1,52 @@
+# Prometheus Core Addon Catalog Application
+apiVersion: keel.io/v1alpha1
+kind: CatalogApplication
+metadata:
+  id: prometheus
+  name: Prometheus Telemetry Server
+  description: Metrics collector scraping cluster control plane, ingress, and workloads to evaluate SLO metrics during progressive rollouts.
+  category: management-core
+  runtime: helm
+spec:
+  upstream:
+    chart: prometheus
+    repoURL: https://prometheus-community.github.io/helm-charts
+    version: "27.5.0"
+  progressiveDelivery:
+    flaggerSupported: false
+    defaultCanary: false
+  schema:
+    type: object
+    properties:
+      server:
+        type: object
+        title: Prometheus Server
+        properties:
+          retention:
+            type: string
+            title: Retention Period
+            default: 7d
+          persistentVolume:
+            type: object
+            title: Persistent Storage
+            properties:
+              enabled:
+                type: boolean
+                title: Enable Persistent Volume
+                default: false
+      alertmanager:
+        type: object
+        title: Alertmanager
+        properties:
+          enabled:
+            type: boolean
+            title: Enable Alertmanager
+            default: false
+      kube-state-metrics:
+        type: object
+        title: Kube State Metrics
+        properties:
+          enabled:
+            type: boolean
+            title: Enable Kube State Metrics
+            default: true

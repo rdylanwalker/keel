@@ -1,0 +1,43 @@
+# Flagger Core Addon Catalog Application
+apiVersion: keel.io/v1alpha1
+kind: CatalogApplication
+metadata:
+  id: flagger
+  name: Flagger Canary Controller
+  description: Progressive delivery operator automating canary deployments, traffic shifting, and metrics analysis via Gateway API and Prometheus.
+  category: management-core
+  runtime: helm
+spec:
+  upstream:
+    chart: flagger
+    repoURL: https://flagger.app
+    version: "1.40.0"
+  progressiveDelivery:
+    flaggerSupported: false
+    defaultCanary: false
+  schema:
+    type: object
+    properties:
+      meshProvider:
+        type: string
+        title: Mesh / Gateway Provider
+        description: Traffic routing provider used by Flagger for canary weight shifting.
+        default: gatewayapi:v1
+        enum:
+          - gatewayapi:v1
+          - kubernetes
+          - istio
+          - nginx
+      metricsServer:
+        type: string
+        title: Prometheus Metrics Server URL
+        description: In-cluster Prometheus URL queried by Flagger for canary metric checks.
+        default: http://prometheus.keel-system:9090
+      podMonitor:
+        type: object
+        title: PodMonitor Integration
+        properties:
+          enabled:
+            type: boolean
+            title: Enable PodMonitor CRD Creation
+            default: false

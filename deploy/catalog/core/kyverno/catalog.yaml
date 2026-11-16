@@ -1,0 +1,54 @@
+# Kyverno Admission Controller Core Addon Catalog Application
+apiVersion: keel.io/v1alpha1
+kind: CatalogApplication
+metadata:
+  id: kyverno
+  name: Kyverno Policy Engine
+  description: Kubernetes-native policy management engine enforcing pod security standards and namespace isolation guardrails.
+  category: management-core
+  runtime: helm
+spec:
+  upstream:
+    chart: kyverno
+    repoURL: https://kyverno.github.io/kyverno/
+    version: "3.3.7"
+  progressiveDelivery:
+    flaggerSupported: false
+    defaultCanary: false
+  schema:
+    type: object
+    properties:
+      admissionController:
+        type: object
+        title: Admission Controller
+        properties:
+          replicas:
+            type: integer
+            title: Replica Count
+            default: 2
+            minimum: 1
+            maximum: 10
+      backgroundController:
+        type: object
+        title: Background Controller
+        properties:
+          enabled:
+            type: boolean
+            title: Enable Background Policy Auditing
+            default: true
+      cleanupController:
+        type: object
+        title: Cleanup Controller
+        properties:
+          enabled:
+            type: boolean
+            title: Enable Resource Cleanup Controller
+            default: true
+      reportsController:
+        type: object
+        title: Reports Controller
+        properties:
+          enabled:
+            type: boolean
+            title: Enable Policy Reports Controller
+            default: true
