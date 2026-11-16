@@ -86,6 +86,8 @@ pub async fn metrics(State(state): State<AppState>) -> Response {
 #[serde(rename_all = "camelCase")]
 pub struct CatalogResponse {
     pub applications: Vec<CatalogApplication>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub core_addons: Vec<CatalogApplication>,
     pub blueprints: Vec<CatalogInfraBlueprint>,
     #[serde(default)]
     pub bundles: Vec<CatalogBundle>,
@@ -127,6 +129,18 @@ pub async fn get_catalog(
         }
     }
     applications.sort_by(|a, b| a.metadata.id.cmp(&b.metadata.id));
+
+    let mut core_addons = Vec::new();
+    for path in find_catalog_files(&state.repo_workdir.join("catalog/core")).await {
+        let yaml = tokio::fs::read_to_string(&path).await?;
+        match parse_catalog_application(&yaml) {
+            Ok(app) => core_addons.push(app),
+            Err(err) => {
+                tracing::warn!(path = %path.display(), error = %err, "Skipping invalid core CatalogApplication");
+            }
+        }
+    }
+    core_addons.sort_by(|a, b| a.metadata.id.cmp(&b.metadata.id));
 
     let mut blueprints = Vec::new();
     let mut pulumi_yaml = HashMap::new();
@@ -172,6 +186,7 @@ pub async fn get_catalog(
 
     Ok(Json(CatalogResponse {
         applications,
+        core_addons,
         blueprints,
         bundles,
         enabled_providers,
@@ -3987,6 +4002,14 @@ pub async fn delete_release(
     State(state): State<AppState>,
     AxumPath((namespace, name)): AxumPath<(String, String)>,
 ) -> Result<Json<DeleteResourceResponse>, ServerError> {
+    if matches!(
+        namespace.as_str(),
+        "keel-system" | "flux-system" | "kyverno"
+    ) {
+        return Err(ServerError::Forbidden(
+            "Protected management-plane base addon cannot be deleted via API".to_string(),
+        ));
+    }
     delete_gitops_resource_pr(auth, state, namespace, name, "apps").await
 }
 
@@ -4683,4 +4706,671 @@ pub async fn put_git_credentials(
         has_ssh_key,
         has_personal_access_token,
     }))
+}
+
+/// Request body for `POST /api/v1/management/addons/{id}/upgrade`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpgradeManagementAddonRequest {
+    #[serde(default)]
+    pub version: Option<String>,
+    #[serde(default)]
+    pub values: Value,
+}
+
+/// Response body for `POST /api/v1/management/addons/{id}/upgrade` and `rollback`.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManagementAddonProposalResponse {
+    pub id: String,
+    pub proposal: PullRequestInfo,
+    pub branch: String,
+}
+
+async fn find_core_addon_manifest(
+    repo_workdir: &Path,
+    id: &str,
+) -> Result<(PathBuf, String, Value), ServerError> {
+    let dir = repo_workdir.join("clusters/management/core-addons");
+    let mut entries = tokio::fs::read_dir(&dir).await.map_err(|err| {
+        if err.kind() == std::io::ErrorKind::NotFound {
+            ServerError::NotFound(format!(
+                "Core addon '{id}' not found under clusters/management/core-addons/"
+            ))
+        } else {
+            ServerError::Io(err)
+        }
+    })?;
+
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        let is_yaml = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("yaml") || ext.eq_ignore_ascii_case("yml"));
+        if !is_yaml {
+            continue;
+        }
+        let raw = tokio::fs::read_to_string(&path).await?;
+        let Ok(doc) = serde_yml::from_str::<Value>(&raw) else {
+            continue;
+        };
+        let meta_name = doc
+            .get("metadata")
+            .and_then(|m| m.get("name"))
+            .and_then(|n| n.as_str());
+        if meta_name == Some(id) {
+            let file_name = path
+                .file_name()
+                .and_then(|f| f.to_str())
+                .ok_or_else(|| ServerError::Internal("Invalid core addon filename".to_string()))?;
+            let rel_path = format!("clusters/management/core-addons/{file_name}");
+            return Ok((path, rel_path, doc));
+        }
+    }
+
+    Err(ServerError::NotFound(format!(
+        "Core addon '{id}' not found under clusters/management/core-addons/"
+    )))
+}
+
+fn merge_json_values(target: &mut Value, patch: &Value) {
+    match (target, patch) {
+        (Value::Object(target_map), Value::Object(patch_map)) => {
+            for (k, v) in patch_map {
+                match target_map.get_mut(k) {
+                    Some(existing) if existing.is_object() && v.is_object() => {
+                        merge_json_values(existing, v);
+                    }
+                    _ => {
+                        target_map.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+        }
+        (target_slot, patch_val) => {
+            *target_slot = patch_val.clone();
+        }
+    }
+}
+
+/// `POST /api/v1/management/addons/{id}/upgrade`
+///
+/// Updates a protected management-plane core addon manifest under
+/// `clusters/management/core-addons/` on a new branch and opens a PR via `ForgeProvider`.
+pub async fn upgrade_management_addon(
+    auth: AuthSession,
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Json(req): Json<UpgradeManagementAddonRequest>,
+) -> Result<(StatusCode, Json<ManagementAddonProposalResponse>), ServerError> {
+    validate_dns_label(&id, "id")?;
+
+    let timestamp = Utc::now().timestamp().max(1) as u64;
+    let branch = format!("chore/core-addon-{id}-{timestamp}");
+
+    let (commit_sha, rel_path) = {
+        let _guard = state.git_lock.lock().await;
+        state
+            .git_runner
+            .sync_branch_from_remote(&state.repo_workdir, "origin", "main")
+            .await?;
+
+        let (abs_path, rel_path, mut doc) =
+            find_core_addon_manifest(&state.repo_workdir, &id).await?;
+
+        if let Some(version) = req
+            .version
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+        {
+            let spec_obj = doc
+                .as_object_mut()
+                .and_then(|root| {
+                    root.entry("spec")
+                        .or_insert_with(|| Value::Object(Default::default()))
+                        .as_object_mut()
+                })
+                .ok_or_else(|| {
+                    ServerError::Internal(
+                        "Core addon manifest root or spec is not a mapping".to_string(),
+                    )
+                })?;
+            let chart_obj = spec_obj
+                .entry("chart")
+                .or_insert_with(|| Value::Object(Default::default()))
+                .as_object_mut()
+                .ok_or_else(|| {
+                    ServerError::Internal(
+                        "Core addon manifest spec.chart is not a mapping".to_string(),
+                    )
+                })?;
+            let chart_spec_obj = chart_obj
+                .entry("spec")
+                .or_insert_with(|| Value::Object(Default::default()))
+                .as_object_mut()
+                .ok_or_else(|| {
+                    ServerError::Internal(
+                        "Core addon manifest spec.chart.spec is not a mapping".to_string(),
+                    )
+                })?;
+            chart_spec_obj.insert("version".to_string(), Value::String(version.to_string()));
+        }
+
+        if req.values.is_object() {
+            let spec_obj = doc
+                .as_object_mut()
+                .and_then(|root| {
+                    root.entry("spec")
+                        .or_insert_with(|| Value::Object(Default::default()))
+                        .as_object_mut()
+                })
+                .ok_or_else(|| {
+                    ServerError::Internal(
+                        "Core addon manifest root or spec is not a mapping".to_string(),
+                    )
+                })?;
+            match spec_obj.get_mut("values") {
+                Some(existing) if existing.is_object() => {
+                    merge_json_values(existing, &req.values);
+                }
+                _ => {
+                    spec_obj.insert("values".to_string(), req.values.clone());
+                }
+            }
+        }
+
+        let metadata_obj = doc
+            .as_object_mut()
+            .and_then(|root| {
+                root.entry("metadata")
+                    .or_insert_with(|| Value::Object(Default::default()))
+                    .as_object_mut()
+            })
+            .ok_or_else(|| {
+                ServerError::Internal("Core addon manifest metadata is not a mapping".to_string())
+            })?;
+        let labels_obj = metadata_obj
+            .entry("labels")
+            .or_insert_with(|| Value::Object(Default::default()))
+            .as_object_mut()
+            .ok_or_else(|| {
+                ServerError::Internal("Core addon manifest labels is not a mapping".to_string())
+            })?;
+        labels_obj.insert(
+            "keel.io/protect".to_string(),
+            Value::String("true".to_string()),
+        );
+
+        let updated_yaml = serde_yml::to_string(&doc).map_err(|e| {
+            ServerError::Internal(format!("Failed to serialize core addon YAML: {e}"))
+        })?;
+
+        state
+            .git_runner
+            .checkout_new_branch(&state.repo_workdir, &branch)
+            .await?;
+        tokio::fs::write(&abs_path, &updated_yaml).await?;
+        state
+            .git_runner
+            .add(&state.repo_workdir, [rel_path.as_str()])
+            .await?;
+
+        let author = CommitAuthor::new(
+            auth.claims.name.as_deref().unwrap_or(&auth.claims.sub),
+            auth.claims.email.as_deref().unwrap_or("keel@keel.local"),
+        );
+        let commit_msg = format!("chore(core-addon): upgrade {id}");
+        let sha = state
+            .git_runner
+            .commit(&state.repo_workdir, &commit_msg, &author)
+            .await?;
+        state
+            .git_runner
+            .push(&state.repo_workdir, "origin", &branch)
+            .await?;
+
+        let _ = state
+            .git_runner
+            .checkout_branch(&state.repo_workdir, "main")
+            .await;
+        (sha, rel_path)
+    };
+
+    let pr_req = CreatePrRequest::new(
+        format!("chore(core-addon): upgrade {id}"),
+        format!(
+            "Automated management-plane core addon upgrade for `{id}`\n\n- Commit: `{commit_sha}`\n- Path: `{rel_path}`"
+        ),
+        &branch,
+    )
+    .with_tenant("management")
+    .with_author(format!(
+        "{} <{}>",
+        auth.claims.name.as_deref().unwrap_or(&auth.claims.sub),
+        auth.claims.email.as_deref().unwrap_or("keel@keel.local")
+    ));
+    let proposal = state.forge.create_pull_request(pr_req).await?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(ManagementAddonProposalResponse {
+            id,
+            proposal,
+            branch,
+        }),
+    ))
+}
+
+/// `POST /api/v1/management/addons/{id}/rollback`
+///
+/// Reverts a management-plane core addon manifest under `clusters/management/core-addons/`
+/// to its previous Git revision on a new branch and opens a PR via `ForgeProvider`.
+pub async fn rollback_management_addon(
+    auth: AuthSession,
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<(StatusCode, Json<ManagementAddonProposalResponse>), ServerError> {
+    validate_dns_label(&id, "id")?;
+
+    let timestamp = Utc::now().timestamp().max(1) as u64;
+    let branch = format!("revert/core-addon-{id}-{timestamp}");
+
+    let (commit_sha, prev_sha, rel_path) = {
+        let _guard = state.git_lock.lock().await;
+        state
+            .git_runner
+            .sync_branch_from_remote(&state.repo_workdir, "origin", "main")
+            .await?;
+
+        let (abs_path, rel_path, _doc) = find_core_addon_manifest(&state.repo_workdir, &id).await?;
+
+        let repo_str = state.repo_workdir.to_str().ok_or_else(|| {
+            ServerError::Internal("Repository workdir path is not valid UTF-8".to_string())
+        })?;
+
+        let log_out = tokio::process::Command::new("git")
+            .args([
+                "-C",
+                repo_str,
+                "log",
+                "-n",
+                "2",
+                "--format=%H",
+                "--",
+                &rel_path,
+            ])
+            .output()
+            .await?;
+        if !log_out.status.success() {
+            let stderr = String::from_utf8_lossy(&log_out.stderr);
+            return Err(ServerError::Internal(format!(
+                "git log failed for '{rel_path}': {stderr}"
+            )));
+        }
+
+        let commits: Vec<String> = String::from_utf8_lossy(&log_out.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect();
+        if commits.len() < 2 {
+            return Err(ServerError::BadRequest(
+                "No previous revision found to roll back to".to_string(),
+            ));
+        }
+        let prev_sha = commits[1].clone();
+
+        let show_spec = format!("{prev_sha}:{rel_path}");
+        let show_out = tokio::process::Command::new("git")
+            .args(["-C", repo_str, "show", &show_spec])
+            .output()
+            .await?;
+        if !show_out.status.success() {
+            let stderr = String::from_utf8_lossy(&show_out.stderr);
+            return Err(ServerError::Internal(format!(
+                "git show failed for '{show_spec}': {stderr}"
+            )));
+        }
+        let prev_yaml = String::from_utf8_lossy(&show_out.stdout).into_owned();
+
+        state
+            .git_runner
+            .checkout_new_branch(&state.repo_workdir, &branch)
+            .await?;
+        tokio::fs::write(&abs_path, &prev_yaml).await?;
+        state
+            .git_runner
+            .add(&state.repo_workdir, [rel_path.as_str()])
+            .await?;
+
+        let author = CommitAuthor::new(
+            auth.claims.name.as_deref().unwrap_or(&auth.claims.sub),
+            auth.claims.email.as_deref().unwrap_or("keel@keel.local"),
+        );
+        let commit_msg = format!("revert(core-addon): rollback {id} to {prev_sha}");
+        let sha = state
+            .git_runner
+            .commit(&state.repo_workdir, &commit_msg, &author)
+            .await?;
+        state
+            .git_runner
+            .push(&state.repo_workdir, "origin", &branch)
+            .await?;
+
+        let _ = state
+            .git_runner
+            .checkout_branch(&state.repo_workdir, "main")
+            .await;
+        (sha, prev_sha, rel_path)
+    };
+
+    let pr_req = CreatePrRequest::new(
+        format!("revert(core-addon): rollback {id}"),
+        format!(
+            "Automated management-plane core addon rollback for `{id}`\n\n- Target revision: `{prev_sha}`\n- Commit: `{commit_sha}`\n- Path: `{rel_path}`"
+        ),
+        &branch,
+    )
+    .with_tenant("management")
+    .with_author(format!(
+        "{} <{}>",
+        auth.claims.name.as_deref().unwrap_or(&auth.claims.sub),
+        auth.claims.email.as_deref().unwrap_or("keel@keel.local")
+    ));
+    let proposal = state.forge.create_pull_request(pr_req).await?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(ManagementAddonProposalResponse {
+            id,
+            proposal,
+            branch,
+        }),
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use keel_core::{AuthPhase, KEEL_SYSTEM_NAMESPACE};
+    use keel_git::{CommitAuthor, GitRunner, LocalGitProvider};
+    use keel_kube::{InMemorySecretStore, TelemetryMux};
+    use tempfile::TempDir;
+
+    use super::*;
+    use crate::auth::SessionClaims;
+
+    fn test_auth() -> AuthSession {
+        AuthSession {
+            claims: SessionClaims {
+                sub: "admin@keel.local".to_string(),
+                email: Some("admin@keel.local".to_string()),
+                name: Some("Keel Admin".to_string()),
+                groups: vec!["keel-admins".to_string()],
+                auth_phase: AuthPhase::OidcActive,
+                exp: Utc::now().timestamp() + 3600,
+            },
+        }
+    }
+
+    async fn setup_test_state() -> (TempDir, AppState, PathBuf) {
+        let temp_dir = tempfile::tempdir().expect("create tempdir");
+        let bare_repo = temp_dir.path().join("remote.git");
+        let workdir = temp_dir.path().join("workdir");
+
+        let git = GitRunner::new();
+        git.init_bare(&bare_repo).await.expect("init bare");
+        git.clone(bare_repo.to_str().unwrap(), &workdir)
+            .await
+            .expect("clone");
+
+        tokio::fs::create_dir_all(workdir.join("catalog/core/s3-state-backend"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            workdir.join("catalog/core/s3-state-backend/catalog.yaml"),
+            r#"apiVersion: keel.io/v1alpha1
+kind: CatalogApplication
+metadata:
+  id: s3-state-backend
+  name: SeaweedFS S3 Backend
+  description: Seed S3-compatible state backend
+  category: storage
+  runtime: helm
+spec:
+  upstream:
+    repoURL: https://seaweedfs.github.io/seaweedfs/helm
+    chart: seaweedfs
+    version: "4.53.0"
+  schema:
+    type: object
+    properties:
+      s3:
+        type: object
+"#,
+        )
+        .await
+        .unwrap();
+
+        tokio::fs::create_dir_all(workdir.join("clusters/management/core-addons"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            workdir.join("clusters/management/core-addons/s3-seaweedfs.yaml"),
+            r#"apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: s3-state-backend
+  namespace: keel-system
+  labels:
+    app.kubernetes.io/managed-by: keel
+    keel.io/protect: "true"
+spec:
+  interval: 10m
+  chart:
+    spec:
+      chart: seaweedfs
+      version: "4.53.0"
+  values:
+    s3:
+      enabled: true
+      enableAuth: true
+    master:
+      replicas: 1
+"#,
+        )
+        .await
+        .unwrap();
+
+        git.add(&workdir, ["."]).await.unwrap();
+        git.commit(
+            &workdir,
+            "chore: initial core addon seed",
+            &CommitAuthor::new("Keel Seed", "seed@keel.local"),
+        )
+        .await
+        .unwrap();
+        git.push(&workdir, "origin", "HEAD:refs/heads/main")
+            .await
+            .unwrap();
+
+        let forge = Arc::new(LocalGitProvider::new(&bare_repo));
+        let secret_store = Arc::new(InMemorySecretStore::new());
+        let state = AppState::new(
+            forge,
+            secret_store,
+            TelemetryMux::default(),
+            git,
+            &workdir,
+            bare_repo.to_string_lossy().to_string(),
+            AuthPhase::OidcActive,
+        );
+
+        (temp_dir, state, workdir)
+    }
+
+    #[tokio::test]
+    async fn get_catalog_returns_core_addons() {
+        let (_tmp, state, _workdir) = setup_test_state().await;
+        let Json(resp) = get_catalog(test_auth(), State(state))
+            .await
+            .expect("get_catalog succeeds");
+
+        assert_eq!(resp.core_addons.len(), 1);
+        assert_eq!(resp.core_addons[0].metadata.id, "s3-state-backend");
+    }
+
+    #[tokio::test]
+    async fn delete_release_rejects_protected_management_namespaces() {
+        let (_tmp, state, _workdir) = setup_test_state().await;
+
+        for ns in [KEEL_SYSTEM_NAMESPACE, "flux-system", "kyverno"] {
+            let err = delete_release(
+                test_auth(),
+                State(state.clone()),
+                AxumPath((ns.to_string(), "s3-state-backend".to_string())),
+            )
+            .await
+            .expect_err("protected namespace must be rejected");
+
+            match err {
+                ServerError::Forbidden(msg) => {
+                    assert_eq!(
+                        msg,
+                        "Protected management-plane base addon cannot be deleted via API"
+                    );
+                }
+                other => panic!("expected Forbidden, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn upgrade_management_addon_creates_branch_and_pr() {
+        let (_tmp, state, workdir) = setup_test_state().await;
+
+        let req = UpgradeManagementAddonRequest {
+            version: Some("4.54.0".to_string()),
+            values: json!({
+                "s3": {
+                    "enableAuth": false
+                },
+                "filer": {
+                    "replicas": 2
+                }
+            }),
+        };
+
+        let (status, Json(resp)) = upgrade_management_addon(
+            test_auth(),
+            State(state.clone()),
+            AxumPath("s3-state-backend".to_string()),
+            Json(req),
+        )
+        .await
+        .expect("upgrade_management_addon succeeds");
+
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(resp.id, "s3-state-backend");
+        assert!(
+            resp.branch
+                .starts_with("chore/core-addon-s3-state-backend-")
+        );
+        assert_eq!(resp.proposal.source_branch, resp.branch);
+
+        // Inspect updated file on the pushed branch
+        state
+            .git_runner
+            .checkout_branch(&workdir, &resp.branch)
+            .await
+            .unwrap();
+        let raw = tokio::fs::read_to_string(
+            workdir.join("clusters/management/core-addons/s3-seaweedfs.yaml"),
+        )
+        .await
+        .unwrap();
+        let doc: Value = serde_yml::from_str(&raw).unwrap();
+        assert_eq!(doc["spec"]["chart"]["spec"]["version"], "4.54.0");
+        assert_eq!(doc["spec"]["values"]["s3"]["enabled"], true);
+        assert_eq!(doc["spec"]["values"]["s3"]["enableAuth"], false);
+        assert_eq!(doc["spec"]["values"]["filer"]["replicas"], 2);
+        assert_eq!(doc["metadata"]["labels"]["keel.io/protect"], "true");
+    }
+
+    #[tokio::test]
+    async fn rollback_management_addon_requires_two_commits_and_reverts_when_present() {
+        let (_tmp, state, workdir) = setup_test_state().await;
+
+        // With only 1 commit, rollback must return BadRequest (400)
+        let err = rollback_management_addon(
+            test_auth(),
+            State(state.clone()),
+            AxumPath("s3-state-backend".to_string()),
+        )
+        .await
+        .expect_err("rollback with 1 commit should fail");
+        match err {
+            ServerError::BadRequest(msg) => {
+                assert_eq!(msg, "No previous revision found to roll back to");
+            }
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+
+        // Create a second commit on main modifying s3-seaweedfs.yaml
+        let addon_path = workdir.join("clusters/management/core-addons/s3-seaweedfs.yaml");
+        let original_yaml = tokio::fs::read_to_string(&addon_path).await.unwrap();
+        let updated_yaml = original_yaml.replace("4.53.0", "4.54.0");
+        tokio::fs::write(&addon_path, &updated_yaml).await.unwrap();
+        state
+            .git_runner
+            .add(
+                &workdir,
+                ["clusters/management/core-addons/s3-seaweedfs.yaml"],
+            )
+            .await
+            .unwrap();
+        state
+            .git_runner
+            .commit(
+                &workdir,
+                "chore(core-addon): bump s3-state-backend to 4.54.0",
+                &CommitAuthor::new("Keel Admin", "admin@keel.local"),
+            )
+            .await
+            .unwrap();
+        state
+            .git_runner
+            .push(&workdir, "origin", "HEAD:refs/heads/main")
+            .await
+            .unwrap();
+
+        // Now rollback should succeed and restore 4.53.0 on a revert branch + PR
+        let (status, Json(resp)) = rollback_management_addon(
+            test_auth(),
+            State(state.clone()),
+            AxumPath("s3-state-backend".to_string()),
+        )
+        .await
+        .expect("rollback with 2 commits succeeds");
+
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(resp.id, "s3-state-backend");
+        assert!(
+            resp.branch
+                .starts_with("revert/core-addon-s3-state-backend-")
+        );
+        assert_eq!(resp.proposal.source_branch, resp.branch);
+
+        state
+            .git_runner
+            .checkout_branch(&workdir, &resp.branch)
+            .await
+            .unwrap();
+        let reverted_raw = tokio::fs::read_to_string(&addon_path).await.unwrap();
+        assert_eq!(reverted_raw, original_yaml);
+    }
 }

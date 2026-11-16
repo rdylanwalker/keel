@@ -107,6 +107,14 @@ pub fn build_router(state: AppState) -> Router {
             post(routes::reconcile_release),
         )
         .route(
+            "/api/v1/management/addons/{id}/upgrade",
+            post(routes::upgrade_management_addon),
+        )
+        .route(
+            "/api/v1/management/addons/{id}/rollback",
+            post(routes::rollback_management_addon),
+        )
+        .route(
             "/api/v1/bundles/{namespace}/{name}/config",
             get(routes::get_bundle_config),
         )
