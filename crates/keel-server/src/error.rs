@@ -257,3 +257,125 @@ impl IntoResponse for ServerError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn server_error_variants_map_to_expected_status_codes() {
+        let cases = vec![
+            (
+                ServerError::Unauthorized("unauth".into()),
+                StatusCode::UNAUTHORIZED,
+            ),
+            (
+                ServerError::Forbidden("forbidden".into()),
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                ServerError::NotFound("missing".into()),
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                ServerError::BadRequest("bad".into()),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                ServerError::Conflict("conflict".into()),
+                StatusCode::CONFLICT,
+            ),
+            (
+                ServerError::ServiceUnavailable("down".into()),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                ServerError::SchemaValidation(vec![]),
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                ServerError::Core(CoreError::SchemaValidation(vec![])),
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                ServerError::Core(CoreError::Validation("invalid".into())),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                ServerError::Core(CoreError::CommandFailed {
+                    program: "sops".into(),
+                    message: "err".into(),
+                }),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            (
+                ServerError::Forge(ForgeError::NotFound("1".into())),
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                ServerError::Forge(ForgeError::InvalidState(
+                    "1".into(),
+                    keel_git::PullRequestState::Closed,
+                )),
+                StatusCode::CONFLICT,
+            ),
+            (
+                ServerError::Forge(ForgeError::MergeConflict("1".into(), "dirty".into())),
+                StatusCode::CONFLICT,
+            ),
+            (
+                ServerError::Forge(ForgeError::InvalidInput("bad".into())),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                ServerError::Forge(ForgeError::Api {
+                    status: 502,
+                    message: "timeout".into(),
+                }),
+                StatusCode::BAD_GATEWAY,
+            ),
+            (
+                ServerError::Git(GitError::InvalidArgument {
+                    field: "branch",
+                    reason: "bad".into(),
+                }),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                ServerError::Git(GitError::Io(std::io::Error::other("git io"))),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            (
+                ServerError::Pko(PkoError::Validation("bad stack".into())),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                ServerError::Pko(PkoError::PreviewParse("bad json".into())),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            (
+                ServerError::Kube(KubeError::InvalidInput("bad ns".into())),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                ServerError::Kube(KubeError::Json(
+                    serde_json::from_str::<serde_json::Value>("{").unwrap_err(),
+                )),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            (
+                ServerError::Io(std::io::Error::other("disk")),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            (
+                ServerError::Internal("oops".into()),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+        ];
+
+        for (err, expected) in cases {
+            let res = err.into_response();
+            assert_eq!(res.status(), expected);
+        }
+    }
+}
