@@ -39,7 +39,7 @@ AI agents **MUST NOT** violate the following constraints from `SDD.md`:
 
 1. **Provider-Agnostic Stage 0 Bootstrap Targets:**
    * Never hardcode Proxmox VE as a mandatory dependency in `keel-cli` or `keel-core`.
-   * All Stage 0 bootstrapping must flow through the `BootstrapTarget` trait (`kind`, `kubeconfig`, `proxmox`, `aws`, `gcp`, `azure`, `hetzner`), producing an identical seed control-plane layout (Flux CD, PKO v2, S3, SOPS/`age`, Kyverno, Envoy Gateway, Flagger) regardless of the underlying host.
+   * All Stage 0 bootstrapping must flow through the `BootstrapTarget` trait (`kind`, `kubeconfig`, `proxmox`, `aws`, `gcp`, `azure`, `hetzner`), producing an identical seed control-plane layout (Flux CD, PKO v2, S3, SOPS/`age`, Kyverno, Envoy Gateway, Flagger) regardless of the underlying host. All infrastructure-provisioning Stage 0 targets (`kind`, `proxmox`, `aws`, `gcp`, `azure`, `hetzner`) execute Pulumi YAML programs in `deploy/bootstrap/<target>/Pulumi.yaml` through `BootstrapTarget`, leaving only `--target kubeconfig` as direct cluster attachment.
    * Ensure Flux `GitRepository` manifests support outbound pull-polling (`interval: 1m`) so `kind` and local `k3s` clusters behind NAT/firewalls work without inbound webhooks.
 
 2. **No Crossplane or Custom Infrastructure CRDs:**

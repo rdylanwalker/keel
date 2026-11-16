@@ -68,19 +68,20 @@ flowchart TB
 ### 2.1 Stage 0: Provider-Agnostic Localhost Bootstrap (PR-Free Initialization)
 Because PKO v2 and Flux require a running Kubernetes cluster, Stage 0 executes directly from the `keel` binary on `localhost` without requiring an existing Git forge or PR workflow. Operators select one of three `BootstrapTarget` drivers:
 
-1. **Local / Existing Cluster (`--target kind` | `--target kubeconfig`):**
-   * `kind`: Invokes `kind create cluster` (via `tokio::process::Command`) with local ingress port mappings for zero-dependency workstation bootstrapping.
-   * `kubeconfig`: Connects directly to any pre-existing Kubernetes cluster (`k3s`, `Talos`, `microk8s`, or pre-provisioned cloud cluster) via `--kubeconfig` / `--context`.
-2. **On-Premises Hypervisor (`--target proxmox`):**
+1. **Local Container Cluster (`--target kind`):**
+   * Executes the built-in Stage 0 Pulumi program (`deploy/bootstrap/kind/Pulumi.yaml`) using `tehcyx/kind` to provision the `keel-mgmt` management cluster with local ingress port mappings for zero-dependency workstation bootstrapping.
+2. **Existing Cluster (`--target kubeconfig`):**
+   * Connects directly to any pre-existing Kubernetes cluster (`k3s`, `Talos`, `microk8s`, or pre-provisioned cloud cluster) via `--kubeconfig` / `--context`.
+3. **On-Premises Hypervisor (`--target proxmox`):**
    * Executes the built-in Stage 0 Pulumi program (`deploy/bootstrap/proxmox/`) using `bpg/proxmox` to provision `k3s` or `Talos Linux` VMs via `cloud-init`.
-3. **Public Cloud (`--target aws|gcp|azure|hetzner`):**
+4. **Public Cloud (`--target aws|gcp|azure|hetzner`):**
    * Executes a built-in Stage 0 Pulumi program (`deploy/bootstrap/<cloud>/`) to provision either cost-optimized VMs (`k3s`/`Talos`) or a managed Kubernetes cluster (`EKS`/`GKE`/`AKS`) alongside native S3-compatible object storage.
 
 #### Seed Control-Plane Installation (Identical Across All Targets)
 Once the seed cluster API is reachable, `keel bootstrap init` performs the exact same installation sequence regardless of target:
 1. Installs **Garage/MinIO S3** (or binds the cloud provider's S3-compatible bucket), **Flux CD**, **PKO v2**, **Kyverno**, **Envoy Gateway**, **Prometheus**, **Flagger**, **Dex** (Apache-2.0 in-cluster OIDC provider with username/password DB and extensible Google/Apple/Active Directory connectors, unless `--oidc-issuer` points to an external OIDC provider), and optional in-cluster **Forgejo/Gitea**.
 2. Generates a root **`age` keypair**, injects the private key into `flux-system/sops-age`, and writes `.sops.yaml` into the seed Git repository.
-3. For `proxmox` and cloud targets, uploads the Stage 0 Pulumi state to `s3://pulumi-state` and imports it into a Flux-managed PKO `Stack` CR (`management-cluster-core`) with `protect: true` enabled.
+3. For `kind`, `proxmox`, and cloud targets, uploads the Stage 0 Pulumi state to `s3://pulumi-state` and imports it into a Flux-managed PKO `Stack` CR (`management-cluster-core`) with `protect: true` enabled.
 4. Provisions the initial Dex admin user (`--admin-username` / `--admin-password`, or auto-generated credentials printed once to stdout) as a bcrypt-hashed `staticPasswords` entry in Dex, configures OIDC PKCE for `keel-server`, and exposes the portal on `http://localhost:8080` (via automatic port-forward to the in-cluster `keel-server` pod or cluster ingress).
 
 #### NAT / Firewall & Ephemeral Local Cluster Resilience
@@ -90,7 +91,7 @@ Once the seed cluster API is reachable, `keel bootstrap init` performs the exact
 ### 2.2 Stage 1: Self-Hosted Pivot & Anti-Lockout Guardrails
 Once the management cluster is healthy:
 1. **PR Enforcement Activation:** All subsequent infrastructure or application changes—whether triggered via GUI or CLI—create a Git branch, commit encrypted secrets via SOPS, open a PR via `ForgeProvider`, and spin up an ephemeral PKO preview.
-2. **Control-Plane Protection:** On `proxmox` and cloud targets, the seed cluster's core PKO `Stack` (`management-cluster-core`) carries `protect: true` flags on all control-plane VMs, clusters, and storage volumes.
+2. **Control-Plane Protection:** On `kind`, `proxmox`, and cloud targets, the seed cluster's core PKO `Stack` (`management-cluster-core`) carries `protect: true` flags on all control-plane VMs, clusters, and storage volumes.
 3. **Break-Glass Recovery:** If an operator ever damages the management cluster or in-cluster Git forge, `keel bootstrap recover --s3-endpoint <url>` pulls the versioned Pulumi state directly from S3 and executes a local recovery reconciliation.
 
 ### 2.3 Bootstrap & Handover Sequence
@@ -105,12 +106,10 @@ sequenceDiagram
     participant Git as Git Repo / Forge
 
     Op->>CLI: keel bootstrap init --target <kind|kubeconfig|proxmox|aws|gcp|azure|hetzner>
-    alt target == kind
-        CLI->>Target: kind create cluster --name keel-mgmt
-    else target == kubeconfig
+    alt target == kubeconfig
         CLI->>Target: Validate existing cluster connectivity
-    else target in [proxmox, aws, gcp, azure, hetzner]
-        CLI->>Target: Run Stage 0 Pulumi bootstrap stack (VMs / Managed K8s)
+    else target in [kind, proxmox, aws, gcp, azure, hetzner]
+        CLI->>Target: Run Stage 0 Pulumi bootstrap stack (Kind / VMs / Managed K8s)
     end
     Target-->>CLI: Cluster Kubeconfig & Endpoint
     CLI->>K8S: Install S3, Flux CD, PKO v2, Kyverno, Envoy, Flagger, Dex OIDC (+ optional Forge)
