@@ -1,3 +1,10 @@
+## [0.5.1](https://github.com/rdylanwalker/keel/compare/v0.5.0...v0.5.1) (2026-11-16)
+
+
+### Bug Fixes
+
+* **e2e:** set git author and cleanup partial kind cluster ([abfa1ae](https://github.com/rdylanwalker/keel/commit/abfa1ae39f2f5d87162beb89121cbc28f2f69b4a))
+
 # [0.5.0](https://github.com/rdylanwalker/keel/compare/v0.4.1...v0.5.0) (2026-11-16)
 
 
