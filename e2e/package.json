@@ -9,7 +9,8 @@
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
     "test": "playwright test",
-    "test:live": "KEEL_E2E_LIVE=1 playwright test tests/07-kind-live-e2e.spec.ts --project=chromium"
+    "test:live": "KEEL_E2E_LIVE=1 playwright test tests/07-kind-live-e2e.spec.ts --project=chromium",
+    "screenshots": "node ./scripts/capture-screenshots.mjs"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",

@@ -318,3 +318,7 @@ docs:
 # Build static documentation with mdBook
 docs-build:
     mdbook build
+
+# Capture/update UI screenshots via Playwright against a running keel server (default http://127.0.0.1:8080)
+screenshots *ARGS:
+    pnpm --dir e2e screenshots {{ARGS}}
