@@ -323,6 +323,31 @@ impl BootstrapTarget for PulumiBootstrapTarget {
     ) -> Result<ClusterConnection, CoreError> {
         self.ensure_target(cfg)?;
         let state_dir = self.state_dir(cfg);
+        if self.target == BootstrapTargetKind::Kind
+            && state_dir.exists()
+            && let Ok(output) = Command::new("kind")
+                .arg("get")
+                .arg("clusters")
+                .output()
+                .await
+            && output.status.success()
+        {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            if !parse_kind_clusters_output(&stdout, &cfg.cluster_name) {
+                tracing::info!(
+                    cluster = %cfg.cluster_name,
+                    state_dir = %state_dir.display(),
+                    "Clearing stale Stage 0 Pulumi state because kind cluster no longer exists"
+                );
+                let _ = tokio::fs::remove_dir_all(&state_dir).await;
+                let cp_state_dir = std::env::temp_dir()
+                    .join("keel-stage0-pulumi")
+                    .join(format!("control-plane-{}", cfg.cluster_name));
+                if cp_state_dir.exists() {
+                    let _ = tokio::fs::remove_dir_all(&cp_state_dir).await;
+                }
+            }
+        }
         tokio::fs::create_dir_all(&state_dir).await?;
         let program_dir = self.materialize_program_dir(cfg, &state_dir).await?;
 
@@ -523,6 +548,11 @@ struct NamedUser {
 }
 
 /// Parses and validates a Kubernetes `kubeconfig` YAML payload and optional context override.
+/// Returns `true` if `cluster_name` appears as an exact line in `kind get clusters` output.
+pub(crate) fn parse_kind_clusters_output(stdout: &str, cluster_name: &str) -> bool {
+    stdout.lines().any(|line| line.trim() == cluster_name)
+}
+
 pub fn validate_kubeconfig_yaml(
     yaml: &str,
     requested_context: Option<&str>,
@@ -992,5 +1022,18 @@ contexts:
 
         let _ = tokio::fs::remove_dir_all(driver.state_dir(&cfg)).await;
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    #[test]
+    fn test_parse_kind_clusters_output() {
+        let out = "keel-mgmt\nworkload-dev\n";
+        assert!(parse_kind_clusters_output(out, "keel-mgmt"));
+        assert!(parse_kind_clusters_output(out, "workload-dev"));
+        assert!(!parse_kind_clusters_output(out, "keel-mgmt-2"));
+        assert!(!parse_kind_clusters_output(
+            "No kind clusters found.\n",
+            "keel-mgmt"
+        ));
+        assert!(!parse_kind_clusters_output("", "keel-mgmt"));
     }
 }
