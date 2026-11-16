@@ -26,48 +26,8 @@ import {
   TenantSummary,
 } from "../types/api"
 import { createProposal, fetchCatalogSchema } from "../lib/api"
+import { extractSchemaDefaults } from "../lib/schemaBuilder"
 import { jsonToYaml } from "../lib/utils"
-
-export function extractSchemaDefaults(
-  schema?: Record<string, unknown>,
-  defaultValues?: Record<string, unknown>
-): Record<string, unknown> {
-  const result: Record<string, unknown> = { ...(defaultValues ?? {}) }
-  const properties = schema?.properties
-  if (
-    !properties ||
-    typeof properties !== "object" ||
-    Array.isArray(properties)
-  ) {
-    return result
-  }
-  for (const [key, rawProp] of Object.entries(
-    properties as Record<string, unknown>
-  )) {
-    if (!rawProp || typeof rawProp !== "object" || Array.isArray(rawProp)) {
-      continue
-    }
-    const prop = rawProp as Record<string, unknown>
-    if (result[key] === undefined && prop.default !== undefined) {
-      result[key] = prop.default
-    } else if (
-      prop.type === "object" &&
-      prop.properties &&
-      typeof prop.properties === "object"
-    ) {
-      const nested = extractSchemaDefaults(
-        prop,
-        result[key] && typeof result[key] === "object"
-          ? (result[key] as Record<string, unknown>)
-          : undefined
-      )
-      if (Object.keys(nested).length > 0) {
-        result[key] = nested
-      }
-    }
-  }
-  return result
-}
 
 const RjsfAddButton: React.FC<IconButtonProps> = ({
   onClick,
