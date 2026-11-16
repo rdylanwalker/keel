@@ -1,0 +1,60 @@
+name: Bootstrap Friction / Target Report
+description: Report an issue or share test results from `keel bootstrap init` (kind, kubeconfig, Proxmox, or cloud targets)
+title: "[Bootstrap] "
+labels: ["alpha-feedback", "bootstrap"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for testing Keel in early alpha! Tell us what happened during Stage 0 (`keel bootstrap init`)—even small papercuts or confusing docs are super helpful.
+  - type: dropdown
+    id: target
+    attributes:
+      label: Bootstrap Target
+      options:
+        - kind
+        - kubeconfig (k3s / Talos / existing K8s)
+        - proxmox
+        - hetzner
+        - aws
+        - gcp
+        - azure
+    validations:
+      required: true
+  - type: dropdown
+    id: outcome
+    attributes:
+      label: Outcome
+      options:
+        - Failed during infrastructure provisioning
+        - Failed during control-plane seed install
+        - Succeeded, but had UX / docs friction
+        - Succeeded cleanly (sharing test report!)
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: OS & Tool Versions
+      placeholder: "e.g., Ubuntu 24.04, keel v0.5.0, Docker 27.x, Pulumi 3.x"
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Command Run (redact any secrets/tokens)
+      render: bash
+      placeholder: |
+        keel bootstrap init --target kind --with-forge
+  - type: textarea
+    id: logs
+    attributes:
+      label: Error Output / What Happened
+      description: Paste relevant logs or describe where you got stuck.
+      validations:
+        required: true
+  - type: textarea
+    id: suggestions
+    attributes:
+      label: What would have made this smoother?
+      description: Optional — docs, flags, error messages, defaults, etc.

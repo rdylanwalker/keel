@@ -3,8 +3,21 @@ import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { DemoRecorder } from '../scripts/demo-recorder.js';
 
 const LIVE_ENABLED = process.env.KEEL_E2E_LIVE === '1';
+const RECORD_DEMO = process.env.KEEL_E2E_RECORD_DEMO === '1';
+const DEMO_GIF_PATH = path.resolve(
+  process.cwd(),
+  process.env.KEEL_DEMO_GIF_PATH || '../docs/assets/demo.gif',
+);
+
+if (RECORD_DEMO) {
+  test.use({
+    viewport: { width: 1280, height: 800 },
+    video: 'on',
+  });
+}
 const MGMT_CLUSTER = process.env.KEEL_E2E_MGMT_CLUSTER || 'keel-mgmt';
 const WORKLOAD_CLUSTER = process.env.KEEL_E2E_WORKLOAD_CLUSTER || 'e2e-lab';
 const BASE_URL = process.env.KEEL_BASE_URL || 'http://127.0.0.1:8080';
@@ -276,10 +289,13 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
   test('07.1 - CLI standalone app on mgmt -> GUI bundle workload kind cluster -> GUI standalone canary app on workload cluster', async ({
     page,
   }) => {
+    const demo = new DemoRecorder(RECORD_DEMO);
+
     await test.step('1. Authenticate in GUI via Dex OIDC', async () => {
       logStep('Opening GUI and signing in via Dex OIDC...');
       await page.goto('/');
       await expect(page.getByText('Keel Control Plane')).toBeVisible();
+      await demo.capture(page, 'login-page', 700);
 
       if (await page.getByText('Authentication Required').isVisible()) {
         await page
@@ -301,6 +317,7 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
       await expect(page.getByText('management-cluster-core', { exact: true })).toBeVisible({
         timeout: 30_000,
       });
+      await demo.capture(page, 'topology-mgmt-initial', 1000);
       logStep('Authenticated and management-cluster-core is visible');
     });
 
@@ -375,11 +392,13 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
       await expect(page.getByRole('button', { name: /Merge PR/i }).first()).toBeVisible({
         timeout: 15_000,
       });
+      await demo.capture(page, 'pr-inspector-cli-podinfo', 900);
       await page
         .getByRole('button', { name: /Merge PR/i })
         .first()
         .click();
       await expect(page.getByText(/merged cleanly/i)).toBeVisible({ timeout: 20_000 });
+      await demo.capture(page, 'pr-merged-cli-podinfo', 700);
       await waitForK8sReady('helmrelease', 'podinfo', 'tenant-default', 180_000);
     });
 
@@ -401,21 +420,26 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
           .filter({ has: page.getByText('kind-canary-platform', { exact: true }) })
           .first();
         await expect(bundleCard).toBeVisible({ timeout: 15_000 });
+        await demo.capture(page, 'catalog-list', 900);
         await bundleCard.getByRole('button', { name: 'Create' }).click();
 
         await page.locator('#instance-name-input').fill(WORKLOAD_CLUSTER);
+        await demo.capture(page, 'catalog-bundle-form', 900);
         await page.getByRole('button', { name: /Submit & Open Git PR Proposal/i }).click();
         await expect(page.getByText(/Git PR Proposal Successfully Opened!/i)).toBeVisible({
           timeout: 20_000,
         });
+        await demo.capture(page, 'bundle-pr-opened', 700);
 
         logStep('Merging kind-canary-platform bundle PR...');
         await page.getByRole('button', { name: /PR & Preview Inspector/i }).click();
+        await demo.burst(page, 'bundle-preview-inspector', 3, 400, 400);
         await page
           .getByRole('button', { name: /Merge PR/i })
           .first()
           .click();
         await expect(page.getByText(/merged cleanly/i)).toBeVisible({ timeout: 20_000 });
+        await demo.capture(page, 'bundle-pr-merged', 700);
       }
 
       await waitForK8sReady('stack', `${WORKLOAD_CLUSTER}-cluster`, 'tenant-default', 300_000);
@@ -469,6 +493,7 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
         if (await apiTokenInput.isVisible()) {
           await apiTokenInput.fill('e2e-workload-token-1234');
         }
+        await demo.capture(page, 'canary-app-form', 900);
         await page.getByRole('button', { name: /Submit & Open Git PR Proposal/i }).click();
         await expect(page.getByText(/Git PR Proposal Successfully Opened!/i)).toBeVisible({
           timeout: 20_000,
@@ -476,6 +501,7 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
 
         logStep('Merging workload-cluster podinfo PR...');
         await page.getByRole('button', { name: /PR & Preview Inspector/i }).click();
+        await demo.capture(page, 'canary-app-pr-inspector', 900);
         await page
           .getByRole('button', { name: /Merge PR/i })
           .first()
@@ -500,6 +526,8 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
         timeout: 20_000,
       });
       await expect(page.getByText(workloadAppName).first()).toBeVisible({ timeout: 20_000 });
+      await demo.burst(page, 'topology-final', 3, 500, 900);
+      await demo.finish(DEMO_GIF_PATH);
       logStep('Topology Map verification complete');
     });
   });

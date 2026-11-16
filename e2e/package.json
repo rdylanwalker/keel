@@ -10,14 +10,18 @@
     "typecheck": "tsc --noEmit",
     "test": "playwright test",
     "test:live": "KEEL_E2E_LIVE=1 playwright test tests/07-kind-live-e2e.spec.ts --project=chromium",
+    "demo:gif": "KEEL_E2E_LIVE=1 KEEL_E2E_RECORD_DEMO=1 playwright test tests/07-kind-live-e2e.spec.ts --project=chromium",
     "screenshots": "node ./scripts/capture-screenshots.mjs"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
     "@playwright/test": "^1.65.1",
     "@types/node": "^26.6.6",
+    "@types/pngjs": "^6.0.5",
     "eslint": "^10.15.0",
     "eslint-config-prettier": "^10.1.8",
+    "gifenc": "^1.0.3",
+    "pngjs": "^7.0.0",
     "prettier": "^3.10.1",
     "typescript": "^6.0.0",
     "typescript-eslint": "^8.72.2"

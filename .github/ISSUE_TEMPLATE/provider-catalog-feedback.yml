@@ -1,0 +1,39 @@
+name: Provider / Catalog / Form UX Feedback
+description: Report issues with Day-1 infrastructure providers, `catalog.yaml` schemas, `@rjsf/core` forms, or request a new blueprint
+title: "[Provider/Catalog] "
+labels: ["alpha-feedback", "catalog"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Share feedback on Day-1 providers (`proxmox`, `aws`, `gcp`, `azure`, `hetzner`, `cloudflare`, custom TF/OpenTofu), `catalog.yaml` schemas, or request a new app/infra blueprint.
+  - type: dropdown
+    id: category
+    attributes:
+      label: Feedback Area
+      options:
+        - Day-1 Infrastructure Provider test report
+        - Custom OpenTofu / Terraform bridge provider
+        - Catalog form UX (@rjsf/core / JSON Schema)
+        - Request a new catalog app or infra blueprint
+    validations:
+      required: true
+  - type: input
+    id: provider_or_chart
+    attributes:
+      label: Provider / Helm Chart / Blueprint Name
+      placeholder: "e.g., bpg/proxmox, bitnami/postgresql, hetzner-k3s"
+    validations:
+      required: true
+  - type: textarea
+    id: details
+    attributes:
+      label: Details
+      description: Describe what you tried, what worked or failed, or what blueprint you'd like to see.
+      validations:
+        required: true
+  - type: textarea
+    id: schema_snippet
+    attributes:
+      label: Relevant `catalog.yaml` or Values Snippet (optional)
+      render: yaml

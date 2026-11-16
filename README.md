@@ -12,6 +12,16 @@ Keel is a single-binary **Rust** control plane and **React** web portal that boo
 
 ---
 
+## Live Demo (`kind` + Forgejo + Dex + Flux + PKO v2)
+
+<p align="center">
+  <img src="./docs/assets/demo.gif" alt="Keel Live Demo: OIDC login, self-service catalog PRs, PKO v2 preview & merge, workload kind cluster + canary app, and Topology Map" width="900" />
+</p>
+
+*Recorded directly from the live `kind` E2E workflow (`pnpm --dir e2e demo:gif`): OIDC login → CLI & GUI PR proposals → PKO v2 diff & merge → provisioning a workload `kind` cluster + canary `podinfo` → live Topology Map.*
+
+---
+
 ## Core Capabilities
 
 * **Provider-Agnostic Zero-to-Cloud Self-Bootstrapping:** Start from a compiled `keel` binary on `localhost` using `kind`, an existing `kubeconfig`, Proxmox VE, or a public cloud to initialize a seed management cluster complete with **Flux CD**, **Pulumi Kubernetes Operator (PKO v2)**, **SeaweedFS S3**, **SOPS + `age`**, **Dex** OIDC (or external OIDC), and optional in-cluster **Forgejo**.
@@ -20,6 +30,50 @@ Keel is a single-binary **Rust** control plane and **React** web portal that boo
 * **Multi-Cloud & Arbitrary OpenTofu/Terraform Providers:** Manage **Proxmox VE** (`bpg/proxmox`), **AWS**, **GCP**, **Azure**, **Hetzner**, and **Cloudflare**—or enable any future registry provider dynamically via Pulumi's OpenTofu/Terraform bridge without recompiling Keel.
 * **Progressive Delivery:** Opt-in **Flagger + Envoy Gateway** canary rollouts with Prometheus metric rollback for stateless Kubernetes services.
 * **Multi-Tenant Isolation & Anti-Lockout Guardrails:** Namespace-per-tenant boundaries, per-tenant `age` encryption keys, **Kyverno** admission policies, `protect: true` control-plane stacks, and break-glass S3 recovery (`keel bootstrap recover`).
+
+---
+
+## Alpha Status & Support Matrix
+
+> **Early Alpha Notice:** Keel is in active early alpha. The local `kind` + in-cluster Forgejo/Dex workflow is continuously tested end-to-end in CI, while cloud/hypervisor targets and external forges are implemented and ready for early-adopter testing. Feedback, bug reports, and real-world test reports on any ⚠️ target are especially welcome!
+
+**Legend:** ✅ Tested in Live E2E &nbsp;|&nbsp; ⚠️ Implemented / Experimental (Unit-Tested, Needs Real-World Testing) &nbsp;|&nbsp; ❌ Not Yet Supported
+
+### Stage 0 Bootstrap Targets (`keel bootstrap init`)
+
+| Target | Driver / Template | Status | Notes |
+| :--- | :--- | :---: | :--- |
+| **Local `kind`** | `deploy/bootstrap/kind/Pulumi.yaml` (`tehcyx/kind`) | ✅ | Primary dev & CI live-E2E path (`--local-dev-docker-socket-exception`) |
+| **Existing Cluster (`kubeconfig`)** | `KubeconfigBootstrapTarget` (`k3s`, `Talos`, managed K8s) | ⚠️ | Unit-tested; ready for community testing on `k3s` / `Talos` / EKS / GKE |
+| **Proxmox VE** | `deploy/bootstrap/proxmox/Pulumi.yaml` (`bpg/proxmox`) | ⚠️ | Template & `PulumiBootstrapTarget` wired; needs real PVE cluster validation |
+| **Hetzner Cloud** | `deploy/bootstrap/hetzner/Pulumi.yaml` (`pulumi/hcloud`) | ⚠️ | Template & `PulumiBootstrapTarget` wired; needs live account validation |
+| **AWS** | `deploy/bootstrap/aws/Pulumi.yaml` (`pulumi/aws`) | ⚠️ | Template & `PulumiBootstrapTarget` wired; needs live account validation |
+| **GCP** | `deploy/bootstrap/gcp/Pulumi.yaml` (`pulumi/gcp`) | ⚠️ | Template & `PulumiBootstrapTarget` wired; needs live account validation |
+| **Azure** | `deploy/bootstrap/azure/Pulumi.yaml` (`pulumi/azure-native`) | ⚠️ | Template & `PulumiBootstrapTarget` wired; needs live account validation |
+
+### Default Day-1 Infrastructure Providers (`deploy/seed/providers/registry.yaml`)
+
+| Provider | Plugin | Default State | Status | Notes |
+| :--- | :--- | :--- | :---: | :--- |
+| **kind** | `tehcyx/kind` (TF bridge) | Enabled | ✅ | Provisions workload `kind` clusters in live E2E |
+| **Proxmox VE** | `bpg/proxmox` (TF bridge) | Disabled | ⚠️ | Enable via **Topology → Providers**; needs PVE feedback |
+| **AWS** | `pulumi/aws` | Disabled | ⚠️ | Enable via **Topology → Providers**; needs live testing |
+| **GCP** | `pulumi/gcp` | Disabled | ⚠️ | Enable via **Topology → Providers**; needs live testing |
+| **Azure** | `pulumi/azure-native` | Disabled | ⚠️ | Enable via **Topology → Providers**; needs live testing |
+| **Hetzner Cloud** | `pulumi/hcloud` | Disabled | ⚠️ | Enable via **Topology → Providers**; needs live testing |
+| **Cloudflare** | `pulumi/cloudflare` | Disabled | ⚠️ | Enable via **Topology → Providers**; needs live testing |
+| **Custom OpenTofu / TF** | `terraform-provider` bridge | Opt-in | ⚠️ | Add dynamically via UI/Git PR without recompiling Keel |
+
+### Git Forges (`ForgeProvider`)
+
+| Forge | Mode | Status | Notes |
+| :--- | :--- | :---: | :--- |
+| **Forgejo / Gitea** | In-cluster (`--with-forge`) or external | ✅ | Tested in live `kind` E2E |
+| **Local Bare Git** | Local filesystem (`--repo-dir`) | ✅ | Default when `--with-forge` is omitted (no PRs/Flux remote polling) |
+| **GitHub** | External API + SSH/HTTPS | ⚠️ | Implemented & unit-tested; needs live PR/preview feedback |
+| **GitLab** | External API + SSH/HTTPS | ⚠️ | Implemented & unit-tested; needs live PR/preview feedback |
+
+**Have you tested one of the ⚠️ targets?** [Open a Bootstrap or Provider Feedback issue](https://github.com/rdylanwalker/keel/issues/new/choose) with what worked or where it broke.
 
 ---
 

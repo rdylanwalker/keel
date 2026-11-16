@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Online Documentation
+    url: https://rdylanwalker.github.io/keel/
+    about: Setup guides, CLI reference, and architecture docs
+  - name: Architecture & Spec (SDD.md)
+    url: https://github.com/rdylanwalker/keel/blob/main/SDD.md
+    about: Full Spec-Driven Development specification and NFRs
