@@ -269,6 +269,7 @@ pub async fn toggle_provider(
     AxumPath(id): AxumPath<String>,
     Json(req): Json<ToggleProviderRequest>,
 ) -> Result<Json<ToggleProviderResponse>, ServerError> {
+    auth.require_admin()?;
     validate_dns_label(&id, "id")?;
 
     let mut registry = load_provider_registry(&state.repo_workdir).await?;
@@ -451,6 +452,7 @@ pub async fn register_catalog_app(
     State(state): State<AppState>,
     Json(req): Json<RegisterCatalogAppRequest>,
 ) -> Result<(StatusCode, Json<RegisterCatalogAppResponse>), ServerError> {
+    auth.require_admin()?;
     validate_dns_label(&req.id, "id")?;
 
     match req.kind.as_str() {
@@ -1067,6 +1069,7 @@ pub async fn update_catalog_item(
     axum::extract::Path((kind, id)): axum::extract::Path<(String, String)>,
     Json(req): Json<UpdateCatalogItemRequest>,
 ) -> Result<(StatusCode, Json<RegisterCatalogAppResponse>), ServerError> {
+    auth.require_admin()?;
     validate_dns_label(&id, "id")?;
     let normalized_kind = match kind.as_str() {
         "app" => "app",
@@ -1426,29 +1429,103 @@ fn yaml_value_to_json_schema(val: &Value) -> Value {
     }
 }
 
+fn is_disallowed_ssrf_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_multicast()
+                || (v4.octets()[0] == 100 && (v4.octets()[1] & 0b1100_0000) == 64)
+        }
+        std::net::IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || (v6.segments()[0] & 0xfe00) == 0xfc00
+                || (v6.segments()[0] & 0xffc0) == 0xfe80
+        }
+    }
+}
+
+async fn validate_upstream_helm_repo_url(repo_url: &str) -> Result<url::Url, ServerError> {
+    let parsed = url::Url::parse(repo_url).map_err(|_| {
+        ServerError::BadRequest(
+            "repoUrl must be a valid http://, https://, or oci:// URL".to_string(),
+        )
+    })?;
+    if !matches!(parsed.scheme(), "http" | "https" | "oci") {
+        return Err(ServerError::BadRequest(
+            "repoUrl must start with http://, https://, or oci://".to_string(),
+        ));
+    }
+    if parsed.username() != "" || parsed.password().is_some() {
+        return Err(ServerError::BadRequest(
+            "repoUrl must not contain embedded credentials".to_string(),
+        ));
+    }
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| ServerError::BadRequest("repoUrl must include a valid host".to_string()))?;
+    if host.eq_ignore_ascii_case("localhost")
+        || host.ends_with(".local")
+        || host.ends_with(".internal")
+        || host.ends_with(".cluster.local")
+    {
+        return Err(ServerError::BadRequest(
+            "repoUrl host is not permitted (private/cluster-internal hosts are blocked)"
+                .to_string(),
+        ));
+    }
+    if let Ok(ip) = host
+        .trim_matches(|c| c == '[' || c == ']')
+        .parse::<std::net::IpAddr>()
+        && is_disallowed_ssrf_ip(ip)
+    {
+        return Err(ServerError::BadRequest(
+            "repoUrl IP address is not permitted (private/loopback/link-local ranges are blocked)"
+                .to_string(),
+        ));
+    }
+    let port = parsed.port_or_known_default().unwrap_or(443);
+    if let Ok(addrs) = tokio::net::lookup_host((host, port)).await {
+        for addr in addrs {
+            if is_disallowed_ssrf_ip(addr.ip()) {
+                return Err(ServerError::BadRequest(
+                    "repoUrl resolves to a disallowed private/loopback/link-local IP".to_string(),
+                ));
+            }
+        }
+    }
+    Ok(parsed)
+}
+
 async fn fetch_upstream_helm_schema(
     repo_url: &str,
     chart: &str,
     version: Option<&str>,
 ) -> Result<(Value, String), ServerError> {
+    const MAX_SCHEMA_BYTES: u64 = 2 * 1024 * 1024;
     let repo_url = repo_url.trim();
     let chart = chart.trim();
-    if !(repo_url.starts_with("http://")
-        || repo_url.starts_with("https://")
-        || repo_url.starts_with("oci://"))
+    let _validated_url = validate_upstream_helm_repo_url(repo_url).await?;
+    if chart.is_empty()
+        || chart.starts_with('-')
+        || chart.contains("..")
+        || chart.contains('/')
+        || chart.contains('\\')
+        || chart.contains('\0')
+        || chart.chars().any(char::is_whitespace)
     {
-        return Err(ServerError::BadRequest(
-            "repoUrl must start with http://, https://, or oci://".to_string(),
-        ));
-    }
-    if chart.is_empty() || chart.starts_with('-') || chart.contains("..") || chart.contains(' ') {
         return Err(ServerError::BadRequest(
             "invalid Helm chart name".to_string(),
         ));
     }
     if let Some(v) = version {
         let v = v.trim();
-        if v.starts_with('-') || v.contains(' ') {
+        if v.starts_with('-') || v.contains('\0') || v.chars().any(char::is_whitespace) {
             return Err(ServerError::BadRequest(
                 "invalid Helm chart version".to_string(),
             ));
@@ -1475,11 +1552,16 @@ async fn fetch_upstream_helm_schema(
     args.push("--untardir".to_string());
     args.push(tmp_path);
 
-    let output = tokio::process::Command::new("helm")
-        .args(&args)
-        .output()
-        .await
-        .map_err(|e| ServerError::Internal(format!("failed to invoke helm CLI: {e}")))?;
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        tokio::process::Command::new("helm").args(&args).output(),
+    )
+    .await
+    .map_err(|_| {
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        ServerError::Internal("helm pull timed out after 30s".to_string())
+    })?
+    .map_err(|e| ServerError::Internal(format!("failed to invoke helm CLI: {e}")))?;
 
     if !output.status.success() {
         let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
@@ -1496,6 +1578,13 @@ async fn fetch_upstream_helm_schema(
         .await
         .unwrap_or(false)
     {
+        let meta = tokio::fs::metadata(&schema_json_path).await?;
+        if meta.len() > MAX_SCHEMA_BYTES {
+            let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
+            return Err(ServerError::BadRequest(
+                "upstream values.schema.json exceeds 2 MiB size limit".to_string(),
+            ));
+        }
         let raw = tokio::fs::read_to_string(&schema_json_path).await?;
         let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
         let parsed: Value = serde_json::from_str(&raw).map_err(|e| {
@@ -1509,6 +1598,13 @@ async fn fetch_upstream_helm_schema(
         .await
         .unwrap_or(false)
     {
+        let meta = tokio::fs::metadata(&values_yaml_path).await?;
+        if meta.len() > MAX_SCHEMA_BYTES {
+            let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
+            return Err(ServerError::BadRequest(
+                "upstream values.yaml exceeds 2 MiB size limit".to_string(),
+            ));
+        }
         let raw = tokio::fs::read_to_string(&values_yaml_path).await?;
         let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
         let parsed: Value = serde_yml::from_str(&raw)
@@ -1607,6 +1703,7 @@ pub async fn create_tenant(
     State(state): State<AppState>,
     Json(req): Json<CreateTenantRequest>,
 ) -> Result<(StatusCode, Json<CreateTenantResponse>), ServerError> {
+    auth.require_admin()?;
     validate_dns_label(&req.id, "id")?;
     let namespace = tenant_namespace(&req.id)?;
 
@@ -1735,6 +1832,8 @@ pub async fn delete_tenant(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<DeleteTenantResponse>, ServerError> {
+    auth.require_admin()?;
+    validate_dns_label(&id, "id")?;
     if id == "default" {
         return Err(ServerError::BadRequest(
             "Cannot delete the 'default' tenant".to_string(),
@@ -1973,6 +2072,7 @@ pub async fn create_proposal(
     Json(req): Json<CreateProposalRequest>,
 ) -> Result<(StatusCode, Json<CreateProposalResponse>), ServerError> {
     validate_dns_label(&req.tenant, "tenant")?;
+    auth.require_tenant_access(&req.tenant)?;
     validate_dns_label(&req.catalog_id, "catalog_id")?;
 
     let instance_name = req
@@ -3759,10 +3859,11 @@ pub struct MergeProposalResponse {
 
 /// `POST /api/v1/proposals/{pr_id}/merge`
 pub async fn merge_proposal(
-    _auth: AuthSession,
+    auth: AuthSession,
     State(state): State<AppState>,
     AxumPath(pr_id): AxumPath<String>,
 ) -> Result<Json<MergeProposalResponse>, ServerError> {
+    auth.require_admin()?;
     let merged = state.forge.merge_pull_request(&pr_id).await?;
 
     // Sync local repo_workdir to origin/main so subsequent catalog/tenant/stack/release reads reflect the merge.
@@ -3804,10 +3905,11 @@ pub async fn merge_proposal(
 ///
 /// Closes an open PR without merging and garbage-collects any ephemeral PKO preview resources.
 pub async fn reject_proposal(
-    _auth: AuthSession,
+    auth: AuthSession,
     State(state): State<AppState>,
     AxumPath(pr_id): AxumPath<String>,
 ) -> Result<Json<MergeProposalResponse>, ServerError> {
+    auth.require_admin()?;
     let closed = state.forge.close_pull_request(&pr_id).await?;
 
     let cached = state.preview_cache.write().await.remove(&pr_id);
@@ -3836,10 +3938,11 @@ pub async fn reject_proposal(
 ///
 /// Reopens a previously closed PR proposal via the configured [`ForgeProvider`].
 pub async fn reopen_proposal(
-    _auth: AuthSession,
+    auth: AuthSession,
     State(state): State<AppState>,
     AxumPath(pr_id): AxumPath<String>,
 ) -> Result<Json<MergeProposalResponse>, ServerError> {
+    auth.require_admin()?;
     let reopened = state.forge.reopen_pull_request(&pr_id).await?;
 
     Ok(Json(MergeProposalResponse {
@@ -4031,6 +4134,7 @@ async fn delete_gitops_resource_pr(
 
     let tenant = namespace.strip_prefix("tenant-").unwrap_or(&namespace);
     validate_dns_label(tenant, "tenant")?;
+    auth.require_tenant_access(tenant)?;
 
     let timestamp = Utc::now().timestamp().max(1) as u64;
     let action_label = format!("delete-{name}");
@@ -4518,12 +4622,14 @@ pub struct RestartStackResponse {
 ///
 /// Triggers a `kubectl rollout restart` equivalent on `<name>-workspace` StatefulSet.
 pub async fn restart_stack_workspace(
-    _auth: AuthSession,
+    auth: AuthSession,
     State(state): State<AppState>,
     AxumPath((namespace, name)): AxumPath<(String, String)>,
 ) -> Result<Json<RestartStackResponse>, ServerError> {
     validate_dns_label(&namespace, "namespace")?;
     validate_dns_label(&name, "name")?;
+    let tenant = namespace.strip_prefix("tenant-").unwrap_or(&namespace);
+    auth.require_tenant_access(tenant)?;
 
     let message = state
         .state_provider
@@ -4552,12 +4658,14 @@ pub struct ReconcileReleaseResponse {
 /// Annotates a Flux `HelmRelease` (or `Kustomization`) with `reconcile.fluxcd.io/requestedAt`
 /// to trigger immediate reconciliation.
 pub async fn reconcile_release(
-    _auth: AuthSession,
+    auth: AuthSession,
     State(state): State<AppState>,
     AxumPath((namespace, name)): AxumPath<(String, String)>,
 ) -> Result<Json<ReconcileReleaseResponse>, ServerError> {
     validate_dns_label(&namespace, "namespace")?;
     validate_dns_label(&name, "name")?;
+    let tenant = namespace.strip_prefix("tenant-").unwrap_or(&namespace);
+    auth.require_tenant_access(tenant)?;
 
     let message = state
         .state_provider
@@ -4804,6 +4912,7 @@ pub async fn upgrade_management_addon(
     AxumPath(id): AxumPath<String>,
     Json(req): Json<UpgradeManagementAddonRequest>,
 ) -> Result<(StatusCode, Json<ManagementAddonProposalResponse>), ServerError> {
+    auth.require_admin()?;
     validate_dns_label(&id, "id")?;
 
     let timestamp = Utc::now().timestamp().max(1) as u64;
@@ -4972,6 +5081,7 @@ pub async fn rollback_management_addon(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<(StatusCode, Json<ManagementAddonProposalResponse>), ServerError> {
+    auth.require_admin()?;
     validate_dns_label(&id, "id")?;
 
     let timestamp = Utc::now().timestamp().max(1) as u64;
@@ -4986,36 +5096,10 @@ pub async fn rollback_management_addon(
 
         let (abs_path, rel_path, _doc) = find_core_addon_manifest(&state.repo_workdir, &id).await?;
 
-        let repo_str = state.repo_workdir.to_str().ok_or_else(|| {
-            ServerError::Internal("Repository workdir path is not valid UTF-8".to_string())
-        })?;
-
-        let log_out = tokio::process::Command::new("git")
-            .args([
-                "-C",
-                repo_str,
-                "log",
-                "-n",
-                "2",
-                "--format=%H",
-                "--",
-                &rel_path,
-            ])
-            .output()
+        let commits = state
+            .git_runner
+            .log_file_commits(&state.repo_workdir, &rel_path, 2)
             .await?;
-        if !log_out.status.success() {
-            let stderr = String::from_utf8_lossy(&log_out.stderr);
-            return Err(ServerError::Internal(format!(
-                "git log failed for '{rel_path}': {stderr}"
-            )));
-        }
-
-        let commits: Vec<String> = String::from_utf8_lossy(&log_out.stdout)
-            .lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty())
-            .map(str::to_string)
-            .collect();
         if commits.len() < 2 {
             return Err(ServerError::BadRequest(
                 "No previous revision found to roll back to".to_string(),
@@ -5023,18 +5107,15 @@ pub async fn rollback_management_addon(
         }
         let prev_sha = commits[1].clone();
 
-        let show_spec = format!("{prev_sha}:{rel_path}");
-        let show_out = tokio::process::Command::new("git")
-            .args(["-C", repo_str, "show", &show_spec])
-            .output()
-            .await?;
-        if !show_out.status.success() {
-            let stderr = String::from_utf8_lossy(&show_out.stderr);
-            return Err(ServerError::Internal(format!(
-                "git show failed for '{show_spec}': {stderr}"
-            )));
-        }
-        let prev_yaml = String::from_utf8_lossy(&show_out.stdout).into_owned();
+        let prev_yaml = state
+            .git_runner
+            .show_file_at_ref(&state.repo_workdir, &prev_sha, &rel_path)
+            .await?
+            .ok_or_else(|| {
+                ServerError::Internal(format!(
+                    "Previous revision '{prev_sha}:{rel_path}' not found"
+                ))
+            })?;
 
         state
             .git_runner

@@ -51,3 +51,5 @@ tokio-stream = "0.1"
 base64 = "0.22"
 hex = "0.4"
 bcrypt = "0.17"
+jsonwebtoken = { version = "12", features = ["rust_crypto"] }
+url = "2.5"

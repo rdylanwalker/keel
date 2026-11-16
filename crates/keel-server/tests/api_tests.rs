@@ -3354,3 +3354,151 @@ async fn test_toggling_canary_on_bundle_item_removes_stale_manifests_and_avoids_
         "stale networkpolicy-canary.yaml must be deleted when toggling canary=false"
     );
 }
+
+#[tokio::test]
+async fn test_security_ssrf_rbac_csrf_and_open_redirect_guards() {
+    let fixture = setup_fixture().await;
+    let admin_cookie = login_and_get_cookie(&fixture).await;
+
+    // Mint a non-admin tenant-scoped session cookie (only member of `tenant-alpha`)
+    let session_key = fixture
+        .state
+        .secret_store
+        .get_or_create_session_key()
+        .await
+        .unwrap();
+    let tenant_claims = SessionClaims {
+        sub: "alice@keel.local".to_string(),
+        email: Some("alice@keel.local".to_string()),
+        name: Some("Alice".to_string()),
+        groups: vec!["tenant-alpha".to_string()],
+        auth_phase: AuthPhase::OidcActive,
+        exp: chrono::Utc::now().timestamp() + 3600,
+    };
+    let tenant_token = keel_server::encrypt_session_token(&session_key, &tenant_claims).unwrap();
+    let tenant_cookie = format!("{SESSION_COOKIE_NAME}={tenant_token}");
+
+    let app = build_router(fixture.state.clone());
+
+    // 1. SSRF and path-traversal rejection in fetch-schema
+    for (repo_url, chart) in [
+        ("http://127.0.0.1:8080/charts", "podinfo"),
+        ("http://169.254.169.254/latest/meta-data", "podinfo"),
+        ("http://dex.keel-system.svc.cluster.local:5556", "podinfo"),
+        ("https://charts.example.com", "foo/bar"),
+    ] {
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/catalog/fetch-schema")
+                    .header(COOKIE, &admin_cookie)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({ "repoUrl": repo_url, "chart": chart }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            res.status(),
+            StatusCode::BAD_REQUEST,
+            "expected 400 for ({repo_url}, {chart})"
+        );
+    }
+
+    // 2. RBAC: non-admin cannot create tenants or toggle providers
+    let create_tenant_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/tenants")
+                .header(COOKIE, &tenant_cookie)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({ "id": "beta" }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_tenant_res.status(), StatusCode::FORBIDDEN);
+
+    let toggle_provider_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri("/api/v1/providers/proxmox")
+                .header(COOKIE, &tenant_cookie)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({ "enabled": false }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(toggle_provider_res.status(), StatusCode::FORBIDDEN);
+
+    // 3. Tenant isolation: tenant-alpha user cannot propose into tenant-acme
+    let cross_tenant_prop = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/proposals")
+                .header(COOKIE, &tenant_cookie)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "tenant": "acme",
+                        "catalogId": "grafana",
+                        "kind": "app",
+                        "values": { "replicas": 1 }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cross_tenant_prop.status(), StatusCode::FORBIDDEN);
+
+    // 4. CSRF guard: cross-origin Origin header rejected when cookie-authenticated
+    let csrf_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/tenants")
+                .header(COOKIE, &admin_cookie)
+                .header("host", "127.0.0.1:8080")
+                .header("origin", "https://evil.example.com")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({ "id": "gamma" }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(csrf_res.status(), StatusCode::FORBIDDEN);
+
+    // 5. Open redirect rejection in OIDC login
+    *fixture.state.oidc_config.write().await = Some(OidcConfig {
+        enabled: true,
+        issuer_url: "https://idp.keel.local/dex".to_string(),
+        client_id: "keel-server".to_string(),
+        redirect_url: "https://keel.local/api/v1/auth/callback".to_string(),
+        scopes: vec!["openid".to_string()],
+    });
+    let open_redirect_res = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/auth/login?redirect_uri=https://evil.example.com/steal")
+                .header("host", "keel.local")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(open_redirect_res.status(), StatusCode::BAD_REQUEST);
+}

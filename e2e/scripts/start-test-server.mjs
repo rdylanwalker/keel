@@ -1,5 +1,6 @@
 import { Buffer } from 'node:buffer';
 import { spawn, spawnSync } from 'node:child_process';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
@@ -16,6 +17,15 @@ const OIDC_ISSUER = `http://127.0.0.1:${OIDC_PORT}`;
 
 function startMockOidcServer() {
   const b64url = (obj) => Buffer.from(JSON.stringify(obj)).toString('base64url');
+  const { publicKey, privateKey } = crypto.generateKeyPairSync('rsa', {
+    modulusLength: 2048,
+  });
+  const publicJwk = {
+    ...publicKey.export({ format: 'jwk' }),
+    kid: 'e2e-key-1',
+    use: 'sig',
+    alg: 'RS256',
+  };
   const server = http.createServer((req, res) => {
     const url = new URL(req.url || '/', OIDC_ISSUER);
     if (req.method === 'GET' && url.pathname === '/.well-known/openid-configuration') {
@@ -25,8 +35,14 @@ function startMockOidcServer() {
           issuer: OIDC_ISSUER,
           authorization_endpoint: `${OIDC_ISSUER}/auth`,
           token_endpoint: `${OIDC_ISSUER}/token`,
+          jwks_uri: `${OIDC_ISSUER}/keys`,
         }),
       );
+      return;
+    }
+    if (req.method === 'GET' && url.pathname === '/keys') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ keys: [publicJwk] }));
       return;
     }
     if (req.method === 'GET' && url.pathname === '/auth') {
@@ -67,18 +83,28 @@ function startMockOidcServer() {
       return;
     }
     if (req.method === 'POST' && url.pathname === '/token') {
-      const header = b64url({ alg: 'RS256', typ: 'JWT' });
+      const now = Math.floor(Date.now() / 1000);
+      const header = b64url({ alg: 'RS256', typ: 'JWT', kid: 'e2e-key-1' });
       const payload = b64url({
+        iss: OIDC_ISSUER,
+        aud: 'keel-server',
+        iat: now,
+        exp: now + 3600,
         sub: 'admin@keel.local',
         email: 'admin@keel.local',
         name: 'Keel E2E Admin',
         groups: ['keel-admins'],
       });
+      const signingInput = `${header}.${payload}`;
+      const signature = crypto
+        .sign('RSA-SHA256', Buffer.from(signingInput), privateKey)
+        .toString('base64url');
+      const signedJwt = `${signingInput}.${signature}`;
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(
         JSON.stringify({
-          id_token: `${header}.${payload}.mock-sig`,
-          access_token: `${header}.${payload}.mock-sig`,
+          id_token: signedJwt,
+          access_token: signedJwt,
           token_type: 'Bearer',
         }),
       );

@@ -13,10 +13,13 @@ use axum::response::{IntoResponse, Response};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::Utc;
+use jsonwebtoken::jwk::JwkSet;
+use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use keel_core::{AuthPhase, EnvelopeCrypto};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use url::Url;
 
 use crate::error::ServerError;
 use crate::state::AppState;
@@ -49,6 +52,49 @@ pub struct SessionClaims {
 #[derive(Debug, Clone)]
 pub struct AuthSession {
     pub claims: SessionClaims,
+}
+
+impl AuthSession {
+    /// Returns `true` when the caller holds cluster-administrator privileges.
+    pub fn is_admin(&self) -> bool {
+        self.claims.auth_phase == AuthPhase::BreakGlass
+            || self
+                .claims
+                .groups
+                .iter()
+                .any(|g| matches!(g.as_str(), "keel-admins" | "admin" | "admins"))
+    }
+
+    /// Enforces cluster-administrator privileges, returning `403 Forbidden` otherwise.
+    pub fn require_admin(&self) -> Result<(), ServerError> {
+        if self.is_admin() {
+            Ok(())
+        } else {
+            Err(ServerError::Forbidden(
+                "Administrator privileges required for this operation".to_string(),
+            ))
+        }
+    }
+
+    /// Enforces access to `tenant_id` (either cluster admin or member of `<tenant_id>` / `tenant-<tenant_id>`).
+    pub fn require_tenant_access(&self, tenant_id: &str) -> Result<(), ServerError> {
+        if self.is_admin() {
+            return Ok(());
+        }
+        let prefixed = format!("tenant-{tenant_id}");
+        if self
+            .claims
+            .groups
+            .iter()
+            .any(|g| g == tenant_id || g == &prefixed)
+        {
+            Ok(())
+        } else {
+            Err(ServerError::Forbidden(format!(
+                "Access denied for tenant '{tenant_id}'"
+            )))
+        }
+    }
 }
 
 impl FromRequestParts<AppState> for AuthSession {
@@ -127,7 +173,7 @@ fn build_session_cookie_header(
 ) -> Result<HeaderValue, ServerError> {
     let secure_attr = if secure { "Secure; " } else { "" };
     let cookie = format!(
-        "{SESSION_COOKIE_NAME}={token}; HttpOnly; {secure_attr}SameSite=Lax; Path=/; Max-Age={max_age}"
+        "{SESSION_COOKIE_NAME}={token}; HttpOnly; {secure_attr}SameSite=Strict; Path=/; Max-Age={max_age}"
     );
     HeaderValue::from_str(&cookie)
         .map_err(|e| ServerError::Internal(format!("Invalid session cookie header: {e}")))
@@ -191,11 +237,22 @@ pub struct AuthLoginResponse {
 
 #[derive(Debug, Deserialize)]
 struct OidcDiscoveryDocument {
+    #[serde(default)]
+    issuer: Option<String>,
     authorization_endpoint: String,
     token_endpoint: String,
+    #[serde(default)]
+    jwks_uri: Option<String>,
 }
 
-async fn resolve_oidc_endpoints(issuer_url: &str) -> (String, String) {
+struct ResolvedOidcEndpoints {
+    authorization_endpoint: String,
+    token_endpoint: String,
+    jwks_uri: String,
+    expected_issuer: String,
+}
+
+async fn resolve_oidc_endpoints(issuer_url: &str) -> ResolvedOidcEndpoints {
     let issuer = issuer_url.trim_end_matches('/');
     let discovery_url = format!("{issuer}/.well-known/openid-configuration");
     if let Ok(client) = reqwest::Client::builder()
@@ -205,6 +262,12 @@ async fn resolve_oidc_endpoints(issuer_url: &str) -> (String, String) {
         && resp.status().is_success()
         && let Ok(doc) = resp.json::<OidcDiscoveryDocument>().await
     {
+        let expected_issuer = doc
+            .issuer
+            .as_deref()
+            .map(|s| s.trim_end_matches('/').to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| issuer.to_string());
         // When `keel serve` port-forwards an in-cluster Dex instance to `127.0.0.1`,
         // Dex's discovery document advertises its configured issuer URL (e.g.
         // `.svc.cluster.local` or `dex.keel.local`), which a host browser without
@@ -212,12 +275,27 @@ async fn resolve_oidc_endpoints(issuer_url: &str) -> (String, String) {
         if (issuer.starts_with("http://127.0.0.1:") || issuer.starts_with("http://localhost:"))
             && !doc.authorization_endpoint.starts_with(issuer)
         {
-            return (format!("{issuer}/auth"), format!("{issuer}/token"));
+            return ResolvedOidcEndpoints {
+                authorization_endpoint: format!("{issuer}/auth"),
+                token_endpoint: format!("{issuer}/token"),
+                jwks_uri: format!("{issuer}/keys"),
+                expected_issuer,
+            };
         }
-        return (doc.authorization_endpoint, doc.token_endpoint);
+        return ResolvedOidcEndpoints {
+            authorization_endpoint: doc.authorization_endpoint,
+            token_endpoint: doc.token_endpoint,
+            jwks_uri: doc.jwks_uri.unwrap_or_else(|| format!("{issuer}/keys")),
+            expected_issuer,
+        };
     }
     // Standard Dex OIDC endpoints fallback
-    (format!("{issuer}/auth"), format!("{issuer}/token"))
+    ResolvedOidcEndpoints {
+        authorization_endpoint: format!("{issuer}/auth"),
+        token_endpoint: format!("{issuer}/token"),
+        jwks_uri: format!("{issuer}/keys"),
+        expected_issuer: issuer.to_string(),
+    }
 }
 
 /// Response body for `GET /api/v1/auth/status`.
@@ -308,27 +386,21 @@ pub async fn oidc_login(
     let code_challenge = URL_SAFE_NO_PAD.encode(challenge_digest);
 
     let secure = is_secure_request(&headers);
-    let redirect_uri = query
-        .redirect_uri
-        .filter(|u| !u.trim().is_empty())
-        .or_else(|| {
-            let host = headers
-                .get(axum::http::header::HOST)
-                .and_then(|v| v.to_str().ok())
-                .map(str::trim)
-                .filter(|h| !h.is_empty())?;
-            let scheme = if headers
-                .get("x-forwarded-proto")
-                .and_then(|v| v.to_str().ok())
-                .is_some_and(|p| p.eq_ignore_ascii_case("https"))
-            {
-                "https"
-            } else {
-                "http"
-            };
-            Some(format!("{scheme}://{host}/api/v1/auth/callback"))
-        })
-        .unwrap_or_else(|| oidc.redirect_url.clone());
+    let validated_host = headers
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|h| is_valid_host_header(h));
+
+    let redirect_uri = if let Some(requested) = query.redirect_uri.filter(|u| !u.trim().is_empty())
+    {
+        validate_oidc_redirect_uri(&requested, &oidc.redirect_url, validated_host)?
+    } else if let Some(host) = validated_host {
+        let scheme = if secure { "https" } else { "http" };
+        format!("{scheme}://{host}/api/v1/auth/callback")
+    } else {
+        oidc.redirect_url.clone()
+    };
 
     let pkce_payload = PkceStatePayload {
         state: state_nonce.clone(),
@@ -347,7 +419,8 @@ pub async fn oidc_login(
     );
     let pkce_cookie = build_pkce_cookie_header(&encrypted_pkce, PKCE_TTL_SECONDS, secure)?;
 
-    let (authorization_endpoint, _) = resolve_oidc_endpoints(&oidc.issuer_url).await;
+    let endpoints = resolve_oidc_endpoints(&oidc.issuer_url).await;
+    let authorization_endpoint = endpoints.authorization_endpoint;
     let scopes = oidc.scopes.join("%20");
     let sep = if authorization_endpoint.contains('?') {
         '&'
@@ -383,8 +456,6 @@ pub struct OidcCallbackQuery {
 struct OidcTokenResponse {
     #[serde(default)]
     id_token: Option<String>,
-    #[serde(default)]
-    access_token: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -455,10 +526,13 @@ pub async fn oidc_callback(
         ));
     }
 
-    let (_, token_endpoint) = resolve_oidc_endpoints(&oidc.issuer_url).await;
-    let client = reqwest::Client::new();
+    let endpoints = resolve_oidc_endpoints(&oidc.issuer_url).await;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .map_err(|e| ServerError::Internal(format!("Failed to construct HTTP client: {e}")))?;
     let token_res = client
-        .post(&token_endpoint)
+        .post(&endpoints.token_endpoint)
         .form(&[
             ("grant_type", "authorization_code"),
             ("code", code.as_str()),
@@ -482,14 +556,18 @@ pub async fn oidc_callback(
         .await
         .map_err(|e| ServerError::Internal(format!("Invalid OIDC token response: {e}")))?;
 
-    let jwt = token_body
-        .id_token
-        .or(token_body.access_token)
-        .ok_or_else(|| {
-            ServerError::Unauthorized("OIDC token response missing id_token".to_string())
-        })?;
+    let id_token = token_body.id_token.ok_or_else(|| {
+        ServerError::Unauthorized("OIDC token response missing id_token".to_string())
+    })?;
 
-    let jwt_claims = decode_jwt_payload_claims(&jwt)?;
+    let jwt_claims = verify_oidc_id_token(
+        &client,
+        &endpoints.jwks_uri,
+        &endpoints.expected_issuer,
+        &oidc.client_id,
+        &id_token,
+    )
+    .await?;
     let phase = *state.auth_phase.read().await;
     let claims = SessionClaims {
         sub: jwt_claims.sub.clone(),
@@ -532,17 +610,197 @@ pub async fn oidc_callback(
     Ok(resp)
 }
 
-fn decode_jwt_payload_claims(jwt: &str) -> Result<JwtClaimsSubset, ServerError> {
-    let mut parts = jwt.split('.');
-    let _header = parts.next();
-    let payload_b64 = parts
-        .next()
-        .ok_or_else(|| ServerError::Unauthorized("Invalid JWT format".to_string()))?;
-    let payload_bytes = URL_SAFE_NO_PAD
-        .decode(payload_b64)
-        .map_err(|_| ServerError::Unauthorized("Invalid JWT payload encoding".to_string()))?;
-    serde_json::from_slice(&payload_bytes)
-        .map_err(|_| ServerError::Unauthorized("Invalid JWT claims".to_string()))
+async fn verify_oidc_id_token(
+    client: &reqwest::Client,
+    jwks_uri: &str,
+    expected_issuer: &str,
+    client_id: &str,
+    id_token: &str,
+) -> Result<JwtClaimsSubset, ServerError> {
+    let header = decode_header(id_token)
+        .map_err(|_| ServerError::Unauthorized("Malformed OIDC id_token header".to_string()))?;
+
+    if !matches!(
+        header.alg,
+        Algorithm::RS256
+            | Algorithm::RS384
+            | Algorithm::RS512
+            | Algorithm::ES256
+            | Algorithm::ES384
+            | Algorithm::EdDSA
+    ) {
+        return Err(ServerError::Unauthorized(format!(
+            "Unsupported OIDC id_token signing algorithm: {:?}",
+            header.alg
+        )));
+    }
+
+    let jwks_resp = client
+        .get(jwks_uri)
+        .send()
+        .await
+        .map_err(|e| ServerError::Internal(format!("Failed to fetch OIDC JWKS: {e}")))?;
+    if !jwks_resp.status().is_success() {
+        return Err(ServerError::Unauthorized(format!(
+            "OIDC JWKS endpoint returned HTTP {}",
+            jwks_resp.status()
+        )));
+    }
+    let jwks: JwkSet = jwks_resp
+        .json()
+        .await
+        .map_err(|e| ServerError::Internal(format!("Invalid OIDC JWKS payload: {e}")))?;
+
+    let jwk = match header.kid.as_deref() {
+        Some(kid) => jwks.find(kid).ok_or_else(|| {
+            ServerError::Unauthorized("OIDC id_token kid not found in JWKS".to_string())
+        })?,
+        None if jwks.keys.len() == 1 => &jwks.keys[0],
+        None => {
+            return Err(ServerError::Unauthorized(
+                "OIDC id_token missing kid and JWKS contains multiple keys".to_string(),
+            ));
+        }
+    };
+
+    let decoding_key = DecodingKey::from_jwk(jwk).map_err(|_| {
+        ServerError::Unauthorized("Invalid JWK for id_token verification".to_string())
+    })?;
+
+    let mut validation = Validation::new(header.alg);
+    validation.validate_exp = true;
+    validation.validate_nbf = true;
+    validation.set_audience(&[client_id]);
+    validation.set_issuer(&[expected_issuer]);
+
+    let token_data =
+        decode::<JwtClaimsSubset>(id_token, &decoding_key, &validation).map_err(|e| {
+            ServerError::Unauthorized(format!("OIDC id_token verification failed: {e}"))
+        })?;
+
+    Ok(token_data.claims)
+}
+
+fn is_valid_host_header(host: &str) -> bool {
+    !host.is_empty()
+        && !host.contains('@')
+        && !host.contains('/')
+        && !host.contains('\\')
+        && !host.chars().any(char::is_whitespace)
+}
+
+fn validate_oidc_redirect_uri(
+    requested: &str,
+    configured_redirect: &str,
+    request_host: Option<&str>,
+) -> Result<String, ServerError> {
+    let parsed = Url::parse(requested.trim())
+        .map_err(|_| ServerError::BadRequest("Invalid redirect_uri".to_string()))?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.username() != ""
+        || parsed.password().is_some()
+    {
+        return Err(ServerError::BadRequest(
+            "redirect_uri must be an http(s) URL without credentials".to_string(),
+        ));
+    }
+
+    if let Ok(configured) = Url::parse(configured_redirect.trim())
+        && parsed.scheme() == configured.scheme()
+        && parsed.host_str() == configured.host_str()
+        && parsed.port_or_known_default() == configured.port_or_known_default()
+        && parsed.path() == configured.path()
+    {
+        return Ok(parsed.to_string());
+    }
+
+    if let Some(host_hdr) = request_host {
+        let parsed_authority = match parsed.port() {
+            Some(p) => format!("{}:{p}", parsed.host_str().unwrap_or_default()),
+            None => parsed.host_str().unwrap_or_default().to_string(),
+        };
+        if parsed_authority.eq_ignore_ascii_case(host_hdr)
+            && parsed.path() == "/api/v1/auth/callback"
+        {
+            return Ok(parsed.to_string());
+        }
+    }
+
+    Err(ServerError::BadRequest(
+        "redirect_uri is not in the allowed OIDC callback origins".to_string(),
+    ))
+}
+
+/// Enforces same-origin `Origin` / `Referer` validation on cookie-authenticated state-changing requests.
+pub(crate) async fn csrf_origin_guard(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Result<Response, ServerError> {
+    let method = req.method();
+    let is_mutating = matches!(
+        *method,
+        axum::http::Method::POST
+            | axum::http::Method::PUT
+            | axum::http::Method::DELETE
+            | axum::http::Method::PATCH
+    );
+    if is_mutating {
+        let headers = req.headers();
+        let has_bearer = headers
+            .get(AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.starts_with("Bearer "));
+        let has_session_cookie =
+            extract_cookie_value(headers, SESSION_COOKIE_NAME).is_some_and(|v| !v.is_empty());
+
+        if has_session_cookie && !has_bearer {
+            let host = headers
+                .get(axum::http::header::HOST)
+                .and_then(|v| v.to_str().ok())
+                .map(str::trim);
+            let origin_hdr = headers
+                .get(axum::http::header::ORIGIN)
+                .and_then(|v| v.to_str().ok())
+                .map(str::trim);
+            let referer_hdr = headers
+                .get(axum::http::header::REFERER)
+                .and_then(|v| v.to_str().ok())
+                .map(str::trim);
+
+            if let Some(origin_raw) = origin_hdr {
+                let origin_url = Url::parse(origin_raw)
+                    .map_err(|_| ServerError::Forbidden("Invalid Origin header".to_string()))?;
+                if !url_matches_host(&origin_url, host) {
+                    return Err(ServerError::Forbidden(
+                        "Cross-origin request rejected by CSRF guard".to_string(),
+                    ));
+                }
+            } else if let Some(referer_raw) = referer_hdr {
+                let referer_url = Url::parse(referer_raw)
+                    .map_err(|_| ServerError::Forbidden("Invalid Referer header".to_string()))?;
+                if !url_matches_host(&referer_url, host) {
+                    return Err(ServerError::Forbidden(
+                        "Cross-origin Referer rejected by CSRF guard".to_string(),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(next.run(req).await)
+}
+
+fn url_matches_host(url: &Url, host_hdr: Option<&str>) -> bool {
+    let Some(expected_host) = host_hdr else {
+        return false;
+    };
+    let Some(url_host) = url.host_str() else {
+        return false;
+    };
+    let authority = match url.port() {
+        Some(p) => format!("{url_host}:{p}"),
+        None => url_host.to_string(),
+    };
+    authority.eq_ignore_ascii_case(expected_host)
 }
 
 fn url_encode_component(input: &str) -> String {

@@ -127,6 +127,7 @@ pub fn build_router(state: AppState) -> Router {
         )
         // Embedded React + Shadcn SPA fallback
         .fallback(spa::spa_fallback)
+        .layer(axum::middleware::from_fn(auth::csrf_origin_guard))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
