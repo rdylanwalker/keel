@@ -69,7 +69,7 @@ Either download the latest release binary from **GitHub Releases** (or build fro
 
 ```bash
 # Option A: Download prebuilt release binary (Linux amd64 example)
-curl -fsSL https://github.com/OWNER/keel/releases/latest/download/keel-linux-amd64.tar.gz \
+curl -fsSL https://github.com/rdylanwalker/keel/releases/latest/download/keel-linux-amd64.tar.gz \
   | tar -xz -C ~/.local/bin keel
 
 # Option B: Build from source
@@ -88,7 +88,7 @@ keel bootstrap init \
   --repo-dir ./keel-gitops
 ```
 
-Copy the single-use **256-bit Stage 0 bootstrap token** printed to stdout.
+Copy the generated **Admin Username** and **Admin Password** printed in the Stage 0 bootstrap summary (or use the values you supplied via `--admin-username` / `--admin-password` / `KEEL_ADMIN_PASSWORD`, or your external `--oidc-issuer`).
 
 ### 3. Start the Control Plane & Authenticate
 Start `keel serve` (or `just build-serve` to build, restart in the background, and print local URLs/credentials; `just serve` for foreground; `just serve-demo` for a pre-seeded demo catalog):
@@ -97,30 +97,35 @@ Start `keel serve` (or `just build-serve` to build, restart in the background, a
 keel serve --bind 127.0.0.1:8080 --repo-dir ./keel-gitops
 ```
 
-When `keel serve` (or `keel bootstrap init`) starts in Stage 0 bootstrap mode, it generates a **single-use 256-bit bootstrap token** and prints it directly to stdout:
+When a Kubernetes cluster is reachable, `keel serve` automatically port-forwards in-cluster **Dex OIDC** (and **Forgejo** if `--with-forge` was enabled) and prints:
 
 ```text
 Keel Control Plane listening on http://127.0.0.1:8080
-Stage 0 Bootstrap Token: <64-character-hex-token>
 ```
 
-> **Note:** Only the SHA-256 hash of the token is stored (in `keel-system/bootstrap-token`), and it is invalidated immediately after its first successful login. If you need a new token while running locally in Stage 0, restart `keel serve` and copy the newly printed token from stdout.
-
-Authenticate your CLI session and/or open `http://127.0.0.1:8080` in your browser, click **Bootstrap Token Login**, and paste the token:
+Authenticate your CLI session via OIDC Authorization Code + PKCE, and/or open `http://127.0.0.1:8080` in your browser and click **Sign in with OIDC** using the printed Dex admin credentials:
 
 ```bash
-keel auth login --server http://127.0.0.1:8080 --bootstrap-token <TOKEN>
+keel auth login --server http://127.0.0.1:8080
 ```
+
+> **Note:** If you need to reset the in-cluster Dex admin password later during local development, run `just dex-reset-password`.
 
 ### 4. Provision a Second `kind` Workload Cluster & Deploy an App (PR-Driven)
 Every mutation after Stage 0 validates inputs against `catalog.yaml` JSON Schemas, encrypts secrets with SOPS + `age`, opens a Pull Request, and triggers a PKO v2 preview:
 
 ```bash
-# Open a PR to provision a workload kind cluster from the management cluster
+# Create a values file for the kind-cluster blueprint and open a PR
+cat <<'EOF' > workload-values.yaml
+clusterName: workload-dev
+kubernetesVersion: v1.32.0
+workerCount: 1
+EOF
+
 keel infra provision \
   --blueprint kind-cluster \
   --tenant platform-team \
-  --values-file ./deploy/catalog/infra/kind-cluster/values.example.yaml \
+  --values-file ./workload-values.yaml \
   --server http://127.0.0.1:8080
 
 # Inspect the pre-merge PKO resource diff (+ Create / ~ Update / - Delete)
@@ -263,11 +268,12 @@ KEEL_E2E_REUSE_CLUSTER=0 pnpm --dir e2e test:live  # bootstraps a fresh kind clu
 ```
 
 ### Releases & Dependency Hygiene
-* **Versioning:** Governed by [Conventional Commits](https://www.conventionalcommits.org/) and `semantic-release` (`feat:`, `fix:`, `BREAKING CHANGE:`). Merging to `main` automatically tags a SemVer release, cross-compiles static binaries (`linux/amd64`, `linux/arm64`, `darwin/arm64`, `windows/amd64`), builds signed multi-arch OCI images (`Cosign`), and attaches a CycloneDX SBOM.
-* **Dependencies:** Initialized with latest compatible stable versions and kept current via **Renovate** running weekly every Monday at 04:00 UTC with auto-merge enabled for passing non-major updates.
+* **Versioning & Artifacts:** Governed by [Conventional Commits](https://www.conventionalcommits.org/) and `semantic-release` (`feat:`, `fix:`, `BREAKING CHANGE:`). Merging to `main` automatically tags a SemVer release, cross-compiles release binaries (`linux/amd64`, `linux/arm64`, `darwin/arm64`, `windows/amd64`), attaches a CycloneDX SBOM and HTML documentation archive, and publishes the mdBook documentation to **GitHub Pages**.
+* **Dependencies:** Initialized with latest compatible stable versions and kept current via **Renovate** running weekly before 05:00 UTC on Mondays with auto-merge enabled for passing non-major updates.
 
 ---
 
 ## Documentation
+* **[Online Documentation (GitHub Pages)](https://rdylanwalker.github.io/keel/):** Rendered mdBook user & operations guide (preview locally with `just docs`).
 * **[`SDD.md`](./SDD.md):** Complete architectural specification, sequence diagrams, Git repository schema, API/CLI contracts, and Non-Functional Requirements (`NFR-SEC`, `NFR-REL`, `NFR-PERF`, `NFR-OBS`, `NFR-EXT`, `NFR-QA`).
 * **[`AGENTS.md`](./AGENTS.md):** Mandatory architectural invariants, security prohibitions, commit conventions, and testing rules for AI coding assistants.
