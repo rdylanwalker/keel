@@ -891,7 +891,7 @@ export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
           className="px-3.5 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-xs font-semibold transition-colors shrink-0 flex items-center justify-center gap-1.5 shadow-md shadow-indigo-600/20 cursor-pointer"
         >
           <Plus className="h-4 w-4" />
-          <span>+ Add Catalog Item</span>
+          <span>Add Catalog Item</span>
         </button>
       </div>
 

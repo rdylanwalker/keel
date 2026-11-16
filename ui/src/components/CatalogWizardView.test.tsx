@@ -348,11 +348,15 @@ describe("CatalogWizardView component and jsonToYaml helper", () => {
     render(<CatalogWizardView />)
 
     const addAppBtn = screen.getByRole("button", {
-      name: /\+ Add Catalog Item/i,
+      name: /^Add Catalog Item$/i,
     })
+    expect(addAppBtn).toHaveTextContent("Add Catalog Item")
+    expect(addAppBtn).not.toHaveTextContent("+ Add Catalog Item")
     fireEvent.click(addAppBtn)
 
-    expect(screen.getByText("Add Catalog Item")).toBeInTheDocument()
+    expect(
+      screen.getByRole("heading", { name: "Add Catalog Item" })
+    ).toBeInTheDocument()
 
     fireEvent.change(screen.getByLabelText(/(App|Item) ID \*/i), {
       target: { value: "podinfo" },
@@ -411,12 +415,15 @@ describe("CatalogWizardView component and jsonToYaml helper", () => {
     render(<CatalogWizardView />)
 
     const addItemBtn = screen.getByRole("button", {
-      name: /\+ Add Catalog Item/i,
+      name: /^Add Catalog Item$/i,
     })
     fireEvent.click(addItemBtn)
 
-    expect(screen.getByText("Add Catalog Item")).toBeInTheDocument()
+    expect(
+      screen.getByRole("heading", { name: "Add Catalog Item" })
+    ).toBeInTheDocument()
 
+    // Test infra blueprint submission with default entrypoint and omitted terraform provider
     // Test switching to infra then back to app to test state transitions
     fireEvent.change(screen.getByLabelText(/Catalog Type \*/i), {
       target: { value: "infra" },
@@ -503,15 +510,14 @@ describe("CatalogWizardView component and jsonToYaml helper", () => {
     render(<CatalogWizardView />)
 
     const addItemBtn = screen.getByRole("button", {
-      name: /\+ Add Catalog Item/i,
+      name: /^Add Catalog Item$/i,
     })
     fireEvent.click(addItemBtn)
 
     fireEvent.change(screen.getByLabelText(/Catalog Type \*/i), {
       target: { value: "infra" },
     })
-
-    fireEvent.change(screen.getByLabelText(/Item ID \*/i), {
+    fireEvent.change(screen.getByLabelText(/(App|Item) ID \*/i), {
       target: { value: "kind-local" },
     })
     fireEvent.change(screen.getByLabelText(/Item Name \*/i), {
@@ -588,11 +594,14 @@ describe("CatalogWizardView component and jsonToYaml helper", () => {
     render(<CatalogWizardView />)
 
     const addAppBtn = screen.getByRole("button", {
-      name: /\+ Add Catalog Item/i,
+      name: /^Add Catalog Item$/i,
     })
     fireEvent.click(addAppBtn)
-    expect(screen.getByText("Add Catalog Item")).toBeInTheDocument()
+    expect(
+      screen.getByRole("heading", { name: "Add Catalog Item" })
+    ).toBeInTheDocument()
 
+    // Test cancel button
     // Change category in app mode
     fireEvent.change(screen.getByLabelText(/Category \*/i), {
       target: { value: "Custom App Category" },
@@ -601,7 +610,9 @@ describe("CatalogWizardView component and jsonToYaml helper", () => {
     // Cancel modal via close icon
     const closeBtn = screen.getByRole("button", { name: /Close modal/i })
     fireEvent.click(closeBtn)
-    expect(screen.queryByText("Add Catalog Item")).not.toBeInTheDocument()
+    expect(
+      screen.queryByRole("heading", { name: "Add Catalog Item" })
+    ).not.toBeInTheDocument()
 
     // Fail app creation with string error
     fireEvent.click(addAppBtn)
@@ -1062,9 +1073,7 @@ describe("CatalogWizardView component and jsonToYaml helper", () => {
     fireEvent.click(screen.getByRole("button", { name: /Close modal/i }))
 
     // 2. Add/Edit Catalog Item modal full-screen toggle
-    fireEvent.click(
-      screen.getByRole("button", { name: /\+ Add Catalog Item/i })
-    )
+    fireEvent.click(screen.getByRole("button", { name: /^Add Catalog Item$/i }))
     const catalogItemModal = screen.getByTestId("catalog-item-modal")
     expect(catalogItemModal.className).toContain("max-w-4xl")
     expect(catalogItemModal.className).toContain("w-full")
@@ -1103,9 +1112,7 @@ describe("CatalogWizardView component and jsonToYaml helper", () => {
       expect(within(list).getByText("Test Microservice")).toBeInTheDocument()
     })
 
-    fireEvent.click(
-      screen.getByRole("button", { name: /\+ Add Catalog Item/i })
-    )
+    fireEvent.click(screen.getByRole("button", { name: /^Add Catalog Item$/i }))
     fireEvent.change(screen.getByLabelText(/Catalog Type \*/i), {
       target: { value: "infra" },
     })
@@ -1186,9 +1193,7 @@ describe("CatalogWizardView component and jsonToYaml helper", () => {
       expect(within(list).getByText("Podinfo")).toBeInTheDocument()
     })
 
-    fireEvent.click(
-      screen.getByRole("button", { name: /\+ Add Catalog Item/i })
-    )
+    fireEvent.click(screen.getByRole("button", { name: /^Add Catalog Item$/i }))
     fireEvent.change(screen.getByLabelText(/Catalog Type \*/i), {
       target: { value: "bundle" },
     })
@@ -1274,9 +1279,7 @@ describe("CatalogWizardView component and jsonToYaml helper", () => {
       expect(within(list).getByText("Test Microservice")).toBeInTheDocument()
     })
 
-    fireEvent.click(
-      screen.getByRole("button", { name: /\+ Add Catalog Item/i })
-    )
+    fireEvent.click(screen.getByRole("button", { name: /^Add Catalog Item$/i }))
 
     // Expand the Schema Editor
     fireEvent.click(screen.getByRole("button", { name: /Edit JSON Schema/i }))
@@ -1432,9 +1435,7 @@ describe("CatalogWizardView component and jsonToYaml helper", () => {
       expect(within(list).getByText("Test Microservice")).toBeInTheDocument()
     })
 
-    fireEvent.click(
-      screen.getByRole("button", { name: /\+ Add Catalog Item/i })
-    )
+    fireEvent.click(screen.getByRole("button", { name: /^Add Catalog Item$/i }))
     fireEvent.change(screen.getByLabelText(/Catalog Type \*/i), {
       target: { value: "bundle" },
     })
