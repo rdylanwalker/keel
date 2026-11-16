@@ -139,6 +139,7 @@ struct StoredCredentialsFile {
 pub struct CliContext {
     http: Client,
     no_redirect_http: Client,
+    stream_http: Client,
     credentials_path: PathBuf,
     session_override: Option<String>,
 }
@@ -180,10 +181,16 @@ impl CliContext {
             .timeout(Duration::from_secs(30))
             .build()
             .unwrap_or_else(|_| Client::new());
+        let stream_http = Client::builder()
+            .user_agent("keel-cli/0.1.0")
+            .connect_timeout(Duration::from_secs(10))
+            .build()
+            .unwrap_or_else(|_| Client::new());
 
         Self {
             http,
             no_redirect_http,
+            stream_http,
             credentials_path: credentials_path.into(),
             session_override: None,
         }
@@ -3212,12 +3219,6 @@ pub async fn execute_preview_status(
     }
 
     let base_url = normalize_server_url(&args.server)?;
-    let mut watched_events = Vec::new();
-
-    if args.watch {
-        watched_events = watch_preview_sse(&base_url, &args.pr, ctx).await?;
-    }
-
     let preview_endpoint = format!("{base_url}/api/v1/proposals/{}/preview", args.pr.trim());
     let resp = attach_auth(ctx.http.get(&preview_endpoint), ctx, &base_url)
         .send()
@@ -3226,7 +3227,24 @@ pub async fn execute_preview_status(
         return Err(extract_api_error(resp).await);
     }
 
-    let preview: ProposalPreviewApiResponse = resp.json().await?;
+    let mut preview: ProposalPreviewApiResponse = resp.json().await?;
+    let mut watched_events = Vec::new();
+
+    if args.watch && preview.state == PullRequestState::Open {
+        let watch_timeout = if !preview.report.resources.is_empty() {
+            Duration::from_secs(2)
+        } else {
+            Duration::from_secs(60)
+        };
+        watched_events = watch_preview_sse(&base_url, &args.pr, ctx, watch_timeout).await?;
+
+        let refresh_resp = attach_auth(ctx.http.get(&preview_endpoint), ctx, &base_url)
+            .send()
+            .await?;
+        if refresh_resp.status().is_success() {
+            preview = refresh_resp.json().await?;
+        }
+    }
 
     let mut output = String::new();
     output.push_str(&format!(
@@ -3261,10 +3279,11 @@ async fn watch_preview_sse(
     base_url: &str,
     pr_id: &str,
     ctx: &CliContext,
+    watch_timeout: Duration,
 ) -> Result<Vec<CrdWatchEvent>, CliError> {
     let sse_url = format!("{base_url}/api/v1/events/stream");
     let mut resp = attach_auth(
-        ctx.http
+        ctx.stream_http
             .get(&sse_url)
             .query(&[("namespace", KEEL_PREVIEWS_NAMESPACE)]),
         ctx,
@@ -3280,8 +3299,21 @@ async fn watch_preview_sse(
     let mut collected = Vec::new();
     let mut buffer = String::new();
     let pr_marker = format!("pr-{pr_id}");
+    let deadline = tokio::time::Instant::now() + watch_timeout;
 
-    while let Some(chunk) = resp.chunk().await? {
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let chunk_res = tokio::time::timeout(remaining, resp.chunk()).await;
+        let Ok(chunk_opt) = chunk_res else {
+            // Bounded watch window elapsed without a new terminal SSE event; return collected events cleanly.
+            break;
+        };
+        let Some(chunk) = chunk_opt? else {
+            break;
+        };
         buffer.push_str(&String::from_utf8_lossy(&chunk));
         while let Some(newline_idx) = buffer.find('\n') {
             let line = buffer[..newline_idx].trim().to_string();
