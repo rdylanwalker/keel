@@ -78,7 +78,7 @@ just build
 ```
 
 ### 2. Stage 0: Bootstrap the `kind` Management Cluster
-Run `keel bootstrap init` on `localhost` with `--local-dev-docker-socket-exception` (explicitly adding the Kyverno `PolicyException` that lets PKO v2 workspace pods talk to the local Docker daemon to create workload `kind` clusters):
+Ensure `docker`, `pulumi`, `helm`, `kubectl`, and `git` are installed on `localhost`, then run `keel bootstrap init` with `--local-dev-docker-socket-exception` (explicitly adding the Kyverno `PolicyException` that lets PKO v2 workspace pods talk to the local Docker daemon to create workload `kind` clusters):
 
 ```bash
 keel bootstrap init \
@@ -197,7 +197,7 @@ keel/
 * **Rust** (latest stable toolchain with `clippy`, `rustfmt`, and `cargo-llvm-cov`)
 * **Node.js** (`24+`) & **pnpm** (`12+`)
 * **Task Runner (recommended):** [`just`](https://github.com/casey/just)
-* **CLI Tools:** `git`, `sops`, `age`, `pulumi`, `kubectl`, `kind`, and `docker`
+* **CLI Tools:** `git`, `sops`, `age`, `pulumi`, `helm`, `kubectl`, `kind`, and `docker`
 
 ### Build & Run Locally
 
