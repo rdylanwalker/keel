@@ -78,6 +78,25 @@ flowchart TB
 
 ---
 
+## Comparison with Related Open-Source Projects
+
+While several popular open-source tools solve individual parts of this space (developer portals, GitOps dashboards, IaC PR runners, or PaaS platforms), Keel combines zero-to-control-plane bootstrapping, Flux CD GitOps, dynamic schema-driven app catalogs, and pre-merge Pulumi/OpenTofu PR previews in a single stateless binary:
+
+| Project | Category | Stage 0 Bootstrap | GitOps Engine | Self-Service App Catalog UI | Multi-Cloud & On-Prem IaC | Pre-Merge IaC Diff Previews | Stateless (No External DB) |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **Keel** | Unified GitOps & IaC Control Plane | **Yes** (`kind`, `kubeconfig`, Proxmox, Cloud) | **Flux CD** | **Yes** (JSON Schema → `values.yaml`, no app CRDs) | **Yes** (PKO v2 + OpenTofu/TF providers) | **Yes** (ephemeral PKO `preview: true`) | **Yes** (Git + K8s Secrets) |
+| [**Backstage**](https://backstage.io/) | Internal Developer Portal | No | Bring your own (plugins) | **Yes** (Software Templates) | Via CI/plugins | No (CI-dependent) | No (Postgres) |
+| [**Cyclops**](https://github.com/cyclops-ui/cyclops) | Kubernetes App UI | No | CRD-based (`Module`) | **Yes** (JSON Schema → Helm) | No | No | **Yes** (K8s CRDs) |
+| [**Argo CD**](https://argoproj.github.io/cd/) | GitOps Engine & UI | No | **Argo CD** | No | No (K8s manifests only) | K8s diffs via external/PR tools | **Yes** (K8s CRDs + Redis) |
+| [**Weave GitOps**](https://github.com/weaveworks/weave-gitops) / [**Capacitor**](https://github.com/gimlet-io/capacitor) | Flux CD Dashboard | No | **Flux CD** | No (read/ops UI) | Via Tofu Controller | No | **Yes** (K8s CRDs) |
+| [**Crossplane**](https://www.crossplane.io/) | K8s-Native IaC | No | Paired with Flux/Argo | No | **Yes** (Custom CRDs / XRDs) | No native PR diff | **Yes** (K8s CRDs) |
+| [**Atlantis**](https://www.runatlantis.io/) / [**Digger**](https://github.com/diggerhq/digger) | IaC PR Automation | No | PR-driven runner | No | **Yes** (Terraform / OpenTofu) | **Yes** (`plan` on PR) | Atlantis: **Yes** / Digger: DB |
+| [**Tofu Controller**](https://github.com/flux-iac/tofu-controller) | Flux IaC Controller | No | **Flux CD** | No | **Yes** (OpenTofu / Terraform) | Plan/drift via Flux | **Yes** (K8s CRDs) |
+| [**Cozystack**](https://cozystack.io/) | K8s PaaS-in-a-Box | **Yes** (Talos-based) | **Flux CD** | **Yes** (managed PaaS catalog) | In-cluster KubeVirt/VMs | No | **Yes** (K8s CRDs) |
+| [**Coolify**](https://coolify.io/) / [**Dokploy**](https://dokploy.com/) | Self-Hosted PaaS | **Yes** (VPS/Docker) | Imperative / webhooks | **Yes** (Docker app templates) | No | App previews only (no IaC diff) | No (external DB) |
+
+---
+
 ## Quick Start: Localhost Workflow (`kind` + `keel` CLI)
 
 This end-to-end walkthrough runs entirely on `localhost` using a local `kind` management cluster to provision a second `kind` workload cluster and deploy an application.
