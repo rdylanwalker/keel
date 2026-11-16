@@ -1085,7 +1085,12 @@ async fn initialize_seed_git_repo_with_push(
     })
 }
 
-const SEED_NAMESPACES_YAML: &str = include_str!("../../../deploy/seed/namespaces.yaml");
+const CONTROL_PLANE_PULUMI_YAML: &str =
+    include_str!("../../../deploy/bootstrap/control-plane/Pulumi.yaml");
+const CONTROL_PLANE_FORGEJO_PULUMI_YAML: &str =
+    include_str!("../../../deploy/bootstrap/control-plane-forgejo/Pulumi.yaml");
+const CONTROL_PLANE_DEX_PULUMI_YAML: &str =
+    include_str!("../../../deploy/bootstrap/control-plane-dex/Pulumi.yaml");
 
 async fn run_kubectl_apply(
     context: Option<&str>,
@@ -1125,35 +1130,84 @@ async fn run_kubectl_apply(
     Ok(())
 }
 
-async fn run_helm_install(
-    context: Option<&str>,
-    kubeconfig: Option<&Path>,
-    args: &[&str],
-) -> Result<(), CliError> {
-    let mut cmd = tokio::process::Command::new("helm");
-    if let Some(kc) = kubeconfig {
-        cmd.arg("--kubeconfig").arg(kc);
+async fn materialize_control_plane_program_dir(
+    program_name: &str,
+    embedded_yaml: &str,
+    state_dir: &Path,
+) -> Result<PathBuf, CliError> {
+    let rel = PathBuf::from("deploy").join("bootstrap").join(program_name);
+    if rel.join("Pulumi.yaml").is_file() {
+        return Ok(rel);
     }
-    if let Some(ctx) = context {
-        cmd.arg("--kube-context").arg(ctx);
+    let parent_rel = PathBuf::from("..").join(&rel);
+    if parent_rel.join("Pulumi.yaml").is_file() {
+        return Ok(parent_rel);
     }
+
+    let embedded_dir = state_dir.join(format!("program-{program_name}"));
+    tokio::fs::create_dir_all(&embedded_dir).await?;
+    tokio::fs::write(embedded_dir.join("Pulumi.yaml"), embedded_yaml).await?;
+    Ok(embedded_dir)
+}
+
+async fn run_pulumi_cmd(program_dir: &Path, args: &[&str]) -> Result<(), CliError> {
+    let mut cmd = tokio::process::Command::new("pulumi");
     cmd.args(args)
+        .current_dir(program_dir)
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
+        .stderr(std::process::Stdio::piped())
+        .env("PULUMI_SKIP_UPDATE_CHECK", "true");
+
+    if std::env::var_os("PULUMI_CONFIG_PASSPHRASE").is_none() {
+        cmd.env("PULUMI_CONFIG_PASSPHRASE", "");
+    }
 
     let output = cmd.output().await.map_err(|e| {
         CliError::Validation(format!(
-            "failed to invoke `helm` (is it installed and in PATH?): {e}"
+            "failed to invoke `pulumi` (is it installed and in PATH?): {e}"
         ))
     })?;
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let detail = if !stderr.is_empty() { stderr } else { stdout };
+        let subcmd = args.first().copied().unwrap_or_default();
         return Err(CliError::Validation(format!(
-            "`helm {}` failed: {}",
-            args.join(" "),
-            stderr.trim()
+            "`pulumi {subcmd}` failed: {detail}"
         )));
     }
+    Ok(())
+}
+
+async fn run_pulumi_control_plane_stack(
+    program_name: &str,
+    embedded_yaml: &str,
+    cluster_name: &str,
+    config_pairs: &[(&str, &str, bool)],
+) -> Result<(), CliError> {
+    let state_dir = std::env::temp_dir()
+        .join("keel-stage0-pulumi")
+        .join(format!("control-plane-{cluster_name}"));
+    tokio::fs::create_dir_all(&state_dir).await?;
+    let program_dir =
+        materialize_control_plane_program_dir(program_name, embedded_yaml, &state_dir).await?;
+
+    let backend_url = format!("file://{}", state_dir.display());
+    let stack_name = format!("stage0-{program_name}-{cluster_name}");
+
+    run_pulumi_cmd(&program_dir, &["login", &backend_url]).await?;
+    run_pulumi_cmd(&program_dir, &["stack", "select", &stack_name, "--create"]).await?;
+
+    for &(key, value, is_secret) in config_pairs {
+        if is_secret {
+            run_pulumi_cmd(&program_dir, &["config", "set", "--secret", key, value]).await?;
+        } else {
+            run_pulumi_cmd(&program_dir, &["config", "set", key, value]).await?;
+        }
+    }
+
+    run_pulumi_cmd(&program_dir, &["up", "--yes", "--non-interactive"]).await?;
     Ok(())
 }
 
@@ -1359,93 +1413,35 @@ async fn install_stage0_core_addons(
     let ctx = connection.context.as_deref();
     let kc = connection.kubeconfig_path.as_deref();
 
-    tracing::info!(context = ?ctx, "Applying seed namespaces (`flux-system`, `keel-system`, `keel-previews`)");
-    run_kubectl_apply(ctx, kc, SEED_NAMESPACES_YAML).await?;
+    let sops_age_key =
+        match read_secret_key(ctx, kc, FLUX_SYSTEM_NAMESPACE, "sops-age", "age.agekey").await {
+            Some(existing) => existing,
+            None => artifacts.sops_age_keyfile.clone().unwrap_or_default(),
+        };
+    let enable_policy_exceptions = if artifacts.kyverno_bundle.policy_exception.is_some() {
+        "true"
+    } else {
+        "false"
+    };
+    let kube_context = ctx.unwrap_or("");
 
-    if let Some(ref keyfile) = artifacts.sops_age_keyfile
-        && read_secret_key(ctx, kc, FLUX_SYSTEM_NAMESPACE, "sops-age", "age.agekey")
-            .await
-            .is_none()
-    {
-        let sops_secret = serde_json::json!({
-            "apiVersion": "v1",
-            "kind": "Secret",
-            "metadata": {
-                "name": "sops-age",
-                "namespace": FLUX_SYSTEM_NAMESPACE,
-                "labels": {
-                    "app.kubernetes.io/managed-by": "keel",
-                    "keel.io/secret-kind": "sops-age",
-                },
-            },
-            "type": "Opaque",
-            "stringData": {
-                "age.agekey": keyfile,
-            },
-        });
-        let sops_yaml = serde_yml::to_string(&sops_secret)?;
-        run_kubectl_apply(ctx, kc, &sops_yaml).await?;
-    }
-
-    tracing::info!("Installing Flux CD (`flux2`) into `flux-system`");
-    run_helm_install(
-        ctx,
-        kc,
+    tracing::info!(
+        context = ?ctx,
+        "Deploying Stage 0 seed control-plane addons via Pulumi (`control-plane`)"
+    );
+    run_pulumi_control_plane_stack(
+        "control-plane",
+        CONTROL_PLANE_PULUMI_YAML,
+        &connection.cluster_name,
         &[
-            "upgrade",
-            "--install",
-            "flux2",
-            "oci://ghcr.io/fluxcd-community/charts/flux2",
-            "--namespace",
-            "flux-system",
-            "--create-namespace",
-            "--wait",
-            "--timeout",
-            "5m",
-        ],
-    )
-    .await?;
-
-    tracing::info!("Installing Kyverno admission controller into `kyverno`");
-    let mut kyverno_helm_args = vec![
-        "upgrade",
-        "--install",
-        "kyverno",
-        "kyverno",
-        "--repo",
-        "https://kyverno.github.io/kyverno/",
-        "--namespace",
-        "kyverno",
-        "--create-namespace",
-        "--set",
-        "admissionController.replicas=1",
-    ];
-    if artifacts.kyverno_bundle.policy_exception.is_some() {
-        kyverno_helm_args.extend_from_slice(&[
-            "--set",
-            "features.policyExceptions.enabled=true",
-            "--set",
-            "features.policyExceptions.namespace=keel-system",
-        ]);
-    }
-    kyverno_helm_args.extend_from_slice(&["--wait", "--timeout", "5m"]);
-    run_helm_install(ctx, kc, &kyverno_helm_args).await?;
-
-    tracing::info!("Installing Pulumi Kubernetes Operator (PKO v2) into `keel-system`");
-    run_helm_install(
-        ctx,
-        kc,
-        &[
-            "upgrade",
-            "--install",
-            "pulumi-kubernetes-operator",
-            "oci://ghcr.io/pulumi/helm-charts/pulumi-kubernetes-operator",
-            "--namespace",
-            "keel-system",
-            "--create-namespace",
-            "--wait",
-            "--timeout",
-            "5m",
+            ("kubeconfig", &connection.kubeconfig_yaml, true),
+            ("kubeContext", kube_context, false),
+            ("sopsAgeKey", &sops_age_key, true),
+            (
+                "enableKyvernoPolicyExceptions",
+                enable_policy_exceptions,
+                false,
+            ),
         ],
     )
     .await?;
@@ -1457,133 +1453,26 @@ async fn install_stage0_core_addons(
         .as_deref()
         .is_some_and(|b| b.contains("s3-state-backend-seaweedfs-s3.keel-system.svc.cluster.local"))
     {
-        tracing::info!(
-            "Installing in-cluster FOSS S3 state backend (SeaweedFS) into `keel-system`"
-        );
-        run_helm_install(
-            ctx,
-            kc,
-            &[
-                "upgrade",
-                "--install",
-                "s3-state-backend",
-                "seaweedfs",
-                "--repo",
-                "https://seaweedfs.github.io/seaweedfs/helm",
-                "--version",
-                "4.53.0",
-                "--namespace",
-                "keel-system",
-                "--create-namespace",
-                "--set",
-                "s3.enabled=true",
-                "--set",
-                "s3.enableAuth=true",
-                "--set",
-                "master.logs.type=emptyDir",
-                "--set",
-                "volume.logs.type=emptyDir",
-                "--set",
-                "filer.logs.type=emptyDir",
-                "--set",
-                "s3.logs.type=emptyDir",
-                "--set",
-                "master.data.type=persistentVolumeClaim",
-                "--set",
-                "master.data.size=1Gi",
-                "--set",
-                "filer.data.type=persistentVolumeClaim",
-                "--set",
-                "filer.data.size=2Gi",
-                "--set",
-                "volume.dataDirs[0].name=data1",
-                "--set",
-                "volume.dataDirs[0].type=persistentVolumeClaim",
-                "--set",
-                "volume.dataDirs[0].size=10Gi",
-                "--set",
-                "volume.dataDirs[0].maxVolumes=0",
-                "--set",
-                "volume.idx.type=persistentVolumeClaim",
-                "--set",
-                "volume.idx.size=2Gi",
-                "--wait",
-                "--timeout",
-                "5m",
-            ],
-        )
-        .await?;
         sync_in_cluster_s3_credentials_from_seaweedfs(ctx, kc).await?;
         ensure_seaweedfs_pulumi_bucket(ctx, kc).await?;
     }
 
     if with_forge {
-        tracing::info!("Installing in-cluster Forgejo Git forge into `keel-system`");
-        run_helm_install(
-            ctx,
-            kc,
+        tracing::info!(
+            "Installing in-cluster Forgejo Git forge via Pulumi (`control-plane-forgejo`)"
+        );
+        run_pulumi_control_plane_stack(
+            "control-plane-forgejo",
+            CONTROL_PLANE_FORGEJO_PULUMI_YAML,
+            &connection.cluster_name,
             &[
-                "upgrade",
-                "--install",
-                "forgejo",
-                "oci://code.forgejo.org/forgejo-helm/forgejo",
-                "--namespace",
-                "keel-system",
-                "--create-namespace",
-                "--set",
-                "gitea.admin.username=keel",
-                "--set",
-                "gitea.admin.password=keel-admin-dev",
-                "--set",
-                "gitea.admin.email=admin@keel.local",
-                "--set",
-                "gitea.config.database.DB_TYPE=sqlite3",
-                "--set",
-                "gitea.config.oauth2_client.ENABLE_AUTO_REGISTRATION=true",
-                "--set",
-                "gitea.config.oauth2_client.ACCOUNT_LINKING=auto",
-                "--set",
-                "gitea.config.oauth2_client.USERNAME=userid",
-                "--set",
-                "gitea.config.oauth2_client.OPENID_CONNECT_SCOPES=openid email profile",
-                "--set",
-                "persistence.enabled=false",
-                "--set",
-                "valkey-cluster.enabled=false",
-                "--set",
-                "valkey.enabled=false",
-                "--set",
-                "postgresql.enabled=false",
-                "--set",
-                "postgresql-ha.enabled=false",
-                "--wait",
-                "--timeout",
-                "5m",
+                ("kubeconfig", &connection.kubeconfig_yaml, true),
+                ("kubeContext", kube_context, false),
             ],
         )
         .await?;
     }
 
-    tracing::info!("Installing Envoy Gateway into `keel-system`");
-    run_helm_install(
-        ctx,
-        kc,
-        &[
-            "upgrade",
-            "--install",
-            "envoy-gateway",
-            "oci://docker.io/envoyproxy/gateway-helm",
-            "--version",
-            "v1.3.0",
-            "--namespace",
-            KEEL_SYSTEM_NAMESPACE,
-            "--create-namespace",
-            "--wait",
-            "--timeout",
-            "5m",
-        ],
-    )
-    .await?;
     let gateway_yaml = format!(
         "apiVersion: gateway.networking.k8s.io/v1\n\
          kind: GatewayClass\n\
@@ -1618,70 +1507,6 @@ async fn install_stage0_core_addons(
          \x20         from: All\n"
     );
     run_kubectl_apply(ctx, kc, &gateway_yaml).await?;
-
-    tracing::info!("Installing Prometheus into `keel-system` for Flagger canary telemetry");
-    run_helm_install(
-        ctx,
-        kc,
-        &[
-            "upgrade",
-            "--install",
-            "prometheus",
-            "prometheus",
-            "--repo",
-            "https://prometheus-community.github.io/helm-charts",
-            "--version",
-            "27.5.0",
-            "--namespace",
-            KEEL_SYSTEM_NAMESPACE,
-            "--set",
-            "alertmanager.enabled=false",
-            "--set",
-            "kube-state-metrics.enabled=true",
-            "--set",
-            "prometheus-node-exporter.enabled=false",
-            "--set",
-            "prometheus-pushgateway.enabled=false",
-            "--set",
-            "server.fullnameOverride=prometheus",
-            "--set",
-            "server.retention=7d",
-            "--set",
-            "server.persistentVolume.enabled=false",
-            "--wait",
-            "--timeout",
-            "5m",
-        ],
-    )
-    .await?;
-
-    tracing::info!("Installing Flagger into `keel-system` for Gateway API canary rollouts");
-    run_helm_install(
-        ctx,
-        kc,
-        &[
-            "upgrade",
-            "--install",
-            "flagger",
-            "flagger",
-            "--repo",
-            "https://flagger.app",
-            "--version",
-            "1.40.0",
-            "--namespace",
-            KEEL_SYSTEM_NAMESPACE,
-            "--set",
-            "meshProvider=gatewayapi:v1",
-            "--set",
-            "metricsServer=http://prometheus.keel-system:80",
-            "--set",
-            "podMonitor.enabled=false",
-            "--wait",
-            "--timeout",
-            "5m",
-        ],
-    )
-    .await?;
 
     let metric_templates_yaml = format!(
         "apiVersion: flagger.app/v1beta1\n\
@@ -1720,66 +1545,17 @@ async fn install_stage0_core_addons(
     run_kubectl_apply(ctx, kc, &metric_templates_yaml).await?;
 
     if let Some(ref dex_cfg) = artifacts.dex_config_yaml {
-        tracing::info!(
-            "Applying Stage 0 Dex OIDC config Secret and installing Dex into `keel-system`"
-        );
-        let dex_secret = serde_json::json!({
-            "apiVersion": "v1",
-            "kind": "Secret",
-            "metadata": {
-                "name": &artifacts.dex_secret_name,
-                "namespace": &artifacts.dex_secret_namespace,
-                "labels": {
-                    "app.kubernetes.io/managed-by": "keel",
-                    "keel.io/secret-kind": "dex-config",
-                },
-            },
-            "type": "Opaque",
-            "stringData": {
-                "config.yaml": dex_cfg,
-            },
-        });
-        let dex_secret_yaml = serde_yml::to_string(&dex_secret)?;
-        run_kubectl_apply(ctx, kc, &dex_secret_yaml).await?;
-
-        run_helm_install(
-            ctx,
-            kc,
+        tracing::info!("Installing Stage 0 Dex OIDC provider via Pulumi (`control-plane-dex`)");
+        run_pulumi_control_plane_stack(
+            "control-plane-dex",
+            CONTROL_PLANE_DEX_PULUMI_YAML,
+            &connection.cluster_name,
             &[
-                "upgrade",
-                "--install",
-                "dex",
-                "dex",
-                "--repo",
-                "https://charts.dexidp.io",
-                "--version",
-                "0.21.0",
-                "--namespace",
-                KEEL_SYSTEM_NAMESPACE,
-                "--create-namespace",
-                "--set",
-                "replicaCount=1",
-                "--set",
-                "configSecret.create=false",
-                "--set",
-                &format!("configSecret.name={}", artifacts.dex_secret_name),
-                "--set",
-                "service.ports.http.port=5556",
-                "--set",
-                "podSecurityContext.runAsNonRoot=true",
-                "--set",
-                "podSecurityContext.runAsUser=1001",
-                "--set",
-                "podSecurityContext.seccompProfile.type=RuntimeDefault",
-                "--set",
-                "securityContext.allowPrivilegeEscalation=false",
-                "--set",
-                "securityContext.runAsNonRoot=true",
-                "--set",
-                "securityContext.capabilities.drop={ALL}",
-                "--wait",
-                "--timeout",
-                "5m",
+                ("kubeconfig", &connection.kubeconfig_yaml, true),
+                ("kubeContext", kube_context, false),
+                ("dexConfigYaml", dex_cfg, true),
+                ("dexSecretName", &artifacts.dex_secret_name, false),
+                ("dexSecretNamespace", &artifacts.dex_secret_namespace, false),
             ],
         )
         .await?;

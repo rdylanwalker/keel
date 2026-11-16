@@ -1,0 +1,80 @@
+# Stage 0 In-Cluster Dex OIDC Identity Provider (`SDD.md` §2.1, §6.1, `NFR-SEC-01`)
+# Installed when no external `--oidc-issuer` is provided.
+name: keel-stage0-control-plane-dex
+runtime: yaml
+description: Stage 0 in-cluster Dex OIDC provider and config Secret in keel-system
+
+config:
+  kubeconfig:
+    type: string
+  kubeContext:
+    type: string
+    default: ""
+  dexConfigYaml:
+    type: string
+  dexSecretName:
+    type: string
+    default: dex-config
+  dexSecretNamespace:
+    type: string
+    default: keel-system
+
+resources:
+  k8sProvider:
+    type: kubernetes:provider:Provider
+    properties:
+      kubeconfig: ${kubeconfig}
+      context: ${kubeContext}
+      enableServerSideApply: true
+
+  dexConfigSecret:
+    type: kubernetes:core/v1:Secret
+    options:
+      provider: ${k8sProvider}
+    properties:
+      metadata:
+        name: ${dexSecretName}
+        namespace: ${dexSecretNamespace}
+        labels:
+          app.kubernetes.io/managed-by: keel
+          keel.io/secret-kind: dex-config
+      type: Opaque
+      stringData:
+        config.yaml: ${dexConfigYaml}
+
+  dex:
+    type: kubernetes:helm.sh/v3:Release
+    options:
+      provider: ${k8sProvider}
+      dependsOn:
+        - ${dexConfigSecret}
+    properties:
+      name: dex
+      chart: dex
+      version: "0.21.0"
+      repositoryOpts:
+        repo: https://charts.dexidp.io
+      namespace: keel-system
+      createNamespace: true
+      waitForJobs: true
+      timeout: 300
+      values:
+        replicaCount: 1
+        configSecret:
+          create: false
+          name: ${dexSecretName}
+        service:
+          ports:
+            http:
+              port: 5556
+        podSecurityContext:
+          runAsNonRoot: true
+          runAsUser: 1001
+          seccompProfile:
+            type: RuntimeDefault
+        securityContext:
+          allowPrivilegeEscalation: false
+          runAsNonRoot: true
+          capabilities:
+            drop:
+              - ALL

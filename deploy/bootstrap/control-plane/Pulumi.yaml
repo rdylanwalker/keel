@@ -1,0 +1,249 @@
+# Stage 0 Seed Control-Plane Addons (`SDD.md` §2.1, §6.2, `NFR-SEC-03`)
+# Provisions seed namespaces, SOPS age secret, Flux CD, Kyverno, PKO v2, SeaweedFS S3,
+# Envoy Gateway, Prometheus, and Flagger via pulumi-kubernetes.
+name: keel-stage0-control-plane
+runtime: yaml
+description: Stage 0 seed control-plane addons (Flux CD, Kyverno, PKO v2, SeaweedFS, Envoy Gateway, Prometheus, Flagger)
+
+config:
+  kubeconfig:
+    type: string
+  kubeContext:
+    type: string
+    default: ""
+  sopsAgeKey:
+    type: string
+    default: ""
+  enableKyvernoPolicyExceptions:
+    type: boolean
+    default: true
+
+resources:
+  k8sProvider:
+    type: kubernetes:provider:Provider
+    properties:
+      kubeconfig: ${kubeconfig}
+      context: ${kubeContext}
+      enableServerSideApply: true
+
+  fluxSystemNamespace:
+    type: kubernetes:core/v1:Namespace
+    options:
+      provider: ${k8sProvider}
+    properties:
+      metadata:
+        name: flux-system
+        labels:
+          app.kubernetes.io/managed-by: keel
+          app.kubernetes.io/part-of: keel-control-plane
+
+  keelSystemNamespace:
+    type: kubernetes:core/v1:Namespace
+    options:
+      provider: ${k8sProvider}
+    properties:
+      metadata:
+        name: keel-system
+        labels:
+          app.kubernetes.io/managed-by: keel
+          app.kubernetes.io/part-of: keel-control-plane
+          pod-security.kubernetes.io/enforce: baseline
+          pod-security.kubernetes.io/audit: restricted
+          pod-security.kubernetes.io/warn: restricted
+
+  keelPreviewsNamespace:
+    type: kubernetes:core/v1:Namespace
+    options:
+      provider: ${k8sProvider}
+    properties:
+      metadata:
+        name: keel-previews
+        labels:
+          app.kubernetes.io/managed-by: keel
+          app.kubernetes.io/part-of: keel-control-plane
+          pod-security.kubernetes.io/enforce: restricted
+          pod-security.kubernetes.io/audit: restricted
+          pod-security.kubernetes.io/warn: restricted
+
+  sopsAgeSecret:
+    type: kubernetes:core/v1:Secret
+    options:
+      provider: ${k8sProvider}
+      dependsOn:
+        - ${fluxSystemNamespace}
+    properties:
+      metadata:
+        name: sops-age
+        namespace: flux-system
+        labels:
+          app.kubernetes.io/managed-by: keel
+          keel.io/secret-kind: sops-age
+      type: Opaque
+      stringData:
+        age.agekey: ${sopsAgeKey}
+
+  flux2:
+    type: kubernetes:helm.sh/v3:Release
+    options:
+      provider: ${k8sProvider}
+      dependsOn:
+        - ${fluxSystemNamespace}
+    properties:
+      name: flux2
+      chart: oci://ghcr.io/fluxcd-community/charts/flux2
+      namespace: flux-system
+      createNamespace: true
+      waitForJobs: true
+      timeout: 300
+
+  kyverno:
+    type: kubernetes:helm.sh/v3:Release
+    options:
+      provider: ${k8sProvider}
+      dependsOn:
+        - ${keelSystemNamespace}
+    properties:
+      name: kyverno
+      chart: kyverno
+      repositoryOpts:
+        repo: https://kyverno.github.io/kyverno/
+      namespace: kyverno
+      createNamespace: true
+      waitForJobs: true
+      timeout: 300
+      values:
+        admissionController:
+          replicas: 1
+        features:
+          policyExceptions:
+            enabled: ${enableKyvernoPolicyExceptions}
+            namespace: keel-system
+
+  pulumiKubernetesOperator:
+    type: kubernetes:helm.sh/v3:Release
+    options:
+      provider: ${k8sProvider}
+      dependsOn:
+        - ${keelSystemNamespace}
+    properties:
+      name: pulumi-kubernetes-operator
+      chart: oci://ghcr.io/pulumi/helm-charts/pulumi-kubernetes-operator
+      namespace: keel-system
+      createNamespace: true
+      waitForJobs: true
+      timeout: 300
+
+  s3StateBackend:
+    type: kubernetes:helm.sh/v3:Release
+    options:
+      provider: ${k8sProvider}
+      dependsOn:
+        - ${keelSystemNamespace}
+    properties:
+      name: s3-state-backend
+      chart: seaweedfs
+      version: "4.53.0"
+      repositoryOpts:
+        repo: https://seaweedfs.github.io/seaweedfs/helm
+      namespace: keel-system
+      createNamespace: true
+      waitForJobs: true
+      timeout: 300
+      values:
+        s3:
+          enabled: true
+          enableAuth: true
+          logs:
+            type: emptyDir
+        master:
+          logs:
+            type: emptyDir
+          data:
+            type: persistentVolumeClaim
+            size: 1Gi
+        filer:
+          logs:
+            type: emptyDir
+          data:
+            type: persistentVolumeClaim
+            size: 2Gi
+        volume:
+          logs:
+            type: emptyDir
+          idx:
+            type: persistentVolumeClaim
+            size: 2Gi
+          dataDirs:
+            - name: data1
+              type: persistentVolumeClaim
+              size: 10Gi
+              maxVolumes: 0
+
+  envoyGateway:
+    type: kubernetes:helm.sh/v3:Release
+    options:
+      provider: ${k8sProvider}
+      dependsOn:
+        - ${keelSystemNamespace}
+    properties:
+      name: envoy-gateway
+      chart: oci://docker.io/envoyproxy/gateway-helm
+      version: v1.3.0
+      namespace: keel-system
+      createNamespace: true
+      waitForJobs: true
+      timeout: 300
+
+  prometheus:
+    type: kubernetes:helm.sh/v3:Release
+    options:
+      provider: ${k8sProvider}
+      dependsOn:
+        - ${keelSystemNamespace}
+    properties:
+      name: prometheus
+      chart: prometheus
+      version: "27.5.0"
+      repositoryOpts:
+        repo: https://prometheus-community.github.io/helm-charts
+      namespace: keel-system
+      createNamespace: true
+      waitForJobs: true
+      timeout: 300
+      values:
+        alertmanager:
+          enabled: false
+        kube-state-metrics:
+          enabled: true
+        prometheus-node-exporter:
+          enabled: false
+        prometheus-pushgateway:
+          enabled: false
+        server:
+          fullnameOverride: prometheus
+          retention: 7d
+          persistentVolume:
+            enabled: false
+
+  flagger:
+    type: kubernetes:helm.sh/v3:Release
+    options:
+      provider: ${k8sProvider}
+      dependsOn:
+        - ${envoyGateway}
+        - ${prometheus}
+    properties:
+      name: flagger
+      chart: flagger
+      version: "1.40.0"
+      repositoryOpts:
+        repo: https://flagger.app
+      namespace: keel-system
+      createNamespace: true
+      waitForJobs: true
+      timeout: 300
+      values:
+        meshProvider: gatewayapi:v1
+        metricsServer: http://prometheus.keel-system.svc.cluster.local:80
+        podMonitor:
+          enabled: false

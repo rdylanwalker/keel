@@ -1,0 +1,56 @@
+# Stage 0 In-Cluster Forgejo Git Forge (`SDD.md` §2.1)
+# Installed when `keel bootstrap init --with-forge` is enabled.
+name: keel-stage0-control-plane-forgejo
+runtime: yaml
+description: Stage 0 in-cluster Forgejo Git forge in keel-system
+
+config:
+  kubeconfig:
+    type: string
+  kubeContext:
+    type: string
+    default: ""
+
+resources:
+  k8sProvider:
+    type: kubernetes:provider:Provider
+    properties:
+      kubeconfig: ${kubeconfig}
+      context: ${kubeContext}
+      enableServerSideApply: true
+
+  forgejo:
+    type: kubernetes:helm.sh/v3:Release
+    options:
+      provider: ${k8sProvider}
+    properties:
+      name: forgejo
+      chart: oci://code.forgejo.org/forgejo-helm/forgejo
+      namespace: keel-system
+      createNamespace: true
+      waitForJobs: true
+      timeout: 300
+      values:
+        gitea:
+          admin:
+            username: keel
+            password: keel-admin-dev
+            email: admin@keel.local
+          config:
+            database:
+              DB_TYPE: sqlite3
+            oauth2_client:
+              ENABLE_AUTO_REGISTRATION: true
+              ACCOUNT_LINKING: auto
+              USERNAME: userid
+              OPENID_CONNECT_SCOPES: openid email profile
+        persistence:
+          enabled: false
+        valkey-cluster:
+          enabled: false
+        valkey:
+          enabled: false
+        postgresql:
+          enabled: false
+        postgresql-ha:
+          enabled: false
