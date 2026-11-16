@@ -730,13 +730,19 @@ async fn provision_in_cluster_forgejo(
         .build()
         .map_err(|e| CliError::Validation(e.to_string()))?;
 
+    let forgejo_user = "keel";
+    let forgejo_pass = std::env::var("KEEL_FORGEJO_ADMIN_PASSWORD")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "keel-admin-dev".to_string());
+
     // 1. Ensure `keel/infra-gitops` repository exists (201 Created or 409 Already Exists)
     let repo_resp = client
         .post(format!("{base}/api/v1/user/repos"))
-        .basic_auth("keel", Some("keel-admin-dev"))
+        .basic_auth(forgejo_user, Some(forgejo_pass.as_str()))
         .json(&serde_json::json!({
             "name": "infra-gitops",
-            "private": false,
+            "private": true,
             "auto_init": false
         }))
         .send()
@@ -754,7 +760,7 @@ async fn provision_in_cluster_forgejo(
     let token_name = format!("keel-stage0-{}", chrono::Utc::now().timestamp());
     let tok_resp = client
         .post(format!("{base}/api/v1/users/keel/tokens"))
-        .basic_auth("keel", Some("keel-admin-dev"))
+        .basic_auth(forgejo_user, Some(forgejo_pass.as_str()))
         .json(&serde_json::json!({
             "name": token_name,
             "scopes": ["write:repository", "write:issue", "read:user"]
@@ -1366,6 +1372,13 @@ async fn read_secret_key(
     secret_name: &str,
     key: &str,
 ) -> Option<String> {
+    if key.is_empty()
+        || !key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    {
+        return None;
+    }
     let mut cmd = tokio::process::Command::new("kubectl");
     if let Some(kc) = kubeconfig {
         cmd.arg("--kubeconfig").arg(kc);
