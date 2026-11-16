@@ -6,7 +6,7 @@ These hands-on walkthroughs assume you have completed the [Stage 0 Bootstrap](bo
 2. `keel serve` running on `http://127.0.0.1:8080`.
 3. An authenticated Web UI or CLI session (`keel auth login`).
 
-> **New to Keel?** Follow the [Stage 0 Bootstrap](bootstrap.md) guide first to initialize your local `kind` management cluster and obtain your bootstrap token.
+> **New to Keel?** Follow the [Stage 0 Bootstrap](bootstrap.md) guide first to initialize your local `kind` management cluster and sign in via OIDC.
 
 ---
 

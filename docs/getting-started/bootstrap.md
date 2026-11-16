@@ -80,26 +80,23 @@ When a Kubernetes cluster is reachable via `KUBECONFIG` (or in-cluster config), 
 - Opens background `kubectl port-forward` tunnels to in-cluster **Forgejo** (`--with-forge`, preferring `127.0.0.1:3000` or falling back to an ephemeral port) and **Dex** (preferring `127.0.0.1:5556`) when running on `localhost`.
 - Rewrites Forgejo PR `html_url` links (**Forge Link** / **View PR on Forge**) to the active local port-forwarded URL and rewrites Dex discovery endpoints to `http://127.0.0.1:<port>/dex` so host browsers can complete OIDC login without `/etc/hosts` changes.
 
-When running offline without OIDC configured (e.g. `just serve`), `keel serve` starts in Stage 0 Bootstrap Token mode and prints a **single-use 256-bit bootstrap token** to stdout:
+When running locally without an active cluster (e.g. `just serve` or `just serve-demo`), `keel serve` prints:
 
 ```text
 Keel Control Plane listening on http://127.0.0.1:8080
-Stage 0 Bootstrap Token: <64-character-hex-token>
 ```
-
-> **Note — Single-use token:** Only the SHA-256 hash of the token is stored, and the token is invalidated immediately after its first successful login. Restart `keel serve` if you need a fresh token during offline Stage 0 development.
 
 ### Development Shortcuts (`just`)
 
 - `just serve` — Starts `keel serve` with a clean temporary local Git repository.
-- `just serve-demo` — Starts `keel serve` pre-seeded with `deploy/catalog/` blueprints and providers.
+- `just serve-demo` — Starts `keel serve` pre-seeded with `deploy/catalog/` blueprints and providers (open `http://127.0.0.1:8080/?demo=true` for an unauthenticated UI preview).
 
 ## 3. Authenticate
 
 ### Web UI
 
 - **With OIDC (default after `keel bootstrap init`):** Open `http://127.0.0.1:8080`, click **Sign in with OIDC**, and log in with the Dex admin username/password printed by `keel bootstrap init` (or your external OIDC account).
-- **Without OIDC (offline / `just serve`):** Open `http://127.0.0.1:8080`, click **Bootstrap Token Login**, and paste the 64-character token from stdout.
+- **UI Preview Mode (`just serve-demo`):** Open `http://127.0.0.1:8080/?demo=true` to explore the UI with pre-seeded demo data without an OIDC provider.
 
 ### CLI
 
@@ -108,8 +105,6 @@ Authenticate the CLI via OIDC Authorization Code + PKCE:
 ```bash
 keel auth login --server http://127.0.0.1:8080
 ```
-
-For offline local development without OIDC, use **Bootstrap Token Login** in the Web UI (or exchange the token via `POST /api/v1/auth/bootstrap`).
 
 ## 4. WSL2 + Windows Browser Notes
 

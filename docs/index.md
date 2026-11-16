@@ -19,7 +19,7 @@ flowchart TB
 
 ## Documentation Guide
 
-1. **[Stage 0 Bootstrap](getting-started/bootstrap.md)** — Initialize a management cluster (`kind`, `kubeconfig`, Proxmox, or cloud), start `keel serve`, and authenticate with the Stage 0 bootstrap token.
+1. **[Stage 0 Bootstrap](getting-started/bootstrap.md)** — Initialize a management cluster (`kind`, `kubeconfig`, Proxmox, or cloud), start `keel serve`, and authenticate via OIDC.
 2. **[Provisioning Workflow](getting-started/provisioning.md)** — Enable providers, create tenants, submit infrastructure & application PRs, inspect Git + PKO v2 diffs, and merge changes.
 3. **[Things to Try](getting-started/things-to-try.md)** — Hands-on walkthroughs starting from a local `kind` management cluster (second `kind` cluster, `podinfo` canary rollout, minimal AWS EKS, and custom blueprints).
 4. **[Catalog Overview](catalog/overview.md)** — Understand `CatalogInfraBlueprint` and `CatalogApplication` (`keel.io/v1alpha1`), JSON Schema forms, and SOPS/`age` secret encryption.
