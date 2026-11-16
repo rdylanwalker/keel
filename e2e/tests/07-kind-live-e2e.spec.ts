@@ -126,6 +126,7 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
       }
       fs.mkdirSync(DETERMINISTIC_REPO_DIR, { recursive: true });
       tmpRepoDir = DETERMINISTIC_REPO_DIR;
+      createdMgmtCluster = true;
       logStep(
         `Bootstrapping fresh kind management cluster "${MGMT_CLUSTER}" via deploy/bootstrap/kind/Pulumi.yaml (repo: ${tmpRepoDir})...`,
       );
@@ -148,7 +149,6 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
         undefined,
         true,
       );
-      createdMgmtCluster = true;
     } else {
       logStep(`Reusing existing kind management cluster "${MGMT_CLUSTER}"`);
     }
@@ -169,7 +169,19 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
       if (!diff.ok) {
         runCmd(
           'git',
-          ['-C', repoDir, 'commit', '-m', 'chore(e2e): seed full catalog blueprints and bundles'],
+          [
+            '-C',
+            repoDir,
+            '-c',
+            'user.name=Keel E2E',
+            '-c',
+            'user.email=e2e@keel.local',
+            '-c',
+            'commit.gpgsign=false',
+            'commit',
+            '-m',
+            'chore(e2e): seed full catalog blueprints and bundles',
+          ],
           { GIT_EDITOR: 'true' },
         );
       }
@@ -252,6 +264,7 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
       }
       if (tmpRepoDir) {
         fs.rmSync(tmpRepoDir, { recursive: true, force: true });
+        fs.rmSync(`${tmpRepoDir}.git`, { recursive: true, force: true });
       }
     } else {
       console.log(
