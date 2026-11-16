@@ -48,7 +48,7 @@ serve-demo:
     git -C "$tmp_dir/work" -c user.name="Keel Demo" -c user.email="demo@keel.io" commit -m "chore(demo): seed catalog and providers" >/dev/null
     git -C "$tmp_dir/work" push origin main >/dev/null 2>&1
     echo "Demo URL (unauthenticated UI preview): http://127.0.0.1:8080/?demo=true"
-    echo "Live API URL (use printed Bootstrap Token): http://127.0.0.1:8080/"
+    echo "Live API URL (OIDC login): http://127.0.0.1:8080/"
     cargo run --bin keel -- serve --bind 127.0.0.1:8080 --repo-dir "$tmp_dir/work" --bare-repo "$tmp_dir/bare.git"
 
 # Stop any running background or orphaned `keel serve` process
@@ -162,7 +162,6 @@ build-serve *ARGS: build
     if [ -n "$dex_port" ]; then
         echo "Dex OIDC Local URL:      http://127.0.0.1:$dex_port/dex"
     fi
-    grep "Bootstrap Token" "$log_file" || true
 
     if command -v kubectl >/dev/null 2>&1; then
         dex_email=$(kubectl get secret -n keel-system dex-config -o jsonpath='{.data.config\.yaml}' 2>/dev/null | base64 -d 2>/dev/null | awk '/email:/ {print $NF; exit}' || true)
