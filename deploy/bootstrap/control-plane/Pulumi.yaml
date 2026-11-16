@@ -20,7 +20,7 @@ config:
 
 resources:
   k8sProvider:
-    type: kubernetes:provider:Provider
+    type: pulumi:providers:kubernetes
     properties:
       kubeconfig: ${kubeconfig}
       context: ${kubeContext}

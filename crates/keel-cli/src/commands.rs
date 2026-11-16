@@ -1298,7 +1298,7 @@ async fn run_pulumi_control_plane_stack(
         if is_secret {
             run_pulumi_cmd(&program_dir, &["config", "set", "--secret", key, value]).await?;
         } else {
-            run_pulumi_cmd(&program_dir, &["config", "set", key, value]).await?;
+            run_pulumi_cmd(&program_dir, &["config", "set", "--plaintext", key, value]).await?;
         }
     }
 
