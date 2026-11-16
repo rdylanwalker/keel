@@ -61,7 +61,7 @@ pub enum CoreError {
     #[error("Validation error: {0}")]
     Validation(String),
 
-    #[error("Schema validation failed with {} field error(s)", .0.len())]
+    #[error("{}", format_schema_validation_errors(.0))]
     SchemaValidation(Vec<SchemaFieldError>),
 
     #[error("Crypto error: {0}")]
@@ -72,6 +72,27 @@ pub enum CoreError {
 
     #[error("Not implemented: {0}")]
     NotImplemented(String),
+}
+
+fn format_schema_validation_errors(errors: &[SchemaFieldError]) -> String {
+    if errors.is_empty() {
+        return "Schema validation failed with 0 field error(s)".to_string();
+    }
+    let details: Vec<String> = errors
+        .iter()
+        .map(|e| {
+            if e.field_path.is_empty() {
+                e.message.clone()
+            } else {
+                format!("{}: {}", e.field_path, e.message)
+            }
+        })
+        .collect();
+    format!(
+        "Schema validation failed with {} field error(s): {}",
+        errors.len(),
+        details.join("; ")
+    )
 }
 
 /// Validates that `value` conforms to a Kubernetes DNS-1123 label (`[a-z0-9]([-a-z0-9]*[a-z0-9])?`, max 63 chars).
@@ -152,5 +173,25 @@ mod tests {
         // Over 56 chars in tenant_id exceeds 63 chars when prefixed with "tenant-"
         let too_long = "a".repeat(57);
         assert!(tenant_namespace(&too_long).is_err());
+    }
+
+    #[test]
+    fn test_schema_validation_error_display_includes_fields() {
+        let err = CoreError::SchemaValidation(vec![
+            SchemaFieldError {
+                field_path: String::new(),
+                schema_path: "/required".to_string(),
+                message: "\"ingressHost\" is a required property".to_string(),
+            },
+            SchemaFieldError {
+                field_path: "/apiToken".to_string(),
+                schema_path: "/properties/apiToken/minLength".to_string(),
+                message: "must be at least 8 characters".to_string(),
+            },
+        ]);
+        let rendered = err.to_string();
+        assert!(rendered.contains("2 field error(s)"));
+        assert!(rendered.contains("\"ingressHost\" is a required property"));
+        assert!(rendered.contains("/apiToken: must be at least 8 characters"));
     }
 }
