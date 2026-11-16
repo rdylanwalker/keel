@@ -1,3 +1,15 @@
+# [0.4.0](https://github.com/rdylanwalker/keel/compare/v0.3.0...v0.4.0) (2026-11-16)
+
+
+### Bug Fixes
+
+* **ui:** remove duplicate plus on Add Catalog Item button ([6d3a50e](https://github.com/rdylanwalker/keel/commit/6d3a50e8a8d80a4bd4268d6764ad68b6ef93d530))
+
+
+### Features
+
+* **ui:** support nested objects and arrays in schema builder ([4d102b3](https://github.com/rdylanwalker/keel/commit/4d102b3503de3a6e7f1bde249d1da788d5415489))
+
 # [0.3.0](https://github.com/rdylanwalker/keel/compare/v0.2.0...v0.3.0) (2026-11-16)
 
 
