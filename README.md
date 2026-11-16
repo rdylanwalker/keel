@@ -125,7 +125,7 @@ keel bootstrap init \
   --repo-dir ./keel-gitops
 ```
 
-Copy the generated **Admin Username** and **Admin Password** printed in the Stage 0 bootstrap summary (or use the values you supplied via `--admin-username` / `--admin-password` / `KEEL_ADMIN_PASSWORD`, or your external `--oidc-issuer`).
+Copy the generated **Admin Username** and **Admin Password** printed in the Stage 0 bootstrap summary (or use the values you supplied via `--admin-username` / `--admin-password` / `KEEL_ADMIN_PASSWORD`, or your external `--oidc-issuer`). Add `--with-forge` if you want an in-cluster Forgejo Git server so Flux CD can pull-poll inside `kind` (without `--with-forge`, Stage 0 uses a local bare Git repo and skips in-cluster `GitRepository` reconciliation).
 
 ### 3. Start the Control Plane & Authenticate
 Start `keel serve` (or `just build-serve` to build, restart in the background, and print local URLs/credentials; `just serve` for foreground; `just serve-demo` for a pre-seeded demo catalog):
@@ -169,10 +169,16 @@ keel infra provision \
 keel preview status --pr 1 --watch --server http://127.0.0.1:8080
 
 # Merge the PR in the GUI (PR & Preview Inspector) or via Git, then install an app:
+cat <<'EOF' > podinfo-values.yaml
+replicaCount: 2
+ingressHost: podinfo.keel.local
+apiToken: demo-podinfo-token
+EOF
+
 keel app install \
   --app podinfo \
   --tenant platform-team \
-  --values-file ./deploy/catalog/apps/podinfo/upstream/values.yaml \
+  --values-file ./podinfo-values.yaml \
   --canary \
   --server http://127.0.0.1:8080
 ```
