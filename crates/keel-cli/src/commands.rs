@@ -558,6 +558,37 @@ const STARTER_KIND_CLUSTER_PULUMI_YAML: &str =
 const STARTER_PODINFO_CATALOG_YAML: &str =
     include_str!("../../../deploy/catalog/apps/podinfo/catalog.yaml");
 
+const SEED_CORE_ADDON_KUSTOMIZATION_YAML: &str =
+    include_str!("../../../deploy/seed/core-addons/kustomization.yaml");
+const SEED_CORE_ADDON_HELM_REPOSITORIES_YAML: &str =
+    include_str!("../../../deploy/seed/core-addons/helm-repositories.yaml");
+const SEED_CORE_ADDON_S3_SEAWEEDFS_YAML: &str =
+    include_str!("../../../deploy/seed/core-addons/s3-seaweedfs.yaml");
+const SEED_CORE_ADDON_PKO_YAML: &str = include_str!("../../../deploy/seed/core-addons/pko.yaml");
+const SEED_CORE_ADDON_KYVERNO_YAML: &str =
+    include_str!("../../../deploy/seed/core-addons/kyverno.yaml");
+const SEED_CORE_ADDON_ENVOY_GATEWAY_YAML: &str =
+    include_str!("../../../deploy/seed/core-addons/envoy-gateway.yaml");
+const SEED_CORE_ADDON_PROMETHEUS_YAML: &str =
+    include_str!("../../../deploy/seed/core-addons/prometheus.yaml");
+const SEED_CORE_ADDON_FLAGGER_YAML: &str =
+    include_str!("../../../deploy/seed/core-addons/flagger.yaml");
+const SEED_CORE_ADDON_DEX_YAML: &str = include_str!("../../../deploy/seed/core-addons/dex.yaml");
+
+const CORE_CATALOG_S3_STATE_BACKEND_YAML: &str =
+    include_str!("../../../deploy/catalog/core/s3-state-backend/catalog.yaml");
+const CORE_CATALOG_KYVERNO_YAML: &str =
+    include_str!("../../../deploy/catalog/core/kyverno/catalog.yaml");
+const CORE_CATALOG_DEX_YAML: &str = include_str!("../../../deploy/catalog/core/dex/catalog.yaml");
+const CORE_CATALOG_ENVOY_GATEWAY_YAML: &str =
+    include_str!("../../../deploy/catalog/core/envoy-gateway/catalog.yaml");
+const CORE_CATALOG_PROMETHEUS_YAML: &str =
+    include_str!("../../../deploy/catalog/core/prometheus/catalog.yaml");
+const CORE_CATALOG_FLAGGER_YAML: &str =
+    include_str!("../../../deploy/catalog/core/flagger/catalog.yaml");
+const CORE_CATALOG_PKO_YAML: &str =
+    include_str!("../../../deploy/catalog/core/pulumi-kubernetes-operator/catalog.yaml");
+
 async fn is_dir_empty_or_missing(dir: &Path) -> bool {
     let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
         return true;
@@ -995,8 +1026,72 @@ async fn initialize_seed_git_repo_with_push(
             artifacts.flux_git_repository.to_yaml()?,
         ),
         (
+            "clusters/management/core-addons/kustomization.yaml",
+            SEED_CORE_ADDON_KUSTOMIZATION_YAML.to_string(),
+        ),
+        (
+            "clusters/management/core-addons/helm-repositories.yaml",
+            SEED_CORE_ADDON_HELM_REPOSITORIES_YAML.to_string(),
+        ),
+        (
+            "clusters/management/core-addons/s3-seaweedfs.yaml",
+            SEED_CORE_ADDON_S3_SEAWEEDFS_YAML.to_string(),
+        ),
+        (
+            "clusters/management/core-addons/pko.yaml",
+            SEED_CORE_ADDON_PKO_YAML.to_string(),
+        ),
+        (
+            "clusters/management/core-addons/kyverno.yaml",
+            SEED_CORE_ADDON_KYVERNO_YAML.to_string(),
+        ),
+        (
+            "clusters/management/core-addons/envoy-gateway.yaml",
+            SEED_CORE_ADDON_ENVOY_GATEWAY_YAML.to_string(),
+        ),
+        (
+            "clusters/management/core-addons/prometheus.yaml",
+            SEED_CORE_ADDON_PROMETHEUS_YAML.to_string(),
+        ),
+        (
+            "clusters/management/core-addons/flagger.yaml",
+            SEED_CORE_ADDON_FLAGGER_YAML.to_string(),
+        ),
+        (
+            "clusters/management/core-addons/dex.yaml",
+            SEED_CORE_ADDON_DEX_YAML.to_string(),
+        ),
+        (
             "clusters/management/core-addons/kyverno-policies.yaml",
             artifacts.kyverno_bundle.to_multi_doc_yaml()?,
+        ),
+        (
+            "catalog/core/s3-state-backend/catalog.yaml",
+            CORE_CATALOG_S3_STATE_BACKEND_YAML.to_string(),
+        ),
+        (
+            "catalog/core/kyverno/catalog.yaml",
+            CORE_CATALOG_KYVERNO_YAML.to_string(),
+        ),
+        (
+            "catalog/core/dex/catalog.yaml",
+            CORE_CATALOG_DEX_YAML.to_string(),
+        ),
+        (
+            "catalog/core/envoy-gateway/catalog.yaml",
+            CORE_CATALOG_ENVOY_GATEWAY_YAML.to_string(),
+        ),
+        (
+            "catalog/core/prometheus/catalog.yaml",
+            CORE_CATALOG_PROMETHEUS_YAML.to_string(),
+        ),
+        (
+            "catalog/core/flagger/catalog.yaml",
+            CORE_CATALOG_FLAGGER_YAML.to_string(),
+        ),
+        (
+            "catalog/core/pulumi-kubernetes-operator/catalog.yaml",
+            CORE_CATALOG_PKO_YAML.to_string(),
         ),
         (
             "clusters/management/management-stack.yaml",
@@ -3470,6 +3565,16 @@ spec:
         assert!(
             repo_dir
                 .join("clusters/management/core-addons/kyverno-policies.yaml")
+                .exists()
+        );
+        assert!(
+            repo_dir
+                .join("clusters/management/core-addons/s3-seaweedfs.yaml")
+                .exists()
+        );
+        assert!(
+            repo_dir
+                .join("catalog/core/s3-state-backend/catalog.yaml")
                 .exists()
         );
         assert!(
