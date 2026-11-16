@@ -18,26 +18,14 @@ import {
   UpgradeManagementAddonPayload,
 } from "../types/api"
 
-const TOKEN_KEY = "keel_bootstrap_token"
+let inMemoryToken: string | null = null
 
 export function getStoredToken(): string | null {
-  try {
-    return localStorage.getItem(TOKEN_KEY)
-  } catch {
-    return null
-  }
+  return inMemoryToken
 }
 
 export function setStoredToken(token: string | null): void {
-  try {
-    if (token) {
-      localStorage.setItem(TOKEN_KEY, token)
-    } else {
-      localStorage.removeItem(TOKEN_KEY)
-    }
-  } catch {
-    // Ignore storage errors in restricted contexts
-  }
+  inMemoryToken = token ? token : null
 }
 
 function getHeaders(

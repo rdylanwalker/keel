@@ -37,7 +37,7 @@ import {
 
 describe("api client module", () => {
   beforeEach(() => {
-    localStorage.clear()
+    setStoredToken(null)
     vi.restoreAllMocks()
   })
 
@@ -45,31 +45,13 @@ describe("api client module", () => {
     vi.restoreAllMocks()
   })
 
-  it("handles stored token in localStorage", () => {
+  it("handles stored token in memory without persisting to localStorage", () => {
     expect(getStoredToken()).toBeNull()
     setStoredToken("test-token-123")
     expect(getStoredToken()).toBe("test-token-123")
+    expect(localStorage.getItem("keel_bootstrap_token")).toBeNull()
     setStoredToken(null)
     expect(getStoredToken()).toBeNull()
-  })
-
-  it("handles storage exceptions gracefully", () => {
-    const getItemSpy = vi
-      .spyOn(Storage.prototype, "getItem")
-      .mockImplementation(() => {
-        throw new Error("Storage denied")
-      })
-    expect(getStoredToken()).toBeNull()
-
-    const setItemSpy = vi
-      .spyOn(Storage.prototype, "setItem")
-      .mockImplementation(() => {
-        throw new Error("Storage denied")
-      })
-    expect(() => setStoredToken("token")).not.toThrow()
-
-    getItemSpy.mockRestore()
-    setItemSpy.mockRestore()
   })
 
   it("throws error on API HTTP failure with text response", async () => {
