@@ -242,11 +242,13 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
       })
       setReleases(releasesData || [])
     } catch (err) {
-      setError(
+      const msg =
         err instanceof Error
           ? err.message
           : "Failed to load live stack topology"
-      )
+      if (!(isDemoMode() && msg.includes("API error (401)"))) {
+        setError(msg)
+      }
       if (!isDemoMode()) {
         setStacks(ensureManagementStack([]))
       }
@@ -357,11 +359,13 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
       })
       .catch((err) => {
         if (!cancelled) {
-          setError(
+          const msg =
             err instanceof Error
               ? err.message
               : "Failed to load live stack topology"
-          )
+          if (!(isDemoMode() && msg.includes("API error (401)"))) {
+            setError(msg)
+          }
           if (!isDemoMode()) {
             setStacks(ensureManagementStack([]))
           }
@@ -386,7 +390,7 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
   }, [authenticated, autoRefresh, fetchTopology])
 
   useEffect(() => {
-    if (!authenticated || isStreamPaused) return
+    if (!authenticated || isStreamPaused || isDemoMode()) return
 
     let eventSource: EventSource | null = null
     try {

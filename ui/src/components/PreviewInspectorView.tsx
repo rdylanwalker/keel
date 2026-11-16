@@ -158,9 +158,11 @@ export const PreviewInspectorView: React.FC = () => {
       })
       .catch((err) => {
         if (!cancelled) {
-          setError(
+          const msg =
             err instanceof Error ? err.message : "Failed to load PR proposals"
-          )
+          if (!(isDemoMode() && msg.includes("API error (401)"))) {
+            setError(msg)
+          }
           if (!isDemoMode()) {
             setProposals([])
             setSelectedPR(null)
@@ -190,11 +192,13 @@ export const PreviewInspectorView: React.FC = () => {
       })
       .catch((err) => {
         if (!cancelled) {
-          setError(
+          const msg =
             err instanceof Error
               ? err.message
               : "Failed to load PKO v2 preview diff"
-          )
+          if (!(isDemoMode() && msg.includes("API error (401)"))) {
+            setError(msg)
+          }
           if (isDemoMode()) {
             setPreview(DEFAULT_PREVIEW)
           } else {

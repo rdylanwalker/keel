@@ -319,11 +319,13 @@ export const ControlPlaneProvidersView: React.FC<
       setReleases(releasesData || [])
       setPendingProviderPrs(extractPendingProviderPrs(proposalsData || []))
     } catch (err) {
-      setError(
+      const msg =
         err instanceof Error
           ? err.message
           : "Failed to load control plane & provider state"
-      )
+      if (!(isDemoMode() && msg.includes("API error (401)"))) {
+        setError(msg)
+      }
     } finally {
       setLoading(false)
     }
@@ -375,11 +377,13 @@ export const ControlPlaneProvidersView: React.FC<
       )
       .catch((err) => {
         if (!cancelled) {
-          setError(
+          const msg =
             err instanceof Error
               ? err.message
               : "Failed to load control plane & provider state"
-          )
+          if (!(isDemoMode() && msg.includes("API error (401)"))) {
+            setError(msg)
+          }
         }
       })
       .finally(() => {

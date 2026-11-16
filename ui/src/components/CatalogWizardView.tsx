@@ -330,7 +330,11 @@ export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
           setCatalog([])
         }
       } catch (err) {
-        setError(err instanceof Error ? err.message : "Failed to load catalog")
+        const msg =
+          err instanceof Error ? err.message : "Failed to load catalog"
+        if (!(isDemoMode() && msg.includes("API error (401)"))) {
+          setError(msg)
+        }
         if (!isDemoMode()) {
           setCatalog([])
         }
