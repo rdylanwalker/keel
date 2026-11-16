@@ -17,6 +17,10 @@ flowchart TB
     PKO -->|"OpenTofu / Pulumi Providers"| INFRA["kind / Proxmox / AWS / GCP / Azure / Hetzner / Cloudflare"]
 ```
 
+## Web Portal
+
+![Keel Topology Map](assets/screenshots/topology.png)
+
 ## Documentation Guide
 
 1. **[Stage 0 Bootstrap](getting-started/bootstrap.md)** — Initialize a management cluster (`kind`, `kubeconfig`, Proxmox, or cloud), start `keel serve`, and authenticate via OIDC.

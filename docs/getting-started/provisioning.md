@@ -23,6 +23,8 @@ Infrastructure blueprints in `catalog/infra/` are gated by `providers/registry.y
 
 > **Tip — Local `kind` provider:** `kind` is enabled by default in `providers/registry.yaml` so you can provision local workload `kind` clusters immediately.
 
+![Control Plane & Providers](../assets/screenshots/providers.png)
+
 ## 2. Create a Tenant
 
 1. Open **Catalog & Form Wizard**.
@@ -37,6 +39,8 @@ Infrastructure blueprints in `catalog/infra/` are gated by `providers/registry.y
 2. Choose an infrastructure blueprint (for example, **Local kind Workload Cluster**).
 3. Fill in the generated form parameters and click **Submit & Open Git PR Proposal**.
 4. Click **Go to PR** to open **PR & Preview Inspector**.
+
+![Catalog & Form Wizard](../assets/screenshots/catalog.png)
 
 ### Via CLI
 
@@ -68,6 +72,8 @@ keel preview status --pr 1 --watch --server http://127.0.0.1:8080
 - If a proposal was closed by mistake, select it (e.g., under the **Closed** or **All** tab) and click **Reopen PR** to reopen it.
 - Use the status filter tabs (**Open**, **Merged**, **Closed**, **All**) to browse PR history directly from your configured Git forge.
 
+![PR & Preview Inspector](../assets/screenshots/preview.png)
+
 ## 5. Deploy an Application
 
 Once a workload cluster or tenant namespace is ready:
@@ -86,6 +92,8 @@ keel app install \
 ```
 
 Monitor deployment progress, Flagger canary weights, and live SSE events in **Topology Map**.
+
+![Topology Map](../assets/screenshots/topology.png)
 
 > **Status Lifecycle (`Pending` → `Reconciling` → `Synced` / `Ready` → `Deleting`):** When `keel serve` is connected to a bootstrapped management cluster (via `KUBECONFIG` or in-cluster config), it overlays live Flux CD and PKO v2 CRD conditions onto the Git state. If no cluster is reachable (for example, `just serve` without a cluster) or Flux/PKO has not reconciled the resource yet, stacks and releases remain `Pending`. Resources removed from `main` whose Kubernetes objects are still terminating remain visible as `Deleting` until cluster cleanup completes.
 

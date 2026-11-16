@@ -23,6 +23,8 @@ Enabling a provider on the **Control Plane & Providers** tab updates `providers/
 - `GET /api/v1/catalog` scans `catalog/infra/*/catalog.yaml` and returns only blueprints whose `metadata.provider` is `enabled: true` in `providers/registry.yaml`.
 - Enabling a provider does **not** auto-generate blueprints; you add the exact `CatalogInfraBlueprint` compositions (`catalog.yaml` + `Pulumi.yaml`) your organization wants to offer.
 
+![Catalog & Form Wizard](../assets/screenshots/catalog.png)
+
 ## `CatalogInfraBlueprint` Schema (`keel.io/v1alpha1`)
 
 ```yaml

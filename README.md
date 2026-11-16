@@ -1,8 +1,14 @@
+<p align="center">
+  <img src="./ui/public/keel-logo.svg" alt="Keel logo" width="96" />
+</p>
+
 # Keel
 
 **Self-Service, GitOps-Driven Infrastructure & Application Control Plane**
 
 Keel is a single-binary **Rust** control plane and **React** web portal that bootstraps from `localhost`—onto a local **`kind`** cluster, an **existing Kubernetes cluster (`k3s`/`Talos`)**, **Proxmox VE**, or a **public cloud (`AWS`, `GCP`, `Azure`, `Hetzner`)**—and evolves into a self-hosted, multi-tenant GitOps platform. Using Git as the sole source of desired state and Kubernetes-native resources for runtime state (zero external databases), Keel orchestrates infrastructure across on-premises hypervisors and public clouds alongside unmodified upstream Kubernetes applications.
+
+> **Why "Keel"?** In shipbuilding, the keel is the first structural piece laid down—the backbone that gives a vessel stability before anything else is built on top of it. The name also fits naturally within the maritime Kubernetes ecosystem (*Kubernetes* / "helmsman", *Helm*, and friends), reflecting Keel's role as the foundational control plane you lay down first.
 
 ---
 
@@ -14,6 +20,18 @@ Keel is a single-binary **Rust** control plane and **React** web portal that boo
 * **Multi-Cloud & Arbitrary OpenTofu/Terraform Providers:** Manage **Proxmox VE** (`bpg/proxmox`), **AWS**, **GCP**, **Azure**, **Hetzner**, and **Cloudflare**—or enable any future registry provider dynamically via Pulumi's OpenTofu/Terraform bridge without recompiling Keel.
 * **Progressive Delivery:** Opt-in **Flagger + Envoy Gateway** canary rollouts with Prometheus metric rollback for stateless Kubernetes services.
 * **Multi-Tenant Isolation & Anti-Lockout Guardrails:** Namespace-per-tenant boundaries, per-tenant `age` encryption keys, **Kyverno** admission policies, `protect: true` control-plane stacks, and break-glass S3 recovery (`keel bootstrap recover`).
+
+---
+
+## Web Portal
+
+| Topology Map | Catalog & Form Wizard |
+| :---: | :---: |
+| ![Topology Map](./docs/assets/screenshots/topology.png) | ![Catalog & Form Wizard](./docs/assets/screenshots/catalog.png) |
+
+| PR & Preview Inspector | Control Plane & Providers |
+| :---: | :---: |
+| ![PR & Preview Inspector](./docs/assets/screenshots/preview.png) | ![Control Plane & Providers](./docs/assets/screenshots/providers.png) |
 
 ---
 
