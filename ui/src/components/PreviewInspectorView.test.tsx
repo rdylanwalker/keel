@@ -251,6 +251,9 @@ describe("PreviewInspectorView component", () => {
   it("initializes with DEFAULT_PROPOSALS and DEFAULT_PREVIEW when demo=true is in location search", async () => {
     window.history.replaceState({}, "", "/?demo=true")
     vi.mocked(api.getProposals).mockResolvedValue([])
+    vi.mocked(api.getProposalPreview).mockRejectedValueOnce(
+      new Error("Preview unavailable in demo")
+    )
 
     render(<PreviewInspectorView />)
 
@@ -297,6 +300,77 @@ describe("PreviewInspectorView component", () => {
       expect(screen.getByRole("alert")).toHaveTextContent(
         "Failed to load PKO v2 preview diff"
       )
+    })
+  })
+
+  it("handles reopen PR failure and error, plus drift and unknown op badges", async () => {
+    vi.mocked(api.getProposals).mockResolvedValue([
+      { ...mockProposals[0], status: "closed" },
+    ])
+    vi.mocked(api.getProposalPreview).mockResolvedValue({
+      ...mockPreview,
+      resources: [
+        {
+          op: "Drift" as unknown as "Create",
+          urn: "urn:pulumi:dev::app::pkg:Res::drifted",
+          resource_type: "pkg:Res",
+          name: "drifted",
+          changed_fields: [],
+        },
+        {
+          op: "noop" as unknown as "Create",
+          urn: "urn:pulumi:dev::app::pkg:Res::unknown",
+          resource_type: "pkg:Res",
+          name: "unknown",
+          changed_fields: [],
+        },
+      ],
+    })
+    vi.mocked(api.reopenProposal)
+      .mockResolvedValueOnce({ success: false, message: "Cannot reopen" })
+      .mockRejectedValueOnce(new Error("Reopen network error"))
+
+    render(<PreviewInspectorView />)
+
+    await waitFor(() => {
+      expect(screen.getByText("Drift")).toBeInTheDocument()
+      expect(screen.getByText("noop")).toBeInTheDocument()
+    })
+
+    const reopenBtn = screen.getByRole("button", { name: /Reopen PR/i })
+    fireEvent.click(reopenBtn)
+    await waitFor(() => {
+      expect(screen.getByRole("alert")).toHaveTextContent("Cannot reopen")
+    })
+
+    fireEvent.click(reopenBtn)
+    await waitFor(() => {
+      expect(screen.getByRole("alert")).toHaveTextContent(
+        "Reopen network error"
+      )
+    })
+  })
+
+  it("handles getProposals rejection and status filter tab switches", async () => {
+    vi.mocked(api.getProposals)
+      .mockRejectedValueOnce(new Error("Proposals API down"))
+      .mockResolvedValue([
+        { ...mockProposals[0], id: "100", status: "closed" },
+        { ...mockProposals[0], id: "101", status: "open" },
+        { ...mockProposals[0], id: "102", status: "open" },
+      ])
+    vi.mocked(api.getProposalPreview).mockResolvedValue(mockPreview)
+
+    render(<PreviewInspectorView />)
+
+    await waitFor(() => {
+      expect(screen.getByRole("alert")).toHaveTextContent("Proposals API down")
+    })
+
+    fireEvent.click(screen.getByRole("button", { name: /^merged$/i }))
+    await waitFor(() => {
+      expect(api.getProposals).toHaveBeenCalledWith(undefined, "merged")
+      expect(screen.getByText("Pull Requests (3)")).toBeInTheDocument()
     })
   })
 })

@@ -18,6 +18,7 @@ vi.mock("./lib/api", () => ({
   getReleases: vi.fn().mockResolvedValue([]),
   getReleaseConfig: vi.fn(),
   getStackConfig: vi.fn(),
+  createProposal: vi.fn(),
   startOidcLogin: vi.fn(),
   setStoredToken: vi.fn(),
   createEventSourceStream: vi.fn(() => ({ close: vi.fn() })),
@@ -270,6 +271,30 @@ describe("App top-level application component", () => {
         "podinfo"
       )
     })
+
+    vi.mocked(api.createProposal).mockResolvedValueOnce({
+      id: "88",
+      title: "update podinfo",
+      branch: "keel/acme/app-podinfo-88",
+      author: "admin",
+      tenant: "acme",
+      status: "open",
+      createdAt: "just now",
+      prUrl: "https://git.internal/pr/88",
+    })
+
+    const submitBtn = await screen.findByRole("button", {
+      name: /Submit & Open Git PR Proposal/i,
+    })
+    fireEvent.click(submitBtn)
+
+    await waitFor(() => {
+      expect(screen.getByText(/PR #88 Opened/i)).toBeInTheDocument()
+      expect(screen.getByText(/View on Forge/i)).toBeInTheDocument()
+    })
+
+    fireEvent.click(screen.getByRole("button", { name: /Go to PR/i }))
+    expect(screen.queryByText(/PR #88 Opened/i)).not.toBeInTheDocument()
   })
 
   it("transitions to Authentication Required when keel:unauthorized is dispatched", async () => {
@@ -297,5 +322,62 @@ describe("App top-level application component", () => {
     expect(
       screen.queryByText("Cluster & Workload Topology")
     ).not.toBeInTheDocument()
+  })
+
+  it("opens in-place edit modal when editing a stack from TopologyView", async () => {
+    vi.mocked(api.getAuthStatus).mockResolvedValue({
+      authenticated: true,
+      phase: "oidc-active",
+      tenant: "tenant-acme",
+    })
+    vi.mocked(api.getStacksWithMeta).mockResolvedValue({
+      stacks: [
+        {
+          id: "acme-net",
+          name: "acme-net",
+          namespace: "tenant-acme",
+          tenant: "acme",
+          provider: "proxmox",
+          type: "workload",
+          status: "synced",
+          bundle: "web-stack",
+        },
+      ],
+    })
+    vi.mocked(api.getStackConfig).mockResolvedValue({
+      catalogId: "proxmox-vm",
+      name: "acme-net",
+      tenant: "acme",
+      values: { cores: 4 },
+    })
+    vi.mocked(api.getCatalog).mockResolvedValue([
+      {
+        id: "proxmox-vm",
+        name: "Proxmox VM",
+        description: "Test",
+        category: "infra",
+        type: "infra",
+        version: "1.0.0",
+        schema: {
+          type: "object",
+          properties: { cores: { type: "integer" } },
+        },
+      },
+    ])
+
+    await act(async () => {
+      render(<App />)
+    })
+
+    const editBtn = await screen.findByRole("button", {
+      name: /Edit stack acme-net/i,
+    })
+    await act(async () => {
+      fireEvent.click(editBtn)
+    })
+
+    await waitFor(() => {
+      expect(api.getStackConfig).toHaveBeenCalledWith("tenant-acme", "acme-net")
+    })
   })
 })

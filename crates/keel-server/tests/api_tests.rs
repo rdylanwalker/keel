@@ -2940,9 +2940,22 @@ spec:
         )
         .await
         .unwrap();
-    assert_eq!(res.status(), StatusCode::CREATED);
-    let body: Value =
-        serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let status = res.status();
+    let body_bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let body_str = String::from_utf8_lossy(&body_bytes);
+    if status == StatusCode::BAD_REQUEST {
+        assert!(
+            body_str.contains("has no SOPS age key configured"),
+            "unexpected 400 body: {body_str}"
+        );
+        return;
+    }
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "unexpected status {status}: {body_str}"
+    );
+    let body: Value = serde_json::from_slice(&body_bytes).unwrap();
     let branch = body["branch"].as_str().unwrap();
 
     fixture

@@ -200,4 +200,101 @@ describe("DeployInstanceModal component", () => {
       )
     })
   })
+
+  it("renders bundle graph, tenant/cluster/namespace controls, and custom kubeconfig secret", async () => {
+    const onTenantChange = vi.fn()
+    vi.mocked(api.createProposal).mockResolvedValueOnce({
+      id: "44",
+      title: "deploy bundle",
+      branch: "keel/beta/bundle-44",
+      author: "tester",
+      tenant: "beta",
+      status: "open",
+      createdAt: "just now",
+    })
+
+    const { rerender } = render(
+      <DeployInstanceModal
+        isOpen={true}
+        onClose={onClose}
+        catalogItem={{
+          ...sampleAppItem,
+          id: "full-stack",
+          name: "Full Stack",
+          type: "bundle",
+          bundleItems: [
+            { id: "vpc", kind: "infra", catalogRef: "aws-vpc" },
+            {
+              id: "web",
+              kind: "app",
+              catalogRef: "podinfo",
+              canary: true,
+              dependsOn: ["vpc"],
+            },
+          ],
+        }}
+        tenant="acme"
+        tenants={[
+          { id: "acme", namespace: "tenant-acme" },
+          { id: "beta", namespace: "tenant-beta" },
+        ]}
+        onTenantChange={onTenantChange}
+        onProposalCreated={onProposalCreated}
+      />
+    )
+
+    expect(screen.getByText(/Bundle Execution Graph/i)).toBeInTheDocument()
+    expect(screen.getByText("← vpc")).toBeInTheDocument()
+
+    fireEvent.change(screen.getByLabelText(/Target Tenant/i), {
+      target: { value: "beta" },
+    })
+    expect(onTenantChange).toHaveBeenCalledWith("beta")
+
+    rerender(
+      <DeployInstanceModal
+        isOpen={true}
+        onClose={onClose}
+        catalogItem={sampleAppItem}
+        tenant="beta"
+        tenants={[
+          { id: "acme", namespace: "tenant-acme" },
+          { id: "beta", namespace: "tenant-beta" },
+        ]}
+        onTenantChange={onTenantChange}
+        onProposalCreated={onProposalCreated}
+      />
+    )
+
+    fireEvent.change(screen.getByLabelText(/Instance Name/i), {
+      target: { value: "podinfo-west" },
+    })
+    fireEvent.change(screen.getByLabelText(/Chart Version/i), {
+      target: { value: "6.6.0" },
+    })
+    fireEvent.change(screen.getByLabelText(/Target Cluster/i), {
+      target: { value: "__custom__" },
+    })
+    fireEvent.change(screen.getByLabelText(/Custom kubeconfig Secret name/i), {
+      target: { value: "west-kubeconfig" },
+    })
+    fireEvent.change(screen.getByLabelText(/Target Namespace/i), {
+      target: { value: "web-prod" },
+    })
+
+    fireEvent.click(
+      screen.getByRole("button", { name: /Submit & Open Git PR Proposal/i })
+    )
+
+    await waitFor(() => {
+      expect(api.createProposal).toHaveBeenCalledWith(
+        expect.objectContaining({
+          name: "podinfo-west",
+          version: "6.6.0",
+          targetCluster: "west-kubeconfig",
+          targetNamespace: "web-prod",
+        })
+      )
+    })
+  })
 })
