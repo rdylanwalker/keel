@@ -19,3 +19,8 @@ book/
 # Local dev bootstrap GitOps repositories
 keel-gitops/
 keel-gitops.git/
+
+# Pulumi generated local provider SDKs (from `pulumi install`) and Stage 0 runtime files
+sdks/
+deploy/bootstrap/*/Pulumi.stage0-*.yaml
+deploy/bootstrap/*/*-config
