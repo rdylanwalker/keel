@@ -1,3 +1,10 @@
+## [0.4.1](https://github.com/rdylanwalker/keel/compare/v0.4.0...v0.4.1) (2026-11-16)
+
+
+### Bug Fixes
+
+* **ci:** upload release assets before publishing ([f297334](https://github.com/rdylanwalker/keel/commit/f2973348c4c92b2eb6e0a7537ea649acb9d4982c))
+
 # [0.4.0](https://github.com/rdylanwalker/keel/compare/v0.3.0...v0.4.0) (2026-11-16)
 
 
