@@ -499,9 +499,9 @@ impl SopsManager {
 
 fn validate_cli_path(path: &Path, label: &str) -> Result<String, CoreError> {
     let s = path.to_string_lossy().into_owned();
-    if s.trim().is_empty() || s.starts_with('-') {
+    if s.trim().is_empty() || s.trim_start().starts_with('-') || s.contains('\0') {
         return Err(CoreError::Validation(format!(
-            "{label} must be non-empty and must not start with '-'"
+            "{label} must be non-empty, free of NUL bytes, and must not start with '-'"
         )));
     }
     Ok(s)
@@ -536,19 +536,39 @@ fn parse_age_keygen_output(stdout: &str, stderr: &str) -> Result<AgeKeyPair, Cor
 
 struct ScopedTempFile {
     path: PathBuf,
+    byte_len: usize,
 }
 
 impl ScopedTempFile {
     async fn create(contents: &str) -> Result<Self, CoreError> {
         let path = std::env::temp_dir().join(format!("keel-sops-{}.yaml", uuid::Uuid::new_v4()));
-        tokio::fs::write(&path, contents.as_bytes()).await?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = std::fs::Permissions::from_mode(0o600);
-            tokio::fs::set_permissions(&path, perms).await?;
-        }
-        Ok(Self { path })
+        let bytes = contents.as_bytes().to_vec();
+        let byte_len = bytes.len();
+        let path_clone = path.clone();
+
+        tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+            use std::io::Write;
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            let mut file = opts.open(&path_clone)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            }
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| CoreError::Crypto(format!("Failed to write scoped temp file: {e}")))??;
+
+        Ok(Self { path, byte_len })
     }
 
     fn path(&self) -> &Path {
@@ -558,6 +578,14 @@ impl ScopedTempFile {
 
 impl Drop for ScopedTempFile {
     fn drop(&mut self) {
+        if self.byte_len > 0
+            && let Ok(mut f) = std::fs::OpenOptions::new().write(true).open(&self.path)
+        {
+            use std::io::Write;
+            let zeros = vec![0u8; self.byte_len];
+            let _ = f.write_all(&zeros);
+            let _ = f.sync_all();
+        }
         let _ = std::fs::remove_file(&self.path);
     }
 }
@@ -810,5 +838,26 @@ mod tests {
         let orig_val: serde_json::Value = serde_yml::from_str(plaintext).unwrap();
         let dec_val: serde_json::Value = serde_yml::from_str(&decrypted).unwrap();
         assert_eq!(orig_val, dec_val);
+    }
+
+    #[tokio::test]
+    async fn test_scoped_temp_file_atomic_permissions_and_cli_path_validation() {
+        let temp = ScopedTempFile::create("secret: top-secret\n")
+            .await
+            .unwrap();
+        let path = temp.path().to_path_buf();
+        assert!(path.exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        drop(temp);
+        assert!(!path.exists());
+
+        assert!(validate_cli_path(Path::new(" --config"), "cfg").is_err());
+        assert!(validate_cli_path(Path::new("foo\0bar"), "cfg").is_err());
+        assert!(validate_cli_path(Path::new("valid.yaml"), "cfg").is_ok());
     }
 }
