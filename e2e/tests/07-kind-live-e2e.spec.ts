@@ -95,6 +95,8 @@ async function waitForK8sReady(
   throw new Error(`Timed out waiting for ${kind}/${name} in ${namespace} to become Ready=True`);
 }
 
+// Note: `keel bootstrap init --target kind` provisions the `kind` management cluster
+// via `deploy/bootstrap/kind/Pulumi.yaml` (`tehcyx/kind`) instead of direct `kind create cluster`.
 test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', () => {
   test.skip(
     !LIVE_ENABLED,
@@ -115,6 +117,7 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
         logStep(`Deleting existing kind cluster "${MGMT_CLUSTER}" (KEEL_E2E_REUSE_CLUSTER=0)...`);
         runCmd('kind', ['delete', 'cluster', '--name', MGMT_CLUSTER], undefined, true);
       }
+      fs.rmSync(`/tmp/keel-stage0-pulumi/kind-${MGMT_CLUSTER}`, { recursive: true, force: true });
       if (fs.existsSync(DETERMINISTIC_REPO_DIR)) {
         fs.rmSync(DETERMINISTIC_REPO_DIR, { recursive: true, force: true });
       }
@@ -124,7 +127,7 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
       fs.mkdirSync(DETERMINISTIC_REPO_DIR, { recursive: true });
       tmpRepoDir = DETERMINISTIC_REPO_DIR;
       logStep(
-        `Bootstrapping fresh kind management cluster "${MGMT_CLUSTER}" (repo: ${tmpRepoDir})...`,
+        `Bootstrapping fresh kind management cluster "${MGMT_CLUSTER}" via deploy/bootstrap/kind/Pulumi.yaml (repo: ${tmpRepoDir})...`,
       );
       runCmd(
         KEEL_BIN,
