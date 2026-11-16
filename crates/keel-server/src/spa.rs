@@ -9,6 +9,7 @@ use rust_embed::RustEmbed;
 
 #[derive(RustEmbed)]
 #[folder = "../../ui/dist"]
+#[allow_missing = true]
 pub struct SpaAssets;
 
 const FALLBACK_INDEX_HTML: &str = r#"<!doctype html>
