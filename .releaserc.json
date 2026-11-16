@@ -25,6 +25,7 @@
     [
       "@semantic-release/github",
       {
+        "draftRelease": true,
         "assets": [
           { "path": "dist/sbom.cdx.json", "label": "CycloneDX SBOM" },
           { "path": "dist/keel-docs.tar.gz", "label": "Documentation (HTML)" }

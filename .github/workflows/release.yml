@@ -82,7 +82,7 @@ jobs:
     if: needs.release.outputs.released == 'true'
     runs-on: ubuntu-24.04
     permissions:
-      contents: write
+      contents: read
     steps:
       - uses: actions/checkout@v7
         with:
@@ -114,10 +114,6 @@ jobs:
         with:
           name: keel-ui
           path: dist/keel-ui.tar.gz
-      - name: Upload UI Archive to GitHub Release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "${{ needs.release.outputs.tag }}" dist/keel-ui.tar.gz --clobber
 
   build-binaries:
     name: Build Release Binary (${{ matrix.name }})
@@ -125,7 +121,7 @@ jobs:
     if: needs.release.outputs.released == 'true'
     runs-on: ${{ matrix.os }}
     permissions:
-      contents: write
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -187,7 +183,32 @@ jobs:
         with:
           name: keel-${{ matrix.name }}
           path: dist/${{ matrix.archive }}
-      - name: Upload Binary to GitHub Release
+
+  publish-release:
+    name: Publish GitHub Release
+    needs: [release, build-ui, build-binaries]
+    if: needs.release.outputs.released == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download Release Artifacts
+        uses: actions/download-artifact@v7
+        with:
+          pattern: keel-*
+          path: artifacts
+      - name: Upload Assets & Publish Draft Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "${{ needs.release.outputs.tag }}" "dist/${{ matrix.archive }}" --clobber
+        run: |
+          gh release upload "${{ needs.release.outputs.tag }}" \
+            -R "${{ github.repository }}" \
+            artifacts/keel-ui/keel-ui.tar.gz \
+            artifacts/keel-linux-amd64/keel-linux-amd64.tar.gz \
+            artifacts/keel-linux-arm64/keel-linux-arm64.tar.gz \
+            artifacts/keel-darwin-arm64/keel-darwin-arm64.tar.gz \
+            artifacts/keel-windows-amd64/keel-windows-amd64.zip \
+            --clobber
+          gh release edit "${{ needs.release.outputs.tag }}" \
+            -R "${{ github.repository }}" \
+            --draft=false
