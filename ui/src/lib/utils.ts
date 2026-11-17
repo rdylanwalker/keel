@@ -8,6 +8,25 @@ export function isDemoMode(): boolean {
   )
 }
 
+export function formatForgeProvider(provider?: string): string {
+  switch (provider?.toLowerCase()) {
+    case "forgejo":
+      return "Forgejo"
+    case "gitea":
+      return "Gitea"
+    case "github":
+      return "GitHub"
+    case "gitlab":
+      return "GitLab"
+    case "local":
+    case undefined:
+    case "":
+      return "Local Git"
+    default:
+      return provider!.charAt(0).toUpperCase() + provider!.slice(1)
+  }
+}
+
 export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs))
 }

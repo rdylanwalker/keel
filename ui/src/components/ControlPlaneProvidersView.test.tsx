@@ -45,7 +45,9 @@ describe("ControlPlaneProvidersView component", () => {
     await waitFor(() => {
       expect(screen.getByText("Google Cloud Platform")).toBeInTheDocument()
       expect(
-        screen.getByText("forgejo: https://git.example.com/org/infra.git")
+        screen.getByText(
+          "GitOps: Flux CD v2 · Forge: Forgejo · Secrets: SOPS + age / S3"
+        )
       ).toBeInTheDocument()
     })
   })

@@ -2,12 +2,7 @@ import React, { useCallback, useEffect, useState } from "react"
 import {
   Server,
   Cloud,
-  Cpu,
-  Layers,
   RefreshCw,
-  HardDrive,
-  Shield,
-  GitBranch,
   AlertTriangle,
   ExternalLink,
   Package,
@@ -28,7 +23,7 @@ import {
   rollbackManagementAddon,
   toggleProvider,
 } from "../lib/api"
-import { isDemoMode } from "../lib/utils"
+import { formatForgeProvider, isDemoMode } from "../lib/utils"
 import { DeployInstanceModal } from "./DeployInstanceModal"
 import { PrNotificationBanner } from "./PrNotificationBanner"
 
@@ -510,8 +505,8 @@ export const ControlPlaneProvidersView: React.FC<
       )}
 
       {/* Management Cluster Core Card */}
-      <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 space-y-4">
-        <div className="flex items-center justify-between border-b border-slate-800 pb-4">
+      <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6">
+        <div className="flex items-center justify-between gap-4">
           <div className="flex items-center space-x-3">
             <div className="p-3 bg-indigo-600 rounded-xl text-white shadow-lg shadow-indigo-600/30">
               <Server className="h-6 w-6" />
@@ -525,66 +520,18 @@ export const ControlPlaneProvidersView: React.FC<
                   protect: true
                 </span>
               </div>
-              <p className="text-xs text-slate-400 mt-0.5">
-                Seed GitOps Engine, PKO v2 Synthesizer, Kyverno Gatekeeper,
-                Envoy Ingress &amp; Flagger
+              <p className="text-xs text-slate-400 mt-1">
+                GitOps: Flux CD v2 &middot; Forge:{" "}
+                {formatForgeProvider(clusterMeta.forgeProvider)} &middot;
+                Secrets: SOPS + age / S3
               </p>
             </div>
           </div>
-          <div className="flex items-center space-x-2">
+          <div className="flex items-center space-x-2 shrink-0">
             <span className="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-pulse"></span>
             <span className="text-xs font-semibold text-emerald-400">
               Healthy
             </span>
-          </div>
-        </div>
-
-        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-4 text-xs">
-          <div className="bg-slate-950 p-3 rounded-lg border border-slate-800">
-            <p className="text-slate-500 flex items-center gap-1.5">
-              <Cpu className="h-3.5 w-3.5 text-indigo-400" /> GitOps Engine
-            </p>
-            <p className="font-semibold text-slate-200 mt-1">Flux CD v2</p>
-          </div>
-          <div className="bg-slate-950 p-3 rounded-lg border border-slate-800">
-            <p className="text-slate-500 flex items-center gap-1.5">
-              <Layers className="h-3.5 w-3.5 text-purple-400" /> Infra
-              Synthesizer
-            </p>
-            <p className="font-semibold text-slate-200 mt-1">PKO v2</p>
-          </div>
-          <div className="bg-slate-950 p-3 rounded-lg border border-slate-800">
-            <p className="text-slate-500 flex items-center gap-1.5">
-              <Shield className="h-3.5 w-3.5 text-emerald-400" /> Policy Engine
-            </p>
-            <p className="font-semibold text-slate-200 mt-1">Kyverno</p>
-          </div>
-          <div className="bg-slate-950 p-3 rounded-lg border border-slate-800 min-w-0">
-            <p className="text-slate-500 flex items-center gap-1.5">
-              <HardDrive className="h-3.5 w-3.5 text-amber-400 shrink-0" />{" "}
-              Secrets &amp; State
-            </p>
-            <p
-              className="font-semibold text-slate-200 mt-1 truncate"
-              title={clusterMeta.stateBackend || "S3"}
-            >
-              SOPS + age / {clusterMeta.stateBackend || "S3"}
-            </p>
-          </div>
-          <div className="bg-slate-950 p-3 rounded-lg border border-slate-800 min-w-0 col-span-2 sm:col-span-1">
-            <p className="text-slate-500 flex items-center gap-1.5">
-              <GitBranch className="h-3.5 w-3.5 text-cyan-400 shrink-0" /> Git
-              Forge &amp; Repo
-            </p>
-            <p
-              className="font-semibold text-slate-200 mt-1 truncate font-mono text-[11px]"
-              title={clusterMeta.gitRepoUrl || "Not configured"}
-            >
-              {clusterMeta.forgeProvider
-                ? `${clusterMeta.forgeProvider}: `
-                : ""}
-              {clusterMeta.gitRepoUrl || "Local / Unconfigured"}
-            </p>
           </div>
         </div>
       </div>
