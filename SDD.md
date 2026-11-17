@@ -93,7 +93,7 @@ Once the management cluster is healthy:
 2. **Control-Plane Protection & Base Addon Self-Mutation Guardrails:**
    * **Protection Labeling:** Control-plane PKO `Stack` (`management-cluster-core`) and management-plane base addon resources (`rauthy`, `envoy-gateway`, `flagger`, `kyverno`, `pulumi-kubernetes-operator`, `prometheus`, `s3-state-backend`) carry the `keel.io/protect: "true"` label.
    * **No-Prune Seed Sync:** The `core-addons` Flux `Kustomization` operates with `prune: false` (`deploy/seed/flux-system/gotk-sync.yaml`) ensuring that removing a base addon manifest from Git never uninstalls live control-plane base addons.
-   * **Kyverno Admission Deletion Guard:** The `protect-control-plane` Kyverno `ClusterPolicy` denies `DELETE` operations on protected `Stack` and `HelmRelease` resources in `flux-system`, `keel-system`, and `kyverno` namespaces via standard admission.
+   * **Kyverno Admission Deletion Guard:** The `protect-control-plane` Kyverno `ValidatingPolicy` denies `DELETE` operations on protected `Stack` and `HelmRelease` resources in `flux-system`, `keel-system`, and `kyverno` namespaces via standard admission.
    * **Automated Upgrade Rollback:** Every base addon `HelmRelease` configures `spec.upgrade` with `timeout: 5m` and `remediation.strategy: rollback` (`retries: 1`), automatically reverting failed release upgrades in-cluster.
    * **Revert PR Generation:** If an attempted base addon mutation fails preview validation or health checks, Keel GUI/CLI automatically generates a revert PR to restore the known-good Git state.
 3. **Break-Glass Recovery:** If an operator ever damages the management cluster or in-cluster Git forge, `keel bootstrap recover --s3-endpoint <url>` pulls the versioned Pulumi state directly from S3 and executes a local recovery reconciliation.
@@ -322,6 +322,7 @@ stateDiagram-v2
   * `disallow-privileged-containers` and `restricted` Pod Security Standards across all PKO workspace pods and tenant workloads.
   * `restrict-pulumi-providers` verifying that a tenant only instantiates cloud/Proxmox providers explicitly granted to their tenant role.
   * `protect-control-plane` blocking deletion or modification of `management-cluster-core` resources via standard tenant PRs.
+  * `sync-tenant-secrets` (`policies.kyverno.io/v1` `GeneratingPolicy` with `generateExisting` and `synchronize` enabled) automatically cloning and synchronizing `flux-system/keel-s3-credentials` and `flux-system/git-credentials` into every `tenant-*` namespace via scoped `keel-kyverno-tenant-secret-sync` RBAC, preserving Flux `--no-cross-namespace-refs=true`.
 
 ### 6.3 Stateless Persistence & Secrets Management (K8s Secrets + SOPS/`age`)
 * **Zero Database Architecture:** `keel-server` is completely stateless and uses no SQLite, Postgres, or external database. All runtime state lives natively in Kubernetes `Secret`s, Git, and in-memory `kube-rs` CRD caches:

@@ -357,7 +357,7 @@ pnpm --dir e2e lint
 pnpm --dir e2e typecheck
 pnpm --dir e2e test
 
-# Opt-in live kind E2E (GUI + CLI against real Docker/kind, Flux, PKO, Forgejo, Dex)
+# Opt-in live kind E2E (GUI + CLI against real Docker/kind, Flux, PKO, Forgejo, Rauthy)
 pnpm --dir e2e test:live                      # reuses existing kind-keel-mgmt if present
 KEEL_E2E_REUSE_CLUSTER=0 pnpm --dir e2e test:live  # bootstraps a fresh kind cluster
 ```

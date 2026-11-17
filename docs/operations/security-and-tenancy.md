@@ -26,6 +26,7 @@ Keel deploys Kyverno policies during Stage 0 bootstrap to enforce:
 
 - **Provider Allowlisting:** PKO v2 `Stack`s can only execute providers that are enabled in `providers/registry.yaml`.
 - **Docker Socket Protection:** Host Docker socket mounts are blocked by default. On local `kind` development clusters, passing `--local-dev-docker-socket-exception` to `keel bootstrap init` generates an explicit `PolicyException` scoped to PKO workspace pods so they can provision local workload `kind` clusters.
+- **Tenant Secret Synchronization (`sync-tenant-secrets`):** A Kyverno `GeneratingPolicy` (`policies.kyverno.io/v1`, `generateExisting` and `synchronize` enabled) with scoped RBAC (`keel-kyverno-tenant-secret-sync`) automatically clones `flux-system/keel-s3-credentials` and `flux-system/git-credentials` into `tenant-default` and every newly created `tenant-<id>` namespace, keeping credentials synchronized without violating Flux's `--no-cross-namespace-refs=true`.
 
 ## Control-Plane Anti-Lockout
 
