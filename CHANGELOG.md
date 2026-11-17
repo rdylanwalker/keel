@@ -1,3 +1,9 @@
+## [0.6.6](https://github.com/rdylanwalker/keel/compare/v0.6.5...v0.6.6) (2026-11-17)
+
+### Bug Fixes
+
+* **ci:** install pulumi on ubuntu-26.04 and drop unused pnpm cache ([0c5375b](https://github.com/rdylanwalker/keel/commit/0c5375bb32a9f385be7a74936efc06a8d87c6581))
+
 ## [0.6.5](https://github.com/rdylanwalker/keel/compare/v0.6.4...v0.6.5) (2026-11-17)
 
 ### Bug Fixes
