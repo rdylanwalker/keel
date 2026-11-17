@@ -65,7 +65,7 @@ jobs:
           node-version: 26
           cache: 'pnpm'
           cache-dependency-path: e2e/pnpm-lock.yaml
-      - name: Install kind, kubectl, helm, sops, age
+      - name: Install kind, kubectl, helm, sops, age, pulumi
         run: |
           curl -fsSL https://kind.sigs.k8s.io/dl/latest/kind-linux-amd64 -o /tmp/kind
           sudo install -m 0755 /tmp/kind /usr/local/bin/kind
@@ -75,6 +75,8 @@ jobs:
           sudo apt-get update && sudo apt-get install -y age
           curl -fsSL https://github.com/getsops/sops/releases/download/v3.9.4/sops-v3.9.4.linux.amd64 -o /tmp/sops
           sudo install -m 0755 /tmp/sops /usr/local/bin/sops
+          curl -fsSL https://get.pulumi.com | sh
+          echo "$HOME/.pulumi/bin" >> "$GITHUB_PATH"
           rm -f /tmp/kind /tmp/kubectl /tmp/sops
       - name: Build UI & Keel Binary
         run: |
