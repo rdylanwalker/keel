@@ -1654,7 +1654,7 @@ pub struct TenantsResponse {
 ///
 /// Scans `tenants/*` directories in `state.repo_workdir`, returning deterministic sorted order.
 pub async fn list_tenants(
-    _auth: AuthSession,
+    auth: AuthSession,
     State(state): State<AppState>,
 ) -> Result<Json<TenantsResponse>, ServerError> {
     let mut tenants = Vec::new();
@@ -1667,9 +1667,12 @@ pub async fn list_tenants(
             if !file_type.is_dir() {
                 continue;
             }
-            let Some(id) = entry.file_name().to_str().map(str::to_owned) else {
+            let Some(id) = entry.file_name().to_str().map(str::to_string) else {
                 continue;
             };
+            if !auth.is_admin() && auth.require_tenant_access(&id).is_err() {
+                continue;
+            }
             let namespace = tenant_namespace(&id).unwrap_or_else(|_| format!("tenant-{id}"));
             tenants.push(TenantSummary { id, namespace });
         }
@@ -4052,14 +4055,23 @@ pub struct StacksResponse {
 
 /// `GET /api/v1/stacks`
 pub async fn list_stacks(
-    _auth: AuthSession,
+    auth: AuthSession,
     State(state): State<AppState>,
     Query(query): Query<ListStacksQuery>,
 ) -> Result<Json<StacksResponse>, ServerError> {
-    let stacks = state
+    if let Some(ref tenant) = query.tenant {
+        auth.require_tenant_access(tenant)?;
+    }
+    let mut stacks = state
         .state_provider
         .list_stacks(query.tenant.as_deref(), query.provider.as_deref())
         .await?;
+    if query.tenant.is_none() && !auth.is_admin() {
+        stacks.retain(|s| {
+            let tenant = s.namespace.strip_prefix("tenant-").unwrap_or(&s.namespace);
+            auth.require_tenant_access(tenant).is_ok()
+        });
+    }
 
     let flux_repo_url = tokio::fs::read_to_string(
         state
@@ -4772,14 +4784,23 @@ pub struct ReleasesResponse {
 
 /// `GET /api/v1/releases`
 pub async fn list_releases(
-    _auth: AuthSession,
+    auth: AuthSession,
     State(state): State<AppState>,
     Query(query): Query<ListReleasesQuery>,
 ) -> Result<Json<ReleasesResponse>, ServerError> {
-    let releases = state
+    if let Some(ref tenant) = query.tenant {
+        auth.require_tenant_access(tenant)?;
+    }
+    let mut releases = state
         .state_provider
         .list_releases(query.tenant.as_deref())
         .await?;
+    if query.tenant.is_none() && !auth.is_admin() {
+        releases.retain(|r| {
+            let tenant = r.namespace.strip_prefix("tenant-").unwrap_or(&r.namespace);
+            auth.require_tenant_access(tenant).is_ok()
+        });
+    }
     Ok(Json(ReleasesResponse { releases }))
 }
 
