@@ -409,7 +409,11 @@ impl TenantManifestBundle {
         let docs = self.to_json_values()?;
         let mut rendered = Vec::with_capacity(docs.len());
         for doc in docs {
-            rendered.push(serde_yml::to_string(&doc)?);
+            let mut s = serde_yml::to_string(&doc)?;
+            if !s.ends_with('\n') {
+                s.push('\n');
+            }
+            rendered.push(s);
         }
         Ok(rendered.join("---\n"))
     }
@@ -1141,6 +1145,12 @@ mod tests {
         assert_eq!(json_docs[6]["roleRef"]["name"], "system:auth-delegator");
 
         let yaml = bundle.to_multi_doc_yaml().unwrap();
+        assert!(yaml.contains("\n---\n"));
+        for doc in yaml.split("\n---\n") {
+            let parsed: serde_json::Value =
+                serde_yml::from_str(doc).expect("each multi-doc YAML part should be valid YAML");
+            assert!(parsed.get("kind").is_some());
+        }
         assert!(yaml.contains("pod-security.kubernetes.io/enforce: restricted"));
         assert!(yaml.contains("kind: NetworkPolicy"));
         assert!(yaml.contains("default-deny-all"));

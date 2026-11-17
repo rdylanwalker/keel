@@ -579,7 +579,11 @@ impl KyvernoManifestBundle {
         let manifests = self.all_manifests();
         let mut docs = Vec::with_capacity(manifests.len());
         for m in manifests {
-            docs.push(serde_yml::to_string(&m)?);
+            let mut s = serde_yml::to_string(&m)?;
+            if !s.ends_with('\n') {
+                s.push('\n');
+            }
+            docs.push(s);
         }
         Ok(docs.join("---\n"))
     }
