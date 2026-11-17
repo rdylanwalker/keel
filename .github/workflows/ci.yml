@@ -12,7 +12,7 @@ permissions:
 jobs:
   rust-quality:
     name: Rust Quality Gates
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -28,7 +28,7 @@ jobs:
 
   ui-quality:
     name: UI Quality Gates
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v7
       - uses: pnpm/action-setup@v6
@@ -36,7 +36,7 @@ jobs:
           version: 12
       - uses: actions/setup-node@v7
         with:
-          node-version: 24
+          node-version: 26
           cache: 'pnpm'
           cache-dependency-path: ui/pnpm-lock.yaml
       - name: Install dependencies
@@ -52,7 +52,7 @@ jobs:
 
   e2e-quality:
     name: E2E Quality Gates
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -61,7 +61,7 @@ jobs:
           version: 12
       - uses: actions/setup-node@v7
         with:
-          node-version: 24
+          node-version: 26
           cache: 'pnpm'
           cache-dependency-path: e2e/pnpm-lock.yaml
       - name: Build UI & Keel Binary
@@ -84,7 +84,7 @@ jobs:
 
   docs:
     name: Build Documentation
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v7
       - uses: taiki-e/install-action@v2
