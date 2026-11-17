@@ -291,8 +291,8 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
   }) => {
     const demo = new DemoRecorder(RECORD_DEMO);
 
-    await test.step('1. Authenticate in GUI via Dex OIDC', async () => {
-      logStep('Opening GUI and signing in via Dex OIDC...');
+    await test.step('1. Authenticate in GUI via Rauthy OIDC', async () => {
+      logStep('Opening GUI and signing in via Rauthy OIDC...');
       await page.goto('/');
       await expect(page.getByText('Keel Control Plane')).toBeVisible();
       await demo.capture(page, 'login-page', 700);
@@ -302,14 +302,26 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
           .getByRole('button', { name: /Sign in with OIDC/i })
           .first()
           .click();
-        const loginInput = page.locator('input[name="login"], input#login').first();
-        await expect(loginInput).toBeVisible({ timeout: 20_000 });
-        await loginInput.fill('admin@keel.local');
-        await page.locator('input[name="password"], input#password').first().fill(adminPassword);
+        const emailInput = page
+          .locator(
+            'input[type="email"], input[name="email"], input[name="login"], input#login, input[autocomplete="username"]',
+          )
+          .first();
+        await expect(emailInput).toBeVisible({ timeout: 20_000 });
+        await emailInput.fill('admin@keel.local');
+
+        const passwordInput = page
+          .locator('input[type="password"], input[name="password"], input#password')
+          .first();
+        if (!(await passwordInput.isVisible({ timeout: 1_000 }).catch(() => false))) {
+          await page.locator('button[type="submit"]').first().click();
+        }
+        await expect(passwordInput).toBeVisible({ timeout: 10_000 });
+        await passwordInput.fill(adminPassword);
         await page.locator('button[type="submit"], #submit-login').first().click();
 
         const grantBtn = page.getByRole('button', { name: /Grant Access/i });
-        if (await grantBtn.isVisible({ timeout: 5_000 }).catch(() => false)) {
+        if (await grantBtn.isVisible({ timeout: 2_000 }).catch(() => false)) {
           await grantBtn.click();
         }
       }

@@ -112,6 +112,12 @@ test.describe('06 - Full Localhost GUI GitOps Workflow', () => {
     await expect(page.getByText('Enabled Provider Mesh')).toBeVisible();
     await expect(page.getByRole('heading', { name: 'Management Plane Base Addons' })).toBeVisible();
     await expect(page.getByText('s3-state-backend').first()).toBeVisible();
+    await expect(page.getByTestId('core-addon-rauthy')).toBeVisible();
+    await expect(
+      page
+        .getByTestId('core-addon-rauthy')
+        .getByRole('link', { name: 'https://idp.keel.local:8888/auth/v1/admin' }),
+    ).toBeVisible();
     await expect(page.getByText('Protected').first()).toBeVisible();
 
     await page

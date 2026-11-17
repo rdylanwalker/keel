@@ -192,6 +192,7 @@ async function main() {
   const kindCatalogDir = path.join(workDir, 'catalog', 'infra', 'kind-cluster');
   const podinfoCatalogDir = path.join(workDir, 'catalog', 'apps', 'podinfo');
   const s3CatalogDir = path.join(workDir, 'catalog', 'core', 's3-state-backend');
+  const rauthyCatalogDir = path.join(workDir, 'catalog', 'core', 'rauthy');
   const coreAddonsDir = path.join(workDir, 'clusters', 'management', 'core-addons');
   const tenantAcmeInfra = path.join(workDir, 'tenants', 'acme', 'infra', 'net');
 
@@ -200,6 +201,7 @@ async function main() {
   fs.mkdirSync(kindCatalogDir, { recursive: true });
   fs.mkdirSync(podinfoCatalogDir, { recursive: true });
   fs.mkdirSync(s3CatalogDir, { recursive: true });
+  fs.mkdirSync(rauthyCatalogDir, { recursive: true });
   fs.mkdirSync(coreAddonsDir, { recursive: true });
   fs.mkdirSync(tenantAcmeInfra, { recursive: true });
 
@@ -310,6 +312,34 @@ spec:
         title: Admin Secret Password
         format: password
         writeOnly: true
+`,
+  );
+
+  fs.writeFileSync(
+    path.join(rauthyCatalogDir, 'catalog.yaml'),
+    `apiVersion: keel.io/v1alpha1
+kind: CatalogApplication
+metadata:
+  id: rauthy
+  name: Rauthy OIDC Provider
+  category: management-core
+  runtime: kustomize
+spec:
+  upstream:
+    repoURL: https://github.com/sebadob/rauthy
+    chart: rauthy
+    version: "0.37.2"
+  progressiveDelivery:
+    flaggerSupported: false
+    defaultCanary: false
+  serviceUrl: "https://idp.keel.local:8888/auth/v1/admin"
+  schema:
+    type: object
+    properties:
+      replicas:
+        type: integer
+        title: Replica Count
+        default: 1
 `,
   );
 
