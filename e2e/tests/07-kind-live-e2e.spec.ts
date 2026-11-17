@@ -493,9 +493,9 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
       if (existingTenant.ok) {
         logStep('Namespace tenant-acme already exists; skipping GUI tenant creation');
       } else {
-        logStep('Creating tenant "acme" via GUI (+ New Tenant)...');
+        logStep('Creating tenant "acme" via GUI (New Tenant)...');
         await page.getByRole('button', { name: /Catalog & Form Wizard/i }).click();
-        await page.getByRole('button', { name: /\+ New Tenant/i }).click();
+        await page.getByRole('button', { name: /New Tenant/i }).click();
         await page.getByLabel(/Tenant ID/i).fill('acme');
         await page.getByRole('button', { name: /Create Tenant PR/i }).click();
         await expect(page.getByText(/Git PR Proposal Successfully Opened!/i)).toBeVisible({

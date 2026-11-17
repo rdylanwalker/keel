@@ -275,7 +275,7 @@ describe("CatalogWizardView component and jsonToYaml helper", () => {
 
     render(<CatalogWizardView />)
 
-    const newTenantBtn = screen.getByRole("button", { name: /\+ New Tenant/i })
+    const newTenantBtn = screen.getByRole("button", { name: /New Tenant/i })
     fireEvent.click(newTenantBtn)
 
     expect(screen.getByText("Create New Tenant")).toBeInTheDocument()
@@ -564,7 +564,7 @@ describe("CatalogWizardView component and jsonToYaml helper", () => {
     render(<CatalogWizardView />)
 
     // Open and cancel new tenant modal
-    const newTenantBtn = screen.getByRole("button", { name: /\+ New Tenant/i })
+    const newTenantBtn = screen.getByRole("button", { name: /New Tenant/i })
     fireEvent.click(newTenantBtn)
     expect(screen.getByText("Create New Tenant")).toBeInTheDocument()
 
@@ -1094,7 +1094,7 @@ describe("CatalogWizardView component and jsonToYaml helper", () => {
     fireEvent.click(screen.getByRole("button", { name: /Close modal/i }))
 
     // 3. New Tenant modal full-screen toggle
-    fireEvent.click(screen.getByRole("button", { name: /\+ New Tenant/i }))
+    fireEvent.click(screen.getByRole("button", { name: /New Tenant/i }))
     const tenantModal = screen.getByTestId("new-tenant-modal")
     expect(tenantModal.className).toContain("max-w-4xl")
     expect(tenantModal.className).toContain("w-full")

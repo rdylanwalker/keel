@@ -32,11 +32,11 @@ test.describe('06 - Full Localhost GUI GitOps Workflow', () => {
       timeout: 10000,
     });
 
-    // 3. Create a new tenant via GUI (+ New Tenant) and merge its PR
+    // 3. Create a new tenant via GUI (New Tenant) and merge its PR
     await page.getByRole('button', { name: /Catalog & Form Wizard/i }).click();
     await expect(page.getByText('Self-Service Catalog & Dynamic Form Wizard')).toBeVisible();
 
-    await page.getByRole('button', { name: /\+ New Tenant/i }).click();
+    await page.getByRole('button', { name: /New Tenant/i }).click();
     await page.getByLabel(/Tenant ID/i).fill('e2e-team');
     await page.getByRole('button', { name: /Create Tenant PR/i }).click();
     await expect(page.getByText(/Git PR Proposal Successfully Opened!/i)).toBeVisible({
