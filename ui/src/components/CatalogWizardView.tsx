@@ -748,17 +748,25 @@ export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
             ))}
           </select>
 
-          {tenant !== "default" && (
-            <button
-              type="button"
-              onClick={() => handleDeleteTenant(tenant)}
-              disabled={tenantLoading}
-              className="px-2.5 py-1.5 bg-red-950/60 hover:bg-red-900/80 border border-red-500/30 text-red-300 rounded-lg text-xs font-medium transition-colors disabled:opacity-50 flex items-center gap-1"
-            >
-              <Trash2 className="h-3.5 w-3.5" />
-              <span>Remove</span>
-            </button>
-          )}
+          <button
+            type="button"
+            onClick={() => handleDeleteTenant(tenant)}
+            disabled={tenant === "default" || tenantLoading}
+            title={
+              tenant === "default"
+                ? "The default tenant is protected and cannot be removed"
+                : `Propose removal of tenant ${tenant}`
+            }
+            aria-label={
+              tenant === "default"
+                ? "Remove tenant (disabled for protected default tenant)"
+                : `Remove tenant ${tenant}`
+            }
+            className="px-2.5 py-1.5 bg-red-950/60 hover:bg-red-900/80 disabled:hover:bg-red-950/60 border border-red-500/30 text-red-300 rounded-lg text-xs font-medium transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-1"
+          >
+            <Trash2 className="h-3.5 w-3.5" />
+            <span>Remove</span>
+          </button>
 
           <button
             type="button"

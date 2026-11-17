@@ -320,9 +320,15 @@ describe("CatalogWizardView component and jsonToYaml helper", () => {
         within(select).getByRole("option", { name: "globex" })
       ).toBeInTheDocument()
     })
+
+    // Remove button stays mounted when default tenant is selected, but is disabled
+    const disabledRemoveBtn = screen.getByRole("button", { name: /Remove/i })
+    expect(disabledRemoveBtn).toBeDisabled()
+
     fireEvent.change(select, { target: { value: "globex" } })
 
     const removeBtn = await screen.findByRole("button", { name: /Remove/i })
+    expect(removeBtn).toBeEnabled()
     fireEvent.click(removeBtn)
 
     await waitFor(() => {
