@@ -943,7 +943,9 @@ export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
                   <span>{item.name}</span>
                 </span>
                 <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-slate-800 text-slate-400 shrink-0">
-                  {item.type === "bundle" ? "bundle" : `v${item.version}`}
+                  {item.type === "bundle"
+                    ? "bundle"
+                    : `v${item.version.replace(/^v/i, "")}`}
                 </span>
               </div>
               <p className="text-xs text-slate-400 line-clamp-2">

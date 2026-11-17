@@ -680,7 +680,7 @@ export const ControlPlaneProvidersView: React.FC<
                         {displayChart}
                       </span>
                       <span className="px-2 py-0.5 rounded bg-slate-950 border border-slate-800 text-slate-300 shrink-0">
-                        v{displayVersion}
+                        v{displayVersion.replace(/^v/i, "")}
                       </span>
                     </div>
 

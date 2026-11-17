@@ -234,6 +234,16 @@ describe("ControlPlaneProvidersView component", () => {
         serviceUrl: "https://idp.keel.local:8888/auth/v1/admin",
         schema: { type: "object", properties: {} },
       },
+      {
+        id: "cert-manager",
+        name: "cert-manager",
+        description: "Certificate manager",
+        type: "app",
+        category: "Management Addons",
+        chart: "cert-manager",
+        version: "v1.21.3",
+        schema: { type: "object", properties: {} },
+      },
     ])
     vi.mocked(api.getReleases).mockResolvedValueOnce([
       {
@@ -280,8 +290,10 @@ describe("ControlPlaneProvidersView component", () => {
 
     // Status badges, Protected badge, and no Delete button
     expect(screen.getByText("Ready")).toBeInTheDocument()
-    expect(screen.getAllByText("Unknown")).toHaveLength(2)
-    expect(screen.getAllByText("Protected")).toHaveLength(3)
+    expect(screen.getAllByText("Unknown")).toHaveLength(3)
+    expect(screen.getAllByText("Protected")).toHaveLength(4)
+    expect(screen.getByText("v1.21.3")).toBeInTheDocument()
+    expect(screen.queryByText("vv1.21.3")).not.toBeInTheDocument()
     expect(
       screen.queryByRole("button", { name: /Delete/i })
     ).not.toBeInTheDocument()
