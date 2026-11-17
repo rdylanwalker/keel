@@ -1,3 +1,11 @@
+## [0.6.1](https://github.com/rdylanwalker/keel/compare/v0.6.0...v0.6.1) (2026-11-17)
+
+
+### Bug Fixes
+
+* **ui:** align header tenant select height and option labels ([95ba8b2](https://github.com/rdylanwalker/keel/commit/95ba8b27fa6290ed702de64b55ffb57c66f72a2d))
+* **ui:** avoid duplicate v prefix on version chips ([a91c2f2](https://github.com/rdylanwalker/keel/commit/a91c2f257cdc5692c29a7cdede5b4f8c32a0d487))
+
 # [0.6.0](https://github.com/rdylanwalker/keel/compare/v0.5.1...v0.6.0) (2026-11-17)
 
 
