@@ -104,9 +104,7 @@ impl EnvelopeCrypto {
 
     /// Generates a fresh cryptographically random 256-bit key.
     pub fn generate_key() -> [u8; AES_256_KEY_LEN] {
-        let mut key = [0u8; AES_256_KEY_LEN];
-        rand::rng().fill(&mut key);
-        key
+        rand::random()
     }
 
     /// Computes SHA-256 hex digest (associated helper convenience).

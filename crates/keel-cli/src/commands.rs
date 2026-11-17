@@ -530,8 +530,7 @@ pub async fn synthesize_seed_control_plane(
             generate_admin_password(),
             generate_admin_password()
         );
-        let enc_seed = format!("{}{}", generate_admin_password(), generate_admin_password());
-        let enc_bytes = Sha256::digest(enc_seed.as_bytes());
+        let enc_bytes = keel_core::EnvelopeCrypto::generate_key();
         let enc_key_id = format!(
             "{:02x}{:02x}{:02x}{:02x}",
             enc_bytes[0], enc_bytes[1], enc_bytes[2], enc_bytes[3]
