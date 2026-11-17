@@ -10,7 +10,7 @@ Every tenant maps to a dedicated Kubernetes namespace (`tenant-<tenant-id>`) and
 
 ## OIDC Identity & Tenant RBAC Mapping
 
-`keel-server` requests the `openid`, `profile`, `email`, and `groups` OIDC scopes by default and stores the verified `id_token` claims (`sub`, `email`, `name`, and `groups`) inside the stateless, `AES-256-GCM`-encrypted `keel_session` cookie.
+`keel-server` requests the `openid`, `profile`, `email`, and `groups` OIDC scopes by default and stores the verified `id_token` claims (`sub`, `email`, `name`, and `groups`) inside the stateless, `AES-256-GCM`-encrypted `keel_session` cookie. Signing out via `POST /api/v1/auth/logout` clears both `keel_session` and `keel_pkce` (`Max-Age=0`).
 
 Authorization in `keel-server` maps OIDC `groups` claims to cluster-admin and tenant-scoped permissions:
 
