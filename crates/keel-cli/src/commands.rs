@@ -8,14 +8,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use keel_core::{
     AuthPhase, BootstrapConfig, BootstrapTarget, CatalogApplication, CatalogInfraBlueprint,
     ClusterConnection, CoreError, DEFAULT_POLL_INTERVAL, EnvelopeCrypto, FLUX_SYSTEM_NAMESPACE,
     ForgeConfig, ForgeKind, KEEL_PREVIEWS_NAMESPACE, KEEL_SYSTEM_NAMESPACE, KeelConfig, OidcConfig,
     PreparedHelmValues, ProviderRegistry, SopsConfig, SopsManager, bootstrap_target_factory,
-    generate_admin_password, hash_dex_password_bcrypt, prepare_helm_values, validate_dns_label,
-    validate_schema_values,
+    generate_admin_password, prepare_helm_values, validate_dns_label, validate_schema_values,
 };
 use keel_git::{
     CommitAuthor, ForgeError, ForgeProvider, ForgejoGiteaProvider, GitCredentials, GitError,
@@ -23,10 +22,10 @@ use keel_git::{
     parse_remote_repo_url,
 };
 use keel_kube::{
-    CrdReconcileStatus, CrdWatchEvent, DEX_CONFIG_SECRET_NAME, DockerSocketExceptionConfig,
-    InMemorySecretStore, KubeClusterStatusReader, KubeError, KyvernoManifestBundle,
-    KyvernoPolicyConfig, S3_CREDENTIALS_SECRET_NAME, SecretStateStore, TelemetryMux,
-    TenantIsolationConfig, TenantManifestBundle, WatchedCrdKind,
+    CrdReconcileStatus, CrdWatchEvent, DockerSocketExceptionConfig, InMemorySecretStore,
+    KubeClusterStatusReader, KubeError, KyvernoManifestBundle, KyvernoPolicyConfig,
+    S3_CREDENTIALS_SECRET_NAME, SecretStateStore, TelemetryMux, TenantIsolationConfig,
+    TenantManifestBundle, WatchedCrdKind,
 };
 use keel_pko::{
     CrObjectMeta, DEFAULT_FLUX_POLL_INTERVAL, FLUX_GIT_REPO_API_VERSION, FLUX_GIT_REPO_KIND,
@@ -283,6 +282,21 @@ pub fn normalize_server_url(raw: &str) -> Result<String, CliError> {
 // 1. `keel bootstrap init`
 // ============================================================================
 
+/// Secret name holding the Stage 0 Rauthy OIDC configuration & bootstrap JSON in `keel-system`.
+const RAUTHY_CONFIG_SECRET_NAME: &str = "rauthy-config";
+
+/// Rendered Stage 0 Rauthy OIDC configuration and first-boot JSON seed artifacts.
+#[derive(Clone)]
+pub struct RauthySeedConfig {
+    pub config_toml: String,
+    pub groups_json: String,
+    pub users_json: String,
+    pub clients_json: String,
+    pub forgejo_oidc_secret: Option<String>,
+    pub secret_namespace: String,
+    pub secret_name: String,
+}
+
 /// Seed control-plane artifacts synthesized identically across all Stage 0 `BootstrapTarget`s.
 #[derive(Clone)]
 pub struct SeedControlPlaneArtifacts {
@@ -292,17 +306,14 @@ pub struct SeedControlPlaneArtifacts {
     pub flux_git_repository: FluxGitRepository,
     pub kyverno_bundle: KyvernoManifestBundle,
     pub management_stack: PkoStack,
-    /// Initial admin username/email for Stage 0 Dex seeding.
+    /// Initial admin username/email for Stage 0 Rauthy seeding.
     pub admin_username: String,
-    /// Initial admin password for Stage 0 Dex seeding (never logged in `Debug`).
+    /// Initial admin password for Stage 0 Rauthy seeding (never logged in `Debug`).
     pub admin_password: String,
     /// `true` if `admin_password` was auto-generated rather than supplied via CLI flags.
     pub admin_password_generated: bool,
-    /// Rendered Dex `config.yaml` payload for `keel-system/dex-config` (`None` when using external OIDC).
-    pub dex_config_yaml: Option<String>,
-    /// Kubernetes `Secret` metadata for `keel-system/dex-config`.
-    pub dex_secret_namespace: String,
-    pub dex_secret_name: String,
+    /// Rendered Rauthy config & bootstrap JSON (`None` when using external OIDC or `--oidc-provider none`).
+    pub rauthy_config: Option<RauthySeedConfig>,
     /// Optional generated `age` keyfile contents for `flux-system/sops-age` (never logged).
     pub sops_age_keyfile: Option<String>,
 }
@@ -314,8 +325,13 @@ impl std::fmt::Debug for SeedControlPlaneArtifacts {
             .field("admin_username", &self.admin_username)
             .field("admin_password", &"[REDACTED]")
             .field("admin_password_generated", &self.admin_password_generated)
-            .field("dex_secret_namespace", &self.dex_secret_namespace)
-            .field("dex_secret_name", &self.dex_secret_name)
+            .field(
+                "rauthy_secret",
+                &self
+                    .rauthy_config
+                    .as_ref()
+                    .map(|r| format!("{}/{}", r.secret_namespace, r.secret_name)),
+            )
             .finish()
     }
 }
@@ -368,13 +384,16 @@ pub async fn synthesize_seed_control_plane(
         }
     });
 
-    let oidc_issuer = cfg
+    let external_oidc_issuer = cfg
         .oidc_issuer
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| "http://dex.keel-system.svc.cluster.local:5556/dex".to_string());
+        .map(str::to_string);
+    let use_in_cluster_rauthy = external_oidc_issuer.is_none() && cfg.with_oidc;
+    let oidc_issuer = external_oidc_issuer.clone().or_else(|| {
+        use_in_cluster_rauthy.then(|| "https://idp.keel.local:8888/auth/v1".to_string())
+    });
     let oidc_client_id = cfg
         .oidc_client_id
         .as_deref()
@@ -404,9 +423,9 @@ pub async fn synthesize_seed_control_plane(
             // Mandatory outbound pull-polling interval (`1m`) for NAT/firewall resilience (`AGENTS.md` §3.1)
             poll_interval: DEFAULT_POLL_INTERVAL.to_string(),
         },
-        oidc: Some(OidcConfig {
+        oidc: oidc_issuer.as_ref().map(|issuer_url| OidcConfig {
             enabled: true,
-            issuer_url: oidc_issuer.clone(),
+            issuer_url: issuer_url.clone(),
             client_id: oidc_client_id.clone(),
             redirect_url: "http://127.0.0.1:8080/api/v1/auth/callback".to_string(),
             scopes: vec![
@@ -479,7 +498,7 @@ pub async fn synthesize_seed_control_plane(
     }
     let management_stack = synthesize_management_core_stack(&mgmt_params)?;
 
-    // Stage 0 Dex OIDC admin credentials & config (`SDD.md` §2.1, §6.1, `NFR-SEC-01`)
+    // Stage 0 Rauthy OIDC admin credentials & bootstrap config (`SDD.md` §2.1, §6.1, `NFR-SEC-01`)
     let admin_username = cfg
         .admin_username
         .as_deref()
@@ -498,11 +517,124 @@ pub async fn synthesize_seed_control_plane(
         None => (generate_admin_password(), true),
     };
 
-    let dex_config_yaml = if cfg.oidc_issuer.is_none() {
-        let bcrypt_hash = hash_dex_password_bcrypt(&admin_password)?;
-        Some(format!(
-            "issuer: {oidc_issuer}\nstorage:\n  type: kubernetes\n  config:\n    inCluster: true\nweb:\n  http: 0.0.0.0:5556\nenablePasswordDB: true\nstaticPasswords:\n  - email: {admin_username}\n    hash: \"{bcrypt_hash}\"\n    username: admin\n    userID: \"keel-admin\"\nstaticClients:\n  - id: {oidc_client_id}\n    public: true\n    name: \"Keel Control Plane\"\n    redirectURIs:\n      - http://127.0.0.1:8080/api/v1/auth/callback\n      - http://localhost:8080/api/v1/auth/callback\n"
-        ))
+    let rauthy_config = if use_in_cluster_rauthy {
+        let secret_raft = format!(
+            "{}{}{}",
+            generate_admin_password(),
+            generate_admin_password(),
+            generate_admin_password()
+        );
+        let secret_api = format!(
+            "{}{}{}",
+            generate_admin_password(),
+            generate_admin_password(),
+            generate_admin_password()
+        );
+        let enc_seed = format!("{}{}", generate_admin_password(), generate_admin_password());
+        let enc_bytes = Sha256::digest(enc_seed.as_bytes());
+        let enc_key_id = format!(
+            "{:02x}{:02x}{:02x}{:02x}",
+            enc_bytes[0], enc_bytes[1], enc_bytes[2], enc_bytes[3]
+        );
+        let enc_key_b64 = STANDARD.encode(enc_bytes);
+
+        let config_toml = format!(
+            "[access]\ncookie_mode = 'secure'\n\n\
+             [bootstrap]\nadmin_email = '{admin_username}'\npassword_plain = '{admin_password}'\nbootstrap_dir = '/app/bootstrap'\n\n\
+             [cluster]\nnode_id = 1\nnodes = ['1 127.0.0.1:8100 127.0.0.1:8200']\nsecret_raft = '{secret_raft}'\nsecret_api = '{secret_api}'\n\n\
+             [database]\nhiqlite = true\n\n\
+             [encryption]\nkeys = ['{enc_key_id}/{enc_key_b64}']\nkey_active = '{enc_key_id}'\n\n\
+             [logging]\nlevel = 'info'\n\n\
+             [mfa]\nadmin_force_mfa = false\n\n\
+             [server]\nlisten_address = '0.0.0.0'\nport_http = 8080\nport_https = 8443\nscheme = 'http_https'\npub_url = 'idp.keel.local:8888'\nproxy_mode = true\ntrusted_proxies = ['10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16', '127.0.0.0/8']\n\n\
+             [tls]\ngenerate_self_signed = true\n\n\
+             [webauthn]\nrp_id = 'idp.keel.local'\nrp_origin = 'https://idp.keel.local:8888'\nrp_name = 'Keel IAM'\n"
+        );
+
+        let groups_json = serde_json::to_string_pretty(&json!([
+            { "name": "keel-admins" },
+            { "name": "tenant-default" }
+        ]))?;
+        let users_json = serde_json::to_string_pretty(&json!([
+            {
+                "email": admin_username,
+                "preferred_username": "admin",
+                "given_name": "Keel",
+                "family_name": "Admin",
+                "password": { "Plain": admin_password },
+                "roles": ["rauthy_admin"],
+                "groups": ["keel-admins", "tenant-default"],
+                "enabled": true,
+                "email_verified": true
+            }
+        ]))?;
+        let forgejo_oidc_secret = cfg.with_forge.then(|| {
+            format!(
+                "{}{}{}{}",
+                generate_admin_password(),
+                generate_admin_password(),
+                generate_admin_password(),
+                generate_admin_password()
+            )
+        });
+        let mut clients = vec![json!({
+            "id": oidc_client_id,
+            "name": "Keel Control Plane",
+            "secret": null,
+            "redirect_uris": [
+                "http://127.0.0.1:8080/api/v1/auth/callback",
+                "http://localhost:8080/api/v1/auth/callback",
+                "http://keel.keel.local:8888/api/v1/auth/callback"
+            ],
+            "allowed_origins": [
+                "http://127.0.0.1:8080",
+                "http://localhost:8080",
+                "http://keel.keel.local:8888"
+            ],
+            "enabled": true,
+            "flows_enabled": ["authorization_code", "refresh_token"],
+            "access_token_alg": "RS256",
+            "id_token_alg": "RS256",
+            "auth_code_lifetime": 300,
+            "access_token_lifetime": 3600,
+            "scopes": ["openid", "profile", "email", "groups"],
+            "default_scopes": ["openid", "profile", "email", "groups"],
+            "challenges": ["S256"],
+            "force_mfa": false
+        })];
+        if let Some(ref forgejo_secret) = forgejo_oidc_secret {
+            clients.push(json!({
+                "id": "forgejo",
+                "name": "Forgejo Git Forge",
+                "secret": { "Plain": forgejo_secret },
+                "redirect_uris": [
+                    "https://forgejo.keel.local:8888/user/oauth2/rauthy/callback"
+                ],
+                "allowed_origins": [
+                    "https://forgejo.keel.local:8888"
+                ],
+                "enabled": true,
+                "flows_enabled": ["authorization_code", "refresh_token"],
+                "access_token_alg": "RS256",
+                "id_token_alg": "RS256",
+                "auth_code_lifetime": 300,
+                "access_token_lifetime": 3600,
+                "scopes": ["openid", "profile", "email", "groups"],
+                "default_scopes": ["openid", "profile", "email", "groups"],
+                "force_mfa": false
+            }));
+        }
+        let clients_json = serde_json::to_string_pretty(&clients)?;
+
+        Some(RauthySeedConfig {
+            config_toml,
+            groups_json,
+            users_json,
+            clients_json,
+            forgejo_oidc_secret,
+            secret_namespace: KEEL_SYSTEM_NAMESPACE.to_string(),
+            secret_name: RAUTHY_CONFIG_SECRET_NAME.to_string(),
+        })
     } else {
         None
     };
@@ -517,9 +649,7 @@ pub async fn synthesize_seed_control_plane(
         admin_username,
         admin_password,
         admin_password_generated,
-        dex_config_yaml,
-        dex_secret_namespace: KEEL_SYSTEM_NAMESPACE.to_string(),
-        dex_secret_name: DEX_CONFIG_SECRET_NAME.to_string(),
+        rauthy_config,
         sops_age_keyfile,
     })
 }
@@ -580,13 +710,23 @@ const SEED_CORE_ADDON_PROMETHEUS_YAML: &str =
     include_str!("../../../deploy/seed/core-addons/prometheus.yaml");
 const SEED_CORE_ADDON_FLAGGER_YAML: &str =
     include_str!("../../../deploy/seed/core-addons/flagger.yaml");
-const SEED_CORE_ADDON_DEX_YAML: &str = include_str!("../../../deploy/seed/core-addons/dex.yaml");
+const SEED_CORE_ADDON_CERT_MANAGER_YAML: &str =
+    include_str!("../../../deploy/seed/core-addons/cert-manager.yaml");
+const SEED_CORE_ADDON_RAUTHY_YAML: &str =
+    include_str!("../../../deploy/seed/core-addons/rauthy.yaml");
 
 const CORE_CATALOG_S3_STATE_BACKEND_YAML: &str =
     include_str!("../../../deploy/catalog/core/s3-state-backend/catalog.yaml");
 const CORE_CATALOG_KYVERNO_YAML: &str =
     include_str!("../../../deploy/catalog/core/kyverno/catalog.yaml");
-const CORE_CATALOG_DEX_YAML: &str = include_str!("../../../deploy/catalog/core/dex/catalog.yaml");
+const CORE_CATALOG_CERT_MANAGER_YAML: &str =
+    include_str!("../../../deploy/catalog/core/cert-manager/catalog.yaml");
+const CORE_CATALOG_RAUTHY_YAML: &str =
+    include_str!("../../../deploy/catalog/core/rauthy/catalog.yaml");
+const CORE_CATALOG_DEX_APP_YAML: &str =
+    include_str!("../../../deploy/catalog/apps/dex/catalog.yaml");
+const STARTER_CERT_MANAGER_APP_YAML: &str =
+    include_str!("../../../deploy/catalog/apps/cert-manager/catalog.yaml");
 const CORE_CATALOG_ENVOY_GATEWAY_YAML: &str =
     include_str!("../../../deploy/catalog/core/envoy-gateway/catalog.yaml");
 const CORE_CATALOG_PROMETHEUS_YAML: &str =
@@ -668,11 +808,39 @@ async fn start_forgejo_port_forward(
     )))
 }
 
-async fn start_dex_port_forward(
+async fn start_gateway_port_forward(
     context: Option<&str>,
     kubeconfig: Option<&Path>,
 ) -> Result<TempPortForward, CliError> {
-    let listener = std::net::TcpListener::bind("127.0.0.1:5556")
+    let mut svc_cmd = tokio::process::Command::new("kubectl");
+    if let Some(kc) = kubeconfig {
+        svc_cmd.arg("--kubeconfig").arg(kc);
+    }
+    if let Some(ctx) = context {
+        svc_cmd.arg("--context").arg(ctx);
+    }
+    let svc_out = svc_cmd
+        .args([
+            "-n",
+            KEEL_SYSTEM_NAMESPACE,
+            "get",
+            "svc",
+            "-l",
+            "gateway.envoyproxy.io/owning-gateway-name=keel-ingress",
+            "-o",
+            "jsonpath={.items[0].metadata.name}",
+        ])
+        .output()
+        .await
+        .map_err(|e| CliError::Validation(format!("failed to query Envoy Gateway service: {e}")))?;
+    let svc_name = String::from_utf8_lossy(&svc_out.stdout).trim().to_string();
+    if svc_name.is_empty() {
+        return Err(CliError::Validation(
+            "Envoy Gateway service for keel-ingress not found in keel-system".to_string(),
+        ));
+    }
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:8888")
         .or_else(|_| std::net::TcpListener::bind("127.0.0.1:0"))?;
     let local_port = listener.local_addr()?.port();
     drop(listener);
@@ -688,8 +856,8 @@ async fn start_dex_port_forward(
         "-n",
         KEEL_SYSTEM_NAMESPACE,
         "port-forward",
-        "svc/dex",
-        &format!("{local_port}:5556"),
+        &format!("svc/{svc_name}"),
+        &format!("{local_port}:8888"),
     ])
     .stdout(std::process::Stdio::null())
     .stderr(std::process::Stdio::null());
@@ -701,12 +869,17 @@ async fn start_dex_port_forward(
 
     let client = Client::builder()
         .timeout(Duration::from_secs(2))
+        .danger_accept_invalid_certs(true)
         .build()
         .map_err(|e| CliError::Validation(e.to_string()))?;
-    let health_url = format!("http://127.0.0.1:{local_port}/dex/.well-known/openid-configuration");
+    let health_url = format!("https://127.0.0.1:{local_port}/auth/v1/health");
 
     for _ in 0..40 {
-        if let Ok(resp) = client.get(&health_url).send().await
+        if let Ok(resp) = client
+            .get(&health_url)
+            .header("Host", "idp.keel.local:8888")
+            .send()
+            .await
             && resp.status().is_success()
         {
             return Ok(pf);
@@ -715,7 +888,7 @@ async fn start_dex_port_forward(
     }
 
     Err(CliError::Validation(format!(
-        "timed out waiting for Dex OIDC port-forward on 127.0.0.1:{local_port}"
+        "timed out waiting for Envoy Gateway / Rauthy port-forward on 127.0.0.1:{local_port}"
     )))
 }
 
@@ -723,6 +896,7 @@ async fn provision_in_cluster_forgejo(
     context: Option<&str>,
     kubeconfig: Option<&Path>,
     local_port: u16,
+    forgejo_oidc_secret: Option<&str>,
 ) -> Result<String, CliError> {
     let base = format!("http://127.0.0.1:{local_port}");
     let client = Client::builder()
@@ -803,6 +977,103 @@ async fn provision_in_cluster_forgejo(
     });
     let secret_yaml = serde_yml::to_string(&secret_doc)?;
     run_kubectl_apply(context, kubeconfig, &secret_yaml).await?;
+
+    let flux_git_creds_doc = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": {
+            "name": "git-credentials",
+            "namespace": FLUX_SYSTEM_NAMESPACE,
+        },
+        "type": "Opaque",
+        "stringData": {
+            "username": forgejo_user,
+            "password": token,
+        },
+    });
+    let flux_git_creds_yaml = serde_yml::to_string(&flux_git_creds_doc)?;
+    run_kubectl_apply(context, kubeconfig, &flux_git_creds_yaml).await?;
+
+    // 4. Register Rauthy OIDC SSO provider in Forgejo when enabled
+    if let Some(oidc_secret) = forgejo_oidc_secret {
+        let mut list_cmd = tokio::process::Command::new("kubectl");
+        if let Some(kc) = kubeconfig {
+            list_cmd.arg("--kubeconfig").arg(kc);
+        }
+        if let Some(ctx) = context {
+            list_cmd.arg("--context").arg(ctx);
+        }
+        let list_out = list_cmd
+            .args([
+                "-n",
+                KEEL_SYSTEM_NAMESPACE,
+                "exec",
+                "deploy/forgejo",
+                "--",
+                "forgejo",
+                "admin",
+                "auth",
+                "list",
+            ])
+            .output()
+            .await;
+
+        let already_configured = list_out.as_ref().is_ok_and(|o| {
+            o.status.success() && String::from_utf8_lossy(&o.stdout).contains("rauthy")
+        });
+
+        if !already_configured {
+            let mut add_cmd = tokio::process::Command::new("kubectl");
+            if let Some(kc) = kubeconfig {
+                add_cmd.arg("--kubeconfig").arg(kc);
+            }
+            if let Some(ctx) = context {
+                add_cmd.arg("--context").arg(ctx);
+            }
+            match add_cmd
+                .args([
+                    "-n",
+                    KEEL_SYSTEM_NAMESPACE,
+                    "exec",
+                    "deploy/forgejo",
+                    "--",
+                    "env",
+                    "SSL_CERT_DIR=/etc/ssl/certs:/etc/ssl/keel-ca",
+                    "forgejo",
+                    "admin",
+                    "auth",
+                    "add-oauth",
+                    "--name",
+                    "rauthy",
+                    "--provider",
+                    "openidConnect",
+                    "--key",
+                    "forgejo",
+                    "--secret",
+                    oidc_secret,
+                    "--auto-discover-url",
+                    "https://idp.keel.local:8888/auth/v1/.well-known/openid-configuration",
+                    "--scopes",
+                    "openid email profile groups",
+                ])
+                .output()
+                .await
+            {
+                Ok(out) if out.status.success() => {
+                    tracing::info!("Registered Rauthy OIDC SSO provider in Forgejo");
+                }
+                Ok(out) => {
+                    tracing::warn!(
+                        stderr = %String::from_utf8_lossy(&out.stderr),
+                        "Failed to register Rauthy OIDC SSO provider in Forgejo (non-fatal)"
+                    );
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, "Failed to exec forgejo admin auth add-oauth (non-fatal)");
+                }
+            }
+        }
+    }
 
     Ok(token)
 }
@@ -1071,8 +1342,12 @@ async fn initialize_seed_git_repo_with_push(
             SEED_CORE_ADDON_FLAGGER_YAML.to_string(),
         ),
         (
-            "clusters/management/core-addons/dex.yaml",
-            SEED_CORE_ADDON_DEX_YAML.to_string(),
+            "clusters/management/core-addons/cert-manager.yaml",
+            SEED_CORE_ADDON_CERT_MANAGER_YAML.to_string(),
+        ),
+        (
+            "clusters/management/core-addons/rauthy.yaml",
+            SEED_CORE_ADDON_RAUTHY_YAML.to_string(),
         ),
         (
             "clusters/management/core-addons/kyverno-policies.yaml",
@@ -1087,8 +1362,12 @@ async fn initialize_seed_git_repo_with_push(
             CORE_CATALOG_KYVERNO_YAML.to_string(),
         ),
         (
-            "catalog/core/dex/catalog.yaml",
-            CORE_CATALOG_DEX_YAML.to_string(),
+            "catalog/core/cert-manager/catalog.yaml",
+            CORE_CATALOG_CERT_MANAGER_YAML.to_string(),
+        ),
+        (
+            "catalog/core/rauthy/catalog.yaml",
+            CORE_CATALOG_RAUTHY_YAML.to_string(),
         ),
         (
             "catalog/core/envoy-gateway/catalog.yaml",
@@ -1136,6 +1415,14 @@ async fn initialize_seed_git_repo_with_push(
         files_to_write.push((
             "catalog/apps/podinfo/catalog.yaml",
             STARTER_PODINFO_CATALOG_YAML.to_string(),
+        ));
+        files_to_write.push((
+            "catalog/apps/dex/catalog.yaml",
+            CORE_CATALOG_DEX_APP_YAML.to_string(),
+        ));
+        files_to_write.push((
+            "catalog/apps/cert-manager/catalog.yaml",
+            STARTER_CERT_MANAGER_APP_YAML.to_string(),
         ));
     }
 
@@ -1197,8 +1484,8 @@ const CONTROL_PLANE_PULUMI_YAML: &str =
     include_str!("../../../deploy/bootstrap/control-plane/Pulumi.yaml");
 const CONTROL_PLANE_FORGEJO_PULUMI_YAML: &str =
     include_str!("../../../deploy/bootstrap/control-plane-forgejo/Pulumi.yaml");
-const CONTROL_PLANE_DEX_PULUMI_YAML: &str =
-    include_str!("../../../deploy/bootstrap/control-plane-dex/Pulumi.yaml");
+const CONTROL_PLANE_RAUTHY_PULUMI_YAML: &str =
+    include_str!("../../../deploy/bootstrap/control-plane-rauthy/Pulumi.yaml");
 
 async fn run_kubectl_apply(
     context: Option<&str>,
@@ -1519,6 +1806,128 @@ async fn ensure_seaweedfs_pulumi_bucket(
     Ok(())
 }
 
+/// Best-effort CoreDNS rewrite so in-cluster pods (such as Forgejo) resolve `idp.keel.local`
+/// and `forgejo.keel.local` to the Envoy Gateway proxy service in `keel-system`.
+async fn configure_coredns_local_rewrites(context: Option<&str>, kubeconfig: Option<&Path>) {
+    let mut svc_name = String::new();
+    for _ in 0..15 {
+        let mut cmd = tokio::process::Command::new("kubectl");
+        if let Some(kc) = kubeconfig {
+            cmd.arg("--kubeconfig").arg(kc);
+        }
+        if let Some(ctx) = context {
+            cmd.arg("--context").arg(ctx);
+        }
+        if let Ok(out) = cmd
+            .args([
+                "-n",
+                KEEL_SYSTEM_NAMESPACE,
+                "get",
+                "svc",
+                "-l",
+                "gateway.envoyproxy.io/owning-gateway-name=keel-ingress",
+                "-o",
+                "jsonpath={.items[0].metadata.name}",
+            ])
+            .output()
+            .await
+        {
+            let candidate = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !candidate.is_empty() {
+                svc_name = candidate;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+
+    if svc_name.is_empty() {
+        tracing::warn!(
+            "Envoy Gateway service for keel-ingress not ready yet; skipping CoreDNS local rewrites"
+        );
+        return;
+    }
+
+    let mut get_cm = tokio::process::Command::new("kubectl");
+    if let Some(kc) = kubeconfig {
+        get_cm.arg("--kubeconfig").arg(kc);
+    }
+    if let Some(ctx) = context {
+        get_cm.arg("--context").arg(ctx);
+    }
+    let Ok(cm_out) = get_cm
+        .args([
+            "-n",
+            "kube-system",
+            "get",
+            "configmap",
+            "coredns",
+            "-o",
+            "jsonpath={.data.Corefile}",
+        ])
+        .output()
+        .await
+    else {
+        return;
+    };
+    if !cm_out.status.success() {
+        return;
+    }
+    let corefile = String::from_utf8_lossy(&cm_out.stdout).to_string();
+    if corefile.contains("idp.keel.local") {
+        return;
+    }
+    let target_fqdn = format!("{svc_name}.{KEEL_SYSTEM_NAMESPACE}.svc.cluster.local");
+    let rewrite_block = format!(
+        "    rewrite name exact idp.keel.local {target_fqdn}\n\
+         \x20   rewrite name exact forgejo.keel.local {target_fqdn}\n\
+         \x20   kubernetes cluster.local"
+    );
+    let updated_corefile = corefile.replacen("    kubernetes cluster.local", &rewrite_block, 1);
+    if updated_corefile == corefile {
+        return;
+    }
+
+    let cm_doc = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {
+            "name": "coredns",
+            "namespace": "kube-system",
+        },
+        "data": {
+            "Corefile": updated_corefile,
+        },
+    });
+    if let Ok(cm_yaml) = serde_yml::to_string(&cm_doc)
+        && run_kubectl_apply(context, kubeconfig, &cm_yaml)
+            .await
+            .is_ok()
+    {
+        let mut restart = tokio::process::Command::new("kubectl");
+        if let Some(kc) = kubeconfig {
+            restart.arg("--kubeconfig").arg(kc);
+        }
+        if let Some(ctx) = context {
+            restart.arg("--context").arg(ctx);
+        }
+        let _ = restart
+            .args([
+                "-n",
+                "kube-system",
+                "rollout",
+                "restart",
+                "deployment/coredns",
+            ])
+            .output()
+            .await;
+        tracing::info!(
+            envoy_svc = %svc_name,
+            "Configured CoreDNS rewrites for idp.keel.local and forgejo.keel.local"
+        );
+    }
+}
+
 async fn install_stage0_core_addons(
     connection: &ClusterConnection,
     artifacts: &SeedControlPlaneArtifacts,
@@ -1572,57 +1981,6 @@ async fn install_stage0_core_addons(
         ensure_seaweedfs_pulumi_bucket(ctx, kc).await?;
     }
 
-    if with_forge {
-        tracing::info!(
-            "Installing in-cluster Forgejo Git forge via Pulumi (`control-plane-forgejo`)"
-        );
-        run_pulumi_control_plane_stack(
-            "control-plane-forgejo",
-            CONTROL_PLANE_FORGEJO_PULUMI_YAML,
-            &connection.cluster_name,
-            &[
-                ("kubeconfig", &connection.kubeconfig_yaml, true),
-                ("kubeContext", kube_context, false),
-            ],
-        )
-        .await?;
-    }
-
-    let gateway_yaml = format!(
-        "apiVersion: gateway.networking.k8s.io/v1\n\
-         kind: GatewayClass\n\
-         metadata:\n\
-         \x20 name: keel-envoy\n\
-         \x20 labels:\n\
-         \x20   app.kubernetes.io/managed-by: keel\n\
-         spec:\n\
-         \x20 controllerName: gateway.envoyproxy.io/gatewayclass-controller\n\
-         ---\n\
-         apiVersion: gateway.networking.k8s.io/v1\n\
-         kind: Gateway\n\
-         metadata:\n\
-         \x20 name: keel-ingress\n\
-         \x20 namespace: {KEEL_SYSTEM_NAMESPACE}\n\
-         \x20 labels:\n\
-         \x20   app.kubernetes.io/managed-by: keel\n\
-         spec:\n\
-         \x20 gatewayClassName: keel-envoy\n\
-         \x20 listeners:\n\
-         \x20   - name: http\n\
-         \x20     protocol: HTTP\n\
-         \x20     port: 80\n\
-         \x20     allowedRoutes:\n\
-         \x20       namespaces:\n\
-         \x20         from: All\n\
-         \x20   - name: http-local\n\
-         \x20     protocol: HTTP\n\
-         \x20     port: 8888\n\
-         \x20     allowedRoutes:\n\
-         \x20       namespaces:\n\
-         \x20         from: All\n"
-    );
-    run_kubectl_apply(ctx, kc, &gateway_yaml).await?;
-
     let metric_templates_yaml = format!(
         "apiVersion: flagger.app/v1beta1\n\
          kind: MetricTemplate\n\
@@ -1659,18 +2017,225 @@ async fn install_stage0_core_addons(
     );
     run_kubectl_apply(ctx, kc, &metric_templates_yaml).await?;
 
-    if let Some(ref dex_cfg) = artifacts.dex_config_yaml {
-        tracing::info!("Installing Stage 0 Dex OIDC provider via Pulumi (`control-plane-dex`)");
+    if let Some(ref rauthy_cfg) = artifacts.rauthy_config {
+        tracing::info!("Applying cert-manager self-signed CA & keel-wildcard-tls Certificate");
+        let ca_yaml = format!(
+            "apiVersion: cert-manager.io/v1\n\
+             kind: ClusterIssuer\n\
+             metadata:\n\
+             \x20 name: keel-selfsigned\n\
+             \x20 labels:\n\
+             \x20   app.kubernetes.io/managed-by: keel\n\
+             spec:\n\
+             \x20 selfSigned: {{}}\n\
+             ---\n\
+             apiVersion: cert-manager.io/v1\n\
+             kind: Certificate\n\
+             metadata:\n\
+             \x20 name: keel-ca\n\
+             \x20 namespace: {KEEL_SYSTEM_NAMESPACE}\n\
+             \x20 labels:\n\
+             \x20   app.kubernetes.io/managed-by: keel\n\
+             spec:\n\
+             \x20 isCA: true\n\
+             \x20 commonName: keel-local-ca\n\
+             \x20 secretName: keel-ca-secret\n\
+             \x20 privateKey:\n\
+             \x20   algorithm: ECDSA\n\
+             \x20   size: 256\n\
+             \x20 issuerRef:\n\
+             \x20   name: keel-selfsigned\n\
+             \x20   kind: ClusterIssuer\n\
+             \x20   group: cert-manager.io\n\
+             ---\n\
+             apiVersion: cert-manager.io/v1\n\
+             kind: ClusterIssuer\n\
+             metadata:\n\
+             \x20 name: keel-ca-issuer\n\
+             \x20 labels:\n\
+             \x20   app.kubernetes.io/managed-by: keel\n\
+             spec:\n\
+             \x20 ca:\n\
+             \x20   secretName: keel-ca-secret\n\
+             ---\n\
+             apiVersion: cert-manager.io/v1\n\
+             kind: Certificate\n\
+             metadata:\n\
+             \x20 name: keel-wildcard-tls\n\
+             \x20 namespace: {KEEL_SYSTEM_NAMESPACE}\n\
+             \x20 labels:\n\
+             \x20   app.kubernetes.io/managed-by: keel\n\
+             spec:\n\
+             \x20 secretName: keel-wildcard-tls\n\
+             \x20 dnsNames:\n\
+             \x20   - \"*.keel.local\"\n\
+             \x20   - idp.keel.local\n\
+             \x20   - forgejo.keel.local\n\
+             \x20   - keel.keel.local\n\
+             \x20 issuerRef:\n\
+             \x20   name: keel-ca-issuer\n\
+             \x20   kind: ClusterIssuer\n\
+             \x20   group: cert-manager.io\n"
+        );
+        run_kubectl_apply(ctx, kc, &ca_yaml).await?;
+
+        for _ in 0..30 {
+            if read_secret_key(
+                ctx,
+                kc,
+                KEEL_SYSTEM_NAMESPACE,
+                "keel-wildcard-tls",
+                "tls.crt",
+            )
+            .await
+            .is_some()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+
+        tracing::info!("Applying Envoy GatewayClass & keel-ingress Gateway (HTTPS port 8888)");
+        let gateway_yaml = format!(
+            "apiVersion: gateway.networking.k8s.io/v1\n\
+             kind: GatewayClass\n\
+             metadata:\n\
+             \x20 name: keel-envoy\n\
+             \x20 labels:\n\
+             \x20   app.kubernetes.io/managed-by: keel\n\
+             spec:\n\
+             \x20 controllerName: gateway.envoyproxy.io/gatewayclass-controller\n\
+             ---\n\
+             apiVersion: gateway.networking.k8s.io/v1\n\
+             kind: Gateway\n\
+             metadata:\n\
+             \x20 name: keel-ingress\n\
+             \x20 namespace: {KEEL_SYSTEM_NAMESPACE}\n\
+             \x20 labels:\n\
+             \x20   app.kubernetes.io/managed-by: keel\n\
+             spec:\n\
+             \x20 gatewayClassName: keel-envoy\n\
+             \x20 listeners:\n\
+             \x20   - name: http\n\
+             \x20     protocol: HTTP\n\
+             \x20     port: 80\n\
+             \x20     allowedRoutes:\n\
+             \x20       namespaces:\n\
+             \x20         from: All\n\
+             \x20   - name: https-local\n\
+             \x20     protocol: HTTPS\n\
+             \x20     port: 8888\n\
+             \x20     tls:\n\
+             \x20       mode: Terminate\n\
+             \x20       certificateRefs:\n\
+             \x20         - kind: Secret\n\
+             \x20           name: keel-wildcard-tls\n\
+             \x20     allowedRoutes:\n\
+             \x20       namespaces:\n\
+             \x20         from: All\n\
+             ---\n\
+             apiVersion: gateway.networking.k8s.io/v1\n\
+             kind: HTTPRoute\n\
+             metadata:\n\
+             \x20 name: rauthy-ingress\n\
+             \x20 namespace: {KEEL_SYSTEM_NAMESPACE}\n\
+             \x20 labels:\n\
+             \x20   app.kubernetes.io/managed-by: keel\n\
+             spec:\n\
+             \x20 parentRefs:\n\
+             \x20   - name: keel-ingress\n\
+             \x20     namespace: {KEEL_SYSTEM_NAMESPACE}\n\
+             \x20     sectionName: https-local\n\
+             \x20 hostnames:\n\
+             \x20   - idp.keel.local\n\
+             \x20 rules:\n\
+             \x20   - matches:\n\
+             \x20       - path:\n\
+             \x20           type: PathPrefix\n\
+             \x20           value: /\n\
+             \x20     backendRefs:\n\
+             \x20       - name: rauthy\n\
+             \x20         port: 8080\n"
+        );
+        run_kubectl_apply(ctx, kc, &gateway_yaml).await?;
+
+        if with_forge {
+            tracing::info!(
+                "Installing in-cluster Forgejo Git forge via Pulumi (`control-plane-forgejo`)"
+            );
+            run_pulumi_control_plane_stack(
+                "control-plane-forgejo",
+                CONTROL_PLANE_FORGEJO_PULUMI_YAML,
+                &connection.cluster_name,
+                &[
+                    ("kubeconfig", &connection.kubeconfig_yaml, true),
+                    ("kubeContext", kube_context, false),
+                ],
+            )
+            .await?;
+
+            let forgejo_route_yaml = format!(
+                "apiVersion: gateway.networking.k8s.io/v1\n\
+                 kind: HTTPRoute\n\
+                 metadata:\n\
+                 \x20 name: forgejo-ingress\n\
+                 \x20 namespace: {KEEL_SYSTEM_NAMESPACE}\n\
+                 \x20 labels:\n\
+                 \x20   app.kubernetes.io/managed-by: keel\n\
+                 spec:\n\
+                 \x20 parentRefs:\n\
+                 \x20   - name: keel-ingress\n\
+                 \x20     namespace: {KEEL_SYSTEM_NAMESPACE}\n\
+                 \x20     sectionName: https-local\n\
+                 \x20 hostnames:\n\
+                 \x20   - forgejo.keel.local\n\
+                 \x20 rules:\n\
+                 \x20   - matches:\n\
+                 \x20       - path:\n\
+                 \x20           type: PathPrefix\n\
+                 \x20           value: /\n\
+                 \x20     backendRefs:\n\
+                 \x20       - name: forgejo-http\n\
+                 \x20         port: 3000\n"
+            );
+            run_kubectl_apply(ctx, kc, &forgejo_route_yaml).await?;
+            configure_coredns_local_rewrites(ctx, kc).await;
+        }
+
+        let groups_b64 = STANDARD.encode(rauthy_cfg.groups_json.as_bytes());
+        let users_b64 = STANDARD.encode(rauthy_cfg.users_json.as_bytes());
+        let clients_b64 = STANDARD.encode(rauthy_cfg.clients_json.as_bytes());
+
+        tracing::info!(
+            "Installing Stage 0 Rauthy OIDC provider via Pulumi (`control-plane-rauthy`)"
+        );
         run_pulumi_control_plane_stack(
-            "control-plane-dex",
-            CONTROL_PLANE_DEX_PULUMI_YAML,
+            "control-plane-rauthy",
+            CONTROL_PLANE_RAUTHY_PULUMI_YAML,
             &connection.cluster_name,
             &[
                 ("kubeconfig", &connection.kubeconfig_yaml, true),
                 ("kubeContext", kube_context, false),
-                ("dexConfigYaml", dex_cfg, true),
-                ("dexSecretName", &artifacts.dex_secret_name, false),
-                ("dexSecretNamespace", &artifacts.dex_secret_namespace, false),
+                ("rauthyConfigToml", &rauthy_cfg.config_toml, true),
+                ("rauthyGroupsB64", &groups_b64, false),
+                ("rauthyUsersB64", &users_b64, true),
+                ("rauthyClientsB64", &clients_b64, false),
+                ("rauthySecretName", &rauthy_cfg.secret_name, false),
+                ("rauthySecretNamespace", &rauthy_cfg.secret_namespace, false),
+            ],
+        )
+        .await?;
+    } else if with_forge {
+        tracing::info!(
+            "Installing in-cluster Forgejo Git forge via Pulumi (`control-plane-forgejo`)"
+        );
+        run_pulumi_control_plane_stack(
+            "control-plane-forgejo",
+            CONTROL_PLANE_FORGEJO_PULUMI_YAML,
+            &connection.cluster_name,
+            &[
+                ("kubeconfig", &connection.kubeconfig_yaml, true),
+                ("kubeContext", kube_context, false),
             ],
         )
         .await?;
@@ -1928,10 +2493,11 @@ pub async fn execute_bootstrap_init_with_target(
         artifacts.keel_config.validate()?;
     }
 
-    if args
-        .git_token
-        .as_deref()
-        .is_some_and(|t| !t.trim().is_empty())
+    if cfg.with_forge
+        || args
+            .git_token
+            .as_deref()
+            .is_some_and(|t| !t.trim().is_empty())
     {
         artifacts.flux_git_repository.spec.secret_ref = Some(LocalObjectReference {
             name: "git-credentials".to_string(),
@@ -1959,10 +2525,15 @@ pub async fn execute_bootstrap_init_with_target(
             connection.kubeconfig_path.as_deref(),
         )
         .await?;
+        let forgejo_oidc_secret = artifacts
+            .rauthy_config
+            .as_ref()
+            .and_then(|r| r.forgejo_oidc_secret.as_deref());
         let token = provision_in_cluster_forgejo(
             connection.context.as_deref(),
             connection.kubeconfig_path.as_deref(),
             pf.local_port,
+            forgejo_oidc_secret,
         )
         .await?;
         push_url_override = Some(format!(
@@ -2066,16 +2637,26 @@ fn format_bootstrap_init_summary(
             repo.initial_commit_sha
         ));
     }
-    if artifacts.dex_config_yaml.is_some() {
+    if let Some(ref rauthy) = artifacts.rauthy_config {
         out.push_str(&format!(
-            "OIDC Provider:   Dex ({}/{})\n",
-            artifacts.dex_secret_namespace, artifacts.dex_secret_name
+            "OIDC Provider:   Rauthy ({}/{})\n",
+            KEEL_SYSTEM_NAMESPACE, RAUTHY_CONFIG_SECRET_NAME
         ));
+        out.push_str("OIDC Issuer:     https://idp.keel.local:8888/auth/v1\n");
+        out.push_str("IdP Admin UI:    https://idp.keel.local:8888/auth/v1/admin\n");
         out.push_str(&format!("Admin Username:  {}\n", artifacts.admin_username));
         if artifacts.admin_password_generated {
             out.push_str(&format!("Admin Password:  {}\n", artifacts.admin_password));
         } else {
             out.push_str("Admin Password:  [PROVIDED VIA CLI]\n");
+        }
+        if rauthy.forgejo_oidc_secret.is_some() {
+            out.push_str("Forgejo SSO URL: https://forgejo.keel.local:8888 (OAuth: rauthy)\n");
+            out.push_str(
+                "Local /etc/hosts: ensure `127.0.0.1 idp.keel.local forgejo.keel.local` is configured\n",
+            );
+        } else {
+            out.push_str("Local /etc/hosts: ensure `127.0.0.1 idp.keel.local` is configured\n");
         }
     } else if let Some(ref oidc) = artifacts.keel_config.oidc {
         out.push_str(&format!("OIDC Issuer:     {}\n", oidc.issuer_url));
@@ -2547,7 +3128,7 @@ async fn build_serve_state_with_forward(
         .as_ref()
         .map(|c| c.auth_phase)
         .unwrap_or(AuthPhase::OidcActive);
-    let mut oidc_cfg = parsed_keel_cfg
+    let oidc_cfg = parsed_keel_cfg
         .as_ref()
         .and_then(|c| c.oidc.as_ref())
         .filter(|o| o.enabled)
@@ -2619,20 +3200,19 @@ async fn build_serve_state_with_forward(
 
     if enable_in_cluster_port_forward
         && kube_reader.is_some()
-        && let Some(ref mut oidc) = oidc_cfg
-        && oidc.issuer_url.contains(".svc.cluster.local")
+        && let Some(ref oidc) = oidc_cfg
+        && oidc.issuer_url.contains("idp.keel.local")
     {
-        match start_dex_port_forward(None, None).await {
+        match start_gateway_port_forward(None, None).await {
             Ok(pf) => {
                 tracing::info!(
                     local_port = pf.local_port,
-                    "Started automatic port-forward to in-cluster Dex OIDC"
+                    "Started automatic port-forward to Envoy Gateway (keel-ingress:8888) for Rauthy OIDC"
                 );
-                oidc.issuer_url = format!("http://127.0.0.1:{}/dex", pf.local_port);
                 port_forwards.push(pf);
             }
             Err(err) => {
-                tracing::warn!(error = %err, "Failed to start automatic port-forward to in-cluster Dex OIDC");
+                tracing::warn!(error = %err, "Failed to start automatic port-forward to Envoy Gateway (keel-ingress:8888)");
             }
         }
     }
@@ -2716,6 +3296,12 @@ async fn build_serve_state_with_forward(
             state = state.with_docker_proxy_url(Some(
                 "tcp://keel-docker-proxy.flux-system.svc.cluster.local:2375".to_string(),
             ));
+        }
+        if let Some(ca_pem) = reader
+            .read_secret_key(KEEL_SYSTEM_NAMESPACE, "keel-wildcard-tls", "ca.crt")
+            .await
+        {
+            state = state.with_oidc_ca_pem(Some(ca_pem.into_bytes()));
         }
         state = state.with_state_provider(Arc::new(KubeClusterStateProvider::new(
             repo_state_provider,
@@ -3652,6 +4238,7 @@ spec:
             distro: None,
             with_forge: false,
             oidc_issuer: None,
+            oidc_provider: crate::cli::OidcProviderArg::Rauthy,
             oidc_client_id: None,
             admin_username: None,
             admin_password: None,
@@ -3688,6 +4275,7 @@ spec:
             distro: None,
             with_forge: false,
             oidc_issuer: None,
+            oidc_provider: crate::cli::OidcProviderArg::Rauthy,
             oidc_client_id: None,
             admin_username: None,
             admin_password: None,
@@ -3717,9 +4305,10 @@ spec:
         assert!(
             outcome
                 .artifacts
-                .dex_config_yaml
-                .as_deref()
-                .is_some_and(|y| y.contains("enablePasswordDB: true"))
+                .rauthy_config
+                .as_ref()
+                .is_some_and(|r| r.config_toml.contains("idp.keel.local:8888")
+                    && r.groups_json.contains("keel-admins"))
         );
         assert!(!format!("{:?}", outcome.artifacts).contains(&outcome.artifacts.admin_password));
         assert_eq!(
@@ -4364,6 +4953,7 @@ spec:
             distro: None,
             with_forge: false,
             oidc_issuer: None,
+            oidc_provider: crate::cli::OidcProviderArg::Rauthy,
             oidc_client_id: None,
             admin_username: None,
             admin_password: None,

@@ -100,19 +100,23 @@ pub struct BootstrapInitArgs {
     #[arg(long, default_value_t = false)]
     pub with_forge: bool,
 
-    /// External OIDC issuer URL (disables in-cluster Dex OIDC deployment when provided)
+    /// External OIDC issuer URL (disables in-cluster Rauthy OIDC deployment when provided)
     #[arg(long)]
     pub oidc_issuer: Option<String>,
+
+    /// In-cluster OIDC provider to deploy during Stage 0 when `--oidc-issuer` is omitted
+    #[arg(long, value_enum, default_value_t = OidcProviderArg::Rauthy)]
+    pub oidc_provider: OidcProviderArg,
 
     /// OIDC client ID (defaults to `keel-server`)
     #[arg(long)]
     pub oidc_client_id: Option<String>,
 
-    /// Initial admin username/email for Stage 0 Dex seeding (defaults to `admin@keel.local`)
+    /// Initial admin username/email for Stage 0 Rauthy seeding (defaults to `admin@keel.local`)
     #[arg(long)]
     pub admin_username: Option<String>,
 
-    /// Initial admin password for Stage 0 Dex seeding (auto-generated if omitted)
+    /// Initial admin password for Stage 0 Rauthy seeding (auto-generated if omitted)
     #[arg(long, env = "KEEL_ADMIN_PASSWORD")]
     pub admin_password: Option<String>,
 
@@ -158,7 +162,7 @@ impl BootstrapInitArgs {
             kubeconfig: self.kubeconfig.clone(),
             context: self.context.clone(),
             with_forge: self.with_forge,
-            with_oidc: self.oidc_issuer.is_none(),
+            with_oidc: self.oidc_issuer.is_none() && self.oidc_provider != OidcProviderArg::None,
             oidc_issuer: self.oidc_issuer.clone(),
             oidc_client_id: self.oidc_client_id.clone(),
             admin_username: self.admin_username.clone(),
@@ -243,6 +247,16 @@ pub enum ForgeTypeArg {
     Gitlab,
     Forgejo,
     Gitea,
+}
+
+/// In-cluster OIDC provider selection for Stage 0 bootstrap.
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OidcProviderArg {
+    /// Lightweight Rust OIDC provider with built-in Admin UI for users & groups (default)
+    #[default]
+    Rauthy,
+    /// Skip in-cluster OIDC provider installation
+    None,
 }
 
 impl From<ForgeTypeArg> for keel_core::ForgeKind {
