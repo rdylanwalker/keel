@@ -33,7 +33,7 @@ flowchart TB
         API["keel-server (axum + kube-rs)<br/>Direct git CLI + ForgeProvider + SSE Telemetry"]
         S3["S3 State Backend (Garage / MinIO / Cloud S3)<br/>Versioned Pulumi State"]
         FORGE["Git Forge (Forgejo / Gitea / GitHub / GitLab)<br/>Desired State + PR Previews"]
-        OIDC["OIDC Provider (Dex / External OIDC)"]
+        OIDC["OIDC Provider (Rauthy / External OIDC)"]
         FLUX["Flux CD Controllers<br/>(source / kustomize / helm / notification)"]
         PKO["Pulumi Kubernetes Operator (PKO v2)<br/>Workspace Pods + Preview Mode"]
         GUARD["Kyverno Admission + SOPS/age"]
@@ -78,10 +78,10 @@ Because PKO v2 and Flux require a running Kubernetes cluster, Stage 0 executes d
 
 #### Seed Control-Plane Installation (Identical Across All Targets)
 Once the seed cluster API is reachable, `keel bootstrap init` performs the exact same installation sequence regardless of target:
-1. Runs `deploy/bootstrap/control-plane/Pulumi.yaml` to install **Garage/MinIO S3** (or binds the cloud provider's S3-compatible bucket), **Flux CD**, **PKO v2**, **Kyverno**, **Envoy Gateway**, **Prometheus**, **Flagger**, **Dex** (Apache-2.0 in-cluster OIDC provider with username/password DB and extensible Google/Apple/Active Directory connectors, unless `--oidc-issuer` points to an external OIDC provider), and optional in-cluster **Forgejo/Gitea**, handing management over in-place to Flux CD (`deploy/seed/core-addons/`).
+1. Runs `deploy/bootstrap/control-plane/Pulumi.yaml` to install **Garage/MinIO S3** (or binds the cloud provider's S3-compatible bucket), **Flux CD**, **PKO v2**, **Kyverno**, **Envoy Gateway**, **Prometheus**, **Flagger**, **Rauthy** (Apache-2.0 lightweight Rust in-cluster OIDC provider with Admin UI for users, groups, and clients, unless `--oidc-issuer` or `--oidc-provider none` is passed), and optional in-cluster **Forgejo/Gitea**, handing management over in-place to Flux CD (`deploy/seed/core-addons/`).
 2. Generates a root **`age` keypair**, injects the private key into `flux-system/sops-age`, and writes `.sops.yaml` into the seed Git repository.
 3. For `kind`, `proxmox`, and cloud targets, uploads the Stage 0 Pulumi state to `s3://pulumi-state` and imports it into a Flux-managed PKO `Stack` CR (`management-cluster-core`) with `protect: true` enabled.
-4. Provisions the initial Dex admin user (`--admin-username` / `--admin-password`, or auto-generated credentials printed once to stdout) as a bcrypt-hashed `staticPasswords` entry in Dex, configures OIDC PKCE for `keel-server`, and exposes the portal on `http://localhost:8080` (via automatic port-forward to the in-cluster `keel-server` pod or cluster ingress).
+4. Provisions the initial Rauthy admin user (`--admin-username` / `--admin-password`, or auto-generated credentials printed once to stdout) into `keel-admins` + `rauthy_admin`, configures the `keel-server` OIDC PKCE client (`groups` scope) in `keel-system/rauthy-config`, exposes Rauthy via Envoy Gateway (`http://idp.keel.local:8888`), and exposes the portal on `http://localhost:8080`.
 
 #### NAT / Firewall & Ephemeral Local Cluster Resilience
 * **Outbound Pull-Polling:** Flux `GitRepository` resources default to outbound polling (`interval: 1m`) alongside optional webhook receivers, ensuring local `kind` and home `k3s` management clusters behind NAT/firewalls reconcile external GitHub/GitLab repositories without requiring inbound public ports.
@@ -91,7 +91,7 @@ Once the seed cluster API is reachable, `keel bootstrap init` performs the exact
 Once the management cluster is healthy:
 1. **PR Enforcement Activation:** All subsequent infrastructure or application changes—whether triggered via GUI or CLI—create a Git branch, commit encrypted secrets via SOPS, open a PR via `ForgeProvider`, and spin up an ephemeral PKO preview.
 2. **Control-Plane Protection & Base Addon Self-Mutation Guardrails:**
-   * **Protection Labeling:** Control-plane PKO `Stack` (`management-cluster-core`) and management-plane base addon `HelmRelease` CRs (`dex`, `envoy-gateway`, `flagger`, `kyverno`, `pulumi-kubernetes-operator`, `prometheus`, `s3-state-backend`) carry the `keel.io/protect: "true"` label.
+   * **Protection Labeling:** Control-plane PKO `Stack` (`management-cluster-core`) and management-plane base addon resources (`rauthy`, `envoy-gateway`, `flagger`, `kyverno`, `pulumi-kubernetes-operator`, `prometheus`, `s3-state-backend`) carry the `keel.io/protect: "true"` label.
    * **No-Prune Seed Sync:** The `core-addons` Flux `Kustomization` operates with `prune: false` (`deploy/seed/flux-system/gotk-sync.yaml`) ensuring that removing a base addon manifest from Git never uninstalls live control-plane base addons.
    * **Kyverno Admission Deletion Guard:** The `protect-control-plane` Kyverno `ClusterPolicy` denies `DELETE` operations on protected `Stack` and `HelmRelease` resources in `flux-system`, `keel-system`, and `kyverno` namespaces via standard admission.
    * **Automated Upgrade Rollback:** Every base addon `HelmRelease` configures `spec.upgrade` with `timeout: 5m` and `remediation.strategy: rollback` (`retries: 1`), automatically reverting failed release upgrades in-cluster.
@@ -116,13 +116,13 @@ sequenceDiagram
         CLI->>Target: Run Stage 0 Pulumi bootstrap stack (Kind / VMs / Managed K8s)
     end
     Target-->>CLI: Cluster Kubeconfig & Endpoint
-    CLI->>K8S: Install S3, Flux CD, PKO v2, Kyverno, Envoy, Flagger, Dex OIDC (+ optional Forge)
+    CLI->>K8S: Install S3, Flux CD, PKO v2, Kyverno, Envoy, Flagger, Rauthy OIDC (+ optional Forge)
     CLI->>CLI: Generate root age keypair (.sops.yaml) & seed admin credentials
-    CLI->>K8S: Create Secret flux-system/sops-age & Dex admin Secret
+    CLI->>K8S: Create Secret flux-system/sops-age & Rauthy config Secret
     CLI->>S3: Upload Stage 0 Pulumi state (if infra-provisioned)
     CLI->>Git: Push baseline repo structure + protect:true Stack CRs
     CLI-->>Op: Output Admin Username/Password (if generated) & Portal URL
-    Op->>CLI: Authenticate via OIDC Authorization Code + PKCE (Dex)
+    Op->>CLI: Authenticate via OIDC Authorization Code + PKCE (Rauthy)
 ```
 
 ---
@@ -291,7 +291,7 @@ spec:
 ```
 
 * **Dynamic Form Rendering:** The React frontend feeds `spec.schema` and `spec.uiSchema` directly into **`@rjsf/core` (`react-jsonschema-form`)** mapped to **Shadcn UI** widgets (`Input`, `Select`, `Switch`, `Slider`, `SecretInput`). Form submission serializes directly into an unmodified Helm `values.yaml` override.
-* **Base Addon Catalog Schemas & Upstream Sync Escape Hatch:** Management-plane base addons (`dex`, `envoy-gateway`, `flagger`, `kyverno`, `pulumi-kubernetes-operator`, `prometheus`, `s3-state-backend`) ship with curated minimal `catalog.yaml` JSON schemas exposing high-frequency operational fields for simplified UI configuration. For advanced Helm `values.yaml` tuning, the GUI provides a "Sync Upstream Schema" escape hatch that fetches the full upstream chart `values.schema.json` (or parses raw `values.yaml` defaults) to dynamically expand `@rjsf/core` dynamic forms with complete upstream chart parameters.
+* **Base Addon Catalog Schemas & Upstream Sync Escape Hatch:** Management-plane base addons (`rauthy`, `envoy-gateway`, `flagger`, `kyverno`, `pulumi-kubernetes-operator`, `prometheus`, `s3-state-backend`) ship with curated minimal `catalog.yaml` JSON schemas exposing high-frequency operational fields for simplified UI configuration. For advanced Helm `values.yaml` tuning, the GUI provides a "Sync Upstream Schema" escape hatch that fetches the full upstream chart `values.schema.json` (or parses raw `values.yaml` defaults) to dynamically expand `@rjsf/core` dynamic forms with complete upstream chart parameters.
 * **Companion Infrastructure Hooks:** If an app declares `companionInfrastructure` (e.g., an external PostgreSQL database or S3 bucket), submitting the form bundles both the companion PKO `Stack` manifest and the Flux `HelmRelease` into the **same atomic PR**, ordered via Flux `dependsOn`. The PKO `Stack` exports its outputs into a tenant-scoped Kubernetes `Secret` (via PKO output `Secret` bindings), and Keel generates `spec.valuesFrom` (`kind: Secret`) entries on the `HelmRelease` so `bindValues` keys (`${outputs.*}`, `${secrets.*}`) resolve natively inside the cluster without intermediate templating.
 * **Multi-Item Bundles (`CatalogBundle`):** For multi-step workflows (e.g., provisioning a workload cluster and installing platform + application charts onto it), `catalog/bundles/<bundle-id>/catalog.yaml` defines `kind: CatalogBundle` (`apiVersion: keel.io/v1alpha1`) with `spec.items[]` (`id`, `kind: infra | app`, `catalogRef`, `dependsOn`, `targetClusterFrom`, `targetNamespace`, `canary`, `bindValues`) and a composite `spec.schema`. Keel validates that `dependsOn` forms an acyclic DAG, synthesizes all item manifests under `tenants/<tenant>/bundles/<instance>/` in a single atomic PR, orders cross-kind dependencies via tenant-scoped Flux `Kustomization` `healthChecks` + `dependsOn` (and `HelmRelease.spec.dependsOn`), wires `targetClusterFrom` to the upstream infra `Stack`'s output `kubeconfig` `Secret`, and marks dependent PKO `Stack` previews as deferred until upstream outputs exist.
 
@@ -309,7 +309,7 @@ spec:
 
 ```mermaid
 stateDiagram-v2
-    [*] --> OidcActive: Stage 0 Bootstrap Complete (Dex or External OIDC)
+    [*] --> OidcActive: Stage 0 Bootstrap Complete (Rauthy or External OIDC)
     OidcActive --> OidcActive: OIDC Auth Code + PKCE Login (Username/Password or Upstream Connector)
     OidcActive --> BreakGlass: Emergency CLI Recovery Command (kubeconfig + S3)
     BreakGlass --> OidcActive: Control Plane Restored
@@ -325,7 +325,7 @@ stateDiagram-v2
 
 ### 6.3 Stateless Persistence & Secrets Management (K8s Secrets + SOPS/`age`)
 * **Zero Database Architecture:** `keel-server` is completely stateless and uses no SQLite, Postgres, or external database. All runtime state lives natively in Kubernetes `Secret`s, Git, and in-memory `kube-rs` CRD caches:
-  * **In-Cluster OIDC Provider (Dex):** Stage 0 deploys Dex (Apache-2.0) with Kubernetes CRD storage and bcrypt-hashed `staticPasswords` (stored in a Kubernetes `Secret` in `keel-system`) for immediate username/password login, with Git-managed connector configuration for future Google, Apple, or Active Directory/LDAP federation.
+  * **In-Cluster OIDC Provider (Rauthy):** Stage 0 deploys Rauthy (Apache-2.0) with embedded Hiqlite storage and first-boot JSON seeding (`keel-system/rauthy-config`) for immediate username/password login, Admin UI user/group management (`keel-admins`, `tenant-<id>`), and `keel-server` PKCE client registration.
   * **OIDC Sessions & PKCE State:** Signed and encrypted using a cluster-managed key `Secret` (`keel-system/session-key`) into stateless `HttpOnly`, `Secure`, `SameSite=Strict` cookies (with short-lived K8s `Secret`s or encrypted state cookies for PKCE verifiers).
   * **User Profile Credentials:** Personal Git SSH keys and Forge Personal Access Tokens stored in user profiles are encrypted with `AES-256-GCM` (backed by a cluster root/KMS `Secret` key) and persisted as Kubernetes `Secret`s in `keel-system` keyed by OIDC `sub`. They are never returned over REST APIs or written to logs.
 * **Per-Tenant Git Encryption Keys (SOPS + `age`):** Onboarding a new tenant generates a dedicated `age` keypair. The public key is registered in `.sops.yaml` scoped to `path_regex: ^tenants/<tenant-id>/.*\.enc\.yaml$`, and the private key is stored as a Kubernetes `Secret` exclusively inside `tenant-<tenant-id>`.
@@ -352,7 +352,7 @@ crates/
 
 | Command | Description | Key Flags |
 | :--- | :--- | :--- |
-| `keel bootstrap init` | Executes Stage 0 seed cluster bootstrap across local `kind`, existing `kubeconfig`, Proxmox VE, or public cloud targets, installing Flux/PKO, S3/`age`, and Dex OIDC (or external OIDC). | `--target [kind\|kubeconfig\|proxmox\|aws\|gcp\|azure\|hetzner]`, `--kubeconfig`, `--context`, `--proxmox-url`, `--region`, `--distro [k3s\|talos]`, `--with-forge`, `--oidc-issuer`, `--admin-username`, `--admin-password` |
+| `keel bootstrap init` | Executes Stage 0 seed cluster bootstrap across local `kind`, existing `kubeconfig`, Proxmox VE, or public cloud targets, installing Flux/PKO, S3/`age`, and Rauthy OIDC (or external OIDC). | `--target [kind\|kubeconfig\|proxmox\|aws\|gcp\|azure\|hetzner]`, `--kubeconfig`, `--context`, `--proxmox-url`, `--region`, `--distro [k3s\|talos]`, `--with-forge`, `--oidc-provider [rauthy\|none]`, `--oidc-issuer`, `--admin-username`, `--admin-password` |
 | `keel bootstrap recover` | Break-glass recovery pulling Pulumi state from S3 via `kubeconfig` to repair an unreachable control plane. | `--s3-endpoint`, `--bucket`, `--stack` |
 | `keel auth login` | Authenticates the CLI against `keel-server` via OIDC Authorization Code + PKCE (localhost callback). | `--server` |
 | `keel serve` | Starts the stateless `axum` API server and serves the embedded React + Shadcn SPA. | `--bind 0.0.0.0:8080`, `--config` |
@@ -399,7 +399,7 @@ crates/
 
 | ID | Requirement | Verification Criteria & Technical Control |
 | :--- | :--- | :--- |
-| **NFR-SEC-01** | **OIDC-First Auth & Session Hardening** | Stage 0 provisions an in-cluster Dex OIDC provider (or binds an external OIDC issuer) with bcrypt-hashed admin credentials. All API/UI/CLI sessions enforce OIDC Authorization Code + PKCE and `HttpOnly`, `Secure`, `SameSite=Strict` cookies encrypted with `AES-256-GCM`. |
+| **NFR-SEC-01** | **OIDC-First Auth & Session Hardening** | Stage 0 provisions an in-cluster Rauthy OIDC provider (or binds an external OIDC issuer) with seeded admin credentials in `keel-admins`. All API/UI/CLI sessions enforce OIDC Authorization Code + PKCE and `HttpOnly`, `Secure`, `SameSite=Strict` cookies encrypted with `AES-256-GCM`. |
 | **NFR-SEC-02** | **Strict Tenant Blast-Radius Isolation** | Each tenant is confined to `tenants/<tenant>/` and `tenant-<tenant>` namespace. Flux runs with `--no-cross-namespace-refs=true` and tenant `ServiceAccount` impersonation. |
 | **NFR-SEC-03** | **PKO Workspace Pod Sandboxing** | All PKO v2 `Workspace` pods enforce Kubernetes `restricted` Pod Security Standards (non-root UID, `drop: ["ALL"]` capabilities, read-only root filesystem, `RuntimeDefault` seccomp) and RBAC-authenticated workspace gRPC endpoints. |
 | **NFR-SEC-04** | **Admission Policy Guardrails** | Kyverno policies block privileged workloads, enforce resource quotas, restrict permitted Pulumi/OpenTofu providers per tenant, and protect control-plane stacks from non-admin mutation. |

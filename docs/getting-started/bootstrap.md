@@ -48,7 +48,7 @@ By default, `keel bootstrap init` installs the core control-plane components ont
 - **Pulumi Kubernetes Operator (PKO v2):** Infrastructure operator in `keel-system` plus the `management-cluster-core` `Stack`
 - **Envoy Gateway (`envoy-gateway`):** Gateway API controller in `keel-system` with `GatewayClass` `keel-envoy` and `Gateway` `keel-ingress` (HTTP ports `80` and `8888`)
 - **Prometheus (`prometheus`) & Flagger (`flagger`):** Telemetry (`http://prometheus.keel-system:9090`) and progressive canary delivery controller (`meshProvider: gatewayapi:v1`) in `keel-system`
-- **Dex (`dex`):** In-cluster OIDC identity provider in `keel-system` seeded with `keel-system/dex-config` and initial admin credentials (configured with `restricted` PSS `securityContext` settings for Kyverno compliance; skipped if `--oidc-issuer` is supplied for an external OIDC provider)
+- **Rauthy (`rauthy`):** Lightweight Rust in-cluster OIDC identity provider in `keel-system` with built-in Admin UI (`http://idp.keel.local:8888/auth/v1/admin`) seeded with `keel-system/rauthy-config`, `keel-admins` + `tenant-default` groups, `keel-server` PKCE client, and initial admin credentials (configured with `restricted` PSS `securityContext`; skipped if `--oidc-issuer` or `--oidc-provider none` is supplied)
 
 To initialize only the cluster and GitOps repository without installing the core controllers onto the cluster, pass `--skip-core-install`:
 
@@ -66,19 +66,22 @@ keel bootstrap init \
 
 - `--with-forge` — Installs an in-cluster Forgejo instance in `keel-system` and points Flux + `.keel/config.yaml` at it.
 - `--git-url <URL>` — Connects an external GitHub, GitLab, or Forgejo/Gitea repository (with `KEEL_GIT_TOKEN` / `--git-token` for private repos and PRs). See [Git Repositories & Forges](git-repositories.md).
-- `--admin-username` / `--admin-password` — Customizes the initial admin account seeded into in-cluster Dex (`keel-system/dex-config`). When omitted, `keel bootstrap init` generates a random password and prints it in the bootstrap summary.
-- `--oidc-issuer <URL>` / `--oidc-client-id <ID>` — Connects an external OIDC provider instead of installing in-cluster Dex.
+- `--admin-username` / `--admin-password` — Customizes the initial admin account seeded into in-cluster Rauthy (`keel-system/rauthy-config`) and added to `keel-admins`. When omitted, `keel bootstrap init` generates a random password and prints it in the bootstrap summary.
+- `--oidc-provider <rauthy|none>` — Selects the Stage 0 in-cluster OIDC provider (defaults to `rauthy`; pass `none` to skip in-cluster IdP installation).
+- `--oidc-issuer <URL>` / `--oidc-client-id <ID>` — Connects an external OIDC provider instead of installing in-cluster Rauthy.
 
 ## 2. Start the Control Plane Server
 
 ```bash
+# Ensure idp.keel.local resolves to localhost for Envoy Gateway (:8888) OIDC routing
+# Add `127.0.0.1 idp.keel.local` to /etc/hosts (or C:\Windows\System32\drivers\etc\hosts on Windows)
 keel serve --bind 127.0.0.1:8080 --repo-dir ./keel-gitops
 ```
 
 When a Kubernetes cluster is reachable via `KUBECONFIG` (or in-cluster config), `keel serve` automatically:
 - Queries live **Flux CD** (`Kustomization`, `HelmRelease`) and **PKO v2** (`Stack`) CRD conditions to display `Synced`, `Ready`, `Reconciling`, or `Error` statuses in the UI and CLI (falling back to `Pending` when offline).
-- Opens background `kubectl port-forward` tunnels to in-cluster **Forgejo** (`--with-forge`, preferring `127.0.0.1:3000` or falling back to an ephemeral port) and **Dex** (preferring `127.0.0.1:5556`) when running on `localhost`.
-- Rewrites Forgejo PR `html_url` links (**Forge Link** / **View PR on Forge**) to the active local port-forwarded URL and rewrites Dex discovery endpoints to `http://127.0.0.1:<port>/dex` so host browsers can complete OIDC login without `/etc/hosts` changes.
+- Opens background `kubectl port-forward` tunnels to in-cluster **Forgejo** (`--with-forge`, preferring `127.0.0.1:3000` or falling back to an ephemeral port) and **Envoy Gateway** (`keel-ingress`, preferring `127.0.0.1:8888` for Rauthy `http://idp.keel.local:8888`) when running on `localhost`.
+- Rewrites Forgejo PR `html_url` links (**Forge Link** / **View PR on Forge**) to the active local port-forwarded URL.
 
 When running locally without an active cluster (e.g. `just serve` or `just serve-demo`), `keel serve` prints:
 
@@ -95,7 +98,7 @@ Keel Control Plane listening on http://127.0.0.1:8080
 
 ### Web UI
 
-- **With OIDC (default after `keel bootstrap init`):** Open `http://127.0.0.1:8080`, click **Sign in with OIDC**, and log in with the Dex admin username/password printed by `keel bootstrap init` (or your external OIDC account).
+- **With OIDC (default after `keel bootstrap init`):** Open `http://127.0.0.1:8080`, click **Sign in with OIDC**, and log in with the Rauthy admin username/password printed by `keel bootstrap init` (or your external OIDC account). To manage users and groups, open the Rauthy Admin UI link (`http://idp.keel.local:8888/auth/v1/admin`) from the **Service** box on the **Rauthy OIDC Provider** card under **Control Plane & Providers → Management Plane Base Addons**.
 - **UI Preview Mode (`just serve-demo`):** Open `http://127.0.0.1:8080/?demo=true` to explore the UI with pre-seeded demo data without an OIDC provider.
 
 ### CLI
@@ -110,7 +113,7 @@ keel auth login --server http://127.0.0.1:8080
 
 When running `kind` and `keel serve` inside **WSL2** while opening the GUI in a **Windows** browser:
 
-- **Keel UI & Forge Links Work Without `hosts` Edits:** Open `http://localhost:8080` or `http://127.0.0.1:8080` in Windows. `keel-server` derives the OIDC `redirect_uri` from the incoming `Host` header and sets `keel_pkce` with `SameSite=Lax` (and omits `Secure` on loopback HTTP) so the PKCE cookie survives the redirect back from Dex. Stick to the same host (`localhost` or `127.0.0.1`) you started on.
+- **Keel UI & Forge Links Work Without Custom Ports:** Open `http://localhost:8080` or `http://127.0.0.1:8080` in Windows. `keel-server` derives the OIDC `redirect_uri` from the incoming `Host` header and sets `keel_pkce` with `SameSite=Lax` (and omits `Secure` on loopback HTTP) so the PKCE cookie survives the redirect back from Rauthy (`http://idp.keel.local:8888`). Stick to the same host (`localhost` or `127.0.0.1`) you started on, and add `127.0.0.1 idp.keel.local` to `C:\Windows\System32\drivers\etc\hosts`.
 - **Direct Forgejo Access:** Clicking **Forge Link** / **View PR on Forge** opens Forgejo on `127.0.0.1:<port>` (forwarded automatically by `keel serve`). You can sign in directly with the Stage 0 Forgejo admin credentials (`keel` / `keel-admin-dev`).
 - **Optional — Forgejo OIDC SSO (`forgejo.keel.local:8888`):** Forgejo's `openidConnect` integration (`go-oidc`) requires a single OIDC `issuer` URL reachable by **both** your Windows browser and the Forgejo pod inside `kind`. To enable **Sign in with dex** on Forgejo:
   1. Port-forward the Envoy Gateway service in `keel-system` to `8888`:

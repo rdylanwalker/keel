@@ -24,7 +24,7 @@ Keel is a single-binary **Rust** control plane and **React** web portal that boo
 
 ## Core Capabilities
 
-* **Provider-Agnostic Zero-to-Cloud Self-Bootstrapping:** Start from a compiled `keel` binary on `localhost` using `kind`, an existing `kubeconfig`, Proxmox VE, or a public cloud to initialize a seed management cluster complete with **Flux CD**, **Pulumi Kubernetes Operator (PKO v2)**, **SeaweedFS S3**, **SOPS + `age`**, **Dex** OIDC (or external OIDC), and optional in-cluster **Forgejo**.
+* **Provider-Agnostic Zero-to-Cloud Self-Bootstrapping:** Start from a compiled `keel` binary on `localhost` using `kind`, an existing `kubeconfig`, Proxmox VE, or a public cloud to initialize a seed management cluster complete with **Flux CD**, **Pulumi Kubernetes Operator (PKO v2)**, **SeaweedFS S3**, **SOPS + `age`**, **Rauthy** OIDC (or external OIDC), and optional in-cluster **Forgejo**.
 * **PR-First GitOps with Pre-Merge Previews:** Every infrastructure or application mutation after bootstrap opens a Pull Request (`Forgejo/Gitea`, `GitHub`, `GitLab`, or local Git) and spawns an ephemeral PKO v2 `preview: true` stack—surfacing exact resource diffs (`+ Create`, `~ Update`, `- Delete`, `! Replace`) in both the GUI and CLI before merge.
 * **Self-Service Catalog & Multi-Item Bundles:** Thin `catalog.yaml` sidecars supply JSON Schemas rendered dynamically in React (`@rjsf/core` + Shadcn UI) into standard `values.yaml` overrides. Add or edit Apps, Infrastructure Blueprints (including `Pulumi.yaml` programs), and dependency-chained Multi-Item Bundles directly in the GUI via Git PRs.
 * **Multi-Cloud & Arbitrary OpenTofu/Terraform Providers:** Manage **Proxmox VE** (`bpg/proxmox`), **AWS**, **GCP**, **Azure**, **Hetzner**, and **Cloudflare**—or enable any future registry provider dynamically via Pulumi's OpenTofu/Terraform bridge without recompiling Keel.
@@ -102,7 +102,7 @@ flowchart TB
         API["keel-server (axum + kube-rs)<br/>Direct git CLI + ForgeProvider + SSE"]
         S3["S3 State Backend (SeaweedFS / Cloud S3)<br/>Versioned Pulumi State"]
         FORGE["Git Forge (Forgejo / Gitea / GitHub / GitLab)<br/>Desired State + PR Previews"]
-        OIDC["OIDC Provider (Dex / External OIDC)"]
+        OIDC["OIDC Provider (Rauthy / External OIDC)"]
         FLUX["Flux CD Controllers<br/>(source / kustomize / helm / notification)"]
         PKO["Pulumi Kubernetes Operator (PKO v2)<br/>Workspace Pods + Ephemeral Previews"]
         GUARD["Kyverno Admission + SOPS/age"]
@@ -188,19 +188,17 @@ Start `keel serve` (or `just build-serve` to build, restart in the background, a
 keel serve --bind 127.0.0.1:8080 --repo-dir ./keel-gitops
 ```
 
-When a Kubernetes cluster is reachable, `keel serve` automatically port-forwards in-cluster **Dex OIDC** (and **Forgejo** if `--with-forge` was enabled) and prints:
+When a Kubernetes cluster is reachable, `keel serve` automatically port-forwards **Envoy Gateway** (`keel-ingress:8888` for in-cluster **Rauthy OIDC** at `http://idp.keel.local:8888`, and **Forgejo** if `--with-forge` was enabled) and prints:
 
 ```text
 Keel Control Plane listening on http://127.0.0.1:8080
 ```
 
-Authenticate your CLI session via OIDC Authorization Code + PKCE, and/or open `http://127.0.0.1:8080` in your browser and click **Sign in with OIDC** using the printed Dex admin credentials:
+Ensure `127.0.0.1 idp.keel.local` is in `/etc/hosts` (or `C:\Windows\System32\drivers\etc\hosts` on Windows), then authenticate your CLI session via OIDC Authorization Code + PKCE, and/or open `http://127.0.0.1:8080` in your browser and click **Sign in with OIDC** using the printed Rauthy admin credentials:
 
 ```bash
 keel auth login --server http://127.0.0.1:8080
 ```
-
-> **Note:** If you need to reset the in-cluster Dex admin password later during local development, run `just dex-reset-password`.
 
 ### 4. Provision a Second `kind` Workload Cluster & Deploy an App (PR-Driven)
 Every mutation after Stage 0 validates inputs against `catalog.yaml` JSON Schemas, encrypts secrets with SOPS + `age`, opens a Pull Request, and triggers a PKO v2 preview:
