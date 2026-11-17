@@ -88,7 +88,7 @@ describe("TopologyView component", () => {
     })
   })
 
-  it("expands compact control plane strip details and navigates to providers tab", async () => {
+  it("renders compact control plane strip and navigates to providers tab", async () => {
     const onNavigateToProviders = vi.fn()
     vi.mocked(api.getStacksWithMeta).mockResolvedValueOnce({
       stacks: mockLiveStacks,
@@ -103,15 +103,9 @@ describe("TopologyView component", () => {
       expect(screen.getByText("live-proxmox-stack")).toBeInTheDocument()
     })
 
-    expect(screen.queryByText("Git Forge & Repo")).not.toBeInTheDocument()
-    fireEvent.click(screen.getByRole("button", { name: /Details/i }))
-    expect(screen.getByText("Git Forge & Repo")).toBeInTheDocument()
-    expect(
-      screen.getByText("forgejo: https://git.example.com/org/infra.git")
-    ).toBeInTheDocument()
-
-    fireEvent.click(screen.getByRole("button", { name: /Hide/i }))
-    expect(screen.queryByText("Git Forge & Repo")).not.toBeInTheDocument()
+    expect(screen.getByText("Management Control Plane")).toBeInTheDocument()
+    expect(screen.getByText("protect: true")).toBeInTheDocument()
+    expect(screen.getByText("Healthy")).toBeInTheDocument()
 
     fireEvent.click(screen.getByRole("button", { name: /Providers →/i }))
     expect(onNavigateToProviders).toHaveBeenCalled()

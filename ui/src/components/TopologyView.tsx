@@ -1,13 +1,10 @@
 import React, { useCallback, useEffect, useMemo, useState } from "react"
 import {
   Server,
-  Cpu,
   Layers,
   CheckCircle2,
   AlertTriangle,
   RefreshCw,
-  HardDrive,
-  Shield,
   Activity,
   Boxes,
   RotateCw,
@@ -22,8 +19,6 @@ import {
   Filter,
   Gauge,
   Clock,
-  ChevronDown,
-  ChevronUp,
 } from "lucide-react"
 import { CrdWatchEvent, ReleaseSummary, StackSummary } from "../types/api"
 import {
@@ -185,12 +180,6 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
     isDemoMode() ? DEFAULT_STACKS : []
   )
   const [releases, setReleases] = useState<ReleaseSummary[]>([])
-  const [clusterMeta, setClusterMeta] = useState<{
-    gitRepoUrl?: string
-    forgeProvider?: string
-    stateBackend?: string
-  }>({})
-  const [showControlPlaneDetails, setShowControlPlaneDetails] = useState(false)
   const [loading, setLoading] = useState(false)
   const [autoRefresh, setAutoRefresh] = useState(true)
   const [error, setError] = useState<string | null>(null)
@@ -237,11 +226,6 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
       ])
       setError(null)
       setStacks(ensureManagementStack(stacksRes.stacks || []))
-      setClusterMeta({
-        gitRepoUrl: stacksRes.gitRepoUrl,
-        forgeProvider: stacksRes.forgeProvider,
-        stateBackend: stacksRes.stateBackend,
-      })
       setReleases(releasesData || [])
     } catch (err) {
       const msg =
@@ -354,11 +338,6 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
         if (!cancelled) {
           setError(null)
           setStacks(ensureManagementStack(stacksRes.stacks || []))
-          setClusterMeta({
-            gitRepoUrl: stacksRes.gitRepoUrl,
-            forgeProvider: stacksRes.forgeProvider,
-            stateBackend: stacksRes.stateBackend,
-          })
           setReleases(releasesData || [])
         }
       })
@@ -944,7 +923,7 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
       </div>
 
       {/* Compact Management Control Plane Strip */}
-      <div className="bg-slate-900 border border-slate-800 rounded-xl px-4 py-3 space-y-3">
+      <div className="bg-slate-900 border border-slate-800 rounded-xl px-4 py-3">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div className="flex flex-wrap items-center gap-2.5 text-xs">
             <span className="inline-flex items-center gap-1.5 font-semibold text-white">
@@ -955,97 +934,22 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
             <span className="text-[10px] px-2 py-0.5 rounded-full bg-indigo-500/10 text-indigo-400 border border-indigo-500/30 font-medium">
               protect: true
             </span>
-            <span className="hidden sm:inline text-slate-600">·</span>
-            <span className="text-[11px] px-2 py-0.5 rounded bg-slate-950 border border-slate-800 text-slate-300">
-              Flux CD v2
-            </span>
-            <span className="text-[11px] px-2 py-0.5 rounded bg-slate-950 border border-slate-800 text-slate-300">
-              PKO v2
-            </span>
-            <span className="text-[11px] px-2 py-0.5 rounded bg-slate-950 border border-slate-800 text-slate-300">
-              Kyverno
-            </span>
-            <span className="text-[11px] px-2 py-0.5 rounded bg-slate-950 border border-slate-800 text-slate-300">
-              SOPS + age / {clusterMeta.stateBackend || "S3"}
+            <span className="text-slate-600">&middot;</span>
+            <span className="text-xs font-medium text-emerald-400">
+              Healthy
             </span>
           </div>
 
-          <div className="flex items-center gap-2">
+          {onNavigateToProviders && (
             <button
               type="button"
-              onClick={() => setShowControlPlaneDetails((v) => !v)}
-              className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-[11px] font-medium bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 transition-colors cursor-pointer"
+              onClick={onNavigateToProviders}
+              className="text-[11px] font-medium text-indigo-400 hover:text-indigo-300 px-2 py-1 cursor-pointer"
             >
-              <span>{showControlPlaneDetails ? "Hide" : "Details"}</span>
-              {showControlPlaneDetails ? (
-                <ChevronUp className="h-3 w-3" />
-              ) : (
-                <ChevronDown className="h-3 w-3" />
-              )}
+              Providers &rarr;
             </button>
-            {onNavigateToProviders && (
-              <button
-                type="button"
-                onClick={onNavigateToProviders}
-                className="text-[11px] font-medium text-indigo-400 hover:text-indigo-300 px-2 py-1 cursor-pointer"
-              >
-                Providers &rarr;
-              </button>
-            )}
-          </div>
+          )}
         </div>
-
-        {showControlPlaneDetails && (
-          <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3 pt-2 border-t border-slate-800 text-xs">
-            <div className="bg-slate-950 p-2.5 rounded-lg border border-slate-800">
-              <p className="text-slate-500 flex items-center gap-1.5">
-                <Cpu className="h-3.5 w-3.5 text-indigo-400" /> GitOps Engine
-              </p>
-              <p className="font-semibold text-slate-200 mt-1">Flux CD v2</p>
-            </div>
-            <div className="bg-slate-950 p-2.5 rounded-lg border border-slate-800">
-              <p className="text-slate-500 flex items-center gap-1.5">
-                <Layers className="h-3.5 w-3.5 text-purple-400" /> Infra
-                Synthesizer
-              </p>
-              <p className="font-semibold text-slate-200 mt-1">PKO v2</p>
-            </div>
-            <div className="bg-slate-950 p-2.5 rounded-lg border border-slate-800">
-              <p className="text-slate-500 flex items-center gap-1.5">
-                <Shield className="h-3.5 w-3.5 text-emerald-400" /> Policy
-                Engine
-              </p>
-              <p className="font-semibold text-slate-200 mt-1">Kyverno</p>
-            </div>
-            <div className="bg-slate-950 p-2.5 rounded-lg border border-slate-800 min-w-0">
-              <p className="text-slate-500 flex items-center gap-1.5">
-                <HardDrive className="h-3.5 w-3.5 text-amber-400 shrink-0" />{" "}
-                Secrets &amp; State
-              </p>
-              <p
-                className="font-semibold text-slate-200 mt-1 truncate"
-                title={clusterMeta.stateBackend || "S3"}
-              >
-                SOPS + age / {clusterMeta.stateBackend || "S3"}
-              </p>
-            </div>
-            <div className="bg-slate-950 p-2.5 rounded-lg border border-slate-800 min-w-0 col-span-2 sm:col-span-1">
-              <p className="text-slate-500 flex items-center gap-1.5">
-                <GitBranch className="h-3.5 w-3.5 text-cyan-400 shrink-0" /> Git
-                Forge &amp; Repo
-              </p>
-              <p
-                className="font-semibold text-slate-200 mt-1 truncate font-mono text-[11px]"
-                title={clusterMeta.gitRepoUrl || "Not configured"}
-              >
-                {clusterMeta.forgeProvider
-                  ? `${clusterMeta.forgeProvider}: `
-                  : ""}
-                {clusterMeta.gitRepoUrl || "Local / Unconfigured"}
-              </p>
-            </div>
-          </div>
-        )}
       </div>
 
       {/* Active Flagger Canary Progressive Delivery Section (promoted when active) */}
