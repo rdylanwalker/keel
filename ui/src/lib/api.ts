@@ -422,8 +422,11 @@ export interface StacksWithMeta {
   stateBackend?: string
 }
 
-export async function getStacksWithMeta(): Promise<StacksWithMeta> {
-  const res = await fetch("/api/v1/stacks", {
+export async function getStacksWithMeta(
+  tenant?: string
+): Promise<StacksWithMeta> {
+  const qs = tenant ? `?tenant=${encodeURIComponent(tenant)}` : ""
+  const res = await fetch(`/api/v1/stacks${qs}`, {
     headers: getHeaders(),
   })
   const raw = await handleResponse<
@@ -446,8 +449,8 @@ export async function getStacksWithMeta(): Promise<StacksWithMeta> {
   }
 }
 
-export async function getStacks(): Promise<StackSummary[]> {
-  const { stacks } = await getStacksWithMeta()
+export async function getStacks(tenant?: string): Promise<StackSummary[]> {
+  const { stacks } = await getStacksWithMeta(tenant)
   return stacks
 }
 
@@ -614,8 +617,9 @@ export async function reconcileRelease(
   }>(res)
 }
 
-export async function getReleases(): Promise<ReleaseSummary[]> {
-  const res = await fetch("/api/v1/releases", {
+export async function getReleases(tenant?: string): Promise<ReleaseSummary[]> {
+  const qs = tenant ? `?tenant=${encodeURIComponent(tenant)}` : ""
+  const res = await fetch(`/api/v1/releases${qs}`, {
     headers: getHeaders(),
   })
   const raw = await handleResponse<

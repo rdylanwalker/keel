@@ -169,6 +169,7 @@ export interface TopologyViewProps {
   onEditRelease?: (namespace: string, name: string) => void
   onEditStack?: (namespace: string, name: string) => void
   authenticated?: boolean
+  selectedTenant?: string
 }
 
 export const TopologyView: React.FC<TopologyViewProps> = ({
@@ -178,6 +179,7 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
   onEditRelease,
   onEditStack,
   authenticated = true,
+  selectedTenant,
 }) => {
   const [stacks, setStacks] = useState<StackSummary[]>(() =>
     isDemoMode() ? DEFAULT_STACKS : []
@@ -230,8 +232,8 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
     setLoading(true)
     try {
       const [stacksRes, releasesData] = await Promise.all([
-        getStacksWithMeta(),
-        getReleases().catch(() => []),
+        getStacksWithMeta(selectedTenant),
+        getReleases(selectedTenant).catch(() => []),
       ])
       setError(null)
       setStacks(ensureManagementStack(stacksRes.stacks || []))
@@ -255,7 +257,7 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
     } finally {
       setLoading(false)
     }
-  }, [])
+  }, [selectedTenant])
 
   const handleQuickRestart = async (stack: StackSummary) => {
     const ns = resolveStackNamespace(stack)
@@ -344,7 +346,10 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
       return
     }
     let cancelled = false
-    Promise.all([getStacksWithMeta(), getReleases().catch(() => [])])
+    Promise.all([
+      getStacksWithMeta(selectedTenant),
+      getReleases(selectedTenant).catch(() => []),
+    ])
       .then(([stacksRes, releasesData]) => {
         if (!cancelled) {
           setError(null)
@@ -379,7 +384,7 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
     return () => {
       cancelled = true
     }
-  }, [authenticated])
+  }, [authenticated, selectedTenant])
 
   useEffect(() => {
     if (!authenticated || !autoRefresh) {

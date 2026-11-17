@@ -213,6 +213,10 @@ export interface AuthStatus {
   phase: "oidc-active" | "break-glass" | "oidc"
   oidcEnabled?: boolean
   sub?: string
+  name?: string
+  email?: string
+  groups?: string[]
+  isAdmin?: boolean
   username?: string
   tenant?: string
 }

@@ -18,6 +18,7 @@ import {
   Proposal,
   ReleaseSummary,
   StackSummary,
+  TenantSummary,
 } from "./types/api"
 import {
   getAuthStatus,
@@ -26,6 +27,7 @@ import {
   getReleases,
   getStackConfig,
   getStacks,
+  getTenants,
   setStoredToken,
   startOidcLogin,
 } from "./lib/api"
@@ -174,8 +176,9 @@ export const App: React.FC = () => {
   const [authStatus, setAuthStatus] = useState<AuthStatus>({
     authenticated: false,
     phase: "oidc-active",
-    tenant: "tenant-default",
   })
+  const [tenants, setTenants] = useState<TenantSummary[]>([])
+  const [selectedTenant, setSelectedTenant] = useState<string>("")
 
   useEffect(() => {
     let cancelled = false
@@ -199,6 +202,39 @@ export const App: React.FC = () => {
   }, [])
 
   useEffect(() => {
+    if (!authStatus.authenticated) {
+      return
+    }
+    let cancelled = false
+    getTenants()
+      .then((items) => {
+        if (!cancelled && Array.isArray(items)) {
+          setTenants(items)
+          if (items.length === 1 && !authStatus.isAdmin) {
+            setSelectedTenant(items[0].id)
+          }
+        }
+      })
+      .catch(() => {
+        // Keep existing tenants on transient error
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [authStatus.authenticated, authStatus.isAdmin])
+
+  const visibleTenants: TenantSummary[] = authStatus.authenticated
+    ? tenants
+    : isDemoMode()
+      ? [
+          { id: "default", namespace: "tenant-default" },
+          { id: "acme", namespace: "tenant-acme" },
+        ]
+      : []
+  const activeSelectedTenant =
+    authStatus.authenticated || isDemoMode() ? selectedTenant : ""
+
+  useEffect(() => {
     const handleUnauthorized = () => {
       if (!isDemoMode()) {
         setAuthStatus((prev) =>
@@ -217,7 +253,9 @@ export const App: React.FC = () => {
         authenticated: true,
         phase: "oidc-active",
         username: "Demo Admin (admin@keel.local)",
-        tenant: "tenant-default",
+        name: "Demo Admin",
+        email: "admin@keel.local",
+        isAdmin: true,
       })
       return
     }
@@ -229,9 +267,34 @@ export const App: React.FC = () => {
     setAuthStatus({
       authenticated: false,
       phase: "oidc-active",
-      tenant: "tenant-default",
     })
+    setTenants([])
+    setSelectedTenant("")
   }
+
+  const derivedTenantLabel = (() => {
+    if (visibleTenants.length === 1) {
+      return visibleTenants[0].namespace
+    }
+    const groupTenant = authStatus.groups?.find(
+      (g) => !["keel-admins", "admin", "admins"].includes(g)
+    )
+    if (groupTenant) {
+      return groupTenant.startsWith("tenant-")
+        ? groupTenant
+        : `tenant-${groupTenant}`
+    }
+    return authStatus.tenant || "tenant-default"
+  })()
+
+  const showTenantSwitcher =
+    visibleTenants.length > 1 || Boolean(authStatus.isAdmin)
+  const userDisplayLabel =
+    authStatus.name ||
+    authStatus.email ||
+    authStatus.sub ||
+    authStatus.username ||
+    (authStatus.phase === "break-glass" ? "Break-Glass" : "OIDC Auth")
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans antialiased">
@@ -258,25 +321,57 @@ export const App: React.FC = () => {
 
         {/* Auth status & Tenant header pill */}
         <div className="flex items-center space-x-3">
-          {(authStatus.authenticated || isDemoMode()) && (
-            <div className="hidden sm:flex items-center space-x-2 text-xs bg-slate-950 px-3 py-1.5 rounded-lg border border-slate-800">
-              <span className="w-2 h-2 rounded-full bg-emerald-400"></span>
-              <span className="text-slate-400">Tenant:</span>
-              <span className="font-mono font-semibold text-slate-200">
-                {authStatus.tenant || "tenant-default"}
-              </span>
-            </div>
-          )}
+          {(authStatus.authenticated || isDemoMode()) &&
+            (showTenantSwitcher ? (
+              <div className="hidden sm:flex items-center space-x-2 text-xs bg-slate-950 px-3 py-1.5 rounded-lg border border-slate-800">
+                <span className="w-2 h-2 rounded-full bg-emerald-400"></span>
+                <label
+                  htmlFor="header-tenant-select"
+                  className="text-slate-400"
+                >
+                  Tenant:
+                </label>
+                <select
+                  id="header-tenant-select"
+                  aria-label="Active Tenant"
+                  value={activeSelectedTenant}
+                  onChange={(e) => setSelectedTenant(e.target.value)}
+                  className="bg-transparent font-mono font-semibold text-slate-200 focus:outline-none cursor-pointer"
+                >
+                  <option value="" className="bg-slate-900 text-slate-200">
+                    All Tenants
+                  </option>
+                  {visibleTenants.map((t) => (
+                    <option
+                      key={t.id}
+                      value={t.id}
+                      className="bg-slate-900 text-slate-200"
+                    >
+                      {t.namespace}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            ) : (
+              <div className="hidden sm:flex items-center space-x-2 text-xs bg-slate-950 px-3 py-1.5 rounded-lg border border-slate-800">
+                <span className="w-2 h-2 rounded-full bg-emerald-400"></span>
+                <span className="text-slate-400">Tenant:</span>
+                <span className="font-mono font-semibold text-slate-200">
+                  {derivedTenantLabel}
+                </span>
+              </div>
+            ))}
 
           {authStatus.authenticated ? (
             <div className="flex items-center space-x-2">
               <span className="flex items-center space-x-1.5 text-xs bg-emerald-500/10 text-emerald-300 border border-emerald-500/20 px-3 py-1.5 rounded-lg font-medium">
                 <ShieldCheck className="h-3.5 w-3.5 text-emerald-400" />
-                <span>
-                  {authStatus.phase === "break-glass"
-                    ? "Break-Glass"
-                    : "OIDC Auth"}
-                </span>
+                <span>{userDisplayLabel}</span>
+                {authStatus.isAdmin && (
+                  <span className="ml-1 px-1.5 py-0.5 text-[10px] font-semibold rounded bg-indigo-500/20 text-indigo-300 border border-indigo-500/30">
+                    Admin
+                  </span>
+                )}
               </span>
               <button
                 onClick={handleLogout}
@@ -392,6 +487,7 @@ export const App: React.FC = () => {
               {activeTab === "topology" && (
                 <TopologyView
                   authenticated={authStatus.authenticated}
+                  selectedTenant={activeSelectedTenant || undefined}
                   onNavigateToCatalog={() => navigateToTab("catalog")}
                   onNavigateToPreview={() => navigateToTab("preview")}
                   onNavigateToProviders={() => navigateToTab("providers")}
@@ -401,10 +497,15 @@ export const App: React.FC = () => {
               )}
               {activeTab === "catalog" && (
                 <CatalogWizardView
+                  selectedTenant={activeSelectedTenant || undefined}
                   onNavigateToPreview={() => navigateToTab("preview")}
                 />
               )}
-              {activeTab === "preview" && <PreviewInspectorView />}
+              {activeTab === "preview" && (
+                <PreviewInspectorView
+                  selectedTenant={activeSelectedTenant || undefined}
+                />
+              )}
               {activeTab === "providers" && (
                 <ControlPlaneProvidersView
                   authenticated={authStatus.authenticated}

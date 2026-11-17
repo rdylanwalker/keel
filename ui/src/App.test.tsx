@@ -18,6 +18,7 @@ vi.mock("./lib/api", () => ({
   getReleases: vi.fn().mockResolvedValue([]),
   getReleaseConfig: vi.fn(),
   getStackConfig: vi.fn(),
+  getTenants: vi.fn().mockResolvedValue([]),
   createProposal: vi.fn(),
   startOidcLogin: vi.fn(),
   setStoredToken: vi.fn(),
@@ -140,7 +141,7 @@ describe("App top-level application component", () => {
     })
     const demoBtn = screen.getAllByRole("button", { name: /Demo Login/i })[0]
     fireEvent.click(demoBtn)
-    expect(screen.getAllByText("OIDC Auth").length).toBeGreaterThan(0)
+    expect(screen.getAllByText("Demo Admin").length).toBeGreaterThan(0)
 
     const logoutBtn = screen.getAllByRole("button", { name: /Logout/i })[0]
     fireEvent.click(logoutBtn)
@@ -189,7 +190,7 @@ describe("App top-level application component", () => {
       render(<App />)
     })
 
-    expect(screen.getByText("OIDC Auth")).toBeInTheDocument()
+    expect(screen.getByText("OIDC User")).toBeInTheDocument()
   })
 
   it("restores active page from URL hash on initial load and falls back to #topology on unknown hash", async () => {
@@ -384,6 +385,64 @@ describe("App top-level application component", () => {
 
     await waitFor(() => {
       expect(api.getStackConfig).toHaveBeenCalledWith("tenant-acme", "acme-net")
+    })
+  })
+
+  it("displays signed-in user identity, Admin badge, and tenant switcher for multi-tenant/admin users", async () => {
+    vi.mocked(api.getAuthStatus).mockResolvedValue({
+      authenticated: true,
+      phase: "oidc-active",
+      sub: "dylan@acme.internal",
+      name: "Dylan",
+      groups: ["keel-admins"],
+      isAdmin: true,
+    })
+    vi.mocked(api.getTenants).mockResolvedValue([
+      { id: "default", namespace: "tenant-default" },
+      { id: "acme", namespace: "tenant-acme" },
+    ])
+
+    await act(async () => {
+      render(<App />)
+    })
+
+    expect(screen.getByText("Dylan")).toBeInTheDocument()
+    expect(screen.getByText("Admin")).toBeInTheDocument()
+
+    const tenantSelect = await screen.findByLabelText("Active Tenant")
+    expect(tenantSelect).toHaveValue("")
+
+    await act(async () => {
+      fireEvent.change(tenantSelect, { target: { value: "acme" } })
+    })
+
+    await waitFor(() => {
+      expect(api.getStacksWithMeta).toHaveBeenCalledWith("acme")
+      expect(api.getReleases).toHaveBeenCalledWith("acme")
+    })
+  })
+
+  it("displays static tenant pill derived from single accessible tenant for non-admin user", async () => {
+    vi.mocked(api.getAuthStatus).mockResolvedValue({
+      authenticated: true,
+      phase: "oidc-active",
+      sub: "alice@acme.internal",
+      groups: ["tenant-acme"],
+      isAdmin: false,
+    })
+    vi.mocked(api.getTenants).mockResolvedValue([
+      { id: "acme", namespace: "tenant-acme" },
+    ])
+
+    await act(async () => {
+      render(<App />)
+    })
+
+    expect(screen.getByText("alice@acme.internal")).toBeInTheDocument()
+    expect(screen.queryByText("Admin")).not.toBeInTheDocument()
+    expect(screen.queryByLabelText("Active Tenant")).not.toBeInTheDocument()
+    await waitFor(() => {
+      expect(screen.getAllByText("tenant-acme").length).toBeGreaterThan(0)
     })
   })
 })

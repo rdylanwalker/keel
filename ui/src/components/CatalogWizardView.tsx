@@ -214,12 +214,14 @@ export interface CatalogWizardViewProps {
     kind?: "app" | "infra"
   } | null
   onClearReleaseTarget?: () => void
+  selectedTenant?: string
 }
 
 export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
   onNavigateToPreview,
   initialReleaseTarget,
   onClearReleaseTarget,
+  selectedTenant,
 }) => {
   const [catalog, setCatalog] = useState<CatalogItem[]>(() =>
     isDemoMode() ? DEFAULT_CATALOG : []
@@ -233,7 +235,14 @@ export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
   const [isDeployModalOpen, setIsDeployModalOpen] = useState(false)
   const [isDeployEditMode, setIsDeployEditMode] = useState(false)
 
-  const [tenant, setTenant] = useState("default")
+  const [tenant, setTenant] = useState(selectedTenant || "default")
+  const [prevSelectedTenant, setPrevSelectedTenant] = useState(selectedTenant)
+  if (selectedTenant !== prevSelectedTenant) {
+    setPrevSelectedTenant(selectedTenant)
+    if (selectedTenant) {
+      setTenant(selectedTenant)
+    }
+  }
   const [stacks, setStacks] = useState<StackSummary[]>([])
   const [releases, setReleases] = useState<ReleaseSummary[]>([])
   const [tenants, setTenants] = useState<TenantSummary[]>(() =>

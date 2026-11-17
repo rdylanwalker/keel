@@ -109,7 +109,13 @@ const DEFAULT_PREVIEW: PreviewReport = {
   ],
 }
 
-export const PreviewInspectorView: React.FC = () => {
+export interface PreviewInspectorViewProps {
+  selectedTenant?: string
+}
+
+export const PreviewInspectorView: React.FC<PreviewInspectorViewProps> = ({
+  selectedTenant,
+}) => {
   const [proposals, setProposals] = useState<Proposal[]>(() =>
     isDemoMode() ? DEFAULT_PROPOSALS : []
   )
@@ -132,7 +138,7 @@ export const PreviewInspectorView: React.FC = () => {
 
   useEffect(() => {
     let cancelled = false
-    getProposals(undefined, statusFilter)
+    getProposals(selectedTenant, statusFilter)
       .then((data) => {
         if (!cancelled) {
           if (data && data.length > 0) {
@@ -178,7 +184,7 @@ export const PreviewInspectorView: React.FC = () => {
     return () => {
       cancelled = true
     }
-  }, [statusFilter])
+  }, [selectedTenant, statusFilter])
 
   useEffect(() => {
     if (!selectedPR) return
