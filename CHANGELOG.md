@@ -1,3 +1,10 @@
+## [0.6.5](https://github.com/rdylanwalker/keel/compare/v0.6.4...v0.6.5) (2026-11-17)
+
+### Bug Fixes
+
+* **security:** avoid zero-init key buffer and SHA256 key derivation ([6870e6f](https://github.com/rdylanwalker/keel/commit/6870e6fc5cad7eb4c67c8340518d5ddf1f8154da))
+* **security:** resolve GitHub CodeQL code-scanning vulnerabilities ([576dc04](https://github.com/rdylanwalker/keel/commit/576dc048275484a4a5fd82f2125bf49e8d809826))
+
 ## [0.6.4](https://github.com/rdylanwalker/keel/compare/v0.6.3...v0.6.4) (2026-11-17)
 
 
