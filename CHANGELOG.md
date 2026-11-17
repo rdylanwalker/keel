@@ -1,3 +1,10 @@
+## [0.6.3](https://github.com/rdylanwalker/keel/compare/v0.6.2...v0.6.3) (2026-11-17)
+
+
+### Bug Fixes
+
+* **ci:** pin terraform-provider version and pass GITHUB_TOKEN ([f45b6a5](https://github.com/rdylanwalker/keel/commit/f45b6a5de205575f946cf9e22b88e8ccc24e2de5))
+
 ## [0.6.2](https://github.com/rdylanwalker/keel/compare/v0.6.1...v0.6.2) (2026-11-17)
 
 
