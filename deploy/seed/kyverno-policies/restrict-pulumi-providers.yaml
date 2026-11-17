@@ -1,28 +1,24 @@
-# Restricts PKO v2 `Stack` CRs in `keel-previews` and `tenant-*` namespaces to providers
-# enabled in `providers/registry.yaml` (`SDD.md` §4.1, §6.2, `NFR-SEC-04`).
-apiVersion: kyverno.io/v1
-kind: ClusterPolicy
+# Kyverno ValidatingPolicy: restrict-pulumi-providers
+apiVersion: policies.kyverno.io/v1
+kind: ValidatingPolicy
 metadata:
   name: restrict-pulumi-providers
   labels:
     app.kubernetes.io/managed-by: keel
     keel.io/policy-tier: provider-governance
 spec:
-  validationFailureAction: Enforce
-  background: true
-  rules:
-    - name: validate-enabled-pulumi-provider
-      match:
-        any:
-          - resources:
-              kinds:
-                - pulumi.com/v1/Stack
-              namespaces:
-                - keel-previews
-                - tenant-*
-      validate:
-        message: "Stack `keel.io/provider` label must be one of the enabled providers: proxmox | aws | gcp | azure | hetzner | cloudflare | kind | kubernetes"
-        pattern:
-          metadata:
-            labels:
-              keel.io/provider: "proxmox | aws | gcp | azure | hetzner | cloudflare | kind | kubernetes"
+  validationActions:
+    - Deny
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["pulumi.com"]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["stacks"]
+  matchConditions:
+    - name: tenant-or-preview-namespace
+      expression: "request.namespace == 'keel-previews' || request.namespace.startsWith('tenant-')"
+  validations:
+    - expression: >-
+        has(object.metadata.labels) && ('keel.io/provider' in object.metadata.labels) && object.metadata.labels['keel.io/provider'] in ["kind","proxmox","aws","gcp","azure","hetzner"]
+      message: "Stack `keel.io/provider` label must be one of the enabled providers: kind | proxmox | aws | gcp | azure | hetzner"

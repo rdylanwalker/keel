@@ -7,3 +7,4 @@ resources:
   - disallow-privileged-containers.yaml
   - protect-control-plane.yaml
   - restrict-pulumi-providers.yaml
+  - sync-tenant-secrets.yaml

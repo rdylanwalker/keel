@@ -19,6 +19,7 @@ use crate::tenant::validate_resource_name;
 pub const POLICY_DISALLOW_PRIVILEGED: &str = "disallow-privileged-containers";
 pub const POLICY_PROTECT_CONTROL_PLANE: &str = "protect-control-plane";
 pub const POLICY_RESTRICT_PULUMI_PROVIDERS: &str = "restrict-pulumi-providers";
+pub const POLICY_SYNC_TENANT_SECRETS: &str = "sync-tenant-secrets";
 pub const EXCEPTION_LOCAL_KIND_DOCKER_SOCKET: &str = "local-kind-docker-socket-exception";
 
 pub const RULE_DISALLOW_PRIVILEGED: &str = "disallow-privileged";
@@ -380,10 +381,157 @@ pub fn build_local_kind_docker_socket_exception(
     }))
 }
 
+/// Generates `GeneratingPolicy/sync-tenant-secrets` (`policies.kyverno.io/v1`) to clone and
+/// synchronize `keel-s3-credentials` and `git-credentials` from `flux-system` into every
+/// `tenant-*` namespace.
+pub fn build_sync_tenant_secrets_policy() -> Value {
+    let generate_expr = "generator.Apply(object.metadata.name, [\n\
+         \x20 {\n\
+         \x20   \"apiVersion\": dyn(\"v1\"),\n\
+         \x20   \"kind\": dyn(\"Secret\"),\n\
+         \x20   \"metadata\": dyn({\n\
+         \x20     \"name\": \"keel-s3-credentials\",\n\
+         \x20     \"labels\": {\n\
+         \x20       \"app.kubernetes.io/managed-by\": \"keel\",\n\
+         \x20       \"keel.io/secret-kind\": \"s3-credentials\"\n\
+         \x20     }\n\
+         \x20   }),\n\
+         \x20   \"type\": dyn(variables.s3Secret.type),\n\
+         \x20   \"data\": dyn(variables.s3Secret.data)\n\
+         \x20 },\n\
+         \x20 {\n\
+         \x20   \"apiVersion\": dyn(\"v1\"),\n\
+         \x20   \"kind\": dyn(\"Secret\"),\n\
+         \x20   \"metadata\": dyn({\n\
+         \x20     \"name\": \"git-credentials\",\n\
+         \x20     \"labels\": {\n\
+         \x20       \"app.kubernetes.io/managed-by\": \"keel\",\n\
+         \x20       \"keel.io/secret-kind\": \"git-credentials\"\n\
+         \x20     }\n\
+         \x20   }),\n\
+         \x20   \"type\": dyn(variables.gitSecret.type),\n\
+         \x20   \"data\": dyn(variables.gitSecret.data)\n\
+         \x20 }\n\
+         ])";
+
+    json!({
+        "apiVersion": "policies.kyverno.io/v1",
+        "kind": "GeneratingPolicy",
+        "metadata": {
+            "name": POLICY_SYNC_TENANT_SECRETS,
+            "labels": {
+                "app.kubernetes.io/managed-by": "keel",
+                "keel.io/policy-tier": "tenant-secret-sync"
+            }
+        },
+        "spec": {
+            "evaluation": {
+                "generateExisting": {
+                    "enabled": true
+                },
+                "synchronize": {
+                    "enabled": true
+                }
+            },
+            "matchConstraints": {
+                "resourceRules": [
+                    {
+                        "apiGroups": [""],
+                        "apiVersions": ["v1"],
+                        "operations": ["CREATE", "UPDATE"],
+                        "resources": ["namespaces"]
+                    }
+                ]
+            },
+            "matchConditions": [
+                {
+                    "name": "tenant-namespace",
+                    "expression": "object.metadata.name.startsWith('tenant-')"
+                }
+            ],
+            "variables": [
+                {
+                    "name": "s3Secret",
+                    "expression": format!("resource.Get('v1', 'secrets', '{FLUX_SYSTEM_NAMESPACE}', 'keel-s3-credentials')")
+                },
+                {
+                    "name": "gitSecret",
+                    "expression": format!("resource.Get('v1', 'secrets', '{FLUX_SYSTEM_NAMESPACE}', 'git-credentials')")
+                }
+            ],
+            "generate": [
+                {
+                    "expression": generate_expr
+                }
+            ]
+        }
+    })
+}
+
+/// Generates scoped RBAC (`ClusterRole` + `ClusterRoleBinding`) granting Kyverno's
+/// `background-controller` permission to clone and synchronize `keel-s3-credentials` and
+/// `git-credentials` into `tenant-*` namespaces.
+pub fn build_sync_tenant_secrets_rbac() -> [Value; 2] {
+    let cluster_role = json!({
+        "apiVersion": "rbac.authorization.k8s.io/v1",
+        "kind": "ClusterRole",
+        "metadata": {
+            "name": "keel-kyverno-tenant-secret-sync",
+            "labels": {
+                "app.kubernetes.io/managed-by": "keel"
+            }
+        },
+        "rules": [
+            {
+                "apiGroups": [""],
+                "resources": ["secrets"],
+                "verbs": ["list", "watch", "create"]
+            },
+            {
+                "apiGroups": [""],
+                "resources": ["secrets"],
+                "resourceNames": ["keel-s3-credentials", "git-credentials"],
+                "verbs": ["get", "update", "patch", "delete"]
+            }
+        ]
+    });
+
+    let cluster_role_binding = json!({
+        "apiVersion": "rbac.authorization.k8s.io/v1",
+        "kind": "ClusterRoleBinding",
+        "metadata": {
+            "name": "keel-kyverno-tenant-secret-sync",
+            "labels": {
+                "app.kubernetes.io/managed-by": "keel"
+            }
+        },
+        "roleRef": {
+            "apiGroup": "rbac.authorization.k8s.io",
+            "kind": "ClusterRole",
+            "name": "keel-kyverno-tenant-secret-sync"
+        },
+        "subjects": [
+            {
+                "kind": "ServiceAccount",
+                "name": "kyverno-background-controller",
+                "namespace": "kyverno"
+            },
+            {
+                "kind": "ServiceAccount",
+                "name": "kyverno-admission-controller",
+                "namespace": "kyverno"
+            }
+        ]
+    });
+
+    [cluster_role, cluster_role_binding]
+}
+
 /// Generated bundle of baseline Kyverno `ClusterPolicy` manifests and optional local-dev `PolicyException`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct KyvernoManifestBundle {
     pub cluster_policies: Vec<Value>,
+    pub supporting_manifests: Vec<Value>,
     pub policy_exception: Option<Value>,
 }
 
@@ -397,6 +545,10 @@ impl KyvernoManifestBundle {
             build_restrict_pulumi_providers_policy(&config.allowed_providers)?,
         ];
 
+        let [sync_role, sync_binding] = build_sync_tenant_secrets_rbac();
+        let supporting_manifests =
+            vec![sync_role, sync_binding, build_sync_tenant_secrets_policy()];
+
         let policy_exception = if config.local_dev_docker_socket_exception {
             Some(build_local_kind_docker_socket_exception(
                 &config.docker_socket_exception,
@@ -407,6 +559,7 @@ impl KyvernoManifestBundle {
 
         Ok(Self {
             cluster_policies,
+            supporting_manifests,
             policy_exception,
         })
     }
@@ -414,6 +567,7 @@ impl KyvernoManifestBundle {
     /// Returns all generated JSON manifests in deterministic apply order.
     pub fn all_manifests(&self) -> Vec<Value> {
         let mut all = self.cluster_policies.clone();
+        all.extend(self.supporting_manifests.iter().cloned());
         if let Some(exc) = &self.policy_exception {
             all.push(exc.clone());
         }
@@ -442,8 +596,9 @@ mod tests {
 
         let bundle = KyvernoManifestBundle::generate(&cfg).unwrap();
         assert_eq!(bundle.cluster_policies.len(), 3);
+        assert_eq!(bundle.supporting_manifests.len(), 3);
         assert!(bundle.policy_exception.is_none());
-        assert_eq!(bundle.all_manifests().len(), 3);
+        assert_eq!(bundle.all_manifests().len(), 6);
 
         let names: Vec<&str> = bundle
             .cluster_policies
@@ -480,7 +635,7 @@ mod tests {
         };
 
         let bundle = KyvernoManifestBundle::generate(&cfg).unwrap();
-        assert_eq!(bundle.all_manifests().len(), 4);
+        assert_eq!(bundle.all_manifests().len(), 7);
 
         let exc = bundle
             .policy_exception
@@ -546,5 +701,60 @@ mod tests {
 
         // Empty allowed providers rejected
         assert!(build_restrict_pulumi_providers_policy(&[]).is_err());
+    }
+
+    #[test]
+    fn sync_tenant_secrets_policy_and_rbac_are_generated() {
+        let policy = build_sync_tenant_secrets_policy();
+        assert_eq!(policy["apiVersion"], "policies.kyverno.io/v1");
+        assert_eq!(policy["kind"], "GeneratingPolicy");
+        assert_eq!(policy["metadata"]["name"], POLICY_SYNC_TENANT_SECRETS);
+        assert_eq!(
+            policy["spec"]["evaluation"]["generateExisting"]["enabled"],
+            true
+        );
+        assert_eq!(policy["spec"]["evaluation"]["synchronize"]["enabled"], true);
+
+        let vars = policy["spec"]["variables"].as_array().unwrap();
+        assert_eq!(vars.len(), 2);
+        assert_eq!(vars[0]["name"], "s3Secret");
+        assert!(
+            vars[0]["expression"]
+                .as_str()
+                .unwrap()
+                .contains("keel-s3-credentials")
+        );
+        assert_eq!(vars[1]["name"], "gitSecret");
+        assert!(
+            vars[1]["expression"]
+                .as_str()
+                .unwrap()
+                .contains("git-credentials")
+        );
+
+        let generate = policy["spec"]["generate"].as_array().unwrap();
+        assert_eq!(generate.len(), 1);
+        let expr = generate[0]["expression"].as_str().unwrap();
+        assert!(expr.contains("generator.Apply"));
+        assert!(expr.contains("keel-s3-credentials"));
+        assert!(expr.contains("git-credentials"));
+
+        let [role, binding] = build_sync_tenant_secrets_rbac();
+        assert_eq!(role["kind"], "ClusterRole");
+        assert_eq!(role["metadata"]["name"], "keel-kyverno-tenant-secret-sync");
+        assert_eq!(
+            role["rules"][1]["resourceNames"],
+            json!(["keel-s3-credentials", "git-credentials"])
+        );
+        assert_eq!(binding["kind"], "ClusterRoleBinding");
+        assert_eq!(
+            binding["subjects"][0]["name"],
+            "kyverno-background-controller"
+        );
+        assert_eq!(
+            binding["subjects"][1]["name"],
+            "kyverno-admission-controller"
+        );
+        assert_eq!(binding["subjects"][0]["namespace"], "kyverno");
     }
 }

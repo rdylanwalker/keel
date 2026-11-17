@@ -1,69 +1,31 @@
-# Anti-lockout admission guardrail protecting `management-cluster-core` PKO Stacks (`NFR-REL-01`)
-# and blocking tenant/preview ServiceAccounts from mutating control-plane namespaces (`NFR-SEC-04`).
-apiVersion: kyverno.io/v1
-kind: ClusterPolicy
+# Kyverno ValidatingPolicy: protect-control-plane (NFR-REL-01, NFR-SEC-04)
+apiVersion: policies.kyverno.io/v1
+kind: ValidatingPolicy
 metadata:
   name: protect-control-plane
   labels:
     app.kubernetes.io/managed-by: keel
     keel.io/policy-tier: anti-lockout
 spec:
-  validationFailureAction: Enforce
-  background: false
-  rules:
-    - name: block-management-cluster-core-deletion
-      match:
-        any:
-          - resources:
-              kinds:
-                - pulumi.com/v1/Stack
-              names:
-                - management-cluster-core
-          - resources:
-              kinds:
-                - pulumi.com/v1/Stack
-              selector:
-                matchLabels:
-                  keel.io/protect: "true"
-          - resources:
-              kinds:
-                - helm.toolkit.fluxcd.io/v2/HelmRelease
-              namespaces:
-                - flux-system
-                - keel-system
-                - kyverno
-              selector:
-                matchLabels:
-                  keel.io/protect: "true"
-      validate:
-        message: "Protected control-plane Stack or HelmRelease cannot be deleted via standard admission; use `keel bootstrap recover` for break-glass maintenance."
-        deny:
-          conditions:
-            any:
-              - key: "{{ request.operation }}"
-                operator: Equals
-                value: DELETE
-    - name: deny-tenant-mutation-of-control-plane-namespaces
-      match:
-        any:
-          - resources:
-              namespaces:
-                - flux-system
-                - keel-system
-            subjects:
-              - kind: Group
-                name: system:serviceaccounts:keel-previews
-              - kind: User
-                name: system:serviceaccount:tenant-*
-      validate:
-        message: "Tenant and preview ServiceAccounts are strictly prohibited from mutating control-plane namespaces."
-        deny:
-          conditions:
-            any:
-              - key: "{{ request.operation }}"
-                operator: In
-                value:
-                  - CREATE
-                  - UPDATE
-                  - DELETE
-                  - CONNECT
+  validationActions:
+    - Deny
+  evaluation:
+    background:
+      enabled: false
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["pulumi.com"]
+        apiVersions: ["v1"]
+        operations: ["DELETE"]
+        resources: ["stacks"]
+      - apiGroups: ["*"]
+        apiVersions: ["*"]
+        operations: ["CREATE", "UPDATE", "DELETE", "CONNECT"]
+        resources: ["*"]
+  validations:
+    - expression: >-
+        !(request.operation == 'DELETE' && request.kind.group == 'pulumi.com' && request.kind.kind == 'Stack' && (oldObject.metadata.name == 'management-cluster-core' || (has(oldObject.metadata.labels) && 'keel.io/protect' in oldObject.metadata.labels && oldObject.metadata.labels['keel.io/protect'] == 'true')))
+      message: "Protected control-plane Stack `management-cluster-core` cannot be deleted via standard admission; use `keel bootstrap recover` for break-glass maintenance."
+    - expression: >-
+        !((request.namespace == 'flux-system' || request.namespace == 'keel-system') && has(request.userInfo) && has(request.userInfo.username) && (request.userInfo.username.startsWith('system:serviceaccount:keel-previews:') || request.userInfo.username.startsWith('system:serviceaccount:tenant-')))
+      message: "Tenant and preview ServiceAccounts are strictly prohibited from mutating control-plane namespaces."
