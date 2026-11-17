@@ -372,6 +372,7 @@ async fn test_session_cookie_auth_middleware_and_status() {
 
     // POST /api/v1/auth/logout clears keel_session and keel_pkce cookies
     let logout_res = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -401,10 +402,46 @@ async fn test_session_cookie_auth_middleware_and_status() {
             .any(|c| c.starts_with("keel_pkce=;") && c.contains("Max-Age=0")),
         "expected Set-Cookie clearing keel_pkce, got {set_cookies:?}"
     );
+    assert!(
+        set_cookies
+            .iter()
+            .any(|c| c.starts_with("keel_logged_out=1;")),
+        "expected Set-Cookie setting keel_logged_out=1, got {set_cookies:?}"
+    );
     let logout_json: Value =
         serde_json::from_slice(&logout_res.into_body().collect().await.unwrap().to_bytes())
             .unwrap();
     assert_eq!(logout_json["authenticated"], false);
+
+    // Subsequent /api/v1/auth/login with keel_logged_out=1 appends prompt=login
+    *fixture.state.oidc_config.write().await = Some(OidcConfig {
+        enabled: true,
+        issuer_url: "https://idp.keel.local/realms/keel".to_string(),
+        client_id: "keel-ui".to_string(),
+        redirect_url: "https://keel.local/api/v1/auth/callback".to_string(),
+        scopes: vec!["openid".to_string()],
+    });
+    let reauth_login = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/auth/login")
+                .header(COOKIE, "keel_logged_out=1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reauth_login.status(), StatusCode::FOUND);
+    let reauth_loc = reauth_login
+        .headers()
+        .get(axum::http::header::LOCATION)
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(
+        reauth_loc.contains("prompt=login"),
+        "expected prompt=login in redirect URL, got {reauth_loc}"
+    );
 }
 
 #[tokio::test]

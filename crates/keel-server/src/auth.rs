@@ -30,6 +30,9 @@ pub const SESSION_COOKIE_NAME: &str = "keel_session";
 /// Short-lived cookie holding the encrypted OIDC PKCE verifier & state nonce.
 pub const PKCE_COOKIE_NAME: &str = "keel_pkce";
 
+/// Marker cookie set on logout so the next OIDC login forces `prompt=login`.
+pub const LOGGED_OUT_COOKIE_NAME: &str = "keel_logged_out";
+
 const SESSION_TTL_SECONDS: i64 = 3600;
 const PKCE_TTL_SECONDS: i64 = 300;
 
@@ -215,6 +218,19 @@ fn build_pkce_cookie_header(
     );
     HeaderValue::from_str(&cookie)
         .map_err(|e| ServerError::Internal(format!("Invalid PKCE cookie header: {e}")))
+}
+
+fn build_logged_out_cookie_header(
+    value: &str,
+    max_age: i64,
+    secure: bool,
+) -> Result<HeaderValue, ServerError> {
+    let secure_attr = if secure { "Secure; " } else { "" };
+    let cookie = format!(
+        "{LOGGED_OUT_COOKIE_NAME}={value}; HttpOnly; {secure_attr}SameSite=Lax; Path=/api/v1/auth; Max-Age={max_age}"
+    );
+    HeaderValue::from_str(&cookie)
+        .map_err(|e| ServerError::Internal(format!("Invalid logged-out cookie header: {e}")))
 }
 
 fn extract_cookie_value<'a>(headers: &'a HeaderMap, cookie_name: &str) -> Option<&'a str> {
@@ -423,6 +439,8 @@ struct PkceStatePayload {
 pub struct OidcLoginQuery {
     #[serde(default)]
     pub redirect_uri: Option<String>,
+    #[serde(default)]
+    pub prompt: Option<String>,
 }
 
 /// `GET /api/v1/auth/login`
@@ -493,18 +511,24 @@ pub async fn oidc_login(
     } else {
         '?'
     };
+    let force_reauth = query.prompt.as_deref() == Some("login")
+        || extract_cookie_value(&headers, LOGGED_OUT_COOKIE_NAME).is_some_and(|v| v == "1");
+    let prompt_param = if force_reauth { "&prompt=login" } else { "" };
     let auth_url = format!(
-        "{authorization_endpoint}{sep}response_type=code&client_id={}&redirect_uri={}&scope={scopes}&state={state_nonce}&code_challenge={code_challenge}&code_challenge_method=S256",
+        "{authorization_endpoint}{sep}response_type=code&client_id={}&redirect_uri={}&scope={scopes}&state={state_nonce}&code_challenge={code_challenge}&code_challenge_method=S256{prompt_param}",
         url_encode_component(&oidc.client_id),
         url_encode_component(&redirect_uri),
     );
 
     let location = HeaderValue::from_str(&auth_url)
         .map_err(|e| ServerError::Internal(format!("Invalid OIDC redirect URL: {e}")))?;
+    let clear_logged_out_cookie = build_logged_out_cookie_header("", 0, secure)?;
 
     let mut resp = StatusCode::FOUND.into_response();
     resp.headers_mut().insert(LOCATION, location);
-    resp.headers_mut().insert(SET_COOKIE, pkce_cookie);
+    resp.headers_mut().append(SET_COOKIE, pkce_cookie);
+    resp.headers_mut()
+        .append(SET_COOKIE, clear_logged_out_cookie);
     Ok(resp)
 }
 
@@ -680,6 +704,7 @@ pub async fn logout(headers: HeaderMap) -> Result<Response, ServerError> {
     let secure = is_secure_request(&headers);
     let clear_session_cookie = build_session_cookie_header("", 0, secure)?;
     let clear_pkce_cookie = build_pkce_cookie_header("", 0, secure)?;
+    let logged_out_cookie = build_logged_out_cookie_header("1", 86400, secure)?;
 
     let mut resp = (
         StatusCode::OK,
@@ -690,6 +715,7 @@ pub async fn logout(headers: HeaderMap) -> Result<Response, ServerError> {
         .into_response();
     resp.headers_mut().append(SET_COOKIE, clear_session_cookie);
     resp.headers_mut().append(SET_COOKIE, clear_pkce_cookie);
+    resp.headers_mut().append(SET_COOKIE, logged_out_cookie);
     Ok(resp)
 }
 
