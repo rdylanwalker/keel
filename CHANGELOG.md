@@ -1,3 +1,9 @@
+## [0.6.10](https://github.com/rdylanwalker/keel/compare/v0.6.9...v0.6.10) (2026-11-17)
+
+### Bug Fixes
+
+* **catalog:** standardize kindest/node default to v1.35.8 ([22f7372](https://github.com/rdylanwalker/keel/commit/22f7372c5b9a6616c164885df25621ba51fe8369))
+
 ## [0.6.9](https://github.com/rdylanwalker/keel/compare/v0.6.8...v0.6.9) (2026-11-17)
 
 ### Bug Fixes
