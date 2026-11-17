@@ -41,4 +41,36 @@ test.describe('01 - Stage 0 OIDC PKCE Auth Flow', () => {
     expect(location).toContain('code_challenge_method=S256');
     expect(location).toContain('client_id=keel-server');
   });
+
+  test('01.5 - Logout clears session cookie so page reload stays unauthenticated', async ({
+    page,
+  }) => {
+    await page.goto('/');
+    await expect(page.getByText('Authentication Required')).toBeVisible();
+
+    await page
+      .getByRole('button', { name: /Sign in with OIDC/i })
+      .first()
+      .click();
+    await expect(page.getByText('Dex Login')).toBeVisible();
+    await page.getByLabel(/Username/i).fill('admin@keel.local');
+    await page.getByLabel(/Password/i).fill('e2e-password');
+    await page.getByRole('button', { name: /Sign In/i }).click();
+
+    const logoutButton = page.getByRole('button', { name: 'Logout' });
+    await expect(logoutButton).toBeVisible({ timeout: 10000 });
+
+    const logoutPromise = page.waitForResponse(
+      (res) => res.url().includes('/api/v1/auth/logout') && res.request().method() === 'POST',
+    );
+    await logoutButton.click();
+    const logoutRes = await logoutPromise;
+    expect(logoutRes.status()).toBe(200);
+
+    await expect(page.getByText('Authentication Required')).toBeVisible();
+
+    await page.reload();
+    await expect(page.getByText('Authentication Required')).toBeVisible();
+    await expect(logoutButton).toHaveCount(0);
+  });
 });
