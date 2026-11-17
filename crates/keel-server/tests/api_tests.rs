@@ -345,6 +345,10 @@ async fn test_session_cookie_auth_middleware_and_status() {
             .unwrap();
     assert_eq!(status_json["authenticated"], true);
     assert_eq!(status_json["sub"], "admin@keel.local");
+    assert_eq!(status_json["name"], "Keel Admin");
+    assert_eq!(status_json["email"], "admin@keel.local");
+    assert_eq!(status_json["groups"], serde_json::json!(["keel-admins"]));
+    assert_eq!(status_json["isAdmin"], true);
 }
 
 #[tokio::test]

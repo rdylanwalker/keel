@@ -314,7 +314,7 @@ async fn resolve_oidc_endpoints(issuer_url: &str, ca_pem: Option<&[u8]>) -> Reso
 }
 
 /// Response body for `GET /api/v1/auth/status`.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AuthStatusResponse {
     pub phase: AuthPhase,
@@ -322,6 +322,13 @@ pub struct AuthStatusResponse {
     pub authenticated: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sub: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<String>,
+    pub is_admin: bool,
 }
 
 /// `GET /api/v1/auth/status`
@@ -342,6 +349,10 @@ pub async fn auth_status(
 
     let mut authenticated = false;
     let mut sub = None;
+    let mut name = None;
+    let mut email = None;
+    let mut groups = Vec::new();
+    let mut is_admin = false;
 
     if let Some(token) = extract_session_token(&headers)
         && let Ok(session_key) = state.secret_store.get_or_create_session_key().await
@@ -349,7 +360,11 @@ pub async fn auth_status(
         && claims.exp > Utc::now().timestamp()
     {
         authenticated = true;
-        sub = Some(claims.sub);
+        sub = Some(claims.sub.clone());
+        name = claims.name.clone();
+        email = claims.email.clone();
+        groups = claims.groups.clone();
+        is_admin = AuthSession { claims }.is_admin();
     }
 
     Ok(Json(AuthStatusResponse {
@@ -357,6 +372,10 @@ pub async fn auth_status(
         oidc_enabled,
         authenticated,
         sub,
+        name,
+        email,
+        groups,
+        is_admin,
     }))
 }
 
