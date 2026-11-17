@@ -523,6 +523,7 @@ pub async fn register_catalog_app(
                     companion_infrastructure: Vec::new(),
                     schema,
                     ui_schema: None,
+                    service_url: None,
                 },
             };
             application.validate()?;

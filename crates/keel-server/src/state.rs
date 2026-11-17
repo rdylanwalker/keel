@@ -764,6 +764,7 @@ pub struct AppState {
     pub remote_url: String,
     pub auth_phase: Arc<RwLock<AuthPhase>>,
     pub oidc_config: Arc<RwLock<Option<OidcConfig>>>,
+    pub oidc_ca_pem: Option<Vec<u8>>,
     pub state_provider: Arc<dyn ClusterStateProvider>,
     pub backend_url: String,
     pub s3_credentials_secret: Option<String>,
@@ -795,6 +796,7 @@ impl AppState {
             remote_url: remote_url.into(),
             auth_phase: Arc::new(RwLock::new(auth_phase)),
             oidc_config: Arc::new(RwLock::new(None)),
+            oidc_ca_pem: None,
             state_provider,
             backend_url: "s3://pulumi-state".to_string(),
             s3_credentials_secret: None,
@@ -807,6 +809,12 @@ impl AppState {
     /// Configures an optional `DOCKER_HOST` proxy endpoint for local `kind`-in-`kind` PKO workspaces.
     pub fn with_docker_proxy_url(mut self, url: Option<String>) -> Self {
         self.docker_proxy_url = url;
+        self
+    }
+
+    /// Configures an optional PEM-encoded root CA certificate for OIDC discovery/token/JWKS calls.
+    pub fn with_oidc_ca_pem(mut self, pem: Option<Vec<u8>>) -> Self {
+        self.oidc_ca_pem = pem;
         self
     }
 

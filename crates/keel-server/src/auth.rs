@@ -252,12 +252,26 @@ struct ResolvedOidcEndpoints {
     expected_issuer: String,
 }
 
-async fn resolve_oidc_endpoints(issuer_url: &str) -> ResolvedOidcEndpoints {
+fn build_oidc_http_client(
+    timeout_secs: u64,
+    ca_pem: Option<&[u8]>,
+) -> Result<reqwest::Client, ServerError> {
+    let mut builder =
+        reqwest::Client::builder().timeout(std::time::Duration::from_secs(timeout_secs));
+    if let Some(pem) = ca_pem
+        && let Ok(cert) = reqwest::Certificate::from_pem(pem)
+    {
+        builder = builder.add_root_certificate(cert);
+    }
+    builder
+        .build()
+        .map_err(|e| ServerError::Internal(format!("Failed to construct HTTP client: {e}")))
+}
+
+async fn resolve_oidc_endpoints(issuer_url: &str, ca_pem: Option<&[u8]>) -> ResolvedOidcEndpoints {
     let issuer = issuer_url.trim_end_matches('/');
     let discovery_url = format!("{issuer}/.well-known/openid-configuration");
-    if let Ok(client) = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(2))
-        .build()
+    if let Ok(client) = build_oidc_http_client(2, ca_pem)
         && let Ok(resp) = client.get(&discovery_url).send().await
         && resp.status().is_success()
         && let Ok(doc) = resp.json::<OidcDiscoveryDocument>().await
@@ -265,8 +279,9 @@ async fn resolve_oidc_endpoints(issuer_url: &str) -> ResolvedOidcEndpoints {
         let expected_issuer = doc
             .issuer
             .as_deref()
-            .map(|s| s.trim_end_matches('/').to_string())
+            .map(str::trim)
             .filter(|s| !s.is_empty())
+            .map(str::to_string)
             .unwrap_or_else(|| issuer.to_string());
         // When `keel serve` port-forwards an in-cluster Dex instance to `127.0.0.1`,
         // Dex's discovery document advertises its configured issuer URL (e.g.
@@ -419,7 +434,7 @@ pub async fn oidc_login(
     );
     let pkce_cookie = build_pkce_cookie_header(&encrypted_pkce, PKCE_TTL_SECONDS, secure)?;
 
-    let endpoints = resolve_oidc_endpoints(&oidc.issuer_url).await;
+    let endpoints = resolve_oidc_endpoints(&oidc.issuer_url, state.oidc_ca_pem.as_deref()).await;
     let authorization_endpoint = endpoints.authorization_endpoint;
     let scopes = oidc.scopes.join("%20");
     let sep = if authorization_endpoint.contains('?') {
@@ -526,11 +541,8 @@ pub async fn oidc_callback(
         ));
     }
 
-    let endpoints = resolve_oidc_endpoints(&oidc.issuer_url).await;
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()
-        .map_err(|e| ServerError::Internal(format!("Failed to construct HTTP client: {e}")))?;
+    let endpoints = resolve_oidc_endpoints(&oidc.issuer_url, state.oidc_ca_pem.as_deref()).await;
+    let client = build_oidc_http_client(5, state.oidc_ca_pem.as_deref())?;
     let token_res = client
         .post(&endpoints.token_endpoint)
         .form(&[

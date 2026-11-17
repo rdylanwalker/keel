@@ -154,7 +154,7 @@ pub struct BootstrapConfig {
     pub context: Option<String>,
     #[serde(default)]
     pub with_forge: bool,
-    /// Deploy in-cluster Dex OIDC provider during Stage 0 (default `true`; skipped when `oidc_issuer` is set).
+    /// Deploy in-cluster Rauthy OIDC provider during Stage 0 (default `true`; skipped when `oidc_issuer` is set or `--oidc-provider none`).
     #[serde(default = "default_true")]
     pub with_oidc: bool,
     /// Optional external OIDC issuer URL (disables in-cluster Dex deployment when provided).
@@ -947,6 +947,9 @@ pub struct CatalogAppSpec {
     pub schema: serde_json::Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ui_schema: Option<serde_json::Value>,
+    /// Optional external/ingress URL for accessing this service (e.g., admin UI on Management Plane Base Addons).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_url: Option<String>,
 }
 
 /// Git-stored `keel.io/v1alpha1` `CatalogApplication` definition (`SDD.md` §5.1).
