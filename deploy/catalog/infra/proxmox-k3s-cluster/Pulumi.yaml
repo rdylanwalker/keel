@@ -6,6 +6,7 @@ description: Provision a k3s workload cluster VM on Proxmox VE via bpg/proxmox
 packages:
   proxmox:
     source: terraform-provider
+    version: 1.5.1
     parameters:
       - bpg/proxmox
       - 0.71.0

@@ -7,6 +7,7 @@ description: Provision a local workload kind cluster via Pulumi's OpenTofu/Terra
 packages:
   kind:
     source: terraform-provider
+    version: 1.5.1
     parameters:
       - tehcyx/kind
       - 0.13.0
