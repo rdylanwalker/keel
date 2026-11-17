@@ -556,6 +556,18 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
               .isVisible({ timeout: 2_000 })
               .catch(() => false))
           ) {
+            if (
+              await rauthyPage
+                .locator('dialog[open]')
+                .first()
+                .isVisible({ timeout: 500 })
+                .catch(() => false)
+            ) {
+              await rauthyPage.keyboard.press('Escape');
+              await expect(rauthyPage.locator('dialog[open]')).toHaveCount(0, {
+                timeout: 5_000,
+              });
+            }
             const addGroupBtn = rauthyPage.getByRole('button', { name: /add/i }).first();
             await expect(addGroupBtn).toBeVisible({ timeout: 10_000 });
             await addGroupBtn.click({ timeout: 10_000 });
@@ -572,6 +584,15 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
             await expect(rauthyPage.getByText(groupName, { exact: true }).first()).toBeVisible({
               timeout: 10_000,
             });
+            if (
+              await rauthyPage
+                .locator('dialog[open]')
+                .first()
+                .isVisible({ timeout: 500 })
+                .catch(() => false)
+            ) {
+              await rauthyPage.keyboard.press('Escape');
+            }
           }
         }
         logStep(
