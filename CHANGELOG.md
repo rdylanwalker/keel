@@ -1,3 +1,10 @@
+## [0.6.2](https://github.com/rdylanwalker/keel/compare/v0.6.1...v0.6.2) (2026-11-17)
+
+
+### Bug Fixes
+
+* **e2e:** fix OIDC login assertion and live DNS resolution ([7cb918f](https://github.com/rdylanwalker/keel/commit/7cb918faf4f15ffa8a9dc07a9c9fb56b6b5ea38c))
+
 ## [0.6.1](https://github.com/rdylanwalker/keel/compare/v0.6.0...v0.6.1) (2026-11-17)
 
 
