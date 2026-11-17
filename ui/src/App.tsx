@@ -28,6 +28,7 @@ import {
   getStackConfig,
   getStacks,
   getTenants,
+  logout,
   setStoredToken,
   startOidcLogin,
 } from "./lib/api"
@@ -262,7 +263,7 @@ export const App: React.FC = () => {
     startOidcLogin()
   }
 
-  const handleLogout = () => {
+  const handleLogout = async () => {
     setStoredToken(null)
     setAuthStatus({
       authenticated: false,
@@ -270,6 +271,13 @@ export const App: React.FC = () => {
     })
     setTenants([])
     setSelectedTenant("")
+    if (!isDemoMode()) {
+      try {
+        await logout()
+      } catch {
+        // Best-effort server cookie clear; local state is already cleared.
+      }
+    }
   }
 
   const derivedTenantLabel = (() => {

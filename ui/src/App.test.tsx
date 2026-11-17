@@ -5,6 +5,7 @@ import * as api from "./lib/api"
 
 vi.mock("./lib/api", () => ({
   getAuthStatus: vi.fn(),
+  getTenants: vi.fn().mockResolvedValue([]),
   getStacks: vi.fn().mockResolvedValue([]),
   getStacksWithMeta: vi.fn().mockResolvedValue({ stacks: [] }),
   getProviders: vi.fn().mockResolvedValue([]),
@@ -18,9 +19,9 @@ vi.mock("./lib/api", () => ({
   getReleases: vi.fn().mockResolvedValue([]),
   getReleaseConfig: vi.fn(),
   getStackConfig: vi.fn(),
-  getTenants: vi.fn().mockResolvedValue([]),
   createProposal: vi.fn(),
   startOidcLogin: vi.fn(),
+  logout: vi.fn().mockResolvedValue({ authenticated: false }),
   setStoredToken: vi.fn(),
   createEventSourceStream: vi.fn(() => ({ close: vi.fn() })),
 }))
@@ -146,6 +147,27 @@ describe("App top-level application component", () => {
     const logoutBtn = screen.getAllByRole("button", { name: /Logout/i })[0]
     fireEvent.click(logoutBtn)
     expect(api.setStoredToken).toHaveBeenCalledWith(null)
+  })
+
+  it("calls server logout endpoint when logging out outside demo mode", async () => {
+    vi.mocked(api.getAuthStatus).mockResolvedValue({
+      authenticated: true,
+      phase: "oidc-active",
+      username: "admin@keel.local",
+      tenant: "tenant-default",
+    })
+
+    await act(async () => {
+      render(<App />)
+    })
+
+    const logoutBtn = screen.getAllByRole("button", { name: /Logout/i })[0]
+    await act(async () => {
+      fireEvent.click(logoutBtn)
+    })
+
+    expect(api.setStoredToken).toHaveBeenCalledWith(null)
+    expect(api.logout).toHaveBeenCalledTimes(1)
   })
 
   it("handles auth status failure gracefully on mount", async () => {

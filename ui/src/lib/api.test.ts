@@ -3,6 +3,7 @@ import {
   setStoredToken,
   getStoredToken,
   getAuthStatus,
+  logout,
   getCatalog,
   getProposals,
   createProposal,
@@ -104,6 +105,23 @@ describe("api client module", () => {
         "Content-Type": "application/json",
         Authorization: "Bearer bearer-secret",
       },
+    })
+  })
+
+  it("posts to /api/v1/auth/logout on logout", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ authenticated: false }),
+    })
+    vi.stubGlobal("fetch", fetchMock)
+
+    const res = await logout()
+    expect(res).toEqual({ authenticated: false })
+    expect(fetchMock).toHaveBeenCalledWith("/api/v1/auth/logout", {
+      method: "POST",
+      headers: expect.objectContaining({
+        "Content-Type": "application/json",
+      }),
     })
   })
 

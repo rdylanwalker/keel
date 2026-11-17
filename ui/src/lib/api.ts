@@ -72,6 +72,14 @@ export async function getAuthStatus(): Promise<AuthStatus> {
   return handleResponse<AuthStatus>(res)
 }
 
+export async function logout(): Promise<{ authenticated: boolean }> {
+  const res = await fetch("/api/v1/auth/logout", {
+    method: "POST",
+    headers: getHeaders(),
+  })
+  return handleResponse<{ authenticated: boolean }>(res)
+}
+
 interface RawCatalogEntry {
   metadata?: {
     id?: string
