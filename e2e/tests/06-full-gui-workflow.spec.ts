@@ -26,7 +26,7 @@ test.describe('06 - Full Localhost GUI GitOps Workflow', () => {
     await page.getByRole('button', { name: /Sign In/i }).click();
 
     // Header should update and live management cluster should load
-    await expect(page.getByText('OIDC Auth')).toBeVisible({ timeout: 10000 });
+    await expect(page.getByText('Keel E2E Admin')).toBeVisible({ timeout: 10000 });
     await expect(page.getByText(/API error \(401\)/i)).toHaveCount(0);
     await expect(page.getByText('management-cluster-core', { exact: true })).toBeVisible({
       timeout: 10000,

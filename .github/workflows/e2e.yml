@@ -82,6 +82,8 @@ jobs:
         run: |
           pnpm --dir e2e install
           pnpm --dir e2e exec playwright install --with-deps chromium
+      - name: Configure local *.keel.local DNS resolution
+        run: echo "127.0.0.1 idp.keel.local forgejo.keel.local" | sudo tee -a /etc/hosts
       - name: Run Live kind E2E
         env:
           KEEL_E2E_LIVE: '1'
