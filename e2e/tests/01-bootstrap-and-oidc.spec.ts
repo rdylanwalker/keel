@@ -72,5 +72,12 @@ test.describe('01 - Stage 0 OIDC PKCE Auth Flow', () => {
     await page.reload();
     await expect(page.getByText('Authentication Required')).toBeVisible();
     await expect(logoutButton).toHaveCount(0);
+
+    // Clicking Sign in with OIDC after logout must prompt for credentials (prompt=login)
+    await page
+      .getByRole('button', { name: /Sign in with OIDC/i })
+      .first()
+      .click();
+    await expect(page.getByText('Dex Login')).toBeVisible();
   });
 });

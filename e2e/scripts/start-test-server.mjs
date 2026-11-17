@@ -49,6 +49,16 @@ function startMockOidcServer() {
       const redirectUri =
         url.searchParams.get('redirect_uri') || `${SERVER_URL}/api/v1/auth/callback`;
       const state = url.searchParams.get('state') || '';
+      const prompt = url.searchParams.get('prompt') || '';
+      const hasSsoCookie = (req.headers.cookie || '').includes('mock_idp_sso=1');
+      if (hasSsoCookie && prompt !== 'login') {
+        const target = new URL(redirectUri);
+        target.searchParams.set('code', 'e2e-mock-code');
+        target.searchParams.set('state', state);
+        res.writeHead(302, { Location: target.toString() });
+        res.end();
+        return;
+      }
       res.writeHead(200, { 'Content-Type': 'text/html' });
       res.end(`<!doctype html>
 <html>
@@ -77,7 +87,10 @@ function startMockOidcServer() {
         const target = new URL(redirectUri);
         target.searchParams.set('code', 'e2e-mock-code');
         target.searchParams.set('state', state);
-        res.writeHead(302, { Location: target.toString() });
+        res.writeHead(302, {
+          Location: target.toString(),
+          'Set-Cookie': 'mock_idp_sso=1; Path=/; HttpOnly',
+        });
         res.end();
       });
       return;
