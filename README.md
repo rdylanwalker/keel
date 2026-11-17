@@ -12,13 +12,11 @@ Keel is a single-binary **Rust** control plane and **React** web portal that boo
 
 ---
 
-## Live Demo (`kind` + Forgejo + Dex + Flux + PKO v2)
+## Live Demo (`kind` + Forgejo + Rauthy + Flux + PKO v2)
 
-<p align="center">
-  <img src="./docs/assets/demo.gif" alt="Keel Live Demo: OIDC login, self-service catalog PRs, PKO v2 preview & merge, workload kind cluster + canary app, and Topology Map" width="900" />
-</p>
+https://github.com/user-attachments/assets/acd21ec9-33e6-4b9b-a441-b88b6f310810
 
-*Recorded directly from the live `kind` E2E workflow (`pnpm --dir e2e demo:gif`): OIDC login → CLI & GUI PR proposals → PKO v2 diff & merge → provisioning a workload `kind` cluster + canary `podinfo` → live Topology Map.*
+*Recorded directly from the live `kind` E2E workflow (`KEEL_E2E_REUSE_CLUSTER=0 pnpm --dir e2e demo:video`): Rauthy OIDC login → CLI & GUI PR proposals → PKO v2 diff & merge → provisioning a workload `kind` cluster + canary `podinfo` → live Topology Map & Event Stream.*
 
 ---
 
@@ -35,7 +33,7 @@ Keel is a single-binary **Rust** control plane and **React** web portal that boo
 
 ## Alpha Status & Support Matrix
 
-> **Early Alpha Notice:** Keel is in active early alpha. The local `kind` + in-cluster Forgejo/Dex workflow is continuously tested end-to-end in CI, while cloud/hypervisor targets and external forges are implemented and ready for early-adopter testing. Feedback, bug reports, and real-world test reports on any ⚠️ target are especially welcome!
+> **Early Alpha Notice:** Keel is in active early alpha. The local `kind` + in-cluster Forgejo/Rauthy workflow is continuously tested end-to-end in CI, while cloud/hypervisor targets and external forges are implemented and ready for early-adopter testing. Feedback, bug reports, and real-world test reports on any ⚠️ target are especially welcome!
 
 **Legend:** ✅ Tested in Live E2E &nbsp;|&nbsp; ⚠️ Implemented / Experimental (Unit-Tested, Needs Real-World Testing) &nbsp;|&nbsp; ❌ Not Yet Supported
 
@@ -86,6 +84,10 @@ Keel is a single-binary **Rust** control plane and **React** web portal that boo
 | PR & Preview Inspector | Control Plane & Providers |
 | :---: | :---: |
 | ![PR & Preview Inspector](./docs/assets/screenshots/preview.png) | ![Control Plane & Providers](./docs/assets/screenshots/providers.png) |
+
+| Live Reconciler Event Stream (Topology) |
+| :---: |
+| ![Live Reconciler Event Stream](./docs/assets/screenshots/topology-events.png) |
 
 ---
 
