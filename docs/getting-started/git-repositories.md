@@ -18,6 +18,8 @@ Because Flux CD uses **outbound pull-polling** (`interval: 1m`), a local `kind` 
 
 1. Create a new repository on GitHub/GitLab/Forgejo (for example `https://github.com/my-org/keel-gitops.git`).
 2. Create a PAT with repository read/write + Pull Request permissions and export it:
+   - **GitHub (Fine-grained PAT scoped to the repo):** `Pull requests` (Read & Write), `Issues` (Read & Write, for PR preview comments), and `Contents` (Read & Write) — or a Classic PAT with `repo`.
+   - **GitLab (Project or Personal Access Token):** `api` scope (with Developer or Maintainer role on the project).
 
 ```bash
 export KEEL_GIT_TOKEN="ghp_your_token_here"

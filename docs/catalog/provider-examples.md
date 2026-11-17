@@ -801,3 +801,87 @@ resources:
 outputs:
   hostname: ${record.hostname}
 ```
+
+---
+
+## Custom OpenTofu / Terraform Provider (`hashicorp/random` Example)
+
+Any OpenTofu/Terraform provider can be added dynamically after Keel MGMT is running via PKO v2's `terraform-provider` bridge—without recompiling Keel. The zero-credential `hashicorp/random` example below is useful for smoke-testing the bridge end-to-end.
+
+> **Resource Type Naming Tip:** Pulumi's dynamic `terraform-provider` bridge strips the `<provider>_` prefix from Terraform resource names (for example, `random_pet` becomes `random:index/pet:Pet`). Inspect exact resource type tokens anytime with:
+> ```bash
+> pulumi package get-schema terraform-provider hashicorp/random 3.6.3 | grep -i pet
+> ```
+
+### 1. Register the Blueprint After Keel MGMT Is Running
+
+Open **Catalog & Form Wizard → Add Catalog Item → Infrastructure Blueprint (PKO v2)** in the Web UI (or `POST /api/v1/catalog`), set **Provider** to `kubernetes` (already allowed by `restrict-pulumi-providers` and enabled by default), set **Terraform Provider** to `hashicorp/random`, and paste the `catalog.yaml` schema / `Pulumi.yaml` below.
+
+#### `catalog.yaml` (`catalog/infra/random-pet/catalog.yaml`)
+
+```yaml
+apiVersion: keel.io/v1alpha1
+kind: CatalogInfraBlueprint
+metadata:
+  id: random-pet
+  name: Random Pet Generator
+  description: Zero-credential random pet name via hashicorp/random OpenTofu/Terraform bridge.
+  category: utilities
+  provider: kubernetes
+spec:
+  pulumiRuntime: yaml
+  entrypoint: Pulumi.yaml
+  protectByDefault: false
+  outputs:
+    - petId
+  schema:
+    type: object
+    required: [prefix, length]
+    properties:
+      prefix:
+        type: string
+        title: Prefix
+        default: keel
+      length:
+        type: integer
+        title: Word Length
+        default: 2
+        minimum: 1
+        maximum: 5
+```
+
+#### `Pulumi.yaml` (`catalog/infra/random-pet/Pulumi.yaml`)
+
+```yaml
+name: random-pet
+runtime: yaml
+description: Zero-credential random pet name via hashicorp/random
+packages:
+  random:
+    source: terraform-provider
+    parameters:
+      - hashicorp/random
+      - 3.6.3
+config:
+  prefix:
+    type: string
+    default: keel
+  length:
+    type: integer
+    default: 2
+resources:
+  pet:
+    type: random:index/pet:Pet
+    properties:
+      prefix: ${prefix}
+      length: ${length}
+outputs:
+  petId: ${pet.id}
+```
+
+### 2. Merge & Provision
+
+1. Merge the catalog registration PR in **PR Previews** (or `POST /api/v1/proposals/<pr_id>/merge`).
+2. In **Catalog & Form Wizard**, click **Deploy** on **Random Pet Generator** (or run `keel infra provision --blueprint random-pet --tenant default --values-file values.yaml`).
+3. Inspect the ephemeral PKO preview in **PR Previews**, then click **Approve & Merge**.
+4. Flux CD creates `Stack/random-pet` in `tenant-default`, PKO v2 downloads the `terraform-provider` bridge for `hashicorp/random`, and `kubectl -n tenant-default get stack random-pet` reports `READY: True` with the generated `petId` output.

@@ -37,6 +37,26 @@ keel bootstrap init \
   --repo-dir ./keel-gitops
 ```
 
+#### Local `k3d` (`k3s`) Example
+
+Disable `k3d`'s bundled Traefik ingress so Envoy Gateway (`keel-ingress`) can bind ports cleanly, and expose `:8888` for Rauthy OIDC:
+
+```bash
+k3d cluster create keel-mgmt \
+  --k3s-arg "--disable=traefik@server:*" \
+  -p "8888:8888@loadbalancer" \
+  --wait
+
+keel bootstrap init \
+  --target kubeconfig \
+  --cluster-name keel-mgmt \
+  --context k3d-keel-mgmt \
+  --with-forge \
+  --repo-dir ./keel-gitops
+```
+
+> **Talos Note:** Talos does not ship a default `StorageClass` out of the box—install a provisioner such as `local-path-provisioner` (marked as default `StorageClass`) before running `keel bootstrap init --target kubeconfig` so SeaweedFS and Rauthy PVCs can bind. Also note that `talosctl cluster create docker` requires nested cgroup delegation not available under WSL2 cgroups v2 (use `talosctl cluster create qemu` or a VM/bare-metal Talos node).
+
 ### Core Controllers Installed Out of the Box
 
 By default, `keel bootstrap init` installs the core control-plane components onto the target cluster using `kubectl` and `helm`:

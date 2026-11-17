@@ -42,7 +42,7 @@ https://github.com/user-attachments/assets/acd21ec9-33e6-4b9b-a441-b88b6f310810
 | Target | Driver / Template | Status | Notes |
 | :--- | :--- | :---: | :--- |
 | **Local `kind`** | `deploy/bootstrap/kind/Pulumi.yaml` (`tehcyx/kind`) | ✅ | Primary dev & CI live-E2E path (`--local-dev-docker-socket-exception`) |
-| **Existing Cluster (`kubeconfig`)** | `KubeconfigBootstrapTarget` (`k3s`, `Talos`, managed K8s) | ⚠️ | Unit-tested; ready for community testing on `k3s` / `Talos` / EKS / GKE |
+| **Existing Cluster (`kubeconfig`)** | `KubeconfigBootstrapTarget` (`k3d`/`k3s`, `Talos`, managed K8s) | ✅ / ⚠️ | `k3d` (`k3s`) tested in live E2E; `Talos`/managed K8s ready for community testing |
 | **Proxmox VE** | `deploy/bootstrap/proxmox/Pulumi.yaml` (`bpg/proxmox`) | ⚠️ | Template & `PulumiBootstrapTarget` wired; needs real PVE cluster validation |
 | **Hetzner Cloud** | `deploy/bootstrap/hetzner/Pulumi.yaml` (`pulumi/hcloud`) | ⚠️ | Template & `PulumiBootstrapTarget` wired; needs live account validation |
 | **AWS** | `deploy/bootstrap/aws/Pulumi.yaml` (`pulumi/aws`) | ⚠️ | Template & `PulumiBootstrapTarget` wired; needs live account validation |
@@ -60,7 +60,7 @@ https://github.com/user-attachments/assets/acd21ec9-33e6-4b9b-a441-b88b6f310810
 | **Azure** | `pulumi/azure-native` | Disabled | ⚠️ | Enable via **Topology → Providers**; needs live testing |
 | **Hetzner Cloud** | `pulumi/hcloud` | Disabled | ⚠️ | Enable via **Topology → Providers**; needs live testing |
 | **Cloudflare** | `pulumi/cloudflare` | Disabled | ⚠️ | Enable via **Topology → Providers**; needs live testing |
-| **Custom OpenTofu / TF** | `terraform-provider` bridge | Opt-in | ⚠️ | Add dynamically via UI/Git PR without recompiling Keel |
+| **Custom OpenTofu / TF** | `terraform-provider` bridge | ✅ | Tested live (`hashicorp/random`); add dynamically via UI/API/Git PR without recompiling Keel |
 
 ### Git Forges (`ForgeProvider`)
 
@@ -68,8 +68,8 @@ https://github.com/user-attachments/assets/acd21ec9-33e6-4b9b-a441-b88b6f310810
 | :--- | :--- | :---: | :--- |
 | **Forgejo / Gitea** | In-cluster (`--with-forge`) or external | ✅ | Tested in live `kind` E2E |
 | **Local Bare Git** | Local filesystem (`--repo-dir`) | ✅ | Default when `--with-forge` is omitted (no PRs/Flux remote polling) |
-| **GitHub** | External API + SSH/HTTPS | ⚠️ | Implemented & unit-tested; needs live PR/preview feedback |
-| **GitLab** | External API + SSH/HTTPS | ⚠️ | Implemented & unit-tested; needs live PR/preview feedback |
+| **GitHub** | External API + HTTPS/SSH | ✅ | Tested in live E2E (Stage 0 push, Flux polling, PR create/preview/merge) |
+| **GitLab** | External API + HTTPS/SSH | ✅ | Tested in live E2E (Stage 0 push, Flux polling, MR create/preview/merge) |
 
 **Have you tested one of the ⚠️ targets?** [Open a Bootstrap or Provider Feedback issue](https://github.com/rdylanwalker/keel/issues/new/choose) with what worked or where it broke.
 

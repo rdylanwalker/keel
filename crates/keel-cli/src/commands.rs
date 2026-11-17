@@ -1783,6 +1783,10 @@ async fn ensure_seaweedfs_pulumi_bucket(
     let out = child.wait_with_output().await?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        if stderr.contains("already exists") || stdout.contains("already exists") {
+            return Ok(());
+        }
         return Err(CliError::Validation(format!(
             "failed to create `pulumi-state` bucket in SeaweedFS: {stderr}"
         )));
@@ -2083,7 +2087,34 @@ async fn install_stage0_core_addons(
         }
         run_kubectl_apply(ctx, kc, &metric_templates_yaml).await?;
         tracing::info!("Applying Kyverno policies & management core Stack");
-        run_kubectl_apply(ctx, kc, &kyverno_yaml).await?;
+        let mut last_err = None;
+        for attempt in 1..=6 {
+            match run_kubectl_apply(ctx, kc, &kyverno_yaml).await {
+                Ok(()) => {
+                    last_err = None;
+                    break;
+                }
+                Err(err) => {
+                    let msg = err.to_string();
+                    let transient_webhook = msg.contains("failed calling webhook")
+                        || msg.contains("context deadline exceeded")
+                        || msg.contains("connection refused");
+                    if transient_webhook && attempt < 6 {
+                        tracing::warn!(
+                            attempt,
+                            "Kyverno webhook not ready yet; retrying policy apply in 5s: {msg}"
+                        );
+                        last_err = Some(err);
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        continue;
+                    }
+                    return Err(err);
+                }
+            }
+        }
+        if let Some(err) = last_err {
+            return Err(err);
+        }
         if let Some(ref proxy_yaml) = docker_proxy_yaml {
             tracing::info!(
                 "Deploying local-dev Docker socket proxy in flux-system for nested kind"
