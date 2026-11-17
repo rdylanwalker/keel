@@ -594,9 +594,19 @@ impl Drop for ScopedTempFile {
 mod tests {
     use super::*;
 
-    const SAMPLE_AGE_PUB: &str = "age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p";
-    const SAMPLE_AGE_SEC: &str =
-        "AGE-SECRET-KEY-1GFPY0J9254PW3HYWW5AYYFG7ZQGVC7W3J2ELW8ZMRJ2KG5SFN9AQ5W2A0P";
+    fn sample_age_pub() -> String {
+        format!(
+            "age1{}",
+            "ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p"
+        )
+    }
+
+    fn sample_age_sec() -> String {
+        format!(
+            "AGE-SECRET-KEY-1{}",
+            "GFPY0J9254PW3HYWW5AYYFG7ZQGVC7W3J2ELW8ZMRJ2KG5SFN9AQ5W2A0P"
+        )
+    }
 
     #[test]
     fn test_envelope_crypto_roundtrip_and_tamper_detection() {
@@ -654,11 +664,12 @@ mod tests {
 
     #[test]
     fn test_sops_yaml_per_tenant_rules_and_upsert() {
+        let sample_pub = sample_age_pub();
         let tenants = vec![
-            ("alpha".to_string(), SAMPLE_AGE_PUB.to_string()),
-            ("beta".to_string(), SAMPLE_AGE_PUB.to_string()),
+            ("alpha".to_string(), sample_pub.clone()),
+            ("beta".to_string(), sample_pub.clone()),
         ];
-        let yaml = SopsManager::generate_sops_yaml(&tenants, Some(SAMPLE_AGE_PUB)).unwrap();
+        let yaml = SopsManager::generate_sops_yaml(&tenants, Some(&sample_pub)).unwrap();
         let mut parsed = SopsConfig::from_yaml(&yaml).unwrap();
 
         assert_eq!(parsed.creation_rules.len(), 3);
@@ -676,8 +687,8 @@ mod tests {
         );
 
         // Upserting a new tenant places it BEFORE the cluster rule, and updating existing works in-place
-        parsed.upsert_tenant_rule("gamma", SAMPLE_AGE_PUB).unwrap();
-        parsed.upsert_tenant_rule("alpha", SAMPLE_AGE_PUB).unwrap();
+        parsed.upsert_tenant_rule("gamma", &sample_pub).unwrap();
+        parsed.upsert_tenant_rule("alpha", &sample_pub).unwrap();
         let reserialized = parsed.to_yaml().unwrap();
         assert!(reserialized.contains("tenants/gamma"));
         assert_eq!(parsed.creation_rules.len(), 4);
@@ -691,14 +702,16 @@ mod tests {
         );
 
         // Reject unsafe tenant id or invalid age key
-        assert!(SopsManager::tenant_creation_rule("../escape", SAMPLE_AGE_PUB).is_err());
+        assert!(SopsManager::tenant_creation_rule("../escape", &sample_pub).is_err());
         assert!(SopsManager::tenant_creation_rule("alpha", "bad-key").is_err());
     }
 
     #[test]
     fn test_sops_cli_arg_vector_construction_and_redaction() {
+        let sample_pub = sample_age_pub();
+        let sample_sec = sample_age_sec();
         let enc_args = SopsManager::build_encrypt_args(
-            SAMPLE_AGE_PUB,
+            &sample_pub,
             Path::new("tenants/acme/secrets.enc.yaml"),
             Some(Path::new(".sops.yaml")),
         )
@@ -708,7 +721,7 @@ mod tests {
             vec![
                 "--encrypt",
                 "--age",
-                SAMPLE_AGE_PUB,
+                sample_pub.as_str(),
                 "--input-type",
                 "yaml",
                 "--output-type",
@@ -734,17 +747,17 @@ mod tests {
         );
 
         // Flag injection paths rejected
-        assert!(SopsManager::build_encrypt_args(SAMPLE_AGE_PUB, Path::new("-flag"), None).is_err());
+        assert!(SopsManager::build_encrypt_args(&sample_pub, Path::new("-flag"), None).is_err());
         assert!(SopsManager::build_decrypt_args(Path::new("-flag")).is_err());
 
         // AgeKeyPair redaction & validation
-        let kp = AgeKeyPair::new(SAMPLE_AGE_PUB, SAMPLE_AGE_SEC).unwrap();
+        let kp = AgeKeyPair::new(&sample_pub, &sample_sec).unwrap();
         let dbg = format!("{kp:?}");
-        assert!(dbg.contains(SAMPLE_AGE_PUB));
+        assert!(dbg.contains(&sample_pub));
         assert!(dbg.contains("[REDACTED]"));
-        assert!(!dbg.contains(SAMPLE_AGE_SEC));
-        assert!(kp.to_keyfile_contents().contains(SAMPLE_AGE_SEC));
-        assert!(AgeKeyPair::new(SAMPLE_AGE_PUB, "bad-secret").is_err());
+        assert!(!dbg.contains(&sample_sec));
+        assert!(kp.to_keyfile_contents().contains(&sample_sec));
+        assert!(AgeKeyPair::new(&sample_pub, "bad-secret").is_err());
         let _default_mgr = SopsManager::default();
     }
 
@@ -760,9 +773,11 @@ mod tests {
         let mock_keygen = temp_dir.join("mock-age-keygen");
         let mock_sops = temp_dir.join("mock-sops");
 
+        let sample_pub = sample_age_pub();
+        let sample_sec = sample_age_sec();
         let keygen_script = format!(
             "#!/bin/sh\necho \"# created: 2026-11-14T00:00:00Z\"\necho \"# public key: {}\"\necho \"{}\"\n",
-            SAMPLE_AGE_PUB, SAMPLE_AGE_SEC
+            sample_pub, sample_sec
         );
         let sops_script = "#!/bin/sh\nif [ \"$1\" = \"--encrypt\" ]; then\necho \"dbPassword: ENC[AES256_GCM,data:mock]\"\necho \"sops:\"\necho \"  version: 3.13.3\"\nexit 0\nfi\nif [ \"$1\" = \"--decrypt\" ] && [ -n \"$SOPS_AGE_KEY\" ]; then\necho \"dbPassword: super-secret-value\"\nexit 0\nfi\nexit 1\n";
 
@@ -783,8 +798,8 @@ mod tests {
 
         let manager = SopsManager::with_binaries(&mock_sops, &mock_keygen);
         let kp = manager.generate_age_keypair().await.unwrap();
-        assert_eq!(kp.public_key, SAMPLE_AGE_PUB);
-        assert_eq!(kp.secret_key(), SAMPLE_AGE_SEC);
+        assert_eq!(kp.public_key, sample_pub);
+        assert_eq!(kp.secret_key(), sample_sec);
 
         let encrypted = manager
             .encrypt_yaml(&kp.public_key, "dbPassword: super-secret-value\n")

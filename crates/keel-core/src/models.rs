@@ -1165,6 +1165,9 @@ pub struct CatalogBundleSpec {
     pub ui_schema: Option<serde_json::Value>,
 }
 
+/// Maximum allowed number of items inside a `CatalogBundle`.
+pub const MAX_BUNDLE_ITEMS: usize = 1000;
+
 /// Git-stored `keel.io/v1alpha1` `CatalogBundle` definition composing infra + app items with DAG ordering (`SDD.md` §5.1).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1210,6 +1213,11 @@ impl CatalogBundle {
             return Err(CoreError::Validation(
                 "spec.items must contain at least one item".to_string(),
             ));
+        }
+        if self.spec.items.len() > MAX_BUNDLE_ITEMS {
+            return Err(CoreError::Validation(format!(
+                "spec.items exceeds maximum allowed limit of {MAX_BUNDLE_ITEMS} items"
+            )));
         }
 
         let mut by_id = BTreeMap::new();
@@ -1308,7 +1316,8 @@ impl CatalogBundle {
             .iter()
             .filter_map(|(id, deg)| if *deg == 0 { Some(*id) } else { None })
             .collect();
-        let mut ordered = Vec::with_capacity(self.spec.items.len());
+        let items_capacity = self.spec.items.len().min(MAX_BUNDLE_ITEMS);
+        let mut ordered = Vec::with_capacity(items_capacity);
 
         while let Some(id) = queue.pop_front() {
             if let Some(item) = by_id.get(id) {

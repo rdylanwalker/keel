@@ -867,20 +867,10 @@ async fn start_gateway_port_forward(
         .map_err(|e| CliError::Validation(format!("failed to spawn kubectl port-forward: {e}")))?;
     let pf = TempPortForward { local_port, child };
 
-    let client = Client::builder()
-        .timeout(Duration::from_secs(2))
-        .danger_accept_invalid_certs(true)
-        .build()
-        .map_err(|e| CliError::Validation(e.to_string()))?;
-    let health_url = format!("https://127.0.0.1:{local_port}/auth/v1/health");
-
     for _ in 0..40 {
-        if let Ok(resp) = client
-            .get(&health_url)
-            .header("Host", "idp.keel.local:8888")
-            .send()
+        if tokio::net::TcpStream::connect(("127.0.0.1", local_port))
             .await
-            && resp.status().is_success()
+            .is_ok()
         {
             return Ok(pf);
         }
@@ -986,11 +976,12 @@ async fn provision_in_cluster_forgejo(
         .await
         .map_err(|e| CliError::Validation(format!("Forgejo token parse failed: {e}")))?;
     let token = tok_json
-        .get("sha1")
+        .get("token")
+        .or_else(|| tok_json.get("sha1"))
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
         .ok_or_else(|| {
-            CliError::Validation("Forgejo token response missing `sha1` field".to_string())
+            CliError::Validation("Forgejo access token response missing token field".to_string())
         })?
         .to_string();
 

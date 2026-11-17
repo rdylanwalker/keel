@@ -15,6 +15,15 @@ const BIND_ADDR = '127.0.0.1:18080';
 const OIDC_PORT = 18081;
 const OIDC_ISSUER = `http://127.0.0.1:${OIDC_PORT}`;
 
+function escapeHtml(str) {
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
 function startMockOidcServer() {
   const b64url = (obj) => Buffer.from(JSON.stringify(obj)).toString('base64url');
   const { publicKey, privateKey } = crypto.generateKeyPairSync('rsa', {
@@ -65,8 +74,8 @@ function startMockOidcServer() {
   <body>
     <h1>Dex Login</h1>
     <form method="POST" action="/auth">
-      <input type="hidden" name="redirect_uri" value="${redirectUri}" />
-      <input type="hidden" name="state" value="${state}" />
+      <input type="hidden" name="redirect_uri" value="${escapeHtml(redirectUri)}" />
+      <input type="hidden" name="state" value="${escapeHtml(state)}" />
       <label>Username <input name="username" type="text" required /></label>
       <label>Password <input name="password" type="password" required /></label>
       <button type="submit">Sign In</button>

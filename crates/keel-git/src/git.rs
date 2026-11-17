@@ -65,6 +65,12 @@ impl CommitAuthor {
                 });
             }
         }
+        if name.starts_with('-') || email.starts_with('-') {
+            return Err(GitError::InvalidArgument {
+                field: "author",
+                reason: "author name and email must not start with '-'".to_string(),
+            });
+        }
         Ok(format!("{name} <{email}>"))
     }
 }
@@ -212,10 +218,12 @@ impl PreparedAuthEnv {
 
                 let mut files = vec![key_file];
                 let host_check_opts = if let Some(hosts) = known_hosts {
-                    if hosts.contains('\0') {
+                    if hosts.contains('\0') || hosts.contains('\n') || hosts.contains('\r') {
                         return Err(GitError::InvalidArgument {
                             field: "known_hosts",
-                            reason: "known_hosts must not contain NUL bytes".to_string(),
+                            reason:
+                                "known_hosts must not contain NUL or newline control characters"
+                                    .to_string(),
                         });
                     }
                     let hosts_file = EphemeralSecretFile::create("known-hosts", hosts.as_bytes())?;
@@ -289,10 +297,10 @@ fn shell_single_quote_path(path: &Path) -> Result<String, GitError> {
         field: "temp_path",
         reason: "temporary path is not valid UTF-8".to_string(),
     })?;
-    if s.contains('\0') || s.contains('\n') || s.contains('\r') {
+    if s.starts_with('-') || s.contains('\0') || s.contains('\n') || s.contains('\r') {
         return Err(GitError::InvalidArgument {
             field: "temp_path",
-            reason: "temporary path contains control characters".to_string(),
+            reason: "temporary path contains control characters or leading '-'".to_string(),
         });
     }
     let escaped = s.replace('\'', "'\\''");
@@ -578,8 +586,13 @@ impl GitRunner {
     /// Creates and checks out a new branch (`git checkout -b <branch>`).
     pub async fn checkout_new_branch(&self, work_dir: &Path, branch: &str) -> Result<(), GitError> {
         validate_git_ref(branch, "branch")?;
-        self.exec(Some(work_dir), "checkout", &["checkout", "-b", branch], &[])
-            .await?;
+        self.exec(
+            Some(work_dir),
+            "checkout",
+            &["checkout", "-b", branch, "--"],
+            &[],
+        )
+        .await?;
         Ok(())
     }
 
@@ -709,7 +722,7 @@ impl GitRunner {
             self.exec(
                 Some(work_dir),
                 "merge",
-                &["merge", "--ff-only", source_ref],
+                &["merge", "--ff-only", "--", source_ref],
                 &[],
             )
             .await?;
@@ -753,7 +766,7 @@ impl GitRunner {
             .exec(
                 Some(work_dir),
                 "show-ref",
-                &["show-ref", "--verify", "--quiet", full_ref],
+                &["show-ref", "--verify", "--quiet", "--", full_ref],
                 &[],
             )
             .await;
@@ -952,6 +965,15 @@ impl GitRunner {
         args: &[&str],
         extra_envs: &[(&str, &str)],
     ) -> Result<String, GitError> {
+        for arg in args {
+            if arg.contains('\0') || arg.contains('\n') || arg.contains('\r') {
+                return Err(GitError::InvalidArgument {
+                    field: "git_arg",
+                    reason: "git arguments must not contain NUL or newline control characters"
+                        .to_string(),
+                });
+            }
+        }
         let auth_guard = PreparedAuthEnv::from_credentials(&self.credentials)?;
 
         let mut cmd = Command::new(&self.git_binary);

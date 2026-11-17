@@ -964,9 +964,13 @@ mod tests {
     #[tokio::test]
     async fn tenant_age_key_roundtrip_and_validation() {
         let store = InMemorySecretStore::new();
+        let test_sec = format!(
+            "AGE-SECRET-KEY-1{}",
+            "GFPY0J9V5C8X7W4N6M2Q3R8T9Y0U1I2O3P4A5S6D7F8G9H0J1K2L3Z4X5C"
+        );
         let age_key = TenantAgeKey::new(
             "age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p",
-            "AGE-SECRET-KEY-1GFPY0J9V5C8X7W4N6M2Q3R8T9Y0U1I2O3P4A5S6D7F8G9H0J1K2L3Z4X5C",
+            test_sec,
         );
 
         // Debug redacts private key

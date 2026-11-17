@@ -36,8 +36,15 @@ export function jsonToYaml(obj: unknown, indentLevel = 0): string {
   if (obj === null || obj === undefined) return "null\n"
   if (typeof obj === "boolean" || typeof obj === "number") return `${obj}\n`
   if (typeof obj === "string") {
-    if (obj.includes("\n") || obj.includes(":") || obj.includes("#")) {
-      return `"${obj.replace(/"/g, '\\"')}"\n`
+    if (
+      obj.includes("\n") ||
+      obj.includes("\r") ||
+      obj.includes(":") ||
+      obj.includes("#") ||
+      obj.includes('"') ||
+      obj.includes("\\")
+    ) {
+      return `${JSON.stringify(obj)}\n`
     }
     return `${obj}\n`
   }

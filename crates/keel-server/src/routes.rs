@@ -101,6 +101,33 @@ pub struct CatalogResponse {
 ///
 /// Scans `catalog/apps/*/catalog.yaml` and `catalog/infra/*/catalog.yaml` in `repo_workdir`,
 /// filtering infrastructure blueprints by enabled providers in `providers/registry.yaml`.
+/// Joins `rel` onto `base`, validating that `rel` is a relative path containing no `ParentDir` (`..`)
+/// components and that the resulting path remains within `base`.
+fn safe_relative_path(base: &Path, rel: &str) -> Option<PathBuf> {
+    let rel_trim = rel.trim();
+    if rel_trim.is_empty() {
+        return None;
+    }
+    let rel_path = Path::new(rel_trim);
+    if rel_path.is_absolute() {
+        return None;
+    }
+    for component in rel_path.components() {
+        match component {
+            std::path::Component::ParentDir
+            | std::path::Component::Prefix(_)
+            | std::path::Component::RootDir => return None,
+            _ => {}
+        }
+    }
+    let joined = base.join(rel_path);
+    if joined.starts_with(base) {
+        Some(joined)
+    } else {
+        None
+    }
+}
+
 pub async fn get_catalog(
     _auth: AuthSession,
     State(state): State<AppState>,
@@ -158,8 +185,9 @@ pub async fn get_catalog(
                         } else {
                             bp.spec.entrypoint.as_str()
                         };
-                        let pulumi_path = dir.join(entrypoint);
-                        if let Ok(content) = tokio::fs::read_to_string(&pulumi_path).await {
+                        if let Some(pulumi_path) = safe_relative_path(dir, entrypoint)
+                            && let Ok(content) = tokio::fs::read_to_string(&pulumi_path).await
+                        {
                             pulumi_yaml.insert(bp.metadata.id.clone(), content);
                         }
                     }

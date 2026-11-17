@@ -556,11 +556,33 @@ Configured to run weekly, group ecosystem updates logically to minimize PR noise
   },
   "packageRules": [
     {
-      "description": "Group Rust workspace crate updates",
+      "description": "Group non-breaking Rust patch updates",
       "matchManagers": ["cargo"],
       "groupName": "rust-dependencies",
-      "matchUpdateTypes": ["minor", "patch"],
+      "matchUpdateTypes": ["patch"],
       "automerge": true
+    },
+    {
+      "description": "Group non-breaking Rust minor updates (>= 1.0.0)",
+      "matchManagers": ["cargo"],
+      "groupName": "rust-dependencies",
+      "matchCurrentVersion": "!/^0\\./",
+      "matchUpdateTypes": ["minor"],
+      "automerge": true
+    },
+    {
+      "description": "Require manual review for pre-1.0 Rust minor updates (SemVer breaking)",
+      "matchManagers": ["cargo"],
+      "matchCurrentVersion": "/^0\\./",
+      "matchUpdateTypes": ["minor"],
+      "automerge": false
+    },
+    {
+      "description": "Group tightly coupled Kubernetes Rust crates",
+      "matchManagers": ["cargo"],
+      "matchPackageNames": ["kube", "k8s-openapi"],
+      "groupName": "rust-kube",
+      "automerge": false
     },
     {
       "description": "Group React, Shadcn, Tailwind, and Playwright updates",
