@@ -330,6 +330,7 @@ async fn test_session_cookie_auth_middleware_and_status() {
     let cookie = login_and_get_cookie(&fixture).await;
 
     let status_res = app
+        .clone()
         .oneshot(
             Request::builder()
                 .uri("/api/v1/auth/status")
@@ -349,6 +350,42 @@ async fn test_session_cookie_auth_middleware_and_status() {
     assert_eq!(status_json["email"], "admin@keel.local");
     assert_eq!(status_json["groups"], serde_json::json!(["keel-admins"]));
     assert_eq!(status_json["isAdmin"], true);
+
+    // POST /api/v1/auth/logout clears keel_session and keel_pkce cookies
+    let logout_res = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/logout")
+                .header(COOKIE, &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(logout_res.status(), StatusCode::OK);
+    let set_cookies: Vec<String> = logout_res
+        .headers()
+        .get_all(axum::http::header::SET_COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok().map(str::to_string))
+        .collect();
+    assert!(
+        set_cookies
+            .iter()
+            .any(|c| c.starts_with("keel_session=;") && c.contains("Max-Age=0")),
+        "expected Set-Cookie clearing keel_session, got {set_cookies:?}"
+    );
+    assert!(
+        set_cookies
+            .iter()
+            .any(|c| c.starts_with("keel_pkce=;") && c.contains("Max-Age=0")),
+        "expected Set-Cookie clearing keel_pkce, got {set_cookies:?}"
+    );
+    let logout_json: Value =
+        serde_json::from_slice(&logout_res.into_body().collect().await.unwrap().to_bytes())
+            .unwrap();
+    assert_eq!(logout_json["authenticated"], false);
 }
 
 #[tokio::test]

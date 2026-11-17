@@ -14,8 +14,8 @@ use axum::routing::{delete, get, post, put};
 use tower_http::trace::TraceLayer;
 
 pub use auth::{
-    AuthLoginResponse, AuthSession, AuthStatusResponse, PKCE_COOKIE_NAME, SESSION_COOKIE_NAME,
-    SessionClaims, decrypt_session_token, encrypt_session_token,
+    AuthLoginResponse, AuthLogoutResponse, AuthSession, AuthStatusResponse, PKCE_COOKIE_NAME,
+    SESSION_COOKIE_NAME, SessionClaims, decrypt_session_token, encrypt_session_token,
 };
 pub use error::{ErrorResponse, ServerError};
 pub use routes::healthz as health_check;
@@ -34,6 +34,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/auth/status", get(auth::auth_status))
         .route("/api/v1/auth/login", get(auth::oidc_login))
         .route("/api/v1/auth/callback", get(auth::oidc_callback))
+        .route("/api/v1/auth/logout", post(auth::logout))
         // Protected REST & SSE API surface
         .route(
             "/api/v1/catalog",

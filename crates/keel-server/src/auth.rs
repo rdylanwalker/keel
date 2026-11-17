@@ -235,6 +235,13 @@ pub struct AuthLoginResponse {
     pub phase: AuthPhase,
 }
 
+/// Response body for `POST /api/v1/auth/logout`.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthLogoutResponse {
+    pub authenticated: bool,
+}
+
 #[derive(Debug, Deserialize)]
 struct OidcDiscoveryDocument {
     #[serde(default)]
@@ -637,6 +644,26 @@ pub async fn oidc_callback(
             .into_response()
     };
     resp.headers_mut().append(SET_COOKIE, session_cookie);
+    resp.headers_mut().append(SET_COOKIE, clear_pkce_cookie);
+    Ok(resp)
+}
+
+/// `POST /api/v1/auth/logout`
+///
+/// Clears the stateless `keel_session` and `keel_pkce` cookies by setting `Max-Age=0`.
+pub async fn logout(headers: HeaderMap) -> Result<Response, ServerError> {
+    let secure = is_secure_request(&headers);
+    let clear_session_cookie = build_session_cookie_header("", 0, secure)?;
+    let clear_pkce_cookie = build_pkce_cookie_header("", 0, secure)?;
+
+    let mut resp = (
+        StatusCode::OK,
+        Json(AuthLogoutResponse {
+            authenticated: false,
+        }),
+    )
+        .into_response();
+    resp.headers_mut().append(SET_COOKIE, clear_session_cookie);
     resp.headers_mut().append(SET_COOKIE, clear_pkce_cookie);
     Ok(resp)
 }
