@@ -221,6 +221,17 @@ describe("ControlPlaneProvidersView component", () => {
         version: "1.40.0",
         schema: { type: "object", properties: {} },
       },
+      {
+        id: "rauthy",
+        name: "Rauthy OIDC Provider",
+        description: "Lightweight Rust OIDC provider",
+        type: "app",
+        category: "Management Addons",
+        chart: "rauthy",
+        version: "0.37.2",
+        serviceUrl: "https://idp.keel.local:8888/auth/v1/admin",
+        schema: { type: "object", properties: {} },
+      },
     ])
     vi.mocked(api.getReleases).mockResolvedValueOnce([
       {
@@ -254,14 +265,21 @@ describe("ControlPlaneProvidersView component", () => {
       expect(
         screen.getByText("Management Plane Base Addons")
       ).toBeInTheDocument()
+      const rauthyLink = screen.getByRole("link", {
+        name: "https://idp.keel.local:8888/auth/v1/admin",
+      })
+      expect(rauthyLink).toHaveAttribute(
+        "href",
+        "https://idp.keel.local:8888/auth/v1/admin"
+      )
       expect(screen.getByTestId("core-addon-kyverno")).toBeInTheDocument()
       expect(screen.getByTestId("core-addon-flagger")).toBeInTheDocument()
     })
 
     // Status badges, Protected badge, and no Delete button
     expect(screen.getByText("Ready")).toBeInTheDocument()
-    expect(screen.getByText("Unknown")).toBeInTheDocument()
-    expect(screen.getAllByText("Protected")).toHaveLength(2)
+    expect(screen.getAllByText("Unknown")).toHaveLength(2)
+    expect(screen.getAllByText("Protected")).toHaveLength(3)
     expect(
       screen.queryByRole("button", { name: /Delete/i })
     ).not.toBeInTheDocument()

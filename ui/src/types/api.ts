@@ -65,6 +65,7 @@ export interface CatalogItem {
   protectByDefault?: boolean
   pulumiYaml?: string
   bundleItems?: CatalogBundleItem[]
+  serviceUrl?: string
   schema: RJSFSchema
   uiSchema?: Record<string, unknown>
   defaultValues?: Record<string, unknown>

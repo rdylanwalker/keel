@@ -95,6 +95,7 @@ interface RawCatalogEntry {
     pulumiRuntime?: "yaml" | "hcl" | "opentofu-bridge"
     entrypoint?: string
     protectByDefault?: boolean
+    serviceUrl?: string
     schema?: Record<string, unknown>
     uiSchema?: Record<string, unknown>
     items?: CatalogBundleItem[]
@@ -128,6 +129,7 @@ function mapCatalogApplication(app: RawCatalogEntry): CatalogItem {
     runtime: app.metadata?.runtime,
     flaggerSupported: app.spec?.progressiveDelivery?.flaggerSupported ?? false,
     defaultCanary: app.spec?.progressiveDelivery?.defaultCanary ?? false,
+    serviceUrl: app.spec?.serviceUrl,
     schema: app.spec?.schema ?? { type: "object", properties: {} },
     uiSchema: app.spec?.uiSchema,
   }

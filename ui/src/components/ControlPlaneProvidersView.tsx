@@ -9,6 +9,7 @@ import {
   Shield,
   GitBranch,
   AlertTriangle,
+  ExternalLink,
   Package,
   RotateCcw,
   SlidersHorizontal,
@@ -99,13 +100,26 @@ const DEFAULT_CORE_ADDONS: CatalogItem[] = [
     schema: { type: "object", properties: {} },
   },
   {
-    id: "dex",
-    name: "Dex OIDC",
-    description: "OpenID Connect identity provider",
+    id: "cert-manager",
+    name: "cert-manager",
+    description:
+      "Automated X.509 certificate management and self-signed/ACME ClusterIssuers",
     type: "app",
     category: "Management Addons",
-    chart: "dex",
-    version: "0.19.1",
+    chart: "cert-manager",
+    version: "v1.21.3",
+    schema: { type: "object", properties: {} },
+  },
+  {
+    id: "rauthy",
+    name: "Rauthy OIDC Provider",
+    description:
+      "Lightweight Rust OpenID Connect identity provider with Admin UI for users, groups, and OIDC clients",
+    type: "app",
+    category: "Management Addons",
+    chart: "rauthy",
+    version: "0.37.2",
+    serviceUrl: "https://idp.keel.local:8888/auth/v1/admin",
     schema: { type: "object", properties: {} },
   },
   {
@@ -722,6 +736,23 @@ export const ControlPlaneProvidersView: React.FC<
                         v{displayVersion}
                       </span>
                     </div>
+
+                    {addon.serviceUrl && (
+                      <div className="bg-slate-950 p-2.5 rounded-lg border border-slate-800 text-xs">
+                        <p className="text-[10px] uppercase tracking-wider text-slate-500">
+                          Service
+                        </p>
+                        <a
+                          href={addon.serviceUrl}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="mt-0.5 inline-flex items-center gap-1.5 text-[11px] font-mono text-indigo-400 hover:text-indigo-300 break-all"
+                        >
+                          <span>{addon.serviceUrl}</span>
+                          <ExternalLink className="h-3 w-3 shrink-0" />
+                        </a>
+                      </div>
+                    )}
                   </div>
 
                   <div className="pt-3 border-t border-slate-800/60 flex items-center justify-between gap-2">
