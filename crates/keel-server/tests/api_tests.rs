@@ -3354,7 +3354,10 @@ async fn test_app_proposal_with_flagger_canary_stages_canary_yaml() {
     .await
     .unwrap();
     assert!(canary_yaml.contains("kind: Canary"));
-    assert!(canary_yaml.contains("provider: gatewayapi:v1"));
+    assert!(
+        canary_yaml.contains("provider: gatewayapi:v1")
+            || canary_yaml.contains("provider: \"gatewayapi:v1\"")
+    );
     assert!(canary_yaml.contains("name: keel-ingress"));
     assert!(canary_yaml.contains("grafana.keel.local"));
 

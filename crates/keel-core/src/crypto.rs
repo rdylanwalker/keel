@@ -9,7 +9,7 @@ use aes_gcm::aead::Aead;
 use aes_gcm::{Aes256Gcm, Key, KeyInit, Nonce};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use rand::Rng;
+use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::process::Command;
@@ -116,13 +116,14 @@ impl EnvelopeCrypto {
 
     /// Encrypts `plaintext` with `AES-256-GCM` using a fresh 96-bit random nonce and returns Base64(`nonce || ciphertext`).
     pub fn encrypt(&self, plaintext: &[u8]) -> Result<String, CoreError> {
-        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&self.key));
+        let key: Key<Aes256Gcm> = self.key.into();
+        let cipher = Aes256Gcm::new(&key);
         let mut nonce_bytes = [0u8; AES_GCM_NONCE_LEN];
         rand::rng().fill(&mut nonce_bytes);
-        let nonce = Nonce::from_slice(&nonce_bytes);
+        let nonce = Nonce::from(nonce_bytes);
 
         let ciphertext = cipher
-            .encrypt(nonce, plaintext)
+            .encrypt(&nonce, plaintext)
             .map_err(|_| CoreError::Crypto("AES-256-GCM encryption failed".to_string()))?;
 
         let mut combined = Vec::with_capacity(AES_GCM_NONCE_LEN + ciphertext.len());
@@ -145,11 +146,13 @@ impl EnvelopeCrypto {
         }
 
         let (nonce_bytes, ciphertext) = combined.split_at(AES_GCM_NONCE_LEN);
-        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&self.key));
-        let nonce = Nonce::from_slice(nonce_bytes);
+        let key: Key<Aes256Gcm> = self.key.into();
+        let cipher = Aes256Gcm::new(&key);
+        let nonce = Nonce::try_from(nonce_bytes)
+            .map_err(|_| CoreError::Crypto("Invalid AES-GCM nonce length".to_string()))?;
 
         cipher
-            .decrypt(nonce, ciphertext)
+            .decrypt(&nonce, ciphertext)
             .map_err(|_| CoreError::Crypto("AES-256-GCM decryption failed".to_string()))
     }
 

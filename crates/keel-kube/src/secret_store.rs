@@ -18,7 +18,7 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use keel_core::KEEL_SYSTEM_NAMESPACE;
 use kube::api::PostParams;
 use kube::{Api, Client};
-use rand::RngCore;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
@@ -542,10 +542,12 @@ async fn put_user_git_creds_impl<B: SecretBackend>(
     let mut nonce_bytes = [0u8; AES_GCM_NONCE_LEN];
     rand::rng().fill_bytes(&mut nonce_bytes);
 
-    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(encryption_key));
+    let key: Key<Aes256Gcm> = (*encryption_key).into();
+    let cipher = Aes256Gcm::new(&key);
+    let nonce = Nonce::from(nonce_bytes);
     let ciphertext = cipher
         .encrypt(
-            Nonce::from_slice(&nonce_bytes),
+            &nonce,
             Payload {
                 msg: &plaintext,
                 aad,
@@ -640,10 +642,13 @@ async fn get_user_git_creds_impl<B: SecretBackend>(
         })?;
 
     let aad = oidc_sub.trim().as_bytes();
-    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(encryption_key));
+    let key: Key<Aes256Gcm> = (*encryption_key).into();
+    let cipher = Aes256Gcm::new(&key);
+    let nonce = Nonce::try_from(nonce_raw.0.as_slice())
+        .map_err(|_| KubeError::Crypto("Invalid AES-GCM nonce length".to_string()))?;
     let plaintext = cipher
         .decrypt(
-            Nonce::from_slice(&nonce_raw.0),
+            &nonce,
             Payload {
                 msg: &ciphertext.0,
                 aad,

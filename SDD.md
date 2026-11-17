@@ -556,9 +556,10 @@ Configured to run weekly, group ecosystem updates logically to minimize PR noise
   },
   "packageRules": [
     {
-      "description": "Group non-breaking Rust patch updates",
+      "description": "Group non-breaking Rust patch updates (>= 0.1.0)",
       "matchManagers": ["cargo"],
       "groupName": "rust-dependencies",
+      "matchCurrentVersion": "!/^0\\.0\\./",
       "matchUpdateTypes": ["patch"],
       "automerge": true
     },
@@ -571,10 +572,17 @@ Configured to run weekly, group ecosystem updates logically to minimize PR noise
       "automerge": true
     },
     {
-      "description": "Require manual review for pre-1.0 Rust minor updates (SemVer breaking)",
+      "description": "Require manual review for pre-1.0 Rust minor updates and 0.0.x patches (SemVer breaking)",
       "matchManagers": ["cargo"],
       "matchCurrentVersion": "/^0\\./",
       "matchUpdateTypes": ["minor"],
+      "automerge": false
+    },
+    {
+      "description": "Require manual review for 0.0.x Rust patch updates (SemVer breaking)",
+      "matchManagers": ["cargo"],
+      "matchCurrentVersion": "/^0\\.0\\./",
+      "matchUpdateTypes": ["patch"],
       "automerge": false
     },
     {

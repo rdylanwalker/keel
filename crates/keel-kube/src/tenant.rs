@@ -267,7 +267,7 @@ pub fn build_tenant_default_deny_network_policy(
             ..ObjectMeta::default()
         },
         spec: Some(NetworkPolicySpec {
-            pod_selector: LabelSelector::default(),
+            pod_selector: Some(LabelSelector::default()),
             policy_types: Some(vec!["Ingress".to_string(), "Egress".to_string()]),
             ingress: None,
             egress: None,

@@ -22,6 +22,26 @@ use tokio::sync::{Mutex, RwLock};
 
 use crate::error::ServerError;
 
+/// Splits a multi-document YAML stream on `---` document markers.
+fn split_yaml_documents(content: &str) -> Vec<String> {
+    let mut docs = Vec::new();
+    let mut current = String::new();
+    for line in content.lines() {
+        if line.trim() == "---" {
+            if !current.trim().is_empty() {
+                docs.push(std::mem::take(&mut current));
+            }
+        } else {
+            current.push_str(line);
+            current.push('\n');
+        }
+    }
+    if !current.trim().is_empty() {
+        docs.push(current);
+    }
+    docs
+}
+
 /// Summary of a PKO v2 `Stack` resource returned by `GET /api/v1/stacks`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -246,8 +266,8 @@ impl ClusterStateProvider for RepoClusterStateProvider {
             let Ok(content) = tokio::fs::read_to_string(&path).await else {
                 continue;
             };
-            for doc in serde_yml::Deserializer::from_str(&content) {
-                let Ok(val) = Value::deserialize(doc) else {
+            for doc in split_yaml_documents(&content) {
+                let Ok(val) = serde_yml::from_str::<Value>(&doc) else {
                     continue;
                 };
                 if val.get("kind").and_then(Value::as_str) != Some("Stack") {
@@ -405,8 +425,8 @@ impl ClusterStateProvider for RepoClusterStateProvider {
             let Ok(content) = tokio::fs::read_to_string(&path).await else {
                 continue;
             };
-            for doc in serde_yml::Deserializer::from_str(&content) {
-                let Ok(val) = Value::deserialize(doc) else {
+            for doc in split_yaml_documents(&content) {
+                let Ok(val) = serde_yml::from_str::<Value>(&doc) else {
                     continue;
                 };
                 let api_version = val

@@ -136,8 +136,8 @@ pub fn validate_schema_values(schema: &Value, values: &Value) -> Result<(), Core
     let mut errors: Vec<SchemaFieldError> = validator
         .iter_errors(values)
         .map(|err| SchemaFieldError {
-            field_path: err.instance_path.to_string(),
-            schema_path: err.schema_path.to_string(),
+            field_path: err.instance_path().to_string(),
+            schema_path: err.schema_path().to_string(),
             message: err.to_string(),
         })
         .collect();

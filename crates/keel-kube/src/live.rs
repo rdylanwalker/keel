@@ -505,7 +505,7 @@ impl KubeClusterStatusReader {
                 .metadata
                 .creation_timestamp
                 .as_ref()
-                .map(|t| t.0.to_rfc3339());
+                .map(|t| t.0.to_string());
             let last_synced = extract_last_synced(&item.data, creation_ts.as_deref());
             let resource_count = extract_resource_count(&item.data);
 
@@ -802,8 +802,8 @@ impl LiveStatusSource for KubeClusterStatusReader {
                         count: ev.count,
                         last_seen: ev
                             .last_timestamp
-                            .map(|t| t.0.to_rfc3339())
-                            .or_else(|| ev.metadata.creation_timestamp.map(|t| t.0.to_rfc3339())),
+                            .map(|t| t.0.to_string())
+                            .or_else(|| ev.metadata.creation_timestamp.map(|t| t.0.to_string())),
                     })
                     .collect()
             })
@@ -938,8 +938,8 @@ impl LiveStatusSource for KubeClusterStatusReader {
                         count: ev.count,
                         last_seen: ev
                             .last_timestamp
-                            .map(|t| t.0.to_rfc3339())
-                            .or_else(|| ev.metadata.creation_timestamp.map(|t| t.0.to_rfc3339())),
+                            .map(|t| t.0.to_string())
+                            .or_else(|| ev.metadata.creation_timestamp.map(|t| t.0.to_string())),
                     })
                     .collect()
             })
@@ -1092,7 +1092,7 @@ pub fn extract_resource_metadata(
             .metadata
             .creation_timestamp
             .as_ref()
-            .map(|t| t.0.to_rfc3339()),
+            .map(|t| t.0.to_string()),
         labels: obj.metadata.labels.clone().unwrap_or_default(),
         annotations: obj
             .metadata
