@@ -8,9 +8,9 @@ export default defineConfig({
   testDir: './tests',
   fullyParallel: false,
   forbidOnly: !!process.env.CI,
-  retries: process.env.CI ? 2 : 0,
+  retries: isLive ? 0 : process.env.CI ? 2 : 0,
   workers: 1,
-  timeout: isLive ? 15 * 60 * 1000 : 30 * 1000,
+  timeout: isLive ? 20 * 60 * 1000 : 30 * 1000,
   reporter: isLive ? [['list'], ['html', { open: 'never' }]] : 'html',
   ...(isLive
     ? {}

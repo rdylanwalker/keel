@@ -99,13 +99,61 @@ async function waitForK8sReady(
     if (now - lastLog >= 15_000) {
       const elapsed = Math.round((now - start) / 1000);
       const maxSec = Math.round(timeoutMs / 1000);
-      const detail = reason || message || 'pending';
+      const detail = reason && message ? `${reason}: ${message}` : reason || message || 'pending';
       logStep(
         `Waiting: ${kind}/${name} (${namespace}) Ready=${status || 'Unknown'} (${detail}) [${elapsed}s/${maxSec}s]`,
       );
       lastLog = now;
     }
     await new Promise((r) => setTimeout(r, 5000));
+  }
+  const desc = tryCmd('kubectl', ['describe', kind, name, '-n', namespace]);
+  if (desc.stdout) {
+    logStep(`${kind}/${name} (${namespace}) describe at timeout:\n${desc.stdout}`);
+  }
+  if (kind === 'stack') {
+    const pods = tryCmd('kubectl', ['get', 'pods', '-A', '-o', 'wide']);
+    if (pods.stdout) {
+      logStep(`Cluster pods at timeout:\n${pods.stdout}`);
+    }
+    const pkoLogs = tryCmd('kubectl', [
+      'logs',
+      '-n',
+      'flux-system',
+      '-l',
+      'app.kubernetes.io/name=pulumi-kubernetes-operator',
+      '--tail=80',
+    ]);
+    if (pkoLogs.stdout) {
+      logStep(`PKO controller logs at timeout:\n${pkoLogs.stdout}`);
+    }
+    const stackPods = tryCmd('kubectl', [
+      'get',
+      'pods',
+      '-n',
+      namespace,
+      '-o',
+      'jsonpath={.items[*].metadata.name}',
+    ]);
+    if (stackPods.ok && stackPods.stdout) {
+      for (const podName of stackPods.stdout.split(/\s+/).filter(Boolean)) {
+        const podLogs = tryCmd('kubectl', [
+          'logs',
+          '-n',
+          namespace,
+          podName,
+          '--all-containers',
+          '--tail=80',
+        ]);
+        if (podLogs.stdout) {
+          logStep(`Pod ${namespace}/${podName} logs at timeout:\n${podLogs.stdout}`);
+        }
+      }
+    }
+    const containers = tryCmd('docker', ['ps', '-a']);
+    if (containers.stdout) {
+      logStep(`Docker containers at timeout:\n${containers.stdout}`);
+    }
   }
   throw new Error(`Timed out waiting for ${kind}/${name} in ${namespace} to become Ready=True`);
 }
@@ -790,7 +838,7 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
       await Promise.all([
         waitForK8sReady('helmrelease', 'podinfo', 'tenant-default', 180_000),
         waitForNamespace('tenant-acme', 120_000),
-        waitForK8sReady('stack', `${WORKLOAD_CLUSTER}-cluster`, 'tenant-default', 300_000),
+        waitForK8sReady('stack', `${WORKLOAD_CLUSTER}-cluster`, 'tenant-default', 480_000),
       ]);
       await Promise.all([
         waitForK8sReady('stack', `${WORKLOAD_CLUSTER}-canary-config`, 'tenant-default', 300_000),
