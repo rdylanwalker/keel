@@ -761,4 +761,28 @@ mod tests {
         );
         assert_eq!(binding["subjects"][0]["namespace"], "kyverno");
     }
+
+    #[test]
+    fn to_multi_doc_yaml_separates_documents_cleanly() {
+        let bundle = KyvernoManifestBundle::generate(&KyvernoPolicyConfig {
+            local_dev_docker_socket_exception: true,
+            ..KyvernoPolicyConfig::default()
+        })
+        .unwrap();
+        let yaml = bundle.to_multi_doc_yaml().unwrap();
+        assert!(yaml.ends_with('\n'));
+        assert!(yaml.contains("\n---\n"));
+        for line in yaml.lines() {
+            if line.contains("---") {
+                assert_eq!(line, "---", "document separator must be on its own line");
+            }
+        }
+        let docs: Vec<&str> = yaml.split("\n---\n").collect();
+        assert_eq!(docs.len(), 7);
+        for doc in docs {
+            let parsed: serde_json::Value =
+                serde_yml::from_str(doc).expect("each Kyverno multi-doc YAML part must parse");
+            assert!(parsed.get("kind").is_some());
+        }
+    }
 }

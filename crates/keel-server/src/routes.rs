@@ -1802,18 +1802,9 @@ pub async fn create_tenant(
         if !resources.contains(&rbac_entry) {
             resources.push(rbac_entry);
         }
-        let kustomization_doc = serde_json::json!({
-            "apiVersion": "kustomize.config.k8s.io/v1beta1",
-            "kind": "Kustomization",
-            "resources": resources,
-        });
         tokio::fs::write(
             &tenants_kustomization_path,
-            serde_yml::to_string(&kustomization_doc).map_err(|e| {
-                ServerError::Internal(format!(
-                    "failed to serialize tenants/kustomization.yaml: {e}"
-                ))
-            })?,
+            serialize_tenants_kustomization(&resources)?,
         )
         .await?;
 
@@ -1954,18 +1945,9 @@ pub async fn delete_tenant(
                 .filter_map(|v| v.as_str().map(str::to_string))
                 .filter(|r| !r.starts_with(&format!("{id}/")))
                 .collect();
-            let kustomization_doc = json!({
-                "apiVersion": "kustomize.config.k8s.io/v1beta1",
-                "kind": "Kustomization",
-                "resources": resources,
-            });
             tokio::fs::write(
                 &tenants_kustomization_path,
-                serde_yml::to_string(&kustomization_doc).map_err(|e| {
-                    ServerError::Internal(format!(
-                        "failed to serialize tenants/kustomization.yaml: {e}"
-                    ))
-                })?,
+                serialize_tenants_kustomization(&resources)?,
             )
             .await?;
             staged_paths.push("tenants/kustomization.yaml".to_string());
@@ -2824,19 +2806,10 @@ pub async fn create_proposal(
                 resources.push(manifest_rel_to_tenants);
             }
         }
-        let kustomization_doc = serde_json::json!({
-            "apiVersion": "kustomize.config.k8s.io/v1beta1",
-            "kind": "Kustomization",
-            "resources": resources,
-        });
         tokio::fs::create_dir_all(state.repo_workdir.join("tenants")).await?;
         tokio::fs::write(
             &tenants_kustomization_path,
-            serde_yml::to_string(&kustomization_doc).map_err(|e| {
-                ServerError::Internal(format!(
-                    "failed to serialize tenants/kustomization.yaml: {e}"
-                ))
-            })?,
+            serialize_tenants_kustomization(&resources)?,
         )
         .await?;
         staged_paths.push("tenants/kustomization.yaml".to_string());
@@ -3550,19 +3523,10 @@ async fn create_bundle_proposal(
                 resources.push(res);
             }
         }
-        let kustomization_doc = serde_json::json!({
-            "apiVersion": "kustomize.config.k8s.io/v1beta1",
-            "kind": "Kustomization",
-            "resources": resources,
-        });
         tokio::fs::create_dir_all(state.repo_workdir.join("tenants")).await?;
         tokio::fs::write(
             &tenants_kustomization_path,
-            serde_yml::to_string(&kustomization_doc).map_err(|e| {
-                ServerError::Internal(format!(
-                    "failed to serialize tenants/kustomization.yaml: {e}"
-                ))
-            })?,
+            serialize_tenants_kustomization(&resources)?,
         )
         .await?;
         staged_paths.push("tenants/kustomization.yaml".to_string());
@@ -3964,6 +3928,23 @@ pub async fn get_proposal_preview(
 pub struct MergeProposalResponse {
     pub proposal: PullRequestInfo,
     pub gc_plan: GcPlan,
+}
+
+fn serialize_tenants_kustomization(resources: &[String]) -> Result<String, ServerError> {
+    let kustomization_doc = serde_json::json!({
+        "apiVersion": "kustomize.config.k8s.io/v1beta1",
+        "kind": "Kustomization",
+        "resources": resources,
+    });
+    let mut yaml = serde_yml::to_string(&kustomization_doc).map_err(|e| {
+        ServerError::Internal(format!(
+            "failed to serialize tenants/kustomization.yaml: {e}"
+        ))
+    })?;
+    if !yaml.ends_with('\n') {
+        yaml.push('\n');
+    }
+    Ok(yaml)
 }
 
 /// Validates that a PR's changed files are strictly scoped to `tenants/<tenant>/` (excluding `rbac.yaml`)
@@ -4461,18 +4442,9 @@ async fn delete_gitops_resource_pr(
                 .filter_map(|v| v.as_str().map(str::to_string))
                 .filter(|r| !r.starts_with(&format!("{prefix_in_tenants}/")))
                 .collect();
-            let kustomization_doc = json!({
-                "apiVersion": "kustomize.config.k8s.io/v1beta1",
-                "kind": "Kustomization",
-                "resources": resources,
-            });
             tokio::fs::write(
                 &tenants_kustomization_path,
-                serde_yml::to_string(&kustomization_doc).map_err(|e| {
-                    ServerError::Internal(format!(
-                        "failed to serialize tenants/kustomization.yaml: {e}"
-                    ))
-                })?,
+                serialize_tenants_kustomization(&resources)?,
             )
             .await?;
             staged_paths.push("tenants/kustomization.yaml".to_string());
@@ -5738,5 +5710,30 @@ spec:
             .unwrap();
         let reverted_raw = tokio::fs::read_to_string(&addon_path).await.unwrap();
         assert_eq!(reverted_raw, original_yaml);
+    }
+
+    #[test]
+    fn serialize_tenants_kustomization_ends_with_newline_and_preserves_prior_entries() {
+        let initial = serialize_tenants_kustomization(&[
+            "default/rbac.yaml".to_string(),
+            "default/apps/e2e-lab-podinfo/helmrelease-canary.yaml".to_string(),
+        ])
+        .unwrap();
+        assert!(initial.ends_with('\n'));
+
+        let updated = serialize_tenants_kustomization(&[
+            "default/rbac.yaml".to_string(),
+            "default/apps/e2e-lab-podinfo/helmrelease-canary.yaml".to_string(),
+            "acme/apps/acme-podinfo/helmrelease.yaml".to_string(),
+        ])
+        .unwrap();
+        assert!(updated.ends_with('\n'));
+        assert!(
+            updated.starts_with(&initial),
+            "appending a new tenant entry must not alter existing lines"
+        );
+
+        let parsed: serde_json::Value = serde_yml::from_str(&updated).unwrap();
+        assert_eq!(parsed["resources"].as_array().unwrap().len(), 3);
     }
 }

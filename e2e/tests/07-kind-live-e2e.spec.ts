@@ -121,6 +121,38 @@ async function waitForNamespace(name: string, timeoutMs = 120_000): Promise<void
     }
     await new Promise((r) => setTimeout(r, 3000));
   }
+  const fluxDiag = tryCmd('kubectl', [
+    'get',
+    'gitrepository,kustomization,helmrelease,stack',
+    '-A',
+  ]);
+  if (fluxDiag.stdout) {
+    logStep(`Flux/PKO resources at timeout:\n${fluxDiag.stdout}`);
+  }
+  const gitRepoDesc = tryCmd('kubectl', [
+    'get',
+    'gitrepository',
+    'flux-system',
+    '-n',
+    'flux-system',
+    '-o',
+    'jsonpath={.status.conditions}',
+  ]);
+  if (gitRepoDesc.stdout) {
+    logStep(`flux-system GitRepository conditions: ${gitRepoDesc.stdout}`);
+  }
+  const ksDesc = tryCmd('kubectl', [
+    'get',
+    'kustomization',
+    'keel-tenants',
+    '-n',
+    'flux-system',
+    '-o',
+    'jsonpath={.status.conditions}',
+  ]);
+  if (ksDesc.stdout) {
+    logStep(`keel-tenants Kustomization conditions: ${ksDesc.stdout}`);
+  }
   throw new Error(`Timed out waiting for namespace/${name} to become Active`);
 }
 

@@ -1193,6 +1193,38 @@ pub async fn initialize_seed_git_repo(
     initialize_seed_git_repo_with_push(repo_dir, artifacts, None, None).await
 }
 
+fn render_default_tenant_git_repository_yaml(repo: &FluxGitRepository) -> Result<String, CliError> {
+    let mut repo_yaml = repo.to_yaml()?;
+    if !repo_yaml.ends_with('\n') {
+        repo_yaml.push('\n');
+    }
+    Ok(format!(
+        "{repo_yaml}---\n\
+         apiVersion: networking.k8s.io/v1\n\
+         kind: NetworkPolicy\n\
+         metadata:\n\
+         \x20 name: allow-pko-workspace\n\
+         \x20 namespace: tenant-default\n\
+         spec:\n\
+         \x20 podSelector:\n\
+         \x20   matchLabels:\n\
+         \x20     auto.pulumi.com/component: workspace\n\
+         \x20 policyTypes:\n\
+         \x20 - Ingress\n\
+         \x20 - Egress\n\
+         \x20 ingress:\n\
+         \x20 - from:\n\
+         \x20   - namespaceSelector:\n\
+         \x20       matchLabels:\n\
+         \x20         kubernetes.io/metadata.name: {KEEL_SYSTEM_NAMESPACE}\n\
+         \x20   ports:\n\
+         \x20   - protocol: TCP\n\
+         \x20     port: 50051\n\
+         \x20 egress:\n\
+         \x20 - {{}}\n"
+    ))
+}
+
 async fn initialize_seed_git_repo_with_push(
     repo_dir: &Path,
     artifacts: &SeedControlPlaneArtifacts,
@@ -1230,32 +1262,8 @@ async fn initialize_seed_git_repo_with_push(
     let mut default_tenant_git_repo = artifacts.flux_git_repository.clone();
     default_tenant_git_repo.metadata.name = "keel-gitops".to_string();
     default_tenant_git_repo.metadata.namespace = "tenant-default".to_string();
-    let default_tenant_git_repo_yaml = format!(
-        "{}---\n\
-         apiVersion: networking.k8s.io/v1\n\
-         kind: NetworkPolicy\n\
-         metadata:\n\
-         \x20 name: allow-pko-workspace\n\
-         \x20 namespace: tenant-default\n\
-         spec:\n\
-         \x20 podSelector:\n\
-         \x20   matchLabels:\n\
-         \x20     auto.pulumi.com/component: workspace\n\
-         \x20 policyTypes:\n\
-         \x20 - Ingress\n\
-         \x20 - Egress\n\
-         \x20 ingress:\n\
-         \x20 - from:\n\
-         \x20   - namespaceSelector:\n\
-         \x20       matchLabels:\n\
-         \x20         kubernetes.io/metadata.name: {KEEL_SYSTEM_NAMESPACE}\n\
-         \x20   ports:\n\
-         \x20   - protocol: TCP\n\
-         \x20     port: 50051\n\
-         \x20 egress:\n\
-         \x20 - {{}}\n",
-        default_tenant_git_repo.to_yaml()?
-    );
+    let default_tenant_git_repo_yaml =
+        render_default_tenant_git_repository_yaml(&default_tenant_git_repo)?;
 
     let tenants_kustomization_yaml = "apiVersion: kustomize.config.k8s.io/v1beta1\n\
         kind: Kustomization\n\
@@ -5079,5 +5087,46 @@ spec:
             .await
             .unwrap();
         assert_eq!(origin, "https://github.com/acme/infra-gitops.git");
+    }
+
+    #[test]
+    fn default_tenant_git_repository_yaml_is_valid_multi_doc() {
+        let repo = FluxGitRepository {
+            api_version: FLUX_GIT_REPO_API_VERSION.to_string(),
+            kind: FLUX_GIT_REPO_KIND.to_string(),
+            metadata: CrObjectMeta {
+                name: "keel-gitops".to_string(),
+                namespace: "tenant-default".to_string(),
+                labels: BTreeMap::new(),
+                annotations: BTreeMap::new(),
+            },
+            spec: FluxGitRepositorySpec {
+                interval: DEFAULT_FLUX_POLL_INTERVAL.to_string(),
+                url: "https://forgejo.keel.local/keel/infra-gitops.git".to_string(),
+                git_ref: FluxGitRepositoryRef {
+                    branch: Some("main".to_string()),
+                    tag: None,
+                    commit: None,
+                },
+                secret_ref: Some(LocalObjectReference {
+                    name: "git-credentials".to_string(),
+                }),
+                timeout: Some("60s".to_string()),
+            },
+        };
+        let yaml = render_default_tenant_git_repository_yaml(&repo).unwrap();
+        assert!(yaml.ends_with('\n'));
+        assert!(yaml.contains("\n---\n"));
+        for line in yaml.lines() {
+            if line.contains("---") {
+                assert_eq!(line, "---", "document separator must be on its own line");
+            }
+        }
+        let docs: Vec<&str> = yaml.split("\n---\n").collect();
+        assert_eq!(docs.len(), 2);
+        let first: serde_json::Value = serde_yml::from_str(docs[0]).unwrap();
+        let second: serde_json::Value = serde_yml::from_str(docs[1]).unwrap();
+        assert_eq!(first["kind"], "GitRepository");
+        assert_eq!(second["kind"], "NetworkPolicy");
     }
 }
