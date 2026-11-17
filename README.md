@@ -122,7 +122,7 @@ Every mutation validates inputs against `catalog.yaml` JSON Schemas, encrypts se
 # Propose a new workload kind cluster
 cat <<'EOF' > workload-values.yaml
 clusterName: workload-dev
-kubernetesVersion: v1.32.0
+kubernetesVersion: v1.35.8
 workerCount: 1
 EOF
 

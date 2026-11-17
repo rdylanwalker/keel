@@ -28,7 +28,7 @@ In **Catalog & Form Wizard**:
 2. Select **Local kind Workload Cluster** (`kind-cluster`).
 3. Fill in the form:
    - **Cluster Name:** `workload-dev`
-   - **Kubernetes Version:** `v1.32.0`
+   - **Kubernetes Version:** `v1.35.8`
    - **Worker Node Count:** `1`
 4. Click **Submit & Open Git PR Proposal**.
 
@@ -37,7 +37,7 @@ Or submit the same proposal via CLI:
 ```bash
 cat <<'EOF' > /tmp/workload-dev.yaml
 clusterName: workload-dev
-kubernetesVersion: v1.32.0
+kubernetesVersion: v1.35.8
 workerCount: 1
 EOF
 

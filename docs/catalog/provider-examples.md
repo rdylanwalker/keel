@@ -43,8 +43,8 @@ spec:
       kubernetesVersion:
         type: string
         title: Kubernetes Version
-        default: v1.32.0
-        enum: [v1.32.0, v1.31.4, v1.30.8]
+        default: v1.35.8
+        enum: [v1.37.0, v1.36.4, v1.35.8, v1.34.11, v1.33.12]
       workerCount:
         type: integer
         title: Worker Node Count
@@ -71,7 +71,7 @@ config:
     default: workload-dev
   kubernetesVersion:
     type: string
-    default: v1.32.0
+    default: v1.35.8
   workerCount:
     type: integer
     default: 1

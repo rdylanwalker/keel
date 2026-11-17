@@ -47,7 +47,7 @@ Infrastructure blueprints in `catalog/infra/` are gated by `providers/registry.y
 ```bash
 cat <<'EOF' > /tmp/workload-dev.yaml
 clusterName: workload-dev
-kubernetesVersion: v1.32.0
+kubernetesVersion: v1.35.8
 workerCount: 1
 EOF
 

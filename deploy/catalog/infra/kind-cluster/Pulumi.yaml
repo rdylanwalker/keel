@@ -18,7 +18,7 @@ config:
     default: workload-dev
   kubernetesVersion:
     type: string
-    default: v1.32.0
+    default: v1.35.8
   workerCount:
     type: integer
     default: 1
