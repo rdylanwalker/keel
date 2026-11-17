@@ -1,3 +1,9 @@
+## [0.6.8](https://github.com/rdylanwalker/keel/compare/v0.6.7...v0.6.8) (2026-11-17)
+
+### Bug Fixes
+
+* **yaml:** ensure trailing newlines in multi-doc and kustomization YAML ([7e1a9ce](https://github.com/rdylanwalker/keel/commit/7e1a9cea865c71ca6f5dd116a8e4275a7765f7bb))
+
 ## [0.6.7](https://github.com/rdylanwalker/keel/compare/v0.6.6...v0.6.7) (2026-11-17)
 
 ### Bug Fixes
