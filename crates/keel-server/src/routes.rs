@@ -1747,9 +1747,50 @@ pub async fn create_tenant(
         tokio::fs::create_dir_all(&target_dir).await?;
         tokio::fs::write(target_dir.join("rbac.yaml"), &rbac_yaml).await?;
 
+        let tenants_kustomization_path = state.repo_workdir.join("tenants/kustomization.yaml");
+        let existing_kustomization = if tokio::fs::try_exists(&tenants_kustomization_path)
+            .await
+            .unwrap_or(false)
+        {
+            tokio::fs::read_to_string(&tenants_kustomization_path)
+                .await
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let mut resources: Vec<String> =
+            serde_yml::from_str::<serde_json::Value>(&existing_kustomization)
+                .ok()
+                .and_then(|v| v.get("resources").and_then(|r| r.as_array()).cloned())
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect();
+        let rbac_entry = format!("{}/rbac.yaml", req.id);
+        if !resources.contains(&rbac_entry) {
+            resources.push(rbac_entry);
+        }
+        let kustomization_doc = serde_json::json!({
+            "apiVersion": "kustomize.config.k8s.io/v1beta1",
+            "kind": "Kustomization",
+            "resources": resources,
+        });
+        tokio::fs::write(
+            &tenants_kustomization_path,
+            serde_yml::to_string(&kustomization_doc).map_err(|e| {
+                ServerError::Internal(format!(
+                    "failed to serialize tenants/kustomization.yaml: {e}"
+                ))
+            })?,
+        )
+        .await?;
+
         state
             .git_runner
-            .add(&state.repo_workdir, [&rel_file])
+            .add(
+                &state.repo_workdir,
+                [&rel_file, "tenants/kustomization.yaml"],
+            )
             .await?;
 
         let author = CommitAuthor::new(
@@ -1863,9 +1904,44 @@ pub async fn delete_tenant(
             .await?;
 
         tokio::fs::remove_dir_all(state.repo_workdir.join(&rel_dir)).await?;
+        let mut staged_paths = vec![rel_dir.clone()];
+
+        let tenants_kustomization_path = state.repo_workdir.join("tenants/kustomization.yaml");
+        if tokio::fs::try_exists(&tenants_kustomization_path)
+            .await
+            .unwrap_or(false)
+        {
+            let existing = tokio::fs::read_to_string(&tenants_kustomization_path)
+                .await
+                .unwrap_or_default();
+            let resources: Vec<String> = serde_yml::from_str::<Value>(&existing)
+                .ok()
+                .and_then(|v| v.get("resources").and_then(|r| r.as_array()).cloned())
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .filter(|r| !r.starts_with(&format!("{id}/")))
+                .collect();
+            let kustomization_doc = json!({
+                "apiVersion": "kustomize.config.k8s.io/v1beta1",
+                "kind": "Kustomization",
+                "resources": resources,
+            });
+            tokio::fs::write(
+                &tenants_kustomization_path,
+                serde_yml::to_string(&kustomization_doc).map_err(|e| {
+                    ServerError::Internal(format!(
+                        "failed to serialize tenants/kustomization.yaml: {e}"
+                    ))
+                })?,
+            )
+            .await?;
+            staged_paths.push("tenants/kustomization.yaml".to_string());
+        }
+
         state
             .git_runner
-            .add(&state.repo_workdir, [&rel_dir])
+            .add(&state.repo_workdir, staged_paths)
             .await?;
 
         let author = CommitAuthor::new(
