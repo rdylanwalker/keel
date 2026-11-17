@@ -1,3 +1,9 @@
+## [0.6.7](https://github.com/rdylanwalker/keel/compare/v0.6.6...v0.6.7) (2026-11-17)
+
+### Bug Fixes
+
+* **kube:** ensure trailing newline in multi-doc YAML output ([f7c0fd7](https://github.com/rdylanwalker/keel/commit/f7c0fd705038f78bb269cc5099488f5d4c143208))
+
 ## [0.6.6](https://github.com/rdylanwalker/keel/compare/v0.6.5...v0.6.6) (2026-11-17)
 
 ### Bug Fixes
