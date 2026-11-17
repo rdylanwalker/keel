@@ -1,3 +1,9 @@
+## [0.6.9](https://github.com/rdylanwalker/keel/compare/v0.6.8...v0.6.9) (2026-11-17)
+
+### Bug Fixes
+
+* **e2e:** disable live retries and add stack timeout diagnostics ([47b8e48](https://github.com/rdylanwalker/keel/commit/47b8e4865b1dfd17c4da86d92196b68120ee669e))
+
 ## [0.6.8](https://github.com/rdylanwalker/keel/compare/v0.6.7...v0.6.8) (2026-11-17)
 
 ### Bug Fixes
