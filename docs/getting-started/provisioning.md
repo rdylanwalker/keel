@@ -83,10 +83,16 @@ Once a workload cluster or tenant namespace is ready:
 3. Submit and merge the PR—or run via CLI:
 
 ```bash
+cat <<'EOF' > podinfo-values.yaml
+replicaCount: 2
+ingressHost: podinfo.keel.local
+apiToken: demo-podinfo-token
+EOF
+
 keel app install \
   --app podinfo \
   --tenant platform-team \
-  --values-file ./deploy/catalog/apps/podinfo/upstream/values.yaml \
+  --values-file ./podinfo-values.yaml \
   --canary \
   --server http://127.0.0.1:8080
 ```

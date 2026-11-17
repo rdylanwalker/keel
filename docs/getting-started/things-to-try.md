@@ -73,10 +73,16 @@ With a tenant namespace ready (such as `default` or `dev-team`), deploy **Podinf
 4. Click **Submit & Open Git PR Proposal** (or via CLI):
 
 ```bash
+cat <<'EOF' > podinfo-values.yaml
+replicaCount: 2
+ingressHost: podinfo.keel.local
+apiToken: demo-podinfo-token
+EOF
+
 keel app install \
   --app podinfo \
   --tenant default \
-  --values-file ./deploy/catalog/apps/podinfo/upstream/values.yaml \
+  --values-file ./podinfo-values.yaml \
   --canary \
   --server http://127.0.0.1:8080
 ```
