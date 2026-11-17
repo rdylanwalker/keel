@@ -93,20 +93,28 @@ spec:
             - name: rauthy-bootstrap
               mountPath: /app/bootstrap
               readOnly: true
+          startupProbe:
+            httpGet:
+              scheme: HTTP
+              port: 8080
+              path: /auth/v1/health
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            failureThreshold: 30
           readinessProbe:
             httpGet:
               scheme: HTTP
               port: 8200
               path: /ready
-            initialDelaySeconds: 5
-            periodSeconds: 3
-            failureThreshold: 3
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            failureThreshold: 5
           livenessProbe:
             httpGet:
               scheme: HTTP
               port: 8080
               path: /auth/v1/health
-            initialDelaySeconds: 30
+            initialDelaySeconds: 10
             periodSeconds: 20
             failureThreshold: 3
           resources:

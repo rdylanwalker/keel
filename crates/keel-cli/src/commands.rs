@@ -540,7 +540,7 @@ pub async fn synthesize_seed_control_plane(
 
         let config_toml = format!(
             "[access]\ncookie_mode = 'secure'\n\n\
-             [bootstrap]\nadmin_email = '{admin_username}'\npassword_plain = '{admin_password}'\nbootstrap_dir = '/app/bootstrap'\n\n\
+             [bootstrap]\nbootstrap_dir = '/app/bootstrap'\n\n\
              [cluster]\nnode_id = 1\nnodes = ['1 127.0.0.1:8100 127.0.0.1:8200']\nsecret_raft = '{secret_raft}'\nsecret_api = '{secret_api}'\n\n\
              [database]\nhiqlite = true\n\n\
              [encryption]\nkeys = ['{enc_key_id}/{enc_key_b64}']\nkey_active = '{enc_key_id}'\n\n\
@@ -892,6 +892,38 @@ async fn start_gateway_port_forward(
     )))
 }
 
+/// Applies the `git-credentials` Secret to `flux-system` and ensures `tenant-default`
+/// exists so Kyverno's `sync-tenant-secrets` `GeneratingPolicy` automatically clones and
+/// synchronizes `git-credentials` into `tenant-default` and all future `tenant-*` namespaces.
+async fn apply_git_credentials_secret(
+    context: Option<&str>,
+    kubeconfig: Option<&Path>,
+    username: &str,
+    password: &str,
+) -> Result<(), CliError> {
+    let default_tenant_rbac =
+        TenantManifestBundle::synthesize(&TenantIsolationConfig::new("default"))?
+            .to_multi_doc_yaml()?;
+    run_kubectl_apply(context, kubeconfig, &default_tenant_rbac).await?;
+
+    let creds_doc = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": {
+            "name": "git-credentials",
+            "namespace": FLUX_SYSTEM_NAMESPACE,
+        },
+        "type": "Opaque",
+        "stringData": {
+            "username": username,
+            "password": password,
+        },
+    });
+    let creds_yaml = serde_yml::to_string(&creds_doc)?;
+    run_kubectl_apply(context, kubeconfig, &creds_yaml).await?;
+    Ok(())
+}
+
 async fn provision_in_cluster_forgejo(
     context: Option<&str>,
     kubeconfig: Option<&Path>,
@@ -978,21 +1010,7 @@ async fn provision_in_cluster_forgejo(
     let secret_yaml = serde_yml::to_string(&secret_doc)?;
     run_kubectl_apply(context, kubeconfig, &secret_yaml).await?;
 
-    let flux_git_creds_doc = serde_json::json!({
-        "apiVersion": "v1",
-        "kind": "Secret",
-        "metadata": {
-            "name": "git-credentials",
-            "namespace": FLUX_SYSTEM_NAMESPACE,
-        },
-        "type": "Opaque",
-        "stringData": {
-            "username": forgejo_user,
-            "password": token,
-        },
-    });
-    let flux_git_creds_yaml = serde_yml::to_string(&flux_git_creds_doc)?;
-    run_kubectl_apply(context, kubeconfig, &flux_git_creds_yaml).await?;
+    apply_git_credentials_secret(context, kubeconfig, forgejo_user, &token).await?;
 
     // 4. Register Rauthy OIDC SSO provider in Forgejo when enabled
     if let Some(oidc_secret) = forgejo_oidc_secret {
@@ -1735,7 +1753,6 @@ async fn sync_in_cluster_s3_credentials_from_seaweedfs(
         KEEL_SYSTEM_NAMESPACE,
         FLUX_SYSTEM_NAMESPACE,
         KEEL_PREVIEWS_NAMESPACE,
-        "tenant-default",
     ] {
         let secret_doc = serde_json::json!({
             "apiVersion": "v1",
@@ -2403,21 +2420,7 @@ async fn install_stage0_core_addons(
         || repo_url.starts_with("git://")
     {
         if let Some(token) = git_token.map(str::trim).filter(|t| !t.is_empty()) {
-            let secret_doc = serde_json::json!({
-                "apiVersion": "v1",
-                "kind": "Secret",
-                "metadata": {
-                    "name": "git-credentials",
-                    "namespace": FLUX_SYSTEM_NAMESPACE,
-                },
-                "type": "Opaque",
-                "stringData": {
-                    "username": "git",
-                    "password": token,
-                },
-            });
-            let secret_yaml = serde_yml::to_string(&secret_doc)?;
-            run_kubectl_apply(ctx, kc, &secret_yaml).await?;
+            apply_git_credentials_secret(ctx, kc, "git", token).await?;
         }
         let git_repo_yaml = artifacts.flux_git_repository.to_yaml()?;
         run_kubectl_apply(ctx, kc, &git_repo_yaml).await?;
