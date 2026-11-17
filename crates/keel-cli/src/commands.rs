@@ -1601,7 +1601,8 @@ async fn run_pulumi_control_plane_stack(
 ) -> Result<(), CliError> {
     let state_dir = std::env::temp_dir()
         .join("keel-stage0-pulumi")
-        .join(format!("control-plane-{cluster_name}"));
+        .join(format!("control-plane-{cluster_name}"))
+        .join(program_name);
     tokio::fs::create_dir_all(&state_dir).await?;
     let program_dir =
         materialize_control_plane_program_dir(program_name, embedded_yaml, &state_dir).await?;
@@ -1612,12 +1613,20 @@ async fn run_pulumi_control_plane_stack(
     run_pulumi_cmd(&program_dir, &["login", &backend_url]).await?;
     run_pulumi_cmd(&program_dir, &["stack", "select", &stack_name, "--create"]).await?;
 
-    for &(key, value, is_secret) in config_pairs {
-        if is_secret {
-            run_pulumi_cmd(&program_dir, &["config", "set", "--secret", key, value]).await?;
-        } else {
-            run_pulumi_cmd(&program_dir, &["config", "set", "--plaintext", key, value]).await?;
+    if !config_pairs.is_empty() {
+        let mut owned_args: Vec<String> = Vec::with_capacity(2 + config_pairs.len() * 2);
+        owned_args.push("config".to_string());
+        owned_args.push("set-all".to_string());
+        for &(key, value, is_secret) in config_pairs {
+            owned_args.push(if is_secret {
+                "--secret".to_string()
+            } else {
+                "--plaintext".to_string()
+            });
+            owned_args.push(format!("{key}={value}"));
         }
+        let arg_refs: Vec<&str> = owned_args.iter().map(String::as_str).collect();
+        run_pulumi_cmd(&program_dir, &arg_refs).await?;
     }
 
     run_pulumi_cmd(&program_dir, &["up", "--yes", "--non-interactive"]).await?;
@@ -1987,16 +1996,12 @@ async fn install_stage0_core_addons(
     )
     .await?;
 
-    if artifacts
+    let needs_seaweedfs_sync = artifacts
         .management_stack
         .spec
         .backend
         .as_deref()
-        .is_some_and(|b| b.contains("s3-state-backend-seaweedfs-s3.keel-system.svc.cluster.local"))
-    {
-        sync_in_cluster_s3_credentials_from_seaweedfs(ctx, kc).await?;
-        ensure_seaweedfs_pulumi_bucket(ctx, kc).await?;
-    }
+        .is_some_and(|b| b.contains("s3-state-backend-seaweedfs-s3.keel-system.svc.cluster.local"));
 
     let metric_templates_yaml = format!(
         "apiVersion: flagger.app/v1beta1\n\
@@ -2032,9 +2037,108 @@ async fn install_stage0_core_addons(
          \x20     sum(rate(envoy_cluster_upstream_rq_time_bucket{{envoy_cluster_name=~\"httproute/{{{{ namespace }}}}/{{{{ target }}}}/.*\"}}[{{{{ interval }}}}])) by (le)\n\
          \x20   )\n"
     );
-    run_kubectl_apply(ctx, kc, &metric_templates_yaml).await?;
+    let kyverno_yaml = artifacts.kyverno_bundle.to_multi_doc_yaml()?;
+    let docker_proxy_yaml = artifacts.kyverno_bundle.policy_exception.as_ref().map(|_| {
+        format!(
+            "apiVersion: apps/v1\n\
+             kind: Deployment\n\
+             metadata:\n\
+             \x20 name: keel-docker-proxy\n\
+             \x20 namespace: {FLUX_SYSTEM_NAMESPACE}\n\
+             \x20 labels:\n\
+             \x20   app.kubernetes.io/managed-by: keel\n\
+             \x20   keel.io/local-dev-only: \"true\"\n\
+             spec:\n\
+             \x20 replicas: 1\n\
+             \x20 selector:\n\
+             \x20   matchLabels:\n\
+             \x20     app: keel-docker-proxy\n\
+             \x20 template:\n\
+             \x20   metadata:\n\
+             \x20     labels:\n\
+             \x20       app: keel-docker-proxy\n\
+             \x20   spec:\n\
+             \x20     containers:\n\
+             \x20       - name: socat\n\
+             \x20         image: alpine/socat:latest\n\
+             \x20         args:\n\
+             \x20           - -t\n\
+             \x20           - \"600\"\n\
+             \x20           - TCP-LISTEN:2375,fork,reuseaddr\n\
+             \x20           - UNIX-CONNECT:/var/run/docker.sock\n\
+             \x20         ports:\n\
+             \x20           - containerPort: 2375\n\
+             \x20         volumeMounts:\n\
+             \x20           - name: docker-sock\n\
+             \x20             mountPath: /var/run/docker.sock\n\
+             \x20     volumes:\n\
+             \x20       - name: docker-sock\n\
+             \x20         hostPath:\n\
+             \x20           path: /var/run/docker.sock\n\
+             \x20           type: Socket\n\
+             ---\n\
+             apiVersion: v1\n\
+             kind: Service\n\
+             metadata:\n\
+             \x20 name: keel-docker-proxy\n\
+             \x20 namespace: {FLUX_SYSTEM_NAMESPACE}\n\
+             \x20 labels:\n\
+             \x20   app.kubernetes.io/managed-by: keel\n\
+             \x20   keel.io/local-dev-only: \"true\"\n\
+             spec:\n\
+             \x20 selector:\n\
+             \x20   app: keel-docker-proxy\n\
+             \x20 ports:\n\
+             \x20   - port: 2375\n\
+             \x20     targetPort: 2375\n\
+             ---\n\
+             apiVersion: networking.k8s.io/v1\n\
+             kind: NetworkPolicy\n\
+             metadata:\n\
+             \x20 name: allow-keel-docker-proxy\n\
+             \x20 namespace: {FLUX_SYSTEM_NAMESPACE}\n\
+             \x20 labels:\n\
+             \x20   app.kubernetes.io/managed-by: keel\n\
+             \x20   keel.io/local-dev-only: \"true\"\n\
+             spec:\n\
+             \x20 podSelector:\n\
+             \x20   matchLabels:\n\
+             \x20     app: keel-docker-proxy\n\
+             \x20 policyTypes:\n\
+             \x20   - Ingress\n\
+             \x20 ingress:\n\
+             \x20   - from:\n\
+             \x20       - namespaceSelector: {{}}\n\
+             \x20         podSelector:\n\
+             \x20           matchLabels:\n\
+             \x20             auto.pulumi.com/component: workspace\n\
+             \x20     ports:\n\
+             \x20       - port: 2375\n\
+             \x20         protocol: TCP\n"
+        )
+    });
 
-    if let Some(ref rauthy_cfg) = artifacts.rauthy_config {
+    let infra_setup_fut = async {
+        if needs_seaweedfs_sync {
+            sync_in_cluster_s3_credentials_from_seaweedfs(ctx, kc).await?;
+            ensure_seaweedfs_pulumi_bucket(ctx, kc).await?;
+        }
+        run_kubectl_apply(ctx, kc, &metric_templates_yaml).await?;
+        tracing::info!("Applying Kyverno policies & management core Stack");
+        run_kubectl_apply(ctx, kc, &kyverno_yaml).await?;
+        if let Some(ref proxy_yaml) = docker_proxy_yaml {
+            tracing::info!(
+                "Deploying local-dev Docker socket proxy in flux-system for nested kind"
+            );
+            run_kubectl_apply(ctx, kc, proxy_yaml).await?;
+        }
+        Ok::<(), CliError>(())
+    };
+
+    let rauthy_fut = async {
+        let Some(ref rauthy_cfg) = artifacts.rauthy_config else {
+            return Ok::<(), CliError>(());
+        };
         tracing::info!("Applying cert-manager self-signed CA & keel-wildcard-tls Certificate");
         let ca_yaml = format!(
             "apiVersion: cert-manager.io/v1\n\
@@ -2176,49 +2280,6 @@ async fn install_stage0_core_addons(
         );
         run_kubectl_apply(ctx, kc, &gateway_yaml).await?;
 
-        if with_forge {
-            tracing::info!(
-                "Installing in-cluster Forgejo Git forge via Pulumi (`control-plane-forgejo`)"
-            );
-            run_pulumi_control_plane_stack(
-                "control-plane-forgejo",
-                CONTROL_PLANE_FORGEJO_PULUMI_YAML,
-                &connection.cluster_name,
-                &[
-                    ("kubeconfig", &connection.kubeconfig_yaml, true),
-                    ("kubeContext", kube_context, false),
-                ],
-            )
-            .await?;
-
-            let forgejo_route_yaml = format!(
-                "apiVersion: gateway.networking.k8s.io/v1\n\
-                 kind: HTTPRoute\n\
-                 metadata:\n\
-                 \x20 name: forgejo-ingress\n\
-                 \x20 namespace: {KEEL_SYSTEM_NAMESPACE}\n\
-                 \x20 labels:\n\
-                 \x20   app.kubernetes.io/managed-by: keel\n\
-                 spec:\n\
-                 \x20 parentRefs:\n\
-                 \x20   - name: keel-ingress\n\
-                 \x20     namespace: {KEEL_SYSTEM_NAMESPACE}\n\
-                 \x20     sectionName: https-local\n\
-                 \x20 hostnames:\n\
-                 \x20   - forgejo.keel.local\n\
-                 \x20 rules:\n\
-                 \x20   - matches:\n\
-                 \x20       - path:\n\
-                 \x20           type: PathPrefix\n\
-                 \x20           value: /\n\
-                 \x20     backendRefs:\n\
-                 \x20       - name: forgejo-http\n\
-                 \x20         port: 3000\n"
-            );
-            run_kubectl_apply(ctx, kc, &forgejo_route_yaml).await?;
-            configure_coredns_local_rewrites(ctx, kc).await;
-        }
-
         let groups_b64 = STANDARD.encode(rauthy_cfg.groups_json.as_bytes());
         let users_b64 = STANDARD.encode(rauthy_cfg.users_json.as_bytes());
         let clients_b64 = STANDARD.encode(rauthy_cfg.clients_json.as_bytes());
@@ -2241,8 +2302,13 @@ async fn install_stage0_core_addons(
                 ("rauthySecretNamespace", &rauthy_cfg.secret_namespace, false),
             ],
         )
-        .await?;
-    } else if with_forge {
+        .await
+    };
+
+    let forgejo_fut = async {
+        if !with_forge {
+            return Ok::<(), CliError>(());
+        }
         tracing::info!(
             "Installing in-cluster Forgejo Git forge via Pulumi (`control-plane-forgejo`)"
         );
@@ -2255,93 +2321,38 @@ async fn install_stage0_core_addons(
                 ("kubeContext", kube_context, false),
             ],
         )
-        .await?;
-    }
+        .await
+    };
 
-    tracing::info!("Applying Kyverno policies & management core Stack");
-    let kyverno_yaml = artifacts.kyverno_bundle.to_multi_doc_yaml()?;
-    run_kubectl_apply(ctx, kc, &kyverno_yaml).await?;
+    tokio::try_join!(infra_setup_fut, rauthy_fut, forgejo_fut)?;
 
-    if artifacts.kyverno_bundle.policy_exception.is_some() {
-        tracing::info!("Deploying local-dev Docker socket proxy in flux-system for nested kind");
-        let docker_proxy_yaml = format!(
-            "apiVersion: apps/v1\n\
-             kind: Deployment\n\
+    if with_forge && artifacts.rauthy_config.is_some() {
+        let forgejo_route_yaml = format!(
+            "apiVersion: gateway.networking.k8s.io/v1\n\
+             kind: HTTPRoute\n\
              metadata:\n\
-             \x20 name: keel-docker-proxy\n\
-             \x20 namespace: {FLUX_SYSTEM_NAMESPACE}\n\
+             \x20 name: forgejo-ingress\n\
+             \x20 namespace: {KEEL_SYSTEM_NAMESPACE}\n\
              \x20 labels:\n\
              \x20   app.kubernetes.io/managed-by: keel\n\
-             \x20   keel.io/local-dev-only: \"true\"\n\
              spec:\n\
-             \x20 replicas: 1\n\
-             \x20 selector:\n\
-             \x20   matchLabels:\n\
-             \x20     app: keel-docker-proxy\n\
-             \x20 template:\n\
-             \x20   metadata:\n\
-             \x20     labels:\n\
-             \x20       app: keel-docker-proxy\n\
-             \x20   spec:\n\
-             \x20     containers:\n\
-             \x20       - name: socat\n\
-             \x20         image: alpine/socat:latest\n\
-             \x20         args:\n\
-             \x20           - -t\n\
-             \x20           - \"600\"\n\
-             \x20           - TCP-LISTEN:2375,fork,reuseaddr\n\
-             \x20           - UNIX-CONNECT:/var/run/docker.sock\n\
-             \x20         ports:\n\
-             \x20           - containerPort: 2375\n\
-             \x20         volumeMounts:\n\
-             \x20           - name: docker-sock\n\
-             \x20             mountPath: /var/run/docker.sock\n\
-             \x20     volumes:\n\
-             \x20       - name: docker-sock\n\
-             \x20         hostPath:\n\
-             \x20           path: /var/run/docker.sock\n\
-             \x20           type: Socket\n\
-             ---\n\
-             apiVersion: v1\n\
-             kind: Service\n\
-             metadata:\n\
-             \x20 name: keel-docker-proxy\n\
-             \x20 namespace: {FLUX_SYSTEM_NAMESPACE}\n\
-             \x20 labels:\n\
-             \x20   app.kubernetes.io/managed-by: keel\n\
-             \x20   keel.io/local-dev-only: \"true\"\n\
-             spec:\n\
-             \x20 selector:\n\
-             \x20   app: keel-docker-proxy\n\
-             \x20 ports:\n\
-             \x20   - port: 2375\n\
-             \x20     targetPort: 2375\n\
-             ---\n\
-             apiVersion: networking.k8s.io/v1\n\
-             kind: NetworkPolicy\n\
-             metadata:\n\
-             \x20 name: allow-keel-docker-proxy\n\
-             \x20 namespace: {FLUX_SYSTEM_NAMESPACE}\n\
-             \x20 labels:\n\
-             \x20   app.kubernetes.io/managed-by: keel\n\
-             \x20   keel.io/local-dev-only: \"true\"\n\
-             spec:\n\
-             \x20 podSelector:\n\
-             \x20   matchLabels:\n\
-             \x20     app: keel-docker-proxy\n\
-             \x20 policyTypes:\n\
-             \x20   - Ingress\n\
-             \x20 ingress:\n\
-             \x20   - from:\n\
-             \x20       - namespaceSelector: {{}}\n\
-             \x20         podSelector:\n\
-             \x20           matchLabels:\n\
-             \x20             auto.pulumi.com/component: workspace\n\
-             \x20     ports:\n\
-             \x20       - port: 2375\n\
-             \x20         protocol: TCP\n"
+             \x20 parentRefs:\n\
+             \x20   - name: keel-ingress\n\
+             \x20     namespace: {KEEL_SYSTEM_NAMESPACE}\n\
+             \x20     sectionName: https-local\n\
+             \x20 hostnames:\n\
+             \x20   - forgejo.keel.local\n\
+             \x20 rules:\n\
+             \x20   - matches:\n\
+             \x20       - path:\n\
+             \x20           type: PathPrefix\n\
+             \x20           value: /\n\
+             \x20     backendRefs:\n\
+             \x20       - name: forgejo-http\n\
+             \x20         port: 3000\n"
         );
-        run_kubectl_apply(ctx, kc, &docker_proxy_yaml).await?;
+        run_kubectl_apply(ctx, kc, &forgejo_route_yaml).await?;
+        configure_coredns_local_rewrites(ctx, kc).await;
     }
 
     let mgmt_sa_name = artifacts
@@ -2454,6 +2465,92 @@ async fn install_stage0_core_addons(
     Ok(())
 }
 
+#[cfg(debug_assertions)]
+/// Best-effort DX helper: if a local `keel-zot-cache` Docker container is running (via `just zot-up`),
+/// wire containerd `certs.d` mirrors on the newly created `kind` nodes before Stage 0 addons pull images.
+/// Has zero effect when `keel-zot-cache` is not running or on non-`kind` targets.
+async fn maybe_wire_local_zot_mirror(cluster_name: &str) {
+    let inspect = tokio::process::Command::new("docker")
+        .args(["inspect", "-f", "{{.State.Running}}", "keel-zot-cache"])
+        .output()
+        .await;
+    let Ok(out) = inspect else {
+        return;
+    };
+    if !out.status.success() || String::from_utf8_lossy(&out.stdout).trim() != "true" {
+        return;
+    }
+
+    let _ = tokio::process::Command::new("docker")
+        .args(["network", "connect", "kind", "keel-zot-cache"])
+        .output()
+        .await;
+
+    let nodes_out = tokio::process::Command::new("kind")
+        .args(["get", "nodes", "--name", cluster_name])
+        .output()
+        .await;
+    let Ok(nodes_out) = nodes_out else {
+        return;
+    };
+    if !nodes_out.status.success() {
+        return;
+    }
+
+    let nodes: Vec<String> = String::from_utf8_lossy(&nodes_out.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect();
+    if nodes.is_empty() {
+        return;
+    }
+
+    const MIRRORS: &[(&str, &str)] = &[
+        ("docker.io", "https://registry-1.docker.io"),
+        ("ghcr.io", "https://ghcr.io"),
+        ("quay.io", "https://quay.io"),
+        ("registry.k8s.io", "https://registry.k8s.io"),
+    ];
+
+    for node in &nodes {
+        for (reg, upstream) in MIRRORS {
+            let dir = format!("/etc/containerd/certs.d/{reg}");
+            let file = format!("{dir}/hosts.toml");
+            let mkdir_ok = tokio::process::Command::new("docker")
+                .args(["exec", node, "mkdir", "-p", &dir])
+                .output()
+                .await
+                .is_ok_and(|o| o.status.success());
+            if !mkdir_ok {
+                continue;
+            }
+            let content = format!(
+                "server = \"{upstream}\"\n\n[host.\"http://keel-zot-cache:5000\"]\n  capabilities = [\"pull\", \"resolve\"]\n"
+            );
+            if let Ok(mut child) = tokio::process::Command::new("docker")
+                .args(["exec", "-i", node, "tee", &file])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+            {
+                if let Some(mut stdin) = child.stdin.take() {
+                    use tokio::io::AsyncWriteExt;
+                    let _ = stdin.write_all(content.as_bytes()).await;
+                    let _ = stdin.shutdown().await;
+                }
+                let _ = child.wait().await;
+            }
+        }
+        tracing::info!(
+            node = %node,
+            "Wired local Zot pull-through cache (`keel-zot-cache:5000`) into kind containerd"
+        );
+    }
+}
+
 /// Executes `keel bootstrap init` using an injected [`BootstrapTarget`] driver.
 pub async fn execute_bootstrap_init_with_target(
     args: &BootstrapInitArgs,
@@ -2471,6 +2568,11 @@ pub async fn execute_bootstrap_init_with_target(
     );
 
     let connection = target.provision_cluster(&cfg).await?;
+
+    #[cfg(debug_assertions)]
+    if cfg.target.as_str() == "kind" {
+        maybe_wire_local_zot_mirror(&cfg.cluster_name).await;
+    }
 
     let repo_url_override = if let Some(git_url) = args.git_url.as_deref() {
         Some(git_url.trim().to_string())
