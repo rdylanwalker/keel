@@ -349,6 +349,125 @@ agent-e2e:
     pnpm --dir e2e lint --quiet
     pnpm --dir e2e typecheck
 
+# ------------------------------------------------------------------------------
+# Local DX Pull-Through Registry Cache (Zot) — host/WSL-only, not deployed to clusters
+# ------------------------------------------------------------------------------
+
+# Start a long-lived local Zot pull-through cache container (`keel-zot-cache`) on the `kind` network
+zot-up:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cfg_dir="${HOME}/.cache/keel"
+    cfg_file="${cfg_dir}/zot-config.json"
+    mkdir -p "$cfg_dir"
+    cat > "$cfg_file" <<'EOF'
+    {
+      "distSpecVersion": "1.1.0",
+      "storage": {
+        "rootDirectory": "/var/lib/registry",
+        "dedupe": true,
+        "gc": true,
+        "gcDelay": "1h",
+        "gcInterval": "24h"
+      },
+      "http": {
+        "address": "0.0.0.0",
+        "port": "5000"
+      },
+      "log": {
+        "level": "info"
+      },
+      "extensions": {
+        "sync": {
+          "enable": true,
+          "registries": [
+            { "urls": ["https://registry-1.docker.io"], "onDemand": true, "tlsVerify": true },
+            { "urls": ["https://ghcr.io"], "onDemand": true, "tlsVerify": true },
+            { "urls": ["https://quay.io"], "onDemand": true, "tlsVerify": true },
+            { "urls": ["https://registry.k8s.io"], "onDemand": true, "tlsVerify": true }
+          ]
+        }
+      }
+    }
+    EOF
+    docker network inspect kind >/dev/null 2>&1 || docker network create kind >/dev/null
+    docker volume inspect keel-zot-cache-data >/dev/null 2>&1 || docker volume create keel-zot-cache-data >/dev/null
+    if docker ps -a --format '{{ "{{" }}.Names{{ "}}" }}' | grep -qx 'keel-zot-cache'; then
+        if docker ps --format '{{ "{{" }}.Names{{ "}}" }}' | grep -qx 'keel-zot-cache'; then
+            echo "keel-zot-cache is already running on 127.0.0.1:5050 (kind network: http://keel-zot-cache:5000)."
+        else
+            docker start keel-zot-cache >/dev/null
+            echo "Started existing keel-zot-cache container on 127.0.0.1:5050."
+        fi
+    else
+        docker run -d \
+            --name keel-zot-cache \
+            --restart unless-stopped \
+            --network kind \
+            -p 127.0.0.1:5050:5000 \
+            -v keel-zot-cache-data:/var/lib/registry \
+            -v "${cfg_file}:/etc/zot/config.json:ro" \
+            ghcr.io/project-zot/zot-minimal-linux-amd64:latest \
+            serve /etc/zot/config.json >/dev/null
+        echo "Started keel-zot-cache on 127.0.0.1:5050 (kind network: http://keel-zot-cache:5000)."
+    fi
+    echo "Run 'just zot-wire <cluster-name>' to point an existing kind cluster's containerd at the cache."
+
+# Configure containerd on an existing kind cluster's nodes to pull through `keel-zot-cache` (falls back to upstream if stopped)
+zot-wire cluster="keel-mgmt":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    nodes=$(kind get nodes --name "{{cluster}}" 2>/dev/null || true)
+    if [ -z "$nodes" ]; then
+        echo "No kind nodes found for cluster '{{cluster}}'." >&2
+        exit 1
+    fi
+    for node in $nodes; do
+        for reg_pair in \
+            "docker.io|https://registry-1.docker.io" \
+            "ghcr.io|https://ghcr.io" \
+            "quay.io|https://quay.io" \
+            "registry.k8s.io|https://registry.k8s.io"; do
+            reg="${reg_pair%%|*}"
+            upstream="${reg_pair##*|}"
+            docker exec -i "$node" sh -c "mkdir -p /etc/containerd/certs.d/${reg} && cat > /etc/containerd/certs.d/${reg}/hosts.toml" <<EOF
+    server = "${upstream}"
+
+    [host."http://keel-zot-cache:5000"]
+      capabilities = ["pull", "resolve"]
+    EOF
+        done
+        echo "Wired containerd certs.d mirrors on node ${node}."
+    done
+
+# Show status of the local Zot pull-through cache container and volume
+zot-status:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    docker ps -a --filter "name=^/keel-zot-cache$" --format 'table {{ "{{" }}.Names{{ "}}" }}\t{{ "{{" }}.Status{{ "}}" }}\t{{ "{{" }}.Ports{{ "}}" }}'
+    if curl -fsS http://127.0.0.1:5050/v2/ >/dev/null 2>&1; then
+        echo "Registry /v2/ endpoint: healthy (http://127.0.0.1:5050/v2/)"
+    else
+        echo "Registry /v2/ endpoint: unreachable"
+    fi
+
+# Stop and remove the local Zot cache container (pass `purge` to also delete cached image volume)
+zot-down mode="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if docker ps -a --format '{{ "{{" }}.Names{{ "}}" }}' | grep -qx 'keel-zot-cache'; then
+        docker rm -f keel-zot-cache >/dev/null
+        echo "Removed keel-zot-cache container."
+    else
+        echo "keel-zot-cache container is not present."
+    fi
+    if [ "{{mode}}" = "purge" ]; then
+        if docker volume inspect keel-zot-cache-data >/dev/null 2>&1; then
+            docker volume rm keel-zot-cache-data >/dev/null
+            echo "Removed keel-zot-cache-data volume."
+        fi
+    fi
+
 # Stop keel serve, delete the local kind management cluster, and remove local GitOps repos
 down cluster_name="keel-mgmt" repo_dir="./keel-gitops":
     #!/usr/bin/env bash
