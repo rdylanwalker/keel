@@ -227,22 +227,41 @@ spec:
     }
 }
 
-async fn login_and_get_cookie(fixture: &TestFixture) -> String {
+async fn login_with_groups_and_name(
+    fixture: &TestFixture,
+    sub: &str,
+    name: &str,
+    groups: Vec<&str>,
+) -> String {
     let session_key = fixture
         .secret_store
         .get_or_create_session_key()
         .await
         .unwrap();
     let claims = SessionClaims {
-        sub: "admin@keel.local".to_string(),
-        email: Some("admin@keel.local".to_string()),
-        name: Some("Keel Admin".to_string()),
-        groups: vec!["keel-admins".to_string()],
+        sub: sub.to_string(),
+        email: Some(sub.to_string()),
+        name: Some(name.to_string()),
+        groups: groups.into_iter().map(str::to_string).collect(),
         auth_phase: AuthPhase::OidcActive,
         exp: chrono::Utc::now().timestamp() + 3600,
     };
     let token = encrypt_session_token(&session_key, &claims).unwrap();
     format!("{SESSION_COOKIE_NAME}={token}")
+}
+
+async fn login_with_groups(fixture: &TestFixture, sub: &str, groups: Vec<&str>) -> String {
+    login_with_groups_and_name(fixture, sub, sub, groups).await
+}
+
+async fn login_and_get_cookie(fixture: &TestFixture) -> String {
+    login_with_groups_and_name(
+        fixture,
+        "admin@keel.local",
+        "Keel Admin",
+        vec!["keel-admins"],
+    )
+    .await
 }
 
 #[tokio::test]
@@ -2550,6 +2569,208 @@ spec:
         .await
         .unwrap();
     assert_eq!(missing_cfg.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_tenant_admin_scoped_merge_reject_reopen_and_escalation_guards() {
+    let fixture = setup_fixture().await;
+    let app = build_router(fixture.state.clone());
+
+    let acme_dev_cookie = login_with_groups(&fixture, "dev@acme.local", vec!["tenant-acme"]).await;
+    let acme_admin_cookie =
+        login_with_groups(&fixture, "admin@acme.local", vec!["tenant-acme-admin"]).await;
+    let cluster_admin_cookie = login_and_get_cookie(&fixture).await;
+
+    // 1. tenant-acme-admin cannot create or delete tenants (cluster-admin only)
+    let create_tenant_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/tenants")
+                .header(COOKIE, &acme_admin_cookie)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({ "id": "beta" }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_tenant_res.status(), StatusCode::FORBIDDEN);
+
+    // 2. tenant-acme developer opens a scoped app PR in `acme`
+    let prop_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/proposals")
+                .header(COOKIE, &acme_dev_cookie)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "catalogId": "grafana",
+                        "kind": "app",
+                        "tenant": "acme",
+                        "name": "acme-grafana",
+                        "values": { "replicas": 2 }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(prop_res.status(), StatusCode::CREATED);
+    let prop_json: Value =
+        serde_json::from_slice(&prop_res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let acme_pr_id = prop_json["proposal"]["id"].as_str().unwrap().to_string();
+
+    // 3. Plain `tenant-acme` developer cannot merge the PR
+    let dev_merge_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/v1/proposals/{acme_pr_id}/merge"))
+                .header(COOKIE, &acme_dev_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(dev_merge_res.status(), StatusCode::FORBIDDEN);
+
+    // 4. `tenant-acme-admin` CAN reject, reopen, and merge the scoped `acme` PR
+    let reject_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/v1/proposals/{acme_pr_id}/reject"))
+                .header(COOKIE, &acme_admin_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reject_res.status(), StatusCode::OK);
+
+    let reopen_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/v1/proposals/{acme_pr_id}/reopen"))
+                .header(COOKIE, &acme_admin_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reopen_res.status(), StatusCode::OK);
+
+    let admin_merge_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/v1/proposals/{acme_pr_id}/merge"))
+                .header(COOKIE, &acme_admin_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(admin_merge_res.status(), StatusCode::OK);
+
+    // 5. `tenant-acme-admin` CANNOT merge a PR that modifies `tenants/acme/rbac.yaml`
+    let rbac_branch = "keel/acme/escalate-rbac-1700000001";
+    {
+        let _guard = fixture.state.git_lock.lock().await;
+        fixture
+            .state
+            .git_runner
+            .sync_branch_from_remote(&fixture.state.repo_workdir, "origin", "main")
+            .await
+            .unwrap();
+        fixture
+            .state
+            .git_runner
+            .checkout_new_branch(&fixture.state.repo_workdir, rbac_branch)
+            .await
+            .unwrap();
+        tokio::fs::write(
+            fixture.state.repo_workdir.join("tenants/acme/rbac.yaml"),
+            "kind: Namespace\nmetadata:\n  name: tenant-acme\n",
+        )
+        .await
+        .unwrap();
+        fixture
+            .state
+            .git_runner
+            .add(&fixture.state.repo_workdir, ["tenants/acme/rbac.yaml"])
+            .await
+            .unwrap();
+        fixture
+            .state
+            .git_runner
+            .commit(
+                &fixture.state.repo_workdir,
+                "chore(acme): attempt rbac change",
+                &keel_git::CommitAuthor::new("Acme Admin", "admin@acme.local"),
+            )
+            .await
+            .unwrap();
+        fixture
+            .state
+            .git_runner
+            .push(&fixture.state.repo_workdir, "origin", rbac_branch)
+            .await
+            .unwrap();
+        fixture
+            .state
+            .git_runner
+            .checkout_branch(&fixture.state.repo_workdir, "main")
+            .await
+            .unwrap();
+    }
+    let rbac_pr = fixture
+        .state
+        .forge
+        .create_pull_request(
+            keel_git::CreatePrRequest::new("Attempt RBAC edit", "test", rbac_branch)
+                .with_tenant("acme"),
+        )
+        .await
+        .unwrap();
+
+    let blocked_rbac_merge = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/v1/proposals/{}/merge", rbac_pr.id))
+                .header(COOKIE, &acme_admin_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(blocked_rbac_merge.status(), StatusCode::FORBIDDEN);
+
+    // 6. Cluster admin (`keel-admins`) CAN merge the `rbac.yaml` PR
+    let cluster_merge = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/v1/proposals/{}/merge", rbac_pr.id))
+                .header(COOKIE, &cluster_admin_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cluster_merge.status(), StatusCode::OK);
 }
 
 #[tokio::test]

@@ -76,9 +76,34 @@ impl AuthSession {
         }
     }
 
-    /// Enforces access to `tenant_id` (either cluster admin or member of `<tenant_id>` / `tenant-<tenant_id>`).
-    pub fn require_tenant_access(&self, tenant_id: &str) -> Result<(), ServerError> {
+    /// Returns `true` when the caller holds cluster-admin or tenant-scoped admin privileges for `tenant_id`
+    /// (member of `keel-admins`, `tenant-<tenant_id>-admin`, or `<tenant_id>-admin`).
+    pub fn is_tenant_admin(&self, tenant_id: &str) -> bool {
         if self.is_admin() {
+            return true;
+        }
+        let prefixed = format!("tenant-{tenant_id}-admin");
+        let short = format!("{tenant_id}-admin");
+        self.claims
+            .groups
+            .iter()
+            .any(|g| g == &prefixed || g == &short)
+    }
+
+    /// Enforces tenant-scoped admin privileges for `tenant_id`, returning `403 Forbidden` otherwise.
+    pub fn require_tenant_admin(&self, tenant_id: &str) -> Result<(), ServerError> {
+        if self.is_tenant_admin(tenant_id) {
+            Ok(())
+        } else {
+            Err(ServerError::Forbidden(format!(
+                "Tenant administrator privileges required for '{tenant_id}'"
+            )))
+        }
+    }
+
+    /// Enforces access to `tenant_id` (cluster admin, tenant admin, or member of `<tenant_id>` / `tenant-<tenant_id>`).
+    pub fn require_tenant_access(&self, tenant_id: &str) -> Result<(), ServerError> {
+        if self.is_tenant_admin(tenant_id) {
             return Ok(());
         }
         let prefixed = format!("tenant-{tenant_id}");

@@ -24,6 +24,7 @@ use keel_core::{
 };
 use keel_git::{
     CommitAuthor, CreatePrRequest, PullRequestComment, PullRequestInfo, PullRequestState,
+    parse_proposal_branch_tenant,
 };
 use keel_kube::{
     CrdReconcileStatus, CrdWatchEvent, FlaggerCanarySpecInput, FluxDependencyRef,
@@ -3937,13 +3938,171 @@ pub struct MergeProposalResponse {
     pub gc_plan: GcPlan,
 }
 
+/// Validates that a PR's changed files are strictly scoped to `tenants/<tenant>/` (excluding `rbac.yaml`)
+/// and only tenant-scoped additions/removals in `tenants/kustomization.yaml`.
+fn validate_tenant_admin_pr_paths(
+    tenant: &str,
+    changed_files: &[String],
+    kustomization_diff: Option<&str>,
+) -> Result<(), ServerError> {
+    if changed_files.is_empty() {
+        return Err(ServerError::Forbidden(
+            "Tenant administrators can only manage PRs with verified tenant-scoped file changes"
+                .to_string(),
+        ));
+    }
+    let tenant_prefix = format!("tenants/{tenant}/");
+    let rbac_path = format!("tenants/{tenant}/rbac.yaml");
+    for path in changed_files {
+        let trimmed = path.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed == rbac_path {
+            return Err(ServerError::Forbidden(format!(
+                "Tenant administrators cannot modify '{rbac_path}'"
+            )));
+        }
+        if trimmed.starts_with(&tenant_prefix) {
+            continue;
+        }
+        if trimmed == "tenants/kustomization.yaml" {
+            let diff = kustomization_diff.ok_or_else(|| {
+                ServerError::Forbidden(
+                    "Unable to verify 'tenants/kustomization.yaml' diff for tenant admin merge"
+                        .to_string(),
+                )
+            })?;
+            let kustomize_prefix = format!("{tenant}/");
+            for line in diff.lines() {
+                if line.starts_with("+++")
+                    || line.starts_with("---")
+                    || line.starts_with("@@")
+                    || line.starts_with("diff ")
+                    || line.starts_with("index ")
+                {
+                    continue;
+                }
+                if let Some(rest) = line.strip_prefix('+').or_else(|| line.strip_prefix('-')) {
+                    let item = rest.trim();
+                    if matches!(
+                        item,
+                        "apiVersion: kustomize.config.k8s.io/v1beta1"
+                            | "kind: Kustomization"
+                            | "resources:"
+                            | ""
+                    ) {
+                        continue;
+                    }
+                    let Some(entry) = item.strip_prefix('-').map(str::trim) else {
+                        return Err(ServerError::Forbidden(
+                            "Tenant administrators may only add/remove resource entries in 'tenants/kustomization.yaml'"
+                                .to_string(),
+                        ));
+                    };
+                    if !entry.starts_with(&kustomize_prefix) {
+                        return Err(ServerError::Forbidden(format!(
+                            "Tenant administrators cannot modify '{entry}' in 'tenants/kustomization.yaml'"
+                        )));
+                    }
+                }
+            }
+            continue;
+        }
+        return Err(ServerError::Forbidden(format!(
+            "Tenant administrators cannot manage PRs modifying '{trimmed}'"
+        )));
+    }
+    Ok(())
+}
+
+/// Authorizes `merge_proposal`, `reject_proposal`, and `reopen_proposal` for either cluster admins
+/// (`keel-admins`) or tenant-scoped admins (`tenant-<id>-admin`) when the PR is strictly scoped to `<id>`.
+async fn require_pr_tenant_admin_access(
+    auth: &AuthSession,
+    state: &AppState,
+    pr_id: &str,
+    expected_state: Option<PullRequestState>,
+) -> Result<(), ServerError> {
+    if auth.is_admin() {
+        return Ok(());
+    }
+
+    let prs = state.forge.list_pull_requests(None, expected_state).await?;
+    let pr = prs
+        .into_iter()
+        .find(|p| p.id == pr_id)
+        .ok_or_else(|| ServerError::NotFound(format!("Pull request '{pr_id}' not found")))?;
+
+    let tenant = parse_proposal_branch_tenant(&pr.source_branch).ok_or_else(|| {
+        ServerError::Forbidden(format!(
+            "PR #{pr_id} branch '{}' is not scoped to a tenant",
+            pr.source_branch
+        ))
+    })?;
+    auth.require_tenant_admin(tenant)?;
+
+    if !tokio::fs::try_exists(state.repo_workdir.join(".git"))
+        .await
+        .unwrap_or(false)
+    {
+        return Err(ServerError::Forbidden(
+            "Git workdir unavailable to verify PR file scope for tenant administrator".to_string(),
+        ));
+    }
+
+    let (changed_files, kustomization_diff) = {
+        let _git_guard = state.git_lock.lock().await;
+        let _ = state.git_runner.fetch(&state.repo_workdir, "origin").await;
+        let range = format!("origin/main...origin/{}", pr.source_branch);
+        let diff_out = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(&state.repo_workdir)
+            .args(["diff", "--name-only", &range])
+            .output()
+            .await
+            .map_err(|e| ServerError::Internal(format!("failed to run git diff: {e}")))?;
+        if !diff_out.status.success() {
+            return Err(ServerError::Forbidden(format!(
+                "Unable to verify changed files on PR #{pr_id} for tenant administrator"
+            )));
+        }
+        let files: Vec<String> = String::from_utf8_lossy(&diff_out.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect();
+
+        let k_diff = if files.iter().any(|f| f == "tenants/kustomization.yaml") {
+            let k_out = tokio::process::Command::new("git")
+                .arg("-C")
+                .arg(&state.repo_workdir)
+                .args(["diff", "-U0", &range, "--", "tenants/kustomization.yaml"])
+                .output()
+                .await
+                .map_err(|e| ServerError::Internal(format!("failed to run git diff: {e}")))?;
+            if k_out.status.success() {
+                Some(String::from_utf8_lossy(&k_out.stdout).into_owned())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        (files, k_diff)
+    };
+
+    validate_tenant_admin_pr_paths(tenant, &changed_files, kustomization_diff.as_deref())
+}
+
 /// `POST /api/v1/proposals/{pr_id}/merge`
 pub async fn merge_proposal(
     auth: AuthSession,
     State(state): State<AppState>,
     AxumPath(pr_id): AxumPath<String>,
 ) -> Result<Json<MergeProposalResponse>, ServerError> {
-    auth.require_admin()?;
+    require_pr_tenant_admin_access(&auth, &state, &pr_id, Some(PullRequestState::Open)).await?;
     let merged = state.forge.merge_pull_request(&pr_id).await?;
 
     // Sync local repo_workdir to origin/main so subsequent catalog/tenant/stack/release reads reflect the merge.
@@ -3989,7 +4148,7 @@ pub async fn reject_proposal(
     State(state): State<AppState>,
     AxumPath(pr_id): AxumPath<String>,
 ) -> Result<Json<MergeProposalResponse>, ServerError> {
-    auth.require_admin()?;
+    require_pr_tenant_admin_access(&auth, &state, &pr_id, Some(PullRequestState::Open)).await?;
     let closed = state.forge.close_pull_request(&pr_id).await?;
 
     let cached = state.preview_cache.write().await.remove(&pr_id);
@@ -4022,7 +4181,7 @@ pub async fn reopen_proposal(
     State(state): State<AppState>,
     AxumPath(pr_id): AxumPath<String>,
 ) -> Result<Json<MergeProposalResponse>, ServerError> {
-    auth.require_admin()?;
+    require_pr_tenant_admin_access(&auth, &state, &pr_id, Some(PullRequestState::Closed)).await?;
     let reopened = state.forge.reopen_pull_request(&pr_id).await?;
 
     Ok(Json(MergeProposalResponse {
