@@ -1,3 +1,10 @@
+## [0.6.4](https://github.com/rdylanwalker/keel/compare/v0.6.3...v0.6.4) (2026-11-17)
+
+
+### Bug Fixes
+
+* **cli:** handle Kyverno webhook startup race and existing S3 bucket ([ec66c3d](https://github.com/rdylanwalker/keel/commit/ec66c3d8c34158ccb54d831b2997ddab8b1becec))
+
 ## [0.6.3](https://github.com/rdylanwalker/keel/compare/v0.6.2...v0.6.3) (2026-11-17)
 
 
