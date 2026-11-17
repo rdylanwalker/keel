@@ -433,6 +433,9 @@ describe("App top-level application component", () => {
 
     const tenantSelect = await screen.findByLabelText("Active Tenant")
     expect(tenantSelect).toHaveValue("")
+    expect(
+      Array.from((tenantSelect as HTMLSelectElement).options).map((o) => o.text)
+    ).toEqual(["All Tenants", "default", "acme"])
 
     await act(async () => {
       fireEvent.change(tenantSelect, { target: { value: "acme" } })

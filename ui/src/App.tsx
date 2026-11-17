@@ -331,7 +331,7 @@ export const App: React.FC = () => {
         <div className="flex items-center space-x-3">
           {(authStatus.authenticated || isDemoMode()) &&
             (showTenantSwitcher ? (
-              <div className="hidden sm:flex items-center space-x-2 text-xs bg-slate-950 px-3 py-1.5 rounded-lg border border-slate-800">
+              <div className="hidden sm:flex items-center space-x-2 h-9 text-xs bg-slate-950 px-3 rounded-lg border border-slate-800">
                 <span className="w-2 h-2 rounded-full bg-emerald-400"></span>
                 <label
                   htmlFor="header-tenant-select"
@@ -355,13 +355,13 @@ export const App: React.FC = () => {
                       value={t.id}
                       className="bg-slate-900 text-slate-200"
                     >
-                      {t.namespace}
+                      {t.id}
                     </option>
                   ))}
                 </select>
               </div>
             ) : (
-              <div className="hidden sm:flex items-center space-x-2 text-xs bg-slate-950 px-3 py-1.5 rounded-lg border border-slate-800">
+              <div className="hidden sm:flex items-center space-x-2 h-9 text-xs bg-slate-950 px-3 rounded-lg border border-slate-800">
                 <span className="w-2 h-2 rounded-full bg-emerald-400"></span>
                 <span className="text-slate-400">Tenant:</span>
                 <span className="font-mono font-semibold text-slate-200">
@@ -372,7 +372,7 @@ export const App: React.FC = () => {
 
           {authStatus.authenticated ? (
             <div className="flex items-center space-x-2">
-              <span className="flex items-center space-x-2 text-xs bg-slate-950 text-slate-100 border border-slate-700 px-3 py-1.5 rounded-lg font-medium">
+              <span className="flex items-center space-x-2 h-9 text-xs bg-slate-950 text-slate-100 border border-slate-700 px-3 rounded-lg font-medium">
                 <ShieldCheck className="h-3.5 w-3.5 text-emerald-400 shrink-0" />
                 <span>{userDisplayLabel}</span>
                 {authStatus.isAdmin ? (
