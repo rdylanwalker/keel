@@ -3,19 +3,21 @@ import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { DemoRecorder } from '../scripts/demo-recorder.js';
 
 const LIVE_ENABLED = process.env.KEEL_E2E_LIVE === '1';
 const RECORD_DEMO = process.env.KEEL_E2E_RECORD_DEMO === '1';
-const DEMO_GIF_PATH = path.resolve(
+const DEMO_VIDEO_PATH = path.resolve(
   process.cwd(),
-  process.env.KEEL_DEMO_GIF_PATH || '../docs/assets/demo.gif',
+  process.env.KEEL_DEMO_VIDEO_PATH || '../docs/assets/demo.webm',
 );
 
 if (RECORD_DEMO) {
   test.use({
     viewport: { width: 1280, height: 800 },
-    video: 'on',
+    video: {
+      mode: 'on',
+      size: { width: 1280, height: 800 },
+    },
   });
 }
 const MGMT_CLUSTER = process.env.KEEL_E2E_MGMT_CLUSTER || 'keel-mgmt';
@@ -120,6 +122,90 @@ async function waitForNamespace(name: string, timeoutMs = 120_000): Promise<void
     await new Promise((r) => setTimeout(r, 3000));
   }
   throw new Error(`Timed out waiting for namespace/${name} to become Active`);
+}
+
+async function installDemoCursorOverlay(page: import('@playwright/test').Page): Promise<void> {
+  await page.addInitScript(() => {
+    const init = () => {
+      if (document.getElementById('keel-demo-cursor')) return;
+      const cursor = document.createElement('div');
+      cursor.id = 'keel-demo-cursor';
+      cursor.style.cssText = [
+        'position:fixed',
+        'left:-100px',
+        'top:-100px',
+        'width:24px',
+        'height:24px',
+        'pointer-events:none',
+        'z-index:2147483647',
+        'transform:translate(-2px,-2px)',
+        'transition:transform 60ms ease-out',
+      ].join(';');
+      cursor.innerHTML =
+        '<svg viewBox="0 0 24 24" width="24" height="24" fill="none" xmlns="http://www.w3.org/2000/svg">' +
+        '<path d="M4 2L20 12L12.5 14L9.5 21L4 2Z" fill="#ffffff" stroke="#0f172a" stroke-width="1.8" stroke-linejoin="round"/>' +
+        '</svg>';
+      document.documentElement.appendChild(cursor);
+
+      const move = (x: number, y: number) => {
+        cursor.style.left = `${x}px`;
+        cursor.style.top = `${y}px`;
+      };
+
+      window.addEventListener(
+        'mousemove',
+        (e) => {
+          move(e.clientX, e.clientY);
+        },
+        { capture: true, passive: true },
+      );
+
+      window.addEventListener(
+        'mousedown',
+        (e) => {
+          move(e.clientX, e.clientY);
+          cursor.style.transform = 'translate(-2px,-2px) scale(0.88)';
+          const ripple = document.createElement('div');
+          ripple.style.cssText = [
+            'position:fixed',
+            `left:${e.clientX}px`,
+            `top:${e.clientY}px`,
+            'width:14px',
+            'height:14px',
+            'border-radius:9999px',
+            'border:2.5px solid #38bdf8',
+            'background:rgba(56,189,248,0.25)',
+            'pointer-events:none',
+            'z-index:2147483646',
+            'transform:translate(-50%,-50%) scale(0.6)',
+            'opacity:1',
+            'transition:transform 380ms ease-out, opacity 380ms ease-out',
+          ].join(';');
+          document.documentElement.appendChild(ripple);
+          requestAnimationFrame(() => {
+            ripple.style.transform = 'translate(-50%,-50%) scale(2.4)';
+            ripple.style.opacity = '0';
+          });
+          setTimeout(() => ripple.remove(), 420);
+        },
+        { capture: true, passive: true },
+      );
+
+      window.addEventListener(
+        'mouseup',
+        () => {
+          cursor.style.transform = 'translate(-2px,-2px) scale(1)';
+        },
+        { capture: true, passive: true },
+      );
+    };
+
+    if (document.documentElement) {
+      init();
+    } else {
+      window.addEventListener('DOMContentLoaded', init, { once: true });
+    }
+  });
 }
 
 async function signInViaRauthy(
@@ -355,15 +441,15 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
   test('07.1 - CLI standalone app on mgmt -> GUI bundle workload kind cluster -> GUI standalone canary app on workload cluster', async ({
     page,
   }) => {
-    const demo = new DemoRecorder(RECORD_DEMO);
+    if (RECORD_DEMO) {
+      await installDemoCursorOverlay(page);
+    }
 
     await test.step('1. Authenticate in GUI via Rauthy OIDC', async () => {
       logStep('Opening GUI and signing in via Rauthy OIDC...');
       await page.goto('/');
       await expect(page.getByText('Keel Control Plane')).toBeVisible();
-      await demo.capture(page, 'login-page', 700);
       await signInViaRauthy(page, 'admin@keel.local', adminPassword);
-      await demo.capture(page, 'topology-mgmt-initial', 1000);
       logStep('Authenticated and management-cluster-core is visible');
     });
 
@@ -438,13 +524,11 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
       await expect(page.getByRole('button', { name: /Merge PR/i }).first()).toBeVisible({
         timeout: 15_000,
       });
-      await demo.capture(page, 'pr-inspector-cli-podinfo', 900);
       await page
         .getByRole('button', { name: /Merge PR/i })
         .first()
         .click();
       await expect(page.getByText(/merged cleanly/i)).toBeVisible({ timeout: 20_000 });
-      await demo.capture(page, 'pr-merged-cli-podinfo', 700);
     });
 
     await test.step('3. GUI Bundle: Submit & merge workload kind cluster + addons PR (kind-canary-platform)', async () => {
@@ -465,26 +549,21 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
           .filter({ has: page.getByText('kind-canary-platform', { exact: true }) })
           .first();
         await expect(bundleCard).toBeVisible({ timeout: 15_000 });
-        await demo.capture(page, 'catalog-list', 900);
         await bundleCard.getByRole('button', { name: 'Create' }).click();
 
         await page.locator('#instance-name-input').fill(WORKLOAD_CLUSTER);
-        await demo.capture(page, 'catalog-bundle-form', 900);
         await page.getByRole('button', { name: /Submit & Open Git PR Proposal/i }).click();
         await expect(page.getByText(/Git PR Proposal Successfully Opened!/i)).toBeVisible({
           timeout: 20_000,
         });
-        await demo.capture(page, 'bundle-pr-opened', 700);
 
         logStep('Merging kind-canary-platform bundle PR...');
         await page.getByRole('button', { name: /PR & Preview Inspector/i }).click();
-        await demo.burst(page, 'bundle-preview-inspector', 3, 400, 400);
         await page
           .getByRole('button', { name: /Merge PR/i })
           .first()
           .click();
         await expect(page.getByText(/merged cleanly/i)).toBeVisible({ timeout: 20_000 });
-        await demo.capture(page, 'bundle-pr-merged', 700);
       }
     });
 
@@ -723,7 +802,6 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
         if (await apiTokenInput.isVisible()) {
           await apiTokenInput.fill('e2e-workload-token-1234');
         }
-        await demo.capture(page, 'canary-app-form', 900);
         await page.getByRole('button', { name: /Submit & Open Git PR Proposal/i }).click();
         await expect(page.getByText(/Git PR Proposal Successfully Opened!/i)).toBeVisible({
           timeout: 20_000,
@@ -731,7 +809,6 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
 
         logStep('Merging workload-cluster podinfo PR...');
         await page.getByRole('button', { name: /PR & Preview Inspector/i }).click();
-        await demo.capture(page, 'canary-app-pr-inspector', 900);
         await page
           .getByRole('button', { name: /Merge PR/i })
           .first()
@@ -756,8 +833,17 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
         timeout: 20_000,
       });
       await expect(page.getByText(workloadAppName).first()).toBeVisible({ timeout: 20_000 });
-      await demo.burst(page, 'topology-final', 3, 500, 900);
-      await demo.finish(DEMO_GIF_PATH);
+      await page.evaluate('window.scrollTo(0, document.body.scrollHeight)');
+      await page.waitForTimeout(1000);
+      if (RECORD_DEMO) {
+        const video = page.video();
+        await page.close();
+        if (video) {
+          fs.mkdirSync(path.dirname(DEMO_VIDEO_PATH), { recursive: true });
+          await video.saveAs(DEMO_VIDEO_PATH);
+          logStep(`Saved demo video to ${DEMO_VIDEO_PATH}`);
+        }
+      }
       logStep('Topology Map verification complete');
     });
   });

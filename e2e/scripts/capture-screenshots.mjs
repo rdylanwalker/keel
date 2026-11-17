@@ -18,6 +18,12 @@ const OUTPUT_DIR = path.resolve(
 
 const PAGES = [
   { id: 'topology', label: 'Topology Map', filename: 'topology.png' },
+  {
+    id: 'topology-events',
+    label: 'Topology Map',
+    filename: 'topology-events.png',
+    scrollToBottom: true,
+  },
   { id: 'catalog', label: 'Catalog & Form Wizard', filename: 'catalog.png' },
   { id: 'preview', label: 'PR & Preview Inspector', filename: 'preview.png' },
   { id: 'providers', label: 'Control Plane & Providers', filename: 'providers.png' },
@@ -154,6 +160,13 @@ async function main() {
       // Wait for lazy-loaded view and any initial API requests to settle.
       await page.waitForLoadState('networkidle').catch(() => {});
       await page.waitForTimeout(800);
+
+      if (entry.scrollToBottom) {
+        await page.evaluate('window.scrollTo(0, document.body.scrollHeight)');
+        await page.waitForTimeout(400);
+      } else {
+        await page.evaluate('window.scrollTo(0, 0)');
+      }
 
       const destPath = path.join(OUTPUT_DIR, entry.filename);
       await page.screenshot({ path: destPath, fullPage: false });
