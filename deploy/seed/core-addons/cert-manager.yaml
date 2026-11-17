@@ -1,0 +1,87 @@
+# cert-manager & Self-Signed Control-Plane CA (`SDD.md` §2.1, §5.2)
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: cert-manager
+  namespace: keel-system
+  labels:
+    app.kubernetes.io/managed-by: keel
+    keel.io/protect: "true"
+spec:
+  interval: 10m
+  chart:
+    spec:
+      chart: cert-manager
+      version: "v1.21.3"
+      sourceRef:
+        kind: HelmRepository
+        name: jetstack
+        namespace: keel-system
+  install:
+    crds: CreateReplace
+  upgrade:
+    crds: CreateReplace
+    timeout: 5m
+    remediation:
+      retries: 1
+      strategy: rollback
+  values:
+    crds:
+      enabled: true
+---
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: keel-selfsigned
+  labels:
+    app.kubernetes.io/managed-by: keel
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: keel-ca
+  namespace: keel-system
+  labels:
+    app.kubernetes.io/managed-by: keel
+spec:
+  isCA: true
+  commonName: keel-local-ca
+  secretName: keel-ca-secret
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+  issuerRef:
+    name: keel-selfsigned
+    kind: ClusterIssuer
+    group: cert-manager.io
+---
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: keel-ca-issuer
+  labels:
+    app.kubernetes.io/managed-by: keel
+spec:
+  ca:
+    secretName: keel-ca-secret
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: keel-wildcard-tls
+  namespace: keel-system
+  labels:
+    app.kubernetes.io/managed-by: keel
+spec:
+  secretName: keel-wildcard-tls
+  dnsNames:
+    - "*.keel.local"
+    - idp.keel.local
+    - forgejo.keel.local
+    - keel.keel.local
+  issuerRef:
+    name: keel-ca-issuer
+    kind: ClusterIssuer
+    group: cert-manager.io

@@ -1,0 +1,27 @@
+# Rauthy OIDC Identity Provider Core Addon Catalog Application
+apiVersion: keel.io/v1alpha1
+kind: CatalogApplication
+metadata:
+  id: rauthy
+  name: Rauthy OIDC Provider
+  description: Lightweight Rust OpenID Connect identity provider with Admin UI for users, groups, and OIDC clients.
+  category: management-core
+  runtime: kustomize
+spec:
+  upstream:
+    chart: rauthy
+    repoURL: https://github.com/sebadob/rauthy
+    version: "0.37.2"
+  progressiveDelivery:
+    flaggerSupported: false
+    defaultCanary: false
+  serviceUrl: https://idp.keel.local:8888/auth/v1/admin
+  schema:
+    type: object
+    properties:
+      replicas:
+        type: integer
+        title: Replica Count
+        default: 1
+        minimum: 1
+        maximum: 5

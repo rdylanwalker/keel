@@ -77,3 +77,14 @@ metadata:
 spec:
   interval: 30m
   url: https://charts.dexidp.io
+---
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: HelmRepository
+metadata:
+  name: jetstack
+  namespace: keel-system
+  labels:
+    app.kubernetes.io/managed-by: keel
+spec:
+  interval: 30m
+  url: https://charts.jetstack.io

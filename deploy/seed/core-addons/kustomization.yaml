@@ -9,4 +9,5 @@ resources:
   - envoy-gateway.yaml
   - prometheus.yaml
   - flagger.yaml
-  - dex.yaml
+  - cert-manager.yaml
+  - rauthy.yaml

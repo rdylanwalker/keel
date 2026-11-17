@@ -51,6 +51,17 @@ spec:
       allowedRoutes:
         namespaces:
           from: All
+    - name: https-local
+      protocol: HTTPS
+      port: 8888
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - kind: Secret
+            name: keel-wildcard-tls
+      allowedRoutes:
+        namespaces:
+          from: All
     - name: https
       protocol: HTTPS
       port: 443

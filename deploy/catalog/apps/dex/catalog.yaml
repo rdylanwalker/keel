@@ -1,11 +1,11 @@
-# Dex OIDC Identity Provider Core Addon Catalog Application
+# Dex OIDC Identity Provider Catalog Application
 apiVersion: keel.io/v1alpha1
 kind: CatalogApplication
 metadata:
   id: dex
   name: Dex OIDC Provider
-  description: OpenID Connect identity provider providing authentication and federated user management for Keel control plane.
-  category: management-core
+  description: OpenID Connect identity provider providing authentication and federated user management.
+  category: security-identity
   runtime: helm
 spec:
   upstream:

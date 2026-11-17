@@ -37,13 +37,15 @@ resources:
             password: keel-admin-dev
             email: admin@keel.local
           config:
+            server:
+              ROOT_URL: "https://forgejo.keel.local:8888/"
             database:
               DB_TYPE: sqlite3
             oauth2_client:
               ENABLE_AUTO_REGISTRATION: true
               ACCOUNT_LINKING: auto
               USERNAME: userid
-              OPENID_CONNECT_SCOPES: openid email profile
+              OPENID_CONNECT_SCOPES: openid email profile groups
         persistence:
           enabled: false
         valkey-cluster:
@@ -54,3 +56,18 @@ resources:
           enabled: false
         postgresql-ha:
           enabled: false
+        extraVolumes:
+          - name: keel-ca
+            secret:
+              secretName: keel-wildcard-tls
+              items:
+                - key: ca.crt
+                  path: ca.crt
+        extraVolumeMounts:
+          - name: keel-ca
+            mountPath: /etc/ssl/keel-ca
+            readOnly: true
+        deployment:
+          env:
+            - name: SSL_CERT_DIR
+              value: /etc/ssl/certs:/etc/ssl/keel-ca

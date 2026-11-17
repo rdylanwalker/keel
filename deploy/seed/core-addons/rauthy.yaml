@@ -1,0 +1,165 @@
+# Rauthy OIDC Identity Provider (`SDD.md` §2.1, §6.1, §6.3, `NFR-SEC-01`)
+# Apache-2.0 licensed, lightweight Rust OIDC provider with embedded Hiqlite DB,
+# Admin UI for users/groups/clients, and declarative first-boot JSON seeding.
+apiVersion: v1
+kind: Service
+metadata:
+  name: rauthy
+  namespace: keel-system
+  labels:
+    app.kubernetes.io/managed-by: keel
+    app: rauthy
+    keel.io/protect: "true"
+spec:
+  selector:
+    app: rauthy
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rauthy-headless
+  namespace: keel-system
+  labels:
+    app.kubernetes.io/managed-by: keel
+    app: rauthy
+    keel.io/protect: "true"
+spec:
+  type: ClusterIP
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app: rauthy
+  ports:
+    - name: hiqlite-raft
+      port: 8100
+      targetPort: 8100
+    - name: hiqlite-api
+      port: 8200
+      targetPort: 8200
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: rauthy
+  namespace: keel-system
+  labels:
+    app.kubernetes.io/managed-by: keel
+    app: rauthy
+    keel.io/protect: "true"
+spec:
+  serviceName: rauthy-headless
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rauthy
+  template:
+    metadata:
+      labels:
+        app: rauthy
+    spec:
+      securityContext:
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: rauthy
+          image: ghcr.io/sebadob/rauthy:0.37.2
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            capabilities:
+              drop:
+                - ALL
+          ports:
+            - containerPort: 8080
+              name: http
+            - containerPort: 8100
+              name: hiqlite-raft
+            - containerPort: 8200
+              name: hiqlite-api
+          volumeMounts:
+            - name: rauthy-data
+              mountPath: /app/data
+            - name: rauthy-config
+              mountPath: /app/config.toml
+              subPath: config.toml
+              readOnly: true
+            - name: rauthy-bootstrap
+              mountPath: /app/bootstrap
+              readOnly: true
+          readinessProbe:
+            httpGet:
+              scheme: HTTP
+              port: 8200
+              path: /ready
+            initialDelaySeconds: 5
+            periodSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              scheme: HTTP
+              port: 8080
+              path: /auth/v1/health
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            failureThreshold: 3
+          resources:
+            requests:
+              memory: 128Mi
+              cpu: 100m
+      volumes:
+        - name: rauthy-config
+          secret:
+            secretName: rauthy-config
+            items:
+              - key: config.toml
+                path: config.toml
+        - name: rauthy-bootstrap
+          secret:
+            secretName: rauthy-config
+            items:
+              - key: groups.json
+                path: groups.json
+              - key: users.json
+                path: users.json
+              - key: clients.json
+                path: clients.json
+  volumeClaimTemplates:
+    - metadata:
+        name: rauthy-data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 128Mi
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: rauthy-ingress
+  namespace: keel-system
+  labels:
+    app.kubernetes.io/managed-by: keel
+    keel.io/protect: "true"
+spec:
+  parentRefs:
+    - name: keel-ingress
+      namespace: keel-system
+      sectionName: https-local
+  hostnames:
+    - idp.keel.local
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        - name: rauthy
+          port: 8080

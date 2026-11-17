@@ -247,3 +247,23 @@ resources:
         metricsServer: http://prometheus.keel-system.svc.cluster.local:80
         podMonitor:
           enabled: false
+
+  certManager:
+    type: kubernetes:helm.sh/v3:Release
+    options:
+      provider: ${k8sProvider}
+      dependsOn:
+        - ${keelSystemNamespace}
+    properties:
+      name: cert-manager
+      chart: cert-manager
+      version: v1.21.3
+      repositoryOpts:
+        repo: https://charts.jetstack.io
+      namespace: keel-system
+      createNamespace: true
+      waitForJobs: true
+      timeout: 300
+      values:
+        crds:
+          enabled: true

@@ -1,0 +1,34 @@
+# cert-manager Core Addon Catalog Application
+apiVersion: keel.io/v1alpha1
+kind: CatalogApplication
+metadata:
+  id: cert-manager
+  name: cert-manager
+  description: Automated X.509 certificate management and self-signed/ACME ClusterIssuers for Kubernetes.
+  category: management-core
+  runtime: helm
+spec:
+  upstream:
+    chart: cert-manager
+    repoURL: https://charts.jetstack.io
+    version: "v1.21.3"
+  progressiveDelivery:
+    flaggerSupported: false
+    defaultCanary: false
+  schema:
+    type: object
+    properties:
+      replicaCount:
+        type: integer
+        title: Controller Replicas
+        default: 1
+        minimum: 1
+        maximum: 5
+      crds:
+        type: object
+        title: CRD Management
+        properties:
+          enabled:
+            type: boolean
+            title: Install CRDs
+            default: true

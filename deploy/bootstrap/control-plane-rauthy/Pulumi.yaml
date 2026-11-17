@@ -1,0 +1,202 @@
+# Stage 0 In-Cluster Rauthy OIDC Identity Provider (`SDD.md` §2.1, §6.1, `NFR-SEC-01`)
+# Installed by default when no external `--oidc-issuer` is provided and `--oidc-provider` is `rauthy`.
+name: keel-stage0-control-plane-rauthy
+runtime: yaml
+description: Stage 0 in-cluster Rauthy OIDC provider, bootstrap config Secret, and Gateway HTTPRoute in keel-system
+
+config:
+  kubeconfig:
+    type: string
+  kubeContext:
+    type: string
+    default: ""
+  rauthyConfigToml:
+    type: string
+  rauthyGroupsB64:
+    type: string
+  rauthyUsersB64:
+    type: string
+  rauthyClientsB64:
+    type: string
+  rauthySecretName:
+    type: string
+    default: rauthy-config
+  rauthySecretNamespace:
+    type: string
+    default: keel-system
+
+resources:
+  k8sProvider:
+    type: pulumi:providers:kubernetes
+    properties:
+      kubeconfig: ${kubeconfig}
+      context: ${kubeContext}
+      enableServerSideApply: true
+
+  rauthyConfigSecret:
+    type: kubernetes:core/v1:Secret
+    options:
+      provider: ${k8sProvider}
+    properties:
+      metadata:
+        name: ${rauthySecretName}
+        namespace: ${rauthySecretNamespace}
+        labels:
+          app.kubernetes.io/managed-by: keel
+          keel.io/secret-kind: rauthy-config
+      type: Opaque
+      stringData:
+        config.toml: ${rauthyConfigToml}
+      data:
+        groups.json: ${rauthyGroupsB64}
+        users.json: ${rauthyUsersB64}
+        clients.json: ${rauthyClientsB64}
+
+  rauthyService:
+    type: kubernetes:core/v1:Service
+    options:
+      provider: ${k8sProvider}
+    properties:
+      metadata:
+        name: rauthy
+        namespace: ${rauthySecretNamespace}
+        labels:
+          app.kubernetes.io/managed-by: keel
+          app: rauthy
+      spec:
+        selector:
+          app: rauthy
+        ports:
+          - name: http
+            port: 8080
+            targetPort: 8080
+
+  rauthyHeadlessService:
+    type: kubernetes:core/v1:Service
+    options:
+      provider: ${k8sProvider}
+    properties:
+      metadata:
+        name: rauthy-headless
+        namespace: ${rauthySecretNamespace}
+        labels:
+          app.kubernetes.io/managed-by: keel
+          app: rauthy
+      spec:
+        type: ClusterIP
+        clusterIP: None
+        publishNotReadyAddresses: true
+        selector:
+          app: rauthy
+        ports:
+          - name: hiqlite-raft
+            port: 8100
+            targetPort: 8100
+          - name: hiqlite-api
+            port: 8200
+            targetPort: 8200
+
+  rauthyStatefulSet:
+    type: kubernetes:apps/v1:StatefulSet
+    options:
+      provider: ${k8sProvider}
+      dependsOn:
+        - ${rauthyConfigSecret}
+        - ${rauthyService}
+        - ${rauthyHeadlessService}
+    properties:
+      metadata:
+        name: rauthy
+        namespace: ${rauthySecretNamespace}
+        labels:
+          app.kubernetes.io/managed-by: keel
+          app: rauthy
+      spec:
+        serviceName: rauthy-headless
+        replicas: 1
+        selector:
+          matchLabels:
+            app: rauthy
+        template:
+          metadata:
+            labels:
+              app: rauthy
+          spec:
+            securityContext:
+              fsGroup: 10001
+              seccompProfile:
+                type: RuntimeDefault
+            containers:
+              - name: rauthy
+                image: ghcr.io/sebadob/rauthy:0.37.2
+                securityContext:
+                  allowPrivilegeEscalation: false
+                  runAsNonRoot: true
+                  runAsUser: 10001
+                  runAsGroup: 10001
+                  capabilities:
+                    drop:
+                      - ALL
+                ports:
+                  - containerPort: 8080
+                    name: http
+                  - containerPort: 8100
+                    name: hiqlite-raft
+                  - containerPort: 8200
+                    name: hiqlite-api
+                volumeMounts:
+                  - name: rauthy-data
+                    mountPath: /app/data
+                  - name: rauthy-config
+                    mountPath: /app/config.toml
+                    subPath: config.toml
+                    readOnly: true
+                  - name: rauthy-bootstrap
+                    mountPath: /app/bootstrap
+                    readOnly: true
+                readinessProbe:
+                  httpGet:
+                    scheme: HTTP
+                    port: 8200
+                    path: /ready
+                  initialDelaySeconds: 5
+                  periodSeconds: 3
+                  failureThreshold: 3
+                livenessProbe:
+                  httpGet:
+                    scheme: HTTP
+                    port: 8080
+                    path: /auth/v1/health
+                  initialDelaySeconds: 30
+                  periodSeconds: 20
+                  failureThreshold: 3
+                resources:
+                  requests:
+                    memory: 128Mi
+                    cpu: 100m
+            volumes:
+              - name: rauthy-config
+                secret:
+                  secretName: ${rauthySecretName}
+                  items:
+                    - key: config.toml
+                      path: config.toml
+              - name: rauthy-bootstrap
+                secret:
+                  secretName: ${rauthySecretName}
+                  items:
+                    - key: groups.json
+                      path: groups.json
+                    - key: users.json
+                      path: users.json
+                    - key: clients.json
+                      path: clients.json
+        volumeClaimTemplates:
+          - metadata:
+              name: rauthy-data
+            spec:
+              accessModes:
+                - ReadWriteOnce
+              resources:
+                requests:
+                  storage: 128Mi
