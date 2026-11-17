@@ -108,9 +108,66 @@ async function waitForK8sReady(
   throw new Error(`Timed out waiting for ${kind}/${name} in ${namespace} to become Ready=True`);
 }
 
+async function waitForNamespace(name: string, timeoutMs = 120_000): Promise<void> {
+  const start = Date.now();
+  const deadline = start + timeoutMs;
+  while (Date.now() < deadline) {
+    const res = tryCmd('kubectl', ['get', 'namespace', name, '-o', 'jsonpath={.status.phase}']);
+    if (res.ok && res.stdout === 'Active') {
+      logStep(`Namespace ${name} is Active`);
+      return;
+    }
+    await new Promise((r) => setTimeout(r, 3000));
+  }
+  throw new Error(`Timed out waiting for namespace/${name} to become Active`);
+}
+
+async function signInViaRauthy(
+  page: import('@playwright/test').Page,
+  email: string,
+  password: string,
+): Promise<void> {
+  await page.goto('/');
+  await expect(page.getByText('Keel Control Plane')).toBeVisible();
+
+  if (await page.getByText('Authentication Required').isVisible()) {
+    await page
+      .getByRole('button', { name: /Sign in with OIDC/i })
+      .first()
+      .click();
+    const emailInput = page
+      .locator(
+        'input[type="email"], input[name="email"], input[name="login"], input#login, input[autocomplete="username"]',
+      )
+      .first();
+    await expect(emailInput).toBeVisible({ timeout: 20_000 });
+    await emailInput.fill(email);
+
+    const passwordInput = page
+      .locator('input[type="password"], input[name="password"], input#password')
+      .first();
+    if (!(await passwordInput.isVisible({ timeout: 1_000 }).catch(() => false))) {
+      await page.locator('button[type="submit"]').first().click();
+    }
+    await expect(passwordInput).toBeVisible({ timeout: 10_000 });
+    await passwordInput.fill(password);
+    await page.locator('button[type="submit"], #submit-login').first().click();
+
+    const grantBtn = page.getByRole('button', { name: /Grant Access/i });
+    if (await grantBtn.isVisible({ timeout: 2_000 }).catch(() => false)) {
+      await grantBtn.click();
+    }
+  }
+
+  await expect(page.getByText('management-cluster-core', { exact: true })).toBeVisible({
+    timeout: 30_000,
+  });
+}
+
 // Note: `keel bootstrap init --target kind` provisions the `kind` management cluster
 // via `deploy/bootstrap/kind/Pulumi.yaml` (`tehcyx/kind`) instead of direct `kind create cluster`.
 test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', () => {
+  test.describe.configure({ mode: 'serial' });
   test.skip(
     !LIVE_ENABLED,
     'Set KEEL_E2E_LIVE=1 (or run `pnpm --dir e2e test:live`) to run live kind E2E',
@@ -120,6 +177,7 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
   let serveProc: ChildProcess | null = null;
   let tmpRepoDir: string | null = null;
   const adminPassword = process.env.KEEL_ADMIN_PASSWORD || 'KeelE2eAdminPass123!';
+  const acmePassword = process.env.KEEL_ACME_PASSWORD || 'KeelE2eAcmePass123!';
 
   test.beforeAll(async () => {
     const clusters = tryCmd('kind', ['get', 'clusters']).stdout.split(/\r?\n/).filter(Boolean);
@@ -296,39 +354,7 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
       await page.goto('/');
       await expect(page.getByText('Keel Control Plane')).toBeVisible();
       await demo.capture(page, 'login-page', 700);
-
-      if (await page.getByText('Authentication Required').isVisible()) {
-        await page
-          .getByRole('button', { name: /Sign in with OIDC/i })
-          .first()
-          .click();
-        const emailInput = page
-          .locator(
-            'input[type="email"], input[name="email"], input[name="login"], input#login, input[autocomplete="username"]',
-          )
-          .first();
-        await expect(emailInput).toBeVisible({ timeout: 20_000 });
-        await emailInput.fill('admin@keel.local');
-
-        const passwordInput = page
-          .locator('input[type="password"], input[name="password"], input#password')
-          .first();
-        if (!(await passwordInput.isVisible({ timeout: 1_000 }).catch(() => false))) {
-          await page.locator('button[type="submit"]').first().click();
-        }
-        await expect(passwordInput).toBeVisible({ timeout: 10_000 });
-        await passwordInput.fill(adminPassword);
-        await page.locator('button[type="submit"], #submit-login').first().click();
-
-        const grantBtn = page.getByRole('button', { name: /Grant Access/i });
-        if (await grantBtn.isVisible({ timeout: 2_000 }).catch(() => false)) {
-          await grantBtn.click();
-        }
-      }
-
-      await expect(page.getByText('management-cluster-core', { exact: true })).toBeVisible({
-        timeout: 30_000,
-      });
+      await signInViaRauthy(page, 'admin@keel.local', adminPassword);
       await demo.capture(page, 'topology-mgmt-initial', 1000);
       logStep('Authenticated and management-cluster-core is visible');
     });
@@ -542,5 +568,236 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
       await demo.finish(DEMO_GIF_PATH);
       logStep('Topology Map verification complete');
     });
+
+    await test.step('6. Admin: Create tenant acme and seed Rauthy group/user acme@keel.local', async () => {
+      const existingTenant = tryCmd('kubectl', ['get', 'namespace', 'tenant-acme']);
+      if (existingTenant.ok) {
+        logStep('Namespace tenant-acme already exists; skipping GUI tenant creation');
+      } else {
+        logStep('Creating tenant "acme" via GUI (+ New Tenant)...');
+        await page.getByRole('button', { name: /Catalog & Form Wizard/i }).click();
+        await page.getByRole('button', { name: /\+ New Tenant/i }).click();
+        await page.getByLabel(/Tenant ID/i).fill('acme');
+        await page.getByRole('button', { name: /Create Tenant PR/i }).click();
+        await expect(page.getByText(/Git PR Proposal Successfully Opened!/i)).toBeVisible({
+          timeout: 20_000,
+        });
+
+        await page.getByRole('button', { name: /PR & Preview Inspector/i }).click();
+        await expect(page.getByRole('heading', { name: /create tenant acme/i })).toBeVisible({
+          timeout: 15_000,
+        });
+        await page
+          .getByRole('button', { name: /Merge PR/i })
+          .first()
+          .click();
+        await expect(page.getByText(/merged cleanly/i)).toBeVisible({ timeout: 20_000 });
+        await waitForNamespace('tenant-acme', 120_000);
+      }
+
+      logStep('Seeding Rauthy group "tenant-acme" and non-admin user "acme@keel.local"...');
+      const rauthyPage = await page.context().newPage();
+      try {
+        await rauthyPage.goto('https://idp.keel.local:8888/auth/v1/admin');
+        const emailInput = rauthyPage
+          .locator('input[type="email"], input[name="email"], input[autocomplete="username"]')
+          .first();
+        if (await emailInput.isVisible({ timeout: 3_000 }).catch(() => false)) {
+          await emailInput.fill('admin@keel.local');
+          const passwordInput = rauthyPage
+            .locator('input[type="password"], input[name="password"]')
+            .first();
+          if (!(await passwordInput.isVisible({ timeout: 1_000 }).catch(() => false))) {
+            await rauthyPage.locator('button[type="submit"]').first().click();
+          }
+          await expect(passwordInput).toBeVisible({ timeout: 10_000 });
+          await passwordInput.fill(adminPassword);
+          await rauthyPage.locator('button[type="submit"]').first().click();
+        }
+        await rauthyPage.waitForURL(/\/auth\/v1\/admin/, { timeout: 20_000 });
+
+        await rauthyPage.evaluate(async (pwd) => {
+          const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+          let csrf = '';
+          for (let i = 0; i < 20; i++) {
+            const sRes = await fetch('/auth/v1/session');
+            if (sRes.ok) {
+              const sJson = await sRes.json();
+              if (sJson?.csrf_token) {
+                csrf = sJson.csrf_token;
+                break;
+              }
+            }
+            await sleep(500);
+          }
+          if (!csrf) throw new Error('Failed to obtain Rauthy admin CSRF token');
+
+          const headers = {
+            'content-type': 'application/json',
+            'x-csrf-token': csrf,
+          };
+
+          const gRes = await fetch('/auth/v1/groups', { headers });
+          if (!gRes.ok) throw new Error(`GET /auth/v1/groups failed: ${gRes.status}`);
+          const groups: Array<{ name: string }> = await gRes.json();
+          if (!groups.some((g) => g.name === 'tenant-acme')) {
+            const createGroupRes = await fetch('/auth/v1/groups', {
+              method: 'POST',
+              headers,
+              body: JSON.stringify({ group: 'tenant-acme' }),
+            });
+            if (!createGroupRes.ok) {
+              throw new Error(
+                `POST /auth/v1/groups failed: ${createGroupRes.status} ${await createGroupRes.text()}`,
+              );
+            }
+          }
+
+          const uRes = await fetch('/auth/v1/users', { headers });
+          if (!uRes.ok) throw new Error(`GET /auth/v1/users failed: ${uRes.status}`);
+          const users: Array<{ id: string; email: string }> = await uRes.json();
+          if (!users.some((u) => u.email === 'acme@keel.local')) {
+            const createUserRes = await fetch('/auth/v1/users', {
+              method: 'POST',
+              headers,
+              body: JSON.stringify({
+                email: 'acme@keel.local',
+                preferred_username: 'acme',
+                given_name: 'Acme',
+                family_name: 'User',
+                language: 'en',
+                groups: ['tenant-acme'],
+                roles: [],
+              }),
+            });
+            if (!createUserRes.ok) {
+              throw new Error(
+                `POST /auth/v1/users failed: ${createUserRes.status} ${await createUserRes.text()}`,
+              );
+            }
+            const createdUser: { id: string } = await createUserRes.json();
+            const updateUserRes = await fetch(`/auth/v1/users/${createdUser.id}`, {
+              method: 'PUT',
+              headers,
+              body: JSON.stringify({
+                email: 'acme@keel.local',
+                given_name: 'Acme',
+                family_name: 'User',
+                password: pwd,
+                roles: [],
+                groups: ['tenant-acme'],
+                enabled: true,
+                email_verified: true,
+              }),
+            });
+            if (!updateUserRes.ok) {
+              throw new Error(
+                `PUT /auth/v1/users/${createdUser.id} failed: ${updateUserRes.status} ${await updateUserRes.text()}`,
+              );
+            }
+          }
+        }, acmePassword);
+      } finally {
+        await rauthyPage.close();
+      }
+      logStep('Rauthy group tenant-acme and user acme@keel.local ready');
+    });
+  });
+
+  test('07.2 - Non-admin user (acme) can use tenant-acme and is denied access to other tenants', async ({
+    browser,
+  }) => {
+    const context = await browser.newContext({ ignoreHTTPSErrors: true });
+    const page = await context.newPage();
+
+    try {
+      await test.step('1. Authenticate as non-admin acme@keel.local via Rauthy OIDC', async () => {
+        logStep('Signing in as non-admin acme@keel.local...');
+        await signInViaRauthy(page, 'acme@keel.local', acmePassword);
+        logStep('Authenticated as acme@keel.local');
+      });
+
+      await test.step('2. Verify non-admin is denied access to tenant-default and admin actions', async () => {
+        const stacksDenied = await page.request.get('/api/v1/stacks?tenant=default');
+        expect(stacksDenied.status()).toBe(403);
+
+        const releasesDenied = await page.request.get('/api/v1/releases?tenant=default');
+        expect(releasesDenied.status()).toBe(403);
+
+        const proposalDenied = await page.request.post('/api/v1/proposals', {
+          data: {
+            catalogId: 'podinfo',
+            name: 'acme-denied-podinfo',
+            tenant: 'default',
+            values: { replicaCount: 1 },
+          },
+        });
+        expect(proposalDenied.status()).toBe(403);
+
+        const createTenantDenied = await page.request.post('/api/v1/tenants', {
+          data: { id: 'acme-unauthorized' },
+        });
+        expect(createTenantDenied.status()).toBe(403);
+        logStep('Confirmed 403 Forbidden for tenant-default and admin tenant creation');
+      });
+
+      await test.step('3. Verify non-admin can access and deploy into tenant-acme', async () => {
+        const stacksAllowed = await page.request.get('/api/v1/stacks?tenant=acme');
+        expect(stacksAllowed.status()).toBe(200);
+
+        const releasesAllowed = await page.request.get('/api/v1/releases?tenant=acme');
+        expect(releasesAllowed.status()).toBe(200);
+
+        const acmeAppName = 'acme-podinfo';
+        const existingApp = tryCmd('kubectl', [
+          'get',
+          'helmrelease',
+          acmeAppName,
+          '-n',
+          'tenant-acme',
+        ]);
+        if (!existingApp.ok) {
+          logStep('Deploying podinfo into tenant-acme as acme@keel.local...');
+          await page.getByRole('button', { name: /Catalog & Form Wizard/i }).click();
+          const tenantSelect = page.locator('#tenant-select-catalog');
+          await expect(tenantSelect.locator('option[value="acme"]')).toHaveCount(1, {
+            timeout: 15_000,
+          });
+          await tenantSelect.selectOption('acme');
+
+          const podinfoCard = page
+            .locator('[data-testid="catalog-list"] > div')
+            .filter({ has: page.getByText('podinfo', { exact: true }) })
+            .first();
+          await expect(podinfoCard).toBeVisible({ timeout: 15_000 });
+          await podinfoCard.getByRole('button', { name: 'Create' }).click();
+
+          await page.locator('#instance-name-input').fill(acmeAppName);
+          const apiTokenInput = page.getByLabel(/API Secret Token/i);
+          if (await apiTokenInput.isVisible()) {
+            await apiTokenInput.fill('e2e-acme-token-1234');
+          }
+          await page.getByRole('button', { name: /Submit & Open Git PR Proposal/i }).click();
+          await expect(page.getByText(/Git PR Proposal Successfully Opened!/i)).toBeVisible({
+            timeout: 20_000,
+          });
+
+          await page.getByRole('button', { name: /PR & Preview Inspector/i }).click();
+          await expect(
+            page.getByRole('heading', { name: new RegExp(acmeAppName, 'i') }).first(),
+          ).toBeVisible({ timeout: 15_000 });
+          await page
+            .getByRole('button', { name: /Merge PR/i })
+            .first()
+            .click();
+          await expect(page.getByText(/merged cleanly/i)).toBeVisible({ timeout: 20_000 });
+        }
+
+        await waitForK8sReady('helmrelease', acmeAppName, 'tenant-acme', 180_000);
+        logStep('Non-admin acme-podinfo reconciled cleanly in tenant-acme');
+      });
+    } finally {
+      await context.close();
+    }
   });
 });
