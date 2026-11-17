@@ -1,3 +1,47 @@
+# [0.6.0](https://github.com/rdylanwalker/keel/compare/v0.5.1...v0.6.0) (2026-11-17)
+
+
+### Bug Fixes
+
+* **cli:** avoid 30s timeout on preview status --watch ([8d5a1b8](https://github.com/rdylanwalker/keel/commit/8d5a1b87a6070bffa95860fbcc1f848a8d8751e1))
+* **cli:** validate secret key template and harden Forgejo bootstrap ([92f0176](https://github.com/rdylanwalker/keel/commit/92f017610be2f9fe372a5e08206cd1d371e4a845))
+* **core:** clear stale kind state on stage 0 re-bootstrap ([f7f6935](https://github.com/rdylanwalker/keel/commit/f7f693599c958f3de4ec9485222619115d93cec4))
+* **core:** harden SOPS temp file permissions and CLI path validation ([8fd337e](https://github.com/rdylanwalker/keel/commit/8fd337e7d32cbd6156ad767dfd004c65215dbd54))
+* **core:** include field details in schema validation errors ([45c66a0](https://github.com/rdylanwalker/keel/commit/45c66a020595e9c6694894d2cb4622a66899730d))
+* **deploy:** parameterize Hetzner management firewall CIDRs ([add4325](https://github.com/rdylanwalker/keel/commit/add4325e4a9e81a9fd2bcebc5fbc4a3e03c34ceb))
+* **git:** expose GitRunner log/show helpers and warn on SSH TOFU ([474e035](https://github.com/rdylanwalker/keel/commit/474e035c43ea6f1665332f20e2443ae50ebeab31))
+* **kube:** include LimitRange and reconciliation RBAC in tenant bundle ([08e2444](https://github.com/rdylanwalker/keel/commit/08e2444e5e8f96843a9a102dcc8924351d736271))
+* **kube:** validate container host before invoking docker port ([124bcb9](https://github.com/rdylanwalker/keel/commit/124bcb9ec815f24e37ac78824f9da85b8ee4eccc))
+* **kyverno:** migrate policies to policies.kyverno.io/v1 for v1.20 ([5906f46](https://github.com/rdylanwalker/keel/commit/5906f46baf138de5bc8afc9f4bc15996c2752d46))
+* **rauthy:** prevent startup crash and readiness probe restarts ([fe3e5eb](https://github.com/rdylanwalker/keel/commit/fe3e5ebb7113174f1f5f10225100e7043b98d28a))
+* **server:** add logout endpoint to clear session cookies ([c252580](https://github.com/rdylanwalker/keel/commit/c25258041debda23f20cd5787b9483c3da1a073a))
+* **server:** enforce OIDC JWKS verification, RBAC, CSRF, and SSRF guards ([e2ef2c8](https://github.com/rdylanwalker/keel/commit/e2ef2c80341afc2cd917a10eb7458bed89a7c868))
+* **server:** enforce tenant access checks on stacks, releases, and tenants list ([4188096](https://github.com/rdylanwalker/keel/commit/418809644c54eed285d5d6c8a95009b6ffe300db))
+* **server:** force OIDC prompt=login on login after logout ([91d627a](https://github.com/rdylanwalker/keel/commit/91d627a215ad85bbb4dda190ff168478a6767d3e))
+* **server:** keep tenants/kustomization.yaml synced on tenant lifecycle ([a1b6470](https://github.com/rdylanwalker/keel/commit/a1b6470c895e4d2148295dacfdedc96760db724e))
+* **ui:** call logout endpoint to clear session cookie ([b00fbb3](https://github.com/rdylanwalker/keel/commit/b00fbb3d47c49690d7136ad06560b4353908580a))
+* **ui:** keep tenant remove button mounted and disabled for default ([f6aa1d1](https://github.com/rdylanwalker/keel/commit/f6aa1d1c63980bee1541cd96d679025035491da5))
+* **ui:** make header user and admin role chips distinct ([e557bd0](https://github.com/rdylanwalker/keel/commit/e557bd06f0fb3424ef29315f06240128ea1d0a74))
+* **ui:** remove duplicate plus from New Tenant button ([bbc69e1](https://github.com/rdylanwalker/keel/commit/bbc69e1704fab3a9d3bc720649b0a86f4cff369a))
+* **ui:** remove duplicate sign-in prompts ([e46329a](https://github.com/rdylanwalker/keel/commit/e46329a7ea86096ffa7d79bca2fb4d836fb2b54a))
+* **ui:** store bearer token in memory instead of localStorage ([00ca343](https://github.com/rdylanwalker/keel/commit/00ca34309daae8674c8bcd6fb2f282fc382d7431))
+
+
+### Features
+
+* **cli:** bootstrap Rauthy, cert-manager, and Forgejo OIDC SSO ([434264b](https://github.com/rdylanwalker/keel/commit/434264ba091412b4ae5f61e0840a4654895158a6))
+* **core,server:** add serviceUrl metadata and OIDC CA/issuer support ([5817f5f](https://github.com/rdylanwalker/keel/commit/5817f5f229e7ac5e4aebbdba4d372faff1b38dc0))
+* **deploy:** replace Dex with Rauthy, add cert-manager and HTTPS gateway ([2d8d6f6](https://github.com/rdylanwalker/keel/commit/2d8d6f6d7185b735c8b5189f9cb9c384cc983d1c))
+* **server:** expose user identity and admin status in auth status ([b8eb8d8](https://github.com/rdylanwalker/keel/commit/b8eb8d83bbaf280fa6f265dc54f16a04159484cc))
+* **server:** support tenant-<id>-admin scoped PR triage and merge ([d035df4](https://github.com/rdylanwalker/keel/commit/d035df48e35a76fb39a912f477a72c8e7914e138))
+* **ui:** add header user identity pill and tenant context switcher ([a08adf6](https://github.com/rdylanwalker/keel/commit/a08adf6e928c4c7c83b34d05e563229fa820ffb3))
+* **ui:** render service link on management plane base addon cards ([fdf2829](https://github.com/rdylanwalker/keel/commit/fdf28290469ddb3e43d55e5cf6949d7a9578b9e1))
+
+
+### Performance Improvements
+
+* **cli:** parallelize Stage 0 addons and batch Pulumi config ([92eb614](https://github.com/rdylanwalker/keel/commit/92eb6146e084346d3ce3fffbdb861f423729fa95))
+
 ## [0.5.1](https://github.com/rdylanwalker/keel/compare/v0.5.0...v0.5.1) (2026-11-16)
 
 
