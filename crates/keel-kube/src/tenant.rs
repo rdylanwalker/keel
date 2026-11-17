@@ -7,8 +7,12 @@
 
 use std::collections::BTreeMap;
 
-use k8s_openapi::api::core::v1::{Namespace, ResourceQuota, ResourceQuotaSpec, ServiceAccount};
+use k8s_openapi::api::core::v1::{
+    LimitRange, LimitRangeItem, LimitRangeSpec, Namespace, ResourceQuota, ResourceQuotaSpec,
+    ServiceAccount,
+};
 use k8s_openapi::api::networking::v1::{NetworkPolicy, NetworkPolicySpec};
+use k8s_openapi::api::rbac::v1::{ClusterRoleBinding, RoleBinding, RoleRef, Subject};
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta};
 use serde::{Deserialize, Serialize};
@@ -271,23 +275,119 @@ pub fn build_tenant_default_deny_network_policy(
     })
 }
 
+/// Generates a default `LimitRange` (`default-container-resources`) so upstream Helm charts
+/// without explicit `resources.limits` satisfy the tenant `ResourceQuota`.
+pub fn build_tenant_limit_range(tenant_id: &str) -> Result<LimitRange, KubeError> {
+    let ns_name = tenant_namespace(tenant_id)?;
+
+    let mut default_limits = BTreeMap::new();
+    default_limits.insert("cpu".to_string(), Quantity("500m".to_string()));
+    default_limits.insert("memory".to_string(), Quantity("1Gi".to_string()));
+
+    let mut default_requests = BTreeMap::new();
+    default_requests.insert("cpu".to_string(), Quantity("100m".to_string()));
+    default_requests.insert("memory".to_string(), Quantity("128Mi".to_string()));
+
+    Ok(LimitRange {
+        metadata: ObjectMeta {
+            name: Some("default-container-resources".to_string()),
+            namespace: Some(ns_name),
+            labels: Some(tenant_common_labels(tenant_id)),
+            ..ObjectMeta::default()
+        },
+        spec: Some(LimitRangeSpec {
+            limits: vec![LimitRangeItem {
+                type_: "Container".to_string(),
+                default: Some(default_limits),
+                default_request: Some(default_requests),
+                ..LimitRangeItem::default()
+            }],
+        }),
+    })
+}
+
+/// Generates the namespace-scoped `RoleBinding` granting `ClusterRole/admin` to the tenant's
+/// reconciliation `ServiceAccount` inside `tenant-<tenant-id>`.
+pub fn build_tenant_admin_role_binding(
+    config: &TenantIsolationConfig,
+) -> Result<RoleBinding, KubeError> {
+    let ns_name = tenant_namespace(&config.tenant_id)?;
+    let sa_name = config.resolved_service_account_name()?;
+    let binding_name = format!("{ns_name}-admin");
+
+    Ok(RoleBinding {
+        metadata: ObjectMeta {
+            name: Some(binding_name),
+            namespace: Some(ns_name.clone()),
+            labels: Some(tenant_common_labels(&config.tenant_id)),
+            ..ObjectMeta::default()
+        },
+        role_ref: RoleRef {
+            api_group: "rbac.authorization.k8s.io".to_string(),
+            kind: "ClusterRole".to_string(),
+            name: "admin".to_string(),
+        },
+        subjects: Some(vec![Subject {
+            kind: "ServiceAccount".to_string(),
+            name: sa_name,
+            namespace: Some(ns_name),
+            api_group: None,
+        }]),
+    })
+}
+
+/// Generates the `ClusterRoleBinding` granting `system:auth-delegator` to the tenant's
+/// `ServiceAccount` so PKO v2 workspace pods can authenticate Kubernetes gRPC calls.
+pub fn build_tenant_auth_delegator_binding(
+    config: &TenantIsolationConfig,
+) -> Result<ClusterRoleBinding, KubeError> {
+    let ns_name = tenant_namespace(&config.tenant_id)?;
+    let sa_name = config.resolved_service_account_name()?;
+    let binding_name = format!("{ns_name}:{sa_name}:system:auth-delegator");
+
+    Ok(ClusterRoleBinding {
+        metadata: ObjectMeta {
+            name: Some(binding_name),
+            labels: Some(tenant_common_labels(&config.tenant_id)),
+            ..ObjectMeta::default()
+        },
+        role_ref: RoleRef {
+            api_group: "rbac.authorization.k8s.io".to_string(),
+            kind: "ClusterRole".to_string(),
+            name: "system:auth-delegator".to_string(),
+        },
+        subjects: Some(vec![Subject {
+            kind: "ServiceAccount".to_string(),
+            name: sa_name,
+            namespace: Some(ns_name),
+            api_group: None,
+        }]),
+    })
+}
+
 /// Synthesized bundle of baseline multi-tenant isolation manifests (`tenants/<tenant-id>/rbac.yaml`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct TenantManifestBundle {
     pub namespace: Namespace,
     pub service_account: ServiceAccount,
     pub resource_quota: ResourceQuota,
+    pub limit_range: LimitRange,
     pub network_policy: NetworkPolicy,
+    pub role_binding: RoleBinding,
+    pub auth_delegator_binding: ClusterRoleBinding,
 }
 
 impl TenantManifestBundle {
-    /// Synthesizes all four baseline isolation resources for a tenant.
+    /// Synthesizes all baseline isolation and reconciliation RBAC resources for a tenant.
     pub fn synthesize(config: &TenantIsolationConfig) -> Result<Self, KubeError> {
         Ok(Self {
             namespace: build_tenant_namespace(&config.tenant_id)?,
             service_account: build_tenant_service_account(config)?,
             resource_quota: build_tenant_resource_quota(config)?,
+            limit_range: build_tenant_limit_range(&config.tenant_id)?,
             network_policy: build_tenant_default_deny_network_policy(&config.tenant_id)?,
+            role_binding: build_tenant_admin_role_binding(config)?,
+            auth_delegator_binding: build_tenant_auth_delegator_binding(config)?,
         })
     }
 
@@ -297,7 +397,10 @@ impl TenantManifestBundle {
             serde_json::to_value(&self.namespace)?,
             serde_json::to_value(&self.service_account)?,
             serde_json::to_value(&self.resource_quota)?,
+            serde_json::to_value(&self.limit_range)?,
             serde_json::to_value(&self.network_policy)?,
+            serde_json::to_value(&self.role_binding)?,
+            serde_json::to_value(&self.auth_delegator_binding)?,
         ])
     }
 
@@ -1026,11 +1129,16 @@ mod tests {
 
         // JSON & multi-doc YAML serialization
         let json_docs = bundle.to_json_values().unwrap();
-        assert_eq!(json_docs.len(), 4);
+        assert_eq!(json_docs.len(), 7);
         assert_eq!(json_docs[0]["kind"], "Namespace");
         assert_eq!(json_docs[1]["kind"], "ServiceAccount");
         assert_eq!(json_docs[2]["kind"], "ResourceQuota");
-        assert_eq!(json_docs[3]["kind"], "NetworkPolicy");
+        assert_eq!(json_docs[3]["kind"], "LimitRange");
+        assert_eq!(json_docs[4]["kind"], "NetworkPolicy");
+        assert_eq!(json_docs[5]["kind"], "RoleBinding");
+        assert_eq!(json_docs[5]["metadata"]["name"], "tenant-acme-prod-admin");
+        assert_eq!(json_docs[6]["kind"], "ClusterRoleBinding");
+        assert_eq!(json_docs[6]["roleRef"]["name"], "system:auth-delegator");
 
         let yaml = bundle.to_multi_doc_yaml().unwrap();
         assert!(yaml.contains("pod-security.kubernetes.io/enforce: restricted"));

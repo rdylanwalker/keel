@@ -1263,49 +1263,7 @@ async fn initialize_seed_git_repo_with_push(
          \x20   - protocol: TCP\n\
          \x20     port: 50051\n\
          \x20 egress:\n\
-         \x20 - {{}}\n\
-         ---\n\
-         apiVersion: v1\n\
-         kind: LimitRange\n\
-         metadata:\n\
-         \x20 name: default-container-resources\n\
-         \x20 namespace: tenant-default\n\
-         spec:\n\
-         \x20 limits:\n\
-         \x20 - type: Container\n\
-         \x20   default:\n\
-         \x20     cpu: 500m\n\
-         \x20     memory: 1Gi\n\
-         \x20   defaultRequest:\n\
-         \x20     cpu: 100m\n\
-         \x20     memory: 128Mi\n\
-         ---\n\
-         apiVersion: rbac.authorization.k8s.io/v1\n\
-         kind: ClusterRoleBinding\n\
-         metadata:\n\
-         \x20 name: tenant-default:tenant-default-sa:system:auth-delegator\n\
-         roleRef:\n\
-         \x20 apiGroup: rbac.authorization.k8s.io\n\
-         \x20 kind: ClusterRole\n\
-         \x20 name: system:auth-delegator\n\
-         subjects:\n\
-         - kind: ServiceAccount\n\
-         \x20 namespace: tenant-default\n\
-         \x20 name: tenant-default-sa\n\
-         ---\n\
-         apiVersion: rbac.authorization.k8s.io/v1\n\
-         kind: RoleBinding\n\
-         metadata:\n\
-         \x20 name: tenant-default-admin\n\
-         \x20 namespace: tenant-default\n\
-         roleRef:\n\
-         \x20 apiGroup: rbac.authorization.k8s.io\n\
-         \x20 kind: ClusterRole\n\
-         \x20 name: admin\n\
-         subjects:\n\
-         - kind: ServiceAccount\n\
-         \x20 name: tenant-default-sa\n\
-         \x20 namespace: tenant-default\n",
+         \x20 - {{}}\n",
         default_tenant_git_repo.to_yaml()?
     );
 
