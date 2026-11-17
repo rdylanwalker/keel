@@ -549,28 +549,30 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
         await expect(groupsNav).toBeVisible({ timeout: 15_000 });
         await groupsNav.click({ timeout: 10_000 });
 
-        if (
-          !(await rauthyPage
-            .getByText('tenant-acme', { exact: true })
-            .isVisible({ timeout: 2_000 })
-            .catch(() => false))
-        ) {
-          const addGroupBtn = rauthyPage.getByRole('button', { name: /add/i }).first();
-          await expect(addGroupBtn).toBeVisible({ timeout: 10_000 });
-          await addGroupBtn.click({ timeout: 10_000 });
-          const dialog = rauthyPage.locator('dialog[open]').first();
-          await expect(dialog).toBeVisible({ timeout: 10_000 });
-          const groupInput = dialog.locator('input').first();
-          await expect(groupInput).toBeVisible({ timeout: 10_000 });
-          await groupInput.fill('tenant-acme');
-          await dialog
-            .locator('button[type="submit"], button')
-            .filter({ hasText: /save|create|add/i })
-            .first()
-            .click({ timeout: 10_000 });
-          await expect(rauthyPage.getByText('tenant-acme', { exact: true }).first()).toBeVisible({
-            timeout: 10_000,
-          });
+        for (const groupName of ['tenant-acme', 'tenant-acme-admin']) {
+          if (
+            !(await rauthyPage
+              .getByText(groupName, { exact: true })
+              .isVisible({ timeout: 2_000 })
+              .catch(() => false))
+          ) {
+            const addGroupBtn = rauthyPage.getByRole('button', { name: /add/i }).first();
+            await expect(addGroupBtn).toBeVisible({ timeout: 10_000 });
+            await addGroupBtn.click({ timeout: 10_000 });
+            const dialog = rauthyPage.locator('dialog[open]').first();
+            await expect(dialog).toBeVisible({ timeout: 10_000 });
+            const groupInput = dialog.locator('input').first();
+            await expect(groupInput).toBeVisible({ timeout: 10_000 });
+            await groupInput.fill(groupName);
+            await dialog
+              .locator('button[type="submit"], button')
+              .filter({ hasText: /save|create|add/i })
+              .first()
+              .click({ timeout: 10_000 });
+            await expect(rauthyPage.getByText(groupName, { exact: true }).first()).toBeVisible({
+              timeout: 10_000,
+            });
+          }
         }
         logStep(
           `Rauthy group tenant-acme ready (csrf=${Boolean(capturedCsrf)}, auth=${Boolean(capturedAuth)})`,
@@ -587,44 +589,60 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
             const uRes = await fetch('/auth/v1/users', { headers });
             if (!uRes.ok) throw new Error(`GET /auth/v1/users failed: ${uRes.status}`);
             const users: Array<{ id: string; email: string }> = await uRes.json();
-            if (!users.some((u) => u.email === 'acme@keel.local')) {
-              const createUserRes = await fetch('/auth/v1/users', {
-                method: 'POST',
-                headers,
-                body: JSON.stringify({
-                  email: 'acme@keel.local',
-                  preferred_username: 'acme',
-                  given_name: 'Acme',
-                  family_name: 'User',
-                  language: 'en',
-                  groups: ['tenant-acme'],
-                  roles: [],
-                }),
-              });
-              if (!createUserRes.ok) {
-                throw new Error(
-                  `POST /auth/v1/users failed: ${createUserRes.status} ${await createUserRes.text()}`,
-                );
-              }
-              const createdUser: { id: string } = await createUserRes.json();
-              const updateUserRes = await fetch(`/auth/v1/users/${createdUser.id}`, {
-                method: 'PUT',
-                headers,
-                body: JSON.stringify({
-                  email: 'acme@keel.local',
-                  given_name: 'Acme',
-                  family_name: 'User',
-                  password: pwd,
-                  roles: [],
-                  groups: ['tenant-acme'],
-                  enabled: true,
-                  email_verified: true,
-                }),
-              });
-              if (!updateUserRes.ok) {
-                throw new Error(
-                  `PUT /auth/v1/users/${createdUser.id} failed: ${updateUserRes.status} ${await updateUserRes.text()}`,
-                );
+            const usersToSeed = [
+              {
+                email: 'acme@keel.local',
+                username: 'acme',
+                given: 'Acme',
+                groups: ['tenant-acme'],
+              },
+              {
+                email: 'acme-admin@keel.local',
+                username: 'acme-admin',
+                given: 'AcmeAdmin',
+                groups: ['tenant-acme-admin'],
+              },
+            ];
+            for (const uSpec of usersToSeed) {
+              if (!users.some((u) => u.email === uSpec.email)) {
+                const createUserRes = await fetch('/auth/v1/users', {
+                  method: 'POST',
+                  headers,
+                  body: JSON.stringify({
+                    email: uSpec.email,
+                    preferred_username: uSpec.username,
+                    given_name: uSpec.given,
+                    family_name: 'User',
+                    language: 'en',
+                    groups: uSpec.groups,
+                    roles: [],
+                  }),
+                });
+                if (!createUserRes.ok) {
+                  throw new Error(
+                    `POST /auth/v1/users (${uSpec.email}) failed: ${createUserRes.status} ${await createUserRes.text()}`,
+                  );
+                }
+                const createdUser: { id: string } = await createUserRes.json();
+                const updateUserRes = await fetch(`/auth/v1/users/${createdUser.id}`, {
+                  method: 'PUT',
+                  headers,
+                  body: JSON.stringify({
+                    email: uSpec.email,
+                    given_name: uSpec.given,
+                    family_name: 'User',
+                    password: pwd,
+                    roles: [],
+                    groups: uSpec.groups,
+                    enabled: true,
+                    email_verified: true,
+                  }),
+                });
+                if (!updateUserRes.ok) {
+                  throw new Error(
+                    `PUT /auth/v1/users/${createdUser.id} failed: ${updateUserRes.status} ${await updateUserRes.text()}`,
+                  );
+                }
               }
             }
           },
@@ -815,17 +833,28 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
           expect(nonAdminMergeRes.status()).toBe(403);
           logStep(`Confirmed non-admin cannot merge PR #${acmePr!.id} (403 Forbidden)`);
 
-          const adminContext = await browser.newContext({ ignoreHTTPSErrors: true });
-          const adminPage = await adminContext.newPage();
+          const tenantAdminContext = await browser.newContext({ ignoreHTTPSErrors: true });
+          const tenantAdminPage = await tenantAdminContext.newPage();
           try {
-            await signInViaRauthy(adminPage, 'admin@keel.local', adminPassword);
-            const adminMergeRes = await adminPage.request.post(
+            await signInViaRauthy(tenantAdminPage, 'acme-admin@keel.local', acmePassword);
+            const otherTenantDenied = await tenantAdminPage.request.get(
+              '/api/v1/stacks?tenant=default',
+            );
+            expect(otherTenantDenied.status()).toBe(403);
+            const createTenantDenied2 = await tenantAdminPage.request.post('/api/v1/tenants', {
+              data: { id: 'gamma' },
+            });
+            expect(createTenantDenied2.status()).toBe(403);
+
+            const tenantAdminMergeRes = await tenantAdminPage.request.post(
               `/api/v1/proposals/${acmePr!.id}/merge`,
             );
-            expect(adminMergeRes.status()).toBe(200);
-            logStep(`Admin merged PR #${acmePr!.id} for tenant-acme`);
+            expect(tenantAdminMergeRes.status()).toBe(200);
+            logStep(
+              `Tenant admin acme-admin@keel.local merged scoped PR #${acmePr!.id} for tenant-acme`,
+            );
           } finally {
-            await adminContext.close();
+            await tenantAdminContext.close();
           }
         }
 
