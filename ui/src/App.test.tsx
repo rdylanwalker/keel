@@ -129,6 +129,7 @@ describe("App top-level application component", () => {
     const loginBtns = screen.getAllByRole("button", {
       name: /Sign in with OIDC/i,
     })
+    expect(loginBtns).toHaveLength(1)
     fireEvent.click(loginBtns[0])
     expect(api.startOidcLogin).toHaveBeenCalled()
 

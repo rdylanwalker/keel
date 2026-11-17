@@ -287,14 +287,19 @@ export const App: React.FC = () => {
                 <LogOut className="h-4 w-4" />
               </button>
             </div>
-          ) : (
+          ) : isDemoMode() ? (
             <button
               onClick={handleLogin}
               className="flex items-center space-x-1.5 px-3.5 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg text-xs font-semibold transition-colors shadow-lg shadow-indigo-600/20"
             >
               <Key className="h-3.5 w-3.5" />
-              <span>{isDemoMode() ? "Demo Login" : "Sign in with OIDC"}</span>
+              <span>Demo Login</span>
             </button>
+          ) : (
+            <span className="flex items-center space-x-1.5 text-xs bg-amber-500/10 text-amber-300 border border-amber-500/20 px-3 py-1.5 rounded-lg font-medium">
+              <ShieldAlert className="h-3.5 w-3.5 text-amber-400" />
+              <span>Unauthenticated</span>
+            </span>
           )}
         </div>
       </header>
@@ -350,28 +355,6 @@ export const App: React.FC = () => {
             <Server className="h-4 w-4" />
             <span>Control Plane &amp; Providers</span>
           </button>
-
-          {/* Unauthenticated info card in sidebar if unauthenticated */}
-          {!authStatus.authenticated && (
-            <div className="pt-6">
-              <div className="bg-slate-950 border border-slate-800 p-4 rounded-xl space-y-2">
-                <div className="flex items-center space-x-2 text-amber-400 text-xs font-medium">
-                  <ShieldAlert className="h-4 w-4" />
-                  <span>Unauthenticated</span>
-                </div>
-                <p className="text-[11px] text-slate-400 leading-normal">
-                  Signing in via OIDC unlocks mutating PR synthesis and merge
-                  actions.
-                </p>
-                <button
-                  onClick={handleLogin}
-                  className="w-full py-1.5 bg-slate-800 hover:bg-slate-700 text-indigo-300 rounded text-xs font-medium transition-colors"
-                >
-                  {isDemoMode() ? "Demo Login" : "Sign in with OIDC"}
-                </button>
-              </div>
-            </div>
-          )}
         </aside>
 
         {/* Content Body */}
