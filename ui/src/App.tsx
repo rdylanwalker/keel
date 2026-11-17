@@ -372,12 +372,16 @@ export const App: React.FC = () => {
 
           {authStatus.authenticated ? (
             <div className="flex items-center space-x-2">
-              <span className="flex items-center space-x-1.5 text-xs bg-emerald-500/10 text-emerald-300 border border-emerald-500/20 px-3 py-1.5 rounded-lg font-medium">
-                <ShieldCheck className="h-3.5 w-3.5 text-emerald-400" />
+              <span className="flex items-center space-x-2 text-xs bg-slate-950 text-slate-100 border border-slate-700 px-3 py-1.5 rounded-lg font-medium">
+                <ShieldCheck className="h-3.5 w-3.5 text-emerald-400 shrink-0" />
                 <span>{userDisplayLabel}</span>
-                {authStatus.isAdmin && (
-                  <span className="ml-1 px-1.5 py-0.5 text-[10px] font-semibold rounded bg-indigo-500/20 text-indigo-300 border border-indigo-500/30">
+                {authStatus.isAdmin ? (
+                  <span className="px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide rounded-md bg-indigo-500/25 text-indigo-200 border border-indigo-400/60">
                     Admin
+                  </span>
+                ) : (
+                  <span className="px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide rounded-md bg-sky-500/20 text-sky-200 border border-sky-400/50">
+                    User
                   </span>
                 )}
               </span>

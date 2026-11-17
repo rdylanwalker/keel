@@ -461,6 +461,7 @@ describe("App top-level application component", () => {
     })
 
     expect(screen.getByText("alice@acme.internal")).toBeInTheDocument()
+    expect(screen.getByText("User")).toBeInTheDocument()
     expect(screen.queryByText("Admin")).not.toBeInTheDocument()
     expect(screen.queryByLabelText("Active Tenant")).not.toBeInTheDocument()
     await waitFor(() => {
