@@ -1,3 +1,9 @@
+## [0.6.12](https://github.com/rdylanwalker/keel/compare/v0.6.11...v0.6.12) (2026-11-18)
+
+### Bug Fixes
+
+* **ci:** raise inotify limits for multi-cluster kind ([7c1bfb0](https://github.com/rdylanwalker/keel/commit/7c1bfb06bb1189650c3bf67619da0f68833c6b9b))
+
 ## [0.6.11](https://github.com/rdylanwalker/keel/compare/v0.6.10...v0.6.11) (2026-11-18)
 
 ### Bug Fixes
