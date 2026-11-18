@@ -28,17 +28,18 @@ use keel_git::{
 };
 use keel_kube::{
     CrdReconcileStatus, CrdWatchEvent, FlaggerCanarySpecInput, FluxDependencyRef,
-    FluxHealthCheckRef, FluxKustomizationSpecInput, HelmChartSourceKind, HelmChartSourceRef,
-    HelmReleaseSpecInput, HelmValuesSecretRef, RemoteKubeConfigRef, StackDiagnostics, TenantAgeKey,
-    TenantIsolationConfig, TenantManifestBundle, UserGitCredentials, WatchedCrdKind,
-    synthesize_canary_gateway_network_policy_yaml, synthesize_flagger_canary_yaml,
-    synthesize_flux_kustomization_yaml, synthesize_helm_release_yaml, user_git_creds_secret_name,
+    FluxHealthCheckRef, FluxKustomizationSpecInput, GITHUB_TOKEN_SECRET_NAME, HelmChartSourceKind,
+    HelmChartSourceRef, HelmReleaseSpecInput, HelmValuesSecretRef, RemoteKubeConfigRef,
+    StackDiagnostics, TenantAgeKey, TenantIsolationConfig, TenantManifestBundle,
+    UserGitCredentials, WatchedCrdKind, synthesize_canary_gateway_network_policy_yaml,
+    synthesize_flagger_canary_yaml, synthesize_flux_kustomization_yaml,
+    synthesize_helm_release_yaml, user_git_creds_secret_name,
 };
 use keel_pko::{
     ChangeOp, EphemeralPreviewParams, GcPlan, PkoEnvRef, PkoStack, PreviewReport,
     PreviewResourceCandidate, PreviewSummary, ResourceDiff, TenantStackParams,
-    attach_s3_credentials_env_refs, build_preview_branch, format_markdown_report, plan_preview_gc,
-    synthesize_ephemeral_preview, synthesize_tenant_stack,
+    attach_github_token_env_ref, attach_s3_credentials_env_refs, build_preview_branch,
+    format_markdown_report, plan_preview_gc, synthesize_ephemeral_preview, synthesize_tenant_stack,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -2427,13 +2428,22 @@ pub async fn create_proposal(
                     PkoEnvRef::from_secret(&infra_secret_name, secret_key),
                 );
             }
+            let tenant_ns = tenant_namespace(&req.tenant)?;
             if let Some(ref s3_secret) = state.s3_credentials_secret {
-                let tenant_ns = tenant_namespace(&req.tenant)?;
                 let _ = state
                     .secret_store
                     .ensure_s3_credentials_in_namespace(&tenant_ns)
                     .await;
                 attach_s3_credentials_env_refs(&mut stack_params.env_refs, s3_secret);
+            }
+            if matches!(
+                state
+                    .secret_store
+                    .ensure_github_token_in_namespace(&tenant_ns)
+                    .await,
+                Ok(true)
+            ) {
+                attach_github_token_env_ref(&mut stack_params.env_refs, GITHUB_TOKEN_SECRET_NAME);
             }
             if bp.spec.outputs.iter().any(|o| o == "kubeconfig") {
                 stack_params.config.insert(
@@ -2908,6 +2918,15 @@ pub async fn create_proposal(
                 .await;
             attach_s3_credentials_env_refs(&mut preview_params.env_refs, s3_secret);
         }
+        if matches!(
+            state
+                .secret_store
+                .ensure_github_token_in_namespace(KEEL_PREVIEWS_NAMESPACE)
+                .await,
+            Ok(true)
+        ) {
+            attach_github_token_env_ref(&mut preview_params.env_refs, GITHUB_TOKEN_SECRET_NAME);
+        }
     }
     let preview_stack = synthesize_ephemeral_preview(&preview_params)?;
 
@@ -3331,6 +3350,18 @@ async fn create_bundle_proposal(
                         .await;
                     attach_s3_credentials_env_refs(&mut stack_params.env_refs, s3_secret);
                 }
+                if matches!(
+                    state
+                        .secret_store
+                        .ensure_github_token_in_namespace(&tenant_ns)
+                        .await,
+                    Ok(true)
+                ) {
+                    attach_github_token_env_ref(
+                        &mut stack_params.env_refs,
+                        GITHUB_TOKEN_SECRET_NAME,
+                    );
+                }
                 if let Some(obj) = partitioned.normal_values.as_object() {
                     for (k, v) in obj {
                         let str_val = match v {
@@ -3608,6 +3639,15 @@ async fn create_bundle_proposal(
             .ensure_s3_credentials_in_namespace(KEEL_PREVIEWS_NAMESPACE)
             .await;
         attach_s3_credentials_env_refs(&mut preview_params.env_refs, s3_secret);
+    }
+    if matches!(
+        state
+            .secret_store
+            .ensure_github_token_in_namespace(KEEL_PREVIEWS_NAMESPACE)
+            .await,
+        Ok(true)
+    ) {
+        attach_github_token_env_ref(&mut preview_params.env_refs, GITHUB_TOKEN_SECRET_NAME);
     }
     let preview_stack = synthesize_ephemeral_preview(&preview_params)?;
 

@@ -959,6 +959,14 @@ pub fn attach_s3_credentials_env_refs(
     );
 }
 
+/// Attaches `GITHUB_TOKEN` from a namespace-local Kubernetes `Secret` (`token` key) to `env_refs`.
+pub fn attach_github_token_env_ref(env_refs: &mut BTreeMap<String, PkoEnvRef>, secret_name: &str) {
+    env_refs.insert(
+        "GITHUB_TOKEN".to_string(),
+        PkoEnvRef::from_secret(secret_name, "token"),
+    );
+}
+
 fn ensure_trailing_newline(s: &str) -> String {
     if s.ends_with('\n') {
         s.to_string()

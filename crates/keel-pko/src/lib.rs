@@ -22,9 +22,9 @@ pub use stack::{
     HelmValuesFromRef, IN_CLUSTER_S3_BACKEND_URL, KEEL_PREVIEWS_NAMESPACE, LocalObjectReference,
     MANAGEMENT_CORE_STACK_NAME, ManagementCoreStackParams, PKO_STACK_API_VERSION, PKO_STACK_KIND,
     PkoEnvRef, PkoFluxSource, PkoFluxSourceRef, PkoStack, PkoStackSpec, PkoWorkspaceTemplate,
-    PreviewStack, TenantStackParams, attach_s3_credentials_env_refs, build_preview_branch,
-    synthesize_ephemeral_preview, synthesize_management_core_stack, synthesize_tenant_stack,
-    validate_preview_branch,
+    PreviewStack, TenantStackParams, attach_github_token_env_ref, attach_s3_credentials_env_refs,
+    build_preview_branch, synthesize_ephemeral_preview, synthesize_management_core_stack,
+    synthesize_tenant_stack, validate_preview_branch,
 };
 
 /// Errors produced by `keel-pko` synthesis and preview diff parsing.

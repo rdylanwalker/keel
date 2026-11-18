@@ -432,6 +432,27 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
       }
     }
 
+    if (process.env.GITHUB_TOKEN) {
+      logStep('Seeding keel-system/keel-github-token secret for PKO plugin downloads...');
+      const manifest = execFileSync(
+        'kubectl',
+        [
+          'create',
+          'secret',
+          'generic',
+          'keel-github-token',
+          '-n',
+          'keel-system',
+          `--from-literal=token=${process.env.GITHUB_TOKEN}`,
+          '--dry-run=client',
+          '-o',
+          'yaml',
+        ],
+        { encoding: 'utf-8' },
+      );
+      execFileSync('kubectl', ['apply', '-f', '-'], { input: manifest, encoding: 'utf-8' });
+    }
+
     if (!(await isServerUp(BASE_URL))) {
       const url = new URL(BASE_URL);
       logStep(`Starting keel serve on ${BASE_URL} (repo: ${repoDir}, log: ${SERVE_LOG_PATH})...`);

@@ -41,6 +41,9 @@ pub const TENANT_SOPS_AGE_SECRET_NAME: &str = "sops-age";
 /// Secret name holding the in-cluster S3 state backend credentials (`accessKey`, `secretKey`).
 pub const S3_CREDENTIALS_SECRET_NAME: &str = "keel-s3-credentials";
 
+/// Optional secret name holding a GitHub token (`token`) for PKO workspace plugin downloads.
+pub const GITHUB_TOKEN_SECRET_NAME: &str = "keel-github-token";
+
 /// Length in bytes of the cluster session / symmetric encryption key (256-bit).
 pub const SESSION_KEY_LEN: usize = 32;
 
@@ -185,6 +188,14 @@ pub trait SecretStateStore: Send + Sync {
     /// `keel-system/keel-s3-credentials` if present. Returns `Ok(true)` if propagated or already
     /// present, or `Ok(false)` if the source secret does not exist in `keel-system`.
     async fn ensure_s3_credentials_in_namespace(
+        &self,
+        target_namespace: &str,
+    ) -> Result<bool, KubeError>;
+
+    /// Ensures `keel-github-token` exists in `target_namespace` by copying it from
+    /// `keel-system/keel-github-token` if present. Returns `Ok(true)` if propagated or already
+    /// present, or `Ok(false)` if the source secret does not exist in `keel-system`.
+    async fn ensure_github_token_in_namespace(
         &self,
         target_namespace: &str,
     ) -> Result<bool, KubeError>;
@@ -410,6 +421,19 @@ impl SecretStateStore for K8sSecretStore {
     ) -> Result<bool, KubeError> {
         ensure_s3_credentials_in_namespace_impl(self, target_namespace).await
     }
+
+    async fn ensure_github_token_in_namespace(
+        &self,
+        target_namespace: &str,
+    ) -> Result<bool, KubeError> {
+        ensure_secret_in_namespace_impl(
+            self,
+            target_namespace,
+            GITHUB_TOKEN_SECRET_NAME,
+            "github-token",
+        )
+        .await
+    }
 }
 
 #[async_trait]
@@ -456,6 +480,19 @@ impl SecretStateStore for InMemorySecretStore {
         target_namespace: &str,
     ) -> Result<bool, KubeError> {
         ensure_s3_credentials_in_namespace_impl(self, target_namespace).await
+    }
+
+    async fn ensure_github_token_in_namespace(
+        &self,
+        target_namespace: &str,
+    ) -> Result<bool, KubeError> {
+        ensure_secret_in_namespace_impl(
+            self,
+            target_namespace,
+            GITHUB_TOKEN_SECRET_NAME,
+            "github-token",
+        )
+        .await
     }
 }
 
@@ -806,19 +843,34 @@ async fn ensure_s3_credentials_in_namespace_impl(
     backend: &impl SecretBackend,
     target_namespace: &str,
 ) -> Result<bool, KubeError> {
-    if target_namespace == KEEL_SYSTEM_NAMESPACE {
-        return has_s3_credentials_impl(backend).await;
-    }
+    ensure_secret_in_namespace_impl(
+        backend,
+        target_namespace,
+        S3_CREDENTIALS_SECRET_NAME,
+        "s3-credentials",
+    )
+    .await
+}
 
+async fn ensure_secret_in_namespace_impl(
+    backend: &impl SecretBackend,
+    target_namespace: &str,
+    secret_name: &str,
+    secret_kind: &str,
+) -> Result<bool, KubeError> {
     let Some(source) = backend
-        .get_secret(KEEL_SYSTEM_NAMESPACE, S3_CREDENTIALS_SECRET_NAME)
+        .get_secret(KEEL_SYSTEM_NAMESPACE, secret_name)
         .await?
     else {
         return Ok(false);
     };
 
+    if target_namespace == KEEL_SYSTEM_NAMESPACE {
+        return Ok(true);
+    }
+
     if backend
-        .get_secret(target_namespace, S3_CREDENTIALS_SECRET_NAME)
+        .get_secret(target_namespace, secret_name)
         .await?
         .is_some()
     {
@@ -827,9 +879,9 @@ async fn ensure_s3_credentials_in_namespace_impl(
 
     let copy = Secret {
         metadata: ObjectMeta {
-            name: Some(S3_CREDENTIALS_SECRET_NAME.to_string()),
+            name: Some(secret_name.to_string()),
             namespace: Some(target_namespace.to_string()),
-            labels: Some(managed_labels("s3-credentials")),
+            labels: Some(managed_labels(secret_kind)),
             ..ObjectMeta::default()
         },
         type_: Some("Opaque".to_string()),
@@ -1190,5 +1242,51 @@ mod tests {
         let data = copied.data.unwrap();
         assert_eq!(data.get("accessKey").unwrap().0, b"keel-pulumi");
         assert_eq!(data.get("secretKey").unwrap().0, b"super-secret");
+    }
+
+    #[tokio::test]
+    async fn github_token_propagation_copies_from_keel_system() {
+        let store = InMemorySecretStore::new();
+        assert!(
+            !store
+                .ensure_github_token_in_namespace("tenant-acme")
+                .await
+                .unwrap()
+        );
+
+        store
+            .upsert_secret(
+                KEEL_SYSTEM_NAMESPACE,
+                Secret {
+                    metadata: ObjectMeta {
+                        name: Some(GITHUB_TOKEN_SECRET_NAME.to_string()),
+                        ..ObjectMeta::default()
+                    },
+                    data: Some(BTreeMap::from([(
+                        "token".to_string(),
+                        ByteString(b"ghp_test_token".to_vec()),
+                    )])),
+                    ..Secret::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            store
+                .ensure_github_token_in_namespace("tenant-acme")
+                .await
+                .unwrap()
+        );
+
+        let copied = store
+            .get_secret("tenant-acme", GITHUB_TOKEN_SECRET_NAME)
+            .await
+            .unwrap()
+            .expect("copied secret");
+        assert_eq!(
+            copied.data.unwrap().get("token").unwrap().0,
+            b"ghp_test_token"
+        );
     }
 }
