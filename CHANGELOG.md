@@ -1,3 +1,9 @@
+## [0.6.11](https://github.com/rdylanwalker/keel/compare/v0.6.10...v0.6.11) (2026-11-18)
+
+### Bug Fixes
+
+* **pko:** propagate optional github token to stack pods ([4ad7dc1](https://github.com/rdylanwalker/keel/commit/4ad7dc1ecf944284024eeed092a20832ca5b0897))
+
 ## [0.6.10](https://github.com/rdylanwalker/keel/compare/v0.6.9...v0.6.10) (2026-11-17)
 
 ### Bug Fixes
