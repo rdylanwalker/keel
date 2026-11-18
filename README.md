@@ -281,5 +281,7 @@ Several great open-source tools solve individual slices of this problem—develo
 
 * **[Online Documentation (GitHub Pages)](https://rdylanwalker.github.io/keel/):** Rendered mdBook user & operations guide.
 * **[`CONTRIBUTING.md`](./CONTRIBUTING.md):** Local build instructions, prerequisites, quality gates, repository layout, and PR conventions.
+* **[Issue Templates](https://github.com/rdylanwalker/keel/issues/new/choose):** Submit [Feature Requests](https://github.com/rdylanwalker/keel/issues/new?template=feature-request.yml), [Bug Reports](https://github.com/rdylanwalker/keel/issues/new?template=bug-report.yml), [Bootstrap Friction Reports](https://github.com/rdylanwalker/keel/issues/new?template=bootstrap-friction.yml), or [Provider & Catalog Feedback](https://github.com/rdylanwalker/keel/issues/new?template=provider-catalog-feedback.yml).
+* **[Pull Request Template](./.github/pull_request_template.md):** Pre-flight architectural checklist and verification requirements for PR submissions.
 * **[`SDD.md`](./SDD.md):** Complete architectural specification, sequence diagrams, Git repository schema, API/CLI contracts, and Non-Functional Requirements.
 * **[`AGENTS.md`](./AGENTS.md):** Architectural invariants, security prohibitions, and verification rules for AI coding assistants.

@@ -10,7 +10,14 @@ Thank you for your interest in contributing to **Keel**! Whether you are fixing 
 
 Keel is in active early alpha. The local `kind` + in-cluster Forgejo/Rauthy workflow is continuously tested end-to-end in CI, while cloud and hypervisor targets (`proxmox`, `aws`, `gcp`, `azure`, `hetzner`, `Talos`/managed `kubeconfig`) are ready for real-world validation.
 
-If you test any experimental target or hit a bug, please [open an issue on GitHub](https://github.com/rdylanwalker/keel/issues/new/choose) with your target, CLI flags, and relevant logs (taking care to redact any secrets or tokens).
+When opening an issue, please choose the appropriate [GitHub Issue Template](https://github.com/rdylanwalker/keel/issues/new/choose):
+
+* **[Feature Request](https://github.com/rdylanwalker/keel/issues/new?template=feature-request.yml):** Propose a new capability, CLI command, UI enhancement, or integration aligned with [`SDD.md`](./SDD.md) and [`AGENTS.md`](./AGENTS.md).
+* **[Bug Report](https://github.com/rdylanwalker/keel/issues/new?template=bug-report.yml):** Report unexpected behavior in the CLI, Web Portal, PR previews, Flux reconciliation, or RBAC/security.
+* **[Bootstrap Friction / Target Report](https://github.com/rdylanwalker/keel/issues/new?template=bootstrap-friction.yml):** Share results or friction encountered during Stage 0 (`keel bootstrap init`) across `kind`, Proxmox, or cloud targets.
+* **[Provider / Catalog / Form UX Feedback](https://github.com/rdylanwalker/keel/issues/new?template=provider-catalog-feedback.yml):** Provide feedback on Day-1 infrastructure providers, `catalog.yaml` JSON schemas, `@rjsf/core` form UX, or request new blueprints.
+
+Please ensure any logs, manifests, or screenshots redact all secrets and sensitive tokens.
 
 ---
 
@@ -29,7 +36,7 @@ keel/
 ├── e2e/                    # Playwright end-to-end test suite & kind/Forgejo test harness
 ├── deploy/                 # Stage 0 target templates & seed Flux, PKO v2, Kyverno, Envoy, Flagger manifests
 ├── docs/                   # mdBook user & operations documentation
-├── .github/workflows/      # GitHub Actions CI, Playwright E2E, and semantic-release pipelines
+├── .github/                # Issue templates, PR template, CI, E2E, and release workflows
 ├── .releaserc.json         # Automated SemVer release & artifact publishing config
 ├── renovate.json           # Weekly automated dependency updates with auto-merge
 ├── justfile                # Common developer build, lint, test, and server tasks
@@ -156,6 +163,7 @@ just agent-e2e
 
 ## Pull Request & Commit Conventions
 
+* **Pull Request Template:** When opening a pull request, GitHub will automatically populate the [Pull Request Template](.github/pull_request_template.md). Please complete the change summary, link any related issue(s), verify the architectural & spec guardrails checklist (stateless control plane, Flux CD + PKO v2, direct `git` CLI, secret hygiene, `SDD.md` alignment), and indicate which local quality gates passed.
 * **Conventional Commits Required:** Versioning and GitHub Releases are governed by [Conventional Commits](https://www.conventionalcommits.org/) and `semantic-release`. Every commit message must follow the specification:
   * `feat(<scope>): ...` — new feature (minor version bump)
   * `fix(<scope>): ...` — bug fix (patch version bump)

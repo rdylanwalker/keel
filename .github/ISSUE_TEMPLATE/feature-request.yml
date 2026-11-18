@@ -1,0 +1,59 @@
+name: Feature Request
+description: Suggest an idea, enhancement, or new capability for Keel
+title: "[Feature] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for suggesting an enhancement to Keel!
+
+        Before submitting, please search existing issues to avoid duplicates and review [`SDD.md`](https://github.com/rdylanwalker/keel/blob/main/SDD.md) and [`AGENTS.md`](https://github.com/rdylanwalker/keel/blob/main/AGENTS.md) to ensure the proposal aligns with Keel's architectural guardrails (single stateless binary, Flux CD GitOps, PKO v2, zero custom CRDs or external databases).
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area / Component
+      options:
+        - CLI (`keel`)
+        - Web Portal (`ui`)
+        - PR & PKO v2 Preview Inspector (`keel-pko`)
+        - Git Forge & GitOps (`keel-git` / Flux CD)
+        - Bootstrap Targets (`kind`, `proxmox`, `aws`, `gcp`, `azure`, `hetzner`, `kubeconfig`)
+        - Catalog, Blueprints & Forms (`catalog.yaml` / `@rjsf/core`)
+        - Security, Auth & Secrets (SOPS / age / Kyverno / Rauthy)
+        - Progressive Delivery & Networking (Envoy Gateway / Flagger)
+        - Documentation & Developer Tooling
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Is your feature request related to a problem or limitation?
+      description: A clear and concise description of the problem you are experiencing or the workflow you want to simplify.
+      placeholder: "I find it challenging to ... or Currently Keel does not support ..."
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: Describe the proposed solution or feature
+      description: A clear and concise description of what you want to happen and how you envision it working in Keel (CLI flags, UI workflow, API endpoint, etc.).
+      placeholder: "Add support for ... or Introduce a CLI command `keel ...` that ..."
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives or workarounds considered
+      description: Describe any alternative solutions, tools, or manual workarounds you have considered.
+  - type: textarea
+    id: sdd_alignment
+    attributes:
+      label: Architectural & SDD.md alignment (optional)
+      description: Does this proposal interact with any specific section of `SDD.md` or non-functional requirements (`NFR-SEC`, `NFR-REL`, `NFR-PERF`, etc.)?
+  - type: textarea
+    id: additional_context
+    attributes:
+      label: Additional context, mockups, or screenshots
+      description: Attach any UI mockups, terminal session outputs, diagrams, or additional context.
