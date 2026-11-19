@@ -255,15 +255,30 @@ async function waitForStackReady(
       '-n',
       namespace,
       '-o',
-      'jsonpath={.status.conditions[?(@.type=="Ready")].status}|{.status.conditions[?(@.type=="Ready")].reason}|{.status.conditions[?(@.type=="Ready")].message}',
+      'jsonpath={.status.conditions[?(@.type=="Ready")].status}|{.status.conditions[?(@.type=="Ready")].reason}|{.status.conditions[?(@.type=="Ready")].message}|{.status.conditions[?(@.type=="Stalled")].status}|{.status.lastUpdate.message}',
     ]);
 
     if (res.ok) {
-      const [status, reason, message] = res.stdout.split('|');
+      const [status, reason, message, stalled, lastUpdateMsg] = res.stdout.split('|');
       if (status === 'True') {
         const elapsed = Math.round((Date.now() - start) / 1000);
         logStep(`PKO v2 Stack ${namespace}/${name} is Ready (${elapsed}s)!`, provider);
         return;
+      }
+      if (stalled === 'True') {
+        const podLogs = tryCmd('kubectl', [
+          'logs',
+          `${name}-workspace-0`,
+          '-n',
+          namespace,
+          '--tail=30',
+        ]);
+        const detail = [lastUpdateMsg, podLogs.ok ? podLogs.stdout : '']
+          .filter(Boolean)
+          .join('\n--- workspace pod logs ---\n');
+        throw new Error(
+          `[${provider}] PKO v2 Stack ${namespace}/${name} stalled (${reason}: ${message})\n${detail}`,
+        );
       }
       if (Date.now() - lastLog > 15_000) {
         const elapsed = Math.round((Date.now() - start) / 1000);

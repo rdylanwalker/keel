@@ -3023,6 +3023,30 @@ pub async fn create_proposal(
                 .config
                 .insert("keel:provider".to_string(), bp.metadata.provider.clone());
             populate_stack_config_from_values(&mut stack_params.config, &partitioned.normal_values);
+            if bp.metadata.provider == "aws"
+                && let Some(region) = stack_params.config.get("region").cloned()
+            {
+                stack_params
+                    .config
+                    .entry("aws:region".to_string())
+                    .or_insert(region);
+            }
+            if bp.metadata.provider == "gcp"
+                && let Some(project) = stack_params.config.get("project").cloned()
+            {
+                stack_params
+                    .config
+                    .entry("gcp:project".to_string())
+                    .or_insert(project);
+            }
+            if bp.metadata.provider == "azure"
+                && let Some(location) = stack_params.config.get("location").cloned()
+            {
+                stack_params
+                    .config
+                    .entry("azure-native:location".to_string())
+                    .or_insert(location);
+            }
             attach_infra_secret_refs(
                 &mut stack_params.env_refs,
                 &mut stack_params.secrets_ref,
