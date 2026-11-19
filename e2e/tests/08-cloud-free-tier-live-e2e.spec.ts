@@ -775,12 +775,15 @@ test.describe('08.1 - Multi-Cloud Free-Tier Stage 1 Live E2E (kind Management Cl
 
       await withGitPrLock(async () => {
         logStep(`Creating proposal for ${catalogId} (${stackName})...`, provider);
+        const resolvedValues = Object.fromEntries(
+          Object.entries(values).map(([k, v]) => [k, v === '${stackName}' ? stackName : v]),
+        );
         const createRes = await request.post(`${BASE_URL}/api/v1/proposals`, {
           data: {
             catalogId,
             name: stackName,
             tenant,
-            values,
+            values: resolvedValues,
           },
         });
         expect(
@@ -897,6 +900,7 @@ test.describe('08.1 - Multi-Cloud Free-Tier Stage 1 Live E2E (kind Management Cl
         values: {
           region: process.env.AWS_REGION || 'us-east-1',
           instanceType: process.env.KEEL_E2E_AWS_INSTANCE_TYPE || 't3.micro',
+          instanceName: '${stackName}',
           sshUser: 'ubuntu',
           sshPublicKey: defaultSshKey,
           awsAccessKeyId: process.env.AWS_ACCESS_KEY_ID,
@@ -910,6 +914,7 @@ test.describe('08.1 - Multi-Cloud Free-Tier Stage 1 Live E2E (kind Management Cl
         values: {
           location: process.env.AZURE_LOCATION || 'eastus',
           vmSize: process.env.KEEL_E2E_AZURE_VM_SIZE || 'Standard_B1s',
+          vmName: '${stackName}',
           sshUser: 'azureuser',
           sshPublicKey: defaultSshKey,
           armClientId: process.env.ARM_CLIENT_ID,
@@ -927,6 +932,7 @@ test.describe('08.1 - Multi-Cloud Free-Tier Stage 1 Live E2E (kind Management Cl
           region: process.env.GCP_REGION || 'us-central1',
           zone: process.env.GCP_ZONE || 'us-central1-a',
           machineType: process.env.KEEL_E2E_GCP_MACHINE_TYPE || 'e2-micro',
+          instanceName: '${stackName}',
           sshUser: 'debian',
           sshPublicKey: defaultSshKey,
           googleCredentials:
