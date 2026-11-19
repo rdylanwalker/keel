@@ -669,6 +669,35 @@ test.describe('08.1 - Multi-Cloud Free-Tier Stage 1 Live E2E (kind Management Cl
         ],
         { GIT_EDITOR: 'true' },
       );
+    }
+
+    if (!(await isServerUp(BASE_URL))) {
+      const url = new URL(BASE_URL);
+      logStep(`Starting keel serve on ${BASE_URL} (repo: ${repoDir}, log: ${SERVE_LOG_PATH})...`);
+      const logFd = fs.openSync(SERVE_LOG_PATH, 'w');
+      serveProc = spawn(
+        KEEL_BIN,
+        ['serve', '--bind', `${url.hostname}:${url.port || '8080'}`, '--repo-dir', repoDir],
+        { stdio: ['ignore', logFd, logFd], detached: true },
+      );
+      const deadline = Date.now() + 30_000;
+      while (Date.now() < deadline) {
+        if (await isServerUp(BASE_URL)) break;
+        await new Promise((r) => setTimeout(r, 1000));
+      }
+      if (!(await isServerUp(BASE_URL))) {
+        throw new Error(`keel serve did not become ready at ${BASE_URL}; check ${SERVE_LOG_PATH}`);
+      }
+      logStep(`keel serve is ready at ${BASE_URL}`);
+    } else {
+      logStep(`Reusing existing keel serve at ${BASE_URL}`);
+    }
+
+    const unpushedCount = Number(
+      tryCmd('git', ['-C', repoDir, 'rev-list', '--count', 'origin/main..HEAD']).stdout || '0',
+    );
+    if (unpushedCount > 0) {
+      logStep(`Pushing ${unpushedCount} catalog commit(s) to origin/main...`);
       const remoteUrl = tryCmd('git', ['-C', repoDir, 'remote', 'get-url', 'origin']).stdout;
       if (remoteUrl.startsWith('http')) {
         const tokRes = tryCmd('kubectl', [
@@ -700,28 +729,6 @@ test.describe('08.1 - Multi-Cloud Free-Tier Stage 1 Live E2E (kind Management Cl
       } else {
         tryCmd('git', ['-C', repoDir, 'push', 'origin', 'main']);
       }
-    }
-
-    if (!(await isServerUp(BASE_URL))) {
-      const url = new URL(BASE_URL);
-      logStep(`Starting keel serve on ${BASE_URL} (repo: ${repoDir}, log: ${SERVE_LOG_PATH})...`);
-      const logFd = fs.openSync(SERVE_LOG_PATH, 'w');
-      serveProc = spawn(
-        KEEL_BIN,
-        ['serve', '--bind', `${url.hostname}:${url.port || '8080'}`, '--repo-dir', repoDir],
-        { stdio: ['ignore', logFd, logFd], detached: true },
-      );
-      const deadline = Date.now() + 30_000;
-      while (Date.now() < deadline) {
-        if (await isServerUp(BASE_URL)) break;
-        await new Promise((r) => setTimeout(r, 1000));
-      }
-      if (!(await isServerUp(BASE_URL))) {
-        throw new Error(`keel serve did not become ready at ${BASE_URL}; check ${SERVE_LOG_PATH}`);
-      }
-      logStep(`keel serve is ready at ${BASE_URL}`);
-    } else {
-      logStep(`Reusing existing keel serve at ${BASE_URL}`);
     }
   });
 
