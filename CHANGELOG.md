@@ -1,3 +1,37 @@
+# [0.7.0](https://github.com/rdylanwalker/keel/compare/v0.6.12...v0.7.0) (2026-11-19)
+
+### Bug Fixes
+
+* **catalog,e2e:** lowercase gcp firewall name, sync blueprints, and retry 409 merge ([d9ce98c](https://github.com/rdylanwalker/keel/commit/d9ce98cc4bf9ca10df952ee5d752fc311f00c095))
+* **catalog,e2e:** remove ternary in aws Pulumi.yaml and use unique VM names per run ([7ad84de](https://github.com/rdylanwalker/keel/commit/7ad84de3f5505272a0083eea9b071adcab3f549a))
+* **cli:** fix Forgejo OIDC secret length and PKCE ([6b35e4d](https://github.com/rdylanwalker/keel/commit/6b35e4d8348f158b6b6e9f9e0d83d73a745afbd7))
+* **cli:** seed free-tier cloud blueprints and fix Forgejo Rauthy OIDC ([abe5801](https://github.com/rdylanwalker/keel/commit/abe58019fbee8d01b67e390f6ca7930df46e5b75))
+* **crypto,server:** include cluster sops-age recipient when encrypting tenant secrets ([435145a](https://github.com/rdylanwalker/keel/commit/435145ae44f55430d350abc6b42477ced5861e92))
+* **e2e:** generate valid ephemeral ed25519 ssh public key for cloud VMs ([d29d28f](https://github.com/rdylanwalker/keel/commit/d29d28f8d7b35affdbbf9521c94d86852d65cf82))
+* **e2e:** merge cloud PRs before parallel reconciliation and seed github token ([e87f86e](https://github.com/rdylanwalker/keel/commit/e87f86e2b34f1730016246a3ebc58ba883f960f4))
+* **e2e:** preserve primary stack error on cleanup and extend cloud timeout to 600s ([ef6ad89](https://github.com/rdylanwalker/keel/commit/ef6ad899f612a8f406e7b73ad40ab2fc174f46ce))
+* **e2e:** push synced blueprints after keel serve starts forgejo port-forward ([14f2072](https://github.com/rdylanwalker/keel/commit/14f207209386a4ebdb6f313236a58fb8bb95ea03))
+* **kube,ui:** surface terminating state and force-delete warnings ([bab4e6b](https://github.com/rdylanwalker/keel/commit/bab4e6b28f9a0179d97ffd43eebc7e99a39fb4c4))
+* **pko,server:** map cloud secret fields to secretsRef and provider envRefs ([ed53682](https://github.com/rdylanwalker/keel/commit/ed53682061a6198a56f9bf099a3d150c8beca755))
+* **pko:** raise workspace memory and use standard azure ip ([25772c3](https://github.com/rdylanwalker/keel/commit/25772c3f212a9ab076bf532c79a59bbe5effc99d))
+* **server,e2e:** set provider region/project/location config and fail fast on stalled stacks ([0e252dc](https://github.com/rdylanwalker/keel/commit/0e252dc39e61fd742e45c06544c60e1c2cd5f557))
+* **server,e2e:** sync Kyverno restrict-pulumi-providers on provider PR merge ([919a466](https://github.com/rdylanwalker/keel/commit/919a4661d96995557280c8428b8f7d23cb7e151e))
+* **ui:** align catalog and deploy forms to runtime ([f175806](https://github.com/rdylanwalker/keel/commit/f17580626321285c9229fd9f0e4a650a5e01fcb5))
+* **ui:** clear pending refresh timers on unmount ([a2a9234](https://github.com/rdylanwalker/keel/commit/a2a9234b7c43c1d96dc3d7e8c8d8b69466235b63))
+* **ui:** make catalog edit modal scrollable ([8727443](https://github.com/rdylanwalker/keel/commit/8727443216cae1b83d7ff6e39b542c5d24317f40))
+
+### Features
+
+* **bootstrap,e2e:** wire cloud stage0 k3s kubeconfig and run stage1 cloud e2e via kind ([4e86214](https://github.com/rdylanwalker/keel/commit/4e8621415e4604da237c637929e6d42237eb380a))
+* **catalog:** generalize cloud VM blueprints with free-tier defaults ([7520568](https://github.com/rdylanwalker/keel/commit/752056820ce40ab4c2d4bca6793a758c12d1b1f7))
+* **catalog:** support raw k8s manifests and ssh access in backend and cli ([fa6c505](https://github.com/rdylanwalker/keel/commit/fa6c5051a2738bfd9b10b38318eb0707fd0d1442))
+* **ssh:** bridge browser terminal via russh and disable non-VM SSH buttons ([eea4a9d](https://github.com/rdylanwalker/keel/commit/eea4a9d20e398d073da511bc958511823d6e00fb))
+* **stacks:** add force-delete support for stuck PKO stacks ([d5736bc](https://github.com/rdylanwalker/keel/commit/d5736bcd3d55de0b638c5fbf882a472bb4f887d2))
+* **stacks:** add native stack unlock to CLI, API, and UI ([2e1b2ec](https://github.com/rdylanwalker/keel/commit/2e1b2ec2cea3ae26a422707a7e1612e3acc6a562))
+* **stacks:** add stack reconcile action and move restart to inspector ([d28a191](https://github.com/rdylanwalker/keel/commit/d28a191ba1c2251beb2492ff61837f82c76283e6))
+* **ui:** add raw manifest wizard and vm ssh browser terminal modal ([b2595d8](https://github.com/rdylanwalker/keel/commit/b2595d818cb1f601eaaa0cbb2425ec5e5c5337af))
+* **ui:** allow editing host in ssh modal and pass to bridge ([796841a](https://github.com/rdylanwalker/keel/commit/796841ad26f2ce85f31e74665036b8dbe3ea00e1))
+
 ## [0.6.12](https://github.com/rdylanwalker/keel/compare/v0.6.11...v0.6.12) (2026-11-18)
 
 ### Bug Fixes
