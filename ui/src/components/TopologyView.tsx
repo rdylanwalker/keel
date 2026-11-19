@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from "react"
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import {
   Server,
   Layers,
@@ -220,6 +220,16 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
     prId?: string
   } | null>(null)
 
+  const pendingTimeoutsRef = useRef<Set<number>>(new Set())
+
+  useEffect(() => {
+    const timeouts = pendingTimeoutsRef.current
+    return () => {
+      timeouts.forEach((id) => window.clearTimeout(id))
+      timeouts.clear()
+    }
+  }, [])
+
   const resolveStackNamespace = (stack: StackSummary) =>
     stack.namespace ||
     (stack.name === "management-cluster-core"
@@ -252,6 +262,17 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
     }
   }, [selectedTenant])
 
+  const scheduleTopologyRefresh = useCallback(
+    (delayMs: number) => {
+      const id = window.setTimeout(() => {
+        pendingTimeoutsRef.current.delete(id)
+        void fetchTopology()
+      }, delayMs)
+      pendingTimeoutsRef.current.add(id)
+    },
+    [fetchTopology]
+  )
+
   const handleQuickStackReconcile = async (stack: StackSummary) => {
     const ns = resolveStackNamespace(stack)
     const key = `${ns}/${stack.name}`
@@ -260,7 +281,7 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
     try {
       const res = await reconcileStack(ns, stack.name)
       setStackBanner({ message: res.message })
-      window.setTimeout(fetchTopology, 1500)
+      scheduleTopologyRefresh(1500)
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : "Failed to reconcile stack")
     } finally {
@@ -276,7 +297,7 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
     try {
       const res = await reconcileRelease(ns, rel.name)
       setReleaseBanner({ message: res.message })
-      window.setTimeout(fetchTopology, 1500)
+      scheduleTopologyRefresh(1500)
     } catch (err: unknown) {
       setError(
         err instanceof Error ? err.message : "Failed to reconcile release"
@@ -299,7 +320,7 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
         prUrl: res.proposal.prUrl,
         prId: res.proposal.id,
       })
-      window.setTimeout(fetchTopology, 1000)
+      scheduleTopologyRefresh(1000)
     } catch (err: unknown) {
       setError(
         err instanceof Error ? err.message : "Failed to open delete stack PR"
@@ -322,7 +343,7 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
         prUrl: res.proposal.prUrl,
         prId: res.proposal.id,
       })
-      window.setTimeout(fetchTopology, 1000)
+      scheduleTopologyRefresh(1000)
     } catch (err: unknown) {
       setError(
         err instanceof Error ? err.message : "Failed to open delete release PR"

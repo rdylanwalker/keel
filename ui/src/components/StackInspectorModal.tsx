@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from "react"
+import React, { useCallback, useEffect, useRef, useState } from "react"
 import {
   X,
   RefreshCw,
@@ -63,6 +63,15 @@ export const StackInspectorModal: React.FC<StackInspectorModalProps> = ({
   const [error, setError] = useState<string | null>(null)
   const [isSshModalOpen, setIsSshModalOpen] = useState(false)
   const [showAdvanced, setShowAdvanced] = useState(false)
+  const pendingTimeoutsRef = useRef<Set<number>>(new Set())
+
+  useEffect(() => {
+    const timeouts = pendingTimeoutsRef.current
+    return () => {
+      timeouts.forEach((id) => window.clearTimeout(id))
+      timeouts.clear()
+    }
+  }, [])
   const isProtectedStack =
     namespace === "flux-system" && name === "management-cluster-core"
   const isStackLocked =
@@ -106,6 +115,17 @@ export const StackInspectorModal: React.FC<StackInspectorModalProps> = ({
     }
   }, [fetchDiag])
 
+  const scheduleDiagnosticsRefresh = useCallback(
+    (delayMs: number) => {
+      const id = window.setTimeout(() => {
+        pendingTimeoutsRef.current.delete(id)
+        void loadDiagnostics()
+      }, delayMs)
+      pendingTimeoutsRef.current.add(id)
+    },
+    [loadDiagnostics]
+  )
+
   useEffect(() => {
     let cancelled = false
     fetchDiag()
@@ -146,7 +166,7 @@ export const StackInspectorModal: React.FC<StackInspectorModalProps> = ({
       const res = await restartStackWorkspace(namespace, name)
       setBanner(res.message)
       onRestarted?.()
-      window.setTimeout(loadDiagnostics, 1500)
+      scheduleDiagnosticsRefresh(1500)
     } catch (err: unknown) {
       setError(
         err instanceof Error ? err.message : "Failed to restart workspace"
@@ -182,7 +202,7 @@ export const StackInspectorModal: React.FC<StackInspectorModalProps> = ({
       const res = await unlockStack(namespace, name)
       setBanner(res.message)
       ;(onUnlocked ?? onRestarted)?.()
-      window.setTimeout(loadDiagnostics, 1500)
+      scheduleDiagnosticsRefresh(1500)
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : "Failed to unlock stack")
     } finally {
