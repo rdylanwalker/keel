@@ -1,7 +1,6 @@
 import React, { useEffect, useState } from "react"
 import {
   GitPullRequest,
-  CheckCircle2,
   AlertTriangle,
   Loader2,
   ExternalLink,
@@ -17,6 +16,7 @@ import {
 } from "lucide-react"
 import { PreviewReport, Proposal, ResourceDiff } from "../types/api"
 import { GitDiffViewer } from "./GitDiffViewer"
+import { PrNotificationBanner } from "./PrNotificationBanner"
 import {
   getProposalPreview,
   getProposals,
@@ -600,16 +600,7 @@ export const PreviewInspectorView: React.FC<PreviewInspectorViewProps> = ({
                 </div>
               </div>
 
-              {mergeSuccess && (
-                <div
-                  role="alert"
-                  className="p-4 bg-purple-950/40 border border-purple-500/30 rounded-xl text-purple-300 text-xs flex items-center space-x-2"
-                >
-                  <CheckCircle2 className="h-4 w-4 text-purple-400 shrink-0" />
-                  <span>{mergeSuccess}</span>
-                </div>
-              )}
-
+              {/* Policy Check Status Banner */}
               {error && (
                 <div
                   role="alert"
@@ -780,6 +771,14 @@ export const PreviewInspectorView: React.FC<PreviewInspectorViewProps> = ({
           )}
         </div>
       </div>
+
+      {mergeSuccess && (
+        <PrNotificationBanner
+          message={mergeSuccess}
+          onDismiss={() => setMergeSuccess(null)}
+          variant="snackbar"
+        />
+      )}
     </div>
   )
 }

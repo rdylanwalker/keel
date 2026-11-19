@@ -142,7 +142,10 @@ describe("VmSshModal component", () => {
       expect(screen.getByTestId("ssh-user-input")).toHaveValue("debian")
     })
 
-    // Override User and Port
+    // Override Host, User, and Port
+    fireEvent.change(screen.getByTestId("ssh-host-display"), {
+      target: { value: "203.0.113.10" },
+    })
     fireEvent.change(screen.getByTestId("ssh-user-input"), {
       target: { value: "ubuntu" },
     })
@@ -151,13 +154,13 @@ describe("VmSshModal component", () => {
     })
 
     expect(screen.getByTestId("ssh-raw-command")).toHaveTextContent(
-      "ssh ubuntu@192.168.1.150 -p 2222"
+      "ssh ubuntu@203.0.113.10 -p 2222"
     )
 
     // Click copy buttons
     fireEvent.click(screen.getByTestId("copy-ssh-raw-btn"))
     expect(navigator.clipboard.writeText).toHaveBeenCalledWith(
-      "ssh ubuntu@192.168.1.150 -p 2222"
+      "ssh ubuntu@203.0.113.10 -p 2222"
     )
 
     fireEvent.click(screen.getByTestId("copy-cli-print-btn"))
@@ -222,9 +225,11 @@ describe("VmSshModal component", () => {
       expect(ws.sentMessages.length).toBeGreaterThan(0)
     })
     const connectFrame = JSON.parse(ws.sentMessages[0])
+    // Verify connect frame contains overridden host
     expect(connectFrame).toEqual(
       expect.objectContaining({
         type: "connect",
+        host: "192.168.1.150",
         user: "debian",
         port: 22,
         privateKey: expect.stringContaining("MOCKKEY"),

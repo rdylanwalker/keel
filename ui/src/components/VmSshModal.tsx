@@ -36,6 +36,7 @@ export const VmSshModal: React.FC<VmSshModalProps> = ({
   const [isFullscreen, setIsFullscreen] = useState(false)
 
   // User connection parameter overrides
+  const [hostOverride, setHostOverride] = useState("")
   const [userOverride, setUserOverride] = useState("")
   const [portOverride, setPortOverride] = useState("")
   const [privateKey, setPrivateKey] = useState("")
@@ -61,6 +62,7 @@ export const VmSshModal: React.FC<VmSshModalProps> = ({
       .then((info) => {
         if (!cancelled) {
           setSshInfo(info)
+          setHostOverride(info.sshHost || "127.0.0.1")
           setUserOverride(info.sshUser)
           setPortOverride(info.sshPort ? String(info.sshPort) : "22")
           if (!info.hasSavedSshKey) {
@@ -114,7 +116,7 @@ export const VmSshModal: React.FC<VmSshModalProps> = ({
   const effectivePort = portOverride.trim()
     ? parseInt(portOverride.trim(), 10) || 22
     : sshInfo?.sshPort || 22
-  const effectiveHost = sshInfo?.sshHost || "127.0.0.1"
+  const effectiveHost = hostOverride.trim() || sshInfo?.sshHost || "127.0.0.1"
   const effectiveTenant = tenant || sshInfo?.tenant || "default"
   const effectiveProvider = provider || sshInfo?.provider || "proxmox"
 
@@ -156,6 +158,7 @@ export const VmSshModal: React.FC<VmSshModalProps> = ({
           type: "connect",
           cols: 80,
           rows: 24,
+          host: effectiveHost,
           user: effectiveUser,
           port: effectivePort,
           ...(privateKey.trim() ? { privateKey: privateKey.trim() } : {}),
@@ -334,10 +337,11 @@ export const VmSshModal: React.FC<VmSshModalProps> = ({
                     <input
                       id="ssh-host-display"
                       type="text"
-                      readOnly
-                      value={effectiveHost}
+                      value={hostOverride}
+                      onChange={(e) => setHostOverride(e.target.value)}
                       data-testid="ssh-host-display"
-                      className="w-full bg-slate-900 border border-slate-800 rounded-lg px-2.5 py-1.5 font-mono text-slate-200 cursor-default"
+                      placeholder="e.g. 192.168.1.150"
+                      className="w-full bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1.5 font-mono text-white focus:outline-none focus:ring-1 focus:ring-emerald-500"
                     />
                   </div>
 

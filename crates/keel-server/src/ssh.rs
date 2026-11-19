@@ -10,7 +10,7 @@ use russh::keys::{PrivateKeyWithHashAlg, decode_secret_key};
 use russh::{ChannelMsg, client};
 use serde::{Deserialize, Serialize};
 
-use crate::routes::clean_candidate_ssh_user;
+use crate::routes::{clean_candidate_ssh_host, clean_candidate_ssh_user};
 
 /// Providers that do not expose an SSH-accessible VM/node endpoint.
 const NON_SSH_PROVIDERS: &[&str] = &[
@@ -53,6 +53,8 @@ pub(crate) enum SshWsClientMessage {
         cols: Option<u16>,
         #[serde(default)]
         rows: Option<u16>,
+        #[serde(default)]
+        host: Option<String>,
         #[serde(default)]
         user: Option<String>,
         #[serde(default)]
@@ -132,7 +134,7 @@ pub(crate) async fn handle_stack_ssh_ws(
 
     let mut active_user = ssh_info.ssh_user.clone();
     let mut active_port = ssh_info.ssh_port;
-    let active_host = ssh_info.ssh_host.clone();
+    let mut active_host = ssh_info.ssh_host.clone();
     let mut cols: u16 = 80;
     let mut rows: u16 = 24;
     let ephemeral_key: Option<String>;
@@ -145,10 +147,28 @@ pub(crate) async fn handle_stack_ssh_ws(
                     Ok(SshWsClientMessage::Connect {
                         cols: req_cols,
                         rows: req_rows,
+                        host,
                         user,
                         port,
                         private_key,
                     }) => {
+                        if let Some(h) = host.as_deref() {
+                            if let Some(cleaned) = clean_candidate_ssh_host(h) {
+                                active_host = cleaned;
+                            } else {
+                                let _ = send_ws_json(
+                                    &mut socket,
+                                    &SshWsServerMessage::Error {
+                                        message: "Invalid SSH host".to_string(),
+                                    },
+                                )
+                                .await;
+                                let _ =
+                                    send_ws_json(&mut socket, &SshWsServerMessage::Disconnected)
+                                        .await;
+                                return;
+                            }
+                        }
                         if let Some(u) = user.as_deref() {
                             if let Some(cleaned) = clean_candidate_ssh_user(u) {
                                 active_user = cleaned;

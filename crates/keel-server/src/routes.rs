@@ -5789,12 +5789,23 @@ fn default_ssh_user_for_provider(provider: &str) -> &'static str {
     }
 }
 
-fn clean_candidate_ssh_host(raw: &str) -> Option<String> {
+fn is_loopback_or_link_local(host: &str) -> bool {
+    let lower = host.to_ascii_lowercase();
+    lower == "localhost"
+        || lower == "::1"
+        || lower == "0.0.0.0"
+        || lower.starts_with("127.")
+        || lower.starts_with("169.254.")
+}
+
+fn clean_single_ssh_host(raw: &str) -> Option<String> {
     let trimmed = raw.trim().trim_matches('"').trim_matches('\'').trim();
     if trimmed.is_empty()
         || trimmed.eq_ignore_ascii_case("dhcp")
         || trimmed.eq_ignore_ascii_case("auto")
         || trimmed.eq_ignore_ascii_case("none")
+        || trimmed.eq_ignore_ascii_case("null")
+        || trimmed.eq_ignore_ascii_case("undefined")
         || trimmed.starts_with("${")
         || trimmed.starts_with('-')
     {
@@ -5810,10 +5821,61 @@ fn clean_candidate_ssh_host(raw: &str) -> Option<String> {
         Some(_) => return None,
         None => trimmed,
     };
-    if host_part.is_empty() || host_part.contains(char::is_whitespace) {
+    if host_part.is_empty()
+        || host_part.contains(char::is_whitespace)
+        || host_part.contains(['[', ']', '{', '}'])
+    {
         return None;
     }
     Some(host_part.to_string())
+}
+
+fn collect_hosts_from_json_value(val: &serde_json::Value, out: &mut Vec<String>) {
+    match val {
+        serde_json::Value::String(s) => {
+            if let Some(cleaned) = clean_single_ssh_host(s) {
+                out.push(cleaned);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_hosts_from_json_value(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn pick_preferred_host(candidates: Vec<String>) -> Option<String> {
+    candidates
+        .iter()
+        .find(|h| !is_loopback_or_link_local(h))
+        .cloned()
+        .or_else(|| candidates.into_iter().next())
+}
+
+pub(crate) fn clean_candidate_ssh_host(raw: &str) -> Option<String> {
+    let trimmed = raw.trim().trim_matches('"').trim_matches('\'').trim();
+    if trimmed.starts_with('[')
+        && let Ok(json_val) = serde_json::from_str::<Value>(trimmed)
+    {
+        let mut candidates = Vec::new();
+        collect_hosts_from_json_value(&json_val, &mut candidates);
+        return pick_preferred_host(candidates);
+    }
+    clean_single_ssh_host(trimmed)
+}
+
+fn extract_ssh_host_from_yaml_value(val: &Value) -> Option<String> {
+    match val {
+        Value::String(s) => clean_candidate_ssh_host(s),
+        Value::Array(_) => {
+            let mut candidates = Vec::new();
+            collect_hosts_from_json_value(val, &mut candidates);
+            pick_preferred_host(candidates)
+        }
+        _ => None,
+    }
 }
 
 pub(crate) fn clean_candidate_ssh_user(raw: &str) -> Option<String> {
@@ -5927,10 +5989,17 @@ async fn resolve_stack_ssh_info(
 
     const HOST_KEYS: &[&str] = &[
         "sshHost",
+        "ssh_host",
+        "externalIp",
+        "externalHostname",
         "publicIp",
+        "public_ip",
         "controlPlanePublicIp",
         "controlPlaneIp",
+        "ipv4Address",
+        "ipv4Addresses",
         "ipAddress",
+        "ip_address",
         "hostname",
         "host",
         "ip",
@@ -5948,8 +6017,8 @@ async fn resolve_stack_ssh_info(
         && let Some(obj) = values_doc.as_ref().and_then(Value::as_object)
     {
         for key in HOST_KEYS {
-            if let Some(val) = obj.get(*key).and_then(Value::as_str)
-                && let Some(cleaned) = clean_candidate_ssh_host(val)
+            if let Some(val) = obj.get(*key)
+                && let Some(cleaned) = extract_ssh_host_from_yaml_value(val)
             {
                 ssh_host = Some(cleaned);
                 break;
@@ -5963,8 +6032,8 @@ async fn resolve_stack_ssh_info(
             .and_then(Value::as_object)
     {
         for key in HOST_KEYS {
-            if let Some(val) = obj.get(*key).and_then(Value::as_str)
-                && let Some(cleaned) = clean_candidate_ssh_host(val)
+            if let Some(val) = obj.get(*key)
+                && let Some(cleaned) = extract_ssh_host_from_yaml_value(val)
             {
                 ssh_host = Some(cleaned);
                 break;
@@ -5978,8 +6047,8 @@ async fn resolve_stack_ssh_info(
             .and_then(Value::as_object)
     {
         for key in HOST_KEYS {
-            if let Some(val) = obj.get(*key).and_then(Value::as_str)
-                && let Some(cleaned) = clean_candidate_ssh_host(val)
+            if let Some(val) = obj.get(*key)
+                && let Some(cleaned) = extract_ssh_host_from_yaml_value(val)
             {
                 ssh_host = Some(cleaned);
                 break;
@@ -7417,5 +7486,24 @@ spec:
             "kubernetes",
             "postgres-managed"
         ));
+    }
+
+    #[test]
+    fn clean_candidate_ssh_host_extracts_external_ip_from_arrays_and_rejects_invalid() {
+        assert_eq!(
+            clean_candidate_ssh_host(r#"[["127.0.0.1"], ["192.168.1.150"]]"#).as_deref(),
+            Some("192.168.1.150")
+        );
+        assert_eq!(
+            clean_candidate_ssh_host(r#"["169.254.1.1", "203.0.113.5/24"]"#).as_deref(),
+            Some("203.0.113.5")
+        );
+        assert_eq!(
+            clean_candidate_ssh_host(r#"["127.0.0.1"]"#).as_deref(),
+            Some("127.0.0.1")
+        );
+        assert_eq!(clean_candidate_ssh_host("dhcp"), None);
+        assert_eq!(clean_candidate_ssh_host("-oProxyCommand=evil"), None);
+        assert_eq!(clean_candidate_ssh_host("192.168.1.0/24"), None);
     }
 }

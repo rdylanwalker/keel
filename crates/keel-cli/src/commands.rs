@@ -1045,54 +1045,101 @@ async fn provision_in_cluster_forgejo(
         });
 
         if !already_configured {
-            let mut add_cmd = tokio::process::Command::new("kubectl");
+            let mut rauthy_wait = tokio::process::Command::new("kubectl");
             if let Some(kc) = kubeconfig {
-                add_cmd.arg("--kubeconfig").arg(kc);
+                rauthy_wait.arg("--kubeconfig").arg(kc);
             }
             if let Some(ctx) = context {
-                add_cmd.arg("--context").arg(ctx);
+                rauthy_wait.arg("--context").arg(ctx);
             }
-            match add_cmd
+            let _ = rauthy_wait
                 .args([
                     "-n",
                     KEEL_SYSTEM_NAMESPACE,
-                    "exec",
-                    "deploy/forgejo",
-                    "--",
-                    "env",
-                    "SSL_CERT_DIR=/etc/ssl/certs:/etc/ssl/keel-ca",
-                    "forgejo",
-                    "admin",
-                    "auth",
-                    "add-oauth",
-                    "--name",
-                    "rauthy",
-                    "--provider",
-                    "openidConnect",
-                    "--key",
-                    "forgejo",
-                    "--secret",
-                    oidc_secret,
-                    "--auto-discover-url",
-                    "https://idp.keel.local:8888/auth/v1/.well-known/openid-configuration",
-                    "--scopes",
-                    "openid email profile groups",
+                    "rollout",
+                    "status",
+                    "statefulset/rauthy",
+                    "--timeout=120s",
                 ])
                 .output()
-                .await
-            {
-                Ok(out) if out.status.success() => {
-                    tracing::info!("Registered Rauthy OIDC SSO provider in Forgejo");
+                .await;
+
+            let mut registered = false;
+            let mut last_err = String::new();
+            for attempt in 1..=15 {
+                let mut add_cmd = tokio::process::Command::new("kubectl");
+                if let Some(kc) = kubeconfig {
+                    add_cmd.arg("--kubeconfig").arg(kc);
                 }
-                Ok(out) => {
-                    tracing::warn!(
-                        stderr = %String::from_utf8_lossy(&out.stderr),
-                        "Failed to register Rauthy OIDC SSO provider in Forgejo (non-fatal)"
-                    );
+                if let Some(ctx) = context {
+                    add_cmd.arg("--context").arg(ctx);
                 }
-                Err(err) => {
-                    tracing::warn!(error = %err, "Failed to exec forgejo admin auth add-oauth (non-fatal)");
+                match add_cmd
+                    .args([
+                        "-n",
+                        KEEL_SYSTEM_NAMESPACE,
+                        "exec",
+                        "deploy/forgejo",
+                        "--",
+                        "env",
+                        "SSL_CERT_DIR=/etc/ssl/certs:/etc/ssl/keel-ca",
+                        "forgejo",
+                        "admin",
+                        "auth",
+                        "add-oauth",
+                        "--name",
+                        "rauthy",
+                        "--provider",
+                        "openidConnect",
+                        "--key",
+                        "forgejo",
+                        "--secret",
+                        oidc_secret,
+                        "--auto-discover-url",
+                        "https://idp.keel.local:8888/auth/v1/.well-known/openid-configuration",
+                        "--scopes",
+                        "openid email profile groups",
+                    ])
+                    .output()
+                    .await
+                {
+                    Ok(out) if out.status.success() => {
+                        tracing::info!(attempt, "Registered Rauthy OIDC SSO provider in Forgejo");
+                        registered = true;
+                        break;
+                    }
+                    Ok(out) => {
+                        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                        if stderr.contains("already exists") {
+                            tracing::info!(
+                                "Rauthy OIDC SSO provider already registered in Forgejo"
+                            );
+                            registered = true;
+                            break;
+                        }
+                        last_err = stderr;
+                        tracing::debug!(
+                            attempt,
+                            error = %last_err,
+                            "Waiting for Rauthy OIDC discovery endpoint before registering in Forgejo"
+                        );
+                    }
+                    Err(err) => {
+                        last_err = err.to_string();
+                        tracing::debug!(
+                            attempt,
+                            error = %last_err,
+                            "Retrying forgejo admin auth add-oauth"
+                        );
+                    }
                 }
+                tokio::time::sleep(Duration::from_secs(3)).await;
+            }
+            if !registered {
+                tracing::warn!(
+                    error = %last_err,
+                    "Failed to register Rauthy OIDC SSO provider in Forgejo after retries (non-fatal)"
+                );
             }
         }
     }
@@ -1942,6 +1989,24 @@ async fn configure_coredns_local_rewrites(context: Option<&str>, kubeconfig: Opt
                 "rollout",
                 "restart",
                 "deployment/coredns",
+            ])
+            .output()
+            .await;
+        let mut status = tokio::process::Command::new("kubectl");
+        if let Some(kc) = kubeconfig {
+            status.arg("--kubeconfig").arg(kc);
+        }
+        if let Some(ctx) = context {
+            status.arg("--context").arg(ctx);
+        }
+        let _ = status
+            .args([
+                "-n",
+                "kube-system",
+                "rollout",
+                "status",
+                "deployment/coredns",
+                "--timeout=60s",
             ])
             .output()
             .await;

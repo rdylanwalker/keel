@@ -123,6 +123,9 @@ describe("PreviewInspectorView component", () => {
     await waitFor(() => {
       expect(api.mergeProposal).toHaveBeenCalledWith("101")
       expect(screen.getByText("Merged cleanly into main")).toBeInTheDocument()
+      expect(screen.getByRole("status")).toHaveTextContent(
+        "Merged cleanly into main"
+      )
       const rejectBtn = screen.getByRole("button", { name: /Reject PR/i })
       expect(mergeBtn).toHaveAttribute("aria-label", "Merged")
       expect(mergeBtn).toBeDisabled()
@@ -132,6 +135,14 @@ describe("PreviewInspectorView component", () => {
       expect(mergeBtn.className).toContain("enabled:hover:bg-purple-500")
       expect(rejectBtn.className).toContain("enabled:hover:bg-rose-600/30")
     })
+
+    // Verify snackbar dismiss button closes notification
+    fireEvent.click(
+      screen.getByRole("button", { name: /Dismiss notification/i })
+    )
+    expect(
+      screen.queryByText("Merged cleanly into main")
+    ).not.toBeInTheDocument()
   })
 
   it("handles merge failure and preview fetch error gracefully", async () => {
