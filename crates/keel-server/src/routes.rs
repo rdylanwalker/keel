@@ -5779,6 +5779,46 @@ pub async fn restart_stack_workspace(
     }))
 }
 
+/// Response body for `POST /api/v1/stacks/{namespace}/{name}/force-delete`.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ForceDeleteStackResponse {
+    pub force_deleted: bool,
+    pub namespace: String,
+    pub name: String,
+    pub message: String,
+}
+
+/// `POST /api/v1/stacks/{namespace}/{name}/force-delete`
+///
+/// Clears finalizers on a stuck/terminating PKO v2 `Stack` and deletes it if not already terminating.
+pub async fn force_delete_stack(
+    auth: AuthSession,
+    State(state): State<AppState>,
+    AxumPath((namespace, name)): AxumPath<(String, String)>,
+) -> Result<Json<ForceDeleteStackResponse>, ServerError> {
+    validate_dns_label(&namespace, "namespace")?;
+    validate_dns_label(&name, "name")?;
+    if namespace == "flux-system" && name == keel_pko::MANAGEMENT_CORE_STACK_NAME {
+        return Err(ServerError::Forbidden(
+            "Cannot force-delete protected management-cluster-core stack".to_string(),
+        ));
+    }
+    let tenant = namespace.strip_prefix("tenant-").unwrap_or(&namespace);
+    auth.require_tenant_access(tenant)?;
+
+    let message = state
+        .state_provider
+        .force_delete_stack(&namespace, &name)
+        .await?;
+    Ok(Json(ForceDeleteStackResponse {
+        force_deleted: true,
+        namespace,
+        name,
+        message,
+    }))
+}
+
 fn default_ssh_user_for_provider(provider: &str) -> &'static str {
     match provider.trim().to_ascii_lowercase().as_str() {
         "aws" | "proxmox" => "ubuntu",

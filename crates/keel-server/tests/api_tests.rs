@@ -1816,6 +1816,73 @@ spec:
 }
 
 #[tokio::test]
+async fn test_force_delete_stack_endpoint_guardrails() {
+    let fixture = setup_fixture().await;
+    let cookie = login_and_get_cookie(&fixture).await;
+    let app = build_router(fixture.state.clone());
+
+    // 1. Unauthenticated POST /api/v1/stacks/tenant-acme/azure-vm/force-delete -> 401
+    let unauth_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/stacks/tenant-acme/azure-vm/force-delete")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauth_res.status(), StatusCode::UNAUTHORIZED);
+
+    // 2. Protected management-cluster-core stack -> 403 Forbidden
+    let protected_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/stacks/flux-system/management-cluster-core/force-delete")
+                .header(COOKIE, &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(protected_res.status(), StatusCode::FORBIDDEN);
+
+    // 3. Cross-tenant access -> 403 Forbidden
+    let tenant_cookie =
+        login_with_groups_and_name(&fixture, "dev-user", "Dev User", vec!["tenant:acme"]).await;
+    let cross_tenant_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/stacks/tenant-beta/azure-vm/force-delete")
+                .header(COOKIE, &tenant_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cross_tenant_res.status(), StatusCode::FORBIDDEN);
+
+    // 4. Repo-only state provider without live cluster -> 400 BadRequest
+    let repo_only_res = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/stacks/tenant-acme/azure-vm/force-delete")
+                .header(COOKIE, &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(repo_only_res.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn test_blueprint_merge_visibility_and_proposal_status_history() {
     let fixture = setup_fixture().await;
     let cookie = login_and_get_cookie(&fixture).await;

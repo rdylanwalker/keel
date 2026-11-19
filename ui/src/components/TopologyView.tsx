@@ -1424,6 +1424,7 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
           provider={inspectedStack.provider}
           onClose={() => setInspectedStack(null)}
           onRestarted={fetchTopology}
+          onForceDeleted={fetchTopology}
           onOpenSsh={() => {
             setSshStack({
               stackName: inspectedStack.name,

@@ -85,6 +85,10 @@ pub fn build_router(state: AppState) -> Router {
             post(routes::restart_stack_workspace),
         )
         .route(
+            "/api/v1/stacks/{namespace}/{name}/force-delete",
+            post(routes::force_delete_stack),
+        )
+        .route(
             "/api/v1/stacks/{namespace}/{name}/config",
             get(routes::get_stack_config),
         )

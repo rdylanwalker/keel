@@ -12,6 +12,7 @@ import {
   ReleaseConfig,
   ReleaseSummary,
   RestartStackResponse,
+  ForceDeleteStackResponse,
   StackDiagnostics,
   StackSshInfo,
   StackSummary,
@@ -658,6 +659,20 @@ export async function restartStackWorkspace(
     }
   )
   return handleResponse<RestartStackResponse>(res)
+}
+
+export async function forceDeleteStack(
+  namespace: string,
+  name: string
+): Promise<ForceDeleteStackResponse> {
+  const res = await fetch(
+    `/api/v1/stacks/${encodeURIComponent(namespace)}/${encodeURIComponent(name)}/force-delete`,
+    {
+      method: "POST",
+      headers: getHeaders(),
+    }
+  )
+  return handleResponse<ForceDeleteStackResponse>(res)
 }
 
 export async function reconcileRelease(

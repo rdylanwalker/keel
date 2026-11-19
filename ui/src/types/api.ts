@@ -188,6 +188,13 @@ export interface RestartStackResponse {
   message: string
 }
 
+export interface ForceDeleteStackResponse {
+  forceDeleted: boolean
+  namespace: string
+  name: string
+  message: string
+}
+
 export interface ReleaseSummary {
   id: string
   name: string

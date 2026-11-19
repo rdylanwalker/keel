@@ -45,8 +45,8 @@ use sha2::{Digest, Sha256};
 
 use crate::cli::{
     AppCommands, AppInstallArgs, AuthCommands, AuthLoginArgs, BootstrapCommands, BootstrapInitArgs,
-    BootstrapRecoverArgs, Cli, Commands, InfraCommands, InfraListArgs, InfraProvisionArgs,
-    InfraSshArgs, OutputFormat, PreviewCommands, PreviewStatusArgs, ServeArgs,
+    BootstrapRecoverArgs, Cli, Commands, InfraCommands, InfraForceDeleteArgs, InfraListArgs,
+    InfraProvisionArgs, InfraSshArgs, OutputFormat, PreviewCommands, PreviewStatusArgs, ServeArgs,
 };
 
 /// Unified error type returned by `keel` CLI command handlers.
@@ -4181,6 +4181,51 @@ pub async fn execute_infra_ssh(args: &InfraSshArgs, ctx: &CliContext) -> Result<
     }
 }
 
+/// Executes `keel infra force-delete` by calling `POST /api/v1/stacks/{namespace}/{name}/force-delete`.
+pub async fn execute_infra_force_delete(
+    args: &InfraForceDeleteArgs,
+    ctx: &CliContext,
+) -> Result<String, CliError> {
+    validate_dns_label(&args.stack_name, "stack_name")?;
+    let namespace = match &args.namespace {
+        Some(ns) => {
+            validate_dns_label(ns, "namespace")?;
+            ns.clone()
+        }
+        None => {
+            validate_dns_label(&args.tenant, "tenant")?;
+            format!("tenant-{}", args.tenant)
+        }
+    };
+
+    let base_url = normalize_server_url(&args.server)?;
+    let endpoint = format!(
+        "{base_url}/api/v1/stacks/{}/{}/force-delete",
+        namespace, args.stack_name
+    );
+
+    let resp = attach_auth(ctx.http.post(&endpoint), ctx, &base_url)
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        return Err(extract_api_error(resp).await);
+    }
+
+    let body: Value = resp.json().await?;
+    if matches!(args.output, OutputFormat::Json) {
+        return Ok(serde_json::to_string_pretty(&body)?);
+    }
+
+    let message = body
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("Stack force-deleted");
+    Ok(format!(
+        "Force-deleted stack {namespace}/{}: {message}",
+        args.stack_name
+    ))
+}
+
 // ============================================================================
 // 8. `keel preview status` & Terminal Diff Table Formatter
 // ============================================================================
@@ -4440,6 +4485,7 @@ pub async fn dispatch(cli: &Cli, ctx: &CliContext) -> Result<String, CliError> {
             InfraCommands::List(args) => execute_infra_list(args, ctx).await,
             InfraCommands::Provision(args) => Ok(execute_infra_provision(args, ctx).await?.output),
             InfraCommands::Ssh(args) => execute_infra_ssh(args, ctx).await,
+            InfraCommands::ForceDelete(args) => execute_infra_force_delete(args, ctx).await,
         },
         Commands::App(a) => match &a.command {
             AppCommands::Install(args) => Ok(execute_app_install(args, ctx).await?.output),
@@ -5316,6 +5362,46 @@ spec:
             server: server_url.clone(),
         };
         assert!(execute_infra_ssh(&bad_user_ssh, &ctx).await.is_err());
+
+        // 7c. `keel infra force-delete` CLI parsing & protected stack rejection
+        let force_delete_cli = Cli::try_parse_from([
+            "keel",
+            "infra",
+            "force-delete",
+            "management-cluster-core",
+            "--namespace",
+            "flux-system",
+            "--server",
+            &server_url,
+        ])
+        .unwrap();
+        let force_delete_err = dispatch(&force_delete_cli, &ctx).await.unwrap_err();
+        assert!(
+            force_delete_err
+                .to_string()
+                .contains("management-cluster-core"),
+            "unexpected error: {force_delete_err}"
+        );
+
+        let json_cli = Cli::try_parse_from([
+            "keel",
+            "infra",
+            "force-delete",
+            "azure-free-tier-vm",
+            "--tenant",
+            "default",
+            "--output",
+            "json",
+            "--server",
+            &server_url,
+        ])
+        .unwrap();
+        assert!(matches!(
+            json_cli.command,
+            Commands::Infra(crate::cli::InfraArgs {
+                command: InfraCommands::ForceDelete(_)
+            })
+        ));
 
         // `keel app install --engine flux` and `--engine pulumi`
         for eng in ["flux", "pulumi"] {

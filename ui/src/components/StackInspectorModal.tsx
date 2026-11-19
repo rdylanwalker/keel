@@ -10,9 +10,11 @@ import {
   Activity,
   Maximize2,
   Minimize2,
+  Trash2,
 } from "lucide-react"
 import { StackDiagnostics } from "../types/api"
 import {
+  forceDeleteStack,
   getReleaseDiagnostics,
   getStackDiagnostics,
   restartStackWorkspace,
@@ -28,6 +30,7 @@ export interface StackInspectorModalProps {
   provider?: string
   onClose: () => void
   onRestarted?: () => void
+  onForceDeleted?: () => void
   onOpenSsh?: () => void
 }
 
@@ -39,16 +42,21 @@ export const StackInspectorModal: React.FC<StackInspectorModalProps> = ({
   provider,
   onClose,
   onRestarted,
+  onForceDeleted,
   onOpenSsh,
 }) => {
   const [diag, setDiag] = useState<StackDiagnostics | null>(null)
   const [loading, setLoading] = useState(true)
   const [restarting, setRestarting] = useState(false)
+  const [confirmingForceDelete, setConfirmingForceDelete] = useState(false)
+  const [forceDeleting, setForceDeleting] = useState(false)
   const [autoRefresh, setAutoRefresh] = useState(true)
   const [isFullscreen, setIsFullscreen] = useState(false)
   const [banner, setBanner] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [isSshModalOpen, setIsSshModalOpen] = useState(false)
+  const isProtectedStack =
+    namespace === "flux-system" && name === "management-cluster-core"
 
   const fetchDiag = useCallback(
     () =>
@@ -119,6 +127,24 @@ export const StackInspectorModal: React.FC<StackInspectorModalProps> = ({
       )
     } finally {
       setRestarting(false)
+    }
+  }
+
+  const handleForceDelete = async () => {
+    setForceDeleting(true)
+    setError(null)
+    setBanner(null)
+    try {
+      const res = await forceDeleteStack(namespace, name)
+      setBanner(res.message)
+      setConfirmingForceDelete(false)
+      ;(onForceDeleted ?? onRestarted)?.()
+    } catch (err: unknown) {
+      setError(
+        err instanceof Error ? err.message : "Failed to force-delete stack"
+      )
+    } finally {
+      setForceDeleting(false)
     }
   }
 
@@ -219,13 +245,28 @@ export const StackInspectorModal: React.FC<StackInspectorModalProps> = ({
               <button
                 type="button"
                 onClick={handleRestart}
-                disabled={restarting}
+                disabled={restarting || forceDeleting}
                 className="flex items-center space-x-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 border border-amber-500/30 transition-colors cursor-pointer disabled:opacity-50"
               >
                 <RotateCw
                   className={`h-3.5 w-3.5 ${restarting ? "animate-spin" : ""}`}
                 />
                 <span>{restarting ? "Restarting..." : "Rollout Restart"}</span>
+              </button>
+            )}
+            {kind === "stack" && !isProtectedStack && (
+              <button
+                type="button"
+                data-testid="inspector-force-delete-btn"
+                onClick={() => setConfirmingForceDelete(true)}
+                disabled={forceDeleting || restarting}
+                title="Clear finalizers and force-delete a stuck or terminating Stack"
+                className="flex items-center space-x-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-red-500/15 hover:bg-red-500/25 text-red-300 border border-red-500/30 transition-colors cursor-pointer disabled:opacity-50"
+              >
+                <Trash2 className="h-3.5 w-3.5" />
+                <span>
+                  {forceDeleting ? "Force Deleting..." : "Force Delete"}
+                </span>
               </button>
             )}
             <button
@@ -262,6 +303,40 @@ export const StackInspectorModal: React.FC<StackInspectorModalProps> = ({
               : "overflow-y-auto space-y-5"
           }`}
         >
+          {confirmingForceDelete && (
+            <div className="shrink-0 p-3 rounded-xl bg-red-500/10 border border-red-500/40 text-xs text-red-200 flex flex-wrap items-center justify-between gap-3">
+              <div className="flex items-center space-x-2">
+                <AlertTriangle className="h-4 w-4 text-red-400 shrink-0" />
+                <span>
+                  Clear finalizers and force-delete{" "}
+                  <code className="font-mono text-white">
+                    {namespace}/{name}
+                  </code>
+                  ? Pulumi will not destroy any remaining cloud resources.
+                </span>
+              </div>
+              <div className="flex items-center space-x-2">
+                <button
+                  type="button"
+                  onClick={() => setConfirmingForceDelete(false)}
+                  disabled={forceDeleting}
+                  className="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 cursor-pointer disabled:opacity-50"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  data-testid="confirm-force-delete-btn"
+                  onClick={handleForceDelete}
+                  disabled={forceDeleting}
+                  className="px-3 py-1 rounded-lg font-semibold bg-red-600 hover:bg-red-500 text-white cursor-pointer disabled:opacity-50"
+                >
+                  {forceDeleting ? "Force Deleting..." : "Confirm Force Delete"}
+                </button>
+              </div>
+            </div>
+          )}
+
           {banner && (
             <div className="shrink-0 p-3 rounded-xl bg-emerald-500/10 border border-emerald-500/30 text-xs text-emerald-300 flex items-center space-x-2">
               <CheckCircle2 className="h-4 w-4 shrink-0" />

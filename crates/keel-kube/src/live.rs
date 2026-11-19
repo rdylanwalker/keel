@@ -7,7 +7,7 @@ use chrono::Utc;
 use k8s_openapi::api::apps::v1::StatefulSet;
 use k8s_openapi::api::core::v1::{Event as K8sEvent, Pod};
 use kube::Client;
-use kube::api::{Api, DynamicObject, ListParams, LogParams, Patch, PatchParams};
+use kube::api::{Api, DeleteParams, DynamicObject, ListParams, LogParams, Patch, PatchParams};
 use kube::discovery::ApiResource;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -175,6 +175,13 @@ pub trait LiveStatusSource: Send + Sync {
     ) -> Result<String, KubeError> {
         Err(KubeError::InvalidInput(
             "Live Kubernetes cluster connection required to restart stack workspace".to_string(),
+        ))
+    }
+
+    /// Clears finalizers on a stuck/terminating PKO v2 `Stack` and deletes it if not already terminating.
+    async fn force_delete_stack(&self, _namespace: &str, _name: &str) -> Result<String, KubeError> {
+        Err(KubeError::InvalidInput(
+            "Live Kubernetes cluster connection required to force-delete stack".to_string(),
         ))
     }
 
@@ -1011,6 +1018,62 @@ impl LiveStatusSource for KubeClusterStatusReader {
         Ok(format!(
             "Triggered rollout restart for StatefulSet {namespace}/{sts_name}"
         ))
+    }
+
+    async fn force_delete_stack(&self, namespace: &str, name: &str) -> Result<String, KubeError> {
+        if namespace == "flux-system" && name == "management-cluster-core" {
+            return Err(KubeError::InvalidInput(
+                "Cannot force-delete protected management-cluster-core stack".to_string(),
+            ));
+        }
+
+        let ar = ApiResource {
+            group: "pulumi.com".to_string(),
+            version: "v1".to_string(),
+            api_version: "pulumi.com/v1".to_string(),
+            kind: "Stack".to_string(),
+            plural: "stacks".to_string(),
+        };
+        let api: Api<DynamicObject> = Api::namespaced_with(self.client.clone(), namespace, &ar);
+        let existing = api.get_opt(name).await?.ok_or_else(|| {
+            KubeError::InvalidInput(format!("Stack {namespace}/{name} not found"))
+        })?;
+
+        let is_protected = existing
+            .metadata
+            .labels
+            .as_ref()
+            .and_then(|labels| labels.get("keel.io/protected"))
+            .map(String::as_str)
+            == Some("true");
+        if is_protected {
+            return Err(KubeError::InvalidInput(format!(
+                "Cannot force-delete protected Stack {namespace}/{name}"
+            )));
+        }
+
+        let was_terminating = existing.metadata.deletion_timestamp.is_some();
+        let patch = json!({
+            "metadata": {
+                "finalizers": Value::Null
+            }
+        });
+        api.patch(name, &PatchParams::default(), &Patch::Merge(&patch))
+            .await?;
+
+        if !was_terminating {
+            match api.delete(name, &DeleteParams::default()).await {
+                Ok(_) => {}
+                Err(kube::Error::Api(err)) if err.code == 404 => {}
+                Err(err) => return Err(err.into()),
+            }
+        }
+
+        Ok(if was_terminating {
+            format!("Cleared finalizers on terminating Stack {namespace}/{name}")
+        } else {
+            format!("Cleared finalizers and force-deleted Stack {namespace}/{name}")
+        })
     }
 
     async fn reconcile_release(&self, namespace: &str, name: &str) -> Result<String, KubeError> {

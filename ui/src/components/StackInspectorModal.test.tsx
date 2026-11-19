@@ -7,6 +7,7 @@ vi.mock("../lib/api", () => ({
   getStackDiagnostics: vi.fn(),
   getReleaseDiagnostics: vi.fn(),
   restartStackWorkspace: vi.fn(),
+  forceDeleteStack: vi.fn(),
 }))
 
 const sampleDiagnostics = {
@@ -186,5 +187,49 @@ describe("StackInspectorModal component", () => {
 
     const sshBtn = await screen.findByTestId("inspector-ssh-btn")
     expect(sshBtn).toBeDisabled()
+    expect(
+      screen.queryByTestId("inspector-force-delete-btn")
+    ).not.toBeInTheDocument()
+  })
+
+  it("confirms and executes Force Delete for non-protected stacks", async () => {
+    const onForceDeleted = vi.fn()
+    vi.mocked(api.getStackDiagnostics).mockResolvedValue(sampleDiagnostics)
+    vi.mocked(api.forceDeleteStack).mockResolvedValue({
+      forceDeleted: true,
+      namespace: "tenant-default",
+      name: "azure-free-tier-vm",
+      message:
+        "Cleared finalizers on terminating Stack tenant-default/azure-free-tier-vm",
+    })
+
+    render(
+      <StackInspectorModal
+        namespace="tenant-default"
+        name="azure-free-tier-vm"
+        kind="stack"
+        onClose={onClose}
+        onForceDeleted={onForceDeleted}
+      />
+    )
+
+    const forceDeleteBtn = await screen.findByTestId(
+      "inspector-force-delete-btn"
+    )
+    fireEvent.click(forceDeleteBtn)
+
+    const confirmBtn = await screen.findByTestId("confirm-force-delete-btn")
+    fireEvent.click(confirmBtn)
+
+    await waitFor(() => {
+      expect(api.forceDeleteStack).toHaveBeenCalledWith(
+        "tenant-default",
+        "azure-free-tier-vm"
+      )
+      expect(onForceDeleted).toHaveBeenCalled()
+      expect(
+        screen.getByText(/Cleared finalizers on terminating Stack/i)
+      ).toBeInTheDocument()
+    })
   })
 })

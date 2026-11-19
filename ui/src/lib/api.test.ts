@@ -27,6 +27,7 @@ import {
   deleteRelease,
   getBundleConfig,
   restartStackWorkspace,
+  forceDeleteStack,
   reconcileRelease,
   getProviders,
   toggleProvider,
@@ -659,9 +660,14 @@ describe("api client module", () => {
     await deleteRelease("tenant-acme", "podinfo")
     await getBundleConfig("tenant-acme", "kind-with-podinfo")
     await restartStackWorkspace("tenant-acme", "dev-kind")
+    await forceDeleteStack("tenant-acme", "dev-kind")
     await reconcileRelease("tenant-acme", "podinfo")
 
-    expect(fetchMock).toHaveBeenCalledTimes(10)
+    expect(fetchMock).toHaveBeenCalledTimes(11)
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/v1/stacks/tenant-acme/dev-kind/force-delete",
+      expect.objectContaining({ method: "POST" })
+    )
     expect(fetchMock).toHaveBeenCalledWith(
       "/api/v1/catalog/fetch-schema",
       expect.objectContaining({ method: "POST" })

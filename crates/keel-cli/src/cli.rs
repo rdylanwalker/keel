@@ -305,6 +305,8 @@ pub enum InfraCommands {
     Provision(InfraProvisionArgs),
     /// Display SSH connection info or open an interactive SSH session to a provisioned VM stack
     Ssh(InfraSshArgs),
+    /// Clear finalizers and force-delete a stuck or terminating PKO v2 Stack
+    ForceDelete(InfraForceDeleteArgs),
 }
 
 /// Arguments for `keel infra list` (`SDD.md` §7.2).
@@ -378,6 +380,29 @@ pub struct InfraSshArgs {
     pub output: String,
 
     /// Keel server URL
+    #[arg(long, default_value = DEFAULT_SERVER_URL)]
+    pub server: String,
+}
+
+/// Arguments for `keel infra force-delete`.
+#[derive(Args, Debug, Clone, PartialEq, Eq)]
+pub struct InfraForceDeleteArgs {
+    /// Infrastructure stack name
+    pub stack_name: String,
+
+    /// Target tenant identifier (resolves to `tenant-<tenant>` unless `--namespace` is specified)
+    #[arg(long, default_value = "default")]
+    pub tenant: String,
+
+    /// Explicit Kubernetes namespace override
+    #[arg(long)]
+    pub namespace: Option<String>,
+
+    /// Output format (`table|json`)
+    #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+    pub output: OutputFormat,
+
+    /// Keel server base URL
     #[arg(long, default_value = DEFAULT_SERVER_URL)]
     pub server: String,
 }
