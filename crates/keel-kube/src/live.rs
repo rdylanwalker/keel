@@ -184,6 +184,11 @@ pub trait LiveStatusSource: Send + Sync {
             "Live Kubernetes cluster connection required to reconcile release".to_string(),
         ))
     }
+
+    /// Reads the `<name>-outputs` Kubernetes `Secret` (if present) for a PKO `Stack` in `namespace`.
+    async fn stack_outputs(&self, _namespace: &str, _name: &str) -> HashMap<String, String> {
+        HashMap::new()
+    }
 }
 
 /// Live `kube-rs` implementation querying PKO v2 `Stack`, Flux `HelmRelease`, and Flux `Kustomization` CRDs.
@@ -217,6 +222,24 @@ impl KubeClusterStatusReader {
         let data = secret.data?;
         let bytes = data.get(key)?;
         String::from_utf8(bytes.0.clone()).ok()
+    }
+
+    /// Reads all UTF-8 key-value pairs from a Kubernetes `Secret` (such as `<stack>-outputs`).
+    pub async fn read_secret_map(&self, namespace: &str, name: &str) -> HashMap<String, String> {
+        use k8s_openapi::api::core::v1::Secret;
+        let secrets: Api<Secret> = Api::namespaced(self.client.clone(), namespace);
+        let Ok(secret) = secrets.get(name).await else {
+            return HashMap::new();
+        };
+        let mut out = HashMap::new();
+        if let Some(data) = secret.data {
+            for (k, bytes) in data {
+                if let Ok(val) = String::from_utf8(bytes.0) {
+                    out.insert(k, val);
+                }
+            }
+        }
+        out
     }
 
     async fn collect_canary_statuses_for_client(
@@ -1035,6 +1058,11 @@ impl LiveStatusSource for KubeClusterStatusReader {
             }
             Err(err) => Err(err.into()),
         }
+    }
+
+    async fn stack_outputs(&self, namespace: &str, name: &str) -> HashMap<String, String> {
+        let secret_name = format!("{name}-outputs");
+        self.read_secret_map(namespace, &secret_name).await
     }
 }
 

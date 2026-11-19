@@ -17,9 +17,10 @@ pub use bootstrap::{
     ValidatedKubeconfig, factory as bootstrap_target_factory, validate_kubeconfig_yaml,
 };
 pub use catalog::{
-    PartitionedValues, PreparedHelmValues, SchemaFieldError, extract_secret_field_paths,
-    is_secret_schema_node, parse_catalog, parse_catalog_application, parse_catalog_blueprint,
-    parse_catalog_bundle, partition_values_by_schema, prepare_helm_values, render_helm_values_yaml,
+    PartitionedValues, PreparedHelmValues, SchemaFieldError, extract_manifest_variables,
+    extract_secret_field_paths, is_secret_schema_node, parse_catalog, parse_catalog_application,
+    parse_catalog_blueprint, parse_catalog_bundle, partition_values_by_schema, prepare_helm_values,
+    render_helm_values_yaml, render_manifest_template, validate_k8s_manifests_yaml,
     validate_schema_values,
 };
 pub use crypto::{
@@ -33,8 +34,9 @@ pub use models::{
     CatalogBlueprintMetadata, CatalogBlueprintSpec, CatalogBundle, CatalogBundleItem,
     CatalogBundleMetadata, CatalogBundleSpec, CatalogInfraBlueprint, CatalogManifest,
     CompanionInfraHook, DEFAULT_CLUSTER_NAME, DEFAULT_POLL_INTERVAL, ForgeConfig, ForgeKind,
-    KeelConfig, OidcConfig, ProgressiveDeliverySpec, ProviderEntry, ProviderRegistry,
-    ResourceQuotaSpec, S3BackendConfig, TenantConfig, UpstreamSource,
+    KeelConfig, ManifestEngine, OidcConfig, ProgressiveDeliverySpec, ProviderEntry,
+    ProviderRegistry, ResourceQuotaSpec, S3BackendConfig, StackSshInfoResponse, TenantConfig,
+    UpstreamSource,
 };
 
 /// Flux CD controllers namespace (`SDD.md` §1).

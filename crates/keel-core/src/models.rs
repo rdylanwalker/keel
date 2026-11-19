@@ -850,7 +850,7 @@ impl TenantConfig {
     }
 }
 
-/// Application packaging runtime supported by Flux CD (`SDD.md` §5.1).
+/// Application packaging runtime supported by Flux CD and PKO (`SDD.md` §5.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AppRuntime {
@@ -858,6 +858,8 @@ pub enum AppRuntime {
     Helm,
     #[serde(alias = "Kustomize", alias = "KUSTOMIZE")]
     Kustomize,
+    #[serde(alias = "Manifest", alias = "MANIFEST")]
+    Manifest,
 }
 
 impl AppRuntime {
@@ -865,6 +867,7 @@ impl AppRuntime {
         match self {
             Self::Helm => "helm",
             Self::Kustomize => "kustomize",
+            Self::Manifest => "manifest",
         }
     }
 }
@@ -882,8 +885,49 @@ impl FromStr for AppRuntime {
         match s.trim().to_ascii_lowercase().as_str() {
             "helm" => Ok(Self::Helm),
             "kustomize" => Ok(Self::Kustomize),
+            "manifest" => Ok(Self::Manifest),
             other => Err(CoreError::Validation(format!(
-                "Unsupported application runtime '{other}'; expected 'helm' or 'kustomize'"
+                "Unsupported application runtime '{other}'; expected 'helm', 'kustomize', or 'manifest'"
+            ))),
+        }
+    }
+}
+
+/// Reconciliation engine for raw Kubernetes manifest catalog applications (`SDD.md` §5.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ManifestEngine {
+    #[default]
+    #[serde(alias = "Flux", alias = "FLUX")]
+    Flux,
+    #[serde(alias = "Pulumi", alias = "PULUMI")]
+    Pulumi,
+}
+
+impl ManifestEngine {
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Flux => "flux",
+            Self::Pulumi => "pulumi",
+        }
+    }
+}
+
+impl fmt::Display for ManifestEngine {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for ManifestEngine {
+    type Err = CoreError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "flux" => Ok(Self::Flux),
+            "pulumi" => Ok(Self::Pulumi),
+            other => Err(CoreError::Validation(format!(
+                "Unsupported manifest engine '{other}'; expected 'flux' or 'pulumi'"
             ))),
         }
     }
@@ -902,9 +946,9 @@ pub struct CatalogAppMetadata {
 }
 
 /// Unmodified upstream Helm chart or Kustomize repository reference (`NFR-EXT-01`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct UpstreamSource {
-    #[serde(rename = "repoURL", alias = "repoUrl", alias = "repo_url")]
+    #[serde(default, rename = "repoURL", alias = "repoUrl", alias = "repo_url")]
     pub repo_url: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chart: Option<String>,
@@ -939,6 +983,7 @@ pub struct CompanionInfraHook {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CatalogAppSpec {
+    #[serde(default)]
     pub upstream: UpstreamSource,
     #[serde(default)]
     pub progressive_delivery: ProgressiveDeliverySpec,
@@ -950,6 +995,13 @@ pub struct CatalogAppSpec {
     /// Optional external/ingress URL for accessing this service (e.g., admin UI on Management Plane Base Addons).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service_url: Option<String>,
+    /// Optional default reconciliation engine (`flux` or `pulumi`) when `metadata.runtime == "manifest"`.
+    #[serde(
+        default,
+        alias = "default_engine",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub default_engine: Option<ManifestEngine>,
 }
 
 /// Git-stored `keel.io/v1alpha1` `CatalogApplication` definition (`SDD.md` §5.1).
@@ -988,7 +1040,9 @@ impl CatalogApplication {
                 "metadata.category must not be empty".to_string(),
             ));
         }
-        if self.spec.upstream.repo_url.trim().is_empty() {
+        if self.metadata.runtime != AppRuntime::Manifest
+            && self.spec.upstream.repo_url.trim().is_empty()
+        {
             return Err(CoreError::Validation(
                 "spec.upstream.repoURL must not be empty".to_string(),
             ));
@@ -1353,6 +1407,23 @@ pub enum CatalogManifest {
     Bundle(Box<CatalogBundle>),
 }
 
+/// Resolved SSH connection metadata for a provisioned VM infrastructure stack (`GET /api/v1/stacks/{namespace}/{name}/ssh-info`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StackSshInfoResponse {
+    pub stack_name: String,
+    pub namespace: String,
+    pub tenant: String,
+    pub provider: String,
+    pub ssh_host: String,
+    pub ssh_user: String,
+    pub ssh_port: u16,
+    pub ssh_command: String,
+    pub cli_command: String,
+    pub cli_exec_command: String,
+    pub has_saved_ssh_key: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1590,11 +1661,66 @@ mod tests {
             AppRuntime::from_str("Kustomize").unwrap(),
             AppRuntime::Kustomize
         );
+        assert_eq!(
+            AppRuntime::from_str("manifest").unwrap(),
+            AppRuntime::Manifest
+        );
+        assert_eq!(
+            AppRuntime::from_str("MANIFEST").unwrap(),
+            AppRuntime::Manifest
+        );
+        assert_eq!(AppRuntime::Manifest.as_str(), "manifest");
+        assert_eq!(AppRuntime::Manifest.to_string(), "manifest");
         assert!(AppRuntime::from_str("docker-compose").is_err());
 
         let h: AppRuntime = serde_yml::from_str("Helm").unwrap();
         assert_eq!(h, AppRuntime::Helm);
         let k: AppRuntime = serde_yml::from_str("kustomize").unwrap();
         assert_eq!(k, AppRuntime::Kustomize);
+        let m: AppRuntime = serde_yml::from_str("Manifest").unwrap();
+        assert_eq!(m, AppRuntime::Manifest);
+    }
+
+    #[test]
+    fn test_manifest_engine_variants_and_catalog_validation() {
+        assert_eq!(ManifestEngine::default(), ManifestEngine::Flux);
+        assert_eq!(
+            ManifestEngine::from_str("flux").unwrap(),
+            ManifestEngine::Flux
+        );
+        assert_eq!(
+            ManifestEngine::from_str("PULUMI").unwrap(),
+            ManifestEngine::Pulumi
+        );
+        assert_eq!(ManifestEngine::Flux.as_str(), "flux");
+        assert_eq!(ManifestEngine::Pulumi.as_str(), "pulumi");
+        assert_eq!(ManifestEngine::Pulumi.to_string(), "pulumi");
+        assert!(ManifestEngine::from_str("argocd").is_err());
+
+        let app = CatalogApplication {
+            api_version: CATALOG_API_VERSION.to_string(),
+            kind: CATALOG_APPLICATION_KIND.to_string(),
+            metadata: CatalogAppMetadata {
+                id: "nginx-raw".to_string(),
+                name: "Nginx Raw Manifest".to_string(),
+                description: None,
+                category: "Web".to_string(),
+                runtime: AppRuntime::Manifest,
+            },
+            spec: CatalogAppSpec {
+                upstream: UpstreamSource::default(),
+                progressive_delivery: ProgressiveDeliverySpec::default(),
+                companion_infrastructure: Vec::new(),
+                schema: serde_json::json!({ "type": "object", "properties": {} }),
+                ui_schema: None,
+                service_url: None,
+                default_engine: Some(ManifestEngine::Pulumi),
+            },
+        };
+        assert!(app.validate().is_ok());
+
+        let mut helm_app = app;
+        helm_app.metadata.runtime = AppRuntime::Helm;
+        assert!(helm_app.validate().is_err());
     }
 }

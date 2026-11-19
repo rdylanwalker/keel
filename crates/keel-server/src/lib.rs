@@ -18,7 +18,8 @@ pub use auth::{
     SESSION_COOKIE_NAME, SessionClaims, decrypt_session_token, encrypt_session_token,
 };
 pub use error::{ErrorResponse, ServerError};
-pub use routes::healthz as health_check;
+pub use keel_core::StackSshInfoResponse;
+pub use routes::{CatalogItemDto, CreateCatalogItemRequest, healthz as health_check};
 pub use state::{
     AppState, CachedPreview, ClusterStateProvider, KubeClusterStateProvider, ReleaseSummary,
     RepoClusterStateProvider, StackSummary,
@@ -85,6 +86,14 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/api/v1/stacks/{namespace}/{name}/config",
             get(routes::get_stack_config),
+        )
+        .route(
+            "/api/v1/stacks/{namespace}/{name}/ssh-info",
+            get(routes::get_stack_ssh_info),
+        )
+        .route(
+            "/api/v1/stacks/{namespace}/{name}/ssh/ws",
+            get(routes::stack_ssh_ws),
         )
         .route(
             "/api/v1/stacks/{namespace}/{name}",

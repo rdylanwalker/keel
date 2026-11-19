@@ -40,12 +40,13 @@ pub use telemetry::{
 };
 pub use tenant::{
     FlaggerCanarySpecInput, FluxDependencyRef, FluxHealthCheckRef, FluxKustomizationSpecInput,
-    HelmChartSourceKind, HelmChartSourceRef, HelmReleaseSpecInput, HelmValuesSecretRef,
-    RemoteKubeConfigRef, TENANT_NAMESPACE_PREFIX, TenantIsolationConfig, TenantManifestBundle,
-    TenantQuotaSpec, build_tenant_default_deny_network_policy, build_tenant_namespace,
-    build_tenant_resource_quota, build_tenant_service_account,
-    synthesize_canary_gateway_network_policy, synthesize_canary_gateway_network_policy_yaml,
-    synthesize_flagger_canary, synthesize_flagger_canary_yaml, synthesize_flux_kustomization,
+    FluxSubstituteReference, HelmChartSourceKind, HelmChartSourceRef, HelmReleaseSpecInput,
+    HelmValuesSecretRef, RemoteKubeConfigRef, TENANT_NAMESPACE_PREFIX, TenantIsolationConfig,
+    TenantManifestBundle, TenantQuotaSpec, build_tenant_default_deny_network_policy,
+    build_tenant_namespace, build_tenant_resource_quota, build_tenant_service_account,
+    generate_flux_kustomization_manifest, synthesize_canary_gateway_network_policy,
+    synthesize_canary_gateway_network_policy_yaml, synthesize_flagger_canary,
+    synthesize_flagger_canary_yaml, synthesize_flux_kustomization,
     synthesize_flux_kustomization_yaml, synthesize_helm_release, synthesize_helm_release_yaml,
     tenant_namespace, validate_tenant_id,
 };

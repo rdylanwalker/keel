@@ -894,6 +894,15 @@ pub struct FluxHealthCheckRef {
     pub namespace: Option<String>,
 }
 
+/// Reference to a `ConfigMap` or `Secret` for Flux `Kustomization.spec.postBuild.substituteFrom`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FluxSubstituteReference {
+    pub kind: String, // "ConfigMap" or "Secret"
+    pub name: String,
+    #[serde(default)]
+    pub optional: bool,
+}
+
 /// Input specification for synthesizing a tenant-scoped Flux `Kustomization` (`kustomize.toolkit.fluxcd.io/v1`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FluxKustomizationSpecInput {
@@ -913,6 +922,10 @@ pub struct FluxKustomizationSpecInput {
     pub target_namespace: Option<String>,
     #[serde(default)]
     pub extra_labels: BTreeMap<String, String>,
+    #[serde(default)]
+    pub post_build_substitute: BTreeMap<String, String>,
+    #[serde(default)]
+    pub post_build_substitute_from: Vec<FluxSubstituteReference>,
 }
 
 impl FluxKustomizationSpecInput {
@@ -936,6 +949,8 @@ impl FluxKustomizationSpecInput {
             kube_config: None,
             target_namespace: None,
             extra_labels: BTreeMap::new(),
+            post_build_substitute: BTreeMap::new(),
+            post_build_substitute_from: Vec::new(),
         }
     }
 }
@@ -1036,6 +1051,32 @@ pub fn synthesize_flux_kustomization(
         spec.insert("healthChecks".to_string(), Value::Array(checks));
     }
 
+    if !input.post_build_substitute.is_empty() || !input.post_build_substitute_from.is_empty() {
+        let mut post_build = serde_json::Map::new();
+        if !input.post_build_substitute.is_empty() {
+            post_build.insert("substitute".to_string(), json!(input.post_build_substitute));
+        }
+        if !input.post_build_substitute_from.is_empty() {
+            let mut sub_from = Vec::with_capacity(input.post_build_substitute_from.len());
+            for sr in &input.post_build_substitute_from {
+                if sr.kind != "ConfigMap" && sr.kind != "Secret" {
+                    return Err(KubeError::InvalidInput(format!(
+                        "post_build_substitute_from.kind must be 'ConfigMap' or 'Secret', got '{}'",
+                        sr.kind
+                    )));
+                }
+                validate_resource_name("post_build_substitute_from.name", &sr.name)?;
+                sub_from.push(json!({
+                    "kind": sr.kind,
+                    "name": sr.name,
+                    "optional": sr.optional,
+                }));
+            }
+            post_build.insert("substituteFrom".to_string(), Value::Array(sub_from));
+        }
+        spec.insert("postBuild".to_string(), Value::Object(post_build));
+    }
+
     let mut labels = tenant_common_labels(&input.tenant_id);
     for (k, v) in &input.extra_labels {
         labels.insert(k.clone(), v.clone());
@@ -1059,6 +1100,13 @@ pub fn synthesize_flux_kustomization_yaml(
 ) -> Result<String, KubeError> {
     let manifest = synthesize_flux_kustomization(input)?;
     Ok(serde_yml::to_string(&manifest)?)
+}
+
+/// Alias for [`synthesize_flux_kustomization_yaml`] generating a `kustomize.toolkit.fluxcd.io/v1` `Kustomization` YAML.
+pub fn generate_flux_kustomization_manifest(
+    input: &FluxKustomizationSpecInput,
+) -> Result<String, KubeError> {
+    synthesize_flux_kustomization_yaml(input)
 }
 
 #[cfg(test)]
@@ -1348,5 +1396,46 @@ mod tests {
             "keel-system"
         );
         assert_eq!(np["spec"]["ingress"][0]["ports"][0]["port"], 9898);
+    }
+
+    #[test]
+    fn flux_kustomization_synthesizes_post_build_substitute_and_substitute_from() {
+        let mut input = FluxKustomizationSpecInput::new(
+            "default",
+            "raw-nginx",
+            "keel-gitops",
+            "./tenants/default/apps/raw-nginx",
+        );
+        input
+            .post_build_substitute
+            .insert("ENV".to_string(), "production".to_string());
+        input.post_build_substitute_from = vec![
+            FluxSubstituteReference {
+                kind: "ConfigMap".to_string(),
+                name: "raw-nginx-values".to_string(),
+                optional: true,
+            },
+            FluxSubstituteReference {
+                kind: "Secret".to_string(),
+                name: "raw-nginx-secrets".to_string(),
+                optional: true,
+            },
+        ];
+
+        let yaml = generate_flux_kustomization_manifest(&input).unwrap();
+        let doc: Value = serde_yml::from_str(&yaml).unwrap();
+        assert_eq!(doc["apiVersion"], "kustomize.toolkit.fluxcd.io/v1");
+        assert_eq!(doc["kind"], "Kustomization");
+        assert_eq!(doc["spec"]["postBuild"]["substitute"]["ENV"], "production");
+        let sub_from = doc["spec"]["postBuild"]["substituteFrom"]
+            .as_array()
+            .unwrap();
+        assert_eq!(sub_from.len(), 2);
+        assert_eq!(sub_from[0]["kind"], "ConfigMap");
+        assert_eq!(sub_from[0]["name"], "raw-nginx-values");
+        assert_eq!(sub_from[0]["optional"], true);
+        assert_eq!(sub_from[1]["kind"], "Secret");
+        assert_eq!(sub_from[1]["name"], "raw-nginx-secrets");
+        assert_eq!(sub_from[1]["optional"], true);
     }
 }

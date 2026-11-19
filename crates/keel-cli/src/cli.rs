@@ -303,6 +303,8 @@ pub enum InfraCommands {
     List(InfraListArgs),
     /// Validate parameters against a blueprint JSONSchema and open a provisioning PR
     Provision(InfraProvisionArgs),
+    /// Display SSH connection info or open an interactive SSH session to a provisioned VM stack
+    Ssh(InfraSshArgs),
 }
 
 /// Arguments for `keel infra list` (`SDD.md` §7.2).
@@ -345,6 +347,41 @@ pub struct InfraProvisionArgs {
     pub server: String,
 }
 
+/// Arguments for `keel infra ssh` (`SDD.md` §7.2).
+#[derive(Args, Debug, Clone, PartialEq, Eq)]
+pub struct InfraSshArgs {
+    /// Infrastructure stack name
+    pub stack_name: String,
+
+    /// Target tenant identifier
+    #[arg(long, default_value = "default")]
+    pub tenant: String,
+
+    /// Override SSH username
+    #[arg(long)]
+    pub user: Option<String>,
+
+    /// Override SSH port
+    #[arg(long)]
+    pub port: Option<u16>,
+
+    /// Path to SSH private key identity file (-i)
+    #[arg(long, short = 'i')]
+    pub identity_file: Option<PathBuf>,
+
+    /// Execute the SSH command interactively in the current terminal instead of printing
+    #[arg(long)]
+    pub exec: bool,
+
+    /// Output format when printing (table, json, command)
+    #[arg(long, default_value = "table")]
+    pub output: String,
+
+    /// Keel server URL
+    #[arg(long, default_value = DEFAULT_SERVER_URL)]
+    pub server: String,
+}
+
 /// `keel app` subcommands.
 #[derive(Args, Debug, Clone, PartialEq, Eq)]
 pub struct AppArgs {
@@ -377,6 +414,10 @@ pub struct AppInstallArgs {
     /// Enable Flagger + Envoy Gateway progressive canary rollout
     #[arg(long, default_value_t = false)]
     pub canary: bool,
+
+    /// Reconciliation engine for raw Kubernetes manifest catalog apps (`flux` or `pulumi`)
+    #[arg(long)]
+    pub engine: Option<String>,
 
     /// Keel server base URL
     #[arg(long, default_value = DEFAULT_SERVER_URL)]
@@ -732,6 +773,64 @@ mod tests {
         assert_eq!(app_args.tenant, "acme");
         assert_eq!(app_args.values_file, PathBuf::from("authentik.yaml"));
         assert!(app_args.canary);
+        assert_eq!(app_args.engine, None);
+
+        let app_engine_cli = Cli::try_parse_from([
+            "keel",
+            "app",
+            "install",
+            "--app",
+            "raw-nginx",
+            "--tenant",
+            "acme",
+            "--values-file",
+            "nginx.yaml",
+            "--engine",
+            "pulumi",
+        ])
+        .unwrap();
+        let Commands::App(AppArgs {
+            command: AppCommands::Install(app_engine_args),
+        }) = app_engine_cli.command
+        else {
+            panic!("expected app install with engine");
+        };
+        assert_eq!(app_engine_args.engine.as_deref(), Some("pulumi"));
+
+        let ssh_cli = Cli::try_parse_from([
+            "keel",
+            "infra",
+            "ssh",
+            "proxmox-vm",
+            "--tenant",
+            "acme",
+            "--user",
+            "debian",
+            "--port",
+            "2222",
+            "-i",
+            "/tmp/id_ed25519",
+            "--output",
+            "command",
+            "--exec",
+        ])
+        .unwrap();
+        let Commands::Infra(InfraArgs {
+            command: InfraCommands::Ssh(ssh_args),
+        }) = ssh_cli.command
+        else {
+            panic!("expected infra ssh");
+        };
+        assert_eq!(ssh_args.stack_name, "proxmox-vm");
+        assert_eq!(ssh_args.tenant, "acme");
+        assert_eq!(ssh_args.user.as_deref(), Some("debian"));
+        assert_eq!(ssh_args.port, Some(2222));
+        assert_eq!(
+            ssh_args.identity_file,
+            Some(PathBuf::from("/tmp/id_ed25519"))
+        );
+        assert_eq!(ssh_args.output, "command");
+        assert!(ssh_args.exec);
 
         let prev_cli = Cli::try_parse_from([
             "keel",

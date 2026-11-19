@@ -172,6 +172,10 @@ pub trait ClusterStateProvider: Send + Sync {
             "Live Kubernetes cluster connection required to reconcile release".to_string(),
         ))
     }
+
+    async fn stack_outputs(&self, _namespace: &str, _name: &str) -> HashMap<String, String> {
+        HashMap::new()
+    }
 }
 
 /// Default stateless [`ClusterStateProvider`] that scans `tenants/` and `deploy/`
@@ -394,11 +398,19 @@ impl ClusterStateProvider for RepoClusterStateProvider {
 
         let mut releases = Vec::new();
         for path in files {
-            if path.file_name().and_then(|n| n.to_str()) == Some("flux-kustomization.yaml") {
+            let fname = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let has_manifests_yaml = path
+                .parent()
+                .is_some_and(|p| p.join("manifests.yaml").is_file());
+            let has_stack_yaml = path
+                .parent()
+                .is_some_and(|p| p.join("stack.yaml").is_file());
+            if fname == "flux-kustomization.yaml" && (!has_manifests_yaml || has_stack_yaml) {
                 continue;
             }
             if let Some(parent) = path.parent()
                 && parent != tenants_root.as_path()
+                && fname != "flux-kustomization.yaml"
             {
                 let allowed = kustomize_allowlists
                     .entry(parent.to_path_buf())
@@ -415,7 +427,7 @@ impl ClusterStateProvider for RepoClusterStateProvider {
                         )
                     });
                 if let Some(set) = allowed
-                    && let Some(fname) = path.file_name().and_then(|n| n.to_str())
+                    && !fname.is_empty()
                     && fname != "kustomization.yaml"
                     && !set.contains(fname)
                 {
@@ -434,10 +446,12 @@ impl ClusterStateProvider for RepoClusterStateProvider {
                     .and_then(Value::as_str)
                     .unwrap_or_default();
                 let kind = val.get("kind").and_then(Value::as_str).unwrap_or_default();
+                let is_manifest_pulumi_stack = kind == "Stack" && has_manifests_yaml;
                 let is_flux_release = kind == "HelmRelease"
                     || (kind == "Kustomization"
                         && api_version.starts_with("kustomize.toolkit.fluxcd.io/"))
-                    || kind == "Canary";
+                    || kind == "Canary"
+                    || is_manifest_pulumi_stack;
                 if !is_flux_release {
                     continue;
                 }
@@ -469,6 +483,7 @@ impl ClusterStateProvider for RepoClusterStateProvider {
 
                 let chart = val
                     .pointer("/spec/chart/spec/chart")
+                    .or_else(|| val.pointer("/metadata/labels/keel.io~1catalog-id"))
                     .and_then(Value::as_str)
                     .unwrap_or(&name)
                     .to_string();
@@ -476,9 +491,16 @@ impl ClusterStateProvider for RepoClusterStateProvider {
                     .pointer("/spec/chart/spec/version")
                     .and_then(Value::as_str)
                     .map(str::to_owned);
-                let runtime = match kind {
-                    "Kustomization" => "kustomize",
-                    _ => "helm",
+                let label_runtime = val
+                    .pointer("/metadata/labels/keel.io~1runtime")
+                    .and_then(Value::as_str);
+                let runtime = if label_runtime == Some("manifest") || has_manifests_yaml {
+                    "manifest"
+                } else {
+                    match kind {
+                        "Kustomization" => "kustomize",
+                        _ => "helm",
+                    }
                 }
                 .to_string();
 
@@ -762,6 +784,10 @@ impl ClusterStateProvider for KubeClusterStateProvider {
             .reconcile_release(namespace, name)
             .await
             .map_err(|e| ServerError::Internal(format!("Flux reconcile failed: {e}")))
+    }
+
+    async fn stack_outputs(&self, namespace: &str, name: &str) -> HashMap<String, String> {
+        self.live.stack_outputs(namespace, name).await
     }
 }
 

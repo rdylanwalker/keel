@@ -1,0 +1,61 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: http-echo
+  labels:
+    app.kubernetes.io/name: http-echo
+spec:
+  replicas: ${replicas}
+  selector:
+    matchLabels:
+      app: http-echo
+  template:
+    metadata:
+      labels:
+        app: http-echo
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: http-echo
+          image: hashicorp/http-echo:1.0.0
+          args:
+            - -text=${echoText}
+          ports:
+            - containerPort: 5678
+              name: http
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 10001
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            limits:
+              cpu: 100m
+              memory: 64Mi
+            requests:
+              cpu: 10m
+              memory: 16Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: http-echo
+  labels:
+    app.kubernetes.io/name: http-echo
+spec:
+  type: ClusterIP
+  ports:
+    - port: 80
+      targetPort: 5678
+      protocol: TCP
+      name: http
+  selector:
+    app: http-echo

@@ -46,7 +46,7 @@ use sha2::{Digest, Sha256};
 use crate::cli::{
     AppCommands, AppInstallArgs, AuthCommands, AuthLoginArgs, BootstrapCommands, BootstrapInitArgs,
     BootstrapRecoverArgs, Cli, Commands, InfraCommands, InfraListArgs, InfraProvisionArgs,
-    OutputFormat, PreviewCommands, PreviewStatusArgs, ServeArgs,
+    InfraSshArgs, OutputFormat, PreviewCommands, PreviewStatusArgs, ServeArgs,
 };
 
 /// Unified error type returned by `keel` CLI command handlers.
@@ -3695,17 +3695,21 @@ pub async fn execute_infra_provision(
         "infra",
         &values,
         false,
+        None,
     )
     .await
 }
 
-/// Executes `keel app install`: validates Helm/Kustomize values against catalog JSONSchema and opens a PR (`AGENTS.md` §3.6).
+/// Executes `keel app install`: validates Helm/Kustomize/Manifest values against catalog JSONSchema and opens a PR (`AGENTS.md` §3.6).
 pub async fn execute_app_install(
     args: &AppInstallArgs,
     ctx: &CliContext,
 ) -> Result<ProposalCommandOutcome, CliError> {
     validate_dns_label(&args.app, "app")?;
     validate_dns_label(&args.tenant, "tenant")?;
+    if let Some(ref eng) = args.engine {
+        eng.parse::<keel_core::ManifestEngine>()?;
+    }
     let values = load_values_file(&args.values_file).await?;
     let base_url = normalize_server_url(&args.server)?;
 
@@ -3731,6 +3735,7 @@ pub async fn execute_app_install(
         "application",
         &values,
         args.canary,
+        args.engine.as_deref(),
     )
     .await
 }
@@ -3746,6 +3751,7 @@ async fn fetch_catalog(base_url: &str, ctx: &CliContext) -> Result<CatalogApiRes
     Ok(resp.json().await?)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn submit_proposal_request(
     base_url: &str,
     ctx: &CliContext,
@@ -3754,15 +3760,24 @@ async fn submit_proposal_request(
     kind: &str,
     values: &Value,
     canary: bool,
+    action_engine: Option<&str>,
 ) -> Result<ProposalCommandOutcome, CliError> {
     let endpoint = format!("{base_url}/api/v1/proposals");
-    let req_body = json!({
+    let mut req_body = json!({
         "tenant": tenant,
         "catalogId": catalog_id,
         "kind": kind,
         "values": values,
         "canary": canary,
     });
+    if let Some(eng) = action_engine
+        && let Some(obj) = req_body.as_object_mut()
+    {
+        obj.insert(
+            "actionEngine".to_string(),
+            Value::String(eng.trim().to_ascii_lowercase()),
+        );
+    }
 
     let resp = attach_auth(ctx.http.post(&endpoint).json(&req_body), ctx, base_url)
         .send()
@@ -3797,6 +3812,270 @@ async fn submit_proposal_request(
         report: created.report,
         output,
     })
+}
+
+/// Builds a validated `ssh` argument vector (never invoking `sh -c`, preventing flag injection per `NFR-SEC-06`).
+pub fn build_ssh_argv(
+    info: &keel_core::StackSshInfoResponse,
+    identity_file: Option<&Path>,
+) -> Result<Vec<String>, CliError> {
+    validate_non_flag_input(&info.ssh_user, "ssh_user")?;
+    validate_non_flag_input(&info.ssh_host, "ssh_host")?;
+    if info.ssh_user.chars().any(char::is_whitespace)
+        || info.ssh_host.chars().any(char::is_whitespace)
+    {
+        return Err(CliError::Validation(
+            "ssh_user and ssh_host must not contain whitespace".to_string(),
+        ));
+    }
+    if info.ssh_port == 0 {
+        return Err(CliError::Validation(
+            "ssh_port must be greater than 0".to_string(),
+        ));
+    }
+
+    let mut argv = Vec::new();
+    if info.ssh_port != 22 {
+        argv.push("-p".to_string());
+        argv.push(info.ssh_port.to_string());
+    }
+    if let Some(id_path) = identity_file {
+        let id_str = id_path.to_string_lossy().trim().to_string();
+        validate_non_flag_input(&id_str, "identity_file")?;
+        argv.push("-i".to_string());
+        argv.push(id_str);
+    }
+    argv.push(format!("{}@{}", info.ssh_user, info.ssh_host));
+    Ok(argv)
+}
+
+/// Formats [`keel_core::StackSshInfoResponse`] as `table`, `json`, or `command`.
+pub fn format_ssh_info_output(
+    info: &keel_core::StackSshInfoResponse,
+    output_format: &str,
+) -> Result<String, CliError> {
+    match output_format.trim().to_ascii_lowercase().as_str() {
+        "command" => Ok(info.ssh_command.clone()),
+        "json" => Ok(serde_json::to_string_pretty(info)?),
+        "table" => {
+            let mut out = String::new();
+            out.push_str(&format!("Stack:       {}\n", info.stack_name));
+            out.push_str(&format!("Namespace:   {}\n", info.namespace));
+            out.push_str(&format!("Tenant:      {}\n", info.tenant));
+            out.push_str(&format!("Provider:    {}\n", info.provider));
+            out.push_str(&format!("Host:        {}\n", info.ssh_host));
+            out.push_str(&format!("User:        {}\n", info.ssh_user));
+            out.push_str(&format!("Port:        {}\n", info.ssh_port));
+            out.push_str(&format!("SSH Command: {}", info.ssh_command));
+            Ok(out)
+        }
+        other => Err(CliError::Validation(format!(
+            "Unsupported --output format '{other}'; expected 'table', 'json', or 'command'"
+        ))),
+    }
+}
+
+async fn resolve_local_fallback_ssh_info(
+    workdir: &Path,
+    tenant: &str,
+    stack_name: &str,
+) -> Option<keel_core::StackSshInfoResponse> {
+    let stack_dir = workdir
+        .join("tenants")
+        .join(tenant)
+        .join("infra")
+        .join(stack_name);
+    let stack_path = stack_dir.join("stack.yaml");
+    let values_path = stack_dir.join("values.yaml");
+    if !tokio::fs::try_exists(&stack_path).await.unwrap_or(false)
+        && !tokio::fs::try_exists(&values_path).await.unwrap_or(false)
+    {
+        return None;
+    }
+
+    let stack_doc = tokio::fs::read_to_string(&stack_path)
+        .await
+        .ok()
+        .and_then(|raw| serde_yml::from_str::<Value>(&raw).ok());
+    let values_doc = tokio::fs::read_to_string(&values_path)
+        .await
+        .ok()
+        .and_then(|raw| serde_yml::from_str::<Value>(&raw).ok());
+
+    let provider = stack_doc
+        .as_ref()
+        .and_then(|d| {
+            d.pointer("/metadata/labels/keel.io~1provider")
+                .or_else(|| d.pointer("/spec/config/keel:provider"))
+        })
+        .and_then(Value::as_str)
+        .unwrap_or("proxmox")
+        .to_string();
+
+    let host_keys = [
+        "sshHost",
+        "publicIp",
+        "controlPlanePublicIp",
+        "controlPlaneIp",
+        "ipAddress",
+        "hostname",
+    ];
+    let mut ssh_host = None;
+    if let Some(obj) = values_doc.as_ref().and_then(Value::as_object) {
+        for k in host_keys {
+            if let Some(v) = obj.get(k).and_then(Value::as_str) {
+                let cleaned = v.trim().split('/').next().unwrap_or("").trim();
+                if !cleaned.is_empty()
+                    && !cleaned.eq_ignore_ascii_case("dhcp")
+                    && !cleaned.starts_with('-')
+                {
+                    ssh_host = Some(cleaned.to_string());
+                    break;
+                }
+            }
+        }
+    }
+    if ssh_host.is_none()
+        && let Some(obj) = stack_doc
+            .as_ref()
+            .and_then(|d| d.pointer("/spec/config"))
+            .and_then(Value::as_object)
+    {
+        for k in host_keys {
+            if let Some(v) = obj.get(k).and_then(Value::as_str) {
+                let cleaned = v.trim().split('/').next().unwrap_or("").trim();
+                if !cleaned.is_empty()
+                    && !cleaned.eq_ignore_ascii_case("dhcp")
+                    && !cleaned.starts_with('-')
+                {
+                    ssh_host = Some(cleaned.to_string());
+                    break;
+                }
+            }
+        }
+    }
+    let ssh_host = ssh_host.unwrap_or_else(|| format!("{stack_name}.{tenant}.local"));
+
+    let default_user = match provider.as_str() {
+        "azure" => "azureuser",
+        "gcp" => "debian",
+        "hetzner" => "root",
+        _ => "ubuntu",
+    };
+    let ssh_user = values_doc
+        .as_ref()
+        .and_then(Value::as_object)
+        .and_then(|o| {
+            o.get("sshUser")
+                .or_else(|| o.get("ciuser"))
+                .and_then(Value::as_str)
+        })
+        .or_else(|| {
+            stack_doc
+                .as_ref()
+                .and_then(|d| d.pointer("/spec/config"))
+                .and_then(Value::as_object)
+                .and_then(|o| {
+                    o.get("sshUser")
+                        .or_else(|| o.get("ciuser"))
+                        .and_then(Value::as_str)
+                })
+        })
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && !s.starts_with('-'))
+        .unwrap_or(default_user)
+        .to_string();
+
+    let ssh_port = 22u16;
+    let namespace = format!("tenant-{tenant}");
+    let ssh_command = format!("ssh {ssh_user}@{ssh_host}");
+    let cli_command = format!("keel infra ssh {stack_name} --tenant {tenant}");
+    let cli_exec_command = format!("keel infra ssh {stack_name} --tenant {tenant} --exec");
+
+    Some(keel_core::StackSshInfoResponse {
+        stack_name: stack_name.to_string(),
+        namespace,
+        tenant: tenant.to_string(),
+        provider,
+        ssh_host,
+        ssh_user,
+        ssh_port,
+        ssh_command,
+        cli_command,
+        cli_exec_command,
+        has_saved_ssh_key: false,
+    })
+}
+
+/// Executes `keel infra ssh` querying `/api/v1/stacks/tenant-{tenant}/{stack_name}/ssh-info`
+/// (with local GitOps fallback) and either printing the connection details or spawning `ssh`.
+pub async fn execute_infra_ssh(args: &InfraSshArgs, ctx: &CliContext) -> Result<String, CliError> {
+    validate_dns_label(&args.stack_name, "stack_name")?;
+    validate_dns_label(&args.tenant, "tenant")?;
+
+    let base_url = normalize_server_url(&args.server)?;
+    let endpoint = format!(
+        "{base_url}/api/v1/stacks/tenant-{}/{}/ssh-info",
+        args.tenant, args.stack_name
+    );
+
+    let mut info: keel_core::StackSshInfoResponse =
+        match attach_auth(ctx.http.get(&endpoint), ctx, &base_url)
+            .send()
+            .await
+        {
+            Ok(resp) => {
+                if !resp.status().is_success() {
+                    return Err(extract_api_error(resp).await);
+                }
+                resp.json().await?
+            }
+            Err(http_err) => {
+                let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                if let Some(fallback) =
+                    resolve_local_fallback_ssh_info(&cwd, &args.tenant, &args.stack_name).await
+                {
+                    fallback
+                } else {
+                    return Err(CliError::Http(http_err));
+                }
+            }
+        };
+
+    if let Some(ref user_override) = args.user {
+        validate_non_flag_input(user_override, "user")?;
+        info.ssh_user = user_override.trim().to_string();
+    }
+    if let Some(port_override) = args.port {
+        if port_override == 0 {
+            return Err(CliError::Validation(
+                "port must be greater than 0".to_string(),
+            ));
+        }
+        info.ssh_port = port_override;
+    }
+
+    let argv = build_ssh_argv(&info, args.identity_file.as_deref())?;
+    info.ssh_command = format!("ssh {}", argv.join(" "));
+
+    if args.exec {
+        let status = tokio::process::Command::new("ssh")
+            .args(&argv)
+            .stdin(std::process::Stdio::inherit())
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit())
+            .status()
+            .await
+            .map_err(|e| CliError::Execution(format!("Failed to execute 'ssh': {e}")))?;
+        if !status.success() {
+            return Err(CliError::Execution(format!(
+                "SSH session exited with status {status}"
+            )));
+        }
+        Ok(String::new())
+    } else {
+        format_ssh_info_output(&info, &args.output)
+    }
 }
 
 // ============================================================================
@@ -4057,6 +4336,7 @@ pub async fn dispatch(cli: &Cli, ctx: &CliContext) -> Result<String, CliError> {
         Commands::Infra(i) => match &i.command {
             InfraCommands::List(args) => execute_infra_list(args, ctx).await,
             InfraCommands::Provision(args) => Ok(execute_infra_provision(args, ctx).await?.output),
+            InfraCommands::Ssh(args) => execute_infra_ssh(args, ctx).await,
         },
         Commands::App(a) => match &a.command {
             AppCommands::Install(args) => Ok(execute_app_install(args, ctx).await?.output),
@@ -4835,6 +5115,92 @@ spec:
         let list_json_out = dispatch(&list_json_cli, &ctx).await.unwrap();
         assert!(list_json_out.contains("\"postgres-managed\""));
 
+        // 7b. `keel infra ssh` against live server (table, json, command, overrides, and flag-injection rejection)
+        for (output_fmt, expected_substr) in [
+            ("table", "Stack:       postgres-managed"),
+            ("json", "\"stackName\": \"postgres-managed\""),
+            ("command", "ssh -p 2222 -i /tmp/id_key debian@"),
+        ] {
+            let ssh_cli = Cli::try_parse_from([
+                "keel",
+                "infra",
+                "ssh",
+                "postgres-managed",
+                "--tenant",
+                "acme",
+                "--user",
+                "debian",
+                "--port",
+                "2222",
+                "-i",
+                "/tmp/id_key",
+                "--output",
+                output_fmt,
+                "--server",
+                &server_url,
+            ])
+            .unwrap();
+            let ssh_out = dispatch(&ssh_cli, &ctx).await.unwrap();
+            assert!(
+                ssh_out.contains(expected_substr),
+                "expected '{expected_substr}' in '{ssh_out}'"
+            );
+        }
+
+        // Flag injection rejection on `execute_infra_ssh`
+        let bad_user_ssh = InfraSshArgs {
+            stack_name: "postgres-managed".to_string(),
+            tenant: "acme".to_string(),
+            user: Some("-oProxyCommand=evil".to_string()),
+            port: None,
+            identity_file: None,
+            exec: false,
+            output: "command".to_string(),
+            server: server_url.clone(),
+        };
+        assert!(execute_infra_ssh(&bad_user_ssh, &ctx).await.is_err());
+
+        // `keel app install --engine flux` and `--engine pulumi`
+        for eng in ["flux", "pulumi"] {
+            let eng_cli = Cli::try_parse_from([
+                "keel",
+                "app",
+                "install",
+                "--app",
+                "authentik",
+                "--tenant",
+                "acme",
+                "--values-file",
+                app_values_file.to_str().unwrap(),
+                "--engine",
+                eng,
+                "--server",
+                &server_url,
+            ])
+            .unwrap();
+            let eng_out = dispatch(&eng_cli, &ctx).await.unwrap();
+            assert!(eng_out.contains("Opened Proposal PR #"));
+        }
+
+        // Invalid `--engine` rejected client-side
+        let bad_eng_cli = Cli::try_parse_from([
+            "keel",
+            "app",
+            "install",
+            "--app",
+            "authentik",
+            "--tenant",
+            "acme",
+            "--values-file",
+            app_values_file.to_str().unwrap(),
+            "--engine",
+            "argocd",
+            "--server",
+            &server_url,
+        ])
+        .unwrap();
+        assert!(dispatch(&bad_eng_cli, &ctx).await.is_err());
+
         let _ = shutdown_tx.send(());
         server_task.await.unwrap();
 
@@ -5128,5 +5494,100 @@ spec:
         let second: serde_json::Value = serde_yml::from_str(docs[1]).unwrap();
         assert_eq!(first["kind"], "GitRepository");
         assert_eq!(second["kind"], "NetworkPolicy");
+    }
+
+    #[test]
+    fn infra_ssh_argv_and_output_formatting_reject_flag_injection() {
+        let info = keel_core::StackSshInfoResponse {
+            stack_name: "proxmox-vm".to_string(),
+            namespace: "tenant-default".to_string(),
+            tenant: "default".to_string(),
+            provider: "proxmox".to_string(),
+            ssh_host: "192.168.10.25".to_string(),
+            ssh_user: "ubuntu".to_string(),
+            ssh_port: 2222,
+            ssh_command: "ssh -p 2222 ubuntu@192.168.10.25".to_string(),
+            cli_command: "keel infra ssh proxmox-vm --tenant default".to_string(),
+            cli_exec_command: "keel infra ssh proxmox-vm --tenant default --exec".to_string(),
+            has_saved_ssh_key: true,
+        };
+
+        let argv = build_ssh_argv(&info, Some(Path::new("/home/user/.ssh/id_ed25519"))).unwrap();
+        assert_eq!(
+            argv,
+            vec![
+                "-p".to_string(),
+                "2222".to_string(),
+                "-i".to_string(),
+                "/home/user/.ssh/id_ed25519".to_string(),
+                "ubuntu@192.168.10.25".to_string()
+            ]
+        );
+
+        let cmd_out = format_ssh_info_output(&info, "command").unwrap();
+        assert_eq!(cmd_out, "ssh -p 2222 ubuntu@192.168.10.25");
+
+        let table_out = format_ssh_info_output(&info, "table").unwrap();
+        assert!(table_out.contains("Stack:       proxmox-vm"));
+        assert!(table_out.contains("Host:        192.168.10.25"));
+        assert!(table_out.contains("SSH Command: ssh -p 2222 ubuntu@192.168.10.25"));
+
+        let json_out = format_ssh_info_output(&info, "json").unwrap();
+        let parsed: keel_core::StackSshInfoResponse = serde_json::from_str(&json_out).unwrap();
+        assert_eq!(parsed, info);
+
+        // Reject option injection in user/host/identity_file
+        let mut injected = info.clone();
+        injected.ssh_user = "-oProxyCommand=evil".to_string();
+        assert!(build_ssh_argv(&injected, None).is_err());
+
+        let mut injected_host = info.clone();
+        injected_host.ssh_host = "-oLocalCommand=evil".to_string();
+        assert!(build_ssh_argv(&injected_host, None).is_err());
+
+        assert!(build_ssh_argv(&info, Some(Path::new("-oProxyCommand=evil"))).is_err());
+    }
+
+    #[tokio::test]
+    async fn resolve_local_fallback_ssh_info_reads_gitops_stack_and_values() {
+        let tmp = TempTestDir::new("local-ssh-fallback");
+        let stack_dir = tmp.path().join("tenants/acme/infra/proxmox-node");
+        tokio::fs::create_dir_all(&stack_dir).await.unwrap();
+        tokio::fs::write(
+            stack_dir.join("values.yaml"),
+            "ipAddress: 10.10.20.55/24\nsshUser: adminuser\n",
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            stack_dir.join("stack.yaml"),
+            r#"apiVersion: pulumi.com/v1
+kind: Stack
+metadata:
+  name: proxmox-node
+  namespace: tenant-acme
+  labels:
+    keel.io/provider: proxmox
+spec:
+  stack: organization/proxmox/acme-proxmox-node
+"#,
+        )
+        .await
+        .unwrap();
+
+        let fallback = resolve_local_fallback_ssh_info(tmp.path(), "acme", "proxmox-node")
+            .await
+            .expect("should resolve local fallback ssh info");
+        assert_eq!(fallback.stack_name, "proxmox-node");
+        assert_eq!(fallback.tenant, "acme");
+        assert_eq!(fallback.provider, "proxmox");
+        assert_eq!(fallback.ssh_host, "10.10.20.55");
+        assert_eq!(fallback.ssh_user, "adminuser");
+        assert_eq!(fallback.ssh_command, "ssh adminuser@10.10.20.55");
+        assert!(
+            resolve_local_fallback_ssh_info(tmp.path(), "acme", "nonexistent")
+                .await
+                .is_none()
+        );
     }
 }

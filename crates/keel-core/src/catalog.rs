@@ -384,6 +384,192 @@ pub fn prepare_helm_values(
     })
 }
 
+fn is_valid_manifest_var_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Parses single or multi-document Kubernetes YAML, ensuring at least one non-empty document exists
+/// and every non-null document is a mapping with non-empty string `apiVersion`, `kind`, and `metadata.name`.
+pub fn validate_k8s_manifests_yaml(raw_yaml: &str) -> Result<Vec<Value>, CoreError> {
+    if raw_yaml.trim().is_empty() {
+        return Err(CoreError::Validation(
+            "Kubernetes manifests YAML must not be empty".to_string(),
+        ));
+    }
+
+    let mut raw_docs = Vec::new();
+    let mut current = String::new();
+    for line in raw_yaml.lines() {
+        let trimmed = line.trim();
+        if trimmed == "---" || trimmed == "..." {
+            if !current.trim().is_empty() {
+                raw_docs.push(std::mem::take(&mut current));
+            }
+        } else {
+            current.push_str(line);
+            current.push('\n');
+        }
+    }
+    if !current.trim().is_empty() {
+        raw_docs.push(current);
+    }
+
+    let mut docs = Vec::new();
+    for (idx, doc_str) in raw_docs.into_iter().enumerate() {
+        let doc: Value = serde_yml::from_str(&doc_str)?;
+        if doc.is_null() {
+            continue;
+        }
+        let doc_num = idx + 1;
+        let Some(obj) = doc.as_object() else {
+            return Err(CoreError::Validation(format!(
+                "Manifest document #{doc_num} must be a YAML mapping object"
+            )));
+        };
+
+        let api_version = obj
+            .get("apiVersion")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or("");
+        if api_version.is_empty() {
+            return Err(CoreError::Validation(format!(
+                "Manifest document #{doc_num} is missing a non-empty string 'apiVersion'"
+            )));
+        }
+
+        let kind = obj
+            .get("kind")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or("");
+        if kind.is_empty() {
+            return Err(CoreError::Validation(format!(
+                "Manifest document #{doc_num} is missing a non-empty string 'kind'"
+            )));
+        }
+
+        let meta_name = obj
+            .get("metadata")
+            .and_then(Value::as_object)
+            .and_then(|m| m.get("name"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or("");
+        if meta_name.is_empty() {
+            return Err(CoreError::Validation(format!(
+                "Manifest document #{doc_num} ({kind}) is missing a non-empty string 'metadata.name'"
+            )));
+        }
+
+        docs.push(doc);
+    }
+
+    if docs.is_empty() {
+        return Err(CoreError::Validation(
+            "Kubernetes manifests YAML must contain at least one non-empty resource document"
+                .to_string(),
+        ));
+    }
+
+    Ok(docs)
+}
+
+/// Extracts unique placeholder variable names matching `${var_name}` or `${var_name:=default}`
+/// (where `var_name` is `[A-Za-z_][A-Za-z0-9_]*`), preserving first-seen order.
+pub fn extract_manifest_variables(raw_yaml: &str) -> Vec<String> {
+    let mut vars = Vec::new();
+    let bytes = raw_yaml.as_bytes();
+    let mut i = 0;
+
+    while i + 2 < bytes.len() {
+        if bytes[i] == b'$'
+            && bytes[i + 1] == b'{'
+            && let Some(rel_end) = raw_yaml[i + 2..].find(['}', '\n'])
+        {
+            let end = i + 2 + rel_end;
+            if bytes[end] == b'}' {
+                let inner = &raw_yaml[i + 2..end];
+                let var_name = match inner.split_once(":=") {
+                    Some((name, _default)) => name,
+                    None => inner,
+                };
+                if is_valid_manifest_var_name(var_name) {
+                    let owned = var_name.to_string();
+                    if !vars.contains(&owned) {
+                        vars.push(owned);
+                    }
+                    i = end + 1;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+
+    vars
+}
+
+/// Substitutes `${var_name}` and `${var_name:=default}` placeholders using stringified scalar values
+/// from `values` (if a key exists in `values`, replace with its string representation; else if `:=default`
+/// is present, replace with `default`; else leave `${var_name}` for Flux `postBuild` / Pulumi).
+pub fn render_manifest_template(raw_yaml: &str, values: &Value) -> String {
+    let mut out = String::with_capacity(raw_yaml.len());
+    let bytes = raw_yaml.as_bytes();
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if i + 2 < bytes.len()
+            && bytes[i] == b'$'
+            && bytes[i + 1] == b'{'
+            && let Some(rel_end) = raw_yaml[i + 2..].find(['}', '\n'])
+        {
+            let end = i + 2 + rel_end;
+            if bytes[end] == b'}' {
+                let inner = &raw_yaml[i + 2..end];
+                let (var_name, default_opt) = match inner.split_once(":=") {
+                    Some((name, def)) => (name, Some(def)),
+                    None => (inner, None),
+                };
+                if is_valid_manifest_var_name(var_name) {
+                    let provided = values
+                        .as_object()
+                        .and_then(|obj| obj.get(var_name))
+                        .and_then(|v| match v {
+                            Value::Null => None,
+                            Value::String(s) => Some(s.clone()),
+                            Value::Bool(b) => Some(b.to_string()),
+                            Value::Number(n) => Some(n.to_string()),
+                            Value::Array(_) | Value::Object(_) => Some(v.to_string()),
+                        });
+                    if let Some(val_str) = provided {
+                        out.push_str(&val_str);
+                    } else if let Some(def) = default_opt {
+                        out.push_str(def);
+                    } else {
+                        out.push_str(&raw_yaml[i..=end]);
+                    }
+                    i = end + 1;
+                    continue;
+                }
+            }
+        }
+
+        let ch = raw_yaml[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -849,5 +1035,58 @@ spec:
         ))
         .expect("canary-gateway-config blueprint should parse");
         assert_eq!(gw_cfg.metadata.id, "canary-gateway-config");
+    }
+
+    #[test]
+    fn test_validate_k8s_manifests_yaml_and_template_rendering() {
+        let multi_doc = r#"
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ${app_name:=demo-app}-config
+data:
+  LOG_LEVEL: ${log_level:=info}
+  SECRET_TOKEN: ${secret_token}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ${app_name:=demo-app}
+spec:
+  replicas: ${replicas:=2}
+"#;
+        let docs = validate_k8s_manifests_yaml(multi_doc).expect("valid multi-doc K8s YAML");
+        assert_eq!(docs.len(), 2);
+        assert_eq!(docs[0]["kind"], "ConfigMap");
+        assert_eq!(docs[1]["kind"], "Deployment");
+
+        let vars = extract_manifest_variables(multi_doc);
+        assert_eq!(
+            vars,
+            vec![
+                "app_name".to_string(),
+                "log_level".to_string(),
+                "secret_token".to_string(),
+                "replicas".to_string(),
+            ]
+        );
+
+        let rendered = render_manifest_template(
+            multi_doc,
+            &json!({
+                "app_name": "my-service",
+                "replicas": 3
+            }),
+        );
+        assert!(rendered.contains("name: my-service-config"));
+        assert!(rendered.contains("LOG_LEVEL: info"));
+        assert!(rendered.contains("SECRET_TOKEN: ${secret_token}"));
+        assert!(rendered.contains("replicas: 3"));
+
+        // Invalid YAML cases
+        assert!(validate_k8s_manifests_yaml("   ").is_err());
+        assert!(validate_k8s_manifests_yaml("---\n---").is_err());
+        assert!(validate_k8s_manifests_yaml("apiVersion: v1\nkind: ConfigMap\n").is_err());
+        assert!(validate_k8s_manifests_yaml("kind: ConfigMap\nmetadata:\n  name: test\n").is_err());
     }
 }

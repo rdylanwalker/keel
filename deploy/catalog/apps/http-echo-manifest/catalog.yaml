@@ -1,0 +1,38 @@
+apiVersion: keel.io/v1alpha1
+kind: CatalogApplication
+metadata:
+  id: http-echo-manifest
+  name: HTTP Echo Raw Manifest
+  description: Parameterized Kubernetes Deployment & Service raw manifest template actioned by Flux CD or Pulumi
+  category: utilities
+  runtime: manifest
+spec:
+  defaultEngine: flux
+  upstream:
+    repoURL: https://github.com/hashicorp/http-echo
+    path: ./manifests.yaml
+    version: 1.0.0
+  progressiveDelivery:
+    flaggerSupported: false
+    defaultCanary: false
+  schema:
+    type: object
+    required:
+      - echoText
+      - replicas
+    properties:
+      echoText:
+        type: string
+        title: Echo Response Message
+        default: hello-from-keel-manifest
+      replicas:
+        type: integer
+        title: Pod Replicas
+        default: 1
+        minimum: 1
+        maximum: 5
+      apiToken:
+        type: string
+        title: Optional Secret API Token
+        format: password
+        writeOnly: true

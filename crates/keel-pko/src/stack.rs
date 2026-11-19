@@ -967,6 +967,135 @@ pub fn attach_github_token_env_ref(env_refs: &mut BTreeMap<String, PkoEnvRef>, s
     );
 }
 
+/// Synthesizes a Pulumi YAML program that deploys raw Kubernetes manifests via `kubernetes:yaml/v2:ConfigGroup`,
+/// declaring `schema_properties` in `configuration` so `Stack.spec.config` values pass Pulumi validation.
+pub fn synthesize_k8s_manifest_pulumi_yaml(
+    stack_name: &str,
+    rendered_manifests_yaml: &str,
+    schema_properties: &[String],
+    target_kubeconfig_defined: bool,
+) -> Result<String, PkoError> {
+    validate_k8s_name("stack_name", stack_name)?;
+    if rendered_manifests_yaml.trim().is_empty() {
+        return Err(PkoError::Validation(
+            "rendered_manifests_yaml must not be empty".to_string(),
+        ));
+    }
+
+    let mut configuration = serde_json::Map::new();
+    for prop in schema_properties {
+        let trimmed = prop.trim();
+        if !trimmed.is_empty() {
+            configuration.insert(
+                trimmed.to_string(),
+                serde_json::json!({
+                    "type": "string",
+                    "default": ""
+                }),
+            );
+        }
+    }
+    if target_kubeconfig_defined {
+        configuration
+            .entry("kubeconfigSecretName".to_string())
+            .or_insert_with(|| {
+                serde_json::json!({
+                    "type": "string",
+                    "default": ""
+                })
+            });
+        configuration
+            .entry("kubeconfigSecretNamespace".to_string())
+            .or_insert_with(|| {
+                serde_json::json!({
+                    "type": "string",
+                    "default": ""
+                })
+            });
+        configuration
+            .entry("kubeconfigPath".to_string())
+            .or_insert_with(|| {
+                serde_json::json!({
+                    "type": "string",
+                    "default": "/etc/keel/kubeconfig/kubeconfig"
+                })
+            });
+    }
+
+    let mut resources = serde_json::Map::new();
+    let mut manifest_resource = serde_json::Map::new();
+    manifest_resource.insert(
+        "type".to_string(),
+        serde_json::Value::String("kubernetes:yaml/v2:ConfigGroup".to_string()),
+    );
+    if target_kubeconfig_defined {
+        resources.insert(
+            "targetCluster".to_string(),
+            serde_json::json!({
+                "type": "pulumi:providers:kubernetes",
+                "properties": {
+                    "kubeconfig": {
+                        "fn::readFile": "/etc/keel/kubeconfig/kubeconfig"
+                    },
+                    "enableServerSideApply": true,
+                    "upsertExistingObjects": true
+                }
+            }),
+        );
+        manifest_resource.insert(
+            "options".to_string(),
+            serde_json::json!({
+                "provider": "${targetCluster}"
+            }),
+        );
+    }
+    manifest_resource.insert(
+        "properties".to_string(),
+        serde_json::json!({
+            "yaml": rendered_manifests_yaml
+        }),
+    );
+    resources.insert(
+        "manifests".to_string(),
+        serde_json::Value::Object(manifest_resource),
+    );
+
+    let mut doc = serde_json::Map::new();
+    doc.insert(
+        "name".to_string(),
+        serde_json::Value::String(stack_name.to_string()),
+    );
+    doc.insert(
+        "runtime".to_string(),
+        serde_json::Value::String("yaml".to_string()),
+    );
+    doc.insert(
+        "description".to_string(),
+        serde_json::Value::String(format!(
+            "Keel PKO Kubernetes manifest stack for {stack_name}"
+        )),
+    );
+    if !configuration.is_empty() {
+        doc.insert(
+            "configuration".to_string(),
+            serde_json::Value::Object(configuration),
+        );
+    }
+    doc.insert(
+        "resources".to_string(),
+        serde_json::Value::Object(resources),
+    );
+    doc.insert(
+        "outputs".to_string(),
+        serde_json::json!({
+            "stackName": stack_name
+        }),
+    );
+
+    let yaml = serde_yml::to_string(&serde_json::Value::Object(doc))?;
+    Ok(ensure_trailing_newline(&yaml))
+}
+
 fn ensure_trailing_newline(s: &str) -> String {
     if s.ends_with('\n') {
         s.to_string()
@@ -1338,5 +1467,47 @@ mod tests {
 
         // Empty PR ID
         assert!(sanitize_pr_id("   ").is_err());
+    }
+
+    #[test]
+    fn synthesize_k8s_manifest_pulumi_yaml_creates_config_group_and_configuration() {
+        let raw_manifests = "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: demo-cm\n";
+        let props = vec!["replicas".to_string(), "imageTag".to_string()];
+
+        let yaml =
+            synthesize_k8s_manifest_pulumi_yaml("demo-manifest", raw_manifests, &props, false)
+                .expect("should synthesize Pulumi.yaml");
+        let parsed: serde_json::Value = serde_yml::from_str(&yaml).unwrap();
+        assert_eq!(parsed["name"], "demo-manifest");
+        assert_eq!(parsed["runtime"], "yaml");
+        assert_eq!(parsed["configuration"]["replicas"]["type"], "string");
+        assert_eq!(parsed["configuration"]["imageTag"]["type"], "string");
+        assert_eq!(
+            parsed["resources"]["manifests"]["type"],
+            "kubernetes:yaml/v2:ConfigGroup"
+        );
+        assert_eq!(
+            parsed["resources"]["manifests"]["properties"]["yaml"],
+            raw_manifests
+        );
+        assert!(parsed["resources"].get("targetCluster").is_none());
+
+        let yaml_remote =
+            synthesize_k8s_manifest_pulumi_yaml("demo-manifest", raw_manifests, &props, true)
+                .expect("should synthesize remote Pulumi.yaml");
+        let parsed_remote: serde_json::Value = serde_yml::from_str(&yaml_remote).unwrap();
+        assert_eq!(
+            parsed_remote["resources"]["targetCluster"]["type"],
+            "pulumi:providers:kubernetes"
+        );
+        assert_eq!(
+            parsed_remote["resources"]["manifests"]["options"]["provider"],
+            "${targetCluster}"
+        );
+        assert!(
+            parsed_remote["configuration"]
+                .get("kubeconfigSecretName")
+                .is_some()
+        );
     }
 }

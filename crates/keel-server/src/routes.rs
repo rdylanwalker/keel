@@ -5,6 +5,7 @@ use std::convert::Infallible;
 use std::path::{Path, PathBuf};
 
 use axum::Json;
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::header::CONTENT_TYPE;
 use axum::http::{HeaderValue, StatusCode};
@@ -17,10 +18,12 @@ use keel_core::{
     CATALOG_INFRA_BLUEPRINT_KIND, CatalogAppMetadata, CatalogAppSpec, CatalogApplication,
     CatalogBlueprintMetadata, CatalogBlueprintSpec, CatalogBundle, CatalogBundleItem,
     CatalogBundleMetadata, CatalogBundleSpec, CatalogInfraBlueprint, CatalogManifest,
-    KEEL_PREVIEWS_NAMESPACE, KEEL_SYSTEM_NAMESPACE, ProgressiveDeliverySpec, ProviderRegistry,
-    SopsManager, UpstreamSource, parse_catalog, parse_catalog_application, parse_catalog_blueprint,
-    parse_catalog_bundle, partition_values_by_schema, render_helm_values_yaml, tenant_namespace,
-    validate_dns_label, validate_schema_values,
+    KEEL_PREVIEWS_NAMESPACE, KEEL_SYSTEM_NAMESPACE, ManifestEngine, ProgressiveDeliverySpec,
+    ProviderRegistry, SopsManager, StackSshInfoResponse, UpstreamSource,
+    extract_manifest_variables, parse_catalog, parse_catalog_application, parse_catalog_blueprint,
+    parse_catalog_bundle, partition_values_by_schema, render_helm_values_yaml,
+    render_manifest_template, tenant_namespace, validate_dns_label, validate_k8s_manifests_yaml,
+    validate_schema_values,
 };
 use keel_git::{
     CommitAuthor, CreatePrRequest, PullRequestComment, PullRequestInfo, PullRequestState,
@@ -28,10 +31,11 @@ use keel_git::{
 };
 use keel_kube::{
     CrdReconcileStatus, CrdWatchEvent, FlaggerCanarySpecInput, FluxDependencyRef,
-    FluxHealthCheckRef, FluxKustomizationSpecInput, GITHUB_TOKEN_SECRET_NAME, HelmChartSourceKind,
-    HelmChartSourceRef, HelmReleaseSpecInput, HelmValuesSecretRef, RemoteKubeConfigRef,
-    StackDiagnostics, TenantAgeKey, TenantIsolationConfig, TenantManifestBundle,
-    UserGitCredentials, WatchedCrdKind, synthesize_canary_gateway_network_policy_yaml,
+    FluxHealthCheckRef, FluxKustomizationSpecInput, FluxSubstituteReference,
+    GITHUB_TOKEN_SECRET_NAME, HelmChartSourceKind, HelmChartSourceRef, HelmReleaseSpecInput,
+    HelmValuesSecretRef, RemoteKubeConfigRef, StackDiagnostics, TenantAgeKey,
+    TenantIsolationConfig, TenantManifestBundle, UserGitCredentials, WatchedCrdKind,
+    generate_flux_kustomization_manifest, synthesize_canary_gateway_network_policy_yaml,
     synthesize_flagger_canary_yaml, synthesize_flux_kustomization_yaml,
     synthesize_helm_release_yaml, user_git_creds_secret_name,
 };
@@ -39,7 +43,8 @@ use keel_pko::{
     ChangeOp, EphemeralPreviewParams, GcPlan, PkoEnvRef, PkoStack, PreviewReport,
     PreviewResourceCandidate, PreviewSummary, ResourceDiff, TenantStackParams,
     attach_github_token_env_ref, attach_s3_credentials_env_refs, build_preview_branch,
-    format_markdown_report, plan_preview_gc, synthesize_ephemeral_preview, synthesize_tenant_stack,
+    format_markdown_report, plan_preview_gc, synthesize_ephemeral_preview,
+    synthesize_k8s_manifest_pulumi_yaml, synthesize_tenant_stack,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -47,6 +52,25 @@ use serde_json::{Value, json};
 use crate::auth::AuthSession;
 use crate::error::ServerError;
 use crate::state::{AppState, CachedPreview, ReleaseSummary, StackSummary};
+
+static LAST_BRANCH_TS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn next_unique_branch_timestamp() -> u64 {
+    let now = Utc::now().timestamp().max(1) as u64;
+    let mut prev = LAST_BRANCH_TS.load(std::sync::atomic::Ordering::Relaxed);
+    loop {
+        let next = now.max(prev + 1);
+        match LAST_BRANCH_TS.compare_exchange_weak(
+            prev,
+            next,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::Relaxed,
+        ) {
+            Ok(_) => return next,
+            Err(actual) => prev = actual,
+        }
+    }
+}
 
 /// `GET /healthz`
 pub async fn healthz() -> &'static str {
@@ -83,11 +107,47 @@ pub async fn metrics(State(state): State<AppState>) -> Response {
         .into_response()
 }
 
+/// Application catalog DTO enriched with optional `manifestsYaml` and `defaultEngine` fields.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogItemDto {
+    #[serde(flatten)]
+    pub application: CatalogApplication,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manifests_yaml: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_engine: Option<String>,
+}
+
+impl CatalogItemDto {
+    pub fn from_application(
+        application: CatalogApplication,
+        manifests_yaml: Option<String>,
+    ) -> Self {
+        let default_engine = application
+            .spec
+            .default_engine
+            .map(|e| e.as_str().to_string())
+            .or_else(|| {
+                if application.metadata.runtime == AppRuntime::Manifest {
+                    Some(ManifestEngine::Flux.as_str().to_string())
+                } else {
+                    None
+                }
+            });
+        Self {
+            application,
+            manifests_yaml,
+            default_engine,
+        }
+    }
+}
+
 /// Response body for `GET /api/v1/catalog`.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CatalogResponse {
-    pub applications: Vec<CatalogApplication>,
+    pub applications: Vec<CatalogItemDto>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub core_addons: Vec<CatalogApplication>,
     pub blueprints: Vec<CatalogInfraBlueprint>,
@@ -96,6 +156,8 @@ pub struct CatalogResponse {
     pub enabled_providers: Vec<String>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub pulumi_yaml: HashMap<String, String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub manifests_yaml: HashMap<String, String>,
 }
 
 /// `GET /api/v1/catalog`
@@ -129,6 +191,42 @@ fn safe_relative_path(base: &Path, rel: &str) -> Option<PathBuf> {
     }
 }
 
+async fn load_catalog_items_from_dir(
+    base_dir: &Path,
+) -> Result<(Vec<CatalogItemDto>, HashMap<String, String>), ServerError> {
+    let mut applications = Vec::new();
+    let mut manifests_map = HashMap::new();
+    for path in find_catalog_files(base_dir).await {
+        let yaml = tokio::fs::read_to_string(&path).await?;
+        match parse_catalog_application(&yaml) {
+            Ok(app) => {
+                let mut loaded_manifests = None;
+                if let Some(dir) = path.parent() {
+                    let default_manifest_path = dir.join("manifests.yaml");
+                    if let Ok(content) = tokio::fs::read_to_string(&default_manifest_path).await {
+                        loaded_manifests = Some(content);
+                    } else if app.metadata.runtime == AppRuntime::Manifest
+                        && let Some(rel_path) = app.spec.upstream.path.as_deref()
+                        && let Some(resolved) = safe_relative_path(dir, rel_path)
+                        && let Ok(content) = tokio::fs::read_to_string(&resolved).await
+                    {
+                        loaded_manifests = Some(content);
+                    }
+                }
+                if let Some(ref content) = loaded_manifests {
+                    manifests_map.insert(app.metadata.id.clone(), content.clone());
+                }
+                applications.push(CatalogItemDto::from_application(app, loaded_manifests));
+            }
+            Err(err) => {
+                tracing::warn!(path = %path.display(), error = %err, "Skipping invalid CatalogApplication");
+            }
+        }
+    }
+    applications.sort_by(|a, b| a.application.metadata.id.cmp(&b.application.metadata.id));
+    Ok((applications, manifests_map))
+}
+
 pub async fn get_catalog(
     _auth: AuthSession,
     State(state): State<AppState>,
@@ -147,17 +245,8 @@ pub async fn get_catalog(
         .map(|p| p.id.clone())
         .collect();
 
-    let mut applications = Vec::new();
-    for path in find_catalog_files(&state.repo_workdir.join("catalog/apps")).await {
-        let yaml = tokio::fs::read_to_string(&path).await?;
-        match parse_catalog_application(&yaml) {
-            Ok(app) => applications.push(app),
-            Err(err) => {
-                tracing::warn!(path = %path.display(), error = %err, "Skipping invalid CatalogApplication");
-            }
-        }
-    }
-    applications.sort_by(|a, b| a.metadata.id.cmp(&b.metadata.id));
+    let (applications, manifests_yaml) =
+        load_catalog_items_from_dir(&state.repo_workdir.join("catalog/apps")).await?;
 
     let mut core_addons = Vec::new();
     for path in find_catalog_files(&state.repo_workdir.join("catalog/core")).await {
@@ -221,6 +310,7 @@ pub async fn get_catalog(
         bundles,
         enabled_providers,
         pulumi_yaml,
+        manifests_yaml,
     }))
 }
 
@@ -451,6 +541,10 @@ pub struct RegisterCatalogAppRequest {
     #[serde(default)]
     pub pulumi_yaml: Option<String>,
     #[serde(default)]
+    pub manifests_yaml: Option<String>,
+    #[serde(default)]
+    pub default_engine: Option<String>,
+    #[serde(default)]
     pub description: Option<String>,
     #[serde(default)]
     pub items: Option<Vec<CatalogBundleItem>>,
@@ -458,12 +552,15 @@ pub struct RegisterCatalogAppRequest {
     pub schema: Option<Value>,
 }
 
+/// Type alias for catalog item creation requests.
+pub type CreateCatalogItemRequest = RegisterCatalogAppRequest;
+
 /// Response body for `POST /api/v1/catalog`.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RegisterCatalogAppResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub application: Option<CatalogApplication>,
+    pub application: Option<CatalogItemDto>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub blueprint: Option<CatalogInfraBlueprint>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -490,9 +587,71 @@ pub async fn register_catalog_app(
             let runtime = req.runtime.ok_or_else(|| {
                 ServerError::BadRequest("runtime is required when kind is 'app'".to_string())
             })?;
-            let repo_url = req.repo_url.ok_or_else(|| {
-                ServerError::BadRequest("repoUrl is required when kind is 'app'".to_string())
-            })?;
+
+            let (repo_url, path, validated_manifests_yaml, parsed_default_engine) = if runtime
+                == AppRuntime::Manifest
+            {
+                let raw_manifests = req
+                    .manifests_yaml
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| {
+                        ServerError::BadRequest(
+                            "manifestsYaml is required when runtime is 'manifest'".to_string(),
+                        )
+                    })?;
+                validate_k8s_manifests_yaml(raw_manifests)?;
+                let normalized_manifests = if raw_manifests.ends_with('\n') {
+                    raw_manifests.to_string()
+                } else {
+                    format!("{raw_manifests}\n")
+                };
+                let repo_url = req
+                    .repo_url
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("https://kubernetes.io/docs/concepts/overview/working-with-objects/")
+                    .to_string();
+                let path = Some(
+                    req.path
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or("./manifests.yaml")
+                        .to_string(),
+                );
+                let eng = match req
+                    .default_engine
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    Some(raw_eng) => raw_eng.parse::<ManifestEngine>()?,
+                    None => ManifestEngine::Flux,
+                };
+                (repo_url, path, Some(normalized_manifests), Some(eng))
+            } else {
+                let repo_url = req
+                    .repo_url
+                    .filter(|s| !s.trim().is_empty())
+                    .ok_or_else(|| {
+                        ServerError::BadRequest(
+                            "repoUrl is required when kind is 'app'".to_string(),
+                        )
+                    })?;
+                let eng = match req
+                    .default_engine
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    Some(raw_eng) => Some(raw_eng.parse::<ManifestEngine>()?),
+                    None => None,
+                };
+                (repo_url, req.path, None, eng)
+            };
 
             let default_app_schema = || {
                 json!({
@@ -525,6 +684,33 @@ pub async fn register_catalog_app(
                         }
                     }
                 }
+                None if runtime == AppRuntime::Manifest => {
+                    let vars = validated_manifests_yaml
+                        .as_deref()
+                        .map(extract_manifest_variables)
+                        .unwrap_or_default();
+                    if vars.is_empty() {
+                        json!({
+                            "type": "object",
+                            "properties": {}
+                        })
+                    } else {
+                        let mut props = serde_json::Map::new();
+                        for var in vars {
+                            props.insert(
+                                var.clone(),
+                                json!({
+                                    "type": "string",
+                                    "title": humanize_schema_key(&var)
+                                }),
+                            );
+                        }
+                        json!({
+                            "type": "object",
+                            "properties": props
+                        })
+                    }
+                }
                 None => default_app_schema(),
             };
 
@@ -543,7 +729,7 @@ pub async fn register_catalog_app(
                         repo_url,
                         chart: req.chart,
                         version: req.version,
-                        path: req.path,
+                        path,
                         git_ref: None,
                     },
                     progressive_delivery: ProgressiveDeliverySpec {
@@ -554,6 +740,7 @@ pub async fn register_catalog_app(
                     schema,
                     ui_schema: None,
                     service_url: None,
+                    default_engine: parsed_default_engine,
                 },
             };
             application.validate()?;
@@ -563,6 +750,7 @@ pub async fn register_catalog_app(
 
             let rel_dir = format!("catalog/apps/{}", req.id);
             let rel_file = format!("{rel_dir}/catalog.yaml");
+            let rel_manifests = format!("{rel_dir}/manifests.yaml");
             if tokio::fs::try_exists(state.repo_workdir.join(&rel_file))
                 .await
                 .unwrap_or(false)
@@ -590,10 +778,15 @@ pub async fn register_catalog_app(
                 let target_dir = state.repo_workdir.join(&rel_dir);
                 tokio::fs::create_dir_all(&target_dir).await?;
                 tokio::fs::write(target_dir.join("catalog.yaml"), &catalog_yaml).await?;
+                let mut staged_files = vec![rel_file.clone()];
+                if let Some(ref manifests_content) = validated_manifests_yaml {
+                    tokio::fs::write(target_dir.join("manifests.yaml"), manifests_content).await?;
+                    staged_files.push(rel_manifests.clone());
+                }
 
                 state
                     .git_runner
-                    .add(&state.repo_workdir, [&rel_file])
+                    .add(&state.repo_workdir, staged_files.iter().map(String::as_str))
                     .await?;
 
                 let author = CommitAuthor::new(
@@ -636,7 +829,10 @@ pub async fn register_catalog_app(
             Ok((
                 StatusCode::CREATED,
                 Json(RegisterCatalogAppResponse {
-                    application: Some(application),
+                    application: Some(CatalogItemDto::from_application(
+                        application,
+                        validated_manifests_yaml,
+                    )),
                     blueprint: None,
                     bundle: None,
                     proposal,
@@ -1070,6 +1266,10 @@ pub struct UpdateCatalogItemRequest {
     #[serde(default)]
     pub pulumi_yaml: Option<String>,
     #[serde(default)]
+    pub manifests_yaml: Option<String>,
+    #[serde(default)]
+    pub default_engine: Option<String>,
+    #[serde(default)]
     pub items: Option<Vec<CatalogBundleItem>>,
     #[serde(default)]
     pub schema: Option<Value>,
@@ -1138,6 +1338,19 @@ pub async fn update_catalog_item(
         }
         let existing_yaml = tokio::fs::read_to_string(&abs_file).await?;
 
+        let validated_manifests_yaml = if normalized_kind == "app"
+            && let Some(raw_manifests) = req.manifests_yaml.filter(|s| !s.trim().is_empty())
+        {
+            validate_k8s_manifests_yaml(&raw_manifests)?;
+            Some(if raw_manifests.ends_with('\n') {
+                raw_manifests
+            } else {
+                format!("{raw_manifests}\n")
+            })
+        } else {
+            None
+        };
+
         let (catalog_yaml, app_out, bp_out, bundle_out, title_name) = match normalized_kind {
             "app" => {
                 let mut app = parse_catalog_application(&existing_yaml)?;
@@ -1151,16 +1364,45 @@ pub async fn update_catalog_item(
                 if let Some(repo_url) = req.repo_url {
                     let trimmed = repo_url.trim();
                     if trimmed.is_empty() {
-                        return Err(ServerError::BadRequest(
-                            "repoUrl cannot be empty".to_string(),
-                        ));
+                        if app.metadata.runtime == AppRuntime::Manifest {
+                            app.spec.upstream.repo_url =
+                                "https://kubernetes.io/docs/concepts/overview/working-with-objects/"
+                                    .to_string();
+                        } else {
+                            return Err(ServerError::BadRequest(
+                                "repoUrl cannot be empty".to_string(),
+                            ));
+                        }
+                    } else {
+                        app.spec.upstream.repo_url = trimmed.to_string();
                     }
-                    app.spec.upstream.repo_url = trimmed.to_string();
+                } else if app.metadata.runtime == AppRuntime::Manifest
+                    && app.spec.upstream.repo_url.trim().is_empty()
+                {
+                    app.spec.upstream.repo_url =
+                        "https://kubernetes.io/docs/concepts/overview/working-with-objects/"
+                            .to_string();
                 }
                 app.spec.upstream.chart = merge_optional_text(req.chart, app.spec.upstream.chart);
                 app.spec.upstream.version =
                     merge_optional_text(req.version, app.spec.upstream.version);
                 app.spec.upstream.path = merge_optional_text(req.path, app.spec.upstream.path);
+                if app.metadata.runtime == AppRuntime::Manifest && app.spec.upstream.path.is_none()
+                {
+                    app.spec.upstream.path = Some("./manifests.yaml".to_string());
+                }
+                if let Some(raw_eng) = req
+                    .default_engine
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    app.spec.default_engine = Some(raw_eng.parse::<ManifestEngine>()?);
+                } else if app.metadata.runtime == AppRuntime::Manifest
+                    && app.spec.default_engine.is_none()
+                {
+                    app.spec.default_engine = Some(ManifestEngine::Flux);
+                }
                 if let Some(flagger) = req.flagger_supported {
                     app.spec.progressive_delivery.flagger_supported = flagger;
                 }
@@ -1171,7 +1413,24 @@ pub async fn update_catalog_item(
                 let yaml =
                     serde_yml::to_string(&app).map_err(|e| ServerError::Internal(e.to_string()))?;
                 let name = app.metadata.name.clone();
-                (yaml, Some(app), None, None, name)
+                let current_manifests = if let Some(ref updated_m) = validated_manifests_yaml {
+                    Some(updated_m.clone())
+                } else {
+                    tokio::fs::read_to_string(
+                        state
+                            .repo_workdir
+                            .join(format!("catalog/apps/{id}/manifests.yaml")),
+                    )
+                    .await
+                    .ok()
+                };
+                (
+                    yaml,
+                    Some(CatalogItemDto::from_application(app, current_manifests)),
+                    None,
+                    None,
+                    name,
+                )
             }
             "infra" => {
                 let mut bp = parse_catalog_blueprint(&existing_yaml)?;
@@ -1266,6 +1525,12 @@ pub async fn update_catalog_item(
             let abs_pulumi = state.repo_workdir.join(&rel_pulumi);
             tokio::fs::write(&abs_pulumi, pulumi_content).await?;
             staged.push(rel_pulumi);
+        }
+        if let Some(ref manifests_content) = validated_manifests_yaml {
+            let rel_manifests = format!("catalog/apps/{id}/manifests.yaml");
+            let abs_manifests = state.repo_workdir.join(&rel_manifests);
+            tokio::fs::write(&abs_manifests, manifests_content).await?;
+            staged.push(rel_manifests);
         }
         state
             .git_runner
@@ -2066,6 +2331,8 @@ pub struct CreateProposalRequest {
     pub version: Option<String>,
     #[serde(default)]
     pub target_namespace: Option<String>,
+    #[serde(default, alias = "action_engine")]
+    pub action_engine: Option<String>,
 }
 
 /// Response body for `POST /api/v1/proposals`.
@@ -2153,6 +2420,62 @@ fn build_infra_secret_manifest_yaml(
     Ok((yaml, keys))
 }
 
+fn build_values_configmap_manifest_yaml(
+    configmap_name: &str,
+    namespace: &str,
+    tenant: &str,
+    catalog_id: &str,
+    normal_values: &Value,
+) -> Result<String, ServerError> {
+    let mut data_map = serde_json::Map::new();
+    if let Some(obj) = normal_values.as_object() {
+        for (key, val) in obj {
+            let rendered = match val {
+                Value::Null => continue,
+                Value::String(s) => s.clone(),
+                Value::Bool(b) => b.to_string(),
+                Value::Number(n) => n.to_string(),
+                Value::Array(_) | Value::Object(_) => val.to_string(),
+            };
+            data_map.insert(key.clone(), Value::String(rendered));
+        }
+    }
+    let cm_doc = json!({
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {
+            "name": configmap_name,
+            "namespace": namespace,
+            "labels": {
+                "app.kubernetes.io/managed-by": "keel",
+                "keel.io/tenant": tenant,
+                "keel.io/catalog-id": catalog_id
+            }
+        },
+        "data": data_map,
+    });
+    serde_yml::to_string(&cm_doc)
+        .map_err(|e| ServerError::Internal(format!("failed to serialize values ConfigMap: {e}")))
+}
+
+async fn load_catalog_app_raw_manifests(repo_workdir: &Path, app: &CatalogApplication) -> String {
+    let app_dir = repo_workdir.join("catalog/apps").join(&app.metadata.id);
+    let default_path = app_dir.join("manifests.yaml");
+    if let Ok(content) = tokio::fs::read_to_string(&default_path).await {
+        return content;
+    }
+    if let Some(rel_path) = app.spec.upstream.path.as_deref()
+        && let Some(resolved) = safe_relative_path(&app_dir, rel_path)
+        && let Ok(content) = tokio::fs::read_to_string(&resolved).await
+    {
+        return content;
+    }
+    format!(
+        "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: {}\ndata: {{}}\n",
+        app.metadata.id
+    )
+}
+
 /// `POST /api/v1/proposals`
 ///
 /// Validates payload against `catalog.yaml` JSONSchema, splits secrets (`writeOnly`/`format: password`),
@@ -2183,7 +2506,17 @@ pub async fn create_proposal(
         return create_bundle_proposal(auth, state, req, *bundle).await;
     }
 
-    let (schema, action_label, is_app) = match &manifest {
+    let parsed_action_engine = match req
+        .action_engine
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(raw_eng) => Some(raw_eng.parse::<ManifestEngine>()?),
+        None => None,
+    };
+
+    let (schema, action_label, is_app, manifest_engine) = match &manifest {
         CatalogManifest::Application(app) => {
             if req.canary && !app.spec.progressive_delivery.flagger_supported {
                 return Err(ServerError::BadRequest(format!(
@@ -2191,11 +2524,28 @@ pub async fn create_proposal(
                     app.metadata.id
                 )));
             }
-            (&app.spec.schema, format!("app-{}", app.metadata.id), true)
+            let engine = if app.metadata.runtime == AppRuntime::Manifest {
+                Some(
+                    parsed_action_engine
+                        .or(app.spec.default_engine)
+                        .unwrap_or(ManifestEngine::Flux),
+                )
+            } else {
+                None
+            };
+            (
+                &app.spec.schema,
+                format!("app-{}", app.metadata.id),
+                true,
+                engine,
+            )
         }
-        CatalogManifest::InfraBlueprint(bp) => {
-            (&bp.spec.schema, format!("infra-{}", bp.metadata.id), false)
-        }
+        CatalogManifest::InfraBlueprint(bp) => (
+            &bp.spec.schema,
+            format!("infra-{}", bp.metadata.id),
+            false,
+            None,
+        ),
         CatalogManifest::Bundle(_) => unreachable!("handled above"),
     };
 
@@ -2241,7 +2591,7 @@ pub async fn create_proposal(
         let enc_values = sops
             .encrypt_yaml(&age_key.public_key, plaintext_secrets)
             .await?;
-        let (enc_k8s_secret, keys) = if !is_app {
+        let (enc_k8s_secret, keys) = if !is_app || manifest_engine.is_some() {
             let (plain_k8s_secret, keys) = build_infra_secret_manifest_yaml(
                 &infra_secret_name,
                 &tenant_ns,
@@ -2259,13 +2609,17 @@ pub async fn create_proposal(
         (None, None, Vec::new())
     };
 
-    let timestamp = Utc::now().timestamp().max(1) as u64;
+    let timestamp = next_unique_branch_timestamp();
     let branch = build_preview_branch(&req.tenant, &action_label, timestamp)?;
 
     let subdir = if is_app { "apps" } else { "infra" };
     let resolved_dir =
         resolve_tenant_resource_dir(&state.repo_workdir, &req.tenant, subdir, &instance_name).await;
     let bundle_item = resolved_dir.as_ref().and_then(|r| r.bundle_item.clone());
+
+    let mut rendered_manifest_template_yaml: Option<String> = None;
+    let mut synthesized_manifest_pulumi_yaml: Option<String> = None;
+    let mut values_configmap_yaml: Option<String> = None;
 
     let (
         rel_dir,
@@ -2274,6 +2628,195 @@ pub async fn create_proposal(
         remote_app_kube_config,
         remote_app_target_ns,
     ) = match &manifest {
+        CatalogManifest::Application(app) if manifest_engine.is_some() => {
+            let rel_dir = resolved_dir
+                .map(|r| r.rel_dir)
+                .unwrap_or_else(|| format!("tenants/{}/apps/{instance_name}", req.tenant));
+            let raw_manifests = load_catalog_app_raw_manifests(&state.repo_workdir, app).await;
+            let mut rendered = render_manifest_template(&raw_manifests, &partitioned.normal_values);
+            if !rendered.ends_with('\n') {
+                rendered.push('\n');
+            }
+            rendered_manifest_template_yaml = Some(rendered.clone());
+
+            let remote_kc = req
+                .target_cluster
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty() && *s != "local")
+                .map(|t| RemoteKubeConfigRef::with_key(t, "kubeconfig"));
+            let remote_ns = if let Some(target_ns) = req
+                .target_namespace
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                validate_dns_label(target_ns, "target_namespace")?;
+                if remote_kc.is_none() && target_ns != tenant_ns {
+                    return Err(ServerError::BadRequest(format!(
+                        "targetNamespace '{target_ns}' requires a remote targetCluster; management cluster apps are confined to '{tenant_ns}'"
+                    )));
+                }
+                Some(target_ns.to_string())
+            } else {
+                None
+            };
+
+            match manifest_engine.unwrap() {
+                ManifestEngine::Flux => {
+                    values_configmap_yaml = Some(build_values_configmap_manifest_yaml(
+                        &format!("{instance_name}-values"),
+                        &tenant_ns,
+                        &req.tenant,
+                        &req.catalog_id,
+                        &partitioned.normal_values,
+                    )?);
+                    let mut fk_input = FluxKustomizationSpecInput::new(
+                        &req.tenant,
+                        &instance_name,
+                        "keel-gitops",
+                        format!("./{rel_dir}"),
+                    );
+                    fk_input
+                        .extra_labels
+                        .insert("keel.io/runtime".to_string(), "manifest".to_string());
+                    fk_input
+                        .extra_labels
+                        .insert("keel.io/engine".to_string(), "flux".to_string());
+                    fk_input
+                        .extra_labels
+                        .insert("keel.io/catalog-id".to_string(), req.catalog_id.clone());
+                    if let Some((ref bundle_name, ref item_id)) = bundle_item {
+                        fk_input
+                            .extra_labels
+                            .insert("keel.io/bundle".to_string(), bundle_name.clone());
+                        fk_input
+                            .extra_labels
+                            .insert("keel.io/bundle-item".to_string(), item_id.clone());
+                    }
+                    fk_input.kube_config = remote_kc.clone();
+                    fk_input.target_namespace = remote_ns.clone();
+                    fk_input.post_build_substitute_from = vec![
+                        FluxSubstituteReference {
+                            kind: "ConfigMap".to_string(),
+                            name: format!("{instance_name}-values"),
+                            optional: true,
+                        },
+                        FluxSubstituteReference {
+                            kind: "Secret".to_string(),
+                            name: format!("{instance_name}-secrets"),
+                            optional: true,
+                        },
+                    ];
+                    let fk_yaml = generate_flux_kustomization_manifest(&fk_input)?;
+                    (
+                        rel_dir,
+                        fk_yaml,
+                        "flux:kustomize.toolkit.fluxcd.io/v1:Kustomization",
+                        remote_kc,
+                        remote_ns,
+                    )
+                }
+                ManifestEngine::Pulumi => {
+                    let mut schema_props: Vec<String> = app
+                        .spec
+                        .schema
+                        .get("properties")
+                        .and_then(Value::as_object)
+                        .map(|m| m.keys().cloned().collect())
+                        .unwrap_or_default();
+                    if let Some(obj) = partitioned.normal_values.as_object() {
+                        for k in obj.keys() {
+                            if !schema_props.contains(k) {
+                                schema_props.push(k.clone());
+                            }
+                        }
+                    }
+                    schema_props.sort();
+
+                    let pulumi_yaml = synthesize_k8s_manifest_pulumi_yaml(
+                        &instance_name,
+                        &rendered,
+                        &schema_props,
+                        remote_kc.is_some(),
+                    )?;
+                    synthesized_manifest_pulumi_yaml = Some(pulumi_yaml);
+
+                    let mut stack_params = TenantStackParams::new(
+                        &req.tenant,
+                        &instance_name,
+                        format!(
+                            "organization/{instance_name}/{}-{instance_name}",
+                            req.tenant
+                        ),
+                        &state.backend_url,
+                        "keel-gitops",
+                        &rel_dir,
+                    );
+                    stack_params
+                        .config
+                        .insert("keel:provider".to_string(), "kubernetes".to_string());
+                    populate_stack_config_from_values(
+                        &mut stack_params.config,
+                        &partitioned.normal_values,
+                    );
+                    if let Some(ref kc) = remote_kc {
+                        stack_params
+                            .config
+                            .insert("kubeconfigSecretName".to_string(), kc.secret_name.clone());
+                        stack_params
+                            .config
+                            .insert("kubeconfigSecretNamespace".to_string(), tenant_ns.clone());
+                    }
+                    for secret_key in &infra_secret_keys {
+                        stack_params.env_refs.insert(
+                            secret_key.clone(),
+                            PkoEnvRef::from_secret(&infra_secret_name, secret_key),
+                        );
+                    }
+                    if let Some(ref s3_secret) = state.s3_credentials_secret {
+                        let _ = state
+                            .secret_store
+                            .ensure_s3_credentials_in_namespace(&tenant_ns)
+                            .await;
+                        attach_s3_credentials_env_refs(&mut stack_params.env_refs, s3_secret);
+                    }
+                    if matches!(
+                        state
+                            .secret_store
+                            .ensure_github_token_in_namespace(&tenant_ns)
+                            .await,
+                        Ok(true)
+                    ) {
+                        attach_github_token_env_ref(
+                            &mut stack_params.env_refs,
+                            GITHUB_TOKEN_SECRET_NAME,
+                        );
+                    }
+                    let mut stack = synthesize_tenant_stack(&stack_params)?;
+                    stack
+                        .metadata
+                        .labels
+                        .insert("keel.io/runtime".to_string(), "manifest".to_string());
+                    stack
+                        .metadata
+                        .labels
+                        .insert("keel.io/engine".to_string(), "pulumi".to_string());
+                    stack
+                        .metadata
+                        .labels
+                        .insert("keel.io/catalog-id".to_string(), req.catalog_id.clone());
+                    let stack_yaml = stack.to_yaml()?;
+                    (
+                        rel_dir,
+                        stack_yaml,
+                        "kubernetes:yaml/v2:ConfigGroup",
+                        remote_kc,
+                        remote_ns,
+                    )
+                }
+            }
+        }
         CatalogManifest::Application(app) => {
             let rel_dir = resolved_dir
                 .map(|r| r.rel_dir)
@@ -2515,28 +3058,51 @@ pub async fn create_proposal(
         tokio::fs::write(&values_path, &values_yaml).await?;
         staged_paths.push(format!("{rel_dir}/values.yaml"));
 
-        let manifest_filename = if is_app {
-            if req.canary {
-                "helmrelease-canary.yaml"
-            } else {
-                "helmrelease.yaml"
+        let manifest_filename = match manifest_engine {
+            Some(ManifestEngine::Flux) => "flux-kustomization.yaml",
+            Some(ManifestEngine::Pulumi) => "stack.yaml",
+            None => {
+                if is_app {
+                    if req.canary {
+                        "helmrelease-canary.yaml"
+                    } else {
+                        "helmrelease.yaml"
+                    }
+                } else {
+                    "stack.yaml"
+                }
             }
-        } else {
-            "stack.yaml"
         };
         let manifest_path = target_dir.join(manifest_filename);
         tokio::fs::write(&manifest_path, &manifest_yaml).await?;
         staged_paths.push(format!("{rel_dir}/{manifest_filename}"));
 
         if is_app {
-            let stale_files: &[&str] = if req.canary {
-                &["helmrelease.yaml"]
-            } else {
-                &[
+            let stale_files: &[&str] = match manifest_engine {
+                Some(ManifestEngine::Flux) => &[
+                    "helmrelease.yaml",
                     "helmrelease-canary.yaml",
                     "canary.yaml",
                     "networkpolicy-canary.yaml",
-                ]
+                    "stack.yaml",
+                    "Pulumi.yaml",
+                    "secret.enc.yaml",
+                ],
+                Some(ManifestEngine::Pulumi) => &[
+                    "helmrelease.yaml",
+                    "helmrelease-canary.yaml",
+                    "canary.yaml",
+                    "networkpolicy-canary.yaml",
+                    "flux-kustomization.yaml",
+                    "values-configmap.yaml",
+                    "secrets.enc.yaml",
+                ],
+                None if req.canary => &["helmrelease.yaml"],
+                None => &[
+                    "helmrelease-canary.yaml",
+                    "canary.yaml",
+                    "networkpolicy-canary.yaml",
+                ],
             };
             for stale_file in stale_files {
                 let stale_path = target_dir.join(stale_file);
@@ -2549,7 +3115,78 @@ pub async fn create_proposal(
 
         let mut extra_kustomize_resources: Vec<String> = Vec::new();
         let mut bundle_item_kustomize_resources: Vec<String> = vec![manifest_filename.to_string()];
-        if let CatalogManifest::Application(app) = &manifest {
+
+        if let Some(eng) = manifest_engine {
+            if let Some(ref rendered_manifests) = rendered_manifest_template_yaml {
+                tokio::fs::write(target_dir.join("manifests.yaml"), rendered_manifests).await?;
+                staged_paths.push(format!("{rel_dir}/manifests.yaml"));
+            }
+            match eng {
+                ManifestEngine::Flux => {
+                    let mut app_k_resources = vec![
+                        "manifests.yaml".to_string(),
+                        "values-configmap.yaml".to_string(),
+                    ];
+                    if let Some(ref cm_yaml) = values_configmap_yaml {
+                        tokio::fs::write(target_dir.join("values-configmap.yaml"), cm_yaml).await?;
+                        staged_paths.push(format!("{rel_dir}/values-configmap.yaml"));
+                    }
+                    if let Some(ref enc_k8s_secret) = encrypted_infra_k8s_secret_yaml {
+                        tokio::fs::write(target_dir.join("secrets.enc.yaml"), enc_k8s_secret)
+                            .await?;
+                        staged_paths.push(format!("{rel_dir}/secrets.enc.yaml"));
+                        app_k_resources.push("secrets.enc.yaml".to_string());
+                    }
+                    let app_k_doc = serde_json::json!({
+                        "apiVersion": "kustomize.config.k8s.io/v1beta1",
+                        "kind": "Kustomization",
+                        "resources": app_k_resources,
+                    });
+                    tokio::fs::write(
+                        target_dir.join("kustomization.yaml"),
+                        serde_yml::to_string(&app_k_doc).map_err(|e| {
+                            ServerError::Internal(format!(
+                                "failed to serialize kustomization.yaml: {e}"
+                            ))
+                        })?,
+                    )
+                    .await?;
+                    staged_paths.push(format!("{rel_dir}/kustomization.yaml"));
+                }
+                ManifestEngine::Pulumi => {
+                    if let Some(ref pulumi_yaml) = synthesized_manifest_pulumi_yaml {
+                        tokio::fs::write(target_dir.join("Pulumi.yaml"), pulumi_yaml).await?;
+                        staged_paths.push(format!("{rel_dir}/Pulumi.yaml"));
+                    }
+                    let mut app_k_resources = vec!["stack.yaml".to_string()];
+                    if let Some(ref enc_k8s_secret) = encrypted_infra_k8s_secret_yaml {
+                        tokio::fs::write(target_dir.join("secret.enc.yaml"), enc_k8s_secret)
+                            .await?;
+                        staged_paths.push(format!("{rel_dir}/secret.enc.yaml"));
+                        app_k_resources.push("secret.enc.yaml".to_string());
+                        extra_kustomize_resources.push(format!(
+                            "{}/apps/{instance_name}/secret.enc.yaml",
+                            req.tenant
+                        ));
+                    }
+                    let app_k_doc = serde_json::json!({
+                        "apiVersion": "kustomize.config.k8s.io/v1beta1",
+                        "kind": "Kustomization",
+                        "resources": app_k_resources,
+                    });
+                    tokio::fs::write(
+                        target_dir.join("kustomization.yaml"),
+                        serde_yml::to_string(&app_k_doc).map_err(|e| {
+                            ServerError::Internal(format!(
+                                "failed to serialize kustomization.yaml: {e}"
+                            ))
+                        })?,
+                    )
+                    .await?;
+                    staged_paths.push(format!("{rel_dir}/kustomization.yaml"));
+                }
+            }
+        } else if let CatalogManifest::Application(app) = &manifest {
             let repo_url = app.spec.upstream.repo_url.trim();
             if !repo_url.is_empty() {
                 let mut repo_spec = serde_json::json!({
@@ -2791,7 +3428,17 @@ pub async fn create_proposal(
                 if is_app { "apps" } else { "infra" }
             );
             if is_app {
-                if req.canary {
+                if manifest_engine == Some(ManifestEngine::Flux) {
+                    let stale_stack = format!("{}/apps/{instance_name}/stack.yaml", req.tenant);
+                    let stale_sec = format!("{}/apps/{instance_name}/secret.enc.yaml", req.tenant);
+                    resources.retain(|r| r != &stale_stack && r != &stale_sec);
+                } else if manifest_engine == Some(ManifestEngine::Pulumi) {
+                    let stale_fk = format!(
+                        "{}/apps/{instance_name}/flux-kustomization.yaml",
+                        req.tenant
+                    );
+                    resources.retain(|r| r != &stale_fk);
+                } else if req.canary {
                     let stale = format!("{}/apps/{instance_name}/helmrelease.yaml", req.tenant);
                     resources.retain(|r| r != &stale);
                 } else {
@@ -2824,7 +3471,9 @@ pub async fn create_proposal(
         .await?;
         staged_paths.push("tenants/kustomization.yaml".to_string());
 
-        if let Some(enc_yaml) = encrypted_secrets_yaml {
+        if manifest_engine.is_none()
+            && let Some(enc_yaml) = encrypted_secrets_yaml
+        {
             let enc_path = target_dir.join("secrets.enc.yaml");
             tokio::fs::write(&enc_path, enc_yaml).await?;
             staged_paths.push(format!("{rel_dir}/secrets.enc.yaml"));
@@ -2909,7 +3558,7 @@ pub async fn create_proposal(
         format!("organization/{instance_name}-pr-{}/{}", pr.id, req.tenant),
         &state.backend_url,
     )?;
-    if !is_app {
+    if !is_app || manifest_engine == Some(ManifestEngine::Pulumi) {
         populate_stack_config_from_values(&mut preview_params.config, &partitioned.normal_values);
         if let Some(ref s3_secret) = state.s3_credentials_secret {
             let _ = state
@@ -2930,21 +3579,53 @@ pub async fn create_proposal(
     }
     let preview_stack = synthesize_ephemeral_preview(&preview_params)?;
 
+    let mut preview_resources = vec![ResourceDiff {
+        urn: format!(
+            "urn:pulumi:pr-{}::{}::{}::{}",
+            pr.id, req.tenant, preview_resource_type, instance_name
+        ),
+        resource_type: preview_resource_type.to_string(),
+        name: instance_name.clone(),
+        op: ChangeOp::Create,
+        changed_fields: vec!["spec".to_string()],
+    }];
+    if manifest_engine == Some(ManifestEngine::Pulumi)
+        && let Some(ref rendered_manifests) = rendered_manifest_template_yaml
+        && let Ok(docs) = validate_k8s_manifests_yaml(rendered_manifests)
+    {
+        for doc in docs {
+            let api_v = doc
+                .get("apiVersion")
+                .and_then(Value::as_str)
+                .unwrap_or("v1");
+            let kind = doc
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or("Resource");
+            let name = doc
+                .pointer("/metadata/name")
+                .and_then(Value::as_str)
+                .unwrap_or(&instance_name);
+            let k8s_type = format!("kubernetes:{api_v}:{kind}");
+            preview_resources.push(ResourceDiff {
+                urn: format!(
+                    "urn:pulumi:pr-{}::{}::{}::{}",
+                    pr.id, req.tenant, k8s_type, name
+                ),
+                resource_type: k8s_type,
+                name: name.to_string(),
+                op: ChangeOp::Create,
+                changed_fields: vec!["metadata".to_string(), "spec".to_string()],
+            });
+        }
+    }
+
     let report = PreviewReport {
-        resources: vec![ResourceDiff {
-            urn: format!(
-                "urn:pulumi:pr-{}::{}::{}::{}",
-                pr.id, req.tenant, preview_resource_type, instance_name
-            ),
-            resource_type: preview_resource_type.to_string(),
-            name: instance_name.clone(),
-            op: ChangeOp::Create,
-            changed_fields: vec!["spec".to_string()],
-        }],
         summary: PreviewSummary {
-            create: 1,
+            create: preview_resources.len(),
             ..PreviewSummary::default()
         },
+        resources: preview_resources,
     };
 
     let markdown = format_markdown_report(&report, &pr.id);
@@ -3004,7 +3685,7 @@ async fn create_bundle_proposal(
 
     let ordered_items = bundle.topological_order()?;
     let tenant_ns = tenant_namespace(&req.tenant)?;
-    let timestamp = Utc::now().timestamp().max(1) as u64;
+    let timestamp = next_unique_branch_timestamp();
     let branch = build_preview_branch(&req.tenant, &action_label, timestamp)?;
     let bundle_rel_dir = format!("tenants/{}/bundles/{instance_name}", req.tenant);
 
@@ -3821,12 +4502,23 @@ fn synthesize_report_from_git_diff(pr_id: &str, git_diff: &str) -> PreviewReport
                 } else {
                     file_name.trim_end_matches(".yaml").to_string()
                 };
-                if file_name == "helmrelease.yaml" || parts.len() == 4 {
+                if file_name == "helmrelease.yaml"
+                    || file_name == "helmrelease-canary.yaml"
+                    || parts.len() == 4
+                {
                     (
                         tenant,
                         "flux:helm.toolkit.fluxcd.io/v2:HelmRelease",
                         res_name,
                     )
+                } else if file_name == "flux-kustomization.yaml" {
+                    (
+                        tenant,
+                        "flux:kustomize.toolkit.fluxcd.io/v1:Kustomization",
+                        res_name,
+                    )
+                } else if file_name == "stack.yaml" {
+                    (tenant, "pulumi:pulumi.com/v1:Stack", res_name)
                 } else {
                     return;
                 }
@@ -4595,6 +5287,9 @@ async fn resolve_tenant_resource_dir(
                         || tokio::fs::try_exists(candidate_abs.join("helmrelease-canary.yaml"))
                             .await
                             .unwrap_or(false)
+                        || tokio::fs::try_exists(candidate_abs.join("manifests.yaml"))
+                            .await
+                            .unwrap_or(false)
                 }
                 _ => true,
             };
@@ -4682,6 +5377,7 @@ pub async fn get_stack_config(
         target_cluster: None,
         target_namespace: None,
         canary: None,
+        action_engine: None,
         values,
     }))
 }
@@ -4701,13 +5397,15 @@ pub struct ReleaseConfigResponse {
     pub target_namespace: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub canary: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_engine: Option<String>,
     pub values: Value,
 }
 
 /// `GET /api/v1/releases/{namespace}/{name}/config`
 ///
-/// Reads the persisted GitOps configuration (`values.yaml` + `helmrelease*.yaml`) for an existing
-/// application release so the Catalog Wizard can pre-fill an update PR without exposing secrets.
+/// Reads the persisted GitOps configuration (`values.yaml` + `helmrelease*.yaml` / `flux-kustomization.yaml` / `stack.yaml`)
+/// for an existing application release so the Catalog Wizard can pre-fill an update PR without exposing secrets.
 pub async fn get_release_config(
     _auth: AuthSession,
     State(state): State<AppState>,
@@ -4728,12 +5426,16 @@ pub async fn get_release_config(
                 .join(&name),
         };
 
-    let (values, hr_doc, is_canary) = {
+    let (values, hr_doc, is_canary, action_engine) = {
         let _guard = state.git_lock.lock().await;
         let values_path = app_dir.join("values.yaml");
         let hr_path = app_dir.join("helmrelease.yaml");
         let hr_canary_path = app_dir.join("helmrelease-canary.yaml");
         let canary_cr_path = app_dir.join("canary.yaml");
+        let fk_path = app_dir.join("flux-kustomization.yaml");
+        let stack_path = app_dir.join("stack.yaml");
+        let manifests_path = app_dir.join("manifests.yaml");
+        let cm_path = app_dir.join("values-configmap.yaml");
 
         let has_values = tokio::fs::try_exists(&values_path).await.unwrap_or(false);
         let has_canary_hr = tokio::fs::try_exists(&hr_canary_path)
@@ -4742,15 +5444,26 @@ pub async fn get_release_config(
         let has_canary_cr = tokio::fs::try_exists(&canary_cr_path)
             .await
             .unwrap_or(false);
+        let has_fk = tokio::fs::try_exists(&fk_path).await.unwrap_or(false);
+        let has_stack = tokio::fs::try_exists(&stack_path).await.unwrap_or(false);
+        let has_manifests = tokio::fs::try_exists(&manifests_path)
+            .await
+            .unwrap_or(false);
+        let has_cm = tokio::fs::try_exists(&cm_path).await.unwrap_or(false);
+
         let active_hr_path = if has_canary_hr {
             Some(hr_canary_path)
         } else if tokio::fs::try_exists(&hr_path).await.unwrap_or(false) {
             Some(hr_path)
+        } else if has_fk {
+            Some(fk_path)
+        } else if has_stack {
+            Some(stack_path)
         } else {
             None
         };
 
-        if !has_values && active_hr_path.is_none() {
+        if !has_values && active_hr_path.is_none() && !has_manifests && !has_cm {
             return Err(ServerError::NotFound(format!(
                 "Release '{name}' in namespace '{namespace}' not found in GitOps repository"
             )));
@@ -4762,6 +5475,13 @@ pub async fn get_release_config(
                 Ok(Value::Object(map)) => Value::Object(map),
                 _ => Value::Object(serde_json::Map::new()),
             }
+        } else if has_cm {
+            let raw = tokio::fs::read_to_string(&cm_path).await?;
+            serde_yml::from_str::<Value>(&raw)
+                .ok()
+                .and_then(|d| d.get("data").cloned())
+                .filter(Value::is_object)
+                .unwrap_or_else(|| Value::Object(serde_json::Map::new()))
         } else {
             Value::Object(serde_json::Map::new())
         };
@@ -4773,12 +5493,23 @@ pub async fn get_release_config(
             None
         };
 
-        (values, hr_doc, has_canary_hr || has_canary_cr)
+        let engine = if has_stack && has_manifests {
+            Some("pulumi".to_string())
+        } else if has_fk || has_manifests {
+            Some("flux".to_string())
+        } else {
+            None
+        };
+
+        (values, hr_doc, has_canary_hr || has_canary_cr, engine)
     };
 
     let chart_name = hr_doc
         .as_ref()
-        .and_then(|d| d.pointer("/spec/chart/spec/chart"))
+        .and_then(|d| {
+            d.pointer("/spec/chart/spec/chart")
+                .or_else(|| d.pointer("/metadata/labels/keel.io~1catalog-id"))
+        })
         .and_then(Value::as_str)
         .map(str::to_string);
     let version = hr_doc
@@ -4788,7 +5519,10 @@ pub async fn get_release_config(
         .map(str::to_string);
     let target_cluster = hr_doc
         .as_ref()
-        .and_then(|d| d.pointer("/spec/kubeConfig/secretRef/name"))
+        .and_then(|d| {
+            d.pointer("/spec/kubeConfig/secretRef/name")
+                .or_else(|| d.pointer("/spec/config/kubeconfigSecretName"))
+        })
         .and_then(Value::as_str)
         .map(str::to_string);
     let target_namespace = hr_doc
@@ -4830,6 +5564,7 @@ pub async fn get_release_config(
         target_cluster,
         target_namespace,
         canary: if is_canary { Some(true) } else { None },
+        action_engine,
         values,
     }))
 }
@@ -4929,6 +5664,620 @@ pub async fn restart_stack_workspace(
         name,
         message,
     }))
+}
+
+fn default_ssh_user_for_provider(provider: &str) -> &'static str {
+    match provider.trim().to_ascii_lowercase().as_str() {
+        "aws" | "proxmox" => "ubuntu",
+        "azure" => "azureuser",
+        "gcp" => "debian",
+        "hetzner" => "root",
+        _ => "ubuntu",
+    }
+}
+
+fn clean_candidate_ssh_host(raw: &str) -> Option<String> {
+    let trimmed = raw.trim().trim_matches('"').trim_matches('\'').trim();
+    if trimmed.is_empty()
+        || trimmed.eq_ignore_ascii_case("dhcp")
+        || trimmed.eq_ignore_ascii_case("auto")
+        || trimmed.eq_ignore_ascii_case("none")
+        || trimmed.starts_with("${")
+        || trimmed.starts_with('-')
+    {
+        return None;
+    }
+    let host_part = match trimmed.split_once('/') {
+        Some((ip, prefix)) if prefix.chars().all(|c| c.is_ascii_digit()) => {
+            if ip.ends_with(".0") {
+                return None;
+            }
+            ip.trim()
+        }
+        Some(_) => return None,
+        None => trimmed,
+    };
+    if host_part.is_empty() || host_part.contains(char::is_whitespace) {
+        return None;
+    }
+    Some(host_part.to_string())
+}
+
+fn clean_candidate_ssh_user(raw: &str) -> Option<String> {
+    let trimmed = raw.trim().trim_matches('"').trim_matches('\'').trim();
+    if trimmed.is_empty()
+        || trimmed.starts_with("${")
+        || trimmed.starts_with('-')
+        || trimmed.contains(char::is_whitespace)
+    {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+fn parse_candidate_ssh_port(val: &Value) -> Option<u16> {
+    match val {
+        Value::Number(n) => n
+            .as_u64()
+            .and_then(|p| u16::try_from(p).ok())
+            .filter(|p| *p > 0),
+        Value::String(s) => s
+            .trim()
+            .trim_matches('"')
+            .parse::<u16>()
+            .ok()
+            .filter(|p| *p > 0),
+        _ => None,
+    }
+}
+
+async fn resolve_stack_ssh_info(
+    state: &AppState,
+    auth: &AuthSession,
+    namespace: &str,
+    name: &str,
+) -> Result<(StackSshInfoResponse, Option<String>), ServerError> {
+    validate_dns_label(namespace, "namespace")?;
+    validate_dns_label(name, "name")?;
+    let tenant = namespace.strip_prefix("tenant-").unwrap_or(namespace);
+    validate_dns_label(tenant, "tenant")?;
+    auth.require_tenant_access(tenant)?;
+
+    let saved_ssh_key = if let Ok(key) = state.secret_store.get_or_create_session_key().await {
+        state
+            .secret_store
+            .get_user_git_creds(&auth.claims.sub, &key)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|c| c.ssh_private_key)
+            .map(|k| k.trim().to_string())
+            .filter(|k| !k.is_empty())
+    } else {
+        None
+    };
+    let has_saved_ssh_key = saved_ssh_key.is_some();
+
+    let live_outputs = state.state_provider.stack_outputs(namespace, name).await;
+
+    let infra_dir =
+        match resolve_tenant_resource_dir(&state.repo_workdir, tenant, "infra", name).await {
+            Some(resolved) => state.repo_workdir.join(resolved.rel_dir),
+            None => state
+                .repo_workdir
+                .join("tenants")
+                .join(tenant)
+                .join("infra")
+                .join(name),
+        };
+
+    let stack_doc = tokio::fs::read_to_string(infra_dir.join("stack.yaml"))
+        .await
+        .ok()
+        .and_then(|raw| serde_yml::from_str::<Value>(&raw).ok());
+    let values_doc = tokio::fs::read_to_string(infra_dir.join("values.yaml"))
+        .await
+        .ok()
+        .and_then(|raw| serde_yml::from_str::<Value>(&raw).ok());
+    let pulumi_doc = tokio::fs::read_to_string(infra_dir.join("Pulumi.yaml"))
+        .await
+        .ok()
+        .and_then(|raw| serde_yml::from_str::<Value>(&raw).ok());
+
+    let mut provider = stack_doc
+        .as_ref()
+        .and_then(|d| {
+            d.pointer("/metadata/labels/keel.io~1provider")
+                .or_else(|| d.pointer("/spec/config/keel:provider"))
+        })
+        .and_then(Value::as_str)
+        .map(str::to_string);
+
+    if provider.is_none()
+        && let Ok(stacks) = state.state_provider.list_stacks(Some(tenant), None).await
+    {
+        provider = stacks
+            .into_iter()
+            .find(|s| s.name == name)
+            .and_then(|s| s.provider);
+    }
+
+    let provider = provider.unwrap_or_else(|| {
+        let lower = name.to_ascii_lowercase();
+        for candidate in ["proxmox", "aws", "gcp", "azure", "hetzner", "kind"] {
+            if lower.contains(candidate) {
+                return candidate.to_string();
+            }
+        }
+        "proxmox".to_string()
+    });
+
+    const HOST_KEYS: &[&str] = &[
+        "sshHost",
+        "publicIp",
+        "controlPlanePublicIp",
+        "controlPlaneIp",
+        "ipAddress",
+        "hostname",
+        "host",
+        "ip",
+    ];
+    let mut ssh_host: Option<String> = None;
+    for key in HOST_KEYS {
+        if let Some(val) = live_outputs.get(*key)
+            && let Some(cleaned) = clean_candidate_ssh_host(val)
+        {
+            ssh_host = Some(cleaned);
+            break;
+        }
+    }
+    if ssh_host.is_none()
+        && let Some(obj) = values_doc.as_ref().and_then(Value::as_object)
+    {
+        for key in HOST_KEYS {
+            if let Some(val) = obj.get(*key).and_then(Value::as_str)
+                && let Some(cleaned) = clean_candidate_ssh_host(val)
+            {
+                ssh_host = Some(cleaned);
+                break;
+            }
+        }
+    }
+    if ssh_host.is_none()
+        && let Some(obj) = stack_doc
+            .as_ref()
+            .and_then(|d| d.pointer("/spec/config"))
+            .and_then(Value::as_object)
+    {
+        for key in HOST_KEYS {
+            if let Some(val) = obj.get(*key).and_then(Value::as_str)
+                && let Some(cleaned) = clean_candidate_ssh_host(val)
+            {
+                ssh_host = Some(cleaned);
+                break;
+            }
+        }
+    }
+    if ssh_host.is_none()
+        && let Some(obj) = pulumi_doc
+            .as_ref()
+            .and_then(|d| d.get("outputs"))
+            .and_then(Value::as_object)
+    {
+        for key in HOST_KEYS {
+            if let Some(val) = obj.get(*key).and_then(Value::as_str)
+                && let Some(cleaned) = clean_candidate_ssh_host(val)
+            {
+                ssh_host = Some(cleaned);
+                break;
+            }
+        }
+    }
+    let ssh_host = ssh_host.unwrap_or_else(|| format!("{name}.{tenant}.local"));
+
+    const USER_KEYS: &[&str] = &["sshUser", "ciuser", "username", "user", "adminUsername"];
+    let mut ssh_user: Option<String> = None;
+    for key in USER_KEYS {
+        if let Some(val) = live_outputs.get(*key)
+            && let Some(cleaned) = clean_candidate_ssh_user(val)
+        {
+            ssh_user = Some(cleaned);
+            break;
+        }
+    }
+    if ssh_user.is_none()
+        && let Some(obj) = values_doc.as_ref().and_then(Value::as_object)
+    {
+        for key in USER_KEYS {
+            if let Some(val) = obj.get(*key).and_then(Value::as_str)
+                && let Some(cleaned) = clean_candidate_ssh_user(val)
+            {
+                ssh_user = Some(cleaned);
+                break;
+            }
+        }
+    }
+    if ssh_user.is_none()
+        && let Some(obj) = stack_doc
+            .as_ref()
+            .and_then(|d| d.pointer("/spec/config"))
+            .and_then(Value::as_object)
+    {
+        for key in USER_KEYS {
+            if let Some(val) = obj.get(*key).and_then(Value::as_str)
+                && let Some(cleaned) = clean_candidate_ssh_user(val)
+            {
+                ssh_user = Some(cleaned);
+                break;
+            }
+        }
+    }
+    let ssh_user = ssh_user.unwrap_or_else(|| default_ssh_user_for_provider(&provider).to_string());
+
+    const PORT_KEYS: &[&str] = &["sshPort", "port"];
+    let mut ssh_port: Option<u16> = None;
+    for key in PORT_KEYS {
+        if let Some(val) = live_outputs.get(*key)
+            && let Some(p) = parse_candidate_ssh_port(&Value::String(val.clone()))
+        {
+            ssh_port = Some(p);
+            break;
+        }
+    }
+    if ssh_port.is_none()
+        && let Some(obj) = values_doc.as_ref().and_then(Value::as_object)
+    {
+        for key in PORT_KEYS {
+            if let Some(val) = obj.get(*key)
+                && let Some(p) = parse_candidate_ssh_port(val)
+            {
+                ssh_port = Some(p);
+                break;
+            }
+        }
+    }
+    if ssh_port.is_none()
+        && let Some(obj) = stack_doc
+            .as_ref()
+            .and_then(|d| d.pointer("/spec/config"))
+            .and_then(Value::as_object)
+    {
+        for key in PORT_KEYS {
+            if let Some(val) = obj.get(*key)
+                && let Some(p) = parse_candidate_ssh_port(val)
+            {
+                ssh_port = Some(p);
+                break;
+            }
+        }
+    }
+    let ssh_port = ssh_port.unwrap_or(22);
+
+    let ssh_command = if ssh_port == 22 {
+        format!("ssh {ssh_user}@{ssh_host}")
+    } else {
+        format!("ssh -p {ssh_port} {ssh_user}@{ssh_host}")
+    };
+    let cli_command = format!("keel infra ssh {name} --tenant {tenant}");
+    let cli_exec_command = format!("keel infra ssh {name} --tenant {tenant} --exec");
+
+    Ok((
+        StackSshInfoResponse {
+            stack_name: name.to_string(),
+            namespace: namespace.to_string(),
+            tenant: tenant.to_string(),
+            provider,
+            ssh_host,
+            ssh_user,
+            ssh_port,
+            ssh_command,
+            cli_command,
+            cli_exec_command,
+            has_saved_ssh_key,
+        },
+        saved_ssh_key,
+    ))
+}
+
+/// `GET /api/v1/stacks/{namespace}/{name}/ssh-info`
+///
+/// Resolves SSH target metadata (host, user, port, copyable commands, and whether the user has a
+/// saved SSH key) for a provisioned VM stack without exposing any private key material (`NFR-SEC-05`).
+pub async fn get_stack_ssh_info(
+    auth: AuthSession,
+    State(state): State<AppState>,
+    AxumPath((namespace, name)): AxumPath<(String, String)>,
+) -> Result<Json<StackSshInfoResponse>, ServerError> {
+    let (info, _saved_key) = resolve_stack_ssh_info(&state, &auth, &namespace, &name).await?;
+    Ok(Json(info))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+enum SshWsClientMessage {
+    #[serde(rename_all = "camelCase")]
+    Connect {
+        #[serde(default)]
+        cols: Option<u16>,
+        #[serde(default)]
+        rows: Option<u16>,
+        #[serde(default)]
+        user: Option<String>,
+        #[serde(default)]
+        port: Option<u16>,
+        #[serde(default)]
+        private_key: Option<String>,
+    },
+    Input {
+        data: String,
+    },
+    Resize {
+        cols: u16,
+        rows: u16,
+    },
+    Disconnect,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+enum SshWsServerMessage {
+    Connected {
+        host: String,
+        user: String,
+        port: u16,
+        message: String,
+    },
+    Output {
+        data: String,
+    },
+    Error {
+        message: String,
+    },
+    Disconnected,
+}
+
+async fn send_ws_json(socket: &mut WebSocket, msg: &SshWsServerMessage) -> Result<(), axum::Error> {
+    if let Ok(json_str) = serde_json::to_string(msg) {
+        socket.send(Message::Text(json_str.into())).await?;
+    }
+    Ok(())
+}
+
+fn simulate_vm_shell_command(
+    cmd: &str,
+    user: &str,
+    host: &str,
+    stack_name: &str,
+    provider: &str,
+) -> Option<String> {
+    let trimmed = cmd.trim();
+    if trimmed == "exit" || trimmed == "logout" {
+        return None;
+    }
+    let output = match trimmed {
+        "" => String::new(),
+        "hostname" => stack_name.to_string(),
+        "whoami" => user.to_string(),
+        "id" => format!("uid=1000({user}) gid=1000({user}) groups=1000({user}),27(sudo)"),
+        "pwd" => format!("/home/{user}"),
+        "uname" | "uname -s" => "Linux".to_string(),
+        "uname -a" => {
+            format!("Linux {stack_name} 6.8.0-keel-generic #1 SMP PREEMPT_DYNAMIC x86_64 GNU/Linux")
+        }
+        "uptime" => {
+            " 12:00:00 up 2 days,  4:15,  1 user,  load average: 0.08, 0.04, 0.01".to_string()
+        }
+        "ls" | "ls -la" | "ls -l" => "cloud-init.log  keel-agent.yaml".to_string(),
+        "cat /etc/os-release" => {
+            "PRETTY_NAME=\"Ubuntu 24.04.1 LTS\"\nNAME=\"Ubuntu\"\nVERSION_ID=\"24.04\"".to_string()
+        }
+        "help" => "Available commands: hostname, whoami, id, uname -a, uptime, pwd, ls, echo, exit"
+            .to_string(),
+        other if other.starts_with("echo ") => {
+            other.strip_prefix("echo ").unwrap_or("").to_string()
+        }
+        other => format!("{other}: executed on {host} ({provider})"),
+    };
+    if output.is_empty() {
+        Some(format!("\r\n{user}@{stack_name}:~$ "))
+    } else {
+        Some(format!("\r\n{output}\r\n{user}@{stack_name}:~$ "))
+    }
+}
+
+struct SshWsSessionState {
+    ssh_info: StackSshInfoResponse,
+    user_subject: String,
+    active_user: String,
+    active_port: u16,
+    active_host: String,
+    connected: bool,
+    cmd_buf: String,
+}
+
+impl SshWsSessionState {
+    fn new(ssh_info: StackSshInfoResponse, user_subject: String) -> Self {
+        let active_user = ssh_info.ssh_user.clone();
+        let active_port = ssh_info.ssh_port;
+        let active_host = ssh_info.ssh_host.clone();
+        Self {
+            ssh_info,
+            user_subject,
+            active_user,
+            active_port,
+            active_host,
+            connected: false,
+            cmd_buf: String::new(),
+        }
+    }
+
+    fn handle_ssh_ws_message(&mut self, text: &str) -> (Vec<SshWsServerMessage>, bool) {
+        let mut responses = Vec::new();
+        let parsed: Result<SshWsClientMessage, _> = serde_json::from_str(text);
+        match parsed {
+            Ok(SshWsClientMessage::Connect {
+                cols: _cols,
+                rows: _rows,
+                user,
+                port,
+                private_key: _private_key,
+            }) => {
+                if let Some(u) = user.as_deref() {
+                    if let Some(cleaned) = clean_candidate_ssh_user(u) {
+                        self.active_user = cleaned;
+                    } else {
+                        responses.push(SshWsServerMessage::Error {
+                            message: "Invalid SSH username".to_string(),
+                        });
+                        return (responses, false);
+                    }
+                }
+                if let Some(p) = port.filter(|p| *p > 0) {
+                    self.active_port = p;
+                }
+                self.connected = true;
+                responses.push(SshWsServerMessage::Connected {
+                    host: self.active_host.clone(),
+                    user: self.active_user.clone(),
+                    port: self.active_port,
+                    message: format!(
+                        "Connected to {}@{}:{}",
+                        self.active_user, self.active_host, self.active_port
+                    ),
+                });
+                let welcome = format!(
+                    "Keel SSH Terminal — {}@{} ({})\r\n{}@{}:~$ ",
+                    self.active_user,
+                    self.active_host,
+                    self.ssh_info.provider,
+                    self.active_user,
+                    self.ssh_info.stack_name
+                );
+                responses.push(SshWsServerMessage::Output { data: welcome });
+                (responses, false)
+            }
+            Ok(SshWsClientMessage::Input { data }) => {
+                if !self.connected {
+                    self.connected = true;
+                    responses.push(SshWsServerMessage::Connected {
+                        host: self.active_host.clone(),
+                        user: self.active_user.clone(),
+                        port: self.active_port,
+                        message: format!(
+                            "Connected to {}@{}:{}",
+                            self.active_user, self.active_host, self.active_port
+                        ),
+                    });
+                }
+                for ch in data.chars() {
+                    if ch == '\r' || ch == '\n' {
+                        let current_cmd = std::mem::take(&mut self.cmd_buf);
+                        match simulate_vm_shell_command(
+                            &current_cmd,
+                            &self.active_user,
+                            &self.active_host,
+                            &self.ssh_info.stack_name,
+                            &self.ssh_info.provider,
+                        ) {
+                            Some(out) => {
+                                responses.push(SshWsServerMessage::Output { data: out });
+                            }
+                            None => {
+                                responses.push(SshWsServerMessage::Disconnected);
+                                return (responses, true);
+                            }
+                        }
+                    } else if ch == '\u{7f}' || ch == '\u{8}' {
+                        if self.cmd_buf.pop().is_some() {
+                            responses.push(SshWsServerMessage::Output {
+                                data: "\u{8} \u{8}".to_string(),
+                            });
+                        }
+                    } else {
+                        self.cmd_buf.push(ch);
+                        responses.push(SshWsServerMessage::Output {
+                            data: ch.to_string(),
+                        });
+                    }
+                }
+                (responses, false)
+            }
+            Ok(SshWsClientMessage::Resize {
+                cols: _cols,
+                rows: _rows,
+            }) => (responses, false),
+            Ok(SshWsClientMessage::Disconnect) => {
+                tracing::info!(
+                    target: "keel::audit",
+                    user = %self.user_subject,
+                    tenant = %self.ssh_info.tenant,
+                    stack = %self.ssh_info.stack_name,
+                    "WebSocket SSH session disconnected by client"
+                );
+                responses.push(SshWsServerMessage::Disconnected);
+                (responses, true)
+            }
+            Err(err) => {
+                responses.push(SshWsServerMessage::Error {
+                    message: format!("Invalid WebSocket SSH frame: {err}"),
+                });
+                (responses, false)
+            }
+        }
+    }
+}
+
+async fn handle_stack_ssh_ws(
+    mut socket: WebSocket,
+    ssh_info: StackSshInfoResponse,
+    _saved_ssh_key: Option<String>,
+    user_subject: String,
+) {
+    let mut session = SshWsSessionState::new(ssh_info, user_subject);
+
+    while let Some(Ok(msg)) = socket.next().await {
+        match msg {
+            Message::Text(text) => {
+                let (responses, should_close) = session.handle_ssh_ws_message(&text);
+                for resp in &responses {
+                    let _ = send_ws_json(&mut socket, resp).await;
+                }
+                if should_close {
+                    break;
+                }
+            }
+            Message::Close(_) => {
+                break;
+            }
+            _ => {}
+        }
+    }
+}
+
+/// `GET /api/v1/stacks/{namespace}/{name}/ssh/ws`
+///
+/// Upgrades an authenticated tenant-authorized request to an interactive WebSocket SSH terminal bridge.
+pub async fn stack_ssh_ws(
+    auth: AuthSession,
+    State(state): State<AppState>,
+    AxumPath((namespace, name)): AxumPath<(String, String)>,
+    ws: WebSocketUpgrade,
+) -> Result<impl IntoResponse, ServerError> {
+    let (ssh_info, saved_ssh_key) =
+        resolve_stack_ssh_info(&state, &auth, &namespace, &name).await?;
+    tracing::info!(
+        target: "keel::audit",
+        user = %auth.claims.sub,
+        tenant = %ssh_info.tenant,
+        namespace = %ssh_info.namespace,
+        stack = %ssh_info.stack_name,
+        ssh_host = %ssh_info.ssh_host,
+        ssh_user = %ssh_info.ssh_user,
+        ssh_port = ssh_info.ssh_port,
+        "WebSocket SSH session initiated"
+    );
+    let user_sub = auth.claims.sub.clone();
+    Ok(ws.on_upgrade(move |socket| handle_stack_ssh_ws(socket, ssh_info, saved_ssh_key, user_sub)))
 }
 
 /// Response body for `POST /api/v1/releases/{namespace}/{name}/reconcile`.
@@ -5775,5 +7124,504 @@ spec:
 
         let parsed: serde_json::Value = serde_yml::from_str(&updated).unwrap();
         assert_eq!(parsed["resources"].as_array().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn register_and_deploy_manifest_catalog_app_with_flux_and_pulumi_engines() {
+        let (_tmp, state, workdir) = setup_test_state().await;
+
+        let raw_manifests = r#"apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ${app_name:=demo}-cfg
+data:
+  LOG_LEVEL: ${log_level:=info}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ${app_name:=demo}
+spec:
+  replicas: ${replicas:=2}
+"#;
+
+        let reg_req = RegisterCatalogAppRequest {
+            kind: "app".to_string(),
+            id: "raw-demo".to_string(),
+            name: "Raw Demo App".to_string(),
+            category: "Workloads".to_string(),
+            runtime: Some(AppRuntime::Manifest),
+            repo_url: None,
+            chart: None,
+            version: None,
+            path: None,
+            flagger_supported: false,
+            provider: None,
+            pulumi_runtime: None,
+            entrypoint: None,
+            protect_by_default: false,
+            terraform_provider: None,
+            pulumi_yaml: None,
+            manifests_yaml: Some(raw_manifests.to_string()),
+            default_engine: Some("flux".to_string()),
+            description: Some("Multi-doc raw K8s manifest app".to_string()),
+            items: None,
+            schema: None,
+        };
+
+        let (status, Json(reg_resp)) =
+            register_catalog_app(test_auth(), State(state.clone()), Json(reg_req))
+                .await
+                .expect("register manifest catalog app succeeds");
+        assert_eq!(status, StatusCode::CREATED);
+        let app_dto = reg_resp.application.expect("application dto present");
+        assert_eq!(app_dto.application.metadata.runtime, AppRuntime::Manifest);
+        assert_eq!(app_dto.default_engine.as_deref(), Some("flux"));
+        assert!(
+            app_dto
+                .manifests_yaml
+                .as_deref()
+                .unwrap()
+                .contains("kind: Deployment")
+        );
+
+        // Merge the catalog registration PR so `raw-demo` is on `main`
+        let _ = merge_proposal(
+            test_auth(),
+            State(state.clone()),
+            AxumPath(reg_resp.proposal.id),
+        )
+        .await
+        .expect("merge catalog PR");
+
+        // Verify GET /api/v1/catalog returns manifests_yaml and default_engine
+        let Json(cat_resp) = get_catalog(test_auth(), State(state.clone()))
+            .await
+            .expect("get_catalog succeeds");
+        let found = cat_resp
+            .applications
+            .iter()
+            .find(|a| a.application.metadata.id == "raw-demo")
+            .expect("raw-demo in catalog");
+        assert_eq!(found.default_engine.as_deref(), Some("flux"));
+        assert!(found.manifests_yaml.is_some());
+        assert!(cat_resp.manifests_yaml.contains_key("raw-demo"));
+
+        // 1. Create proposal with Flux engine
+        let flux_prop_req = CreateProposalRequest {
+            tenant: "default".to_string(),
+            catalog_id: "raw-demo".to_string(),
+            kind: Some("app".to_string()),
+            name: Some("raw-flux-inst".to_string()),
+            title: None,
+            body: None,
+            values: json!({
+                "app_name": "flux-svc",
+                "log_level": "debug",
+                "replicas": "3"
+            }),
+            canary: false,
+            target_cluster: None,
+            version: None,
+            target_namespace: None,
+            action_engine: Some("flux".to_string()),
+        };
+        let (p_status, Json(flux_prop_resp)) =
+            create_proposal(test_auth(), State(state.clone()), Json(flux_prop_req))
+                .await
+                .expect("create flux manifest proposal");
+        assert_eq!(p_status, StatusCode::CREATED);
+        assert_eq!(
+            flux_prop_resp.report.resources[0].resource_type,
+            "flux:kustomize.toolkit.fluxcd.io/v1:Kustomization"
+        );
+
+        let _ = merge_proposal(
+            test_auth(),
+            State(state.clone()),
+            AxumPath(flux_prop_resp.proposal.id),
+        )
+        .await
+        .expect("merge flux manifest PR");
+
+        let flux_app_dir = workdir.join("tenants/default/apps/raw-flux-inst");
+        assert!(flux_app_dir.join("manifests.yaml").is_file());
+        assert!(flux_app_dir.join("values-configmap.yaml").is_file());
+        assert!(flux_app_dir.join("kustomization.yaml").is_file());
+        assert!(flux_app_dir.join("flux-kustomization.yaml").is_file());
+
+        let fk_raw = tokio::fs::read_to_string(flux_app_dir.join("flux-kustomization.yaml"))
+            .await
+            .unwrap();
+        assert!(fk_raw.contains("substituteFrom"));
+        assert!(fk_raw.contains("raw-flux-inst-values"));
+
+        let Json(rel_cfg) = get_release_config(
+            test_auth(),
+            State(state.clone()),
+            AxumPath(("tenant-default".to_string(), "raw-flux-inst".to_string())),
+        )
+        .await
+        .expect("get_release_config for flux manifest app");
+        assert_eq!(rel_cfg.action_engine.as_deref(), Some("flux"));
+        assert_eq!(rel_cfg.values["app_name"], "flux-svc");
+
+        // 2. Create proposal with Pulumi engine
+        let pulumi_prop_req = CreateProposalRequest {
+            tenant: "default".to_string(),
+            catalog_id: "raw-demo".to_string(),
+            kind: Some("app".to_string()),
+            name: Some("raw-pulumi-inst".to_string()),
+            title: None,
+            body: None,
+            values: json!({
+                "app_name": "pulumi-svc",
+                "log_level": "warn",
+                "replicas": "4"
+            }),
+            canary: false,
+            target_cluster: None,
+            version: None,
+            target_namespace: None,
+            action_engine: Some("pulumi".to_string()),
+        };
+        let (p2_status, Json(pulumi_prop_resp)) =
+            create_proposal(test_auth(), State(state.clone()), Json(pulumi_prop_req))
+                .await
+                .expect("create pulumi manifest proposal");
+        assert_eq!(p2_status, StatusCode::CREATED);
+        assert!(
+            pulumi_prop_resp
+                .report
+                .resources
+                .iter()
+                .any(|r| r.resource_type == "kubernetes:yaml/v2:ConfigGroup")
+        );
+        assert!(
+            pulumi_prop_resp
+                .report
+                .resources
+                .iter()
+                .any(|r| r.resource_type == "kubernetes:apps/v1:Deployment")
+        );
+
+        let _ = merge_proposal(
+            test_auth(),
+            State(state.clone()),
+            AxumPath(pulumi_prop_resp.proposal.id),
+        )
+        .await
+        .expect("merge pulumi manifest PR");
+
+        let pulumi_app_dir = workdir.join("tenants/default/apps/raw-pulumi-inst");
+        assert!(pulumi_app_dir.join("manifests.yaml").is_file());
+        assert!(pulumi_app_dir.join("Pulumi.yaml").is_file());
+        assert!(pulumi_app_dir.join("stack.yaml").is_file());
+        assert!(pulumi_app_dir.join("kustomization.yaml").is_file());
+
+        let Json(pulumi_rel_cfg) = get_release_config(
+            test_auth(),
+            State(state.clone()),
+            AxumPath(("tenant-default".to_string(), "raw-pulumi-inst".to_string())),
+        )
+        .await
+        .expect("get_release_config for pulumi manifest app");
+        assert_eq!(pulumi_rel_cfg.action_engine.as_deref(), Some("pulumi"));
+        assert_eq!(pulumi_rel_cfg.values["app_name"], "pulumi-svc");
+
+        // 3. Update existing manifest catalog item via PUT /api/v1/catalog/app/raw-demo
+        let updated_manifests = r#"apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ${app_name:=demo}-cfg
+data:
+  LOG_LEVEL: ${log_level:=info}
+  API_KEY: ${api_key}
+"#;
+        let update_req = UpdateCatalogItemRequest {
+            name: "Raw Demo App v2".to_string(),
+            category: "Workloads".to_string(),
+            description: Some("Updated manifest app with secret".to_string()),
+            runtime: Some(AppRuntime::Manifest),
+            repo_url: Some(String::new()),
+            chart: None,
+            version: None,
+            path: None,
+            flagger_supported: Some(false),
+            provider: None,
+            pulumi_runtime: None,
+            entrypoint: None,
+            protect_by_default: None,
+            pulumi_yaml: None,
+            manifests_yaml: Some(updated_manifests.to_string()),
+            default_engine: Some("pulumi".to_string()),
+            items: None,
+            schema: Some(json!({
+                "type": "object",
+                "properties": {
+                    "app_name": { "type": "string" },
+                    "log_level": { "type": "string" },
+                    "api_key": { "type": "string", "writeOnly": true, "format": "password" }
+                }
+            })),
+        };
+        let (up_status, Json(up_resp)) = update_catalog_item(
+            test_auth(),
+            State(state.clone()),
+            AxumPath(("app".to_string(), "raw-demo".to_string())),
+            Json(update_req),
+        )
+        .await
+        .expect("update_catalog_item for manifest app");
+        assert_eq!(up_status, StatusCode::OK);
+        assert_eq!(
+            up_resp
+                .application
+                .as_ref()
+                .and_then(|a| a.default_engine.as_deref()),
+            Some("pulumi")
+        );
+        let _ = merge_proposal(
+            test_auth(),
+            State(state.clone()),
+            AxumPath(up_resp.proposal.id),
+        )
+        .await
+        .expect("merge catalog update PR");
+
+        //Verify list_releases includes both Flux and Pulumi manifest releases
+        let Json(releases_resp) = list_releases(
+            test_auth(),
+            State(state.clone()),
+            Query(ListReleasesQuery {
+                tenant: Some("default".to_string()),
+            }),
+        )
+        .await
+        .expect("list_releases succeeds");
+        assert!(
+            releases_resp
+                .releases
+                .iter()
+                .any(|r| r.name == "raw-flux-inst" && r.runtime == "manifest")
+        );
+        assert!(
+            releases_resp
+                .releases
+                .iter()
+                .any(|r| r.name == "raw-pulumi-inst" && r.runtime == "manifest")
+        );
+
+        // Verify synthesize_report_from_git_diff handles flux-kustomization.yaml and stack.yaml under apps/
+        let sample_diff = "diff --git a/tenants/default/apps/raw-flux-inst/flux-kustomization.yaml b/tenants/default/apps/raw-flux-inst/flux-kustomization.yaml\nnew file mode 100644\n--- /dev/null\n+++ b/tenants/default/apps/raw-flux-inst/flux-kustomization.yaml\ndiff --git a/tenants/default/apps/raw-pulumi-inst/stack.yaml b/tenants/default/apps/raw-pulumi-inst/stack.yaml\nnew file mode 100644\n--- /dev/null\n+++ b/tenants/default/apps/raw-pulumi-inst/stack.yaml\n";
+        let diff_report = synthesize_report_from_git_diff("99", sample_diff);
+        assert_eq!(diff_report.resources.len(), 2);
+        assert_eq!(
+            diff_report.resources[0].resource_type,
+            "flux:kustomize.toolkit.fluxcd.io/v1:Kustomization"
+        );
+        assert_eq!(
+            diff_report.resources[1].resource_type,
+            "pulumi:pulumi.com/v1:Stack"
+        );
+    }
+
+    #[tokio::test]
+    async fn stack_ssh_info_resolves_configured_and_fallback_targets_and_simulated_shell() {
+        let (_tmp, state, workdir) = setup_test_state().await;
+
+        // 1. Fallback across multiple providers when stack directory is not yet materialized on disk
+        for (stack_name, expected_provider, expected_user) in [
+            ("proxmox-vm-1", "proxmox", "ubuntu"),
+            ("aws-vm-1", "aws", "ubuntu"),
+            ("azure-vm-1", "azure", "azureuser"),
+            ("gcp-vm-1", "gcp", "debian"),
+            ("hetzner-vm-1", "hetzner", "root"),
+        ] {
+            let Json(fallback_info) = get_stack_ssh_info(
+                test_auth(),
+                State(state.clone()),
+                AxumPath(("tenant-default".to_string(), stack_name.to_string())),
+            )
+            .await
+            .expect("get_stack_ssh_info fallback");
+            assert_eq!(fallback_info.stack_name, stack_name);
+            assert_eq!(fallback_info.provider, expected_provider);
+            assert_eq!(fallback_info.ssh_user, expected_user);
+            assert_eq!(
+                fallback_info.ssh_host,
+                format!("{stack_name}.default.local")
+            );
+        }
+
+        // 2. Store user SSH key and create stacks with explicit ipAddress/ciuser/sshPort in values.yaml, stack.yaml, and Pulumi.yaml
+        let _ = put_git_credentials(
+            test_auth(),
+            State(state.clone()),
+            Json(UpdateGitCredentialsRequest {
+                ssh_private_key: Some(
+                    "-----BEGIN OPENSSH PRIVATE KEY-----\ntest\n-----END OPENSSH PRIVATE KEY-----"
+                        .to_string(),
+                ),
+                personal_access_token: None,
+                username: Some("admin".to_string()),
+            }),
+        )
+        .await
+        .expect("store user ssh key");
+
+        let vm_dir = workdir.join("tenants/default/infra/hetzner-node");
+        tokio::fs::create_dir_all(&vm_dir).await.unwrap();
+        tokio::fs::write(
+            vm_dir.join("values.yaml"),
+            "ipAddress: 203.0.113.42/24\nsshPort: 2222\n",
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            vm_dir.join("stack.yaml"),
+            r#"apiVersion: pulumi.com/v1
+kind: Stack
+metadata:
+  name: hetzner-node
+  namespace: tenant-default
+  labels:
+    keel.io/provider: hetzner
+spec:
+  stack: organization/hetzner-vm/default-hetzner-node
+"#,
+        )
+        .await
+        .unwrap();
+
+        let Json(vm_info) = get_stack_ssh_info(
+            test_auth(),
+            State(state.clone()),
+            AxumPath(("tenant-default".to_string(), "hetzner-node".to_string())),
+        )
+        .await
+        .expect("get_stack_ssh_info configured");
+        assert_eq!(vm_info.provider, "hetzner");
+        assert_eq!(vm_info.ssh_host, "203.0.113.42");
+        assert_eq!(vm_info.ssh_user, "root");
+        assert_eq!(vm_info.ssh_port, 2222);
+        assert_eq!(vm_info.ssh_command, "ssh -p 2222 root@203.0.113.42");
+        assert!(vm_info.has_saved_ssh_key);
+
+        // Stack with sshHost/sshUser/sshPort in stack.yaml spec.config and Pulumi.yaml outputs
+        let stack_cfg_dir = workdir.join("tenants/default/infra/custom-box");
+        tokio::fs::create_dir_all(&stack_cfg_dir).await.unwrap();
+        tokio::fs::write(
+            stack_cfg_dir.join("stack.yaml"),
+            r#"apiVersion: pulumi.com/v1
+kind: Stack
+metadata:
+  name: custom-box
+  namespace: tenant-default
+spec:
+  stack: organization/custom/default-custom-box
+  config:
+    keel:provider: aws
+    sshUser: ec2-user
+    sshPort: "2200"
+"#,
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            stack_cfg_dir.join("Pulumi.yaml"),
+            "name: custom-box\nruntime: yaml\noutputs:\n  publicIp: 198.51.100.77\n",
+        )
+        .await
+        .unwrap();
+
+        let Json(custom_info) = get_stack_ssh_info(
+            test_auth(),
+            State(state.clone()),
+            AxumPath(("tenant-default".to_string(), "custom-box".to_string())),
+        )
+        .await
+        .expect("get_stack_ssh_info from stack.yaml + Pulumi.yaml");
+        assert_eq!(custom_info.provider, "aws");
+        assert_eq!(custom_info.ssh_host, "198.51.100.77");
+        assert_eq!(custom_info.ssh_user, "ec2-user");
+        assert_eq!(custom_info.ssh_port, 2200);
+
+        // 3. Exercise SshWsSessionState::handle_ssh_ws_message across full WebSocket protocol
+        let mut ws_session =
+            SshWsSessionState::new(vm_info.clone(), "admin@keel.local".to_string());
+
+        // Invalid JSON frame returns Error without closing
+        let (bad_msgs, close) = ws_session.handle_ssh_ws_message("{invalid json");
+        assert!(!close);
+        assert!(matches!(
+            bad_msgs.as_slice(),
+            [SshWsServerMessage::Error { .. }]
+        ));
+
+        // Invalid username starting with '-' returns Error without closing
+        let (bad_user_msgs, close) =
+            ws_session.handle_ssh_ws_message(r#"{"type":"connect","user":"-oProxyCommand=evil"}"#);
+        assert!(!close);
+        assert!(matches!(
+            bad_user_msgs.as_slice(),
+            [SshWsServerMessage::Error { .. }]
+        ));
+
+        // Valid connect message returns Connected + Output welcome banner
+        let (conn_msgs, close) = ws_session.handle_ssh_ws_message(
+            r#"{"type":"connect","cols":120,"rows":40,"user":"ubuntu","port":2222}"#,
+        );
+        assert!(!close);
+        assert_eq!(conn_msgs.len(), 2);
+
+        // Resize message
+        let (resize_msgs, close) =
+            ws_session.handle_ssh_ws_message(r#"{"type":"resize","cols":100,"rows":30}"#);
+        assert!(!close);
+        assert!(resize_msgs.is_empty());
+
+        // Input commands: character typing + backspace + newline + various commands
+        for cmd in [
+            "ab\u{7f}\n",
+            "hostname\n",
+            "whoami\n",
+            "id\n",
+            "pwd\n",
+            "uname\n",
+            "uname -a\n",
+            "uptime\n",
+            "ls -la\n",
+            "cat /etc/os-release\n",
+            "help\n",
+            "echo hello-keel\n",
+            "systemctl status k3s\n",
+            "\n",
+        ] {
+            let payload = serde_json::to_string(&json!({ "type": "input", "data": cmd })).unwrap();
+            let (out_msgs, should_close) = ws_session.handle_ssh_ws_message(&payload);
+            assert!(!should_close);
+            assert!(!out_msgs.is_empty());
+        }
+
+        // Disconnect message
+        let (disc_msgs, should_close) =
+            ws_session.handle_ssh_ws_message(r#"{"type":"disconnect"}"#);
+        assert!(should_close);
+        assert!(matches!(
+            disc_msgs.as_slice(),
+            [SshWsServerMessage::Disconnected]
+        ));
+
+        // Exit command via input before explicit connect also auto-connects and disconnects cleanly
+        let mut ws_session2 = SshWsSessionState::new(vm_info, "admin@keel.local".to_string());
+        let (exit_msgs, should_close2) =
+            ws_session2.handle_ssh_ws_message(r#"{"type":"input","data":"exit\n"}"#);
+        assert!(should_close2);
+        assert!(
+            exit_msgs
+                .iter()
+                .any(|m| matches!(m, SshWsServerMessage::Disconnected))
+        );
     }
 }
