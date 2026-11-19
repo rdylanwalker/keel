@@ -74,14 +74,15 @@ keel preview status --pr 1 --watch --server http://127.0.0.1:8080
 
 ![PR & Preview Inspector](../assets/screenshots/preview.png)
 
-## 5. Deploy an Application
+## 5. Deploy an Application (Helm, Kustomize, or Raw Manifests)
 
 Once a workload cluster or tenant namespace is ready:
 
-1. Select an application blueprint (such as **Podinfo**) in **Catalog & Form Wizard**.
-2. Configure Helm `values.yaml` parameters and optionally enable **Flagger Canary Rollout**.
+1. Select an application blueprint (such as **Podinfo** for Helm or **HTTP Echo Server** for raw manifests) in **Catalog & Form Wizard**.
+2. Configure form parameters. For raw manifest templates (`runtime: manifest`), select the **Action Engine (`Flux CD Kustomization` vs. `Pulumi PKO Stack`)** in the deploy modal.
 3. Submit and merge the PR—or run via CLI:
 
+#### Helm Chart with Canary Rollout
 ```bash
 cat <<'EOF' > podinfo-values.yaml
 replicaCount: 2
@@ -94,6 +95,31 @@ keel app install \
   --tenant platform-team \
   --values-file ./podinfo-values.yaml \
   --canary \
+  --server http://127.0.0.1:8080
+```
+
+#### Raw Kubernetes Manifest Template (`--engine flux` or `--engine pulumi`)
+```bash
+cat <<'EOF' > echo-values.yaml
+app_name: echo-demo
+port: 8080
+message: "Hello from Keel Manifest Template!"
+EOF
+
+# Deploy via Flux CD Kustomization with postBuild substitution
+keel app install \
+  --app http-echo-manifest \
+  --tenant platform-team \
+  --values-file ./echo-values.yaml \
+  --engine flux \
+  --server http://127.0.0.1:8080
+
+# Or deploy via Pulumi ConfigGroup with pre-merge resource diffs
+keel app install \
+  --app http-echo-manifest \
+  --tenant platform-team \
+  --values-file ./echo-values.yaml \
+  --engine pulumi \
   --server http://127.0.0.1:8080
 ```
 
@@ -110,3 +136,37 @@ From **Topology Map**:
 - **Edit:** Click **Edit** on any infrastructure stack or application release to load its persisted configuration into **Catalog & Form Wizard** and open an update PR.
 - **Restart / Reconcile:** Click **Restart Workspace** on an infrastructure stack to restart its PKO v2 `Workspace` pod, or **Reconcile Now** on an application release to trigger immediate Flux CD reconciliation (`reconcile.fluxcd.io/requestedAt`).
 - **Delete:** Click **Delete** on any stack or release to open a removal PR. After merging, the resource transitions to `Deleting` until Flux CD and PKO v2 finish tearing down the underlying cluster/cloud resources.
+
+## 7. Direct VM SSH Access (Web Portal & CLI)
+
+Keel resolves SSH connection metadata (`sshHost`, `sshUser`, `sshPort`) directly from provisioned PKO v2 stack outputs, allowing immediate access without digging through cloud consoles.
+
+### Access via Web Portal
+1. In **Topology Map** or inside **Stack Inspector**, click the **SSH** action button on any provisioned VM stack card (e.g., `aws-free-tier-vm`, `azure-free-tier-vm`, `gcp-free-tier-vm`).
+2. **Connection Information View:** Displays host, username, port, and one-click copyable commands:
+   - `ssh -p <port> <user>@<host>`
+   - `keel infra ssh <stack-name> --tenant <tenant>`
+   - `keel infra ssh <stack-name> --tenant <tenant> --exec`
+3. **Interactive Browser Terminal:** Click **"Launch Browser Terminal"** to open an in-browser terminal session (`xterm.js` over an authenticated WebSocket bridge `GET /api/v1/stacks/{ns}/{name}/ssh/ws`). You can authenticate using your saved profile SSH key (decrypted in memory from `AES-256-GCM`) or paste an ephemeral private key.
+
+### Access via Keel CLI (`keel infra ssh`)
+The `keel infra ssh` command resolves stack connection details via the API:
+
+```bash
+# Default: Prints connection summary table and copy-ready ssh command
+keel infra ssh my-free-vm --tenant platform-team
+
+# Output raw command string (useful for shell scripting or piping)
+keel infra ssh my-free-vm --tenant platform-team --output command
+
+# Output structured JSON
+keel infra ssh my-free-vm --tenant platform-team --output json
+
+# Direct interactive session attached to your terminal
+keel infra ssh my-free-vm --tenant platform-team --exec
+
+# Override user, port, or specify custom identity file
+keel infra ssh my-free-vm --tenant platform-team -i ~/.ssh/id_ed25519 --user admin --exec
+```
+
+> **Security Note:** `--exec` executes `tokio::process::Command::new("ssh")` with an explicit argument array attached to the current process terminal—guaranteeing zero shell interpolation. Plaintext private keys are never exposed over REST.

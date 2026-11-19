@@ -288,3 +288,85 @@ Try extending the self-service catalog with another provider from [Provider Blue
 1. Enable **Cloudflare (`cloudflare`)** or **Hetzner Cloud (`hetzner`)** on **Control Plane & Providers** and merge the PR.
 2. Add the corresponding `catalog.yaml` + `Pulumi.yaml` under `catalog/infra/<blueprint-id>/` via **+ Add Catalog Item** and merge.
 3. Open **Catalog & Form Wizard** to see the JSON Schema automatically rendered as a validated form, with any `writeOnly: true` / `format: password` fields (such as `CLOUDFLARE_API_TOKEN` or `HCLOUD_TOKEN`) encrypted with SOPS + `age` into `secret.enc.yaml` and bound to `Stack.spec.envRefs` before touching Git.
+
+---
+
+## 6. Deploy a Parameterized Kubernetes Manifest Template (`http-echo-manifest`)
+
+Deploy raw Kubernetes YAML templates without packaging a Helm chart, choosing between Flux CD and Pulumi execution engines.
+
+### Step 1: Deploy via the Web Portal
+1. In **Catalog & Form Wizard**, select target tenant `dev-team`.
+2. Locate the **HTTP Echo Server** (`http-echo-manifest`) application blueprint.
+3. In the deploy modal, configure the parameters:
+   - **Application Name:** `echo-demo`
+   - **Service Port:** `8080`
+   - **Echo Message:** `"Hello from Keel Manifest Template!"`
+4. Notice the **Action Engine** selector:
+   - **Flux CD Kustomization (`flux`):** Generates `manifests.yaml`, non-secret substitutions in `values-configmap.yaml`, and a Flux `Kustomization` using `postBuild.substituteFrom`.
+   - **Pulumi PKO Stack (`pulumi`):** Generates `Pulumi.yaml` wrapping the rendered manifests in `kubernetes:yaml/v2:ConfigGroup` with a PKO v2 `Stack` and ephemeral PR preview diffing.
+5. Click **Submit & Open Git PR Proposal**.
+6. Inspect the PR in **PR & Preview Inspector** and click **Merge PR Proposal**.
+
+### Step 2: Deploy via Keel CLI (`--engine flux` or `--engine pulumi`)
+
+Submit the proposal directly via the CLI:
+
+```bash
+cat <<'EOF' > /tmp/echo-values.yaml
+app_name: echo-cli
+port: 8080
+message: "Hello from CLI Manifest Deployment"
+EOF
+
+# Option A: Deploy using Flux CD engine
+keel app install \
+  --app http-echo-manifest \
+  --tenant dev-team \
+  --values-file /tmp/echo-values.yaml \
+  --engine flux \
+  --server http://127.0.0.1:8080
+
+# Option B: Deploy using Pulumi PKO v2 engine (provides pre-merge diff previews)
+keel app install \
+  --app http-echo-manifest \
+  --tenant dev-team \
+  --values-file /tmp/echo-values.yaml \
+  --engine pulumi \
+  --server http://127.0.0.1:8080
+```
+
+Verify in **Topology Map** that `echo-demo` transitions from `Pending` → `Synced` / `Ready`.
+
+---
+
+## 7. Connect to a Provisioned VM via SSH (Web Portal & CLI)
+
+Once an infrastructure blueprint containing virtual machines has been provisioned (such as `aws-free-tier-vm`, `azure-free-tier-vm`, or `gcp-free-tier-vm`):
+
+### Step 1: Connect via the Web Portal
+1. In **Topology Map**, locate your provisioned VM stack card and click the **SSH** button (or open the **Stack Inspector** and click **SSH**).
+2. The **Connection Information** modal opens with resolved metadata:
+   - `Host`: Public IPv4 address or DNS name
+   - `User`: Configured username (`ubuntu`, `azureuser`, or `debian`)
+   - `Port`: `22`
+3. Click the copy button next to `ssh -p 22 <user>@<host>` to paste into your local terminal.
+4. Or click **"Launch Browser Terminal"**:
+   - Select your saved profile SSH key (or paste an ephemeral private key).
+   - An in-browser terminal connects over a secure WebSocket bridge (`GET /api/v1/stacks/{ns}/{name}/ssh/ws`), streaming interactive PTY input and output directly in your browser.
+
+### Step 2: Connect via the Keel CLI (`keel infra ssh`)
+
+```bash
+# Print connection table and copyable ssh command
+keel infra ssh aws-free-tier-vm --tenant dev-team --server http://127.0.0.1:8080
+
+# Output raw command string
+keel infra ssh aws-free-tier-vm --tenant dev-team --output command
+
+# Launch an interactive terminal session directly in your shell
+keel infra ssh aws-free-tier-vm --tenant dev-team --exec
+
+# Launch with custom SSH identity file and port
+keel infra ssh aws-free-tier-vm --tenant dev-team -i ~/.ssh/id_ed25519 --port 22 --exec
+```

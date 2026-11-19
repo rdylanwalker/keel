@@ -40,13 +40,18 @@ Run `keel bootstrap init` from your laptop to stand up an identical seed control
 ### 2. No More Blind Merges: Pre-Merge Infrastructure Previews
 Outside of initial bootstrap, Keel **never** commits directly to `main`. Every infrastructure or application change opens a Pull Request (`Forgejo/Gitea`, `GitHub`, `GitLab`, or local Git) and spawns an ephemeral PKO v2 `preview: true` stack—streaming exact `+ Create`, `~ Update`, `- Delete`, and `! Replace` resource diffs to both the web portal and CLI before anything touches production.
 
-### 3. Self-Service Forms Without Forking Upstream Apps
-Upstream Helm charts and Kustomize bases stay completely untouched. Thin `catalog.yaml` sidecars provide JSON Schemas that render dynamically in React (`@rjsf/core` + Shadcn UI) and serialize straight into standard `values.yaml` overrides or Pulumi `Stack` configs. Need to deploy a database, DNS record, and app together? Chain them in a **Multi-Item Bundle** directly from the GUI via a Git PR.
+### 3. Self-Service Forms for Helm, Kustomize & Raw Manifest Templates
+Upstream Helm charts, Kustomize bases, and **raw Kubernetes manifests & parameterized `${var}` YAML templates** work seamlessly without structural forks. Thin `catalog.yaml` sidecars provide JSON Schemas that render dynamically in React (`@rjsf/core` + Shadcn UI) and serialize straight into standard `values.yaml` overrides or Pulumi `Stack` configs. For raw Kubernetes manifests, the Catalog Wizard can **auto-extract `${var}` placeholders** into JSON Schema form fields with a single click and allows choosing between **Flux CD** (`Kustomization` + `postBuild.substituteFrom`) or **Pulumi PKO v2** (`kubernetes:yaml/v2:ConfigGroup` with pre-merge resource diffs) as the actioning engine. Need to deploy a database, DNS record, and app together? Chain them in a **Multi-Item Bundle** directly from the GUI via a Git PR.
 
 ### 4. Homelab to Multi-Cloud—Plus Any OpenTofu/Terraform Provider
-Provision VMs and clusters on **Proxmox VE**, **AWS**, **GCP**, **Azure**, **Hetzner**, and **Cloudflare**—or enable any registry provider dynamically through Pulumi's OpenTofu/Terraform bridge (`terraform-provider`) without recompiling Keel.
+Provision VMs and clusters on **Proxmox VE**, **AWS**, **GCP**, **Azure**, **Hetzner**, and **Cloudflare**—or enable any registry provider dynamically through Pulumi's OpenTofu/Terraform bridge (`terraform-provider`) without recompiling Keel. Includes ready-to-use Free Tier VM blueprints for AWS (`aws-free-tier-vm`), Azure (`azure-free-tier-vm`), and GCP (`gcp-free-tier-vm`).
 
-### 5. Safe Rollouts, Tenant Isolation & Break-Glass Recovery
+### 5. Direct VM SSH Access (Web Portal & CLI)
+Inspect connection details and access provisioned cloud or on-premises VMs with zero friction:
+* **Web Portal:** Click **SSH** on any VM card or stack inspector to open the Connection Info modal with one-click copyable `ssh` commands, or click **"Launch Browser Terminal"** for an opt-in interactive in-browser terminal session (`xterm.js` over an authenticated WebSocket bridge) using decrypted profile or ephemeral SSH keys.
+* **Keel CLI:** Run `keel infra ssh <stack>` to print connection metadata and copy-ready `ssh` commands by default (`--output table|command|json`), or add `--exec` to launch an interactive SSH session directly in your terminal via safe direct process execution.
+
+### 6. Safe Rollouts, Tenant Isolation & Break-Glass Recovery
 * **Progressive Delivery:** Opt-in **Flagger + Envoy Gateway** canary rollouts with Prometheus metric rollback for HTTP/gRPC workloads.
 * **Multi-Tenancy & Secret Hygiene:** Namespace-per-tenant isolation (`tenant-<id>`), per-tenant `age` + SOPS encryption in Git, `AES-256-GCM` credential encryption at rest, and Kyverno `restricted` Pod Security Standards.
 * **Anti-Lockout Protection:** Control-plane stacks carry `protect: true`, and `keel bootstrap recover` restores management state directly from versioned S3 if the cluster or Git forge ever goes down.
@@ -247,9 +252,9 @@ Several great open-source tools solve individual slices of this problem—develo
 | **Existing Cluster (`kubeconfig`)** | `KubeconfigBootstrapTarget` (`k3d`/`k3s`, `Talos`, managed K8s) | ✅ / ⚠️ | `k3d` (`k3s`) tested in live E2E; `Talos`/managed K8s ready for community testing |
 | **Proxmox VE** | `deploy/bootstrap/proxmox/Pulumi.yaml` (`bpg/proxmox`) | ⚠️ | Template & `PulumiBootstrapTarget` wired; needs real PVE cluster validation |
 | **Hetzner Cloud** | `deploy/bootstrap/hetzner/Pulumi.yaml` (`pulumi/hcloud`) | ⚠️ | Template & `PulumiBootstrapTarget` wired; needs live account validation |
-| **AWS** | `deploy/bootstrap/aws/Pulumi.yaml` (`pulumi/aws`) | ⚠️ | Template & `PulumiBootstrapTarget` wired; needs live account validation |
-| **GCP** | `deploy/bootstrap/gcp/Pulumi.yaml` (`pulumi/gcp`) | ⚠️ | Template & `PulumiBootstrapTarget` wired; needs live account validation |
-| **Azure** | `deploy/bootstrap/azure/Pulumi.yaml` (`pulumi/azure-native`) | ⚠️ | Template & `PulumiBootstrapTarget` wired; needs live account validation |
+| **AWS** | `deploy/bootstrap/aws/Pulumi.yaml` (`pulumi/aws`) | ⚠️ | Template & `PulumiBootstrapTarget` wired; free-tier `t3.micro`/`t2.micro` supported; tested via opt-in live E2E (`pnpm --dir e2e test:live:cloud`) |
+| **GCP** | `deploy/bootstrap/gcp/Pulumi.yaml` (`pulumi/gcp`) | ⚠️ | Template & `PulumiBootstrapTarget` wired; Always-Free `e2-micro` supported; tested via opt-in live E2E (`pnpm --dir e2e test:live:cloud`) |
+| **Azure** | `deploy/bootstrap/azure/Pulumi.yaml` (`pulumi/azure-native`) | ⚠️ | Template & `PulumiBootstrapTarget` wired; free-tier `Standard_B1s` supported; tested via opt-in live E2E (`pnpm --dir e2e test:live:cloud`) |
 
 ### Default Day-1 Infrastructure Providers (`deploy/seed/providers/registry.yaml`)
 
@@ -257,9 +262,9 @@ Several great open-source tools solve individual slices of this problem—develo
 | :--- | :--- | :--- | :---: | :--- |
 | **kind** | `tehcyx/kind` (TF bridge) | Enabled | ✅ | Provisions workload `kind` clusters in live E2E |
 | **Proxmox VE** | `bpg/proxmox` (TF bridge) | Disabled | ⚠️ | Enable via **Topology → Providers**; needs PVE feedback |
-| **AWS** | `pulumi/aws` | Disabled | ⚠️ | Enable via **Topology → Providers**; needs live testing |
-| **GCP** | `pulumi/gcp` | Disabled | ⚠️ | Enable via **Topology → Providers**; needs live testing |
-| **Azure** | `pulumi/azure-native` | Disabled | ⚠️ | Enable via **Topology → Providers**; needs live testing |
+| **AWS** | `pulumi/aws` | Disabled | ⚠️ | Enable via **Topology → Providers**; includes `aws-free-tier-vm` blueprint; tested in live cloud E2E (`pnpm --dir e2e test:live:cloud`) |
+| **GCP** | `pulumi/gcp` | Disabled | ⚠️ | Enable via **Topology → Providers**; includes `gcp-free-tier-vm` blueprint; tested in live cloud E2E (`pnpm --dir e2e test:live:cloud`) |
+| **Azure** | `pulumi/azure-native` | Disabled | ⚠️ | Enable via **Topology → Providers**; includes `azure-free-tier-vm` blueprint; tested in live cloud E2E (`pnpm --dir e2e test:live:cloud`) |
 | **Hetzner Cloud** | `pulumi/hcloud` | Disabled | ⚠️ | Enable via **Topology → Providers**; needs live testing |
 | **Cloudflare** | `pulumi/cloudflare` | Disabled | ⚠️ | Enable via **Topology → Providers**; needs live testing |
 | **Custom OpenTofu / TF** | `terraform-provider` bridge | ✅ | Tested live (`hashicorp/random`); add dynamically via UI/API/Git PR without recompiling Keel |

@@ -45,3 +45,26 @@ When canary delivery is enabled, Keel synthesizes:
 - **`networkpolicy-canary.yaml`**: A tenant-scoped `NetworkPolicy` permitting TCP ingress on the application's service port from Envoy Gateway proxy pods in `keel-system` through `default-deny-all`.
 
 Because tenant namespaces enforce the `restricted` Pod Security Standard via Kyverno, application charts deployed into tenant namespaces must include a compliant `securityContext` (e.g., `allowPrivilegeEscalation: false`, `runAsNonRoot: true`, a numeric `runAsUser`, and `capabilities.drop: ["ALL"]`).
+
+## Security Model for Virtual Machine SSH Access
+
+Keel provides direct SSH inspection and terminal connectivity for provisioned VMs with strict defense-in-depth controls:
+
+1. **Tenant RBAC Enforcement:**
+   - Stack SSH metadata (`GET /api/v1/stacks/{namespace}/{name}/ssh-info`) and interactive browser WebSocket sessions (`GET /api/v1/stacks/{namespace}/{name}/ssh/ws`) strictly enforce `auth.require_tenant_access(tenant)`.
+   - Operators can only inspect or access VMs within tenant namespaces they are authorized to manage (`tenant-<id>-admin`, `<tenant-id>-admin`, or `keel-admins`). Cross-tenant access is rejected at the API boundary.
+
+2. **Zero Plaintext Private Key Exposure Over REST:**
+   - The REST endpoint returns only connection metadata (`sshHost`, `sshUser`, `sshPort`, provider) and public command strings.
+   - Private keys are never returned in REST responses, serialized in logs, or exposed to unauthorized clients (`NFR-SEC-05`).
+
+3. **In-Memory `AES-256-GCM` Key Decryption:**
+   - User SSH private keys saved in personal profiles are encrypted at rest with `AES-256-GCM` inside Kubernetes `Secret`s in `keel-system`.
+   - When launching an in-browser terminal session via the pure-Rust `russh` WebSocket bridge, the private key is decrypted exclusively in server memory for the duration of the SSH handshake and scrubbed upon disconnection.
+
+4. **Command Injection Defense (`NFR-SEC-06`):**
+   - The `keel infra ssh <stack> --exec` CLI command executes `tokio::process::Command::new("ssh")` with explicit argument vectors attached directly to the active process terminal.
+   - Keel never invokes `sh -c` or interpolates user strings into shell command lines, eliminating shell injection vulnerabilities.
+
+5. **Structured Audit Logging (`NFR-OBS-03`):**
+   - Every VM SSH connection attempt (CLI or WebSocket bridge) produces a structured audit log event recording the authenticated OIDC user identity (`sub`, `email`), client IP, target tenant, stack name, resolved host/port, and timestamp.

@@ -57,6 +57,65 @@ keel bootstrap init \
 
 > **Talos Note:** Talos does not ship a default `StorageClass` out of the box—install a provisioner such as `local-path-provisioner` (marked as default `StorageClass`) before running `keel bootstrap init --target kubeconfig` so SeaweedFS and Rauthy PVCs can bind. Also note that `talosctl cluster create docker` requires nested cgroup delegation not available under WSL2 cgroups v2 (use `talosctl cluster create qemu` or a VM/bare-metal Talos node).
 
+### Public Cloud Management Clusters (AWS, Azure, GCP)
+
+Stage 0 can bootstrap directly onto public cloud providers executing provider Pulumi programs (`deploy/bootstrap/<provider>/Pulumi.yaml`). All templates are pre-configured with free-tier-eligible instance types and volume sizes:
+
+#### 1. Amazon Web Services (`--target aws`)
+Uses `deploy/bootstrap/aws/Pulumi.yaml` (`pulumi/aws`) with free-tier `t3.micro` / `t2.micro` EC2 instance, 30 GB gp3 root disk, and versioned S3 Pulumi state bucket.
+
+```bash
+# Acquire credentials via aws iam (or AWS Console)
+export AWS_ACCESS_KEY_ID="AKIAIOSFODNN7EXAMPLE"
+export AWS_SECRET_ACCESS_KEY="wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+export AWS_REGION="us-east-1"
+
+# Initialize Stage 0 AWS seed management cluster
+keel bootstrap init \
+  --target aws \
+  --cluster-name keel-mgmt \
+  --region us-east-1 \
+  --repo-dir ./keel-gitops
+```
+
+#### 2. Microsoft Azure (`--target azure`)
+Uses `deploy/bootstrap/azure/Pulumi.yaml` (`pulumi/azure-native`) with free-tier `Standard_B1s` VM, 30 GB OS disk, protected Resource Group, and Blob Storage state container.
+
+```bash
+# Acquire credentials via az ad sp create-for-rbac (or Azure Portal)
+export ARM_CLIENT_ID="<client_id>"
+export ARM_CLIENT_SECRET="<client_secret>"
+export ARM_TENANT_ID="<tenant_id>"
+export ARM_SUBSCRIPTION_ID="<subscription_id>"
+export AZURE_LOCATION="eastus"
+
+# Initialize Stage 0 Azure seed management cluster
+keel bootstrap init \
+  --target azure \
+  --cluster-name keel-mgmt \
+  --region eastus \
+  --repo-dir ./keel-gitops
+```
+
+#### 3. Google Cloud Platform (`--target gcp`)
+Uses `deploy/bootstrap/gcp/Pulumi.yaml` (`pulumi/gcp`) with Always-Free `e2-micro` VM in `us-central1-a`, 10 GB `pd-standard` boot disk, and versioned GCS state bucket.
+
+```bash
+# Acquire credentials via gcloud iam service-accounts (or GCP Console)
+export GOOGLE_CREDENTIALS="$(cat ./gcp-key.json)" # or GOOGLE_APPLICATION_CREDENTIALS
+export GCP_PROJECT="my-project-id"
+export GCP_ZONE="us-central1-a"
+
+# Initialize Stage 0 GCP seed management cluster
+keel bootstrap init \
+  --target gcp \
+  --cluster-name keel-mgmt \
+  --region us-central1 \
+  --repo-dir ./keel-gitops
+```
+
+> **Testing Without In-Cluster Controllers (`--skip-core-install`):** To validate cloud infrastructure provisioning without deploying Kubernetes controllers onto the newly booted VM, append `--skip-core-install`.
+
 ### Core Controllers Installed Out of the Box
 
 By default, `keel bootstrap init` installs the core control-plane components onto the target cluster using `kubectl` and `helm`:

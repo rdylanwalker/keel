@@ -154,7 +154,8 @@ infra-gitops/
 ├── catalog/
 │   ├── apps/
 │   │   └── <app-id>/
-│   │       ├── catalog.yaml            # Metadata, JSONSchema, companion infra hooks
+│   │       ├── catalog.yaml            # Metadata, JSONSchema, companion infra hooks, defaultEngine
+│   │       ├── manifests.yaml          # Raw K8s YAML with ${var} placeholders (runtime: manifest)
 │   │       └── upstream/               # Unmodified Helm values / Kustomize bases
 │   ├── infra/
 │   │   └── <blueprint-id>/
@@ -173,9 +174,14 @@ infra-gitops/
         │       └── Pulumi.prod.yaml    # Stack config values
         └── apps/
             └── <release-name>/
-                ├── release.yaml        # Flux HelmRelease / Kustomization
+                ├── release.yaml        # Flux HelmRelease / Kustomization (runtime: helm | kustomize)
                 ├── values.yaml         # Generated directly from JSONSchema form
-                └── canary.yaml         # Optional Flagger Canary CR
+                ├── canary.yaml         # Optional Flagger Canary CR
+                ├── manifests.yaml      # Rendered multi-doc K8s YAML (runtime: manifest)
+                ├── values-configmap.yaml # Non-secret substitution values (runtime: manifest, engine: flux)
+                ├── flux-kustomization.yaml # Flux Kustomization with postBuild (runtime: manifest, engine: flux)
+                ├── Pulumi.yaml         # ConfigGroup program (runtime: manifest, engine: pulumi)
+                └── stack.yaml          # PKO v2 Stack CR with preview: true (runtime: manifest, engine: pulumi)
 ```
 
 ### 3.2 Direct `git` CLI Execution & `ForgeProvider` Trait
@@ -243,7 +249,7 @@ sequenceDiagram
 ## 5. Application Catalog, Dynamic Forms & Progressive Delivery
 
 ### 5.1 Out-of-the-Box Packaging Contract (`catalog.yaml`)
-Applications are never forked or rewritten. Each catalog entry pairs an unmodified upstream artifact (Helm chart repository/OCI ref or Kustomize URL) with a declarative `catalog.yaml` file (using `apiVersion: keel.io/v1alpha1` as a Git-stored catalog schema, not a cluster-installed CRD):
+Applications are never forked or rewritten. Each catalog entry pairs an upstream artifact (Helm chart repository/OCI ref, Kustomize URL, or raw/parameterized Kubernetes YAML manifest templates) with a declarative `catalog.yaml` file (using `apiVersion: keel.io/v1alpha1` as a Git-stored catalog schema, not a cluster-installed CRD):
 
 ```yaml
 apiVersion: keel.io/v1alpha1
@@ -252,7 +258,7 @@ metadata:
   id: authentik
   name: Authentik Identity Provider
   category: security-identity
-  runtime: helm # helm | kustomize
+  runtime: helm # helm | kustomize | manifest
 spec:
   upstream:
     chart: authentik
@@ -289,6 +295,84 @@ spec:
     adminEmail:
       ui:help: "Used for initial administrator recovery notifications."
 ```
+
+#### Raw Kubernetes Manifest & Template Support (`runtime: manifest`)
+Alongside Helm and Kustomize, catalog applications support raw and templated multi-document Kubernetes YAML via `runtime: manifest`. The companion manifest file resides at `catalog/apps/<id>/manifests.yaml` using standard `${var_name}` and `${var_name:=default}` placeholder syntax:
+
+```yaml
+apiVersion: keel.io/v1alpha1
+kind: CatalogApplication
+metadata:
+  id: http-echo-manifest
+  name: HTTP Echo Server
+  category: web
+  runtime: manifest
+spec:
+  defaultEngine: flux # flux | pulumi (default actioning engine)
+  schema:
+    type: object
+    required: [app_name, port, message]
+    properties:
+      app_name:
+        type: string
+        title: Application Name
+        default: http-echo
+      port:
+        type: integer
+        title: Service Port
+        default: 8080
+      message:
+        type: string
+        title: Echo Message
+        default: "Hello from Keel Manifest!"
+      secret_token:
+        type: string
+        title: API Secret Token
+        format: password
+        writeOnly: true # Encrypted via SOPS + age before staging
+```
+
+Companion `catalog/apps/<id>/manifests.yaml`:
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ${app_name:=http-echo}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ${app_name:=http-echo}
+  template:
+    metadata:
+      labels:
+        app: ${app_name:=http-echo}
+    spec:
+      containers:
+        - name: echo
+          image: hashicorp/http-echo:0.2.3
+          args:
+            - "-listen=:${port:=8080}"
+            - "-text=${message:=hello}"
+          ports:
+            - containerPort: ${port:=8080}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ${app_name:=http-echo}
+spec:
+  ports:
+    - port: ${port:=8080}
+      targetPort: ${port:=8080}
+  selector:
+    app: ${app_name:=http-echo}
+```
+
+* **Auto-Extract Schema Tokens:** In the Web UI Catalog Wizard, pasting or editing raw Kubernetes YAML allows clicking **"Auto-Extract Variables to Schema"**, which scans for `${var_name}` and `${var_name:=default}` tokens and dynamically generates `spec.schema.properties` (with defaults and required flags) so operators avoid hand-crafting JSON Schema.
+* **Dual Execution Engines (`actionEngine: "flux" | "pulumi"`):** Operators select the actioning engine either as a catalog default (`spec.defaultEngine`) or at deploy time in the UI Deploy Modal or CLI (`keel app install --engine flux|pulumi`):
+  1. **Flux CD Engine (`flux`):** Synthesizes `tenants/<tenant>/apps/<instance>/manifests.yaml`, non-secret substitution values into `values-configmap.yaml` (`kind: ConfigMap`), SOPS+`age`-encrypted secret fields into `secrets.enc.yaml` (`kind: Secret`), and `flux-kustomization.yaml` (`kustomize.toolkit.fluxcd.io/v1` `Kustomization` with `spec.serviceAccountName: tenant-<tenant>` and `spec.postBuild.substituteFrom` referencing the `ConfigMap` and `Secret`).
+  2. **Pulumi PKO v2 Engine (`pulumi`):** Synthesizes `tenants/<tenant>/apps/<instance>/Pulumi.yaml` wrapping the rendered Kubernetes YAML in a `kubernetes:yaml/v2:ConfigGroup` program alongside a PKO v2 `Stack` (`stack.yaml`). On PR creation, Keel triggers an ephemeral PKO preview (`spec.preview: true`) in `keel-previews`, streaming exact resource-level diffs (`+ Create`, `~ Update`, `- Delete`) to the UI and CLI before merge.
 
 * **Dynamic Form Rendering:** The React frontend feeds `spec.schema` and `spec.uiSchema` directly into **`@rjsf/core` (`react-jsonschema-form`)** mapped to **Shadcn UI** widgets (`Input`, `Select`, `Switch`, `Slider`, `SecretInput`). Form submission serializes directly into an unmodified Helm `values.yaml` override.
 * **Base Addon Catalog Schemas & Upstream Sync Escape Hatch:** Management-plane base addons (`rauthy`, `envoy-gateway`, `flagger`, `kyverno`, `pulumi-kubernetes-operator`, `prometheus`, `s3-state-backend`) ship with curated minimal `catalog.yaml` JSON schemas exposing high-frequency operational fields for simplified UI configuration. For advanced Helm `values.yaml` tuning, the GUI provides a "Sync Upstream Schema" escape hatch that fetches the full upstream chart `values.schema.json` (or parses raw `values.yaml` defaults) to dynamically expand `@rjsf/core` dynamic forms with complete upstream chart parameters.
@@ -359,7 +443,8 @@ crates/
 | `keel serve` | Starts the stateless `axum` API server and serves the embedded React + Shadcn SPA. | `--bind 0.0.0.0:8080`, `--config` |
 | `keel infra list` | Lists all PKO `Stack` resources across providers with live drift and sync status. | `--tenant`, `--provider`, `--output [table\|json]` |
 | `keel infra provision` | Validates parameters against blueprint JSONSchema and opens a provisioning PR. | `--blueprint`, `--tenant`, `--values-file` |
-| `keel app install` | Renders Helm/Kustomize manifests from catalog JSONSchema and opens a PR. | `--app`, `--tenant`, `--values-file`, `--canary` |
+| `keel app install` | Renders Helm, Kustomize, or raw manifest templates from catalog JSONSchema and opens a PR. | `--app`, `--tenant`, `--values-file`, `--canary`, `--engine [flux\|pulumi]` |
+| `keel infra ssh` | Resolves connection info for a provisioned VM stack and optionally connects via SSH. Defaults to printing connection table/command; `--exec` launches an interactive `ssh` session in current terminal via direct `tokio::process::Command::new("ssh")`. | `<stack-name>`, `--tenant <id>`, `--user <user>`, `--port <port>`, `-i <identity-file>`, `--exec`, `--output [table\|json\|command]`, `--server <url>` |
 | `keel preview status` | Fetches and renders the PKO v2 preview diff (`+`/`~`/`-`) for an open PR in the terminal. | `--pr <id>`, `--watch` |
 
 ### 7.3 REST & Server-Sent Events (SSE) API Surface
@@ -381,6 +466,8 @@ crates/
 | `POST` | `/api/v1/proposals/{pr_id}/reopen` | Reopens a previously closed PR proposal via `ForgeProvider`. |
 | `GET` | `/api/v1/stacks` | Lists infrastructure stacks across Proxmox, AWS, GCP, Azure, Hetzner, Cloudflare, and custom providers (including `Deleting` stacks). |
 | `GET` | `/api/v1/stacks/{namespace}/{name}/config` & `DELETE /api/v1/stacks/{namespace}/{name}` | Fetches persisted stack config for editing or opens a PR to delete an infrastructure stack. |
+| `GET` | `/api/v1/stacks/{namespace}/{name}/ssh-info` | Resolves VM SSH connection metadata (`sshHost`, `sshUser`, `sshPort`, provider) and copy-ready CLI/SSH commands from stack output Secret without exposing private keys. |
+| `GET` | `/api/v1/stacks/{namespace}/{name}/ssh/ws` | Opt-in interactive browser SSH terminal over WebSocket bridge using pure-Rust `russh` PTY streaming with saved profile or ephemeral SSH keys. |
 | `POST` | `/api/v1/stacks/{namespace}/{name}/restart` | Triggers a Kubernetes rollout restart on the stack's PKO v2 `Workspace` StatefulSet. |
 | `GET` | `/api/v1/releases` | Lists deployed Helm, Kustomize, and Flagger Canary applications (including `Deleting` releases). |
 | `GET` | `/api/v1/releases/{namespace}/{name}/config` & `DELETE /api/v1/releases/{namespace}/{name}` | Fetches persisted release values for editing or opens a PR to delete a release. |
@@ -390,8 +477,8 @@ crates/
 | `PUT` | `/api/v1/profile/git-credentials` | Stores `AES-256-GCM`-encrypted SSH keys or Forge PATs in a Kubernetes `Secret` for the authenticated user's Git operations. |
 
 ### 7.4 React + Shadcn + Tailwind GUI Views
-1. **Cluster & Provider Topology Map:** Live health view of the management cluster, provisioned workload clusters, Proxmox nodes, and enabled cloud providers—including `Drifted / Error / Deleting` status tracking, `Type` (`management`/`workload`/`cloud`), managed `Resources` count, `Last Synced` timestamps for both stacks and application releases, Bundle grouping, **+ Deploy Stack** / **+ Deploy App** actions, TanStack table sorting/filtering, PR-driven Edit/Delete/Reconcile actions, deduplicated real-time Flux/PKO reconciliation timeline, and Flagger canary traffic-weight gauge + Prometheus error/latency sparklines.
-2. **Self-Service Catalog & Dynamic Form Wizard:** Searchable catalog rendering `catalog.yaml` JSONSchemas via `@rjsf/core` + Shadcn components, supporting creating and editing Apps, Infrastructure Blueprints (including authoring and editing `Pulumi.yaml` directly from the GUI), and Multi-Item Bundles via Git PRs, complete with live `values.yaml` diff preview before submission.
+1. **Cluster & Provider Topology Map & VM SSH Access:** Live health view of the management cluster, provisioned workload clusters, Proxmox nodes, and enabled cloud providers—including `Drifted / Error / Deleting` status tracking, `Type` (`management`/`workload`/`cloud`), managed `Resources` count, `Last Synced` timestamps for both stacks and application releases, Bundle grouping, **+ Deploy Stack** / **+ Deploy App** actions, TanStack table sorting/filtering, PR-driven Edit/Delete/Reconcile actions, deduplicated real-time Flux/PKO reconciliation timeline, Flagger canary traffic-weight gauge + Prometheus error/latency sparklines, and direct **VM SSH Access** (Connection Information modal with copyable `ssh` / `keel infra ssh` commands and an opt-in **"Launch Browser Terminal"** running `@xterm/xterm` over an authenticated WebSocket bridge).
+2. **Self-Service Catalog & Dynamic Form Wizard:** Searchable catalog rendering `catalog.yaml` JSONSchemas via `@rjsf/core` + Shadcn components, supporting creating and editing Apps (Helm, Kustomize, and Raw Kubernetes Manifests with **"Auto-Extract `${var}` Fields"** and Flux vs. Pulumi engine selection), Infrastructure Blueprints (including authoring and editing `Pulumi.yaml` directly from the GUI), and Multi-Item Bundles via Git PRs, complete with live `values.yaml` diff preview before submission.
 3. **PR & PKO Preview Inspector:** Side-by-side view of Open, Merged, Closed, or All Git PRs (with direct external links to Forgejo/Gitea/GitHub/GitLab), resource-level PKO diff trees (`+ Create`, `~ Update`, `- Delete`, `! Replace`), syntax-highlighted unified Git diffs, and policy check status.
 
 ---
@@ -458,35 +545,60 @@ crates/
 ### 9.1 CI/CD & Release Pipeline Flow
 
 ```mermaid
-flowchart LR
+flowchart TD
     subgraph Triggers["Triggers"]
-        PR["Pull Request / Push to main"]
+        PR["Pull Request to main"]
+        MAIN["Push to main"]
         REN["Renovate Bot<br/>(Weekly Schedule: Mondays 04:00 UTC)"]
     end
 
-    subgraph GHA["GitHub Actions CI/CD"]
+    subgraph CI["ci.yml (Fast PR & Reusable Checks)"]
         LINT["Format & Lint<br/>(cargo fmt, clippy, prettier, eslint, tsc)"]
         UNIT["Unit Tests & Coverage<br/>(cargo test >=80%, vitest >=80%)"]
-        BUILD["Build Embedded SPA + Rust Binary<br/>(Linux amd64/arm64, macOS, Windows)"]
-        E2E["Playwright E2E Suite<br/>(Mock Forge + Kind Cluster + PKO Preview)"]
-        AUTO["Renovate Auto-Merge<br/>(If Non-Major & All Checks Pass)"]
-        REL["semantic-release<br/>(Conventional Commits -> SemVer Tag)"]
-        PUB["Publish GitHub Release + Signed OCI Image<br/>(Cosign + SBOM)"]
+        BUILD["Build UI & Binary<br/>(Embedded SPA + Cargo build)"]
+        E2E_MOCK["Playwright Mock E2E<br/>(Fast headless suite, no cluster)"]
+        DOCS["mdBook Build<br/>(Documentation compilation)"]
     end
 
-    PR --> LINT --> UNIT --> BUILD --> E2E
-    REN --> LINT
-    E2E -->|"Renovate PR"| AUTO
-    E2E -->|"Merge to main"| REL --> PUB
+    subgraph E2E_LIVE["e2e.yml (Live Cluster Verification)"]
+        KIND_LIVE["Live kind E2E<br/>(Real kind cluster, Flux, PKO v2, Forgejo, Rauthy)"]
+        CLOUD_LIVE["Live Cloud E2E (Optional)<br/>(AWS, Azure, GCP Free-Tier Blueprints)"]
+    end
+
+    subgraph RELEASE["release.yml (Pre-Release Gate & Publishing on main)"]
+        GATE["workflow_call Gate<br/>needs: [ci, e2e-live]"]
+        REL["semantic-release<br/>(Conventional Commits -> SemVer Tag)"]
+        CROSS["Cross-Compile Static Binaries<br/>(Linux amd64/arm64, macOS, Windows)"]
+        PUB["Publish GitHub Release + Signed OCI Image<br/>(Cosign + SBOM + HTML Docs)"]
+    end
+
+    AUTO["Renovate Auto-Merge<br/>(If Non-Major & All Checks Pass)"]
+
+    PR --> CI
+    REN --> CI
+    CI -->|"Renovate PR"| AUTO
+    MAIN --> RELEASE
+    RELEASE -->|"workflow_call"| CI
+    RELEASE -->|"workflow_call"| E2E_LIVE
+    CI & E2E_LIVE --> GATE --> REL --> CROSS --> PUB
 ```
 
 ### 9.2 GitHub Actions Workflows (`.github/workflows/`)
-1. **`ci.yml` (Runs on all PRs and pushes to `main`):**
-   * **Rust Quality:** `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo audit` (vulnerability scan), and `cargo llvm-cov` enforcing $\ge 80\%$ line coverage.
-   * **Frontend & E2E Quality:** `prettier --check` (formatting across TypeScript, TSX, JSON, YAML, and Markdown), `eslint` (TypeScript/React/Playwright lint rules), `tsc --noEmit` (strict TypeScript typechecking), and `pnpm --dir ui test:unit --coverage` (`vitest`) enforcing $\ge 80\%$ line coverage.
-   * **Playwright E2E (`e2e.yml`):** Spins up an ephemeral `kind` cluster with Flux CD, PKO v2, Kyverno, and a local Gitea container; executes headless Chromium/Firefox Playwright tests verifying end-to-end PR creation, PKO preview diff rendering, and app installation.
-2. **`release.yml` (Runs on `main` after `ci.yml` succeeds):**
-   * Executes **`semantic-release`** to analyze Conventional Commits (`feat:`, `fix:`, `BREAKING CHANGE:`), bump versions synchronously across `Cargo.toml` workspace members and `ui/package.json`, generate `CHANGELOG.md`, cross-compile static binaries (`x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`, `aarch64-apple-darwin`, `x86_64-pc-windows-msvc`), push multi-arch container images to GHCR, attach a CycloneDX SBOM, and sign all artifacts with **Cosign**.
+1. **`ci.yml` (Fast PR Checks & Reusable Verification):**
+   * Triggered on all pull requests to `main` and callable via `workflow_call` by `release.yml`.
+   * **Rust Quality:** `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo llvm-cov` enforcing $\ge 80\%$ line coverage.
+   * **Frontend & E2E Static Quality:** `prettier --check` (formatting across TypeScript, TSX, JSON, YAML, and Markdown), `eslint` (TypeScript/React/Playwright lint rules), `tsc --noEmit` (strict TypeScript typechecking), and `pnpm --dir ui test:unit --coverage` (`vitest`) enforcing $\ge 80\%$ line coverage.
+   * **Mocked Playwright E2E:** Executes headless Chromium Playwright tests (`pnpm --dir e2e test`) verifying catalog wizards, dynamic forms, PR proposals, diff viewer, and UI routes with zero cluster overhead.
+   * **Documentation:** `mdbook build` ensuring the user guide compiles cleanly with zero broken links.
+2. **`e2e.yml` (Live Cluster & Cloud Verification):**
+   * Callable via `workflow_call` on pushes to `main` and manually via `workflow_dispatch`.
+   * **`e2e-live-kind`:** Spins up an ephemeral `kind` cluster with Flux CD, PKO v2, Kyverno, SeaweedFS, Envoy Gateway, Flagger, Rauthy OIDC, and local Forgejo; executes live end-to-end browser and CLI tests verifying Stage 0 bootstrap, OIDC PKCE login, PR creation, live PKO diff streaming, and progressive canary rollouts.
+   * **`e2e-live-cloud` (Optional / Dual-Guard):** Runs `08-cloud-free-tier-live-e2e.spec.ts` against real AWS, Azure, and GCP APIs using free-tier blueprints (`aws-free-tier-vm`, `azure-free-tier-vm`, `gcp-free-tier-vm`) when provider toggles (`KEEL_E2E_CLOUD_<PROVIDER>=1` / `KEEL_E2E_CLOUD_ALL=1`) and credentials are configured.
+3. **`release.yml` (Pre-Release Gate & Publishing on `main`):**
+   * Triggered exclusively on `push: branches: [main]`.
+   * Invokes `ci.yml` (Job `ci`) and `e2e.yml` (Job `e2e-live`) via `workflow_call`.
+   * The `release` job declares `needs: [ci, e2e-live]`, ensuring releases are strictly gated behind 100% green checks on `main`.
+   * Executes **`semantic-release`** to analyze Conventional Commits (`feat:`, `fix:`, `BREAKING CHANGE:`), synchronously bump versions across `Cargo.toml` and `ui/package.json`, generate `CHANGELOG.md`, cross-compile static binaries (`x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`, `aarch64-apple-darwin`, `x86_64-pc-windows-msvc`), push multi-arch container images to GHCR, attach CycloneDX SBOMs, sign all artifacts with **Cosign**, and publish mdBook documentation to GitHub Pages.
 
 ### 9.3 `semantic-release` Configuration (`.releaserc.json`)
 
@@ -636,3 +748,6 @@ Executed headlessly in GitHub Actions against an isolated test harness (`keel-se
 3. **`03-pko-preview-and-merge.spec.ts`:** Opens an infrastructure provisioning PR (e.g., Proxmox/Cloud VM + companion PostgreSQL), asserts that the ephemeral PKO preview runs, verifies `+ Create` / `~ Update` / `- Delete` diff nodes render in the GUI with a valid link to the Gitea PR, merges the PR, and verifies ephemeral preview CR cleanup.
 4. **`04-canary-lifecycle.spec.ts`:** Deploys a stateless K8s app with Flagger canary enabled, asserts live SSE status transitions (`Progressing` -> `Ready`), and verifies automated rollback behavior upon simulated HTTP 5xx/latency threshold breach.
 5. **`05-multi-tenant-isolation.spec.ts`:** Authenticates as `Tenant-A`, attempts to reference a secret or stack in `Tenant-B`, and verifies rejection at both the API layer and Kyverno admission webhook.
+6. **`06-full-gui-workflow.spec.ts`:** Verifies the complete UI user journey (catalog navigation, dynamic form rendering with `@rjsf/core`, PR proposal creation, diff inspector, and merge).
+7. **`07-kind-live-e2e.spec.ts`:** Executes live end-to-end bootstrap, provision, and deploy flows against real `kind` clusters, Flux, PKO v2, Rauthy, and Forgejo.
+8. **`08-cloud-free-tier-live-e2e.spec.ts`:** Multi-cloud live E2E suite validating Stage 0 cloud bootstrap and Stage 1 PKO v2 provider provisioning across AWS, Azure, and GCP using free-tier blueprints (`aws-free-tier-vm`, `azure-free-tier-vm`, `gcp-free-tier-vm`). Governed by the **Dual-Guard Environment Contract** requiring both an explicit toggle (`KEEL_E2E_CLOUD_<PROVIDER>=1` or `KEEL_E2E_CLOUD_ALL=1`) AND valid cloud credentials (`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`, `ARM_CLIENT_ID`/`ARM_CLIENT_SECRET`/`ARM_TENANT_ID`/`ARM_SUBSCRIPTION_ID`, or `GOOGLE_CREDENTIALS`/`GCP_PROJECT`); otherwise cleanly skips. Verifies Stage 0 cloud bootstrap (`--skip-core-install`), Stage 1 PKO v2 preview diff generation, live cloud resource creation, SSH connection metadata resolution (`keel infra ssh`), and guaranteed `pulumi destroy` resource teardown in `finally` blocks.

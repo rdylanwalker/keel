@@ -69,7 +69,7 @@ For infrastructure blueprints (`CatalogInfraBlueprint`), Keel also binds each pa
 
 ## `CatalogApplication` Schema (`keel.io/v1alpha1`)
 
-Upstream Helm charts and Kustomize bases work **without structural modification**. A thin `catalog.yaml` sidecar defines the upstream source and a JSON Schema that renders into standard `values.yaml` overrides:
+Upstream Helm charts, Kustomize bases, and raw Kubernetes manifest templates work **without structural modification**. A thin `catalog.yaml` sidecar defines the source and a JSON Schema that renders into standard `values.yaml` overrides or manifest template variables:
 
 ```yaml
 apiVersion: keel.io/v1alpha1
@@ -78,7 +78,7 @@ metadata:
   id: podinfo
   name: Podinfo
   category: web
-  runtime: helm
+  runtime: helm # helm | kustomize | manifest
 spec:
   upstream:
     repoUrl: https://stefanprodan.github.io/podinfo
@@ -95,6 +95,115 @@ spec:
         title: Replicas
         default: 2
 ```
+
+## Raw Kubernetes Manifests & Templates (`runtime: manifest`)
+
+For teams deploying raw Kubernetes manifests or parameterized YAML templates instead of packaging a Helm chart, Keel provides native `runtime: manifest` catalog entries.
+
+### Directory Layout & Schema
+
+A raw manifest catalog entry is stored under `catalog/apps/<id>/` with two files:
+
+```text
+catalog/apps/http-echo-manifest/
+├── catalog.yaml       # CatalogApplication metadata, defaultEngine & JSON Schema
+└── manifests.yaml     # Multi-document Kubernetes YAML with ${var} placeholders
+```
+
+#### `catalog.yaml`
+```yaml
+apiVersion: keel.io/v1alpha1
+kind: CatalogApplication
+metadata:
+  id: http-echo-manifest
+  name: HTTP Echo Server
+  description: Parameterized HTTP echo deployment and service template
+  category: web
+  runtime: manifest
+spec:
+  defaultEngine: flux # flux | pulumi
+  schema:
+    type: object
+    required: [app_name, port, message]
+    properties:
+      app_name:
+        type: string
+        title: Application Name
+        default: http-echo
+      port:
+        type: integer
+        title: Service Port
+        default: 8080
+      message:
+        type: string
+        title: Echo Message
+        default: "Hello from Keel Manifest!"
+      secret_api_key:
+        type: string
+        title: Secret API Key
+        format: password
+        writeOnly: true # Encrypted via SOPS + age before staging
+```
+
+#### `manifests.yaml`
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ${app_name:=http-echo}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ${app_name:=http-echo}
+  template:
+    metadata:
+      labels:
+        app: ${app_name:=http-echo}
+    spec:
+      containers:
+        - name: echo
+          image: hashicorp/http-echo:0.2.3
+          args:
+            - "-listen=:${port:=8080}"
+            - "-text=${message:=hello}"
+          ports:
+            - containerPort: ${port:=8080}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ${app_name:=http-echo}
+spec:
+  ports:
+    - port: ${port:=8080}
+      targetPort: ${port:=8080}
+  selector:
+    app: ${app_name:=http-echo}
+```
+
+### Template Placeholder Syntax (`${var_name}` / `${var_name:=default}`)
+- `${var_name}`: Replaced by the variable value provided in the dynamic form or CLI.
+- `${var_name:=default_value}`: Replaced by the variable value if provided, or falls back to `default_value`.
+- This placeholder syntax matches standard Kubernetes `envsubst` and Flux CD post-build variable substitution, ensuring portability across execution engines.
+
+### Auto-Extracting Schema Fields in the Catalog Wizard
+In the Web UI (**Catalog & Form Wizard → + Add Catalog Item → Application → Manifest**), you can paste or type your raw Kubernetes YAML directly into the manifest editor and click **"Auto-Extract Variables to Schema"**. Keel scans the YAML tokens, finds all `${var_name}` and `${var_name:=default}` patterns, and automatically populates `spec.schema.properties` with appropriate types, titles, and defaults—instantly generating a Shadcn UI form without writing JSON Schema by hand.
+
+### SOPS Secret Partitioning
+Properties marked `"writeOnly": true` or `"format": "password"` are automatically partitioned from non-secret variables:
+- In the **Flux engine path**, non-secret variables are written to `values-configmap.yaml` (`kind: ConfigMap`), while secret variables are encrypted with the tenant's `age` key into `secrets.enc.yaml` (`kind: Secret`).
+- In the **Pulumi engine path**, secret variables are encrypted into `secrets.enc.yaml` and bound via `Stack.spec.envRefs`.
+
+### Choosing Between Execution Engines (`Flux` vs. `Pulumi`)
+Operators can define `spec.defaultEngine: flux | pulumi` in `catalog.yaml` and override the engine at deploy time in the UI Deploy Modal or CLI (`keel app install --engine flux|pulumi`):
+
+| Feature | Flux CD Engine (`flux`) | Pulumi PKO v2 Engine (`pulumi`) |
+| :--- | :--- | :--- |
+| **Generated Manifests** | `manifests.yaml`, `values-configmap.yaml`, `secrets.enc.yaml`, `flux-kustomization.yaml` | `Pulumi.yaml` (`ConfigGroup`), `stack.yaml`, `secrets.enc.yaml` |
+| **Reconciler** | `kustomize-controller` via `postBuild.substituteFrom` | `pulumi-kubernetes-operator` (PKO v2) |
+| **Pre-Merge Previews** | Git unified diff in PR | Ephemeral PKO `Stack` (`spec.preview: true`) with exact resource-level diffs (`+`/`~`/`-`) |
+| **Best For** | Lightweight, direct Kubernetes reconciliation with zero IaC runner overhead | Applications requiring pre-merge Kubernetes resource diff previews or unified multi-cloud coordination |
 
 ## `CatalogBundle` Schema (`keel.io/v1alpha1`)
 

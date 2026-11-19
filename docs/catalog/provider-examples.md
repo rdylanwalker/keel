@@ -8,6 +8,67 @@ Remember to enable the corresponding provider on **Control Plane & Providers** (
 
 ---
 
+## Multi-Cloud Free-Tier Credential Acquisition & Setup
+
+Before deploying cloud blueprints or running live cloud tests, configure credentials for your cloud provider:
+
+### 1. AWS Credential Acquisition (Console / CLI)
+- Create a least-privilege IAM user or role for testing EC2 and S3:
+  ```bash
+  aws iam create-user --user-name keel-operator
+  aws iam attach-user-policy --user-name keel-operator --policy-arn arn:aws:iam::aws:policy/AmazonEC2FullAccess
+  aws iam attach-user-policy --user-name keel-operator --policy-arn arn:aws:iam::aws:policy/AmazonS3FullAccess
+  aws iam create-access-key --user-name keel-operator
+  ```
+- Configure in your shell or catalog form:
+  - `AWS_ACCESS_KEY_ID`: `AKIA...`
+  - `AWS_SECRET_ACCESS_KEY`: `wJalr...`
+  - `AWS_REGION`: `us-east-1` (Free Tier eligible)
+  - Toggle for E2E tests: `export KEEL_E2E_CLOUD_AWS=1`
+
+### 2. Azure Credential Acquisition (Portal / CLI)
+- Create an Azure Service Principal scoped to your test subscription:
+  ```bash
+  az login
+  SUBSCRIPTION_ID=$(az account show --query id -o tsv)
+  az ad sp create-for-rbac --name "keel-operator-sp" \
+    --role "Contributor" \
+    --scopes "/subscriptions/${SUBSCRIPTION_ID}" \
+    --query '{client_id: appId, client_secret: password, tenant_id: tenant}'
+  ```
+- Configure in your shell or catalog form:
+  - `ARM_CLIENT_ID`: `<appId>`
+  - `ARM_CLIENT_SECRET`: `<password>`
+  - `ARM_TENANT_ID`: `<tenant>`
+  - `ARM_SUBSCRIPTION_ID`: `<subscriptionId>`
+  - `AZURE_LOCATION`: `eastus` (Free Tier eligible)
+  - Toggle for E2E tests: `export KEEL_E2E_CLOUD_AZURE=1`
+
+### 3. GCP Credential Acquisition (Console / CLI)
+- In Google Cloud Console or `gcloud`, enable `compute.googleapis.com` and create a service account with `Compute Admin` and `Storage Admin` roles:
+  ```bash
+  PROJECT_ID=$(gcloud config get-value project)
+  gcloud services enable compute.googleapis.com
+  gcloud iam service-accounts create keel-operator \
+    --description="Keel Operator Service Account" \
+    --display-name="keel-operator"
+  gcloud projects add-iam-policy-binding ${PROJECT_ID} \
+    --member="serviceAccount:keel-operator@${PROJECT_ID}.iam.gserviceaccount.com" \
+    --role="roles/compute.admin"
+  gcloud projects add-iam-policy-binding ${PROJECT_ID} \
+    --member="serviceAccount:keel-operator@${PROJECT_ID}.iam.gserviceaccount.com" \
+    --role="roles/storage.admin"
+  gcloud iam service-accounts keys create ./gcp-key.json \
+    --iam-account="keel-operator@${PROJECT_ID}.iam.gserviceaccount.com"
+  ```
+- Configure in your shell or catalog form:
+  - `GOOGLE_CREDENTIALS`: contents of `gcp-key.json` (or path via `GOOGLE_APPLICATION_CREDENTIALS`)
+  - `GCP_PROJECT`: `${PROJECT_ID}`
+  - `GCP_ZONE`: `us-central1-a` (Always Free tier eligible)
+  - Toggle for E2E tests: `export KEEL_E2E_CLOUD_GCP=1`
+
+---
+
 ## Local `kind` Workload Cluster (`kind`)
 
 Place in `catalog/infra/kind-cluster/`.
@@ -245,6 +306,167 @@ outputs:
 
 ---
 
+## AWS Free-Tier EC2 Instance (`aws-free-tier-vm`)
+
+Place in `catalog/infra/aws-free-tier-vm/`. Provisions a free-tier eligible `t3.micro` / `t2.micro` EC2 virtual machine with security group, SSH key pair, and direct SSH outputs.
+
+### `catalog.yaml`
+
+```yaml
+apiVersion: keel.io/v1alpha1
+kind: CatalogInfraBlueprint
+metadata:
+  id: aws-free-tier-vm
+  name: AWS Free-Tier EC2 Instance
+  description: Provision a free-tier eligible AWS EC2 virtual machine with SSH access
+  category: compute
+  provider: aws
+spec:
+  pulumiRuntime: yaml
+  entrypoint: Pulumi.yaml
+  protectByDefault: true
+  outputs:
+    - instanceId
+    - publicIp
+    - sshHost
+    - sshUser
+    - sshPort
+  schema:
+    type: object
+    required:
+      - sshPublicKey
+    properties:
+      region:
+        type: string
+        title: AWS Region
+        default: us-east-1
+      instanceType:
+        type: string
+        title: EC2 Instance Type
+        default: t3.micro
+        enum:
+          - t3.micro
+          - t2.micro
+      sshUser:
+        type: string
+        title: SSH Username
+        default: ubuntu
+      sshPublicKey:
+        type: string
+        title: Operator SSH Public Key
+      awsAccessKeyId:
+        type: string
+        title: AWS Access Key ID
+        writeOnly: true
+      awsSecretAccessKey:
+        type: string
+        title: AWS Secret Access Key
+        writeOnly: true
+        format: password
+  uiSchema:
+    sshPublicKey:
+      ui:widget: textarea
+      ui:help: "SSH public key injected into the EC2 instance key pair."
+    awsSecretAccessKey:
+      ui:widget: password
+      ui:help: "Encrypted via SOPS + tenant age key before committing to Git."
+```
+
+### `Pulumi.yaml`
+
+```yaml
+name: aws-free-tier-vm
+runtime: yaml
+description: Free-tier eligible AWS EC2 virtual machine
+
+config:
+  region:
+    type: string
+    default: us-east-1
+  instanceType:
+    type: string
+    default: t3.micro
+  sshUser:
+    type: string
+    default: ubuntu
+  sshPublicKey:
+    type: string
+  amiId:
+    type: string
+    default: ""
+  instanceName:
+    type: string
+    default: keel-free-vm
+
+variables:
+  ubuntuAmi:
+    fn::invoke:
+      function: aws:ec2:getAmi
+      arguments:
+        mostRecent: true
+        owners:
+          - "099720109477"
+        filters:
+          - name: name
+            values:
+              - "ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-*"
+          - name: virtualization-type
+            values:
+              - hvm
+
+resources:
+  sshKeyPair:
+    type: aws:ec2:KeyPair
+    properties:
+      publicKey: ${sshPublicKey}
+      tags:
+        managed-by: keel
+
+  vmSecurityGroup:
+    type: aws:ec2:SecurityGroup
+    properties:
+      description: Security group allowing inbound SSH traffic
+      ingress:
+        - protocol: tcp
+          fromPort: 22
+          toPort: 22
+          cidrBlocks:
+            - 0.0.0.0/0
+      egress:
+        - protocol: "-1"
+          fromPort: 0
+          toPort: 0
+          cidrBlocks:
+            - 0.0.0.0/0
+      tags:
+        managed-by: keel
+
+  ec2Instance:
+    type: aws:ec2:Instance
+    properties:
+      instanceType: ${instanceType}
+      ami: ${amiId != "" ? amiId : ubuntuAmi.id}
+      keyName: ${sshKeyPair.keyName}
+      vpcSecurityGroupIds:
+        - ${vmSecurityGroup.id}
+      rootBlockDevice:
+        volumeSize: 20
+        volumeType: gp3
+        encrypted: true
+      tags:
+        Name: ${instanceName}
+        managed-by: keel
+
+outputs:
+  instanceId: ${ec2Instance.id}
+  publicIp: ${ec2Instance.publicIp}
+  sshHost: ${ec2Instance.publicIp}
+  sshUser: ${sshUser}
+  sshPort: 22
+```
+
+---
+
 ## Google Cloud GKE Cluster (`gcp`)
 
 Place in `catalog/infra/gcp-gke/`.
@@ -322,9 +544,9 @@ outputs:
 
 ---
 
-## Always-Free GCP Compute Engine VM (`gcp`)
+## GCP Free-Tier Compute VM (`gcp-free-tier-vm`)
 
-Place in `catalog/infra/gcp-free-vm/`.
+Place in `catalog/infra/gcp-free-tier-vm/`. Provisions an Always-Free eligible `e2-micro` Compute Engine VM on Google Cloud with SSH firewall rule, metadata SSH key, and direct SSH outputs.
 
 ### `catalog.yaml`
 
@@ -332,76 +554,116 @@ Place in `catalog/infra/gcp-free-vm/`.
 apiVersion: keel.io/v1alpha1
 kind: CatalogInfraBlueprint
 metadata:
-  id: gcp-free-vm
-  name: Always-Free GCP Compute Engine VM
-  description: Provision an Always Free e2-micro Compute Engine VM on Google Cloud.
+  id: gcp-free-tier-vm
+  name: GCP Free-Tier Compute VM
+  description: Provision an Always-Free eligible GCP e2-micro virtual machine with SSH access
   category: compute
   provider: gcp
 spec:
   pulumiRuntime: yaml
   entrypoint: Pulumi.yaml
-  protectByDefault: false
+  protectByDefault: true
   outputs:
     - instanceName
-    - internalIp
+    - publicIp
+    - sshHost
+    - sshUser
+    - sshPort
   schema:
     type: object
-    required: [vmName, project, zone, GOOGLE_CREDENTIALS]
+    required:
+      - project
+      - sshPublicKey
     properties:
-      vmName:
-        type: string
-        title: VM Name
-        default: keel-free-vm
-        pattern: "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"
       project:
         type: string
         title: GCP Project ID
+      region:
+        type: string
+        title: GCP Region
+        default: us-central1
       zone:
         type: string
-        title: GCP Zone (Always Free Eligible)
-        default: us-east1-b
-        enum:
-          - us-central1-a
-          - us-central1-b
-          - us-central1-c
-          - us-east1-b
-          - us-east1-c
-          - us-west1-a
-          - us-west1-b
-      GOOGLE_CREDENTIALS:
+        title: GCP Zone
+        default: us-central1-a
+      machineType:
+        type: string
+        title: Machine Type
+        default: e2-micro
+      sshUser:
+        type: string
+        title: SSH Username
+        default: debian
+      sshPublicKey:
+        type: string
+        title: Operator SSH Public Key
+      googleCredentials:
         type: string
         title: GCP Service Account JSON Key
-        format: password
         writeOnly: true
+        format: password
   uiSchema:
-    GOOGLE_CREDENTIALS:
+    sshPublicKey:
+      ui:widget: textarea
+      ui:help: "SSH public key injected into GCP instance metadata."
+    googleCredentials:
       ui:widget: password
-      ui:help: "Service account JSON key encrypted via SOPS + age and bound to Stack.spec.envRefs."
+      ui:help: "Encrypted via SOPS + tenant age key before committing to Git."
 ```
 
 ### `Pulumi.yaml`
 
 ```yaml
-name: gcp-free-vm
+name: gcp-free-tier-vm
 runtime: yaml
-description: Always Free GCP e2-micro Compute Engine VM
+description: Always-Free eligible GCP e2-micro compute instance
+
 config:
-  vmName:
-    type: string
-    default: keel-free-vm
   project:
     type: string
+  region:
+    type: string
+    default: us-central1
   zone:
     type: string
-    default: us-east1-b
+    default: us-central1-a
+  machineType:
+    type: string
+    default: e2-micro
+  sshUser:
+    type: string
+    default: debian
+  sshPublicKey:
+    type: string
+  instanceName:
+    type: string
+    default: keel-free-vm
+
 resources:
-  freeVm:
+  sshFirewall:
+    type: gcp:compute:Firewall
+    properties:
+      project: ${project}
+      network: default
+      description: Allow inbound SSH from any IP
+      allows:
+        - protocol: tcp
+          ports:
+            - "22"
+      sourceRanges:
+        - 0.0.0.0/0
+      targetTags:
+        - allow-ssh
+
+  computeInstance:
     type: gcp:compute:Instance
     properties:
-      name: ${vmName}
       project: ${project}
-      machineType: e2-micro
+      name: ${instanceName}
+      machineType: ${machineType}
       zone: ${zone}
+      tags:
+        - allow-ssh
       bootDisk:
         initializeParams:
           image: debian-cloud/debian-12
@@ -409,11 +671,19 @@ resources:
           type: pd-standard
       networkInterfaces:
         - network: default
+          accessConfigs:
+            - {}
+      metadata:
+        ssh-keys: "${sshUser}:${sshPublicKey}"
       labels:
         managed-by: keel
+
 outputs:
-  instanceName: ${freeVm.name}
-  internalIp: ${freeVm.networkInterfaces[0].networkIp}
+  instanceName: ${computeInstance.name}
+  publicIp: ${computeInstance.networkInterfaces[0].accessConfigs[0].natIp}
+  sshHost: ${computeInstance.networkInterfaces[0].accessConfigs[0].natIp}
+  sshUser: ${sshUser}
+  sshPort: 22
 ```
 
 ---
@@ -540,6 +810,215 @@ resources:
           mode: System
 outputs:
   fqdn: ${aks.fqdn}
+```
+
+---
+
+## Azure Free-Tier Linux VM (`azure-free-tier-vm`)
+
+Place in `catalog/infra/azure-free-tier-vm/`. Provisions a free-tier eligible `Standard_B1s` Linux VM in Microsoft Azure with Resource Group, VNet, Subnet, NSG, Public IP, and direct SSH outputs.
+
+### `catalog.yaml`
+
+```yaml
+apiVersion: keel.io/v1alpha1
+kind: CatalogInfraBlueprint
+metadata:
+  id: azure-free-tier-vm
+  name: Azure Free-Tier Linux VM
+  description: Provision a free-tier eligible Azure Standard_B1s virtual machine with SSH access
+  category: compute
+  provider: azure
+spec:
+  pulumiRuntime: yaml
+  entrypoint: Pulumi.yaml
+  protectByDefault: true
+  outputs:
+    - vmId
+    - publicIp
+    - sshHost
+    - sshUser
+    - sshPort
+  schema:
+    type: object
+    required:
+      - sshPublicKey
+    properties:
+      location:
+        type: string
+        title: Azure Region
+        default: eastus
+      vmSize:
+        type: string
+        title: Virtual Machine Size
+        default: Standard_B1s
+      sshUser:
+        type: string
+        title: SSH Username
+        default: azureuser
+      sshPublicKey:
+        type: string
+        title: Operator SSH Public Key
+      armClientId:
+        type: string
+        title: Azure Client ID
+        writeOnly: true
+      armClientSecret:
+        type: string
+        title: Azure Client Secret
+        writeOnly: true
+        format: password
+      armTenantId:
+        type: string
+        title: Azure Tenant ID
+        writeOnly: true
+      armSubscriptionId:
+        type: string
+        title: Azure Subscription ID
+        writeOnly: true
+  uiSchema:
+    sshPublicKey:
+      ui:widget: textarea
+      ui:help: "SSH public key injected for the administrative user."
+    armClientSecret:
+      ui:widget: password
+      ui:help: "Encrypted via SOPS + tenant age key before committing to Git."
+```
+
+### `Pulumi.yaml`
+
+```yaml
+name: azure-free-tier-vm
+runtime: yaml
+description: Free-tier eligible Azure Standard_B1s Linux virtual machine
+
+config:
+  location:
+    type: string
+    default: eastus
+  vmSize:
+    type: string
+    default: Standard_B1s
+  sshUser:
+    type: string
+    default: azureuser
+  sshPublicKey:
+    type: string
+  vmName:
+    type: string
+    default: keel-free-vm
+
+resources:
+  resourceGroup:
+    type: azure-native:resources:ResourceGroup
+    properties:
+      location: ${location}
+      tags:
+        managed-by: keel
+
+  virtualNetwork:
+    type: azure-native:network:VirtualNetwork
+    properties:
+      resourceGroupName: ${resourceGroup.name}
+      location: ${location}
+      addressSpace:
+        addressPrefixes:
+          - 10.0.0.0/16
+      tags:
+        managed-by: keel
+
+  subnet:
+    type: azure-native:network:Subnet
+    properties:
+      resourceGroupName: ${resourceGroup.name}
+      virtualNetworkName: ${virtualNetwork.name}
+      addressPrefix: 10.0.1.0/24
+
+  publicIp:
+    type: azure-native:network:PublicIPAddress
+    properties:
+      resourceGroupName: ${resourceGroup.name}
+      location: ${location}
+      publicIPAllocationMethod: Dynamic
+      tags:
+        managed-by: keel
+
+  networkSecurityGroup:
+    type: azure-native:network:NetworkSecurityGroup
+    properties:
+      resourceGroupName: ${resourceGroup.name}
+      location: ${location}
+      securityRules:
+        - name: AllowSSH
+          protocol: Tcp
+          direction: Inbound
+          priority: 1000
+          access: Allow
+          sourceAddressPrefix: "*"
+          sourcePortRange: "*"
+          destinationAddressPrefix: "*"
+          destinationPortRange: "22"
+      tags:
+        managed-by: keel
+
+  networkInterface:
+    type: azure-native:network:NetworkInterface
+    properties:
+      resourceGroupName: ${resourceGroup.name}
+      location: ${location}
+      networkSecurityGroup:
+        id: ${networkSecurityGroup.id}
+      ipConfigurations:
+        - name: ipconfig1
+          subnet:
+            id: ${subnet.id}
+          publicIPAddress:
+            id: ${publicIp.id}
+          privateIPAllocationMethod: Dynamic
+      tags:
+        managed-by: keel
+
+  virtualMachine:
+    type: azure-native:compute:VirtualMachine
+    properties:
+      resourceGroupName: ${resourceGroup.name}
+      location: ${location}
+      vmName: ${vmName}
+      hardwareProfile:
+        vmSize: ${vmSize}
+      networkProfile:
+        networkInterfaces:
+          - id: ${networkInterface.id}
+            primary: true
+      storageProfile:
+        imageReference:
+          publisher: Canonical
+          offer: 0001-com-ubuntu-server-jammy
+          sku: 22_04-lts-gen2
+          version: latest
+        osDisk:
+          createOption: FromImage
+          diskSizeGB: 30
+          managedDisk:
+            storageAccountType: Standard_LRS
+      osProfile:
+        computerName: ${vmName}
+        adminUsername: ${sshUser}
+        linuxConfiguration:
+          disablePasswordAuthentication: true
+          ssh:
+            publicKeys:
+              - keyData: ${sshPublicKey}
+                path: /home/${sshUser}/.ssh/authorized_keys
+      tags:
+        managed-by: keel
+
+outputs:
+  vmId: ${virtualMachine.id}
+  publicIp: ${publicIp.ipAddress}
+  sshHost: ${publicIp.ipAddress}
+  sshUser: ${sshUser}
+  sshPort: 22
 ```
 
 ---
