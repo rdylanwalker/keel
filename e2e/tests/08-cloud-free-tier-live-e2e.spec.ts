@@ -114,9 +114,15 @@ const KEEL_BIN = process.env.KEEL_BIN || path.resolve(process.cwd(), '../target/
 const SERVE_LOG_PATH = path.join(os.tmpdir(), 'keel-cloud-e2e-serve.log');
 const DETERMINISTIC_REPO_DIR = path.join(os.tmpdir(), `keel-e2e-gitops-${MGMT_CLUSTER}`);
 
-function logStep(msg: string): void {
+const PREVIEW_TIMEOUT_MS = 180_000;
+const PROVISION_TIMEOUT_MS = 420_000;
+const API_DELETE_TIMEOUT_MS = 180_000;
+const K8S_FINALIZER_TIMEOUT_MS = 300_000;
+
+function logStep(msg: string, provider?: CloudProvider): void {
   const ts = new Date().toISOString().slice(11, 19);
-  console.log(`[cloud-e2e ${ts}] ${msg}`);
+  const tag = provider ? ` [${provider}]` : '';
+  console.log(`[cloud-e2e ${ts}]${tag} ${msg}`);
 }
 
 function runCmd(
@@ -156,21 +162,104 @@ async function isServerUp(url: string): Promise<boolean> {
   }
 }
 
-async function authenticateApiContext(
-  request: import('@playwright/test').APIRequestContext,
-  adminPassword: string,
+async function signInViaRauthy(
+  page: import('@playwright/test').Page,
+  email: string,
+  password: string,
 ): Promise<void> {
-  const statusRes = await request.get(`${BASE_URL}/api/v1/auth/status`);
-  if (!statusRes.ok()) return;
-  const status = (await statusRes.json()) as {
-    authenticated?: boolean;
-    localAuthEnabled?: boolean;
-  };
-  if (status.authenticated) return;
+  await page.goto(BASE_URL);
+  await expect(page.getByText('Keel Control Plane')).toBeVisible();
 
-  await request.post(`${BASE_URL}/api/v1/auth/local/login`, {
-    data: { username: 'admin', password: adminPassword },
+  if (await page.getByText('Authentication Required').isVisible()) {
+    await page
+      .getByRole('button', { name: /Sign in with OIDC/i })
+      .first()
+      .click();
+    const emailInput = page
+      .locator(
+        'input[type="email"], input[name="email"], input[name="login"], input#login, input[autocomplete="username"]',
+      )
+      .first();
+    await expect(emailInput).toBeVisible({ timeout: 20_000 });
+    await emailInput.fill(email);
+
+    const passwordInput = page
+      .locator('input[type="password"], input[name="password"], input#password')
+      .first();
+    if (!(await passwordInput.isVisible({ timeout: 1_000 }).catch(() => false))) {
+      await page.locator('button[type="submit"]').first().click();
+    }
+    await expect(passwordInput).toBeVisible({ timeout: 10_000 });
+    await passwordInput.fill(password);
+    await page.locator('button[type="submit"], #submit-login').first().click();
+
+    const grantBtn = page.getByRole('button', { name: /Grant Access/i });
+    if (await grantBtn.isVisible({ timeout: 2_000 }).catch(() => false)) {
+      await grantBtn.click();
+    }
+  }
+
+  await expect(page.getByText('management-cluster-core', { exact: true })).toBeVisible({
+    timeout: 30_000,
   });
+}
+
+async function waitForStackReady(
+  name: string,
+  namespace: string,
+  provider: CloudProvider,
+  timeoutMs = PROVISION_TIMEOUT_MS,
+): Promise<void> {
+  const start = Date.now();
+  const deadline = start + timeoutMs;
+  const timeoutSec = Math.round(timeoutMs / 1000);
+  let lastLog = 0;
+
+  // Nudge Flux GitRepository/Kustomization if flux CLI is available so reconciliation starts immediately
+  tryCmd('flux', ['reconcile', 'source', 'git', 'flux-system', '-n', 'flux-system']);
+  tryCmd('flux', ['reconcile', 'kustomization', 'flux-system', '-n', 'flux-system']);
+
+  while (Date.now() < deadline) {
+    const res = tryCmd('kubectl', [
+      'get',
+      'stack.pulumi.com',
+      name,
+      '-n',
+      namespace,
+      '-o',
+      'jsonpath={.status.conditions[?(@.type=="Ready")].status}|{.status.conditions[?(@.type=="Ready")].reason}|{.status.conditions[?(@.type=="Ready")].message}',
+    ]);
+
+    if (res.ok) {
+      const [status, reason, message] = res.stdout.split('|');
+      if (status === 'True') {
+        const elapsed = Math.round((Date.now() - start) / 1000);
+        logStep(`PKO v2 Stack ${namespace}/${name} is Ready (${elapsed}s)!`, provider);
+        return;
+      }
+      if (Date.now() - lastLog > 15_000) {
+        const elapsed = Math.round((Date.now() - start) / 1000);
+        logStep(
+          `Waiting for PKO v2 Stack ${namespace}/${name} (${elapsed}s/${timeoutSec}s): status=${status || 'Pending'} reason=${reason || '-'} ${message || ''}`,
+          provider,
+        );
+        lastLog = Date.now();
+      }
+    } else if (Date.now() - lastLog > 15_000) {
+      const elapsed = Math.round((Date.now() - start) / 1000);
+      logStep(
+        `Waiting for Flux to create PKO v2 Stack ${namespace}/${name} (${elapsed}s/${timeoutSec}s)...`,
+        provider,
+      );
+      lastLog = Date.now();
+    }
+
+    await new Promise((r) => setTimeout(r, 5000));
+  }
+
+  throw new Error(
+    `[${provider}] Timed out after ${timeoutSec}s waiting for PKO v2 Stack ${namespace}/${name} to become Ready`,
+  );
 }
 
 /**
@@ -182,9 +271,10 @@ async function deleteAndConfirmStage1StackRemoved(
   request: import('@playwright/test').APIRequestContext,
   tenant: string,
   stackName: string,
+  provider: CloudProvider,
 ): Promise<void> {
   const namespace = `tenant-${tenant}`;
-  logStep(`Requesting deletion of Stage 1 stack ${namespace}/${stackName}...`);
+  logStep(`Requesting deletion of Stage 1 stack ${namespace}/${stackName}...`, provider);
   const delRes = await request
     .delete(`${BASE_URL}/api/v1/stacks/${namespace}/${stackName}`)
     .catch(() => null);
@@ -192,42 +282,71 @@ async function deleteAndConfirmStage1StackRemoved(
     return;
   }
 
-  const delProposal = (await delRes.json().catch(() => null)) as { id?: string | number } | null;
-  if (delProposal?.id !== undefined) {
-    logStep(`Merging deletion PR #${delProposal.id} for ${namespace}/${stackName}...`);
-    const mergeRes = await request.post(`${BASE_URL}/api/v1/proposals/${delProposal.id}/merge`);
+  const delJson = (await delRes.json().catch(() => null)) as {
+    id?: string | number;
+    proposal?: { id?: string | number };
+  } | null;
+  const delPrId = delJson?.proposal?.id ?? delJson?.id;
+  if (delPrId !== undefined) {
+    logStep(`Merging deletion PR #${delPrId} for ${namespace}/${stackName}...`, provider);
+    const mergeRes = await request.post(`${BASE_URL}/api/v1/proposals/${delPrId}/merge`);
     expect(mergeRes.ok()).toBe(true);
+    tryCmd('flux', ['reconcile', 'source', 'git', 'flux-system', '-n', 'flux-system']);
+    tryCmd('flux', ['reconcile', 'kustomization', 'flux-system', '-n', 'flux-system']);
   }
 
   // 1. Poll GET /api/v1/stacks until the stack is confirmed removed from Keel
-  logStep(`Waiting for confirmation that ${namespace}/${stackName} is removed from Keel stacks...`);
-  const apiDeadline = Date.now() + 180_000;
+  const apiTimeoutSec = Math.round(API_DELETE_TIMEOUT_MS / 1000);
+  logStep(
+    `Waiting for ${namespace}/${stackName} removal from Keel stacks (timeout ${apiTimeoutSec}s)...`,
+    provider,
+  );
+  const apiStart = Date.now();
+  const apiDeadline = apiStart + API_DELETE_TIMEOUT_MS;
+  let apiLastLog = 0;
   let removedFromApi = false;
   while (Date.now() < apiDeadline) {
     const stacksRes = await request.get(`${BASE_URL}/api/v1/stacks`);
     if (stacksRes.ok()) {
-      const stacks = (await stacksRes.json()) as Array<{ name?: string; tenant?: string }>;
-      const stillExists = stacks.some((s) => s.name === stackName && s.tenant === tenant);
+      const body = (await stacksRes.json()) as {
+        stacks?: Array<{ name?: string; namespace?: string; tenant?: string }>;
+      };
+      const stacks = Array.isArray(body) ? body : (body.stacks ?? []);
+      const stillExists = stacks.some(
+        (s) => s.name === stackName && (s.namespace === namespace || s.tenant === tenant),
+      );
       if (!stillExists) {
         removedFromApi = true;
         break;
       }
     }
+    if (Date.now() - apiLastLog > 15_000) {
+      const elapsed = Math.round((Date.now() - apiStart) / 1000);
+      logStep(
+        `Still waiting for ${namespace}/${stackName} removal from Keel API (${elapsed}s/${apiTimeoutSec}s)...`,
+        provider,
+      );
+      apiLastLog = Date.now();
+    }
     await new Promise((r) => setTimeout(r, 3000));
   }
   expect(
     removedFromApi,
-    `Timed out waiting for stack ${namespace}/${stackName} to be removed from /api/v1/stacks`,
+    `[${provider}] Timed out after ${apiTimeoutSec}s waiting for stack ${namespace}/${stackName} to be removed from /api/v1/stacks`,
   ).toBe(true);
 
   // 2. Wait until the K8s PKO v2 Stack object finishes its `destroyOnFinalize: true` cloud teardown
   // and is completely deleted from the management cluster.
   try {
     runCmd('kubectl', ['get', 'crd', 'stacks.pulumi.com']);
+    const k8sTimeoutSec = Math.round(K8S_FINALIZER_TIMEOUT_MS / 1000);
     logStep(
-      `Waiting for PKO v2 Stack ${namespace}/${stackName} finalizer (destroyOnFinalize) to complete in Kubernetes...`,
+      `Waiting for PKO v2 Stack ${namespace}/${stackName} finalizer (destroyOnFinalize, timeout ${k8sTimeoutSec}s)...`,
+      provider,
     );
-    const k8sDeadline = Date.now() + 300_000;
+    const k8sStart = Date.now();
+    const k8sDeadline = k8sStart + K8S_FINALIZER_TIMEOUT_MS;
+    let k8sLastLog = 0;
     let removedFromK8s = false;
     while (Date.now() < k8sDeadline) {
       const getRes = tryCmd('kubectl', ['get', 'stack.pulumi.com', stackName, '-n', namespace]);
@@ -235,14 +354,23 @@ async function deleteAndConfirmStage1StackRemoved(
         removedFromK8s = true;
         break;
       }
+      if (Date.now() - k8sLastLog > 15_000) {
+        const elapsed = Math.round((Date.now() - k8sStart) / 1000);
+        logStep(
+          `Waiting for PKO v2 Stack ${namespace}/${stackName} cloud teardown (${elapsed}s/${k8sTimeoutSec}s)...`,
+          provider,
+        );
+        k8sLastLog = Date.now();
+      }
       await new Promise((r) => setTimeout(r, 5000));
     }
     expect(
       removedFromK8s,
-      `Timed out waiting for PKO v2 Stack ${namespace}/${stackName} finalizer to finish cloud teardown`,
+      `[${provider}] Timed out after ${k8sTimeoutSec}s waiting for PKO v2 Stack ${namespace}/${stackName} finalizer to finish cloud teardown`,
     ).toBe(true);
     logStep(
       `Confirmed PKO v2 Stack ${namespace}/${stackName} and its cloud resources are deleted.`,
+      provider,
     );
   } catch {
     // kubectl/PKO CRD not present in this environment
@@ -335,7 +463,7 @@ test.describe('08 - Multi-Cloud Free-Tier Dual-Guard Contract & Blueprint Valida
   });
 
   test('08.0b - Free-tier catalog blueprints & Stage 0 k3s templates exist on disk with required outputs', () => {
-    const deployDir = path.resolve(__dirname, '../../deploy');
+    const deployDir = path.resolve(process.cwd(), '../deploy');
 
     // Stage 0 AWS (k3s + kubeconfig output)
     const stage0Aws = fs.readFileSync(path.join(deployDir, 'bootstrap/aws/Pulumi.yaml'), 'utf-8');
@@ -530,45 +658,65 @@ test.describe('08.1 - Multi-Cloud Free-Tier Stage 1 Live E2E (kind Management Cl
     }
   });
 
-  test('08.1a - AWS: Stage 1 Cloud Free-Tier VM Provisioning, PKO Preview & SSH Info Verification', async ({
-    request,
-  }) => {
-    const gate = resolveCloudTargetGate('aws');
-    test.skip(!gate.enabled, gate.reason);
+  interface CloudVmSpec {
+    provider: CloudProvider;
+    catalogId: string;
+    sshUser: string;
+    values: Record<string, unknown>;
+  }
 
-    await authenticateApiContext(request, adminPassword);
-    const stackName = `aws-vm-${Date.now()}`;
+  async function runStage1CloudVmLifecycle(
+    browser: import('@playwright/test').Browser,
+    spec: CloudVmSpec,
+  ): Promise<void> {
+    const { provider, catalogId, sshUser, values } = spec;
+    const context = await browser.newContext({ ignoreHTTPSErrors: true, baseURL: BASE_URL });
+    const page = await context.newPage();
+    const request = page.request;
+    const stackName = `${provider}-vm-${Date.now()}`;
     const tenant = 'default';
-    let stackProvisioned = false;
+    let prId: string | number | undefined;
+    let stackMerged = false;
 
     try {
-      logStep(`Creating proposal for aws-free-tier-vm (${stackName})...`);
+      logStep(`Signing into Keel UI via Rauthy OIDC...`, provider);
+      await signInViaRauthy(page, 'admin@keel.local', adminPassword);
+
+      logStep(`Creating proposal for ${catalogId} (${stackName})...`, provider);
       const createRes = await request.post(`${BASE_URL}/api/v1/proposals`, {
         data: {
-          catalogId: 'aws-free-tier-vm',
+          catalogId,
           name: stackName,
           tenant,
-          values: {
-            region: process.env.AWS_REGION || 'us-east-1',
-            instanceType: process.env.KEEL_E2E_AWS_INSTANCE_TYPE || 't3.micro',
-            sshUser: 'ubuntu',
-            sshPublicKey:
-              process.env.KEEL_E2E_SSH_PUBLIC_KEY ||
-              'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleKeyForKeelE2ETesting operator@keel.local',
-            awsAccessKeyId: process.env.AWS_ACCESS_KEY_ID,
-            awsSecretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
-          },
+          values,
         },
       });
-      expect(createRes.ok(), `Failed to create AWS proposal: ${await createRes.text()}`).toBe(true);
-      stackProvisioned = true;
+      expect(
+        createRes.ok(),
+        `[${provider}] Failed to create proposal: ${await createRes.text()}`,
+      ).toBe(true);
 
-      const proposal = (await createRes.json()) as { id: string | number };
-      logStep(`Polling preview diff for proposal #${proposal.id}...`);
-      const deadline = Date.now() + 180_000;
+      const created = (await createRes.json()) as {
+        id?: string | number;
+        proposal?: { id?: string | number };
+      };
+      prId = created.proposal?.id ?? created.id;
+      expect(
+        prId,
+        `[${provider}] Missing proposal.id in response: ${JSON.stringify(created)}`,
+      ).toBeTruthy();
+
+      const previewTimeoutSec = Math.round(PREVIEW_TIMEOUT_MS / 1000);
+      logStep(
+        `Polling preview diff for proposal #${prId} (timeout ${previewTimeoutSec}s)...`,
+        provider,
+      );
+      const prevStart = Date.now();
+      const prevDeadline = prevStart + PREVIEW_TIMEOUT_MS;
+      let prevLastLog = 0;
       let previewReady = false;
-      while (Date.now() < deadline) {
-        const prevRes = await request.get(`${BASE_URL}/api/v1/previews/${proposal.id}`);
+      while (Date.now() < prevDeadline) {
+        const prevRes = await request.get(`${BASE_URL}/api/v1/proposals/${prId}/preview`);
         if (prevRes.ok()) {
           const body = await prevRes.text();
           if (body.includes('+ Create') || body.includes('create') || body.includes('preview')) {
@@ -576,191 +724,158 @@ test.describe('08.1 - Multi-Cloud Free-Tier Stage 1 Live E2E (kind Management Cl
             break;
           }
         }
+        if (Date.now() - prevLastLog > 15_000) {
+          const elapsed = Math.round((Date.now() - prevStart) / 1000);
+          logStep(
+            `Still waiting for preview #${prId} (${elapsed}s/${previewTimeoutSec}s)...`,
+            provider,
+          );
+          prevLastLog = Date.now();
+        }
         await new Promise((r) => setTimeout(r, 5000));
       }
-      expect(previewReady).toBe(true);
+      expect(
+        previewReady,
+        `[${provider}] Timed out after ${previewTimeoutSec}s waiting for preview #${prId}`,
+      ).toBe(true);
 
-      logStep(`Merging proposal #${proposal.id}...`);
-      const mergeRes = await request.post(`${BASE_URL}/api/v1/proposals/${proposal.id}/merge`);
+      logStep(`Merging proposal #${prId}...`, provider);
+      const mergeRes = await request.post(`${BASE_URL}/api/v1/proposals/${prId}/merge`);
       expect(mergeRes.ok()).toBe(true);
+      stackMerged = true;
 
-      logStep(`Verifying stack SSH info for ${stackName}...`);
+      logStep(
+        `Waiting for PKO v2 Stack tenant-${tenant}/${stackName} to provision VM...`,
+        provider,
+      );
+      await waitForStackReady(stackName, `tenant-${tenant}`, provider, PROVISION_TIMEOUT_MS);
+
+      logStep(`Verifying stack SSH info for ${stackName}...`, provider);
       const sshRes = await request.get(
         `${BASE_URL}/api/v1/stacks/tenant-${tenant}/${stackName}/ssh-info`,
       );
-      if (sshRes.ok()) {
-        const sshJson = (await sshRes.json()) as {
-          sshHost?: string;
-          sshPort?: number;
-          sshUser?: string;
-        };
-        expect(sshJson.sshPort).toBe(22);
-        expect(sshJson.sshUser).toBe('ubuntu');
-      }
-    } finally {
-      if (stackProvisioned) {
-        await deleteAndConfirmStage1StackRemoved(request, tenant, stackName);
-      } else {
-        logStep(`No Stage 1 AWS stack provisioned (${stackName}); skipping delete.`);
-      }
-    }
-  });
-
-  test('08.2a - Azure: Stage 1 Cloud Free-Tier VM Provisioning, PKO Preview & SSH Info Verification', async ({
-    request,
-  }) => {
-    const gate = resolveCloudTargetGate('azure');
-    test.skip(!gate.enabled, gate.reason);
-
-    await authenticateApiContext(request, adminPassword);
-    const stackName = `azure-vm-${Date.now()}`;
-    const tenant = 'default';
-    let stackProvisioned = false;
-
-    try {
-      logStep(`Creating proposal for azure-free-tier-vm (${stackName})...`);
-      const createRes = await request.post(`${BASE_URL}/api/v1/proposals`, {
-        data: {
-          catalogId: 'azure-free-tier-vm',
-          name: stackName,
-          tenant,
-          values: {
-            location: process.env.AZURE_LOCATION || 'eastus',
-            vmSize: process.env.KEEL_E2E_AZURE_VM_SIZE || 'Standard_B1s',
-            sshUser: 'azureuser',
-            sshPublicKey:
-              process.env.KEEL_E2E_SSH_PUBLIC_KEY ||
-              'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleKeyForKeelE2ETesting operator@keel.local',
-            armClientId: process.env.ARM_CLIENT_ID,
-            armClientSecret: process.env.ARM_CLIENT_SECRET,
-            armTenantId: process.env.ARM_TENANT_ID,
-            armSubscriptionId: process.env.ARM_SUBSCRIPTION_ID,
-          },
-        },
-      });
-      expect(createRes.ok(), `Failed to create Azure proposal: ${await createRes.text()}`).toBe(
+      expect(sshRes.ok(), `[${provider}] Expected ssh-info 200 OK, got ${sshRes.status()}`).toBe(
         true,
       );
-      stackProvisioned = true;
-
-      const proposal = (await createRes.json()) as { id: string | number };
-      logStep(`Polling preview diff for proposal #${proposal.id}...`);
-      const deadline = Date.now() + 180_000;
-      let previewReady = false;
-      while (Date.now() < deadline) {
-        const prevRes = await request.get(`${BASE_URL}/api/v1/previews/${proposal.id}`);
-        if (prevRes.ok()) {
-          const body = await prevRes.text();
-          if (body.includes('+ Create') || body.includes('create') || body.includes('preview')) {
-            previewReady = true;
-            break;
-          }
-        }
-        await new Promise((r) => setTimeout(r, 5000));
-      }
-      expect(previewReady).toBe(true);
-
-      logStep(`Merging proposal #${proposal.id}...`);
-      const mergeRes = await request.post(`${BASE_URL}/api/v1/proposals/${proposal.id}/merge`);
-      expect(mergeRes.ok()).toBe(true);
-
-      logStep(`Verifying stack SSH info for ${stackName}...`);
-      const sshRes = await request.get(
-        `${BASE_URL}/api/v1/stacks/tenant-${tenant}/${stackName}/ssh-info`,
+      const sshJson = (await sshRes.json()) as {
+        sshHost?: string;
+        sshPort?: number;
+        sshUser?: string;
+      };
+      expect(sshJson.sshHost, `[${provider}] Expected non-empty sshHost`).toBeTruthy();
+      expect(sshJson.sshPort).toBe(22);
+      expect(sshJson.sshUser).toBe(sshUser);
+      logStep(
+        `Verified SSH info: ${sshJson.sshUser}@${sshJson.sshHost}:${sshJson.sshPort}`,
+        provider,
       );
-      if (sshRes.ok()) {
-        const sshJson = (await sshRes.json()) as {
-          sshHost?: string;
-          sshPort?: number;
-          sshUser?: string;
-        };
-        expect(sshJson.sshPort).toBe(22);
-        expect(sshJson.sshUser).toBe('azureuser');
-      }
     } finally {
-      if (stackProvisioned) {
-        await deleteAndConfirmStage1StackRemoved(request, tenant, stackName);
-      } else {
-        logStep(`No Stage 1 Azure stack provisioned (${stackName}); skipping delete.`);
+      try {
+        if (stackMerged) {
+          await deleteAndConfirmStage1StackRemoved(request, tenant, stackName, provider);
+        } else if (prId !== undefined) {
+          logStep(`Closing unmerged proposal #${prId}; skipping stack delete.`, provider);
+          await request.post(`${BASE_URL}/api/v1/proposals/${prId}/reject`).catch(() => null);
+        } else {
+          logStep(`No Stage 1 stack provisioned (${stackName}); skipping delete.`, provider);
+        }
+      } finally {
+        await context.close();
       }
     }
-  });
+  }
 
-  test('08.3a - GCP: Stage 1 Cloud Free-Tier VM Provisioning, PKO Preview & SSH Info Verification', async ({
-    request,
+  test('08.1a - Parallel Multi-Cloud Stage 1 Free-Tier VM Provisioning, PKO Preview, SSH Info & Teardown', async ({
+    browser,
   }) => {
-    const gate = resolveCloudTargetGate('gcp');
-    test.skip(!gate.enabled, gate.reason);
+    const defaultSshKey =
+      process.env.KEEL_E2E_SSH_PUBLIC_KEY ||
+      'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleKeyForKeelE2ETesting operator@keel.local';
 
-    await authenticateApiContext(request, adminPassword);
-    const stackName = `gcp-vm-${Date.now()}`;
-    const tenant = 'default';
-    let stackProvisioned = false;
-
-    try {
-      logStep(`Creating proposal for gcp-free-tier-vm (${stackName})...`);
-      const createRes = await request.post(`${BASE_URL}/api/v1/proposals`, {
-        data: {
-          catalogId: 'gcp-free-tier-vm',
-          name: stackName,
-          tenant,
-          values: {
-            project: process.env.GCP_PROJECT || process.env.GOOGLE_PROJECT,
-            region: process.env.GCP_REGION || 'us-central1',
-            zone: process.env.GCP_ZONE || 'us-central1-a',
-            machineType: process.env.KEEL_E2E_GCP_MACHINE_TYPE || 'e2-micro',
-            sshUser: 'debian',
-            sshPublicKey:
-              process.env.KEEL_E2E_SSH_PUBLIC_KEY ||
-              'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleKeyForKeelE2ETesting operator@keel.local',
-            googleCredentials:
-              process.env.GOOGLE_CREDENTIALS || process.env.GOOGLE_APPLICATION_CREDENTIALS,
-          },
+    const specs: CloudVmSpec[] = [
+      {
+        provider: 'aws',
+        catalogId: 'aws-free-tier-vm',
+        sshUser: 'ubuntu',
+        values: {
+          region: process.env.AWS_REGION || 'us-east-1',
+          instanceType: process.env.KEEL_E2E_AWS_INSTANCE_TYPE || 't3.micro',
+          sshUser: 'ubuntu',
+          sshPublicKey: defaultSshKey,
+          awsAccessKeyId: process.env.AWS_ACCESS_KEY_ID,
+          awsSecretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
         },
-      });
-      expect(createRes.ok(), `Failed to create GCP proposal: ${await createRes.text()}`).toBe(true);
-      stackProvisioned = true;
+      },
+      {
+        provider: 'azure',
+        catalogId: 'azure-free-tier-vm',
+        sshUser: 'azureuser',
+        values: {
+          location: process.env.AZURE_LOCATION || 'eastus',
+          vmSize: process.env.KEEL_E2E_AZURE_VM_SIZE || 'Standard_B1s',
+          sshUser: 'azureuser',
+          sshPublicKey: defaultSshKey,
+          armClientId: process.env.ARM_CLIENT_ID,
+          armClientSecret: process.env.ARM_CLIENT_SECRET,
+          armTenantId: process.env.ARM_TENANT_ID,
+          armSubscriptionId: process.env.ARM_SUBSCRIPTION_ID,
+        },
+      },
+      {
+        provider: 'gcp',
+        catalogId: 'gcp-free-tier-vm',
+        sshUser: 'debian',
+        values: {
+          project: process.env.GCP_PROJECT || process.env.GOOGLE_PROJECT,
+          region: process.env.GCP_REGION || 'us-central1',
+          zone: process.env.GCP_ZONE || 'us-central1-a',
+          machineType: process.env.KEEL_E2E_GCP_MACHINE_TYPE || 'e2-micro',
+          sshUser: 'debian',
+          sshPublicKey: defaultSshKey,
+          googleCredentials:
+            process.env.GOOGLE_CREDENTIALS || process.env.GOOGLE_APPLICATION_CREDENTIALS,
+        },
+      },
+    ];
 
-      const proposal = (await createRes.json()) as { id: string | number };
-      logStep(`Polling preview diff for proposal #${proposal.id}...`);
-      const deadline = Date.now() + 180_000;
-      let previewReady = false;
-      while (Date.now() < deadline) {
-        const prevRes = await request.get(`${BASE_URL}/api/v1/previews/${proposal.id}`);
-        if (prevRes.ok()) {
-          const body = await prevRes.text();
-          if (body.includes('+ Create') || body.includes('create') || body.includes('preview')) {
-            previewReady = true;
-            break;
-          }
-        }
-        await new Promise((r) => setTimeout(r, 5000));
-      }
-      expect(previewReady).toBe(true);
-
-      logStep(`Merging proposal #${proposal.id}...`);
-      const mergeRes = await request.post(`${BASE_URL}/api/v1/proposals/${proposal.id}/merge`);
-      expect(mergeRes.ok()).toBe(true);
-
-      logStep(`Verifying stack SSH info for ${stackName}...`);
-      const sshRes = await request.get(
-        `${BASE_URL}/api/v1/stacks/tenant-${tenant}/${stackName}/ssh-info`,
-      );
-      if (sshRes.ok()) {
-        const sshJson = (await sshRes.json()) as {
-          sshHost?: string;
-          sshPort?: number;
-          sshUser?: string;
-        };
-        expect(sshJson.sshPort).toBe(22);
-        expect(sshJson.sshUser).toBe('debian');
-      }
-    } finally {
-      if (stackProvisioned) {
-        await deleteAndConfirmStage1StackRemoved(request, tenant, stackName);
+    const enabledSpecs: CloudVmSpec[] = [];
+    for (const spec of specs) {
+      const gate = resolveCloudTargetGate(spec.provider);
+      if (gate.enabled) {
+        enabledSpecs.push(spec);
       } else {
-        logStep(`No Stage 1 GCP stack provisioned (${stackName}); skipping delete.`);
+        logStep(`SKIPPED: ${gate.reason}`, spec.provider);
       }
+    }
+
+    test.skip(
+      enabledSpecs.length === 0,
+      'No cloud providers enabled (set KEEL_E2E_CLOUD_<PROVIDER>=1 or KEEL_E2E_CLOUD_ALL=1 with credentials)',
+    );
+
+    logStep(
+      `Running ${enabledSpecs.length} cloud provider(s) in parallel: ${enabledSpecs.map((s) => s.provider).join(', ')}`,
+    );
+
+    const results = await Promise.allSettled(
+      enabledSpecs.map((spec) => runStage1CloudVmLifecycle(browser, spec)),
+    );
+
+    const failures = results
+      .map((r, i) => ({ result: r, provider: enabledSpecs[i].provider }))
+      .filter(
+        (x): x is { result: PromiseRejectedResult; provider: CloudProvider } =>
+          x.result.status === 'rejected',
+      );
+
+    if (failures.length > 0) {
+      const summary = failures
+        .map(
+          (f) =>
+            `[${f.provider}] ${f.result.reason instanceof Error ? f.result.reason.message : String(f.result.reason)}`,
+        )
+        .join('\n\n');
+      throw new Error(`${failures.length} cloud provider(s) failed:\n\n${summary}`);
     }
   });
 });
