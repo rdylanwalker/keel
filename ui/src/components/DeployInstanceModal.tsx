@@ -502,24 +502,30 @@ const DeployInstanceModalBody: React.FC<DeployInstanceModalProps> = ({
             </select>
           </div>
         )}
-        {(isManagementAddon || activeItem.type === "app") && (
-          <div>
-            <label
-              htmlFor="chart-version-input"
-              className="block text-[11px] font-medium text-slate-300 mb-1"
-            >
-              Chart Version
-            </label>
-            <input
-              id="chart-version-input"
-              type="text"
-              value={chartVersion}
-              onChange={(e) => setChartVersion(e.target.value)}
-              placeholder={activeItem.version || "latest"}
-              className="w-full bg-slate-950 border border-slate-800 text-xs text-slate-200 rounded-lg px-3 py-1.5 focus:outline-none focus:ring-1 focus:ring-indigo-500 font-mono"
-            />
-          </div>
-        )}
+        {activeItem.runtime !== "manifest" &&
+          (isManagementAddon || activeItem.type === "app") && (
+            <div>
+              <label
+                htmlFor="chart-version-input"
+                className="block text-[11px] font-medium text-slate-300 mb-1"
+              >
+                {activeItem.runtime === "kustomize"
+                  ? "Git Ref / Version"
+                  : "Chart Version"}
+              </label>
+              <input
+                id="chart-version-input"
+                type="text"
+                value={chartVersion}
+                onChange={(e) => setChartVersion(e.target.value)}
+                placeholder={
+                  activeItem.version ||
+                  (activeItem.runtime === "kustomize" ? "main" : "latest")
+                }
+                className="w-full bg-slate-950 border border-slate-800 text-xs text-slate-200 rounded-lg px-3 py-1.5 focus:outline-none focus:ring-1 focus:ring-indigo-500 font-mono"
+              />
+            </div>
+          )}
         {!isManagementAddon && activeItem.type === "app" && (
           <>
             <div>
@@ -764,6 +770,7 @@ const DeployInstanceModalBody: React.FC<DeployInstanceModalProps> = ({
 
           <div className="flex items-center space-x-2 shrink-0">
             {(activeItem?.type === "app" || isManagementAddon) &&
+              activeItem?.runtime !== "manifest" &&
               activeItem?.repoUrl && (
                 <button
                   type="button"

@@ -376,7 +376,7 @@ describe("CatalogWizardView component and jsonToYaml helper", () => {
     fireEvent.change(screen.getByLabelText(/Repository URL \*/i), {
       target: { value: "https://github.com/stefanprodan/podinfo" },
     })
-    fireEvent.change(screen.getByLabelText(/Chart Name \(Helm\) \/ Path/i), {
+    fireEvent.change(screen.getByLabelText(/Chart Name \*/i), {
       target: { value: "podinfo" },
     })
     fireEvent.change(screen.getByLabelText(/Version/i), {
@@ -442,7 +442,7 @@ describe("CatalogWizardView component and jsonToYaml helper", () => {
     fireEvent.change(screen.getByLabelText(/Runtime \*/i), {
       target: { value: "kustomize" },
     })
-    fireEvent.change(screen.getByLabelText(/Chart Name \(Helm\) \/ Path/i), {
+    fireEvent.change(screen.getByLabelText(/^Path$/i), {
       target: { value: "./base" },
     })
     fireEvent.change(screen.getByLabelText(/Version/i), {
@@ -971,7 +971,7 @@ describe("CatalogWizardView component and jsonToYaml helper", () => {
     fireEvent.change(screen.getByLabelText(/Item Name \*/i), {
       target: { value: "Podinfo Pro" },
     })
-    fireEvent.change(screen.getByLabelText(/^Version$/i), {
+    fireEvent.change(screen.getByLabelText(/Version/i), {
       target: { value: "6.8.0" },
     })
 

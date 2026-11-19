@@ -695,31 +695,36 @@ export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
                     manifestsYaml:
                       appForm.manifestsYaml || DEFAULT_STARTER_MANIFEST,
                     defaultEngine: appForm.defaultEngine || "flux",
+                    repoUrl: !appForm.repoUrl?.trim()
+                      ? "https://kubernetes.io/docs/concepts/overview/working-with-objects/"
+                      : appForm.repoUrl.trim(),
+                    path: !appForm.path?.trim()
+                      ? "./manifests.yaml"
+                      : appForm.path.trim(),
+                    chart: isEditing ? "" : undefined,
+                    version: isEditing ? "" : undefined,
                   }
-                : {}),
-              repoUrl:
-                appForm.runtime === "manifest" && !appForm.repoUrl?.trim()
-                  ? "https://kubernetes.io/docs/concepts/overview/working-with-objects/"
-                  : appForm.repoUrl?.trim() || "",
-              chart: isEditing
-                ? (appForm.chart?.trim() ?? "")
-                : appForm.chart?.trim() || undefined,
-              version: isEditing
-                ? (appForm.version?.trim() ?? "")
-                : appForm.version?.trim() || undefined,
-              ...(isEditing
-                ? {
-                    path:
-                      appForm.runtime === "manifest" && !appForm.path?.trim()
-                        ? "./manifests.yaml"
-                        : (appForm.path?.trim() ?? ""),
-                  }
-                : {
-                    path:
-                      appForm.runtime === "manifest" && !appForm.path?.trim()
-                        ? "./manifests.yaml"
+                : appForm.runtime === "kustomize"
+                  ? {
+                      repoUrl: appForm.repoUrl?.trim() || "",
+                      path: isEditing
+                        ? (appForm.path?.trim() ?? "")
                         : appForm.path?.trim() || undefined,
-                  }),
+                      version: isEditing
+                        ? (appForm.version?.trim() ?? "")
+                        : appForm.version?.trim() || undefined,
+                      chart: isEditing ? "" : undefined,
+                    }
+                  : {
+                      repoUrl: appForm.repoUrl?.trim() || "",
+                      chart: isEditing
+                        ? (appForm.chart?.trim() ?? "")
+                        : appForm.chart?.trim() || undefined,
+                      version: isEditing
+                        ? (appForm.version?.trim() ?? "")
+                        : appForm.version?.trim() || undefined,
+                      path: isEditing ? "" : undefined,
+                    }),
               flaggerSupported: !!appForm.flaggerSupported,
               ...(parsedSchema ? { schema: parsedSchema } : {}),
             }
@@ -1544,81 +1549,130 @@ export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
                       </div>
                     )}
 
-                    <div>
-                      <label
-                        htmlFor="app-repourl"
-                        className="block text-xs text-slate-300 font-medium mb-1"
-                      >
-                        Repository URL{" "}
-                        {appForm.runtime === "manifest"
-                          ? "(Optional for Raw Manifests)"
-                          : "*"}
-                      </label>
-                      <input
-                        id="app-repourl"
-                        type="text"
-                        required={appForm.runtime !== "manifest"}
-                        placeholder={
-                          appForm.runtime === "manifest"
-                            ? "https://kubernetes.io/docs/concepts/overview/working-with-objects/ (optional)"
-                            : "https://github.com/stefanprodan/podinfo"
-                        }
-                        value={appForm.repoUrl || ""}
-                        onChange={(e) =>
-                          setAppForm((prev) => ({
-                            ...prev,
-                            repoUrl: e.target.value,
-                          }))
-                        }
-                        className="w-full px-3 py-2 bg-slate-950 border border-slate-800 rounded-lg text-xs text-slate-100 placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-indigo-500 font-mono"
-                      />
-                    </div>
+                    {appForm.runtime !== "manifest" && (
+                      <>
+                        <div>
+                          <label
+                            htmlFor="app-repourl"
+                            className="block text-xs text-slate-300 font-medium mb-1"
+                          >
+                            Repository URL *
+                          </label>
+                          <input
+                            id="app-repourl"
+                            type="text"
+                            required
+                            placeholder={
+                              appForm.runtime === "kustomize"
+                                ? "https://github.com/stefanprodan/podinfo"
+                                : "https://github.com/stefanprodan/podinfo or chart repo URL"
+                            }
+                            value={appForm.repoUrl || ""}
+                            onChange={(e) =>
+                              setAppForm((prev) => ({
+                                ...prev,
+                                repoUrl: e.target.value,
+                              }))
+                            }
+                            className="w-full px-3 py-2 bg-slate-950 border border-slate-800 rounded-lg text-xs text-slate-100 placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-indigo-500 font-mono"
+                          />
+                        </div>
 
-                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                      <div>
-                        <label
-                          htmlFor="app-chart"
-                          className="block text-xs text-slate-300 font-medium mb-1"
-                        >
-                          Chart Name (Helm) / Path
-                        </label>
-                        <input
-                          id="app-chart"
-                          type="text"
-                          placeholder="podinfo"
-                          value={appForm.chart || ""}
-                          onChange={(e) =>
-                            setAppForm((prev) => ({
-                              ...prev,
-                              chart: e.target.value,
-                            }))
-                          }
-                          className="w-full px-3 py-2 bg-slate-950 border border-slate-800 rounded-lg text-xs text-slate-100 placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-indigo-500 font-mono"
-                        />
-                      </div>
+                        {appForm.runtime === "helm" ? (
+                          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                            <div>
+                              <label
+                                htmlFor="app-chart"
+                                className="block text-xs text-slate-300 font-medium mb-1"
+                              >
+                                Chart Name *
+                              </label>
+                              <input
+                                id="app-chart"
+                                type="text"
+                                placeholder="podinfo"
+                                value={appForm.chart || ""}
+                                onChange={(e) =>
+                                  setAppForm((prev) => ({
+                                    ...prev,
+                                    chart: e.target.value,
+                                  }))
+                                }
+                                className="w-full px-3 py-2 bg-slate-950 border border-slate-800 rounded-lg text-xs text-slate-100 placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-indigo-500 font-mono"
+                              />
+                            </div>
 
-                      <div>
-                        <label
-                          htmlFor="app-version"
-                          className="block text-xs text-slate-300 font-medium mb-1"
-                        >
-                          Version
-                        </label>
-                        <input
-                          id="app-version"
-                          type="text"
-                          placeholder="6.7.0"
-                          value={appForm.version || ""}
-                          onChange={(e) =>
-                            setAppForm((prev) => ({
-                              ...prev,
-                              version: e.target.value,
-                            }))
-                          }
-                          className="w-full px-3 py-2 bg-slate-950 border border-slate-800 rounded-lg text-xs text-slate-100 placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-indigo-500 font-mono"
-                        />
-                      </div>
-                    </div>
+                            <div>
+                              <label
+                                htmlFor="app-version"
+                                className="block text-xs text-slate-300 font-medium mb-1"
+                              >
+                                Chart Version
+                              </label>
+                              <input
+                                id="app-version"
+                                type="text"
+                                placeholder="6.7.0"
+                                value={appForm.version || ""}
+                                onChange={(e) =>
+                                  setAppForm((prev) => ({
+                                    ...prev,
+                                    version: e.target.value,
+                                  }))
+                                }
+                                className="w-full px-3 py-2 bg-slate-950 border border-slate-800 rounded-lg text-xs text-slate-100 placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-indigo-500 font-mono"
+                              />
+                            </div>
+                          </div>
+                        ) : (
+                          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                            <div>
+                              <label
+                                htmlFor="app-path"
+                                className="block text-xs text-slate-300 font-medium mb-1"
+                              >
+                                Path
+                              </label>
+                              <input
+                                id="app-path"
+                                type="text"
+                                placeholder="./base"
+                                value={appForm.path || ""}
+                                onChange={(e) =>
+                                  setAppForm((prev) => ({
+                                    ...prev,
+                                    path: e.target.value,
+                                  }))
+                                }
+                                className="w-full px-3 py-2 bg-slate-950 border border-slate-800 rounded-lg text-xs text-slate-100 placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-indigo-500 font-mono"
+                              />
+                            </div>
+
+                            <div>
+                              <label
+                                htmlFor="app-version"
+                                className="block text-xs text-slate-300 font-medium mb-1"
+                              >
+                                Version / Git Ref
+                              </label>
+                              <input
+                                id="app-version"
+                                type="text"
+                                placeholder="v6.7.0"
+                                value={appForm.version || ""}
+                                onChange={(e) =>
+                                  setAppForm((prev) => ({
+                                    ...prev,
+                                    version: e.target.value,
+                                  }))
+                                }
+                                className="w-full px-3 py-2 bg-slate-950 border border-slate-800 rounded-lg text-xs text-slate-100 placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-indigo-500 font-mono"
+                              />
+                            </div>
+                          </div>
+                        )}
+                      </>
+                    )}
 
                     <div className="flex items-center space-x-2 pt-1">
                       <input
