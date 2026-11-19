@@ -4879,6 +4879,35 @@ pub async fn merge_proposal(
             .await;
     }
 
+    if merged.title.starts_with("feat(providers):")
+        && let Ok(registry) = load_provider_registry(&state.repo_workdir).await
+    {
+        let enabled_ids: Vec<String> = registry
+            .providers
+            .into_iter()
+            .filter(|p| p.enabled)
+            .map(|p| p.id)
+            .collect();
+        if let Ok(policy_val) = keel_kube::build_restrict_pulumi_providers_policy(&enabled_ids)
+            && let Ok(policy_json) = serde_json::to_string(&policy_val)
+        {
+            use tokio::io::AsyncWriteExt;
+            if let Ok(mut child) = tokio::process::Command::new("kubectl")
+                .args(["apply", "-f", "-"])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+            {
+                if let Some(mut stdin) = child.stdin.take() {
+                    let _ = stdin.write_all(policy_json.as_bytes()).await;
+                    let _ = stdin.shutdown().await;
+                }
+                let _ = child.wait().await;
+            }
+        }
+    }
+
     let cached = state.preview_cache.write().await.remove(&pr_id);
     let gc_plan = if let Some(entry) = cached {
         let plan = plan_preview_gc(&entry.candidates, &[pr_id.as_str()]);

@@ -204,6 +204,36 @@ async function signInViaRauthy(
   });
 }
 
+function triggerFluxReconcile(): void {
+  const ts = new Date().toISOString();
+  tryCmd('kubectl', [
+    'annotate',
+    '--overwrite',
+    'gitrepository/flux-system',
+    '-n',
+    'flux-system',
+    `reconcile.fluxcd.io/requestedAt=${ts}`,
+  ]);
+  tryCmd('kubectl', [
+    'annotate',
+    '--overwrite',
+    'kustomization/keel-tenants',
+    '-n',
+    'flux-system',
+    `reconcile.fluxcd.io/requestedAt=${ts}`,
+  ]);
+}
+
+let gitPrChain: Promise<void> = Promise.resolve();
+function withGitPrLock<T>(fn: () => Promise<T>): Promise<T> {
+  const next = gitPrChain.then(fn, fn);
+  gitPrChain = next.then(
+    () => undefined,
+    () => undefined,
+  );
+  return next;
+}
+
 async function waitForStackReady(
   name: string,
   namespace: string,
@@ -215,9 +245,7 @@ async function waitForStackReady(
   const timeoutSec = Math.round(timeoutMs / 1000);
   let lastLog = 0;
 
-  // Nudge Flux GitRepository/Kustomization if flux CLI is available so reconciliation starts immediately
-  tryCmd('flux', ['reconcile', 'source', 'git', 'flux-system', '-n', 'flux-system']);
-  tryCmd('flux', ['reconcile', 'kustomization', 'flux-system', '-n', 'flux-system']);
+  triggerFluxReconcile();
 
   while (Date.now() < deadline) {
     const res = tryCmd('kubectl', [
@@ -247,8 +275,18 @@ async function waitForStackReady(
       }
     } else if (Date.now() - lastLog > 15_000) {
       const elapsed = Math.round((Date.now() - start) / 1000);
+      const ks = tryCmd('kubectl', [
+        'get',
+        'kustomization',
+        'keel-tenants',
+        '-n',
+        'flux-system',
+        '-o',
+        'jsonpath={.status.conditions[?(@.type=="Ready")].status}:{.status.conditions[?(@.type=="Ready")].message}',
+      ]);
+      const ksInfo = ks.ok && ks.stdout ? ` (keel-tenants=${ks.stdout})` : '';
       logStep(
-        `Waiting for Flux to create PKO v2 Stack ${namespace}/${name} (${elapsed}s/${timeoutSec}s)...`,
+        `Waiting for Flux to create PKO v2 Stack ${namespace}/${name} (${elapsed}s/${timeoutSec}s)${ksInfo}...`,
         provider,
       );
       lastLog = Date.now();
@@ -275,24 +313,29 @@ async function deleteAndConfirmStage1StackRemoved(
 ): Promise<void> {
   const namespace = `tenant-${tenant}`;
   logStep(`Requesting deletion of Stage 1 stack ${namespace}/${stackName}...`, provider);
-  const delRes = await request
-    .delete(`${BASE_URL}/api/v1/stacks/${namespace}/${stackName}`)
-    .catch(() => null);
-  if (!delRes || !delRes.ok()) {
-    return;
-  }
+  const deletedPr = await withGitPrLock(async () => {
+    const delRes = await request
+      .delete(`${BASE_URL}/api/v1/stacks/${namespace}/${stackName}`)
+      .catch(() => null);
+    if (!delRes || !delRes.ok()) {
+      return false;
+    }
 
-  const delJson = (await delRes.json().catch(() => null)) as {
-    id?: string | number;
-    proposal?: { id?: string | number };
-  } | null;
-  const delPrId = delJson?.proposal?.id ?? delJson?.id;
-  if (delPrId !== undefined) {
-    logStep(`Merging deletion PR #${delPrId} for ${namespace}/${stackName}...`, provider);
-    const mergeRes = await request.post(`${BASE_URL}/api/v1/proposals/${delPrId}/merge`);
-    expect(mergeRes.ok()).toBe(true);
-    tryCmd('flux', ['reconcile', 'source', 'git', 'flux-system', '-n', 'flux-system']);
-    tryCmd('flux', ['reconcile', 'kustomization', 'flux-system', '-n', 'flux-system']);
+    const delJson = (await delRes.json().catch(() => null)) as {
+      id?: string | number;
+      proposal?: { id?: string | number };
+    } | null;
+    const delPrId = delJson?.proposal?.id ?? delJson?.id;
+    if (delPrId !== undefined) {
+      logStep(`Merging deletion PR #${delPrId} for ${namespace}/${stackName}...`, provider);
+      const mergeRes = await request.post(`${BASE_URL}/api/v1/proposals/${delPrId}/merge`);
+      expect(mergeRes.ok()).toBe(true);
+      triggerFluxReconcile();
+    }
+    return true;
+  });
+  if (!deletedPr) {
+    return;
   }
 
   // 1. Poll GET /api/v1/stacks until the stack is confirmed removed from Keel
@@ -682,67 +725,69 @@ test.describe('08.1 - Multi-Cloud Free-Tier Stage 1 Live E2E (kind Management Cl
       logStep(`Signing into Keel UI via Rauthy OIDC...`, provider);
       await signInViaRauthy(page, 'admin@keel.local', adminPassword);
 
-      logStep(`Creating proposal for ${catalogId} (${stackName})...`, provider);
-      const createRes = await request.post(`${BASE_URL}/api/v1/proposals`, {
-        data: {
-          catalogId,
-          name: stackName,
-          tenant,
-          values,
-        },
-      });
-      expect(
-        createRes.ok(),
-        `[${provider}] Failed to create proposal: ${await createRes.text()}`,
-      ).toBe(true);
+      await withGitPrLock(async () => {
+        logStep(`Creating proposal for ${catalogId} (${stackName})...`, provider);
+        const createRes = await request.post(`${BASE_URL}/api/v1/proposals`, {
+          data: {
+            catalogId,
+            name: stackName,
+            tenant,
+            values,
+          },
+        });
+        expect(
+          createRes.ok(),
+          `[${provider}] Failed to create proposal: ${await createRes.text()}`,
+        ).toBe(true);
 
-      const created = (await createRes.json()) as {
-        id?: string | number;
-        proposal?: { id?: string | number };
-      };
-      prId = created.proposal?.id ?? created.id;
-      expect(
-        prId,
-        `[${provider}] Missing proposal.id in response: ${JSON.stringify(created)}`,
-      ).toBeTruthy();
+        const created = (await createRes.json()) as {
+          id?: string | number;
+          proposal?: { id?: string | number };
+        };
+        prId = created.proposal?.id ?? created.id;
+        expect(
+          prId,
+          `[${provider}] Missing proposal.id in response: ${JSON.stringify(created)}`,
+        ).toBeTruthy();
 
-      const previewTimeoutSec = Math.round(PREVIEW_TIMEOUT_MS / 1000);
-      logStep(
-        `Polling preview diff for proposal #${prId} (timeout ${previewTimeoutSec}s)...`,
-        provider,
-      );
-      const prevStart = Date.now();
-      const prevDeadline = prevStart + PREVIEW_TIMEOUT_MS;
-      let prevLastLog = 0;
-      let previewReady = false;
-      while (Date.now() < prevDeadline) {
-        const prevRes = await request.get(`${BASE_URL}/api/v1/proposals/${prId}/preview`);
-        if (prevRes.ok()) {
-          const body = await prevRes.text();
-          if (body.includes('+ Create') || body.includes('create') || body.includes('preview')) {
-            previewReady = true;
-            break;
+        const previewTimeoutSec = Math.round(PREVIEW_TIMEOUT_MS / 1000);
+        logStep(
+          `Polling preview diff for proposal #${prId} (timeout ${previewTimeoutSec}s)...`,
+          provider,
+        );
+        const prevStart = Date.now();
+        const prevDeadline = prevStart + PREVIEW_TIMEOUT_MS;
+        let prevLastLog = 0;
+        let previewReady = false;
+        while (Date.now() < prevDeadline) {
+          const prevRes = await request.get(`${BASE_URL}/api/v1/proposals/${prId}/preview`);
+          if (prevRes.ok()) {
+            const body = await prevRes.text();
+            if (body.includes('+ Create') || body.includes('create') || body.includes('preview')) {
+              previewReady = true;
+              break;
+            }
           }
+          if (Date.now() - prevLastLog > 15_000) {
+            const elapsed = Math.round((Date.now() - prevStart) / 1000);
+            logStep(
+              `Still waiting for preview #${prId} (${elapsed}s/${previewTimeoutSec}s)...`,
+              provider,
+            );
+            prevLastLog = Date.now();
+          }
+          await new Promise((r) => setTimeout(r, 5000));
         }
-        if (Date.now() - prevLastLog > 15_000) {
-          const elapsed = Math.round((Date.now() - prevStart) / 1000);
-          logStep(
-            `Still waiting for preview #${prId} (${elapsed}s/${previewTimeoutSec}s)...`,
-            provider,
-          );
-          prevLastLog = Date.now();
-        }
-        await new Promise((r) => setTimeout(r, 5000));
-      }
-      expect(
-        previewReady,
-        `[${provider}] Timed out after ${previewTimeoutSec}s waiting for preview #${prId}`,
-      ).toBe(true);
+        expect(
+          previewReady,
+          `[${provider}] Timed out after ${previewTimeoutSec}s waiting for preview #${prId}`,
+        ).toBe(true);
 
-      logStep(`Merging proposal #${prId}...`, provider);
-      const mergeRes = await request.post(`${BASE_URL}/api/v1/proposals/${prId}/merge`);
-      expect(mergeRes.ok()).toBe(true);
-      stackMerged = true;
+        logStep(`Merging proposal #${prId}...`, provider);
+        const mergeRes = await request.post(`${BASE_URL}/api/v1/proposals/${prId}/merge`);
+        expect(mergeRes.ok(), `[${provider}] Merge failed: ${await mergeRes.text()}`).toBe(true);
+        stackMerged = true;
+      });
 
       logStep(
         `Waiting for PKO v2 Stack tenant-${tenant}/${stackName} to provision VM...`,
@@ -856,6 +901,48 @@ test.describe('08.1 - Multi-Cloud Free-Tier Stage 1 Live E2E (kind Management Cl
     logStep(
       `Running ${enabledSpecs.length} cloud provider(s) in parallel: ${enabledSpecs.map((s) => s.provider).join(', ')}`,
     );
+
+    // Ensure all enabled cloud providers are toggled on in providers/registry.yaml and Kyverno
+    // `restrict-pulumi-providers` before launching Stage 1 cloud VM proposals in parallel.
+    {
+      const setupContext = await browser.newContext({ ignoreHTTPSErrors: true, baseURL: BASE_URL });
+      const setupPage = await setupContext.newPage();
+      try {
+        await signInViaRauthy(setupPage, 'admin@keel.local', adminPassword);
+        const providersRes = await setupPage.request.get(`${BASE_URL}/api/v1/providers`);
+        expect(providersRes.ok()).toBe(true);
+        const providersBody = (await providersRes.json()) as {
+          providers?: Array<{ id: string; enabled: boolean }>;
+        };
+        const currentProviders = providersBody.providers ?? [];
+        for (const spec of enabledSpecs) {
+          const entry = currentProviders.find((p) => p.id === spec.provider);
+          if (!entry?.enabled) {
+            logStep(`Enabling provider "${spec.provider}" via Keel API...`, spec.provider);
+            const toggleRes = await setupPage.request.post(
+              `${BASE_URL}/api/v1/providers/${spec.provider}/toggle`,
+              { data: { enabled: true } },
+            );
+            expect(
+              toggleRes.ok(),
+              `[${spec.provider}] Failed to toggle provider: ${await toggleRes.text()}`,
+            ).toBe(true);
+            const toggleJson = (await toggleRes.json()) as {
+              proposal?: { id?: string | number };
+            };
+            const togglePrId = toggleJson.proposal?.id;
+            if (togglePrId !== undefined) {
+              const mergeRes = await setupPage.request.post(
+                `${BASE_URL}/api/v1/proposals/${togglePrId}/merge`,
+              );
+              expect(mergeRes.ok()).toBe(true);
+            }
+          }
+        }
+      } finally {
+        await setupContext.close();
+      }
+    }
 
     const results = await Promise.allSettled(
       enabledSpecs.map((spec) => runStage1CloudVmLifecycle(browser, spec)),
