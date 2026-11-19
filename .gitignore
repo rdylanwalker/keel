@@ -12,6 +12,8 @@ e2e/test-results/
 
 # Environment & System
 .env
+.env.*
+!.env.*.example
 .DS_Store
 
 # mdBook build output

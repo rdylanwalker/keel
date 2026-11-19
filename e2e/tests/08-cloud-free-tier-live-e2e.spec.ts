@@ -7,6 +7,41 @@ import { fileURLToPath } from 'node:url';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+const REPO_ROOT = path.resolve(__dirname, '../..');
+
+/**
+ * Automatically loads non-empty `KEY=VALUE` lines from `<repo>/.env.cloud-e2e` into `process.env`
+ * if the file exists and the variable is not already set in the environment.
+ */
+function loadDotEnvCloudFile(envFilePath = path.join(REPO_ROOT, '.env.cloud-e2e')): void {
+  if (!fs.existsSync(envFilePath)) {
+    return;
+  }
+  const content = fs.readFileSync(envFilePath, 'utf-8');
+  for (const rawLine of content.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith('#')) {
+      continue;
+    }
+    const eqIdx = line.indexOf('=');
+    if (eqIdx <= 0) {
+      continue;
+    }
+    const key = line.slice(0, eqIdx).trim();
+    let value = line.slice(eqIdx + 1).trim();
+    if (
+      (value.startsWith('"') && value.endsWith('"')) ||
+      (value.startsWith("'") && value.endsWith("'"))
+    ) {
+      value = value.slice(1, -1);
+    }
+    if (value.length > 0 && process.env[key] === undefined) {
+      process.env[key] = value;
+    }
+  }
+}
+
+loadDotEnvCloudFile();
 
 export interface CloudGateResult {
   enabled: boolean;

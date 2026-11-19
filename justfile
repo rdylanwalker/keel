@@ -319,8 +319,17 @@ test-ui:
 test-e2e: build
     pnpm --dir e2e test
 
-# Run multi-cloud free-tier live E2E suite (AWS/Azure/GCP)
+# Run multi-cloud free-tier live E2E suite (AWS/Azure/GCP; auto-loads .env.cloud-e2e if present)
 test-e2e-cloud: build
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ -f ".env.cloud-e2e" ]; then
+        echo "Loading cloud E2E variables from .env.cloud-e2e..."
+        set -a
+        # shellcheck disable=SC1091
+        source .env.cloud-e2e
+        set +a
+    fi
     pnpm --dir e2e test:live:cloud
 
 # Run all unit and E2E tests
