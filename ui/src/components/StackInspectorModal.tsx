@@ -71,6 +71,18 @@ export const StackInspectorModal: React.FC<StackInspectorModalProps> = ({
       line.includes("the stack is currently locked by")
     ) ??
       false)
+  const isTerminating =
+    kind === "stack" && Boolean(diag?.metadata?.deletionTimestamp)
+  const isWaitingForWorkspace =
+    kind === "stack" &&
+    (diag?.conditions?.some(
+      (c) =>
+        c.type === "Reconciling" &&
+        c.status === "True" &&
+        (c.message?.toLowerCase().includes("workspace") ||
+          c.reason === "StackProcessing")
+    ) ??
+      false)
 
   const fetchDiag = useCallback(
     () =>
@@ -338,6 +350,36 @@ export const StackInspectorModal: React.FC<StackInspectorModalProps> = ({
               : "overflow-y-auto space-y-5"
           }`}
         >
+          {isTerminating && (
+            <div
+              data-testid="inspector-terminating-banner"
+              className="shrink-0 p-3 rounded-xl bg-orange-500/10 border border-orange-500/40 text-xs text-orange-200 flex flex-wrap items-center justify-between gap-3"
+            >
+              <div className="flex items-center space-x-2">
+                <AlertTriangle className="h-4 w-4 text-orange-400 shrink-0" />
+                <span>
+                  {isWaitingForWorkspace
+                    ? "This stack is terminating and waiting for its workspace pod to become ready before running pulumi destroy. Try Restart Workspace before resorting to Force Delete."
+                    : "This stack is terminating while Pulumi destroys its cloud resources. It will be removed automatically once finalized."}
+                </span>
+              </div>
+              {isWaitingForWorkspace && (
+                <button
+                  type="button"
+                  onClick={handleRestart}
+                  disabled={restarting || forceDeleting || unlocking}
+                  className="flex items-center space-x-1.5 px-2.5 py-1 rounded-lg bg-amber-600 hover:bg-amber-500 text-white font-semibold cursor-pointer disabled:opacity-50"
+                >
+                  <RefreshCw
+                    className={`h-3.5 w-3.5 ${restarting ? "animate-spin" : ""}`}
+                  />
+                  <span>
+                    {restarting ? "Restarting..." : "Restart Workspace"}
+                  </span>
+                </button>
+              )}
+            </div>
+          )}
           {isStackLocked && (
             <div className="shrink-0 p-3 rounded-xl bg-amber-500/10 border border-amber-500/40 text-xs text-amber-200 flex flex-wrap items-center justify-between gap-3">
               <div className="flex items-center space-x-2">
@@ -369,6 +411,11 @@ export const StackInspectorModal: React.FC<StackInspectorModalProps> = ({
                     {namespace}/{name}
                   </code>
                   ? Pulumi will not destroy any remaining cloud resources.
+                  {isWaitingForWorkspace
+                    ? " This stack is currently waiting on workspace readiness — try Restart Workspace first."
+                    : !isTerminating
+                      ? " This stack is not currently terminating."
+                      : ""}
                 </span>
               </div>
               <div className="flex items-center space-x-2">

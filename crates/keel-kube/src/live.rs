@@ -85,6 +85,8 @@ pub struct ResourceMetadata {
     pub uid: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub creation_timestamp: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deletion_timestamp: Option<String>,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub labels: std::collections::BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
@@ -1095,6 +1097,7 @@ impl LiveStatusSource for KubeClusterStatusReader {
         }
 
         let was_terminating = existing.metadata.deletion_timestamp.is_some();
+        let warning_suffix = force_delete_warning_suffix(&existing.data);
         let patch = json!({
             "metadata": {
                 "finalizers": Value::Null
@@ -1111,10 +1114,14 @@ impl LiveStatusSource for KubeClusterStatusReader {
             }
         }
 
-        Ok(if was_terminating {
+        let base_msg = if was_terminating {
             format!("Cleared finalizers on terminating Stack {namespace}/{name}")
         } else {
             format!("Cleared finalizers and force-deleted Stack {namespace}/{name}")
+        };
+        Ok(match warning_suffix {
+            Some(warn) => format!("{base_msg}. {warn}"),
+            None => base_msg,
         })
     }
 
@@ -1296,6 +1303,11 @@ pub fn extract_resource_metadata(
         creation_timestamp: obj
             .metadata
             .creation_timestamp
+            .as_ref()
+            .map(|t| t.0.to_string()),
+        deletion_timestamp: obj
+            .metadata
+            .deletion_timestamp
             .as_ref()
             .map(|t| t.0.to_string()),
         labels: obj.metadata.labels.clone().unwrap_or_default(),
@@ -1602,6 +1614,25 @@ async fn exec_pod_command(
     Ok((ok, combined))
 }
 
+pub fn force_delete_warning_suffix(data: &Value) -> Option<String> {
+    let resource_count = extract_resource_count(data).unwrap_or(0);
+    let last_state = data
+        .pointer("/status/lastUpdate/state")
+        .and_then(Value::as_str);
+    if resource_count > 0 {
+        Some(format!(
+            "Warning: {resource_count} tracked cloud resource(s) were not destroyed by Pulumi and may need manual cleanup."
+        ))
+    } else if last_state == Some("failed") {
+        Some(
+            "Warning: the last update failed; partially provisioned cloud resources were not destroyed by Pulumi and may need manual cleanup."
+                .to_string(),
+        )
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1797,5 +1828,52 @@ mod tests {
         }))
         .unwrap();
         assert!(extract_stack_unlock_params(&traversal_dir).is_err());
+    }
+
+    #[test]
+    fn force_delete_warning_suffix_flags_tracked_or_failed_resources() {
+        let with_resources = json!({
+            "status": {
+                "lastUpdate": { "state": "succeeded", "resourceChanges": { "create": 5 } }
+            }
+        });
+        assert!(
+            force_delete_warning_suffix(&with_resources)
+                .unwrap()
+                .contains("5 tracked cloud resource(s)")
+        );
+
+        let failed_partial = json!({
+            "status": {
+                "lastUpdate": { "state": "failed" }
+            }
+        });
+        assert!(
+            force_delete_warning_suffix(&failed_partial)
+                .unwrap()
+                .contains("partially provisioned cloud resources")
+        );
+
+        let clean = json!({
+            "status": {
+                "lastUpdate": { "state": "succeeded" }
+            }
+        });
+        assert!(force_delete_warning_suffix(&clean).is_none());
+    }
+
+    #[test]
+    fn extract_resource_metadata_includes_deletion_timestamp() {
+        let obj: DynamicObject = serde_json::from_value(json!({
+            "apiVersion": "pulumi.com/v1",
+            "kind": "Stack",
+            "metadata": {
+                "name": "azure-free-tier-vm",
+                "deletionTimestamp": "2026-11-19T05:26:42Z"
+            }
+        }))
+        .unwrap();
+        let meta = extract_resource_metadata(&obj, "pulumi.com/v1", "Stack");
+        assert!(meta.deletion_timestamp.is_some());
     }
 }

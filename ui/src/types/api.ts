@@ -151,6 +151,7 @@ export interface ResourceMetadata {
   kind?: string
   uid?: string
   creationTimestamp?: string
+  deletionTimestamp?: string
   labels?: Record<string, string>
   annotations?: Record<string, string>
   specSummary?: Record<string, string>

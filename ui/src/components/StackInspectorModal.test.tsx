@@ -318,4 +318,39 @@ describe("StackInspectorModal component", () => {
       ).toBeInTheDocument()
     })
   })
+
+  it("shows terminating banner with workspace restart guidance when terminating stack awaits workspace readiness", async () => {
+    vi.mocked(api.getStackDiagnostics).mockResolvedValue({
+      ...sampleDiagnostics,
+      metadata: {
+        ...sampleDiagnostics.metadata,
+        deletionTimestamp: "2026-11-19T05:26:42Z",
+      },
+      conditions: [
+        {
+          type: "Reconciling",
+          status: "True",
+          reason: "StackProcessing",
+          message: "waiting for workspace readiness",
+        },
+      ],
+    })
+
+    render(
+      <StackInspectorModal
+        namespace="tenant-default"
+        name="azure-free-tier-vm"
+        kind="stack"
+        onClose={onClose}
+      />
+    )
+
+    const banner = await screen.findByTestId("inspector-terminating-banner")
+    expect(banner).toHaveTextContent(/waiting for its workspace pod/i)
+
+    fireEvent.click(screen.getByTestId("inspector-force-delete-btn"))
+    expect(
+      await screen.findByText(/try Restart Workspace first/i)
+    ).toBeInTheDocument()
+  })
 })
