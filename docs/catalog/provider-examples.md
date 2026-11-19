@@ -939,7 +939,9 @@ resources:
     properties:
       resourceGroupName: ${resourceGroup.name}
       location: ${location}
-      publicIPAllocationMethod: Dynamic
+      publicIPAllocationMethod: Static
+      sku:
+        name: Standard
       tags:
         managed-by: keel
 

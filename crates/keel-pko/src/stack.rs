@@ -251,6 +251,16 @@ pub struct WorkspaceVolume {
     pub secret: Option<WorkspaceSecretVolumeSource>,
 }
 
+/// Resource requests and limits for a PKO workspace container.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceResourceRequirements {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub requests: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub limits: BTreeMap<String, String>,
+}
+
 /// Container entry inside `WorkspacePodSpec` enforcing `restricted` PSS on the `pulumi` container.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -260,6 +270,8 @@ pub struct WorkspaceContainer {
     pub env: Vec<WorkspaceEnvVar>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub volume_mounts: Vec<WorkspaceVolumeMount>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resources: Option<WorkspaceResourceRequirements>,
     pub security_context: ContainerSecurityContext,
 }
 
@@ -317,6 +329,18 @@ impl PkoWorkspaceTemplate {
                                 value: String::new(),
                             }],
                             volume_mounts: Vec::new(),
+                            // Explicit limits override the tenant LimitRange 1Gi default so heavy
+                            // providers like azure-native do not OOMKill mid-update and leave locks.
+                            resources: Some(WorkspaceResourceRequirements {
+                                requests: BTreeMap::from([
+                                    ("cpu".to_string(), "100m".to_string()),
+                                    ("memory".to_string(), "256Mi".to_string()),
+                                ]),
+                                limits: BTreeMap::from([
+                                    ("cpu".to_string(), "2".to_string()),
+                                    ("memory".to_string(), "4Gi".to_string()),
+                                ]),
+                            }),
                             security_context: ContainerSecurityContext {
                                 allow_privilege_escalation: false,
                                 read_only_root_filesystem: false,
@@ -1237,6 +1261,16 @@ mod tests {
         assert_eq!(
             json["spec"]["workspaceTemplate"]["spec"]["podTemplate"]["spec"]["securityContext"]["runAsNonRoot"],
             true
+        );
+        assert_eq!(
+            json["spec"]["workspaceTemplate"]["spec"]["podTemplate"]["spec"]["containers"][0]["resources"]
+                ["requests"]["memory"],
+            "256Mi"
+        );
+        assert_eq!(
+            json["spec"]["workspaceTemplate"]["spec"]["podTemplate"]["spec"]["containers"][0]["resources"]
+                ["limits"]["memory"],
+            "4Gi"
         );
 
         let yaml = stack.to_yaml().expect("yaml serialization");
