@@ -30,7 +30,7 @@ import {
   reconcileRelease,
   restartStackWorkspace,
 } from "../lib/api"
-import { isDemoMode } from "../lib/utils"
+import { isDemoMode, isStackSshSupported } from "../lib/utils"
 import { StackInspectorModal } from "./StackInspectorModal"
 import { VmSshModal } from "./VmSshModal"
 import { StatusBadge } from "./StatusBadge"
@@ -526,6 +526,7 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
           const isProtected =
             stack.name === "management-cluster-core" ||
             stack.namespace === "flux-system"
+          const sshSupported = isStackSshSupported(stack)
           return (
             <div className="inline-flex items-center justify-end gap-1.5">
               {onEditStack && (
@@ -543,7 +544,12 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
               <button
                 type="button"
                 data-testid={`stack-ssh-btn-${stack.name}`}
-                title="SSH Connect"
+                disabled={!sshSupported}
+                title={
+                  sshSupported
+                    ? "SSH Connect"
+                    : "SSH is not supported for this infrastructure"
+                }
                 aria-label={`SSH connect to stack ${stack.name}`}
                 onClick={() =>
                   setSshStack({
@@ -553,7 +559,7 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
                     provider: stack.provider,
                   })
                 }
-                className="p-1.5 rounded-md bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 transition-colors cursor-pointer"
+                className="p-1.5 rounded-md bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
               >
                 <Terminal className="h-3.5 w-3.5" />
               </button>

@@ -27,6 +27,43 @@ export function formatForgeProvider(provider?: string): string {
   }
 }
 
+const NON_SSH_PROVIDERS = new Set([
+  "kind",
+  "kubernetes",
+  "k8s",
+  "helm",
+  "manifest",
+  "kustomize",
+  "flux",
+  "pulumi-k8s",
+  "docker",
+  "local",
+  "cloudflare",
+  "kubeconfig",
+])
+
+export function isStackSshSupported(stack: {
+  name?: string
+  provider?: string
+  type?: string
+}): boolean {
+  const provider = (stack.provider || "").trim().toLowerCase()
+  if (NON_SSH_PROVIDERS.has(provider)) {
+    return false
+  }
+  const name = (stack.name || "").trim().toLowerCase()
+  if (
+    (name === "management-cluster-core" || stack.type === "management") &&
+    !provider
+  ) {
+    return false
+  }
+  if (name === "postgres-managed" || name === "canary-gateway-config") {
+    return false
+  }
+  return true
+}
+
 export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs))
 }

@@ -166,8 +166,25 @@ describe("StackInspectorModal component", () => {
     )
 
     const sshBtn = await screen.findByTestId("inspector-ssh-btn")
-    expect(sshBtn).toBeInTheDocument()
+    expect(sshBtn).toBeEnabled()
     fireEvent.click(sshBtn)
     expect(onOpenSsh).toHaveBeenCalled()
+  })
+
+  it("disables SSH / Connect button for kind and non-VM stacks", async () => {
+    vi.mocked(api.getStackDiagnostics).mockResolvedValue(sampleDiagnostics)
+
+    render(
+      <StackInspectorModal
+        namespace="flux-system"
+        name="management-cluster-core"
+        kind="stack"
+        provider="kind"
+        onClose={onClose}
+      />
+    )
+
+    const sshBtn = await screen.findByTestId("inspector-ssh-btn")
+    expect(sshBtn).toBeDisabled()
   })
 })

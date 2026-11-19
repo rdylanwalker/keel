@@ -7,6 +7,7 @@ pub mod auth;
 pub mod error;
 pub mod routes;
 pub mod spa;
+pub mod ssh;
 pub mod state;
 
 use axum::Router;

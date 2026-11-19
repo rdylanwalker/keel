@@ -763,8 +763,13 @@ describe("TopologyView component", () => {
 
     render(<TopologyView />)
 
+    const mgmtSshBtn = await screen.findByTestId(
+      "stack-ssh-btn-management-cluster-core"
+    )
+    expect(mgmtSshBtn).toBeDisabled()
+
     const sshBtn = await screen.findByTestId("stack-ssh-btn-live-proxmox-stack")
-    expect(sshBtn).toBeInTheDocument()
+    expect(sshBtn).toBeEnabled()
     fireEvent.click(sshBtn)
 
     expect(

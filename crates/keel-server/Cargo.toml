@@ -20,6 +20,7 @@ hex.workspace = true
 jsonwebtoken.workspace = true
 rand.workspace = true
 reqwest.workspace = true
+russh.workspace = true
 rust-embed.workspace = true
 serde.workspace = true
 serde_json.workspace = true

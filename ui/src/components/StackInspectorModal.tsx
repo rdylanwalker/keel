@@ -17,6 +17,7 @@ import {
   getStackDiagnostics,
   restartStackWorkspace,
 } from "../lib/api"
+import { isStackSshSupported } from "../lib/utils"
 import { VmSshModal } from "./VmSshModal"
 
 export interface StackInspectorModalProps {
@@ -187,23 +188,33 @@ export const StackInspectorModal: React.FC<StackInspectorModalProps> = ({
               />
               <span>Refresh</span>
             </button>
-            {kind === "stack" && (
-              <button
-                type="button"
-                data-testid="inspector-ssh-btn"
-                onClick={() => {
-                  if (onOpenSsh) {
-                    onOpenSsh()
-                  } else {
-                    setIsSshModalOpen(true)
-                  }
-                }}
-                className="flex items-center space-x-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-300 border border-emerald-500/30 transition-colors cursor-pointer"
-              >
-                <Terminal className="h-3.5 w-3.5" />
-                <span>SSH / Connect</span>
-              </button>
-            )}
+            {kind === "stack" &&
+              (() => {
+                const sshSupported = isStackSshSupported({ name, provider })
+                return (
+                  <button
+                    type="button"
+                    data-testid="inspector-ssh-btn"
+                    disabled={!sshSupported}
+                    title={
+                      sshSupported
+                        ? "SSH / Connect"
+                        : "SSH is not supported for this infrastructure"
+                    }
+                    onClick={() => {
+                      if (onOpenSsh) {
+                        onOpenSsh()
+                      } else {
+                        setIsSshModalOpen(true)
+                      }
+                    }}
+                    className="flex items-center space-x-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-300 border border-emerald-500/30 transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+                  >
+                    <Terminal className="h-3.5 w-3.5" />
+                    <span>SSH / Connect</span>
+                  </button>
+                )
+              })()}
             {kind === "stack" && (
               <button
                 type="button"
