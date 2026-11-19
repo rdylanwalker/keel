@@ -5,7 +5,7 @@ use std::convert::Infallible;
 use std::path::{Path, PathBuf};
 
 use axum::Json;
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::ws::WebSocketUpgrade;
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::header::CONTENT_TYPE;
 use axum::http::{HeaderValue, StatusCode};
@@ -40,11 +40,10 @@ use keel_kube::{
     synthesize_helm_release_yaml, user_git_creds_secret_name,
 };
 use keel_pko::{
-    ChangeOp, EphemeralPreviewParams, GcPlan, PkoEnvRef, PkoStack, PreviewReport,
-    PreviewResourceCandidate, PreviewSummary, ResourceDiff, TenantStackParams,
-    attach_github_token_env_ref, attach_s3_credentials_env_refs, build_preview_branch,
-    format_markdown_report, plan_preview_gc, synthesize_ephemeral_preview,
-    synthesize_k8s_manifest_pulumi_yaml, synthesize_tenant_stack,
+    ChangeOp, EphemeralPreviewParams, GcPlan, PkoStack, PreviewReport, PreviewResourceCandidate,
+    PreviewSummary, ResourceDiff, TenantStackParams, attach_github_token_env_ref,
+    attach_s3_credentials_env_refs, build_preview_branch, format_markdown_report, plan_preview_gc,
+    synthesize_ephemeral_preview, synthesize_k8s_manifest_pulumi_yaml, synthesize_tenant_stack,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -54,6 +53,47 @@ use crate::error::ServerError;
 use crate::state::{AppState, CachedPreview, ReleaseSummary, StackSummary};
 
 static LAST_BRANCH_TS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn attach_infra_secret_refs(
+    env_refs: &mut std::collections::BTreeMap<String, keel_pko::PkoEnvRef>,
+    secrets_ref: &mut std::collections::BTreeMap<String, keel_pko::PkoEnvRef>,
+    secret_name: &str,
+    secret_keys: &[String],
+) {
+    for secret_key in secret_keys {
+        let ref_val = keel_pko::PkoEnvRef::from_secret(secret_name, secret_key);
+        match secret_key.as_str() {
+            // AWS provider credentials must go into Pulumi `secretsRef` (`aws:accessKey` /
+            // `aws:secretKey`) so they do not overwrite `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`
+            // used by the SeaweedFS S3 state backend.
+            "awsAccessKeyId" => {
+                secrets_ref.insert("aws:accessKey".to_string(), ref_val);
+            }
+            "awsSecretAccessKey" => {
+                secrets_ref.insert("aws:secretKey".to_string(), ref_val);
+            }
+            // Azure & GCP providers read standard uppercase environment variables.
+            "armClientId" => {
+                env_refs.insert("ARM_CLIENT_ID".to_string(), ref_val);
+            }
+            "armClientSecret" => {
+                env_refs.insert("ARM_CLIENT_SECRET".to_string(), ref_val);
+            }
+            "armTenantId" => {
+                env_refs.insert("ARM_TENANT_ID".to_string(), ref_val);
+            }
+            "armSubscriptionId" => {
+                env_refs.insert("ARM_SUBSCRIPTION_ID".to_string(), ref_val);
+            }
+            "googleCredentials" => {
+                env_refs.insert("GOOGLE_CREDENTIALS".to_string(), ref_val);
+            }
+            other => {
+                env_refs.insert(other.to_string(), ref_val);
+            }
+        }
+    }
+}
 
 async fn resolve_sops_recipients(repo_workdir: &std::path::Path, tenant_pub: &str) -> String {
     let sops_cfg = repo_workdir.join(".sops.yaml");
@@ -2786,12 +2826,12 @@ pub async fn create_proposal(
                             .config
                             .insert("kubeconfigSecretNamespace".to_string(), tenant_ns.clone());
                     }
-                    for secret_key in &infra_secret_keys {
-                        stack_params.env_refs.insert(
-                            secret_key.clone(),
-                            PkoEnvRef::from_secret(&infra_secret_name, secret_key),
-                        );
-                    }
+                    attach_infra_secret_refs(
+                        &mut stack_params.env_refs,
+                        &mut stack_params.secrets_ref,
+                        &infra_secret_name,
+                        &infra_secret_keys,
+                    );
                     if let Some(ref s3_secret) = state.s3_credentials_secret {
                         let _ = state
                             .secret_store
@@ -2983,12 +3023,12 @@ pub async fn create_proposal(
                 .config
                 .insert("keel:provider".to_string(), bp.metadata.provider.clone());
             populate_stack_config_from_values(&mut stack_params.config, &partitioned.normal_values);
-            for secret_key in &infra_secret_keys {
-                stack_params.env_refs.insert(
-                    secret_key.clone(),
-                    PkoEnvRef::from_secret(&infra_secret_name, secret_key),
-                );
-            }
+            attach_infra_secret_refs(
+                &mut stack_params.env_refs,
+                &mut stack_params.secrets_ref,
+                &infra_secret_name,
+                &infra_secret_keys,
+            );
             let tenant_ns = tenant_namespace(&req.tenant)?;
             if let Some(ref s3_secret) = state.s3_credentials_secret {
                 let _ = state
@@ -5752,7 +5792,7 @@ fn clean_candidate_ssh_host(raw: &str) -> Option<String> {
     Some(host_part.to_string())
 }
 
-fn clean_candidate_ssh_user(raw: &str) -> Option<String> {
+pub(crate) fn clean_candidate_ssh_user(raw: &str) -> Option<String> {
     let trimmed = raw.trim().trim_matches('"').trim_matches('\'').trim();
     if trimmed.is_empty()
         || trimmed.starts_with("${")
@@ -6041,268 +6081,6 @@ pub async fn get_stack_ssh_info(
     Ok(Json(info))
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(tag = "type", rename_all = "lowercase")]
-enum SshWsClientMessage {
-    #[serde(rename_all = "camelCase")]
-    Connect {
-        #[serde(default)]
-        cols: Option<u16>,
-        #[serde(default)]
-        rows: Option<u16>,
-        #[serde(default)]
-        user: Option<String>,
-        #[serde(default)]
-        port: Option<u16>,
-        #[serde(default)]
-        private_key: Option<String>,
-    },
-    Input {
-        data: String,
-    },
-    Resize {
-        cols: u16,
-        rows: u16,
-    },
-    Disconnect,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(tag = "type", rename_all = "lowercase")]
-enum SshWsServerMessage {
-    Connected {
-        host: String,
-        user: String,
-        port: u16,
-        message: String,
-    },
-    Output {
-        data: String,
-    },
-    Error {
-        message: String,
-    },
-    Disconnected,
-}
-
-async fn send_ws_json(socket: &mut WebSocket, msg: &SshWsServerMessage) -> Result<(), axum::Error> {
-    if let Ok(json_str) = serde_json::to_string(msg) {
-        socket.send(Message::Text(json_str.into())).await?;
-    }
-    Ok(())
-}
-
-fn simulate_vm_shell_command(
-    cmd: &str,
-    user: &str,
-    host: &str,
-    stack_name: &str,
-    provider: &str,
-) -> Option<String> {
-    let trimmed = cmd.trim();
-    if trimmed == "exit" || trimmed == "logout" {
-        return None;
-    }
-    let output = match trimmed {
-        "" => String::new(),
-        "hostname" => stack_name.to_string(),
-        "whoami" => user.to_string(),
-        "id" => format!("uid=1000({user}) gid=1000({user}) groups=1000({user}),27(sudo)"),
-        "pwd" => format!("/home/{user}"),
-        "uname" | "uname -s" => "Linux".to_string(),
-        "uname -a" => {
-            format!("Linux {stack_name} 6.8.0-keel-generic #1 SMP PREEMPT_DYNAMIC x86_64 GNU/Linux")
-        }
-        "uptime" => {
-            " 12:00:00 up 2 days,  4:15,  1 user,  load average: 0.08, 0.04, 0.01".to_string()
-        }
-        "ls" | "ls -la" | "ls -l" => "cloud-init.log  keel-agent.yaml".to_string(),
-        "cat /etc/os-release" => {
-            "PRETTY_NAME=\"Ubuntu 24.04.1 LTS\"\nNAME=\"Ubuntu\"\nVERSION_ID=\"24.04\"".to_string()
-        }
-        "help" => "Available commands: hostname, whoami, id, uname -a, uptime, pwd, ls, echo, exit"
-            .to_string(),
-        other if other.starts_with("echo ") => {
-            other.strip_prefix("echo ").unwrap_or("").to_string()
-        }
-        other => format!("{other}: executed on {host} ({provider})"),
-    };
-    if output.is_empty() {
-        Some(format!("\r\n{user}@{stack_name}:~$ "))
-    } else {
-        Some(format!("\r\n{output}\r\n{user}@{stack_name}:~$ "))
-    }
-}
-
-struct SshWsSessionState {
-    ssh_info: StackSshInfoResponse,
-    user_subject: String,
-    active_user: String,
-    active_port: u16,
-    active_host: String,
-    connected: bool,
-    cmd_buf: String,
-}
-
-impl SshWsSessionState {
-    fn new(ssh_info: StackSshInfoResponse, user_subject: String) -> Self {
-        let active_user = ssh_info.ssh_user.clone();
-        let active_port = ssh_info.ssh_port;
-        let active_host = ssh_info.ssh_host.clone();
-        Self {
-            ssh_info,
-            user_subject,
-            active_user,
-            active_port,
-            active_host,
-            connected: false,
-            cmd_buf: String::new(),
-        }
-    }
-
-    fn handle_ssh_ws_message(&mut self, text: &str) -> (Vec<SshWsServerMessage>, bool) {
-        let mut responses = Vec::new();
-        let parsed: Result<SshWsClientMessage, _> = serde_json::from_str(text);
-        match parsed {
-            Ok(SshWsClientMessage::Connect {
-                cols: _cols,
-                rows: _rows,
-                user,
-                port,
-                private_key: _private_key,
-            }) => {
-                if let Some(u) = user.as_deref() {
-                    if let Some(cleaned) = clean_candidate_ssh_user(u) {
-                        self.active_user = cleaned;
-                    } else {
-                        responses.push(SshWsServerMessage::Error {
-                            message: "Invalid SSH username".to_string(),
-                        });
-                        return (responses, false);
-                    }
-                }
-                if let Some(p) = port.filter(|p| *p > 0) {
-                    self.active_port = p;
-                }
-                self.connected = true;
-                responses.push(SshWsServerMessage::Connected {
-                    host: self.active_host.clone(),
-                    user: self.active_user.clone(),
-                    port: self.active_port,
-                    message: format!(
-                        "Connected to {}@{}:{}",
-                        self.active_user, self.active_host, self.active_port
-                    ),
-                });
-                let welcome = format!(
-                    "Keel SSH Terminal — {}@{} ({})\r\n{}@{}:~$ ",
-                    self.active_user,
-                    self.active_host,
-                    self.ssh_info.provider,
-                    self.active_user,
-                    self.ssh_info.stack_name
-                );
-                responses.push(SshWsServerMessage::Output { data: welcome });
-                (responses, false)
-            }
-            Ok(SshWsClientMessage::Input { data }) => {
-                if !self.connected {
-                    self.connected = true;
-                    responses.push(SshWsServerMessage::Connected {
-                        host: self.active_host.clone(),
-                        user: self.active_user.clone(),
-                        port: self.active_port,
-                        message: format!(
-                            "Connected to {}@{}:{}",
-                            self.active_user, self.active_host, self.active_port
-                        ),
-                    });
-                }
-                for ch in data.chars() {
-                    if ch == '\r' || ch == '\n' {
-                        let current_cmd = std::mem::take(&mut self.cmd_buf);
-                        match simulate_vm_shell_command(
-                            &current_cmd,
-                            &self.active_user,
-                            &self.active_host,
-                            &self.ssh_info.stack_name,
-                            &self.ssh_info.provider,
-                        ) {
-                            Some(out) => {
-                                responses.push(SshWsServerMessage::Output { data: out });
-                            }
-                            None => {
-                                responses.push(SshWsServerMessage::Disconnected);
-                                return (responses, true);
-                            }
-                        }
-                    } else if ch == '\u{7f}' || ch == '\u{8}' {
-                        if self.cmd_buf.pop().is_some() {
-                            responses.push(SshWsServerMessage::Output {
-                                data: "\u{8} \u{8}".to_string(),
-                            });
-                        }
-                    } else {
-                        self.cmd_buf.push(ch);
-                        responses.push(SshWsServerMessage::Output {
-                            data: ch.to_string(),
-                        });
-                    }
-                }
-                (responses, false)
-            }
-            Ok(SshWsClientMessage::Resize {
-                cols: _cols,
-                rows: _rows,
-            }) => (responses, false),
-            Ok(SshWsClientMessage::Disconnect) => {
-                tracing::info!(
-                    target: "keel::audit",
-                    user = %self.user_subject,
-                    tenant = %self.ssh_info.tenant,
-                    stack = %self.ssh_info.stack_name,
-                    "WebSocket SSH session disconnected by client"
-                );
-                responses.push(SshWsServerMessage::Disconnected);
-                (responses, true)
-            }
-            Err(err) => {
-                responses.push(SshWsServerMessage::Error {
-                    message: format!("Invalid WebSocket SSH frame: {err}"),
-                });
-                (responses, false)
-            }
-        }
-    }
-}
-
-async fn handle_stack_ssh_ws(
-    mut socket: WebSocket,
-    ssh_info: StackSshInfoResponse,
-    _saved_ssh_key: Option<String>,
-    user_subject: String,
-) {
-    let mut session = SshWsSessionState::new(ssh_info, user_subject);
-
-    while let Some(Ok(msg)) = socket.next().await {
-        match msg {
-            Message::Text(text) => {
-                let (responses, should_close) = session.handle_ssh_ws_message(&text);
-                for resp in &responses {
-                    let _ = send_ws_json(&mut socket, resp).await;
-                }
-                if should_close {
-                    break;
-                }
-            }
-            Message::Close(_) => {
-                break;
-            }
-            _ => {}
-        }
-    }
-}
-
 /// `GET /api/v1/stacks/{namespace}/{name}/ssh/ws`
 ///
 /// Upgrades an authenticated tenant-authorized request to an interactive WebSocket SSH terminal bridge.
@@ -6326,7 +6104,9 @@ pub async fn stack_ssh_ws(
         "WebSocket SSH session initiated"
     );
     let user_sub = auth.claims.sub.clone();
-    Ok(ws.on_upgrade(move |socket| handle_stack_ssh_ws(socket, ssh_info, saved_ssh_key, user_sub)))
+    Ok(ws.on_upgrade(move |socket| {
+        crate::ssh::handle_stack_ssh_ws(socket, ssh_info, saved_ssh_key, user_sub)
+    }))
 }
 
 /// Response body for `POST /api/v1/releases/{namespace}/{name}/reconcile`.
@@ -7596,81 +7376,22 @@ spec:
         assert_eq!(custom_info.ssh_user, "ec2-user");
         assert_eq!(custom_info.ssh_port, 2200);
 
-        // 3. Exercise SshWsSessionState::handle_ssh_ws_message across full WebSocket protocol
-        let mut ws_session =
-            SshWsSessionState::new(vm_info.clone(), "admin@keel.local".to_string());
-
-        // Invalid JSON frame returns Error without closing
-        let (bad_msgs, close) = ws_session.handle_ssh_ws_message("{invalid json");
-        assert!(!close);
-        assert!(matches!(
-            bad_msgs.as_slice(),
-            [SshWsServerMessage::Error { .. }]
+        // 3. Verify SSH capability gating across providers
+        assert!(crate::ssh::is_ssh_supported_infra(
+            &vm_info.provider,
+            &vm_info.stack_name
         ));
-
-        // Invalid username starting with '-' returns Error without closing
-        let (bad_user_msgs, close) =
-            ws_session.handle_ssh_ws_message(r#"{"type":"connect","user":"-oProxyCommand=evil"}"#);
-        assert!(!close);
-        assert!(matches!(
-            bad_user_msgs.as_slice(),
-            [SshWsServerMessage::Error { .. }]
+        assert!(crate::ssh::is_ssh_supported_infra(
+            &custom_info.provider,
+            &custom_info.stack_name
         ));
-
-        // Valid connect message returns Connected + Output welcome banner
-        let (conn_msgs, close) = ws_session.handle_ssh_ws_message(
-            r#"{"type":"connect","cols":120,"rows":40,"user":"ubuntu","port":2222}"#,
-        );
-        assert!(!close);
-        assert_eq!(conn_msgs.len(), 2);
-
-        // Resize message
-        let (resize_msgs, close) =
-            ws_session.handle_ssh_ws_message(r#"{"type":"resize","cols":100,"rows":30}"#);
-        assert!(!close);
-        assert!(resize_msgs.is_empty());
-
-        // Input commands: character typing + backspace + newline + various commands
-        for cmd in [
-            "ab\u{7f}\n",
-            "hostname\n",
-            "whoami\n",
-            "id\n",
-            "pwd\n",
-            "uname\n",
-            "uname -a\n",
-            "uptime\n",
-            "ls -la\n",
-            "cat /etc/os-release\n",
-            "help\n",
-            "echo hello-keel\n",
-            "systemctl status k3s\n",
-            "\n",
-        ] {
-            let payload = serde_json::to_string(&json!({ "type": "input", "data": cmd })).unwrap();
-            let (out_msgs, should_close) = ws_session.handle_ssh_ws_message(&payload);
-            assert!(!should_close);
-            assert!(!out_msgs.is_empty());
-        }
-
-        // Disconnect message
-        let (disc_msgs, should_close) =
-            ws_session.handle_ssh_ws_message(r#"{"type":"disconnect"}"#);
-        assert!(should_close);
-        assert!(matches!(
-            disc_msgs.as_slice(),
-            [SshWsServerMessage::Disconnected]
+        assert!(!crate::ssh::is_ssh_supported_infra(
+            "kind",
+            "management-cluster-core"
         ));
-
-        // Exit command via input before explicit connect also auto-connects and disconnects cleanly
-        let mut ws_session2 = SshWsSessionState::new(vm_info, "admin@keel.local".to_string());
-        let (exit_msgs, should_close2) =
-            ws_session2.handle_ssh_ws_message(r#"{"type":"input","data":"exit\n"}"#);
-        assert!(should_close2);
-        assert!(
-            exit_msgs
-                .iter()
-                .any(|m| matches!(m, SshWsServerMessage::Disconnected))
-        );
+        assert!(!crate::ssh::is_ssh_supported_infra(
+            "kubernetes",
+            "postgres-managed"
+        ));
     }
 }

@@ -408,6 +408,8 @@ pub struct PkoStackSpec {
     pub config: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env_refs: BTreeMap<String, PkoEnvRef>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub secrets_ref: BTreeMap<String, PkoEnvRef>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workspace_template: Option<PkoWorkspaceTemplate>,
 }
@@ -611,6 +613,7 @@ pub struct TenantStackParams {
     pub output_secret_name: Option<String>,
     pub config: BTreeMap<String, String>,
     pub env_refs: BTreeMap<String, PkoEnvRef>,
+    pub secrets_ref: BTreeMap<String, PkoEnvRef>,
     /// Optional `DOCKER_HOST` endpoint injected into the PKO workspace pod for local `kind`-in-`kind` dev.
     pub docker_host: Option<String>,
 }
@@ -636,6 +639,7 @@ impl TenantStackParams {
             output_secret_name: None,
             config: BTreeMap::new(),
             env_refs: BTreeMap::new(),
+            secrets_ref: BTreeMap::new(),
             docker_host: None,
         }
     }
@@ -735,6 +739,7 @@ pub fn synthesize_management_core_stack(
             output_secret_name: None,
             config,
             env_refs: params.env_refs.clone(),
+            secrets_ref: BTreeMap::new(),
             workspace_template: Some(PkoWorkspaceTemplate::restricted_default()),
         },
     })
@@ -834,6 +839,7 @@ pub fn synthesize_ephemeral_preview(
             output_secret_name: None,
             config: params.config.clone(),
             env_refs: params.env_refs.clone(),
+            secrets_ref: BTreeMap::new(),
             workspace_template: Some(match &params.docker_host {
                 Some(host) => {
                     PkoWorkspaceTemplate::restricted_default().with_env_var("DOCKER_HOST", host)
@@ -918,6 +924,7 @@ pub fn synthesize_tenant_stack(params: &TenantStackParams) -> Result<PkoStack, P
             output_secret_name,
             config: params.config.clone(),
             env_refs: params.env_refs.clone(),
+            secrets_ref: params.secrets_ref.clone(),
             workspace_template: Some({
                 let mut tpl = match &params.docker_host {
                     Some(host) => {
