@@ -569,13 +569,15 @@ pub async fn synthesize_seed_control_plane(
             }
         ]))?;
         let forgejo_oidc_secret = cfg.with_forge.then(|| {
-            format!(
+            let mut secret = format!(
                 "{}{}{}{}",
                 generate_admin_password(),
                 generate_admin_password(),
                 generate_admin_password(),
                 generate_admin_password()
-            )
+            );
+            secret.truncate(64);
+            secret
         });
         let mut clients = vec![json!({
             "id": oidc_client_id,
@@ -1141,6 +1143,43 @@ async fn provision_in_cluster_forgejo(
                     error = %last_err,
                     "Failed to register Rauthy OIDC SSO provider in Forgejo after retries (non-fatal)"
                 );
+            }
+        }
+
+        // Warm up Forgejo's in-memory OIDC provider so the first browser login redirect includes PKCE `code_challenge`.
+        if let Ok(no_redirect_client) = Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(10))
+            .build()
+        {
+            let warmup_url = format!("{base}/user/oauth2/rauthy");
+            for attempt in 1..=3 {
+                match no_redirect_client.get(&warmup_url).send().await {
+                    Ok(resp) => {
+                        let has_pkce = resp
+                            .headers()
+                            .get(reqwest::header::LOCATION)
+                            .and_then(|v| v.to_str().ok())
+                            .is_some_and(|loc| loc.contains("code_challenge="));
+                        tracing::debug!(
+                            attempt,
+                            status = %resp.status(),
+                            has_pkce,
+                            "Warmed up Forgejo Rauthy OIDC redirect"
+                        );
+                        if has_pkce {
+                            break;
+                        }
+                    }
+                    Err(err) => {
+                        tracing::debug!(
+                            attempt,
+                            error = %err,
+                            "Forgejo Rauthy OIDC warm-up request failed (non-fatal)"
+                        );
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
             }
         }
     }
@@ -4844,6 +4883,14 @@ spec:
         assert_eq!(
             forgejo.get("challenges"),
             Some(&serde_json::json!(["S256"]))
+        );
+        assert_eq!(
+            forgejo
+                .get("secret")
+                .and_then(|s| s.get("Plain"))
+                .and_then(|v| v.as_str())
+                .map(str::len),
+            Some(64)
         );
     }
 
