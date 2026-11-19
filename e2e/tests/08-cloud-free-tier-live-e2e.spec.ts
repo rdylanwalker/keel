@@ -634,30 +634,71 @@ test.describe('08.1 - Multi-Cloud Free-Tier Stage 1 Live E2E (kind Management Cl
         ? DETERMINISTIC_REPO_DIR
         : path.resolve(process.cwd(), '../keel-gitops'));
 
-    if (!fs.existsSync(path.join(repoDir, 'catalog/infra/aws-free-tier-vm/catalog.yaml'))) {
-      logStep('Seeding deploy/catalog/{apps,infra,bundles} into GitOps repo...');
-      const deployCatalog = path.resolve(process.cwd(), '../deploy/catalog');
+    const deployCatalog = path.resolve(process.cwd(), '../deploy/catalog');
+    for (const id of ['aws-free-tier-vm', 'azure-free-tier-vm', 'gcp-free-tier-vm']) {
+      fs.cpSync(
+        path.join(deployCatalog, `infra/${id}`),
+        path.join(repoDir, `catalog/infra/${id}`),
+        {
+          recursive: true,
+        },
+      );
+    }
+    if (!fs.existsSync(path.join(repoDir, 'catalog/bundles/kind-canary-platform/catalog.yaml'))) {
+      logStep('Seeding full deploy/catalog/{apps,infra,bundles} into GitOps repo...');
       fs.cpSync(deployCatalog, path.join(repoDir, 'catalog'), { recursive: true });
-      runCmd('git', ['-C', repoDir, 'add', 'catalog']);
-      const diff = tryCmd('git', ['-C', repoDir, 'diff', '--cached', '--quiet']);
-      if (!diff.ok) {
-        runCmd(
-          'git',
-          [
-            '-C',
-            repoDir,
-            '-c',
-            'user.name=Keel E2E',
-            '-c',
-            'user.email=e2e@keel.local',
-            '-c',
-            'commit.gpgsign=false',
-            'commit',
-            '-m',
-            'chore(e2e): seed multi-cloud free-tier catalog blueprints',
-          ],
-          { GIT_EDITOR: 'true' },
+    }
+    runCmd('git', ['-C', repoDir, 'add', 'catalog']);
+    const diff = tryCmd('git', ['-C', repoDir, 'diff', '--cached', '--quiet']);
+    if (!diff.ok) {
+      logStep('Committing updated free-tier catalog blueprints to GitOps repo...');
+      runCmd(
+        'git',
+        [
+          '-C',
+          repoDir,
+          '-c',
+          'user.name=Keel E2E',
+          '-c',
+          'user.email=e2e@keel.local',
+          '-c',
+          'commit.gpgsign=false',
+          'commit',
+          '-m',
+          'chore(e2e): sync multi-cloud free-tier catalog blueprints',
+        ],
+        { GIT_EDITOR: 'true' },
+      );
+      const remoteUrl = tryCmd('git', ['-C', repoDir, 'remote', 'get-url', 'origin']).stdout;
+      if (remoteUrl.startsWith('http')) {
+        const tokRes = tryCmd('kubectl', [
+          'get',
+          'secret',
+          'forge-token',
+          '-n',
+          'keel-system',
+          '-o',
+          'jsonpath={.data.token}',
+        ]);
+        const token = tokRes.ok
+          ? Buffer.from(tokRes.stdout, 'base64').toString('utf-8').trim()
+          : '';
+        const askpassPath = path.join(os.tmpdir(), 'keel-cloud-e2e-askpass.sh');
+        fs.writeFileSync(
+          askpassPath,
+          `#!/bin/sh\ncase "$1" in\n  *Username*) printf "%s\\n" "keel" ;;\n  *Password*) printf "%s\\n" "${token}" ;;\nesac\n`,
+          { mode: 0o700 },
         );
+        try {
+          runCmd('git', ['-C', repoDir, 'push', 'origin', 'main'], {
+            GIT_ASKPASS: askpassPath,
+            GIT_TERMINAL_PROMPT: '0',
+          });
+        } finally {
+          fs.rmSync(askpassPath, { force: true });
+        }
+      } else {
+        tryCmd('git', ['-C', repoDir, 'push', 'origin', 'main']);
       }
     }
 
@@ -784,7 +825,11 @@ test.describe('08.1 - Multi-Cloud Free-Tier Stage 1 Live E2E (kind Management Cl
         ).toBe(true);
 
         logStep(`Merging proposal #${prId}...`, provider);
-        const mergeRes = await request.post(`${BASE_URL}/api/v1/proposals/${prId}/merge`);
+        let mergeRes = await request.post(`${BASE_URL}/api/v1/proposals/${prId}/merge`);
+        for (let attempt = 1; attempt <= 4 && mergeRes.status() === 409; attempt++) {
+          await new Promise((r) => setTimeout(r, 2000));
+          mergeRes = await request.post(`${BASE_URL}/api/v1/proposals/${prId}/merge`);
+        }
         expect(mergeRes.ok(), `[${provider}] Merge failed: ${await mergeRes.text()}`).toBe(true);
         stackMerged = true;
       });
@@ -919,8 +964,8 @@ test.describe('08.1 - Multi-Cloud Free-Tier Stage 1 Live E2E (kind Management Cl
           const entry = currentProviders.find((p) => p.id === spec.provider);
           if (!entry?.enabled) {
             logStep(`Enabling provider "${spec.provider}" via Keel API...`, spec.provider);
-            const toggleRes = await setupPage.request.post(
-              `${BASE_URL}/api/v1/providers/${spec.provider}/toggle`,
+            const toggleRes = await setupPage.request.put(
+              `${BASE_URL}/api/v1/providers/${spec.provider}`,
               { data: { enabled: true } },
             );
             expect(

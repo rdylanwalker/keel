@@ -27,6 +27,7 @@ resources:
   sshFirewall:
     type: gcp:compute:Firewall
     properties:
+      name: ${instanceName}-ssh
       project: ${project}
       network: default
       description: Allow inbound SSH from any IP
