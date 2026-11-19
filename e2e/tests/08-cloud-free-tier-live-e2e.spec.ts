@@ -900,12 +900,21 @@ test.describe('08.1 - Multi-Cloud Free-Tier Stage 1 Live E2E (kind Management Cl
     }
   }
 
+  function generateEphemeralSshPublicKey(): string {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'keel-e2e-ssh-'));
+    const keyPath = path.join(tmpDir, 'id_ed25519');
+    try {
+      runCmd('ssh-keygen', ['-t', 'ed25519', '-N', '', '-C', 'e2e@keel.local', '-f', keyPath]);
+      return fs.readFileSync(`${keyPath}.pub`, 'utf-8').trim();
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  }
+
   test('08.1a - Parallel Multi-Cloud Stage 1 Free-Tier VM Provisioning, PKO Preview, SSH Info & Teardown', async ({
     browser,
   }) => {
-    const defaultSshKey =
-      process.env.KEEL_E2E_SSH_PUBLIC_KEY ||
-      'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleKeyForKeelE2ETesting operator@keel.local';
+    const defaultSshKey = process.env.KEEL_E2E_SSH_PUBLIC_KEY || generateEphemeralSshPublicKey();
 
     const specs: CloudVmSpec[] = [
       {
