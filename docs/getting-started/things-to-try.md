@@ -342,7 +342,7 @@ Verify in **Topology Map** that `echo-demo` transitions from `Pending` → `Sync
 
 ## 7. Connect to a Provisioned VM via SSH (Web Portal & CLI)
 
-Once an infrastructure blueprint containing virtual machines has been provisioned (such as `aws-free-tier-vm`, `azure-free-tier-vm`, or `gcp-free-tier-vm`):
+Once an infrastructure blueprint containing virtual machines has been provisioned (such as `aws-vm`, `azure-vm`, or `gcp-vm`):
 
 ### Step 1: Connect via the Web Portal
 1. In **Topology Map**, locate your provisioned VM stack card and click the **SSH** button (or open the **Stack Inspector** and click **SSH**).
@@ -359,14 +359,14 @@ Once an infrastructure blueprint containing virtual machines has been provisione
 
 ```bash
 # Print connection table and copyable ssh command
-keel infra ssh aws-free-tier-vm --tenant dev-team --server http://127.0.0.1:8080
+keel infra ssh aws-vm --tenant dev-team --server http://127.0.0.1:8080
 
 # Output raw command string
-keel infra ssh aws-free-tier-vm --tenant dev-team --output command
+keel infra ssh aws-vm --tenant dev-team --output command
 
 # Launch an interactive terminal session directly in your shell
-keel infra ssh aws-free-tier-vm --tenant dev-team --exec
+keel infra ssh aws-vm --tenant dev-team --exec
 
 # Launch with custom SSH identity file and port
-keel infra ssh aws-free-tier-vm --tenant dev-team -i ~/.ssh/id_ed25519 --port 22 --exec
+keel infra ssh aws-vm --tenant dev-team -i ~/.ssh/id_ed25519 --port 22 --exec
 ```

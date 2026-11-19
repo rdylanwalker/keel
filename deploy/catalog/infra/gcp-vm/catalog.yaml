@@ -1,9 +1,9 @@
 apiVersion: keel.io/v1alpha1
 kind: CatalogInfraBlueprint
 metadata:
-  id: gcp-free-tier-vm
-  name: GCP Free-Tier Compute VM
-  description: Provision an Always-Free eligible GCP e2-micro virtual machine with SSH access
+  id: gcp-vm
+  name: GCP Compute Engine VM
+  description: Provision a GCP Compute Engine virtual machine with SSH access (defaults to Always-Free e2-micro)
   category: compute
   provider: gcp
 spec:
@@ -25,18 +25,42 @@ spec:
       project:
         type: string
         title: GCP Project ID
+      instanceName:
+        type: string
+        title: Instance Name
+        description: Name assigned to the Compute Engine instance.
+        default: keel-free-vm
       region:
         type: string
         title: GCP Region
+        description: GCP region for the compute instance.
         default: us-central1
       zone:
         type: string
         title: GCP Zone
+        description: GCP zone where the compute instance will be created.
         default: us-central1-a
       machineType:
         type: string
         title: Machine Type
+        description: Compute Engine machine type (defaults to Always-Free eligible e2-micro).
         default: e2-micro
+      diskSizeGb:
+        type: integer
+        title: Boot Disk Size (GB)
+        description: Boot persistent disk size in GiB (GCP Always Free includes up to 30 GB pd-standard).
+        default: 10
+        minimum: 10
+        maximum: 65536
+      diskType:
+        type: string
+        title: Boot Disk Type
+        description: Persistent disk type for the boot volume.
+        default: pd-standard
+        enum:
+          - pd-standard
+          - pd-balanced
+          - pd-ssd
       sshUser:
         type: string
         title: SSH Username
@@ -50,6 +74,9 @@ spec:
         writeOnly: true
         format: password
   uiSchema:
+    machineType:
+      ui:placeholder: "e2-micro"
+      ui:help: "Always-Free default: e2-micro (also supports e2-small, e2-medium, n2-standard-2, etc.)."
     sshPublicKey:
       ui:widget: textarea
       ui:help: "SSH public key injected into GCP instance metadata."

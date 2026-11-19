@@ -555,9 +555,9 @@ test.describe('08 - Multi-Cloud Free-Tier Dual-Guard Contract & Blueprint Valida
 
     // Stage 1 Free-Tier Blueprints
     const blueprints: Array<[string, string, string]> = [
-      ['aws', 'aws-free-tier-vm', 't3.micro'],
-      ['azure', 'azure-free-tier-vm', 'Standard_B1s'],
-      ['gcp', 'gcp-free-tier-vm', 'e2-micro'],
+      ['aws', 'aws-vm', 't3.micro'],
+      ['azure', 'azure-vm', 'Standard_B1s'],
+      ['gcp', 'gcp-vm', 'e2-micro'],
     ];
 
     for (const [provider, id, vmSize] of blueprints) {
@@ -572,6 +572,7 @@ test.describe('08 - Multi-Cloud Free-Tier Dual-Guard Contract & Blueprint Valida
       expect(catContent).toContain(`id: ${id}`);
       expect(catContent).toContain(`provider: ${provider}`);
       expect(catContent).toContain('category: compute');
+      expect(catContent).toContain(`default: ${vmSize}`);
       expect(catContent).toContain('sshHost');
       expect(catContent).toContain('sshUser');
       expect(catContent).toContain('sshPort');
@@ -650,7 +651,7 @@ test.describe('08.1 - Multi-Cloud Free-Tier Stage 1 Live E2E (kind Management Cl
         : path.resolve(process.cwd(), '../keel-gitops'));
 
     const deployCatalog = path.resolve(process.cwd(), '../deploy/catalog');
-    for (const id of ['aws-free-tier-vm', 'azure-free-tier-vm', 'gcp-free-tier-vm']) {
+    for (const id of ['aws-vm', 'azure-vm', 'gcp-vm']) {
       fs.cpSync(
         path.join(deployCatalog, `infra/${id}`),
         path.join(repoDir, `catalog/infra/${id}`),
@@ -975,7 +976,7 @@ test.describe('08.1 - Multi-Cloud Free-Tier Stage 1 Live E2E (kind Management Cl
     const specs: CloudVmSpec[] = [
       {
         provider: 'aws',
-        catalogId: 'aws-free-tier-vm',
+        catalogId: 'aws-vm',
         sshUser: 'ubuntu',
         values: {
           region: process.env.AWS_REGION || 'us-east-1',
@@ -989,7 +990,7 @@ test.describe('08.1 - Multi-Cloud Free-Tier Stage 1 Live E2E (kind Management Cl
       },
       {
         provider: 'azure',
-        catalogId: 'azure-free-tier-vm',
+        catalogId: 'azure-vm',
         sshUser: 'azureuser',
         values: {
           location: process.env.AZURE_LOCATION || 'eastus',
@@ -1005,7 +1006,7 @@ test.describe('08.1 - Multi-Cloud Free-Tier Stage 1 Live E2E (kind Management Cl
       },
       {
         provider: 'gcp',
-        catalogId: 'gcp-free-tier-vm',
+        catalogId: 'gcp-vm',
         sshUser: 'debian',
         values: {
           project: process.env.GCP_PROJECT || process.env.GOOGLE_PROJECT,

@@ -44,7 +44,7 @@ Outside of initial bootstrap, Keel **never** commits directly to `main`. Every i
 Upstream Helm charts, Kustomize bases, and **raw Kubernetes manifests & parameterized `${var}` YAML templates** work seamlessly without structural forks. Thin `catalog.yaml` sidecars provide JSON Schemas that render dynamically in React (`@rjsf/core` + Shadcn UI) and serialize straight into standard `values.yaml` overrides or Pulumi `Stack` configs. For raw Kubernetes manifests, the Catalog Wizard can **auto-extract `${var}` placeholders** into JSON Schema form fields with a single click and allows choosing between **Flux CD** (`Kustomization` + `postBuild.substituteFrom`) or **Pulumi PKO v2** (`kubernetes:yaml/v2:ConfigGroup` with pre-merge resource diffs) as the actioning engine. Need to deploy a database, DNS record, and app together? Chain them in a **Multi-Item Bundle** directly from the GUI via a Git PR.
 
 ### 4. Homelab to Multi-Cloud—Plus Any OpenTofu/Terraform Provider
-Provision VMs and clusters on **Proxmox VE**, **AWS**, **GCP**, **Azure**, **Hetzner**, and **Cloudflare**—or enable any registry provider dynamically through Pulumi's OpenTofu/Terraform bridge (`terraform-provider`) without recompiling Keel. Includes ready-to-use Free Tier VM blueprints for AWS (`aws-free-tier-vm`), Azure (`azure-free-tier-vm`), and GCP (`gcp-free-tier-vm`).
+Provision VMs and clusters on **Proxmox VE**, **AWS**, **GCP**, **Azure**, **Hetzner**, and **Cloudflare**—or enable any registry provider dynamically through Pulumi's OpenTofu/Terraform bridge (`terraform-provider`) without recompiling Keel. Includes ready-to-use VM blueprints (defaulting to free-tier sizes) for AWS (`aws-vm`), Azure (`azure-vm`), and GCP (`gcp-vm`).
 
 ### 5. Direct VM SSH Access (Web Portal & CLI)
 Inspect connection details and access provisioned cloud or on-premises VMs with zero friction:
@@ -262,9 +262,9 @@ Several great open-source tools solve individual slices of this problem—develo
 | :--- | :--- | :--- | :---: | :--- |
 | **kind** | `tehcyx/kind` (TF bridge) | Enabled | ✅ | Provisions workload `kind` clusters in live E2E |
 | **Proxmox VE** | `bpg/proxmox` (TF bridge) | Disabled | ⚠️ | Enable via **Topology → Providers**; needs PVE feedback |
-| **AWS** | `pulumi/aws` | Disabled | ⚠️ | Enable via **Topology → Providers**; includes `aws-free-tier-vm` blueprint; tested in live cloud E2E (`pnpm --dir e2e test:live:cloud`) |
-| **GCP** | `pulumi/gcp` | Disabled | ⚠️ | Enable via **Topology → Providers**; includes `gcp-free-tier-vm` blueprint; tested in live cloud E2E (`pnpm --dir e2e test:live:cloud`) |
-| **Azure** | `pulumi/azure-native` | Disabled | ⚠️ | Enable via **Topology → Providers**; includes `azure-free-tier-vm` blueprint; tested in live cloud E2E (`pnpm --dir e2e test:live:cloud`) |
+| **AWS** | `pulumi/aws` | Disabled | ⚠️ | Enable via **Topology → Providers**; includes `aws-vm` blueprint; tested in live cloud E2E (`pnpm --dir e2e test:live:cloud`) |
+| **GCP** | `pulumi/gcp` | Disabled | ⚠️ | Enable via **Topology → Providers**; includes `gcp-vm` blueprint; tested in live cloud E2E (`pnpm --dir e2e test:live:cloud`) |
+| **Azure** | `pulumi/azure-native` | Disabled | ⚠️ | Enable via **Topology → Providers**; includes `azure-vm` blueprint; tested in live cloud E2E (`pnpm --dir e2e test:live:cloud`) |
 | **Hetzner Cloud** | `pulumi/hcloud` | Disabled | ⚠️ | Enable via **Topology → Providers**; needs live testing |
 | **Cloudflare** | `pulumi/cloudflare` | Disabled | ⚠️ | Enable via **Topology → Providers**; needs live testing |
 | **Custom OpenTofu / TF** | `terraform-provider` bridge | ✅ | Tested live (`hashicorp/random`); add dynamically via UI/API/Git PR without recompiling Keel |

@@ -306,9 +306,9 @@ outputs:
 
 ---
 
-## AWS Free-Tier EC2 Instance (`aws-free-tier-vm`)
+## AWS EC2 Virtual Machine (`aws-vm`)
 
-Place in `catalog/infra/aws-free-tier-vm/`. Provisions a free-tier eligible `t3.micro` / `t2.micro` EC2 virtual machine with security group, SSH key pair, and direct SSH outputs.
+Place in `catalog/infra/aws-vm/`. Provisions an EC2 virtual machine (defaulting to free-tier eligible `t3.micro`) with security group, SSH key pair, and direct SSH outputs.
 
 ### `catalog.yaml`
 
@@ -316,9 +316,9 @@ Place in `catalog/infra/aws-free-tier-vm/`. Provisions a free-tier eligible `t3.
 apiVersion: keel.io/v1alpha1
 kind: CatalogInfraBlueprint
 metadata:
-  id: aws-free-tier-vm
-  name: AWS Free-Tier EC2 Instance
-  description: Provision a free-tier eligible AWS EC2 virtual machine with SSH access
+  id: aws-vm
+  name: AWS EC2 Virtual Machine
+  description: Provision an AWS EC2 virtual machine with SSH access (defaults to free-tier t3.micro)
   category: compute
   provider: aws
 spec:
@@ -375,7 +375,7 @@ spec:
 ### `Pulumi.yaml`
 
 ```yaml
-name: aws-free-tier-vm
+name: aws-vm
 runtime: yaml
 description: Free-tier eligible AWS EC2 virtual machine
 
@@ -544,9 +544,9 @@ outputs:
 
 ---
 
-## GCP Free-Tier Compute VM (`gcp-free-tier-vm`)
+## GCP Compute Engine VM (`gcp-vm`)
 
-Place in `catalog/infra/gcp-free-tier-vm/`. Provisions an Always-Free eligible `e2-micro` Compute Engine VM on Google Cloud with SSH firewall rule, metadata SSH key, and direct SSH outputs.
+Place in `catalog/infra/gcp-vm/`. Provisions a Compute Engine VM on Google Cloud (defaulting to Always-Free eligible `e2-micro`) with SSH firewall rule, metadata SSH key, and direct SSH outputs.
 
 ### `catalog.yaml`
 
@@ -554,9 +554,9 @@ Place in `catalog/infra/gcp-free-tier-vm/`. Provisions an Always-Free eligible `
 apiVersion: keel.io/v1alpha1
 kind: CatalogInfraBlueprint
 metadata:
-  id: gcp-free-tier-vm
-  name: GCP Free-Tier Compute VM
-  description: Provision an Always-Free eligible GCP e2-micro virtual machine with SSH access
+  id: gcp-vm
+  name: GCP Compute Engine VM
+  description: Provision a GCP Compute Engine virtual machine with SSH access (defaults to Always-Free e2-micro)
   category: compute
   provider: gcp
 spec:
@@ -614,7 +614,7 @@ spec:
 ### `Pulumi.yaml`
 
 ```yaml
-name: gcp-free-tier-vm
+name: gcp-vm
 runtime: yaml
 description: Always-Free eligible GCP e2-micro compute instance
 
@@ -814,9 +814,9 @@ outputs:
 
 ---
 
-## Azure Free-Tier Linux VM (`azure-free-tier-vm`)
+## Azure Linux Virtual Machine (`azure-vm`)
 
-Place in `catalog/infra/azure-free-tier-vm/`. Provisions a free-tier eligible `Standard_B1s` Linux VM in Microsoft Azure with Resource Group, VNet, Subnet, NSG, Public IP, and direct SSH outputs.
+Place in `catalog/infra/azure-vm/`. Provisions a Linux VM in Microsoft Azure (defaulting to free-tier eligible `Standard_B1s`) with Resource Group, VNet, Subnet, NSG, Public IP, and direct SSH outputs.
 
 ### `catalog.yaml`
 
@@ -824,9 +824,9 @@ Place in `catalog/infra/azure-free-tier-vm/`. Provisions a free-tier eligible `S
 apiVersion: keel.io/v1alpha1
 kind: CatalogInfraBlueprint
 metadata:
-  id: azure-free-tier-vm
-  name: Azure Free-Tier Linux VM
-  description: Provision a free-tier eligible Azure Standard_B1s virtual machine with SSH access
+  id: azure-vm
+  name: Azure Linux Virtual Machine
+  description: Provision an Azure Linux virtual machine with SSH access (defaults to free-tier Standard_B1s)
   category: compute
   provider: azure
 spec:
@@ -888,7 +888,7 @@ spec:
 ### `Pulumi.yaml`
 
 ```yaml
-name: azure-free-tier-vm
+name: azure-vm
 runtime: yaml
 description: Free-tier eligible Azure Standard_B1s Linux virtual machine
 

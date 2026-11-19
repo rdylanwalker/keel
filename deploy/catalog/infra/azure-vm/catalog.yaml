@@ -1,9 +1,9 @@
 apiVersion: keel.io/v1alpha1
 kind: CatalogInfraBlueprint
 metadata:
-  id: azure-free-tier-vm
-  name: Azure Free-Tier Linux VM
-  description: Provision a free-tier eligible Azure Standard_B1s virtual machine with SSH access
+  id: azure-vm
+  name: Azure Linux Virtual Machine
+  description: Provision an Azure Linux virtual machine with SSH access (defaults to free-tier Standard_B1s)
   category: compute
   provider: azure
 spec:
@@ -21,14 +21,37 @@ spec:
     required:
       - sshPublicKey
     properties:
+      vmName:
+        type: string
+        title: Virtual Machine Name
+        description: Name assigned to the Azure virtual machine.
+        default: keel-free-vm
       location:
         type: string
         title: Azure Region
+        description: Azure location where resources will be provisioned.
         default: eastus
       vmSize:
         type: string
         title: Virtual Machine Size
+        description: Azure VM SKU (defaults to free-tier eligible Standard_B1s).
         default: Standard_B1s
+      diskSizeGb:
+        type: integer
+        title: OS Disk Size (GB)
+        description: Managed OS disk size in GiB (Azure Free Tier includes 64 GB Standard HDD/SSD).
+        default: 30
+        minimum: 30
+        maximum: 4096
+      diskType:
+        type: string
+        title: OS Disk Storage Type
+        description: Azure Managed Disk SKU for the OS disk.
+        default: Standard_LRS
+        enum:
+          - Standard_LRS
+          - StandardSSD_LRS
+          - Premium_LRS
       sshUser:
         type: string
         title: SSH Username
@@ -54,6 +77,9 @@ spec:
         title: Azure Subscription ID
         writeOnly: true
   uiSchema:
+    vmSize:
+      ui:placeholder: "Standard_B1s"
+      ui:help: "Free-tier default: Standard_B1s (also supports Standard_B2s, Standard_D2s_v5, etc.)."
     sshPublicKey:
       ui:widget: textarea
       ui:help: "SSH public key injected for the administrative user."

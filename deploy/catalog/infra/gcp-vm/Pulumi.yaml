@@ -1,6 +1,6 @@
-name: gcp-free-tier-vm
+name: gcp-vm
 runtime: yaml
-description: Always-Free eligible GCP e2-micro compute instance
+description: GCP Compute Engine virtual machine (defaults to Always-Free e2-micro)
 
 config:
   project:
@@ -22,6 +22,12 @@ config:
   instanceName:
     type: string
     default: keel-free-vm
+  diskSizeGb:
+    type: integer
+    default: 10
+  diskType:
+    type: string
+    default: pd-standard
 
 resources:
   sshFirewall:
@@ -52,8 +58,8 @@ resources:
       bootDisk:
         initializeParams:
           image: debian-cloud/debian-12
-          size: 10
-          type: pd-standard
+          size: ${diskSizeGb}
+          type: ${diskType}
       networkInterfaces:
         - network: default
           accessConfigs:

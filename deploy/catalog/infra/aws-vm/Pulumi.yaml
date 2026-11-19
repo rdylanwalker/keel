@@ -1,6 +1,6 @@
-name: aws-free-tier-vm
+name: aws-vm
 runtime: yaml
-description: Free-tier eligible AWS EC2 virtual machine
+description: AWS EC2 virtual machine (defaults to free-tier t3.micro)
 
 config:
   region:
@@ -20,6 +20,12 @@ config:
   instanceName:
     type: string
     default: keel-free-vm
+  diskSizeGb:
+    type: integer
+    default: 20
+  diskType:
+    type: string
+    default: gp3
 
 variables:
   ubuntuAmi:
@@ -73,8 +79,8 @@ resources:
       vpcSecurityGroupIds:
         - ${vmSecurityGroup.id}
       rootBlockDevice:
-        volumeSize: 20
-        volumeType: gp3
+        volumeSize: ${diskSizeGb}
+        volumeType: ${diskType}
         encrypted: true
       tags:
         Name: ${instanceName}

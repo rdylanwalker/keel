@@ -693,18 +693,18 @@ const STARTER_KIND_CLUSTER_CATALOG_YAML: &str =
     include_str!("../../../deploy/catalog/infra/kind-cluster/catalog.yaml");
 const STARTER_KIND_CLUSTER_PULUMI_YAML: &str =
     include_str!("../../../deploy/catalog/infra/kind-cluster/Pulumi.yaml");
-const STARTER_AWS_FREE_TIER_VM_CATALOG_YAML: &str =
-    include_str!("../../../deploy/catalog/infra/aws-free-tier-vm/catalog.yaml");
-const STARTER_AWS_FREE_TIER_VM_PULUMI_YAML: &str =
-    include_str!("../../../deploy/catalog/infra/aws-free-tier-vm/Pulumi.yaml");
-const STARTER_AZURE_FREE_TIER_VM_CATALOG_YAML: &str =
-    include_str!("../../../deploy/catalog/infra/azure-free-tier-vm/catalog.yaml");
-const STARTER_AZURE_FREE_TIER_VM_PULUMI_YAML: &str =
-    include_str!("../../../deploy/catalog/infra/azure-free-tier-vm/Pulumi.yaml");
-const STARTER_GCP_FREE_TIER_VM_CATALOG_YAML: &str =
-    include_str!("../../../deploy/catalog/infra/gcp-free-tier-vm/catalog.yaml");
-const STARTER_GCP_FREE_TIER_VM_PULUMI_YAML: &str =
-    include_str!("../../../deploy/catalog/infra/gcp-free-tier-vm/Pulumi.yaml");
+const STARTER_AWS_VM_CATALOG_YAML: &str =
+    include_str!("../../../deploy/catalog/infra/aws-vm/catalog.yaml");
+const STARTER_AWS_VM_PULUMI_YAML: &str =
+    include_str!("../../../deploy/catalog/infra/aws-vm/Pulumi.yaml");
+const STARTER_AZURE_VM_CATALOG_YAML: &str =
+    include_str!("../../../deploy/catalog/infra/azure-vm/catalog.yaml");
+const STARTER_AZURE_VM_PULUMI_YAML: &str =
+    include_str!("../../../deploy/catalog/infra/azure-vm/Pulumi.yaml");
+const STARTER_GCP_VM_CATALOG_YAML: &str =
+    include_str!("../../../deploy/catalog/infra/gcp-vm/catalog.yaml");
+const STARTER_GCP_VM_PULUMI_YAML: &str =
+    include_str!("../../../deploy/catalog/infra/gcp-vm/Pulumi.yaml");
 const STARTER_PODINFO_CATALOG_YAML: &str =
     include_str!("../../../deploy/catalog/apps/podinfo/catalog.yaml");
 
@@ -1448,28 +1448,28 @@ async fn initialize_seed_git_repo_with_push(
             STARTER_KIND_CLUSTER_PULUMI_YAML.to_string(),
         ));
         files_to_write.push((
-            "catalog/infra/aws-free-tier-vm/catalog.yaml",
-            STARTER_AWS_FREE_TIER_VM_CATALOG_YAML.to_string(),
+            "catalog/infra/aws-vm/catalog.yaml",
+            STARTER_AWS_VM_CATALOG_YAML.to_string(),
         ));
         files_to_write.push((
-            "catalog/infra/aws-free-tier-vm/Pulumi.yaml",
-            STARTER_AWS_FREE_TIER_VM_PULUMI_YAML.to_string(),
+            "catalog/infra/aws-vm/Pulumi.yaml",
+            STARTER_AWS_VM_PULUMI_YAML.to_string(),
         ));
         files_to_write.push((
-            "catalog/infra/azure-free-tier-vm/catalog.yaml",
-            STARTER_AZURE_FREE_TIER_VM_CATALOG_YAML.to_string(),
+            "catalog/infra/azure-vm/catalog.yaml",
+            STARTER_AZURE_VM_CATALOG_YAML.to_string(),
         ));
         files_to_write.push((
-            "catalog/infra/azure-free-tier-vm/Pulumi.yaml",
-            STARTER_AZURE_FREE_TIER_VM_PULUMI_YAML.to_string(),
+            "catalog/infra/azure-vm/Pulumi.yaml",
+            STARTER_AZURE_VM_PULUMI_YAML.to_string(),
         ));
         files_to_write.push((
-            "catalog/infra/gcp-free-tier-vm/catalog.yaml",
-            STARTER_GCP_FREE_TIER_VM_CATALOG_YAML.to_string(),
+            "catalog/infra/gcp-vm/catalog.yaml",
+            STARTER_GCP_VM_CATALOG_YAML.to_string(),
         ));
         files_to_write.push((
-            "catalog/infra/gcp-free-tier-vm/Pulumi.yaml",
-            STARTER_GCP_FREE_TIER_VM_PULUMI_YAML.to_string(),
+            "catalog/infra/gcp-vm/Pulumi.yaml",
+            STARTER_GCP_VM_PULUMI_YAML.to_string(),
         ));
         files_to_write.push((
             "catalog/apps/podinfo/catalog.yaml",
@@ -4694,40 +4694,64 @@ spec:
                 .join("catalog/infra/kind-cluster/catalog.yaml")
                 .exists()
         );
+        assert!(repo_dir.join("catalog/infra/aws-vm/catalog.yaml").exists());
+        assert!(repo_dir.join("catalog/infra/aws-vm/Pulumi.yaml").exists());
         assert!(
             repo_dir
-                .join("catalog/infra/aws-free-tier-vm/catalog.yaml")
+                .join("catalog/infra/azure-vm/catalog.yaml")
                 .exists()
         );
-        assert!(
-            repo_dir
-                .join("catalog/infra/aws-free-tier-vm/Pulumi.yaml")
-                .exists()
-        );
-        assert!(
-            repo_dir
-                .join("catalog/infra/azure-free-tier-vm/catalog.yaml")
-                .exists()
-        );
-        assert!(
-            repo_dir
-                .join("catalog/infra/azure-free-tier-vm/Pulumi.yaml")
-                .exists()
-        );
-        assert!(
-            repo_dir
-                .join("catalog/infra/gcp-free-tier-vm/catalog.yaml")
-                .exists()
-        );
-        assert!(
-            repo_dir
-                .join("catalog/infra/gcp-free-tier-vm/Pulumi.yaml")
-                .exists()
-        );
+        assert!(repo_dir.join("catalog/infra/azure-vm/Pulumi.yaml").exists());
+        assert!(repo_dir.join("catalog/infra/gcp-vm/catalog.yaml").exists());
+        assert!(repo_dir.join("catalog/infra/gcp-vm/Pulumi.yaml").exists());
         assert!(repo_dir.join("catalog/apps/podinfo/catalog.yaml").exists());
 
         let git = GitRunner::new();
         assert!(git.ref_exists(&repo_dir, "refs/heads/main").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn rauthy_forgejo_client_is_confidential_with_s256_pkce() {
+        let args = BootstrapInitArgs {
+            target: BootstrapTargetKind::Kind,
+            cluster_name: "test-oidc".to_string(),
+            kubeconfig: None,
+            context: None,
+            proxmox_url: None,
+            region: None,
+            distro: None,
+            with_forge: true,
+            oidc_issuer: None,
+            oidc_provider: crate::cli::OidcProviderArg::Rauthy,
+            oidc_client_id: None,
+            admin_username: None,
+            admin_password: None,
+            local_dev_docker_socket_exception: false,
+            repo_dir: None,
+            skip_core_install: true,
+            git_url: None,
+            forge_type: None,
+            forge_api_url: None,
+            git_token: None,
+            pulumi_program_dir: None,
+        };
+        let cfg = args.to_bootstrap_config();
+        let artifacts = synthesize_seed_control_plane(&cfg, None).await.unwrap();
+        let rauthy = artifacts.rauthy_config.expect("rauthy config");
+        let clients: serde_json::Value = serde_json::from_str(&rauthy.clients_json).unwrap();
+        let clients_arr = clients.as_array().unwrap();
+        let forgejo = clients_arr
+            .iter()
+            .find(|c| c.get("id").and_then(|v| v.as_str()) == Some("forgejo"))
+            .expect("forgejo client");
+        assert_eq!(
+            forgejo.get("confidential").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            forgejo.get("challenges"),
+            Some(&serde_json::json!(["S256"]))
+        );
     }
 
     #[tokio::test]

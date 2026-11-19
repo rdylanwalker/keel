@@ -159,9 +159,9 @@ just test-e2e-cloud
 ## Multi-Cloud Free-Tier Live E2E Testing (AWS, Azure, GCP)
 
 Keel includes a live end-to-end test suite (`e2e/tests/08-cloud-free-tier-live-e2e.spec.ts`) that validates Stage 0 cloud bootstrapping and Stage 1 PKO v2 provider provisioning against real cloud APIs using zero-cost free-tier resources:
-* **AWS:** `t3.micro` / `t2.micro` EC2 instances (`aws-free-tier-vm` blueprint) + S3
-* **Azure:** `Standard_B1s` VMs (`azure-free-tier-vm` blueprint) in `eastus`
-* **GCP:** `e2-micro` VMs (`gcp-free-tier-vm` blueprint) in `us-central1-a` (Always Free tier)
+* **AWS:** `t3.micro` / `t2.micro` EC2 instances (`aws-vm` blueprint) + S3
+* **Azure:** `Standard_B1s` VMs (`azure-vm` blueprint) in `eastus`
+* **GCP:** `e2-micro` VMs (`gcp-vm` blueprint) in `us-central1-a` (Always Free tier)
 
 ### Dual-Guard Environment Contract
 

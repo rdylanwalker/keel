@@ -1,6 +1,6 @@
-name: azure-free-tier-vm
+name: azure-vm
 runtime: yaml
-description: Free-tier eligible Azure Standard_B1s Linux virtual machine
+description: Azure Linux virtual machine (defaults to free-tier Standard_B1s)
 
 config:
   location:
@@ -17,6 +17,12 @@ config:
   vmName:
     type: string
     default: keel-free-vm
+  diskSizeGb:
+    type: integer
+    default: 30
+  diskType:
+    type: string
+    default: Standard_LRS
 
 resources:
   resourceGroup:
@@ -110,9 +116,9 @@ resources:
           version: latest
         osDisk:
           createOption: FromImage
-          diskSizeGB: 30
+          diskSizeGB: ${diskSizeGb}
           managedDisk:
-            storageAccountType: Standard_LRS
+            storageAccountType: ${diskType}
       osProfile:
         computerName: ${vmName}
         adminUsername: ${sshUser}

@@ -1,9 +1,9 @@
 apiVersion: keel.io/v1alpha1
 kind: CatalogInfraBlueprint
 metadata:
-  id: aws-free-tier-vm
-  name: AWS Free-Tier EC2 Instance
-  description: Provision a free-tier eligible AWS EC2 virtual machine with SSH access
+  id: aws-vm
+  name: AWS EC2 Virtual Machine
+  description: Provision an AWS EC2 virtual machine with SSH access (defaults to free-tier t3.micro)
   category: compute
   provider: aws
 spec:
@@ -21,17 +21,39 @@ spec:
     required:
       - sshPublicKey
     properties:
+      instanceName:
+        type: string
+        title: Instance Name
+        description: Name tag assigned to the EC2 instance.
+        default: keel-free-vm
       region:
         type: string
         title: AWS Region
+        description: AWS region where the EC2 instance will be provisioned.
         default: us-east-1
       instanceType:
         type: string
         title: EC2 Instance Type
+        description: EC2 instance type (defaults to free-tier eligible t3.micro).
         default: t3.micro
+      diskSizeGb:
+        type: integer
+        title: Root Volume Size (GB)
+        description: Root EBS volume size in GiB (AWS Free Tier includes up to 30 GB).
+        default: 20
+        minimum: 8
+        maximum: 16384
+      diskType:
+        type: string
+        title: Root Volume Type
+        description: EBS volume type for the root block device.
+        default: gp3
         enum:
-          - t3.micro
-          - t2.micro
+          - gp3
+          - gp2
+          - io2
+          - st1
+          - sc1
       sshUser:
         type: string
         title: SSH Username
@@ -49,6 +71,9 @@ spec:
         writeOnly: true
         format: password
   uiSchema:
+    instanceType:
+      ui:placeholder: "t3.micro"
+      ui:help: "Free-tier default: t3.micro (also supports t2.micro, t3.small, m5.large, etc.)."
     sshPublicKey:
       ui:widget: textarea
       ui:help: "SSH public key injected into the EC2 instance key pair."

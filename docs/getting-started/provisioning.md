@@ -142,7 +142,7 @@ From **Topology Map**:
 Keel resolves SSH connection metadata (`sshHost`, `sshUser`, `sshPort`) directly from provisioned PKO v2 stack outputs, allowing immediate access without digging through cloud consoles.
 
 ### Access via Web Portal
-1. In **Topology Map** or inside **Stack Inspector**, click the **SSH** action button on any provisioned VM stack card (e.g., `aws-free-tier-vm`, `azure-free-tier-vm`, `gcp-free-tier-vm`).
+1. In **Topology Map** or inside **Stack Inspector**, click the **SSH** action button on any provisioned VM stack card (e.g., `aws-vm`, `azure-vm`, `gcp-vm`).
 2. **Connection Information View:** Displays host, username, port, and one-click copyable commands:
    - `ssh -p <port> <user>@<host>`
    - `keel infra ssh <stack-name> --tenant <tenant>`
