@@ -1,0 +1,62 @@
+apiVersion: keel.io/v1alpha1
+kind: CatalogInfraBlueprint
+metadata:
+  id: azure-free-tier-vm
+  name: Azure Free-Tier Linux VM
+  description: Provision a free-tier eligible Azure Standard_B1s virtual machine with SSH access
+  category: compute
+  provider: azure
+spec:
+  pulumiRuntime: yaml
+  entrypoint: Pulumi.yaml
+  protectByDefault: true
+  outputs:
+    - vmId
+    - publicIp
+    - sshHost
+    - sshUser
+    - sshPort
+  schema:
+    type: object
+    required:
+      - sshPublicKey
+    properties:
+      location:
+        type: string
+        title: Azure Region
+        default: eastus
+      vmSize:
+        type: string
+        title: Virtual Machine Size
+        default: Standard_B1s
+      sshUser:
+        type: string
+        title: SSH Username
+        default: azureuser
+      sshPublicKey:
+        type: string
+        title: Operator SSH Public Key
+      armClientId:
+        type: string
+        title: Azure Client ID
+        writeOnly: true
+      armClientSecret:
+        type: string
+        title: Azure Client Secret
+        writeOnly: true
+        format: password
+      armTenantId:
+        type: string
+        title: Azure Tenant ID
+        writeOnly: true
+      armSubscriptionId:
+        type: string
+        title: Azure Subscription ID
+        writeOnly: true
+  uiSchema:
+    sshPublicKey:
+      ui:widget: textarea
+      ui:help: "SSH public key injected for the administrative user."
+    armClientSecret:
+      ui:widget: password
+      ui:help: "Encrypted via SOPS + tenant age key before committing to Git."

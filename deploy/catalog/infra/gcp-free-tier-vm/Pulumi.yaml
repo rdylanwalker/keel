@@ -1,0 +1,70 @@
+name: gcp-free-tier-vm
+runtime: yaml
+description: Always-Free eligible GCP e2-micro compute instance
+
+config:
+  project:
+    type: string
+  region:
+    type: string
+    default: us-central1
+  zone:
+    type: string
+    default: us-central1-a
+  machineType:
+    type: string
+    default: e2-micro
+  sshUser:
+    type: string
+    default: debian
+  sshPublicKey:
+    type: string
+  instanceName:
+    type: string
+    default: keel-free-vm
+
+resources:
+  sshFirewall:
+    type: gcp:compute:Firewall
+    properties:
+      project: ${project}
+      network: default
+      description: Allow inbound SSH from any IP
+      allows:
+        - protocol: tcp
+          ports:
+            - "22"
+      sourceRanges:
+        - 0.0.0.0/0
+      targetTags:
+        - allow-ssh
+
+  computeInstance:
+    type: gcp:compute:Instance
+    properties:
+      project: ${project}
+      name: ${instanceName}
+      machineType: ${machineType}
+      zone: ${zone}
+      tags:
+        - allow-ssh
+      bootDisk:
+        initializeParams:
+          image: debian-cloud/debian-12
+          size: 10
+          type: pd-standard
+      networkInterfaces:
+        - network: default
+          accessConfigs:
+            - {}
+      metadata:
+        ssh-keys: "${sshUser}:${sshPublicKey}"
+      labels:
+        managed-by: keel
+
+outputs:
+  instanceName: ${computeInstance.name}
+  publicIp: ${computeInstance.networkInterfaces[0].accessConfigs[0].natIp}
+  sshHost: ${computeInstance.networkInterfaces[0].accessConfigs[0].natIp}
+  sshUser: ${sshUser}
+  sshPort: 22

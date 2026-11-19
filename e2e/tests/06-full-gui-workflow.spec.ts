@@ -106,6 +106,33 @@ test.describe('06 - Full Localhost GUI GitOps Workflow', () => {
     await expect(page.getByText(/Live Reconciler Event Stream/i)).toBeVisible();
     await expect(page.getByText(/podinfo/i).first()).toBeVisible({ timeout: 10000 });
 
+    // 6b. Open VM SSH Modal on a provisioned stack -> verify connection commands & opt-in browser terminal
+    const sshButton = page.locator('[data-testid^="stack-ssh-btn-"]').first();
+    await expect(sshButton).toBeVisible();
+    await sshButton.click();
+    await expect(page.getByTestId('ssh-raw-command')).toBeVisible();
+    await expect(page.getByTestId('ssh-cli-print-command')).toBeVisible();
+    await expect(page.getByTestId('ssh-cli-exec-command')).toBeVisible();
+    // Interactive terminal must NOT be active by default before user clicks Launch
+    await expect(page.getByTestId('browser-ssh-terminal')).toHaveCount(0);
+    await page.getByTestId('launch-browser-terminal-btn').click();
+    await expect(page.getByTestId('browser-ssh-terminal')).toBeVisible({ timeout: 10000 });
+    await page.getByTestId('disconnect-browser-terminal-btn').click();
+    await page.getByTestId('vm-ssh-modal-close-btn').click();
+
+    // 6c. Author & deploy a Raw Kubernetes Manifest / Template catalog entry
+    await page.getByRole('button', { name: /Catalog & Form Wizard/i }).click();
+    await page.getByRole('button', { name: /Add Catalog Item/i }).click();
+    await page.locator('#app-id').fill('e2e-raw-manifest');
+    await page.locator('#app-name').fill('E2E Raw Manifest App');
+    await page.locator('#app-runtime').selectOption('manifest');
+    await expect(page.getByTestId('catalog-manifests-yaml-input')).toBeVisible();
+    await page.getByTestId('extract-manifest-vars-btn').first().click();
+    await page.getByRole('button', { name: /Submit App PR Proposal/i }).click();
+    await expect(page.getByText(/Git PR Proposal Successfully Opened!/i)).toBeVisible({
+      timeout: 10000,
+    });
+
     // 7. Verify Control Plane & Providers 4th sidebar tab & base addon upgrade workflow
     await page.getByRole('button', { name: /Control Plane & Providers/i }).click();
     await expect(page.getByText('Management Control Plane Cluster')).toBeVisible();

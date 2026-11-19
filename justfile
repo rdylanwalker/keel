@@ -319,6 +319,10 @@ test-ui:
 test-e2e: build
     pnpm --dir e2e test
 
+# Run multi-cloud free-tier live E2E suite (AWS/Azure/GCP)
+test-e2e-cloud: build
+    pnpm --dir e2e test:live:cloud
+
 # Run all unit and E2E tests
 test: test-rust test-ui test-e2e
 

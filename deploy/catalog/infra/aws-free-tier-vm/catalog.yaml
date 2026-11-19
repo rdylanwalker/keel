@@ -1,0 +1,57 @@
+apiVersion: keel.io/v1alpha1
+kind: CatalogInfraBlueprint
+metadata:
+  id: aws-free-tier-vm
+  name: AWS Free-Tier EC2 Instance
+  description: Provision a free-tier eligible AWS EC2 virtual machine with SSH access
+  category: compute
+  provider: aws
+spec:
+  pulumiRuntime: yaml
+  entrypoint: Pulumi.yaml
+  protectByDefault: true
+  outputs:
+    - instanceId
+    - publicIp
+    - sshHost
+    - sshUser
+    - sshPort
+  schema:
+    type: object
+    required:
+      - sshPublicKey
+    properties:
+      region:
+        type: string
+        title: AWS Region
+        default: us-east-1
+      instanceType:
+        type: string
+        title: EC2 Instance Type
+        default: t3.micro
+        enum:
+          - t3.micro
+          - t2.micro
+      sshUser:
+        type: string
+        title: SSH Username
+        default: ubuntu
+      sshPublicKey:
+        type: string
+        title: Operator SSH Public Key
+      awsAccessKeyId:
+        type: string
+        title: AWS Access Key ID
+        writeOnly: true
+      awsSecretAccessKey:
+        type: string
+        title: AWS Secret Access Key
+        writeOnly: true
+        format: password
+  uiSchema:
+    sshPublicKey:
+      ui:widget: textarea
+      ui:help: "SSH public key injected into the EC2 instance key pair."
+    awsSecretAccessKey:
+      ui:widget: password
+      ui:help: "Encrypted via SOPS + tenant age key before committing to Git."

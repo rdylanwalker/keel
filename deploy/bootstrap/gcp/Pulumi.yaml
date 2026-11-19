@@ -17,7 +17,19 @@ config:
     type: string
   machineType:
     type: string
-    default: e2-standard-4
+    default: e2-micro
+  bootDiskSizeGb:
+    type: integer
+    default: 10
+  bootDiskType:
+    type: string
+    default: pd-standard
+  sshUser:
+    type: string
+    default: debian
+  protectResources:
+    type: boolean
+    default: true
 
 resources:
   pulumiStateBucket:
@@ -47,8 +59,8 @@ resources:
       bootDisk:
         initializeParams:
           image: debian-cloud/debian-12
-          size: 64
-          type: pd-ssd
+          size: ${bootDiskSizeGb}
+          type: ${bootDiskType}
       networkInterfaces:
         - network: default
       labels:
@@ -59,3 +71,6 @@ outputs:
   clusterName: ${clusterName}
   stateBucketUrl: ${pulumiStateBucket.url}
   controlPlaneInternalIp: ${seedControlPlaneVm.networkInterfaces[0].networkIp}
+  sshHost: ${seedControlPlaneVm.networkInterfaces[0].networkIp}
+  sshUser: ${sshUser}
+  sshPort: 22

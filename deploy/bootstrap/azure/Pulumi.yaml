@@ -12,6 +12,21 @@ config:
     default: eastus
   storageAccountName:
     type: string
+  vmSize:
+    type: string
+    default: Standard_B1s
+  osDiskSizeGb:
+    type: integer
+    default: 30
+  sshUser:
+    type: string
+    default: azureuser
+  sshHost:
+    type: string
+    default: ""
+  protectResources:
+    type: boolean
+    default: true
 
 resources:
   managementResourceGroup:
@@ -54,3 +69,6 @@ outputs:
   clusterName: ${clusterName}
   resourceGroupName: ${managementResourceGroup.name}
   stateContainerName: ${pulumiStateContainer.name}
+  sshHost: ${sshHost}
+  sshUser: ${sshUser}
+  sshPort: 22

@@ -1,0 +1,131 @@
+name: azure-free-tier-vm
+runtime: yaml
+description: Free-tier eligible Azure Standard_B1s Linux virtual machine
+
+config:
+  location:
+    type: string
+    default: eastus
+  vmSize:
+    type: string
+    default: Standard_B1s
+  sshUser:
+    type: string
+    default: azureuser
+  sshPublicKey:
+    type: string
+  vmName:
+    type: string
+    default: keel-free-vm
+
+resources:
+  resourceGroup:
+    type: azure-native:resources:ResourceGroup
+    properties:
+      location: ${location}
+      tags:
+        managed-by: keel
+
+  virtualNetwork:
+    type: azure-native:network:VirtualNetwork
+    properties:
+      resourceGroupName: ${resourceGroup.name}
+      location: ${location}
+      addressSpace:
+        addressPrefixes:
+          - 10.0.0.0/16
+      tags:
+        managed-by: keel
+
+  subnet:
+    type: azure-native:network:Subnet
+    properties:
+      resourceGroupName: ${resourceGroup.name}
+      virtualNetworkName: ${virtualNetwork.name}
+      addressPrefix: 10.0.1.0/24
+
+  publicIp:
+    type: azure-native:network:PublicIPAddress
+    properties:
+      resourceGroupName: ${resourceGroup.name}
+      location: ${location}
+      publicIPAllocationMethod: Dynamic
+      tags:
+        managed-by: keel
+
+  networkSecurityGroup:
+    type: azure-native:network:NetworkSecurityGroup
+    properties:
+      resourceGroupName: ${resourceGroup.name}
+      location: ${location}
+      securityRules:
+        - name: AllowSSH
+          protocol: Tcp
+          direction: Inbound
+          priority: 1000
+          access: Allow
+          sourceAddressPrefix: "*"
+          sourcePortRange: "*"
+          destinationAddressPrefix: "*"
+          destinationPortRange: "22"
+      tags:
+        managed-by: keel
+
+  networkInterface:
+    type: azure-native:network:NetworkInterface
+    properties:
+      resourceGroupName: ${resourceGroup.name}
+      location: ${location}
+      networkSecurityGroup:
+        id: ${networkSecurityGroup.id}
+      ipConfigurations:
+        - name: ipconfig1
+          subnet:
+            id: ${subnet.id}
+          publicIPAddress:
+            id: ${publicIp.id}
+          privateIPAllocationMethod: Dynamic
+      tags:
+        managed-by: keel
+
+  virtualMachine:
+    type: azure-native:compute:VirtualMachine
+    properties:
+      resourceGroupName: ${resourceGroup.name}
+      location: ${location}
+      vmName: ${vmName}
+      hardwareProfile:
+        vmSize: ${vmSize}
+      networkProfile:
+        networkInterfaces:
+          - id: ${networkInterface.id}
+            primary: true
+      storageProfile:
+        imageReference:
+          publisher: Canonical
+          offer: 0001-com-ubuntu-server-jammy
+          sku: 22_04-lts-gen2
+          version: latest
+        osDisk:
+          createOption: FromImage
+          diskSizeGB: 30
+          managedDisk:
+            storageAccountType: Standard_LRS
+      osProfile:
+        computerName: ${vmName}
+        adminUsername: ${sshUser}
+        linuxConfiguration:
+          disablePasswordAuthentication: true
+          ssh:
+            publicKeys:
+              - keyData: ${sshPublicKey}
+                path: /home/${sshUser}/.ssh/authorized_keys
+      tags:
+        managed-by: keel
+
+outputs:
+  vmId: ${virtualMachine.id}
+  publicIp: ${publicIp.ipAddress}
+  sshHost: ${publicIp.ipAddress}
+  sshUser: ${sshUser}
+  sshPort: 22

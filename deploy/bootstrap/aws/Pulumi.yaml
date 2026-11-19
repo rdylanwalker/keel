@@ -12,11 +12,20 @@ config:
     default: keel-pulumi-state
   instanceType:
     type: string
-    default: t3.large
+    default: t3.micro
   amiId:
     type: string
   subnetId:
     type: string
+  rootVolumeSizeGb:
+    type: integer
+    default: 30
+  sshUser:
+    type: string
+    default: ubuntu
+  protectResources:
+    type: boolean
+    default: true
 
 resources:
   pulumiStateBucket:
@@ -58,7 +67,7 @@ resources:
       instanceType: ${instanceType}
       subnetId: ${subnetId}
       rootBlockDevice:
-        volumeSize: 64
+        volumeSize: ${rootVolumeSizeGb}
         volumeType: gp3
         encrypted: true
       metadataOptions:
@@ -74,3 +83,6 @@ outputs:
   stateBucket: ${pulumiStateBucket.bucket}
   controlPlanePrivateIp: ${seedControlPlaneNode.privateIp}
   controlPlanePublicIp: ${seedControlPlaneNode.publicIp}
+  sshHost: ${seedControlPlaneNode.publicIp}
+  sshUser: ${sshUser}
+  sshPort: 22

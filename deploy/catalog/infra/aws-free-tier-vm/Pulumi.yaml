@@ -1,0 +1,88 @@
+name: aws-free-tier-vm
+runtime: yaml
+description: Free-tier eligible AWS EC2 virtual machine
+
+config:
+  region:
+    type: string
+    default: us-east-1
+  instanceType:
+    type: string
+    default: t3.micro
+  sshUser:
+    type: string
+    default: ubuntu
+  sshPublicKey:
+    type: string
+  amiId:
+    type: string
+    default: ""
+  instanceName:
+    type: string
+    default: keel-free-vm
+
+variables:
+  ubuntuAmi:
+    fn::invoke:
+      function: aws:ec2:getAmi
+      arguments:
+        mostRecent: true
+        owners:
+          - "099720109477"
+        filters:
+          - name: name
+            values:
+              - "ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-*"
+          - name: virtualization-type
+            values:
+              - hvm
+
+resources:
+  sshKeyPair:
+    type: aws:ec2:KeyPair
+    properties:
+      publicKey: ${sshPublicKey}
+      tags:
+        managed-by: keel
+
+  vmSecurityGroup:
+    type: aws:ec2:SecurityGroup
+    properties:
+      description: Security group allowing inbound SSH traffic
+      ingress:
+        - protocol: tcp
+          fromPort: 22
+          toPort: 22
+          cidrBlocks:
+            - 0.0.0.0/0
+      egress:
+        - protocol: "-1"
+          fromPort: 0
+          toPort: 0
+          cidrBlocks:
+            - 0.0.0.0/0
+      tags:
+        managed-by: keel
+
+  ec2Instance:
+    type: aws:ec2:Instance
+    properties:
+      instanceType: ${instanceType}
+      ami: ${amiId != "" ? amiId : ubuntuAmi.id}
+      keyName: ${sshKeyPair.keyName}
+      vpcSecurityGroupIds:
+        - ${vmSecurityGroup.id}
+      rootBlockDevice:
+        volumeSize: 20
+        volumeType: gp3
+        encrypted: true
+      tags:
+        Name: ${instanceName}
+        managed-by: keel
+
+outputs:
+  instanceId: ${ec2Instance.id}
+  publicIp: ${ec2Instance.publicIp}
+  sshHost: ${ec2Instance.publicIp}
+  sshUser: ${sshUser}
+  sshPort: 22
