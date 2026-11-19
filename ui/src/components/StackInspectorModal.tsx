@@ -11,6 +11,7 @@ import {
   Maximize2,
   Minimize2,
   Trash2,
+  Unlock,
 } from "lucide-react"
 import { StackDiagnostics } from "../types/api"
 import {
@@ -18,6 +19,7 @@ import {
   getReleaseDiagnostics,
   getStackDiagnostics,
   restartStackWorkspace,
+  unlockStack,
 } from "../lib/api"
 import { isStackSshSupported } from "../lib/utils"
 import { VmSshModal } from "./VmSshModal"
@@ -31,6 +33,7 @@ export interface StackInspectorModalProps {
   onClose: () => void
   onRestarted?: () => void
   onForceDeleted?: () => void
+  onUnlocked?: () => void
   onOpenSsh?: () => void
 }
 
@@ -43,11 +46,13 @@ export const StackInspectorModal: React.FC<StackInspectorModalProps> = ({
   onClose,
   onRestarted,
   onForceDeleted,
+  onUnlocked,
   onOpenSsh,
 }) => {
   const [diag, setDiag] = useState<StackDiagnostics | null>(null)
   const [loading, setLoading] = useState(true)
   const [restarting, setRestarting] = useState(false)
+  const [unlocking, setUnlocking] = useState(false)
   const [confirmingForceDelete, setConfirmingForceDelete] = useState(false)
   const [forceDeleting, setForceDeleting] = useState(false)
   const [autoRefresh, setAutoRefresh] = useState(true)
@@ -57,6 +62,12 @@ export const StackInspectorModal: React.FC<StackInspectorModalProps> = ({
   const [isSshModalOpen, setIsSshModalOpen] = useState(false)
   const isProtectedStack =
     namespace === "flux-system" && name === "management-cluster-core"
+  const isStackLocked =
+    kind === "stack" &&
+    (diag?.logs?.some((line) =>
+      line.includes("the stack is currently locked by")
+    ) ??
+      false)
 
   const fetchDiag = useCallback(
     () =>
@@ -148,6 +159,22 @@ export const StackInspectorModal: React.FC<StackInspectorModalProps> = ({
     }
   }
 
+  const handleUnlock = async () => {
+    setUnlocking(true)
+    setError(null)
+    setBanner(null)
+    try {
+      const res = await unlockStack(namespace, name)
+      setBanner(res.message)
+      ;(onUnlocked ?? onRestarted)?.()
+      window.setTimeout(loadDiagnostics, 1500)
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : "Failed to unlock stack")
+    } finally {
+      setUnlocking(false)
+    }
+  }
+
   return (
     <div
       className={`fixed inset-0 z-50 flex items-center justify-center bg-black/75 backdrop-blur-sm ${
@@ -165,33 +192,61 @@ export const StackInspectorModal: React.FC<StackInspectorModalProps> = ({
         }`}
       >
         {/* Header */}
-        <div className="flex flex-wrap items-center justify-between gap-3 px-6 py-4 border-b border-slate-800 bg-slate-950/60">
-          <div className="min-w-0">
-            <div className="flex items-center space-x-2">
-              <Activity className="h-5 w-5 text-indigo-400 shrink-0" />
-              <h3 className="text-base font-bold text-white font-mono truncate">
-                {namespace}/{name}
-              </h3>
-              {diag?.workspacePhase && (
-                <span
-                  className={`text-[10px] px-2 py-0.5 rounded-full font-semibold border ${
-                    diag.workspacePhase === "Running"
-                      ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/20"
-                      : "bg-blue-500/10 text-blue-400 border-blue-500/20"
-                  }`}
-                >
-                  Pod: {diag.workspacePhase}
-                </span>
-              )}
+        <div className="flex flex-col gap-3 px-6 py-4 border-b border-slate-800 bg-slate-950/60">
+          <div className="flex items-start justify-between gap-3">
+            <div className="min-w-0">
+              <div className="flex items-center space-x-2">
+                <Activity className="h-5 w-5 text-indigo-400 shrink-0" />
+                <h3 className="text-base font-bold text-white font-mono truncate">
+                  {namespace}/{name}
+                </h3>
+                {diag?.workspacePhase && (
+                  <span
+                    className={`text-[10px] px-2 py-0.5 rounded-full font-semibold border shrink-0 ${
+                      diag.workspacePhase === "Running"
+                        ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/20"
+                        : "bg-blue-500/10 text-blue-400 border-blue-500/20"
+                    }`}
+                  >
+                    Pod: {diag.workspacePhase}
+                  </span>
+                )}
+              </div>
+              <p className="text-xs text-slate-400 mt-0.5">
+                {kind === "release"
+                  ? "Live Flux HelmRelease / Kustomization conditions, Kubernetes events, and pod logs"
+                  : "Live PKO v2 Stack conditions, Kubernetes events, and workspace pod logs"}
+              </p>
             </div>
-            <p className="text-xs text-slate-400 mt-0.5">
-              {kind === "release"
-                ? "Live Flux HelmRelease / Kustomization conditions, Kubernetes events, and pod logs"
-                : "Live PKO v2 Stack conditions, Kubernetes events, and workspace pod logs"}
-            </p>
+
+            <div className="flex items-center space-x-1 shrink-0">
+              <button
+                type="button"
+                onClick={() => setIsFullscreen((v) => !v)}
+                aria-label={
+                  isFullscreen ? "Exit fullscreen" : "Expand fullscreen"
+                }
+                title={isFullscreen ? "Exit fullscreen" : "Expand fullscreen"}
+                className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 transition-colors cursor-pointer"
+              >
+                {isFullscreen ? (
+                  <Minimize2 className="h-4 w-4" />
+                ) : (
+                  <Maximize2 className="h-4 w-4" />
+                )}
+              </button>
+              <button
+                type="button"
+                onClick={onClose}
+                aria-label="Close inspector"
+                className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 transition-colors cursor-pointer"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
           </div>
 
-          <div className="flex items-center space-x-2">
+          <div className="flex flex-wrap items-center gap-2">
             <button
               type="button"
               onClick={() => setAutoRefresh((v) => !v)}
@@ -244,8 +299,21 @@ export const StackInspectorModal: React.FC<StackInspectorModalProps> = ({
             {kind === "stack" && (
               <button
                 type="button"
+                data-testid="inspector-unlock-btn"
+                onClick={handleUnlock}
+                disabled={unlocking || restarting || forceDeleting}
+                title="Cancel a stale Pulumi state lock and request reconciliation"
+                className="flex items-center space-x-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-sky-500/15 hover:bg-sky-500/25 text-sky-300 border border-sky-500/30 transition-colors cursor-pointer disabled:opacity-50"
+              >
+                <Unlock className="h-3.5 w-3.5" />
+                <span>{unlocking ? "Unlocking..." : "Unlock Stack"}</span>
+              </button>
+            )}
+            {kind === "stack" && (
+              <button
+                type="button"
                 onClick={handleRestart}
-                disabled={restarting || forceDeleting}
+                disabled={restarting || forceDeleting || unlocking}
                 className="flex items-center space-x-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 border border-amber-500/30 transition-colors cursor-pointer disabled:opacity-50"
               >
                 <RotateCw
@@ -259,7 +327,7 @@ export const StackInspectorModal: React.FC<StackInspectorModalProps> = ({
                 type="button"
                 data-testid="inspector-force-delete-btn"
                 onClick={() => setConfirmingForceDelete(true)}
-                disabled={forceDeleting || restarting}
+                disabled={forceDeleting || restarting || unlocking}
                 title="Clear finalizers and force-delete a stuck or terminating Stack"
                 className="flex items-center space-x-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-red-500/15 hover:bg-red-500/25 text-red-300 border border-red-500/30 transition-colors cursor-pointer disabled:opacity-50"
               >
@@ -269,29 +337,6 @@ export const StackInspectorModal: React.FC<StackInspectorModalProps> = ({
                 </span>
               </button>
             )}
-            <button
-              type="button"
-              onClick={() => setIsFullscreen((v) => !v)}
-              aria-label={
-                isFullscreen ? "Exit fullscreen" : "Expand fullscreen"
-              }
-              title={isFullscreen ? "Exit fullscreen" : "Expand fullscreen"}
-              className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 transition-colors cursor-pointer"
-            >
-              {isFullscreen ? (
-                <Minimize2 className="h-4 w-4" />
-              ) : (
-                <Maximize2 className="h-4 w-4" />
-              )}
-            </button>
-            <button
-              type="button"
-              onClick={onClose}
-              aria-label="Close inspector"
-              className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 transition-colors cursor-pointer"
-            >
-              <X className="h-4 w-4" />
-            </button>
           </div>
         </div>
 
@@ -303,6 +348,27 @@ export const StackInspectorModal: React.FC<StackInspectorModalProps> = ({
               : "overflow-y-auto space-y-5"
           }`}
         >
+          {isStackLocked && (
+            <div className="shrink-0 p-3 rounded-xl bg-amber-500/10 border border-amber-500/40 text-xs text-amber-200 flex flex-wrap items-center justify-between gap-3">
+              <div className="flex items-center space-x-2">
+                <AlertTriangle className="h-4 w-4 text-amber-400 shrink-0" />
+                <span>
+                  A stale Pulumi state lock was detected in the workspace logs.
+                  Unlock the stack to cancel the stale lock and trigger
+                  reconciliation.
+                </span>
+              </div>
+              <button
+                type="button"
+                onClick={handleUnlock}
+                disabled={unlocking || restarting || forceDeleting}
+                className="flex items-center space-x-1.5 px-2.5 py-1 rounded-lg bg-sky-600 hover:bg-sky-500 text-white font-semibold cursor-pointer disabled:opacity-50"
+              >
+                <Unlock className="h-3.5 w-3.5" />
+                <span>{unlocking ? "Unlocking..." : "Unlock Now"}</span>
+              </button>
+            </div>
+          )}
           {confirmingForceDelete && (
             <div className="shrink-0 p-3 rounded-xl bg-red-500/10 border border-red-500/40 text-xs text-red-200 flex flex-wrap items-center justify-between gap-3">
               <div className="flex items-center space-x-2">

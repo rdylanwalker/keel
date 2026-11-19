@@ -46,7 +46,8 @@ use sha2::{Digest, Sha256};
 use crate::cli::{
     AppCommands, AppInstallArgs, AuthCommands, AuthLoginArgs, BootstrapCommands, BootstrapInitArgs,
     BootstrapRecoverArgs, Cli, Commands, InfraCommands, InfraForceDeleteArgs, InfraListArgs,
-    InfraProvisionArgs, InfraSshArgs, OutputFormat, PreviewCommands, PreviewStatusArgs, ServeArgs,
+    InfraProvisionArgs, InfraSshArgs, InfraUnlockArgs, OutputFormat, PreviewCommands,
+    PreviewStatusArgs, ServeArgs,
 };
 
 /// Unified error type returned by `keel` CLI command handlers.
@@ -4226,6 +4227,51 @@ pub async fn execute_infra_force_delete(
     ))
 }
 
+/// Executes `keel infra unlock` by calling `POST /api/v1/stacks/{namespace}/{name}/unlock`.
+pub async fn execute_infra_unlock(
+    args: &InfraUnlockArgs,
+    ctx: &CliContext,
+) -> Result<String, CliError> {
+    validate_dns_label(&args.stack_name, "stack_name")?;
+    let namespace = match &args.namespace {
+        Some(ns) => {
+            validate_dns_label(ns, "namespace")?;
+            ns.clone()
+        }
+        None => {
+            validate_dns_label(&args.tenant, "tenant")?;
+            format!("tenant-{}", args.tenant)
+        }
+    };
+
+    let base_url = normalize_server_url(&args.server)?;
+    let endpoint = format!(
+        "{base_url}/api/v1/stacks/{}/{}/unlock",
+        namespace, args.stack_name
+    );
+
+    let resp = attach_auth(ctx.http.post(&endpoint), ctx, &base_url)
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        return Err(extract_api_error(resp).await);
+    }
+
+    let body: Value = resp.json().await?;
+    if matches!(args.output, OutputFormat::Json) {
+        return Ok(serde_json::to_string_pretty(&body)?);
+    }
+
+    let message = body
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("Stack unlocked");
+    Ok(format!(
+        "Unlocked stack {namespace}/{}: {message}",
+        args.stack_name
+    ))
+}
+
 // ============================================================================
 // 8. `keel preview status` & Terminal Diff Table Formatter
 // ============================================================================
@@ -4486,6 +4532,7 @@ pub async fn dispatch(cli: &Cli, ctx: &CliContext) -> Result<String, CliError> {
             InfraCommands::Provision(args) => Ok(execute_infra_provision(args, ctx).await?.output),
             InfraCommands::Ssh(args) => execute_infra_ssh(args, ctx).await,
             InfraCommands::ForceDelete(args) => execute_infra_force_delete(args, ctx).await,
+            InfraCommands::Unlock(args) => execute_infra_unlock(args, ctx).await,
         },
         Commands::App(a) => match &a.command {
             AppCommands::Install(args) => Ok(execute_app_install(args, ctx).await?.output),
@@ -5400,6 +5447,26 @@ spec:
             json_cli.command,
             Commands::Infra(crate::cli::InfraArgs {
                 command: InfraCommands::ForceDelete(_)
+            })
+        ));
+
+        let unlock_cli = Cli::try_parse_from([
+            "keel",
+            "infra",
+            "unlock",
+            "azure-free-tier-vm",
+            "--tenant",
+            "default",
+            "--output",
+            "json",
+            "--server",
+            &server_url,
+        ])
+        .unwrap();
+        assert!(matches!(
+            unlock_cli.command,
+            Commands::Infra(crate::cli::InfraArgs {
+                command: InfraCommands::Unlock(_)
             })
         ));
 

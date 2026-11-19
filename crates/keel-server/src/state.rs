@@ -173,6 +173,12 @@ pub trait ClusterStateProvider: Send + Sync {
         ))
     }
 
+    async fn unlock_stack(&self, _namespace: &str, _name: &str) -> Result<String, ServerError> {
+        Err(ServerError::BadRequest(
+            "Live Kubernetes cluster connection required to unlock stack".to_string(),
+        ))
+    }
+
     async fn reconcile_release(
         &self,
         _namespace: &str,
@@ -796,6 +802,16 @@ impl ClusterStateProvider for KubeClusterStateProvider {
             .map_err(|e| match e {
                 keel_kube::KubeError::InvalidInput(msg) => ServerError::BadRequest(msg),
                 other => ServerError::Internal(format!("Force-delete stack failed: {other}")),
+            })
+    }
+
+    async fn unlock_stack(&self, namespace: &str, name: &str) -> Result<String, ServerError> {
+        self.live
+            .unlock_stack(namespace, name)
+            .await
+            .map_err(|e| match e {
+                keel_kube::KubeError::InvalidInput(msg) => ServerError::BadRequest(msg),
+                other => ServerError::Internal(format!("Unlock stack failed: {other}")),
             })
     }
 

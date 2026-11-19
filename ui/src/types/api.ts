@@ -195,6 +195,13 @@ export interface ForceDeleteStackResponse {
   message: string
 }
 
+export interface UnlockStackResponse {
+  unlocked: boolean
+  namespace: string
+  name: string
+  message: string
+}
+
 export interface ReleaseSummary {
   id: string
   name: string

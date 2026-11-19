@@ -5819,6 +5819,39 @@ pub async fn force_delete_stack(
     }))
 }
 
+/// Response body for `POST /api/v1/stacks/{namespace}/{name}/unlock`.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UnlockStackResponse {
+    pub unlocked: bool,
+    pub namespace: String,
+    pub name: String,
+    pub message: String,
+}
+
+/// `POST /api/v1/stacks/{namespace}/{name}/unlock`
+///
+/// Cancels a stale Pulumi state lock via `pulumi cancel` in the Stack's workspace pod
+/// and requests immediate reconciliation.
+pub async fn unlock_stack(
+    auth: AuthSession,
+    State(state): State<AppState>,
+    AxumPath((namespace, name)): AxumPath<(String, String)>,
+) -> Result<Json<UnlockStackResponse>, ServerError> {
+    validate_dns_label(&namespace, "namespace")?;
+    validate_dns_label(&name, "name")?;
+    let tenant = namespace.strip_prefix("tenant-").unwrap_or(&namespace);
+    auth.require_tenant_access(tenant)?;
+
+    let message = state.state_provider.unlock_stack(&namespace, &name).await?;
+    Ok(Json(UnlockStackResponse {
+        unlocked: true,
+        namespace,
+        name,
+        message,
+    }))
+}
+
 fn default_ssh_user_for_provider(provider: &str) -> &'static str {
     match provider.trim().to_ascii_lowercase().as_str() {
         "aws" | "proxmox" => "ubuntu",

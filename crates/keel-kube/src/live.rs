@@ -7,10 +7,13 @@ use chrono::Utc;
 use k8s_openapi::api::apps::v1::StatefulSet;
 use k8s_openapi::api::core::v1::{Event as K8sEvent, Pod};
 use kube::Client;
-use kube::api::{Api, DeleteParams, DynamicObject, ListParams, LogParams, Patch, PatchParams};
+use kube::api::{
+    Api, AttachParams, DeleteParams, DynamicObject, ListParams, LogParams, Patch, PatchParams,
+};
 use kube::discovery::ApiResource;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tokio::io::AsyncReadExt;
 
 use crate::KubeError;
 
@@ -182,6 +185,14 @@ pub trait LiveStatusSource: Send + Sync {
     async fn force_delete_stack(&self, _namespace: &str, _name: &str) -> Result<String, KubeError> {
         Err(KubeError::InvalidInput(
             "Live Kubernetes cluster connection required to force-delete stack".to_string(),
+        ))
+    }
+
+    /// Cancels a stale Pulumi state lock for a PKO v2 `Stack` via `pulumi cancel` in its workspace pod
+    /// and requests immediate reconciliation.
+    async fn unlock_stack(&self, _namespace: &str, _name: &str) -> Result<String, KubeError> {
+        Err(KubeError::InvalidInput(
+            "Live Kubernetes cluster connection required to unlock stack".to_string(),
         ))
     }
 
@@ -1076,6 +1087,78 @@ impl LiveStatusSource for KubeClusterStatusReader {
         })
     }
 
+    async fn unlock_stack(&self, namespace: &str, name: &str) -> Result<String, KubeError> {
+        let ar = ApiResource {
+            group: "pulumi.com".to_string(),
+            version: "v1".to_string(),
+            api_version: "pulumi.com/v1".to_string(),
+            kind: "Stack".to_string(),
+            plural: "stacks".to_string(),
+        };
+        let api: Api<DynamicObject> = Api::namespaced_with(self.client.clone(), namespace, &ar);
+        let existing = api.get_opt(name).await?.ok_or_else(|| {
+            KubeError::InvalidInput(format!("Stack {namespace}/{name} not found"))
+        })?;
+
+        let (backend, stack_name, flux_dir) = extract_stack_unlock_params(&existing)?;
+
+        let pod_name = format!("{name}-workspace-0");
+        let pods: Api<Pod> = Api::namespaced(self.client.clone(), namespace);
+        if pods.get_opt(&pod_name).await?.is_none() {
+            return Err(KubeError::InvalidInput(format!(
+                "Workspace pod {namespace}/{pod_name} not found; restart the workspace or wait for it to be scheduled"
+            )));
+        }
+
+        let (login_ok, login_out) = exec_pod_command(
+            &pods,
+            &pod_name,
+            "pulumi",
+            vec!["pulumi".to_string(), "login".to_string(), backend],
+        )
+        .await?;
+        if !login_ok {
+            return Err(KubeError::InvalidInput(format!(
+                "Failed to log into Pulumi backend in {namespace}/{pod_name}: {login_out}"
+            )));
+        }
+
+        let cancel_args = build_pulumi_cancel_args(&stack_name, flux_dir.as_deref());
+        let (cancel_ok, cancel_out) =
+            exec_pod_command(&pods, &pod_name, "pulumi", cancel_args).await?;
+        if !cancel_ok {
+            return Err(KubeError::InvalidInput(format!(
+                "Failed to cancel lock for stack {namespace}/{name}: {cancel_out}"
+            )));
+        }
+
+        let requested_at = Utc::now().to_rfc3339();
+        let reconcile_patch = json!({
+            "metadata": {
+                "annotations": {
+                    "pulumi.com/reconcile-request": requested_at
+                }
+            }
+        });
+        api.patch(
+            name,
+            &PatchParams::default(),
+            &Patch::Merge(&reconcile_patch),
+        )
+        .await?;
+
+        let detail = cancel_out.trim();
+        if detail.is_empty() {
+            Ok(format!(
+                "Unlocked stack {namespace}/{name} and requested reconciliation"
+            ))
+        } else {
+            Ok(format!(
+                "Unlocked stack {namespace}/{name} and requested reconciliation: {detail}"
+            ))
+        }
+    }
+
     async fn reconcile_release(&self, namespace: &str, name: &str) -> Result<String, KubeError> {
         let requested_at = Utc::now().to_rfc3339();
         let patch = json!({
@@ -1388,6 +1471,106 @@ fn parse_prometheus_vector_response(body: &Value) -> HashMap<(String, String), f
     out
 }
 
+fn extract_stack_unlock_params(
+    stack_obj: &DynamicObject,
+) -> Result<(String, String, Option<String>), KubeError> {
+    let backend = stack_obj
+        .data
+        .pointer("/spec/backend")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            KubeError::InvalidInput("Stack spec.backend is missing or empty".to_string())
+        })?
+        .to_string();
+
+    let stack_name = stack_obj
+        .data
+        .pointer("/spec/stack")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| KubeError::InvalidInput("Stack spec.stack is missing or empty".to_string()))?
+        .to_string();
+
+    let flux_dir = stack_obj
+        .data
+        .pointer("/spec/fluxSource/dir")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+
+    if let Some(ref dir) = flux_dir
+        && (dir.starts_with('/') || dir.split('/').any(|seg| seg == ".."))
+    {
+        return Err(KubeError::InvalidInput(format!(
+            "Invalid spec.fluxSource.dir: {dir}"
+        )));
+    }
+
+    Ok((backend, stack_name, flux_dir))
+}
+
+fn build_pulumi_cancel_args(stack_name: &str, flux_dir: Option<&str>) -> Vec<String> {
+    let mut args = vec![
+        "pulumi".to_string(),
+        "cancel".to_string(),
+        "--stack".to_string(),
+        stack_name.to_string(),
+        "--yes".to_string(),
+    ];
+    if let Some(dir) = flux_dir {
+        let trimmed = dir.trim_matches('/');
+        if !trimmed.is_empty() {
+            args.push("-C".to_string());
+            args.push(format!("/share/source/{trimmed}"));
+        }
+    }
+    args
+}
+
+async fn exec_pod_command(
+    pods: &Api<Pod>,
+    pod_name: &str,
+    container: &str,
+    command: Vec<String>,
+) -> Result<(bool, String), KubeError> {
+    let ap = AttachParams::default()
+        .container(container)
+        .stdout(true)
+        .stderr(true)
+        .stdin(false)
+        .tty(false);
+    let mut attached = pods.exec(pod_name, command, &ap).await?;
+
+    let mut stdout_buf = String::new();
+    let mut stderr_buf = String::new();
+    if let Some(mut stdout) = attached.stdout() {
+        let _ = stdout.read_to_string(&mut stdout_buf).await;
+    }
+    if let Some(mut stderr) = attached.stderr() {
+        let _ = stderr.read_to_string(&mut stderr_buf).await;
+    }
+
+    let ok = match attached.take_status() {
+        Some(status_fut) => match status_fut.await {
+            Some(status) => status.status.as_deref() == Some("Success"),
+            None => true,
+        },
+        None => true,
+    };
+
+    let combined = match (stdout_buf.trim(), stderr_buf.trim()) {
+        ("", "") => String::new(),
+        (out, "") => out.to_string(),
+        ("", err) => err.to_string(),
+        (out, err) => format!("{out}\n{err}"),
+    };
+    Ok((ok, combined))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1516,5 +1699,72 @@ mod tests {
 
         let err_body = json!({ "status": "error", "error": "bad query" });
         assert!(parse_prometheus_vector_response(&err_body).is_empty());
+    }
+
+    #[test]
+    fn extracts_stack_unlock_params_and_builds_cancel_args() {
+        let stack: DynamicObject = serde_json::from_value(json!({
+            "apiVersion": "pulumi.com/v1",
+            "kind": "Stack",
+            "metadata": { "name": "azure-free-tier-vm", "namespace": "tenant-default" },
+            "spec": {
+                "backend": "s3://pulumi-state?endpoint=s3.local:8333",
+                "stack": "organization/azure-free-tier-vm/default-azure-free-tier-vm",
+                "fluxSource": {
+                    "dir": "tenants/default/infra/azure-free-tier-vm"
+                }
+            }
+        }))
+        .unwrap();
+
+        let (backend, stack_name, dir) = extract_stack_unlock_params(&stack).unwrap();
+        assert_eq!(backend, "s3://pulumi-state?endpoint=s3.local:8333");
+        assert_eq!(
+            stack_name,
+            "organization/azure-free-tier-vm/default-azure-free-tier-vm"
+        );
+        assert_eq!(
+            dir.as_deref(),
+            Some("tenants/default/infra/azure-free-tier-vm")
+        );
+
+        let args = build_pulumi_cancel_args(&stack_name, dir.as_deref());
+        assert_eq!(
+            args,
+            vec![
+                "pulumi",
+                "cancel",
+                "--stack",
+                "organization/azure-free-tier-vm/default-azure-free-tier-vm",
+                "--yes",
+                "-C",
+                "/share/source/tenants/default/infra/azure-free-tier-vm",
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_stack_unlock_params() {
+        let missing_backend: DynamicObject = serde_json::from_value(json!({
+            "apiVersion": "pulumi.com/v1",
+            "kind": "Stack",
+            "metadata": { "name": "test" },
+            "spec": { "stack": "org/proj/dev" }
+        }))
+        .unwrap();
+        assert!(extract_stack_unlock_params(&missing_backend).is_err());
+
+        let traversal_dir: DynamicObject = serde_json::from_value(json!({
+            "apiVersion": "pulumi.com/v1",
+            "kind": "Stack",
+            "metadata": { "name": "test" },
+            "spec": {
+                "backend": "s3://pulumi-state",
+                "stack": "org/proj/dev",
+                "fluxSource": { "dir": "../../etc" }
+            }
+        }))
+        .unwrap();
+        assert!(extract_stack_unlock_params(&traversal_dir).is_err());
     }
 }

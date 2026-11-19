@@ -307,6 +307,8 @@ pub enum InfraCommands {
     Ssh(InfraSshArgs),
     /// Clear finalizers and force-delete a stuck or terminating PKO v2 Stack
     ForceDelete(InfraForceDeleteArgs),
+    /// Cancel a stale Pulumi state lock for a PKO v2 Stack and request reconciliation
+    Unlock(InfraUnlockArgs),
 }
 
 /// Arguments for `keel infra list` (`SDD.md` §7.2).
@@ -387,6 +389,29 @@ pub struct InfraSshArgs {
 /// Arguments for `keel infra force-delete`.
 #[derive(Args, Debug, Clone, PartialEq, Eq)]
 pub struct InfraForceDeleteArgs {
+    /// Infrastructure stack name
+    pub stack_name: String,
+
+    /// Target tenant identifier (resolves to `tenant-<tenant>` unless `--namespace` is specified)
+    #[arg(long, default_value = "default")]
+    pub tenant: String,
+
+    /// Explicit Kubernetes namespace override
+    #[arg(long)]
+    pub namespace: Option<String>,
+
+    /// Output format (`table|json`)
+    #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+    pub output: OutputFormat,
+
+    /// Keel server base URL
+    #[arg(long, default_value = DEFAULT_SERVER_URL)]
+    pub server: String,
+}
+
+/// Arguments for `keel infra unlock`.
+#[derive(Args, Debug, Clone, PartialEq, Eq)]
+pub struct InfraUnlockArgs {
     /// Infrastructure stack name
     pub stack_name: String,
 

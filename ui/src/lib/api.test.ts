@@ -28,6 +28,7 @@ import {
   getBundleConfig,
   restartStackWorkspace,
   forceDeleteStack,
+  unlockStack,
   reconcileRelease,
   getProviders,
   toggleProvider,
@@ -36,6 +37,7 @@ import {
   rollbackManagementAddon,
   createEventSourceStream,
   fetchStackSshInfo,
+  startOidcLogin,
 } from "./api"
 
 describe("api client module", () => {
@@ -661,9 +663,14 @@ describe("api client module", () => {
     await getBundleConfig("tenant-acme", "kind-with-podinfo")
     await restartStackWorkspace("tenant-acme", "dev-kind")
     await forceDeleteStack("tenant-acme", "dev-kind")
+    await unlockStack("tenant-acme", "dev-kind")
     await reconcileRelease("tenant-acme", "podinfo")
 
-    expect(fetchMock).toHaveBeenCalledTimes(11)
+    expect(fetchMock).toHaveBeenCalledTimes(12)
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/v1/stacks/tenant-acme/dev-kind/unlock",
+      expect.objectContaining({ method: "POST" })
+    )
     expect(fetchMock).toHaveBeenCalledWith(
       "/api/v1/stacks/tenant-acme/dev-kind/force-delete",
       expect.objectContaining({ method: "POST" })
@@ -842,5 +849,93 @@ describe("api client module", () => {
       expect.any(Object)
     )
     expect(info).toEqual(mockSshInfo)
+  })
+
+  it("handles rejectProposal and reopenProposal direct success responses and fetchStackSshInfo demo mode", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn()
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({ success: true, message: "Rejected directly" }),
+        })
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({ success: true, message: "Reopened directly" }),
+        })
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({ proposal: { id: "9", state: "open" } }),
+        })
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({ proposal: { id: "9", state: "closed" } }),
+        })
+    )
+
+    await expect(rejectProposal("9")).resolves.toEqual({
+      success: true,
+      message: "Rejected directly",
+    })
+    await expect(reopenProposal("9")).resolves.toEqual({
+      success: true,
+      message: "Reopened directly",
+    })
+    await expect(reopenProposal("9")).resolves.toEqual({
+      success: true,
+      message: "PR #9 reopened.",
+    })
+    await expect(rejectProposal("9")).resolves.toEqual({
+      success: true,
+      message: "PR #9 rejected and closed.",
+    })
+
+    window.history.replaceState({}, "", "/?demo=true")
+    const demoInfo = await fetchStackSshInfo("tenant-acme", "azure-vm")
+    expect(demoInfo.tenant).toBe("acme")
+    expect(demoInfo.sshHost).toBe("192.168.1.150")
+
+    const customNsInfo = await fetchStackSshInfo("custom-ns", "azure-vm")
+    expect(customNsInfo.tenant).toBe("custom-ns")
+    window.history.replaceState({}, "", "/")
+
+    // Non-demo fetch rejection propagates
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockRejectedValueOnce(new Error("SSH info network error"))
+    )
+    await expect(fetchStackSshInfo("tenant-acme", "azure-vm")).rejects.toThrow(
+      "SSH info network error"
+    )
+
+    // Bundle with empty items & no description
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          bundles: [{ metadata: { id: "empty-bundle" }, spec: { items: [] } }],
+          blueprints: [],
+          applications: [],
+        }),
+      })
+    )
+    const catalog = await getCatalog()
+    expect(catalog[0].description).toBe("Multi-item catalog bundle")
+
+    // startOidcLogin delegates to window.location.assign
+    const assignMock = vi.fn()
+    const origLocation = window.location
+    Object.defineProperty(window, "location", {
+      configurable: true,
+      value: { ...origLocation, assign: assignMock },
+    })
+    startOidcLogin()
+    expect(assignMock).toHaveBeenCalledWith("/api/v1/auth/login")
+    Object.defineProperty(window, "location", {
+      configurable: true,
+      value: origLocation,
+    })
   })
 })

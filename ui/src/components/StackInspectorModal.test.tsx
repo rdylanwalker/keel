@@ -8,6 +8,7 @@ vi.mock("../lib/api", () => ({
   getReleaseDiagnostics: vi.fn(),
   restartStackWorkspace: vi.fn(),
   forceDeleteStack: vi.fn(),
+  unlockStack: vi.fn(),
 }))
 
 const sampleDiagnostics = {
@@ -229,6 +230,87 @@ describe("StackInspectorModal component", () => {
       expect(onForceDeleted).toHaveBeenCalled()
       expect(
         screen.getByText(/Cleared finalizers on terminating Stack/i)
+      ).toBeInTheDocument()
+    })
+  })
+
+  it("allows cancelling Force Delete and surfaces errors on failure", async () => {
+    vi.mocked(api.getStackDiagnostics).mockResolvedValue(sampleDiagnostics)
+    vi.mocked(api.forceDeleteStack)
+      .mockRejectedValueOnce(new Error("Forbidden: protected stack"))
+      .mockRejectedValueOnce("unexpected string error")
+
+    render(
+      <StackInspectorModal
+        namespace="tenant-default"
+        name="azure-free-tier-vm"
+        kind="stack"
+        onClose={onClose}
+        onRestarted={onRestarted}
+      />
+    )
+
+    fireEvent.click(await screen.findByTestId("inspector-force-delete-btn"))
+    expect(screen.getByTestId("confirm-force-delete-btn")).toBeInTheDocument()
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }))
+    expect(
+      screen.queryByTestId("confirm-force-delete-btn")
+    ).not.toBeInTheDocument()
+    expect(api.forceDeleteStack).not.toHaveBeenCalled()
+
+    // First failure: Error instance
+    fireEvent.click(screen.getByTestId("inspector-force-delete-btn"))
+    fireEvent.click(screen.getByTestId("confirm-force-delete-btn"))
+    expect(
+      await screen.findByText("Forbidden: protected stack")
+    ).toBeInTheDocument()
+
+    // Second failure: non-Error thrown
+    fireEvent.click(screen.getByTestId("confirm-force-delete-btn"))
+    expect(
+      await screen.findByText("Failed to force-delete stack")
+    ).toBeInTheDocument()
+  })
+
+  it("shows locked-stack banner and executes Unlock Stack", async () => {
+    const onUnlocked = vi.fn()
+    vi.mocked(api.getStackDiagnostics).mockResolvedValue({
+      ...sampleDiagnostics,
+      logs: [
+        "error: the stack is currently locked by 1 lock(s). Either wait for the other process(es) to end or delete the lock file with `pulumi cancel`.",
+      ],
+    })
+    vi.mocked(api.unlockStack).mockResolvedValue({
+      unlocked: true,
+      namespace: "tenant-default",
+      name: "azure-free-tier-vm",
+      message: "Unlocked stack tenant-default/azure-free-tier-vm",
+    })
+
+    render(
+      <StackInspectorModal
+        namespace="tenant-default"
+        name="azure-free-tier-vm"
+        kind="stack"
+        onClose={onClose}
+        onUnlocked={onUnlocked}
+      />
+    )
+
+    expect(
+      await screen.findByText(/A stale Pulumi state lock was detected/i)
+    ).toBeInTheDocument()
+
+    fireEvent.click(screen.getByTestId("inspector-unlock-btn"))
+
+    await waitFor(() => {
+      expect(api.unlockStack).toHaveBeenCalledWith(
+        "tenant-default",
+        "azure-free-tier-vm"
+      )
+      expect(onUnlocked).toHaveBeenCalled()
+      expect(
+        screen.getByText("Unlocked stack tenant-default/azure-free-tier-vm")
       ).toBeInTheDocument()
     })
   })

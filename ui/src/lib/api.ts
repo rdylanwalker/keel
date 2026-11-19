@@ -13,6 +13,7 @@ import {
   ReleaseSummary,
   RestartStackResponse,
   ForceDeleteStackResponse,
+  UnlockStackResponse,
   StackDiagnostics,
   StackSshInfo,
   StackSummary,
@@ -673,6 +674,20 @@ export async function forceDeleteStack(
     }
   )
   return handleResponse<ForceDeleteStackResponse>(res)
+}
+
+export async function unlockStack(
+  namespace: string,
+  name: string
+): Promise<UnlockStackResponse> {
+  const res = await fetch(
+    `/api/v1/stacks/${encodeURIComponent(namespace)}/${encodeURIComponent(name)}/unlock`,
+    {
+      method: "POST",
+      headers: getHeaders(),
+    }
+  )
+  return handleResponse<UnlockStackResponse>(res)
 }
 
 export async function reconcileRelease(

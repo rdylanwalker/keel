@@ -89,6 +89,10 @@ pub fn build_router(state: AppState) -> Router {
             post(routes::force_delete_stack),
         )
         .route(
+            "/api/v1/stacks/{namespace}/{name}/unlock",
+            post(routes::unlock_stack),
+        )
+        .route(
             "/api/v1/stacks/{namespace}/{name}/config",
             get(routes::get_stack_config),
         )
