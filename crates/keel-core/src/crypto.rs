@@ -283,6 +283,19 @@ fn validate_age_public_key(age_public_key: &str) -> Result<(), CoreError> {
     Ok(())
 }
 
+fn validate_age_recipients(recipients: &str) -> Result<(), CoreError> {
+    let trimmed = recipients.trim();
+    if trimmed.is_empty() {
+        return Err(CoreError::Validation(
+            "Invalid age public key; expected 'age1...' recipient without whitespace".to_string(),
+        ));
+    }
+    for part in trimmed.split(',') {
+        validate_age_public_key(part)?;
+    }
+    Ok(())
+}
+
 /// Wrapper around `age-keygen` and `sops` CLI tools executing strictly via argument vectors (`NFR-SEC-06`).
 #[derive(Debug, Clone)]
 pub struct SopsManager {
@@ -356,7 +369,7 @@ impl SopsManager {
         target_file: &Path,
         sops_config: Option<&Path>,
     ) -> Result<Vec<String>, CoreError> {
-        validate_age_public_key(age_public_key)?;
+        validate_age_recipients(age_public_key)?;
         let file_str = validate_cli_path(target_file, "target_file")?;
 
         let mut args = vec![

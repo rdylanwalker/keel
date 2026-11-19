@@ -55,6 +55,22 @@ use crate::state::{AppState, CachedPreview, ReleaseSummary, StackSummary};
 
 static LAST_BRANCH_TS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+async fn resolve_sops_recipients(repo_workdir: &std::path::Path, tenant_pub: &str) -> String {
+    let sops_cfg = repo_workdir.join(".sops.yaml");
+    if let Ok(raw) = tokio::fs::read_to_string(&sops_cfg).await {
+        for line in raw.lines() {
+            let trimmed = line.trim();
+            if let Some(rest) = trimmed.strip_prefix("age:") {
+                let cluster_pub = rest.trim();
+                if cluster_pub.starts_with("age1") && cluster_pub != tenant_pub.trim() {
+                    return format!("{},{cluster_pub}", tenant_pub.trim());
+                }
+            }
+        }
+    }
+    tenant_pub.trim().to_string()
+}
+
 fn next_unique_branch_timestamp() -> u64 {
     let now = Utc::now().timestamp().max(1) as u64;
     let mut prev = LAST_BRANCH_TS.load(std::sync::atomic::Ordering::Relaxed);
@@ -2588,8 +2604,10 @@ pub async fn create_proposal(
             }
         };
         let sops = SopsManager::new();
+        let sops_recipients =
+            resolve_sops_recipients(&state.repo_workdir, &age_key.public_key).await;
         let enc_values = sops
-            .encrypt_yaml(&age_key.public_key, plaintext_secrets)
+            .encrypt_yaml(&sops_recipients, plaintext_secrets)
             .await?;
         let (enc_k8s_secret, keys) = if !is_app || manifest_engine.is_some() {
             let (plain_k8s_secret, keys) = build_infra_secret_manifest_yaml(
@@ -2598,7 +2616,7 @@ pub async fn create_proposal(
                 &partitioned.secret_values,
             )?;
             let enc_k8s = sops
-                .encrypt_yaml(&age_key.public_key, &plain_k8s_secret)
+                .encrypt_yaml(&sops_recipients, &plain_k8s_secret)
                 .await?;
             (Some(enc_k8s), keys)
         } else {
@@ -3773,9 +3791,11 @@ async fn create_bundle_proposal(
                     generated
                 }
             };
+            let sops_recipients =
+                resolve_sops_recipients(&state.repo_workdir, &age_key.public_key).await;
             Some(
                 SopsManager::new()
-                    .encrypt_yaml(&age_key.public_key, plaintext_secrets)
+                    .encrypt_yaml(&sops_recipients, plaintext_secrets)
                     .await?,
             )
         } else {
