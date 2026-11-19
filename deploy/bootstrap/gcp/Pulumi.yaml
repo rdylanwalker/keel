@@ -55,7 +55,7 @@ resources:
       name: ${clusterName}-cp-01
       machineType: ${machineType}
       zone: ${zone}
-      deletionProtection: true
+      deletionProtection: ${protectResources}
       bootDisk:
         initializeParams:
           image: debian-cloud/debian-12

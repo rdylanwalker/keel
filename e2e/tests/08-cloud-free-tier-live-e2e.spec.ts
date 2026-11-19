@@ -125,6 +125,26 @@ function runCmd(bin: string, args: string[], cwd?: string, env?: NodeJS.ProcessE
   }).trim();
 }
 
+/**
+ * Copies a Stage 0 bootstrap Pulumi.yaml into an isolated temp directory with `protect: false`
+ * so ephemeral E2E runs never leave `Pulumi.<stack>.yaml` files in the repository and can always
+ * cleanly `pulumi destroy` every created cloud resource in `finally`.
+ */
+function prepareEphemeralStage0ProgramDir(
+  provider: 'aws' | 'azure' | 'gcp',
+  tmpRoot: string,
+): string {
+  const srcDir = path.resolve(__dirname, `../../deploy/bootstrap/${provider}`);
+  const dstDir = path.join(tmpRoot, 'program');
+  fs.mkdirSync(dstDir, { recursive: true });
+  const rawYaml = fs.readFileSync(path.join(srcDir, 'Pulumi.yaml'), 'utf-8');
+  const ephemeralYaml = rawYaml
+    .replace(/protect:\s*true/g, 'protect: false')
+    .replace(/deletionProtection:\s*true/g, 'deletionProtection: false');
+  fs.writeFileSync(path.join(dstDir, 'Pulumi.yaml'), ephemeralYaml, 'utf-8');
+  return dstDir;
+}
+
 test.describe('08 - Multi-Cloud Free-Tier Dual-Guard Contract & Blueprint Validation', () => {
   test('08.0a - Pure dual-guard helper enforces toggle and credentials requirement', () => {
     // 1. Missing toggle (credentials provided but toggle unset)
@@ -279,30 +299,53 @@ test.describe('08.1 - AWS Free-Tier Live E2E (Stage 0 & Stage 1)', () => {
     test.skip(!gate.enabled, gate.reason);
 
     const tmpWorkspace = fs.mkdtempSync(path.join(os.tmpdir(), 'keel-e2e-stage0-aws-'));
-    const stackName = `e2e-aws-${Date.now()}`;
-    const programDir = path.resolve(__dirname, '../../deploy/bootstrap/aws');
+    const stateDir = path.join(tmpWorkspace, 'state');
+    fs.mkdirSync(stateDir, { recursive: true });
+    const programDir = prepareEphemeralStage0ProgramDir('aws', tmpWorkspace);
+    const suffix = String(Date.now()).slice(-8);
+    const stackName = `e2e-aws-${suffix}`;
+    const pulumiEnv = {
+      PULUMI_CONFIG_PASSPHRASE: 'keel-e2e-passphrase',
+      AWS_REGION: process.env.AWS_REGION || 'us-east-1',
+    };
 
     try {
       logStep(`Running pulumi preview in ephemeral AWS stage 0 stack ${stackName}...`);
-      runCmd('pulumi', ['login', `file://${tmpWorkspace}`]);
-      runCmd('pulumi', ['stack', 'init', stackName], programDir);
-      runCmd('pulumi', ['config', 'set', 'clusterName', stackName], programDir);
-      runCmd('pulumi', ['config', 'set', 'protectResources', 'false'], programDir);
-      const previewOut = runCmd('pulumi', ['preview', '--non-interactive'], programDir);
+      runCmd('pulumi', ['login', `file://${stateDir}`], programDir, pulumiEnv);
+      runCmd('pulumi', ['stack', 'init', stackName], programDir, pulumiEnv);
+      runCmd('pulumi', ['config', 'set', 'clusterName', stackName], programDir, pulumiEnv);
+      runCmd('pulumi', ['config', 'set', 'protectResources', 'false'], programDir, pulumiEnv);
+      runCmd(
+        'pulumi',
+        ['config', 'set', 'aws:region', process.env.AWS_REGION || 'us-east-1'],
+        programDir,
+        pulumiEnv,
+      );
+      const previewOut = runCmd('pulumi', ['preview', '--non-interactive'], programDir, pulumiEnv);
       expect(previewOut.length).toBeGreaterThan(0);
 
       logStep(`Running pulumi up in ephemeral AWS stage 0 stack ${stackName}...`);
-      runCmd('pulumi', ['up', '--yes', '--non-interactive', '--skip-preview'], programDir);
+      runCmd(
+        'pulumi',
+        ['up', '--yes', '--non-interactive', '--skip-preview'],
+        programDir,
+        pulumiEnv,
+      );
       const outputs = JSON.parse(
-        runCmd('pulumi', ['stack', 'output', '--json'], programDir),
+        runCmd('pulumi', ['stack', 'output', '--json'], programDir, pulumiEnv),
       ) as Record<string, unknown>;
       expect(outputs.sshPort).toBe(22);
       expect(outputs.sshUser).toBeTruthy();
     } finally {
       try {
         logStep(`Tearing down ephemeral AWS stage 0 stack ${stackName}...`);
-        runCmd('pulumi', ['destroy', '--yes', '--non-interactive'], programDir);
-        runCmd('pulumi', ['stack', 'rm', '--yes', stackName], programDir);
+        try {
+          runCmd('pulumi', ['state', 'unprotect', '--all', '--yes'], programDir, pulumiEnv);
+        } catch {
+          // ignore if no resources were created yet
+        }
+        runCmd('pulumi', ['destroy', '--yes', '--non-interactive'], programDir, pulumiEnv);
+        runCmd('pulumi', ['stack', 'rm', '--yes', stackName], programDir, pulumiEnv);
       } catch (err) {
         console.warn(`Cleanup error for AWS stack ${stackName}:`, err);
       }
@@ -375,7 +418,17 @@ test.describe('08.1 - AWS Free-Tier Live E2E (Stage 0 & Stage 1)', () => {
       }
     } finally {
       logStep(`Cleaning up stack ${stackName}...`);
-      await request.delete(`/api/v1/stacks/tenant-${tenant}/${stackName}`).catch(() => {});
+      const delRes = await request
+        .delete(`/api/v1/stacks/tenant-${tenant}/${stackName}`)
+        .catch(() => null);
+      if (delRes && delRes.ok()) {
+        const delProposal = (await delRes.json().catch(() => null)) as {
+          id?: string | number;
+        } | null;
+        if (delProposal?.id !== undefined) {
+          await request.post(`/api/v1/proposals/${delProposal.id}/merge`).catch(() => {});
+        }
+      }
     }
   });
 });
@@ -386,30 +439,59 @@ test.describe('08.2 - Azure Free-Tier Live E2E (Stage 0 & Stage 1)', () => {
     test.skip(!gate.enabled, gate.reason);
 
     const tmpWorkspace = fs.mkdtempSync(path.join(os.tmpdir(), 'keel-e2e-stage0-azure-'));
-    const stackName = `e2e-azure-${Date.now()}`;
-    const programDir = path.resolve(__dirname, '../../deploy/bootstrap/azure');
+    const stateDir = path.join(tmpWorkspace, 'state');
+    fs.mkdirSync(stateDir, { recursive: true });
+    const programDir = prepareEphemeralStage0ProgramDir('azure', tmpWorkspace);
+    const suffix = String(Date.now()).slice(-8);
+    const stackName = `e2e-azure-${suffix}`;
+    const storageAccountName = `keele2e${suffix}`;
+    const pulumiEnv = {
+      PULUMI_CONFIG_PASSPHRASE: 'keel-e2e-passphrase',
+    };
 
     try {
       logStep(`Running pulumi preview in ephemeral Azure stage 0 stack ${stackName}...`);
-      runCmd('pulumi', ['login', `file://${tmpWorkspace}`]);
-      runCmd('pulumi', ['stack', 'init', stackName], programDir);
-      runCmd('pulumi', ['config', 'set', 'clusterName', stackName], programDir);
-      runCmd('pulumi', ['config', 'set', 'protectResources', 'false'], programDir);
-      const previewOut = runCmd('pulumi', ['preview', '--non-interactive'], programDir);
+      runCmd('pulumi', ['login', `file://${stateDir}`], programDir, pulumiEnv);
+      runCmd('pulumi', ['stack', 'init', stackName], programDir, pulumiEnv);
+      runCmd('pulumi', ['config', 'set', 'clusterName', stackName], programDir, pulumiEnv);
+      runCmd(
+        'pulumi',
+        ['config', 'set', 'location', process.env.AZURE_LOCATION || 'eastus'],
+        programDir,
+        pulumiEnv,
+      );
+      runCmd(
+        'pulumi',
+        ['config', 'set', 'storageAccountName', storageAccountName],
+        programDir,
+        pulumiEnv,
+      );
+      runCmd('pulumi', ['config', 'set', 'protectResources', 'false'], programDir, pulumiEnv);
+      const previewOut = runCmd('pulumi', ['preview', '--non-interactive'], programDir, pulumiEnv);
       expect(previewOut.length).toBeGreaterThan(0);
 
       logStep(`Running pulumi up in ephemeral Azure stage 0 stack ${stackName}...`);
-      runCmd('pulumi', ['up', '--yes', '--non-interactive', '--skip-preview'], programDir);
+      runCmd(
+        'pulumi',
+        ['up', '--yes', '--non-interactive', '--skip-preview'],
+        programDir,
+        pulumiEnv,
+      );
       const outputs = JSON.parse(
-        runCmd('pulumi', ['stack', 'output', '--json'], programDir),
+        runCmd('pulumi', ['stack', 'output', '--json'], programDir, pulumiEnv),
       ) as Record<string, unknown>;
       expect(outputs.sshPort).toBe(22);
       expect(outputs.sshUser).toBeTruthy();
     } finally {
       try {
         logStep(`Tearing down ephemeral Azure stage 0 stack ${stackName}...`);
-        runCmd('pulumi', ['destroy', '--yes', '--non-interactive'], programDir);
-        runCmd('pulumi', ['stack', 'rm', '--yes', stackName], programDir);
+        try {
+          runCmd('pulumi', ['state', 'unprotect', '--all', '--yes'], programDir, pulumiEnv);
+        } catch {
+          // ignore if no resources were created yet
+        }
+        runCmd('pulumi', ['destroy', '--yes', '--non-interactive'], programDir, pulumiEnv);
+        runCmd('pulumi', ['stack', 'rm', '--yes', stackName], programDir, pulumiEnv);
       } catch (err) {
         console.warn(`Cleanup error for Azure stack ${stackName}:`, err);
       }
@@ -484,7 +566,17 @@ test.describe('08.2 - Azure Free-Tier Live E2E (Stage 0 & Stage 1)', () => {
       }
     } finally {
       logStep(`Cleaning up stack ${stackName}...`);
-      await request.delete(`/api/v1/stacks/tenant-${tenant}/${stackName}`).catch(() => {});
+      const delRes = await request
+        .delete(`/api/v1/stacks/tenant-${tenant}/${stackName}`)
+        .catch(() => null);
+      if (delRes && delRes.ok()) {
+        const delProposal = (await delRes.json().catch(() => null)) as {
+          id?: string | number;
+        } | null;
+        if (delProposal?.id !== undefined) {
+          await request.post(`/api/v1/proposals/${delProposal.id}/merge`).catch(() => {});
+        }
+      }
     }
   });
 });
@@ -495,30 +587,67 @@ test.describe('08.3 - GCP Free-Tier Live E2E (Stage 0 & Stage 1)', () => {
     test.skip(!gate.enabled, gate.reason);
 
     const tmpWorkspace = fs.mkdtempSync(path.join(os.tmpdir(), 'keel-e2e-stage0-gcp-'));
-    const stackName = `e2e-gcp-${Date.now()}`;
-    const programDir = path.resolve(__dirname, '../../deploy/bootstrap/gcp');
+    const stateDir = path.join(tmpWorkspace, 'state');
+    fs.mkdirSync(stateDir, { recursive: true });
+    const programDir = prepareEphemeralStage0ProgramDir('gcp', tmpWorkspace);
+    const suffix = String(Date.now()).slice(-8);
+    const stackName = `e2e-gcp-${suffix}`;
+    const gcpProject = (process.env.GCP_PROJECT || process.env.GOOGLE_PROJECT || '').trim();
+    const stateBucketName = `${gcpProject || 'keel'}-e2e-state-${suffix}`.toLowerCase();
+    const pulumiEnv = {
+      PULUMI_CONFIG_PASSPHRASE: 'keel-e2e-passphrase',
+    };
 
     try {
       logStep(`Running pulumi preview in ephemeral GCP stage 0 stack ${stackName}...`);
-      runCmd('pulumi', ['login', `file://${tmpWorkspace}`]);
-      runCmd('pulumi', ['stack', 'init', stackName], programDir);
-      runCmd('pulumi', ['config', 'set', 'clusterName', stackName], programDir);
-      runCmd('pulumi', ['config', 'set', 'protectResources', 'false'], programDir);
-      const previewOut = runCmd('pulumi', ['preview', '--non-interactive'], programDir);
+      runCmd('pulumi', ['login', `file://${stateDir}`], programDir, pulumiEnv);
+      runCmd('pulumi', ['stack', 'init', stackName], programDir, pulumiEnv);
+      runCmd('pulumi', ['config', 'set', 'clusterName', stackName], programDir, pulumiEnv);
+      runCmd(
+        'pulumi',
+        ['config', 'set', 'stateBucketName', stateBucketName],
+        programDir,
+        pulumiEnv,
+      );
+      runCmd('pulumi', ['config', 'set', 'gcp:project', gcpProject], programDir, pulumiEnv);
+      runCmd(
+        'pulumi',
+        ['config', 'set', 'region', process.env.GCP_REGION || 'us-central1'],
+        programDir,
+        pulumiEnv,
+      );
+      runCmd(
+        'pulumi',
+        ['config', 'set', 'zone', process.env.GCP_ZONE || 'us-central1-a'],
+        programDir,
+        pulumiEnv,
+      );
+      runCmd('pulumi', ['config', 'set', 'protectResources', 'false'], programDir, pulumiEnv);
+      const previewOut = runCmd('pulumi', ['preview', '--non-interactive'], programDir, pulumiEnv);
       expect(previewOut.length).toBeGreaterThan(0);
 
       logStep(`Running pulumi up in ephemeral GCP stage 0 stack ${stackName}...`);
-      runCmd('pulumi', ['up', '--yes', '--non-interactive', '--skip-preview'], programDir);
+      runCmd(
+        'pulumi',
+        ['up', '--yes', '--non-interactive', '--skip-preview'],
+        programDir,
+        pulumiEnv,
+      );
       const outputs = JSON.parse(
-        runCmd('pulumi', ['stack', 'output', '--json'], programDir),
+        runCmd('pulumi', ['stack', 'output', '--json'], programDir, pulumiEnv),
       ) as Record<string, unknown>;
       expect(outputs.sshPort).toBe(22);
       expect(outputs.sshUser).toBeTruthy();
     } finally {
       try {
         logStep(`Tearing down ephemeral GCP stage 0 stack ${stackName}...`);
-        runCmd('pulumi', ['destroy', '--yes', '--non-interactive'], programDir);
-        runCmd('pulumi', ['stack', 'rm', '--yes', stackName], programDir);
+        try {
+          runCmd('pulumi', ['state', 'unprotect', '--all', '--yes'], programDir, pulumiEnv);
+        } catch {
+          // ignore if no resources were created yet
+        }
+        runCmd('pulumi', ['destroy', '--yes', '--non-interactive'], programDir, pulumiEnv);
+        runCmd('pulumi', ['stack', 'rm', '--yes', stackName], programDir, pulumiEnv);
       } catch (err) {
         console.warn(`Cleanup error for GCP stack ${stackName}:`, err);
       }
@@ -593,7 +722,17 @@ test.describe('08.3 - GCP Free-Tier Live E2E (Stage 0 & Stage 1)', () => {
       }
     } finally {
       logStep(`Cleaning up stack ${stackName}...`);
-      await request.delete(`/api/v1/stacks/tenant-${tenant}/${stackName}`).catch(() => {});
+      const delRes = await request
+        .delete(`/api/v1/stacks/tenant-${tenant}/${stackName}`)
+        .catch(() => null);
+      if (delRes && delRes.ok()) {
+        const delProposal = (await delRes.json().catch(() => null)) as {
+          id?: string | number;
+        } | null;
+        if (delProposal?.id !== undefined) {
+          await request.post(`/api/v1/proposals/${delProposal.id}/merge`).catch(() => {});
+        }
+      }
     }
   });
 });

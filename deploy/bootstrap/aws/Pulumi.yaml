@@ -15,17 +15,32 @@ config:
     default: t3.micro
   amiId:
     type: string
-  subnetId:
-    type: string
+    default: ""
   rootVolumeSizeGb:
     type: integer
-    default: 30
+    default: 20
   sshUser:
     type: string
     default: ubuntu
   protectResources:
     type: boolean
     default: true
+
+variables:
+  ubuntuAmi:
+    fn::invoke:
+      function: aws:ec2:getAmi
+      arguments:
+        mostRecent: true
+        owners:
+          - "099720109477"
+        filters:
+          - name: name
+            values:
+              - "ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-*"
+          - name: virtualization-type
+            values:
+              - hvm
 
 resources:
   pulumiStateBucket:
@@ -63,9 +78,8 @@ resources:
     options:
       protect: true
     properties:
-      ami: ${amiId}
+      ami: ${amiId != "" ? amiId : ubuntuAmi.id}
       instanceType: ${instanceType}
-      subnetId: ${subnetId}
       rootBlockDevice:
         volumeSize: ${rootVolumeSizeGb}
         volumeType: gp3
