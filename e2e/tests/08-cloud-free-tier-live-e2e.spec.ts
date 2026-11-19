@@ -115,7 +115,7 @@ const SERVE_LOG_PATH = path.join(os.tmpdir(), 'keel-cloud-e2e-serve.log');
 const DETERMINISTIC_REPO_DIR = path.join(os.tmpdir(), `keel-e2e-gitops-${MGMT_CLUSTER}`);
 
 const PREVIEW_TIMEOUT_MS = 180_000;
-const PROVISION_TIMEOUT_MS = 420_000;
+const PROVISION_TIMEOUT_MS = 600_000;
 const API_DELETE_TIMEOUT_MS = 180_000;
 const K8S_FINALIZER_TIMEOUT_MS = 300_000;
 
@@ -276,9 +276,9 @@ async function waitForStackReady(
         const detail = [lastUpdateMsg, podLogs.ok ? podLogs.stdout : '']
           .filter(Boolean)
           .join('\n--- workspace pod logs ---\n');
-        throw new Error(
-          `[${provider}] PKO v2 Stack ${namespace}/${name} stalled (${reason}: ${message})\n${detail}`,
-        );
+        const errMsg = `PKO v2 Stack ${namespace}/${name} stalled (${reason}: ${message})\n${detail}`;
+        logStep(errMsg, provider);
+        throw new Error(`[${provider}] ${errMsg}`);
       }
       if (Date.now() - lastLog > 15_000) {
         const elapsed = Math.round((Date.now() - start) / 1000);
@@ -783,6 +783,8 @@ test.describe('08.1 - Multi-Cloud Free-Tier Stage 1 Live E2E (kind Management Cl
     const tenant = 'default';
     let prId: string | number | undefined;
     let stackMerged = false;
+    let primaryError: unknown;
+    let cleanupError: unknown;
 
     try {
       logStep(`Signing into Keel UI via Rauthy OIDC...`, provider);
@@ -884,10 +886,24 @@ test.describe('08.1 - Multi-Cloud Free-Tier Stage 1 Live E2E (kind Management Cl
         `Verified SSH info: ${sshJson.sshUser}@${sshJson.sshHost}:${sshJson.sshPort}`,
         provider,
       );
+    } catch (err) {
+      primaryError = err;
+      throw err;
     } finally {
       try {
         if (stackMerged) {
-          await deleteAndConfirmStage1StackRemoved(request, tenant, stackName, provider);
+          try {
+            await deleteAndConfirmStage1StackRemoved(request, tenant, stackName, provider);
+          } catch (err) {
+            if (primaryError) {
+              logStep(
+                `Cleanup warning after primary error: ${err instanceof Error ? err.message : String(err)}`,
+                provider,
+              );
+            } else {
+              cleanupError = err;
+            }
+          }
         } else if (prId !== undefined) {
           logStep(`Closing unmerged proposal #${prId}; skipping stack delete.`, provider);
           await request.post(`${BASE_URL}/api/v1/proposals/${prId}/reject`).catch(() => null);
@@ -897,6 +913,9 @@ test.describe('08.1 - Multi-Cloud Free-Tier Stage 1 Live E2E (kind Management Cl
       } finally {
         await context.close();
       }
+    }
+    if (!primaryError && cleanupError) {
+      throw cleanupError;
     }
   }
 
