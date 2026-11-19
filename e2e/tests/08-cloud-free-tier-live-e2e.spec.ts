@@ -1020,7 +1020,7 @@ test.describe('08.1 - Multi-Cloud Free-Tier Stage 1 Live E2E (kind Management Cl
         sshUser: 'azureuser',
         values: {
           location: process.env.AZURE_LOCATION || 'eastus',
-          vmSize: process.env.KEEL_E2E_AZURE_VM_SIZE || 'Standard_B1s',
+          vmSize: process.env.KEEL_E2E_AZURE_VM_SIZE || 'Standard_F1alds_v7',
           vmName: '${stackName}',
           sshUser: 'azureuser',
           sshPublicKey: defaultSshKey,
