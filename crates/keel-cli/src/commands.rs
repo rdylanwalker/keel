@@ -605,6 +605,7 @@ pub async fn synthesize_seed_control_plane(
             clients.push(json!({
                 "id": "forgejo",
                 "name": "Forgejo Git Forge",
+                "confidential": true,
                 "secret": { "Plain": forgejo_secret },
                 "redirect_uris": [
                     "https://forgejo.keel.local:8888/user/oauth2/rauthy/callback"
@@ -620,6 +621,7 @@ pub async fn synthesize_seed_control_plane(
                 "access_token_lifetime": 3600,
                 "scopes": ["openid", "profile", "email", "groups"],
                 "default_scopes": ["openid", "profile", "email", "groups"],
+                "challenges": ["S256"],
                 "force_mfa": false
             }));
         }
@@ -691,6 +693,18 @@ const STARTER_KIND_CLUSTER_CATALOG_YAML: &str =
     include_str!("../../../deploy/catalog/infra/kind-cluster/catalog.yaml");
 const STARTER_KIND_CLUSTER_PULUMI_YAML: &str =
     include_str!("../../../deploy/catalog/infra/kind-cluster/Pulumi.yaml");
+const STARTER_AWS_FREE_TIER_VM_CATALOG_YAML: &str =
+    include_str!("../../../deploy/catalog/infra/aws-free-tier-vm/catalog.yaml");
+const STARTER_AWS_FREE_TIER_VM_PULUMI_YAML: &str =
+    include_str!("../../../deploy/catalog/infra/aws-free-tier-vm/Pulumi.yaml");
+const STARTER_AZURE_FREE_TIER_VM_CATALOG_YAML: &str =
+    include_str!("../../../deploy/catalog/infra/azure-free-tier-vm/catalog.yaml");
+const STARTER_AZURE_FREE_TIER_VM_PULUMI_YAML: &str =
+    include_str!("../../../deploy/catalog/infra/azure-free-tier-vm/Pulumi.yaml");
+const STARTER_GCP_FREE_TIER_VM_CATALOG_YAML: &str =
+    include_str!("../../../deploy/catalog/infra/gcp-free-tier-vm/catalog.yaml");
+const STARTER_GCP_FREE_TIER_VM_PULUMI_YAML: &str =
+    include_str!("../../../deploy/catalog/infra/gcp-free-tier-vm/Pulumi.yaml");
 const STARTER_PODINFO_CATALOG_YAML: &str =
     include_str!("../../../deploy/catalog/apps/podinfo/catalog.yaml");
 
@@ -1385,6 +1399,30 @@ async fn initialize_seed_git_repo_with_push(
         files_to_write.push((
             "catalog/infra/kind-cluster/Pulumi.yaml",
             STARTER_KIND_CLUSTER_PULUMI_YAML.to_string(),
+        ));
+        files_to_write.push((
+            "catalog/infra/aws-free-tier-vm/catalog.yaml",
+            STARTER_AWS_FREE_TIER_VM_CATALOG_YAML.to_string(),
+        ));
+        files_to_write.push((
+            "catalog/infra/aws-free-tier-vm/Pulumi.yaml",
+            STARTER_AWS_FREE_TIER_VM_PULUMI_YAML.to_string(),
+        ));
+        files_to_write.push((
+            "catalog/infra/azure-free-tier-vm/catalog.yaml",
+            STARTER_AZURE_FREE_TIER_VM_CATALOG_YAML.to_string(),
+        ));
+        files_to_write.push((
+            "catalog/infra/azure-free-tier-vm/Pulumi.yaml",
+            STARTER_AZURE_FREE_TIER_VM_PULUMI_YAML.to_string(),
+        ));
+        files_to_write.push((
+            "catalog/infra/gcp-free-tier-vm/catalog.yaml",
+            STARTER_GCP_FREE_TIER_VM_CATALOG_YAML.to_string(),
+        ));
+        files_to_write.push((
+            "catalog/infra/gcp-free-tier-vm/Pulumi.yaml",
+            STARTER_GCP_FREE_TIER_VM_PULUMI_YAML.to_string(),
         ));
         files_to_write.push((
             "catalog/apps/podinfo/catalog.yaml",
@@ -4589,6 +4627,36 @@ spec:
         assert!(
             repo_dir
                 .join("catalog/infra/kind-cluster/catalog.yaml")
+                .exists()
+        );
+        assert!(
+            repo_dir
+                .join("catalog/infra/aws-free-tier-vm/catalog.yaml")
+                .exists()
+        );
+        assert!(
+            repo_dir
+                .join("catalog/infra/aws-free-tier-vm/Pulumi.yaml")
+                .exists()
+        );
+        assert!(
+            repo_dir
+                .join("catalog/infra/azure-free-tier-vm/catalog.yaml")
+                .exists()
+        );
+        assert!(
+            repo_dir
+                .join("catalog/infra/azure-free-tier-vm/Pulumi.yaml")
+                .exists()
+        );
+        assert!(
+            repo_dir
+                .join("catalog/infra/gcp-free-tier-vm/catalog.yaml")
+                .exists()
+        );
+        assert!(
+            repo_dir
+                .join("catalog/infra/gcp-free-tier-vm/Pulumi.yaml")
                 .exists()
         );
         assert!(repo_dir.join("catalog/apps/podinfo/catalog.yaml").exists());
