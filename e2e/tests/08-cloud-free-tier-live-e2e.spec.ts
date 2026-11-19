@@ -138,11 +138,140 @@ function prepareEphemeralStage0ProgramDir(
   const dstDir = path.join(tmpRoot, 'program');
   fs.mkdirSync(dstDir, { recursive: true });
   const rawYaml = fs.readFileSync(path.join(srcDir, 'Pulumi.yaml'), 'utf-8');
-  const ephemeralYaml = rawYaml
+  let ephemeralYaml = rawYaml
     .replace(/protect:\s*true/g, 'protect: false')
     .replace(/deletionProtection:\s*true/g, 'deletionProtection: false');
+
+  // Ensure ephemeral S3 / GCS buckets set forceDestroy: true so versioned objects never block teardown
+  if (provider === 'aws') {
+    ephemeralYaml = ephemeralYaml.replace(
+      /bucketPrefix:\s*\$\{stateBucketName\}-/,
+      'bucketPrefix: ${stateBucketName}-\n      forceDestroy: true',
+    );
+  } else if (provider === 'gcp') {
+    ephemeralYaml = ephemeralYaml.replace(
+      /uniformBucketLevelAccess:\s*true/,
+      'uniformBucketLevelAccess: true\n      forceDestroy: true',
+    );
+  }
+
   fs.writeFileSync(path.join(dstDir, 'Pulumi.yaml'), ephemeralYaml, 'utf-8');
   return dstDir;
+}
+
+/**
+ * Destroys an ephemeral Stage 0 Pulumi stack, waits for `pulumi destroy` to finish,
+ * and verifies from exported stack state that zero managed cloud resources remain
+ * before removing the stack metadata.
+ */
+function destroyAndVerifyStage0Stack(
+  provider: 'aws' | 'azure' | 'gcp',
+  stackName: string,
+  programDir: string,
+  pulumiEnv: NodeJS.ProcessEnv,
+): void {
+  logStep(
+    `Tearing down ephemeral ${provider.toUpperCase()} stage 0 stack ${stackName} and waiting for resource deletion confirmation...`,
+  );
+  try {
+    runCmd('pulumi', ['state', 'unprotect', '--all', '--yes'], programDir, pulumiEnv);
+  } catch {
+    // ignore if no protected resources exist in state
+  }
+
+  runCmd('pulumi', ['destroy', '--yes', '--non-interactive', '--refresh'], programDir, pulumiEnv);
+
+  // Confirm via stack state export that only the root Stack resource (or 0 resources) remains
+  const exportedRaw = runCmd('pulumi', ['stack', 'export'], programDir, pulumiEnv);
+  const exported = JSON.parse(exportedRaw) as {
+    deployment?: { resources?: Array<{ type?: string; urn?: string }> };
+  };
+  const remainingCloudResources = (exported.deployment?.resources ?? []).filter(
+    (r) => r.type && r.type !== 'pulumi:pulumi:Stack' && !r.type.startsWith('pulumi:providers:'),
+  );
+  expect(
+    remainingCloudResources,
+    `Expected all ${provider.toUpperCase()} Stage 0 cloud resources to be destroyed, but found remaining: ${JSON.stringify(remainingCloudResources)}`,
+  ).toHaveLength(0);
+
+  logStep(
+    `Confirmed 0 remaining ${provider.toUpperCase()} cloud resources in ${stackName}; removing stack state.`,
+  );
+  runCmd('pulumi', ['stack', 'rm', '--yes', stackName], programDir, pulumiEnv);
+}
+
+/**
+ * Deletes a Stage 1 stack via the Keel API, merges the resulting deletion PR, and
+ * polls both the Keel `/api/v1/stacks` endpoint and Kubernetes (if a live cluster is attached)
+ * until the stack and its PKO v2 `destroyOnFinalize` finalizer have completely removed the resource.
+ */
+async function deleteAndConfirmStage1StackRemoved(
+  request: import('@playwright/test').APIRequestContext,
+  tenant: string,
+  stackName: string,
+): Promise<void> {
+  const namespace = `tenant-${tenant}`;
+  logStep(`Requesting deletion of Stage 1 stack ${namespace}/${stackName}...`);
+  const delRes = await request.delete(`/api/v1/stacks/${namespace}/${stackName}`).catch(() => null);
+  if (!delRes || !delRes.ok()) {
+    return;
+  }
+
+  const delProposal = (await delRes.json().catch(() => null)) as { id?: string | number } | null;
+  if (delProposal?.id !== undefined) {
+    logStep(`Merging deletion PR #${delProposal.id} for ${namespace}/${stackName}...`);
+    const mergeRes = await request.post(`/api/v1/proposals/${delProposal.id}/merge`);
+    expect(mergeRes.ok()).toBe(true);
+  }
+
+  // 1. Poll GET /api/v1/stacks until the stack is confirmed removed from Keel
+  logStep(`Waiting for confirmation that ${namespace}/${stackName} is removed from Keel stacks...`);
+  const apiDeadline = Date.now() + 180_000;
+  let removedFromApi = false;
+  while (Date.now() < apiDeadline) {
+    const stacksRes = await request.get('/api/v1/stacks');
+    if (stacksRes.ok()) {
+      const stacks = (await stacksRes.json()) as Array<{ name?: string; tenant?: string }>;
+      const stillExists = stacks.some((s) => s.name === stackName && s.tenant === tenant);
+      if (!stillExists) {
+        removedFromApi = true;
+        break;
+      }
+    }
+    await new Promise((r) => setTimeout(r, 3000));
+  }
+  expect(
+    removedFromApi,
+    `Timed out waiting for stack ${namespace}/${stackName} to be removed from /api/v1/stacks`,
+  ).toBe(true);
+
+  // 2. If kubectl has an active cluster with PKO v2 Stack CRD installed, wait until the K8s Stack
+  // object finishes its `destroyOnFinalize: true` cloud teardown and is completely deleted.
+  try {
+    runCmd('kubectl', ['get', 'crd', 'stacks.pulumi.com']);
+    logStep(
+      `Waiting for PKO v2 Stack ${namespace}/${stackName} finalizer (destroyOnFinalize) to complete in Kubernetes...`,
+    );
+    const k8sDeadline = Date.now() + 300_000;
+    let removedFromK8s = false;
+    while (Date.now() < k8sDeadline) {
+      try {
+        runCmd('kubectl', ['get', 'stack.pulumi.com', stackName, '-n', namespace]);
+      } catch {
+        // `kubectl get` exits non-zero (NotFound) once PKO finishes destroying the cloud resources
+        removedFromK8s = true;
+        break;
+      }
+      await new Promise((r) => setTimeout(r, 5000));
+    }
+    expect(
+      removedFromK8s,
+      `Timed out waiting for PKO v2 Stack ${namespace}/${stackName} to finish cloud destruction in Kubernetes`,
+    ).toBe(true);
+    logStep(`Confirmed PKO v2 Stack ${namespace}/${stackName} and cloud resources are destroyed.`);
+  } catch {
+    // No live Kubernetes cluster / PKO CRD present in standalone server mode; API removal already confirmed.
+  }
 }
 
 test.describe('08 - Multi-Cloud Free-Tier Dual-Guard Contract & Blueprint Validation', () => {
@@ -338,18 +467,10 @@ test.describe('08.1 - AWS Free-Tier Live E2E (Stage 0 & Stage 1)', () => {
       expect(outputs.sshUser).toBeTruthy();
     } finally {
       try {
-        logStep(`Tearing down ephemeral AWS stage 0 stack ${stackName}...`);
-        try {
-          runCmd('pulumi', ['state', 'unprotect', '--all', '--yes'], programDir, pulumiEnv);
-        } catch {
-          // ignore if no resources were created yet
-        }
-        runCmd('pulumi', ['destroy', '--yes', '--non-interactive'], programDir, pulumiEnv);
-        runCmd('pulumi', ['stack', 'rm', '--yes', stackName], programDir, pulumiEnv);
-      } catch (err) {
-        console.warn(`Cleanup error for AWS stack ${stackName}:`, err);
+        destroyAndVerifyStage0Stack('aws', stackName, programDir, pulumiEnv);
+      } finally {
+        fs.rmSync(tmpWorkspace, { recursive: true, force: true });
       }
-      fs.rmSync(tmpWorkspace, { recursive: true, force: true });
     }
   });
 
@@ -417,18 +538,7 @@ test.describe('08.1 - AWS Free-Tier Live E2E (Stage 0 & Stage 1)', () => {
         }
       }
     } finally {
-      logStep(`Cleaning up stack ${stackName}...`);
-      const delRes = await request
-        .delete(`/api/v1/stacks/tenant-${tenant}/${stackName}`)
-        .catch(() => null);
-      if (delRes && delRes.ok()) {
-        const delProposal = (await delRes.json().catch(() => null)) as {
-          id?: string | number;
-        } | null;
-        if (delProposal?.id !== undefined) {
-          await request.post(`/api/v1/proposals/${delProposal.id}/merge`).catch(() => {});
-        }
-      }
+      await deleteAndConfirmStage1StackRemoved(request, tenant, stackName);
     }
   });
 });
@@ -484,18 +594,10 @@ test.describe('08.2 - Azure Free-Tier Live E2E (Stage 0 & Stage 1)', () => {
       expect(outputs.sshUser).toBeTruthy();
     } finally {
       try {
-        logStep(`Tearing down ephemeral Azure stage 0 stack ${stackName}...`);
-        try {
-          runCmd('pulumi', ['state', 'unprotect', '--all', '--yes'], programDir, pulumiEnv);
-        } catch {
-          // ignore if no resources were created yet
-        }
-        runCmd('pulumi', ['destroy', '--yes', '--non-interactive'], programDir, pulumiEnv);
-        runCmd('pulumi', ['stack', 'rm', '--yes', stackName], programDir, pulumiEnv);
-      } catch (err) {
-        console.warn(`Cleanup error for Azure stack ${stackName}:`, err);
+        destroyAndVerifyStage0Stack('azure', stackName, programDir, pulumiEnv);
+      } finally {
+        fs.rmSync(tmpWorkspace, { recursive: true, force: true });
       }
-      fs.rmSync(tmpWorkspace, { recursive: true, force: true });
     }
   });
 
@@ -565,18 +667,7 @@ test.describe('08.2 - Azure Free-Tier Live E2E (Stage 0 & Stage 1)', () => {
         }
       }
     } finally {
-      logStep(`Cleaning up stack ${stackName}...`);
-      const delRes = await request
-        .delete(`/api/v1/stacks/tenant-${tenant}/${stackName}`)
-        .catch(() => null);
-      if (delRes && delRes.ok()) {
-        const delProposal = (await delRes.json().catch(() => null)) as {
-          id?: string | number;
-        } | null;
-        if (delProposal?.id !== undefined) {
-          await request.post(`/api/v1/proposals/${delProposal.id}/merge`).catch(() => {});
-        }
-      }
+      await deleteAndConfirmStage1StackRemoved(request, tenant, stackName);
     }
   });
 });
@@ -640,18 +731,10 @@ test.describe('08.3 - GCP Free-Tier Live E2E (Stage 0 & Stage 1)', () => {
       expect(outputs.sshUser).toBeTruthy();
     } finally {
       try {
-        logStep(`Tearing down ephemeral GCP stage 0 stack ${stackName}...`);
-        try {
-          runCmd('pulumi', ['state', 'unprotect', '--all', '--yes'], programDir, pulumiEnv);
-        } catch {
-          // ignore if no resources were created yet
-        }
-        runCmd('pulumi', ['destroy', '--yes', '--non-interactive'], programDir, pulumiEnv);
-        runCmd('pulumi', ['stack', 'rm', '--yes', stackName], programDir, pulumiEnv);
-      } catch (err) {
-        console.warn(`Cleanup error for GCP stack ${stackName}:`, err);
+        destroyAndVerifyStage0Stack('gcp', stackName, programDir, pulumiEnv);
+      } finally {
+        fs.rmSync(tmpWorkspace, { recursive: true, force: true });
       }
-      fs.rmSync(tmpWorkspace, { recursive: true, force: true });
     }
   });
 
@@ -721,18 +804,7 @@ test.describe('08.3 - GCP Free-Tier Live E2E (Stage 0 & Stage 1)', () => {
         }
       }
     } finally {
-      logStep(`Cleaning up stack ${stackName}...`);
-      const delRes = await request
-        .delete(`/api/v1/stacks/tenant-${tenant}/${stackName}`)
-        .catch(() => null);
-      if (delRes && delRes.ok()) {
-        const delProposal = (await delRes.json().catch(() => null)) as {
-          id?: string | number;
-        } | null;
-        if (delProposal?.id !== undefined) {
-          await request.post(`/api/v1/proposals/${delProposal.id}/merge`).catch(() => {});
-        }
-      }
+      await deleteAndConfirmStage1StackRemoved(request, tenant, stackName);
     }
   });
 });
