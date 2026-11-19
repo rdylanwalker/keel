@@ -1,7 +1,7 @@
 # Stage 0 AWS Seed Management Cluster & Versioned S3 State Backend (`SDD.md` §2.1, `NFR-REL-01`)
 name: keel-stage0-aws
 runtime: yaml
-description: Stage 0 AWS seed management cluster with versioned S3 Pulumi state backend
+description: Stage 0 AWS seed management cluster (k3s) with versioned S3 Pulumi state backend
 
 config:
   clusterName:
@@ -12,16 +12,22 @@ config:
     default: keel-pulumi-state
   instanceType:
     type: string
-    default: t3.micro
+    default: t3.medium
   amiId:
     type: string
     default: ""
   rootVolumeSizeGb:
     type: integer
-    default: 20
+    default: 30
   sshUser:
     type: string
     default: ubuntu
+  allowedManagementCidrs:
+    type: array
+    items:
+      type: string
+    default:
+      - 0.0.0.0/0
   protectResources:
     type: boolean
     default: true
@@ -73,13 +79,65 @@ resources:
       ignorePublicAcls: true
       restrictPublicBuckets: true
 
+  controlPlaneSshKey:
+    type: tls:index:PrivateKey
+    properties:
+      algorithm: ED25519
+
+  controlPlaneKeyPair:
+    type: aws:ec2:KeyPair
+    properties:
+      keyNamePrefix: ${clusterName}-cp-
+      publicKey: ${controlPlaneSshKey.publicKeyOpenssh}
+      tags:
+        app.kubernetes.io/managed-by: keel
+
+  controlPlaneSecurityGroup:
+    type: aws:ec2:SecurityGroup
+    options:
+      protect: true
+    properties:
+      description: Security group for Keel Stage 0 control-plane node (SSH, HTTPS, Kubernetes API)
+      ingress:
+        - protocol: tcp
+          fromPort: 22
+          toPort: 22
+          cidrBlocks: ${allowedManagementCidrs}
+        - protocol: tcp
+          fromPort: 443
+          toPort: 443
+          cidrBlocks:
+            - 0.0.0.0/0
+        - protocol: tcp
+          fromPort: 6443
+          toPort: 6443
+          cidrBlocks: ${allowedManagementCidrs}
+      egress:
+        - protocol: "-1"
+          fromPort: 0
+          toPort: 0
+          cidrBlocks:
+            - 0.0.0.0/0
+      tags:
+        app.kubernetes.io/managed-by: keel
+        keel.io/protect: "true"
+
   seedControlPlaneNode:
     type: aws:ec2:Instance
     options:
       protect: true
     properties:
-      ami: ${amiId != "" ? amiId : ubuntuAmi.id}
+      ami: '${amiId != "" ? amiId : ubuntuAmi.id}'
       instanceType: ${instanceType}
+      keyName: ${controlPlaneKeyPair.keyName}
+      vpcSecurityGroupIds:
+        - ${controlPlaneSecurityGroup.id}
+      associatePublicIpAddress: true
+      userData: |
+        #!/bin/bash
+        set -euo pipefail
+        PUBLIC_IP=$(curl -sf http://169.254.169.254/latest/meta-data/public-ipv4 || curl -sf https://ifconfig.me)
+        curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="server --tls-san=${PUBLIC_IP} --write-kubeconfig-mode=644" sh -
       rootBlockDevice:
         volumeSize: ${rootVolumeSizeGb}
         volumeType: gp3
@@ -92,6 +150,24 @@ resources:
         app.kubernetes.io/managed-by: keel
         keel.io/protect: "true"
 
+  fetchKubeconfig:
+    type: command:remote:Command
+    properties:
+      connection:
+        host: ${seedControlPlaneNode.publicIp}
+        user: ${sshUser}
+        privateKey: ${controlPlaneSshKey.privateKeyOpenssh}
+      create: |
+        for i in $(seq 1 60); do
+          if [ -s /etc/rancher/k3s/k3s.yaml ]; then
+            sed "s/127.0.0.1/${seedControlPlaneNode.publicIp}/g" /etc/rancher/k3s/k3s.yaml
+            exit 0
+          fi
+          sleep 5
+        done
+        echo "Timed out waiting for /etc/rancher/k3s/k3s.yaml" >&2
+        exit 1
+
 outputs:
   clusterName: ${clusterName}
   stateBucket: ${pulumiStateBucket.bucket}
@@ -100,3 +176,5 @@ outputs:
   sshHost: ${seedControlPlaneNode.publicIp}
   sshUser: ${sshUser}
   sshPort: 22
+  kubeconfig:
+    fn::secret: ${fetchKubeconfig.stdout}

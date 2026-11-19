@@ -1,7 +1,7 @@
 # Stage 0 Azure Seed Management Cluster & State Storage (`SDD.md` §2.1, `NFR-REL-01`)
 name: keel-stage0-azure
 runtime: yaml
-description: Stage 0 Azure seed management cluster with protected Resource Group and Blob state storage
+description: Stage 0 Azure seed management cluster (k3s) with protected Resource Group and Blob state storage
 
 config:
   clusterName:
@@ -12,23 +12,45 @@ config:
     default: eastus
   storageAccountName:
     type: string
+    default: ""
   vmSize:
     type: string
-    default: Standard_B1s
+    default: Standard_B2s
   osDiskSizeGb:
     type: integer
     default: 30
   sshUser:
     type: string
     default: azureuser
-  sshHost:
-    type: string
-    default: ""
+  allowedManagementCidrs:
+    type: array
+    items:
+      type: string
+    default:
+      - "*"
   protectResources:
     type: boolean
     default: true
 
+variables:
+  resolvedStorageAccountName: '${storageAccountName != "" ? storageAccountName : "keelst${storageAccountSuffix.result}"}'
+  cloudInitScript:
+    fn::toBase64: |
+      #!/bin/bash
+      set -euo pipefail
+      PUBLIC_IP=$(curl -sf -H Metadata:true "http://169.254.169.254/metadata/instance/network/interface/0/ipv4/ipAddress/0/publicIpAddress?api-version=2021-02-01&format=text" || curl -sf https://ifconfig.me)
+      curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="server --tls-san=${PUBLIC_IP} --write-kubeconfig-mode=644" sh -
+
 resources:
+  storageAccountSuffix:
+    type: random:index:RandomString
+    properties:
+      length: 8
+      lower: true
+      upper: false
+      numeric: true
+      special: false
+
   managementResourceGroup:
     type: azure-native:resources:ResourceGroup
     options:
@@ -45,7 +67,7 @@ resources:
     options:
       protect: true
     properties:
-      accountName: ${storageAccountName}
+      accountName: ${resolvedStorageAccountName}
       resourceGroupName: ${managementResourceGroup.name}
       location: ${location}
       kind: StorageV2
@@ -65,10 +87,167 @@ resources:
       containerName: pulumi-state
       publicAccess: None
 
+  controlPlaneSshKey:
+    type: tls:index:PrivateKey
+    properties:
+      algorithm: ED25519
+
+  controlPlaneVnet:
+    type: azure-native:network:VirtualNetwork
+    options:
+      protect: true
+    properties:
+      resourceGroupName: ${managementResourceGroup.name}
+      location: ${location}
+      addressSpace:
+        addressPrefixes:
+          - 10.10.0.0/16
+      tags:
+        app.kubernetes.io/managed-by: keel
+
+  controlPlaneSubnet:
+    type: azure-native:network:Subnet
+    options:
+      protect: true
+    properties:
+      resourceGroupName: ${managementResourceGroup.name}
+      virtualNetworkName: ${controlPlaneVnet.name}
+      addressPrefix: 10.10.1.0/24
+
+  controlPlanePublicIp:
+    type: azure-native:network:PublicIPAddress
+    options:
+      protect: true
+    properties:
+      resourceGroupName: ${managementResourceGroup.name}
+      location: ${location}
+      publicIPAllocationMethod: Static
+      sku:
+        name: Standard
+      tags:
+        app.kubernetes.io/managed-by: keel
+
+  controlPlaneNsg:
+    type: azure-native:network:NetworkSecurityGroup
+    options:
+      protect: true
+    properties:
+      resourceGroupName: ${managementResourceGroup.name}
+      location: ${location}
+      securityRules:
+        - name: AllowSSH
+          protocol: Tcp
+          direction: Inbound
+          priority: 1000
+          access: Allow
+          sourceAddressPrefix: "*"
+          sourcePortRange: "*"
+          destinationAddressPrefix: "*"
+          destinationPortRange: "22"
+        - name: AllowHTTPS
+          protocol: Tcp
+          direction: Inbound
+          priority: 1010
+          access: Allow
+          sourceAddressPrefix: "*"
+          sourcePortRange: "*"
+          destinationAddressPrefix: "*"
+          destinationPortRange: "443"
+        - name: AllowKubernetesAPI
+          protocol: Tcp
+          direction: Inbound
+          priority: 1020
+          access: Allow
+          sourceAddressPrefix: "*"
+          sourcePortRange: "*"
+          destinationAddressPrefix: "*"
+          destinationPortRange: "6443"
+      tags:
+        app.kubernetes.io/managed-by: keel
+
+  controlPlaneNic:
+    type: azure-native:network:NetworkInterface
+    options:
+      protect: true
+    properties:
+      resourceGroupName: ${managementResourceGroup.name}
+      location: ${location}
+      networkSecurityGroup:
+        id: ${controlPlaneNsg.id}
+      ipConfigurations:
+        - name: ipconfig1
+          subnet:
+            id: ${controlPlaneSubnet.id}
+          publicIPAddress:
+            id: ${controlPlanePublicIp.id}
+          privateIPAllocationMethod: Dynamic
+      tags:
+        app.kubernetes.io/managed-by: keel
+
+  seedControlPlaneVm:
+    type: azure-native:compute:VirtualMachine
+    options:
+      protect: true
+    properties:
+      resourceGroupName: ${managementResourceGroup.name}
+      location: ${location}
+      vmName: ${clusterName}-cp-01
+      hardwareProfile:
+        vmSize: ${vmSize}
+      networkProfile:
+        networkInterfaces:
+          - id: ${controlPlaneNic.id}
+            primary: true
+      storageProfile:
+        imageReference:
+          publisher: Canonical
+          offer: 0001-com-ubuntu-server-jammy
+          sku: 22_04-lts-gen2
+          version: latest
+        osDisk:
+          createOption: FromImage
+          diskSizeGB: ${osDiskSizeGb}
+          managedDisk:
+            storageAccountType: Standard_LRS
+      osProfile:
+        computerName: ${clusterName}-cp-01
+        adminUsername: ${sshUser}
+        customData: ${cloudInitScript}
+        linuxConfiguration:
+          disablePasswordAuthentication: true
+          ssh:
+            publicKeys:
+              - keyData: ${controlPlaneSshKey.publicKeyOpenssh}
+                path: /home/${sshUser}/.ssh/authorized_keys
+      tags:
+        app.kubernetes.io/managed-by: keel
+        keel.io/protect: "true"
+
+  fetchKubeconfig:
+    type: command:remote:Command
+    properties:
+      connection:
+        host: ${controlPlanePublicIp.ipAddress}
+        user: ${sshUser}
+        privateKey: ${controlPlaneSshKey.privateKeyOpenssh}
+      create: |
+        for i in $(seq 1 60); do
+          if [ -s /etc/rancher/k3s/k3s.yaml ]; then
+            sed "s/127.0.0.1/${controlPlanePublicIp.ipAddress}/g" /etc/rancher/k3s/k3s.yaml
+            exit 0
+          fi
+          sleep 5
+        done
+        echo "Timed out waiting for /etc/rancher/k3s/k3s.yaml" >&2
+        exit 1
+
 outputs:
   clusterName: ${clusterName}
   resourceGroupName: ${managementResourceGroup.name}
   stateContainerName: ${pulumiStateContainer.name}
-  sshHost: ${sshHost}
+  controlPlanePublicIp: ${controlPlanePublicIp.ipAddress}
+  sshHost: ${controlPlanePublicIp.ipAddress}
   sshUser: ${sshUser}
   sshPort: 22
+  kubeconfig:
+    fn::secret: ${fetchKubeconfig.stdout}

@@ -68,7 +68,7 @@ resources:
     type: aws:ec2:Instance
     properties:
       instanceType: ${instanceType}
-      ami: ${amiId != "" ? amiId : ubuntuAmi.id}
+      ami: '${amiId != "" ? amiId : ubuntuAmi.id}'
       keyName: ${sshKeyPair.keyName}
       vpcSecurityGroupIds:
         - ${vmSecurityGroup.id}

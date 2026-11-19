@@ -1,7 +1,7 @@
 # Stage 0 GCP Seed Management Cluster & Versioned GCS State Bucket (`SDD.md` §2.1, `NFR-REL-01`)
 name: keel-stage0-gcp
 runtime: yaml
-description: Stage 0 GCP seed management cluster with versioned GCS state backend
+description: Stage 0 GCP seed management cluster (k3s) with versioned GCS state backend
 
 config:
   clusterName:
@@ -15,29 +15,48 @@ config:
     default: us-central1-a
   stateBucketName:
     type: string
+    default: ""
   machineType:
     type: string
-    default: e2-micro
+    default: e2-medium
   bootDiskSizeGb:
     type: integer
-    default: 10
+    default: 20
   bootDiskType:
     type: string
     default: pd-standard
   sshUser:
     type: string
     default: debian
+  allowedManagementCidrs:
+    type: array
+    items:
+      type: string
+    default:
+      - 0.0.0.0/0
   protectResources:
     type: boolean
     default: true
 
+variables:
+  resolvedBucketName: '${stateBucketName != "" ? stateBucketName : "${clusterName}-pulumi-state-${bucketSuffix.result}"}'
+
 resources:
+  bucketSuffix:
+    type: random:index:RandomString
+    properties:
+      length: 8
+      lower: true
+      upper: false
+      numeric: true
+      special: false
+
   pulumiStateBucket:
     type: gcp:storage:Bucket
     options:
       protect: true
     properties:
-      name: ${stateBucketName}
+      name: ${resolvedBucketName}
       location: ${region}
       uniformBucketLevelAccess: true
       publicAccessPrevention: enforced
@@ -46,6 +65,28 @@ resources:
       labels:
         managed-by: keel
         keel-protect: "true"
+
+  controlPlaneSshKey:
+    type: tls:index:PrivateKey
+    properties:
+      algorithm: ED25519
+
+  controlPlaneFirewall:
+    type: gcp:compute:Firewall
+    options:
+      protect: true
+    properties:
+      network: default
+      description: Allow inbound SSH, HTTPS, and Kubernetes API for Keel Stage 0 control plane
+      allows:
+        - protocol: tcp
+          ports:
+            - "22"
+            - "443"
+            - "6443"
+      sourceRanges: ${allowedManagementCidrs}
+      targetTags:
+        - keel-cp
 
   seedControlPlaneVm:
     type: gcp:compute:Instance
@@ -56,6 +97,8 @@ resources:
       machineType: ${machineType}
       zone: ${zone}
       deletionProtection: ${protectResources}
+      tags:
+        - keel-cp
       bootDisk:
         initializeParams:
           image: debian-cloud/debian-12
@@ -63,14 +106,46 @@ resources:
           type: ${bootDiskType}
       networkInterfaces:
         - network: default
+          accessConfigs:
+            - {}
+      metadata:
+        ssh-keys: "${sshUser}:${controlPlaneSshKey.publicKeyOpenssh}"
+        startup-script: |
+          #!/bin/bash
+          set -euo pipefail
+          if [ ! -f /etc/rancher/k3s/k3s.yaml ]; then
+            PUBLIC_IP=$(curl -sf -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/access-configs/0/external-ip || curl -sf https://ifconfig.me)
+            curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="server --tls-san=${PUBLIC_IP} --write-kubeconfig-mode=644" sh -
+          fi
       labels:
         managed-by: keel
         keel-protect: "true"
+
+  fetchKubeconfig:
+    type: command:remote:Command
+    properties:
+      connection:
+        host: ${seedControlPlaneVm.networkInterfaces[0].accessConfigs[0].natIp}
+        user: ${sshUser}
+        privateKey: ${controlPlaneSshKey.privateKeyOpenssh}
+      create: |
+        for i in $(seq 1 60); do
+          if [ -s /etc/rancher/k3s/k3s.yaml ]; then
+            sed "s/127.0.0.1/${seedControlPlaneVm.networkInterfaces[0].accessConfigs[0].natIp}/g" /etc/rancher/k3s/k3s.yaml
+            exit 0
+          fi
+          sleep 5
+        done
+        echo "Timed out waiting for /etc/rancher/k3s/k3s.yaml" >&2
+        exit 1
 
 outputs:
   clusterName: ${clusterName}
   stateBucketUrl: ${pulumiStateBucket.url}
   controlPlaneInternalIp: ${seedControlPlaneVm.networkInterfaces[0].networkIp}
-  sshHost: ${seedControlPlaneVm.networkInterfaces[0].networkIp}
+  controlPlanePublicIp: ${seedControlPlaneVm.networkInterfaces[0].accessConfigs[0].natIp}
+  sshHost: ${seedControlPlaneVm.networkInterfaces[0].accessConfigs[0].natIp}
   sshUser: ${sshUser}
   sshPort: 22
+  kubeconfig:
+    fn::secret: ${fetchKubeconfig.stdout}
