@@ -686,6 +686,27 @@ test.describe('08.1 - Multi-Cloud Free-Tier Stage 1 Live E2E (kind Management Cl
       );
     }
 
+    if (process.env.GITHUB_TOKEN) {
+      logStep('Seeding keel-system/keel-github-token secret for PKO plugin downloads...');
+      const manifest = execFileSync(
+        'kubectl',
+        [
+          'create',
+          'secret',
+          'generic',
+          'keel-github-token',
+          '-n',
+          'keel-system',
+          `--from-literal=token=${process.env.GITHUB_TOKEN}`,
+          '--dry-run=client',
+          '-o',
+          'yaml',
+        ],
+        { encoding: 'utf-8' },
+      );
+      execFileSync('kubectl', ['apply', '-f', '-'], { input: manifest, encoding: 'utf-8' });
+    }
+
     if (!(await isServerUp(BASE_URL))) {
       const url = new URL(BASE_URL);
       logStep(`Starting keel serve on ${BASE_URL} (repo: ${repoDir}, log: ${SERVE_LOG_PATH})...`);
@@ -771,11 +792,19 @@ test.describe('08.1 - Multi-Cloud Free-Tier Stage 1 Live E2E (kind Management Cl
     values: Record<string, unknown>;
   }
 
-  async function runStage1CloudVmLifecycle(
+  interface ProvisionedCloudRun {
+    spec: CloudVmSpec;
+    stackName: string;
+    tenant: string;
+    context: import('@playwright/test').BrowserContext;
+    page: import('@playwright/test').Page;
+  }
+
+  async function createAndMergeCloudProposal(
     browser: import('@playwright/test').Browser,
     spec: CloudVmSpec,
-  ): Promise<void> {
-    const { provider, catalogId, sshUser, values } = spec;
+  ): Promise<ProvisionedCloudRun> {
+    const { provider, catalogId, values } = spec;
     const context = await browser.newContext({ ignoreHTTPSErrors: true, baseURL: BASE_URL });
     const page = await context.newPage();
     const request = page.request;
@@ -783,84 +812,99 @@ test.describe('08.1 - Multi-Cloud Free-Tier Stage 1 Live E2E (kind Management Cl
     const tenant = 'default';
     let prId: string | number | undefined;
     let stackMerged = false;
-    let primaryError: unknown;
-    let cleanupError: unknown;
 
     try {
       logStep(`Signing into Keel UI via Rauthy OIDC...`, provider);
       await signInViaRauthy(page, 'admin@keel.local', adminPassword);
 
-      await withGitPrLock(async () => {
-        logStep(`Creating proposal for ${catalogId} (${stackName})...`, provider);
-        const resolvedValues = Object.fromEntries(
-          Object.entries(values).map(([k, v]) => [k, v === '${stackName}' ? stackName : v]),
-        );
-        const createRes = await request.post(`${BASE_URL}/api/v1/proposals`, {
-          data: {
-            catalogId,
-            name: stackName,
-            tenant,
-            values: resolvedValues,
-          },
-        });
-        expect(
-          createRes.ok(),
-          `[${provider}] Failed to create proposal: ${await createRes.text()}`,
-        ).toBe(true);
-
-        const created = (await createRes.json()) as {
-          id?: string | number;
-          proposal?: { id?: string | number };
-        };
-        prId = created.proposal?.id ?? created.id;
-        expect(
-          prId,
-          `[${provider}] Missing proposal.id in response: ${JSON.stringify(created)}`,
-        ).toBeTruthy();
-
-        const previewTimeoutSec = Math.round(PREVIEW_TIMEOUT_MS / 1000);
-        logStep(
-          `Polling preview diff for proposal #${prId} (timeout ${previewTimeoutSec}s)...`,
-          provider,
-        );
-        const prevStart = Date.now();
-        const prevDeadline = prevStart + PREVIEW_TIMEOUT_MS;
-        let prevLastLog = 0;
-        let previewReady = false;
-        while (Date.now() < prevDeadline) {
-          const prevRes = await request.get(`${BASE_URL}/api/v1/proposals/${prId}/preview`);
-          if (prevRes.ok()) {
-            const body = await prevRes.text();
-            if (body.includes('+ Create') || body.includes('create') || body.includes('preview')) {
-              previewReady = true;
-              break;
-            }
-          }
-          if (Date.now() - prevLastLog > 15_000) {
-            const elapsed = Math.round((Date.now() - prevStart) / 1000);
-            logStep(
-              `Still waiting for preview #${prId} (${elapsed}s/${previewTimeoutSec}s)...`,
-              provider,
-            );
-            prevLastLog = Date.now();
-          }
-          await new Promise((r) => setTimeout(r, 5000));
-        }
-        expect(
-          previewReady,
-          `[${provider}] Timed out after ${previewTimeoutSec}s waiting for preview #${prId}`,
-        ).toBe(true);
-
-        logStep(`Merging proposal #${prId}...`, provider);
-        let mergeRes = await request.post(`${BASE_URL}/api/v1/proposals/${prId}/merge`);
-        for (let attempt = 1; attempt <= 4 && mergeRes.status() === 409; attempt++) {
-          await new Promise((r) => setTimeout(r, 2000));
-          mergeRes = await request.post(`${BASE_URL}/api/v1/proposals/${prId}/merge`);
-        }
-        expect(mergeRes.ok(), `[${provider}] Merge failed: ${await mergeRes.text()}`).toBe(true);
-        stackMerged = true;
+      logStep(`Creating proposal for ${catalogId} (${stackName})...`, provider);
+      const resolvedValues = Object.fromEntries(
+        Object.entries(values).map(([k, v]) => [k, v === '${stackName}' ? stackName : v]),
+      );
+      const createRes = await request.post(`${BASE_URL}/api/v1/proposals`, {
+        data: {
+          catalogId,
+          name: stackName,
+          tenant,
+          values: resolvedValues,
+        },
       });
+      expect(
+        createRes.ok(),
+        `[${provider}] Failed to create proposal: ${await createRes.text()}`,
+      ).toBe(true);
 
+      const created = (await createRes.json()) as {
+        id?: string | number;
+        proposal?: { id?: string | number };
+      };
+      prId = created.proposal?.id ?? created.id;
+      expect(
+        prId,
+        `[${provider}] Missing proposal.id in response: ${JSON.stringify(created)}`,
+      ).toBeTruthy();
+
+      const previewTimeoutSec = Math.round(PREVIEW_TIMEOUT_MS / 1000);
+      logStep(
+        `Polling preview diff for proposal #${prId} (timeout ${previewTimeoutSec}s)...`,
+        provider,
+      );
+      const prevStart = Date.now();
+      const prevDeadline = prevStart + PREVIEW_TIMEOUT_MS;
+      let prevLastLog = 0;
+      let previewReady = false;
+      while (Date.now() < prevDeadline) {
+        const prevRes = await request.get(`${BASE_URL}/api/v1/proposals/${prId}/preview`);
+        if (prevRes.ok()) {
+          const body = await prevRes.text();
+          if (body.includes('+ Create') || body.includes('create') || body.includes('preview')) {
+            previewReady = true;
+            break;
+          }
+        }
+        if (Date.now() - prevLastLog > 15_000) {
+          const elapsed = Math.round((Date.now() - prevStart) / 1000);
+          logStep(
+            `Still waiting for preview #${prId} (${elapsed}s/${previewTimeoutSec}s)...`,
+            provider,
+          );
+          prevLastLog = Date.now();
+        }
+        await new Promise((r) => setTimeout(r, 5000));
+      }
+      expect(
+        previewReady,
+        `[${provider}] Timed out after ${previewTimeoutSec}s waiting for preview #${prId}`,
+      ).toBe(true);
+
+      logStep(`Merging proposal #${prId}...`, provider);
+      let mergeRes = await request.post(`${BASE_URL}/api/v1/proposals/${prId}/merge`);
+      for (let attempt = 1; attempt <= 4 && mergeRes.status() === 409; attempt++) {
+        await new Promise((r) => setTimeout(r, 2000));
+        mergeRes = await request.post(`${BASE_URL}/api/v1/proposals/${prId}/merge`);
+      }
+      expect(mergeRes.ok(), `[${provider}] Merge failed: ${await mergeRes.text()}`).toBe(true);
+      stackMerged = true;
+
+      return { spec, stackName, tenant, context, page };
+    } catch (err) {
+      if (!stackMerged && prId !== undefined) {
+        logStep(`Closing unmerged proposal #${prId}; skipping stack delete.`, provider);
+        await request.post(`${BASE_URL}/api/v1/proposals/${prId}/reject`).catch(() => null);
+      }
+      await context.close();
+      throw err;
+    }
+  }
+
+  async function reconcileVerifyAndDeleteCloudStack(run: ProvisionedCloudRun): Promise<void> {
+    const { spec, stackName, tenant, context, page } = run;
+    const { provider, sshUser } = spec;
+    const request = page.request;
+    let primaryError: unknown;
+    let cleanupError: unknown;
+
+    try {
       logStep(
         `Waiting for PKO v2 Stack tenant-${tenant}/${stackName} to provision VM...`,
         provider,
@@ -891,24 +935,17 @@ test.describe('08.1 - Multi-Cloud Free-Tier Stage 1 Live E2E (kind Management Cl
       throw err;
     } finally {
       try {
-        if (stackMerged) {
-          try {
-            await deleteAndConfirmStage1StackRemoved(request, tenant, stackName, provider);
-          } catch (err) {
-            if (primaryError) {
-              logStep(
-                `Cleanup warning after primary error: ${err instanceof Error ? err.message : String(err)}`,
-                provider,
-              );
-            } else {
-              cleanupError = err;
-            }
+        try {
+          await deleteAndConfirmStage1StackRemoved(request, tenant, stackName, provider);
+        } catch (err) {
+          if (primaryError) {
+            logStep(
+              `Cleanup warning after primary error: ${err instanceof Error ? err.message : String(err)}`,
+              provider,
+            );
+          } else {
+            cleanupError = err;
           }
-        } else if (prId !== undefined) {
-          logStep(`Closing unmerged proposal #${prId}; skipping stack delete.`, provider);
-          await request.post(`${BASE_URL}/api/v1/proposals/${prId}/reject`).catch(() => null);
-        } else {
-          logStep(`No Stage 1 stack provisioned (${stackName}); skipping delete.`, provider);
         }
       } finally {
         await context.close();
@@ -1045,16 +1082,37 @@ test.describe('08.1 - Multi-Cloud Free-Tier Stage 1 Live E2E (kind Management Cl
       }
     }
 
+    // Phase 1: Create, preview, and merge all cloud PRs sequentially so `main` reaches its
+    // final commit before Flux/PKO starts workspace pods (prevents RollingUpdate lock collisions).
+    const mergedRuns: ProvisionedCloudRun[] = [];
+    for (const spec of enabledSpecs) {
+      try {
+        mergedRuns.push(await createAndMergeCloudProposal(browser, spec));
+      } catch (err) {
+        logStep(
+          `Proposal phase failed: ${err instanceof Error ? err.message : String(err)}`,
+          spec.provider,
+        );
+      }
+    }
+
+    // Phase 2: Reconcile, verify SSH info, and tear down all merged cloud stacks in parallel.
     const results = await Promise.allSettled(
-      enabledSpecs.map((spec) => runStage1CloudVmLifecycle(browser, spec)),
+      mergedRuns.map((run) => reconcileVerifyAndDeleteCloudStack(run)),
     );
 
     const failures = results
-      .map((r, i) => ({ result: r, provider: enabledSpecs[i].provider }))
+      .map((r, i) => ({ result: r, provider: mergedRuns[i].spec.provider }))
       .filter(
         (x): x is { result: PromiseRejectedResult; provider: CloudProvider } =>
           x.result.status === 'rejected',
       );
+
+    if (mergedRuns.length !== enabledSpecs.length) {
+      throw new Error(
+        `Only ${mergedRuns.length}/${enabledSpecs.length} cloud proposal(s) merged cleanly`,
+      );
+    }
 
     if (failures.length > 0) {
       const summary = failures
