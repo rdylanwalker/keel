@@ -1,18 +1,25 @@
 name: Playwright E2E
 
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
   workflow_dispatch:
+    inputs:
+      run_cloud_live:
+        description: 'Run live multi-cloud free-tier E2E'
+        type: boolean
+        default: false
+  workflow_call:
+    inputs:
+      run_cloud_live:
+        description: 'Run live multi-cloud free-tier E2E'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 jobs:
-  e2e:
-    name: Playwright E2E Suite
+  e2e-mocked:
+    name: Playwright E2E Suite (Mocked)
     runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v7
@@ -51,7 +58,7 @@ jobs:
 
   e2e-live-kind:
     name: Live kind E2E (GUI + CLI)
-    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call'
     runs-on: ubuntu-26.04
     timeout-minutes: 30
     steps:
@@ -100,5 +107,63 @@ jobs:
         if: always()
         with:
           name: playwright-live-report
+          path: e2e/playwright-report/
+          retention-days: 14
+
+  e2e-live-cloud:
+    name: Live Multi-Cloud Free-Tier E2E (AWS/Azure/GCP)
+    if: inputs.run_cloud_live == true || vars.KEEL_E2E_CLOUD_AWS == '1' || vars.KEEL_E2E_CLOUD_AZURE == '1' || vars.KEEL_E2E_CLOUD_GCP == '1' || vars.KEEL_E2E_CLOUD_ALL == '1'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 12
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 26
+          cache: 'pnpm'
+          cache-dependency-path: e2e/pnpm-lock.yaml
+      - name: Install Pulumi CLI
+        run: |
+          curl -fsSL https://get.pulumi.com | sh
+          echo "$HOME/.pulumi/bin" >> "$GITHUB_PATH"
+      - name: Build UI & Keel Binary
+        run: |
+          pnpm --dir ui install
+          pnpm --dir ui build
+          cargo build --bin keel
+      - name: Install E2E dependencies & Playwright Chromium
+        run: |
+          pnpm --dir e2e install
+          pnpm --dir e2e exec playwright install --with-deps chromium
+      - name: Run Live Cloud Free-Tier E2E
+        env:
+          KEEL_E2E_CLOUD_ALL: ${{ vars.KEEL_E2E_CLOUD_ALL }}
+          KEEL_E2E_CLOUD_AWS: ${{ vars.KEEL_E2E_CLOUD_AWS }}
+          KEEL_E2E_CLOUD_AZURE: ${{ vars.KEEL_E2E_CLOUD_AZURE }}
+          KEEL_E2E_CLOUD_GCP: ${{ vars.KEEL_E2E_CLOUD_GCP }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}
+          AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+          ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+          ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+          ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+          AZURE_LOCATION: ${{ vars.AZURE_LOCATION || 'eastus' }}
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ secrets.GOOGLE_APPLICATION_CREDENTIALS }}
+          GCP_PROJECT: ${{ vars.GCP_PROJECT || secrets.GCP_PROJECT }}
+          GOOGLE_PROJECT: ${{ vars.GOOGLE_PROJECT || secrets.GOOGLE_PROJECT }}
+          GCP_REGION: ${{ vars.GCP_REGION || 'us-central1' }}
+          GCP_ZONE: ${{ vars.GCP_ZONE || 'us-central1-a' }}
+        run: pnpm --dir e2e test:live:cloud
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: playwright-cloud-report
           path: e2e/playwright-report/
           retention-days: 14
