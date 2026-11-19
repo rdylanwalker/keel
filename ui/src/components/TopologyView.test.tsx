@@ -11,7 +11,8 @@ vi.mock("../lib/api", () => ({
   getProviders: vi.fn(),
   getProposals: vi.fn().mockResolvedValue([]),
   toggleProvider: vi.fn(),
-  restartStackWorkspace: vi.fn(),
+  reconcileStack: vi.fn(),
+  forceDeleteStack: vi.fn(),
   reconcileRelease: vi.fn(),
   deleteStack: vi.fn(),
   deleteRelease: vi.fn(),
@@ -500,11 +501,12 @@ describe("TopologyView component", () => {
         targetCluster: "workload-01-kubeconfig",
       },
     ])
-    vi.mocked(api.restartStackWorkspace).mockResolvedValueOnce({
-      restarted: true,
+    vi.mocked(api.reconcileStack).mockResolvedValueOnce({
+      reconciled: true,
       namespace: "tenant-acme",
       name: "live-proxmox-stack",
-      message: "Workspace restarted for live-proxmox-stack",
+      message:
+        "Requested reconciliation for Stack tenant-acme/live-proxmox-stack",
     })
     vi.mocked(api.reconcileRelease).mockResolvedValueOnce({
       reconciled: true,
@@ -568,13 +570,15 @@ describe("TopologyView component", () => {
     )
     expect(onEditRelease).toHaveBeenCalledWith("tenant-acme", "podinfo")
 
-    // Restart stack
+    // Reconcile stack
     fireEvent.click(
-      screen.getByRole("button", { name: "Restart stack live-proxmox-stack" })
+      screen.getByRole("button", { name: "Reconcile stack live-proxmox-stack" })
     )
     await waitFor(() => {
       expect(
-        screen.getByText("Workspace restarted for live-proxmox-stack")
+        screen.getByText(
+          "Requested reconciliation for Stack tenant-acme/live-proxmox-stack"
+        )
       ).toBeInTheDocument()
     })
 
@@ -658,8 +662,8 @@ describe("TopologyView component", () => {
         lastSynced: new Date(Date.now() - 2 * 86400 * 1000).toISOString(),
       },
     ])
-    vi.mocked(api.restartStackWorkspace).mockRejectedValueOnce(
-      new Error("Restart failed")
+    vi.mocked(api.reconcileStack).mockRejectedValueOnce(
+      new Error("Stack reconcile failed")
     )
     vi.mocked(api.reconcileRelease).mockRejectedValueOnce(
       new Error("Reconcile failed")
@@ -679,10 +683,12 @@ describe("TopologyView component", () => {
     })
 
     fireEvent.click(
-      screen.getByRole("button", { name: "Restart stack live-proxmox-stack" })
+      screen.getByRole("button", { name: "Reconcile stack live-proxmox-stack" })
     )
     await waitFor(() => {
-      expect(screen.getByRole("alert")).toHaveTextContent("Restart failed")
+      expect(screen.getByRole("alert")).toHaveTextContent(
+        "Stack reconcile failed"
+      )
     })
 
     fireEvent.click(
@@ -785,5 +791,61 @@ describe("TopologyView component", () => {
         name: "SSH Connect - live-proxmox-stack",
       })
     ).not.toBeInTheDocument()
+  })
+
+  it("renders release fallback fields and triggers Force Delete from StackInspectorModal", async () => {
+    vi.mocked(api.getStacksWithMeta).mockResolvedValue({
+      stacks: mockLiveStacks,
+    })
+    vi.mocked(api.getReleases).mockResolvedValue([
+      {
+        id: "custom-app",
+        name: "custom-app",
+        type: "helm",
+        version: "",
+        namespace: "tenant-acme",
+        tenant: "acme",
+        targetCluster: "prod-kubeconfig",
+        bundle: "web-stack",
+        bundleItem: "app",
+        status: "Ready",
+      },
+    ])
+    vi.mocked(api.getStackDiagnostics).mockResolvedValue({
+      name: "live-proxmox-stack",
+      namespace: "tenant-acme",
+      conditions: [],
+      events: [],
+      logs: [],
+    })
+    vi.mocked(api.forceDeleteStack).mockResolvedValue({
+      forceDeleted: true,
+      namespace: "tenant-acme",
+      name: "live-proxmox-stack",
+      message:
+        "Cleared finalizers on terminating Stack tenant-acme/live-proxmox-stack",
+    })
+
+    render(<TopologyView />)
+
+    expect(await screen.findByText("prod")).toBeInTheDocument()
+    expect(screen.getByText(/web-stack/)).toBeInTheDocument()
+    expect(screen.getByText("latest")).toBeInTheDocument()
+
+    const inspectBtn = await screen.findByRole("button", {
+      name: "Inspect stack live-proxmox-stack",
+    })
+    fireEvent.click(inspectBtn)
+
+    fireEvent.click(await screen.findByTestId("inspector-force-delete-btn"))
+    fireEvent.click(await screen.findByTestId("confirm-force-delete-btn"))
+
+    await waitFor(() => {
+      expect(api.forceDeleteStack).toHaveBeenCalledWith(
+        "tenant-acme",
+        "live-proxmox-stack"
+      )
+      expect(api.getStacksWithMeta).toHaveBeenCalledTimes(2)
+    })
   })
 })

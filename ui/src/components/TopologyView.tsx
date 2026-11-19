@@ -28,7 +28,7 @@ import {
   getReleases,
   getStacksWithMeta,
   reconcileRelease,
-  restartStackWorkspace,
+  reconcileStack,
 } from "../lib/api"
 import { isDemoMode, isStackSshSupported } from "../lib/utils"
 import { StackInspectorModal } from "./StackInspectorModal"
@@ -197,7 +197,7 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
     tenant: string
     provider?: string
   } | null>(null)
-  const [restartingStackKey, setRestartingStackKey] = useState<string | null>(
+  const [reconcilingStackKey, setReconcilingStackKey] = useState<string | null>(
     null
   )
   const [reconcilingReleaseKey, setReconcilingReleaseKey] = useState<
@@ -252,21 +252,19 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
     }
   }, [selectedTenant])
 
-  const handleQuickRestart = async (stack: StackSummary) => {
+  const handleQuickStackReconcile = async (stack: StackSummary) => {
     const ns = resolveStackNamespace(stack)
     const key = `${ns}/${stack.name}`
-    setRestartingStackKey(key)
+    setReconcilingStackKey(key)
     setStackBanner(null)
     try {
-      const res = await restartStackWorkspace(ns, stack.name)
+      const res = await reconcileStack(ns, stack.name)
       setStackBanner({ message: res.message })
       window.setTimeout(fetchTopology, 1500)
     } catch (err: unknown) {
-      setError(
-        err instanceof Error ? err.message : "Failed to restart stack workspace"
-      )
+      setError(err instanceof Error ? err.message : "Failed to reconcile stack")
     } finally {
-      setRestartingStackKey(null)
+      setReconcilingStackKey(null)
     }
   }
 
@@ -581,15 +579,15 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
               </button>
               <button
                 type="button"
-                title="Restart Workspace"
-                aria-label={`Restart stack ${stack.name}`}
-                disabled={restartingStackKey === `${ns}/${stack.name}`}
-                onClick={() => handleQuickRestart(stack)}
-                className="p-1.5 rounded-md bg-amber-500/10 hover:bg-amber-500/20 text-amber-300 border border-amber-500/30 transition-colors cursor-pointer disabled:opacity-50"
+                title="Reconcile Now"
+                aria-label={`Reconcile stack ${stack.name}`}
+                disabled={reconcilingStackKey === `${ns}/${stack.name}`}
+                onClick={() => handleQuickStackReconcile(stack)}
+                className="p-1.5 rounded-md bg-blue-500/10 hover:bg-blue-500/20 text-blue-300 border border-blue-500/30 transition-colors cursor-pointer disabled:opacity-50"
               >
                 <RotateCw
                   className={`h-3.5 w-3.5 ${
-                    restartingStackKey === `${ns}/${stack.name}`
+                    reconcilingStackKey === `${ns}/${stack.name}`
                       ? "animate-spin"
                       : ""
                   }`}
@@ -617,7 +615,7 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
       },
     ],
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [onEditStack, restartingStackKey, deletingKey]
+    [onEditStack, reconcilingStackKey, deletingKey]
   )
 
   const releaseColumns = useMemo<DataTableColumnDef<ReleaseSummary>[]>(
@@ -781,7 +779,7 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
                 aria-label={`Reconcile release ${rel.name}`}
                 disabled={reconcilingReleaseKey === `${ns}/${rel.name}`}
                 onClick={() => handleQuickReconcile(rel)}
-                className="p-1.5 rounded-md bg-amber-500/10 hover:bg-amber-500/20 text-amber-300 border border-amber-500/30 transition-colors cursor-pointer disabled:opacity-50"
+                className="p-1.5 rounded-md bg-blue-500/10 hover:bg-blue-500/20 text-blue-300 border border-blue-500/30 transition-colors cursor-pointer disabled:opacity-50"
               >
                 <RotateCw
                   className={`h-3.5 w-3.5 ${

@@ -106,7 +106,7 @@ describe("StackInspectorModal component", () => {
     expect(onClose).toHaveBeenCalled()
   })
 
-  it("triggers rollout restart and handles release kind", async () => {
+  it("triggers rollout restart from Advanced section and handles release kind", async () => {
     vi.mocked(api.getStackDiagnostics).mockResolvedValue(sampleDiagnostics)
     vi.mocked(api.restartStackWorkspace).mockResolvedValue({
       restarted: true,
@@ -125,7 +125,11 @@ describe("StackInspectorModal component", () => {
     )
 
     await screen.findByText("Pod: Running")
-    fireEvent.click(screen.getByRole("button", { name: /Rollout Restart/i }))
+    expect(
+      screen.queryByRole("button", { name: /Restart Workspace/i })
+    ).not.toBeInTheDocument()
+    fireEvent.click(screen.getByTestId("inspector-advanced-toggle"))
+    fireEvent.click(screen.getByRole("button", { name: /Restart Workspace/i }))
 
     expect(
       await screen.findByText("Workspace pod deleted for rollout restart")
@@ -149,7 +153,7 @@ describe("StackInspectorModal component", () => {
 
     expect(await screen.findByText("Release not found")).toBeInTheDocument()
     expect(
-      screen.queryByRole("button", { name: /Rollout Restart/i })
+      screen.queryByTestId("inspector-advanced-toggle")
     ).not.toBeInTheDocument()
   })
 

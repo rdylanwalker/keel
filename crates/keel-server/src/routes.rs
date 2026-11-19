@@ -5779,6 +5779,42 @@ pub async fn restart_stack_workspace(
     }))
 }
 
+/// Response body for `POST /api/v1/stacks/{namespace}/{name}/reconcile`.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReconcileStackResponse {
+    pub reconciled: bool,
+    pub namespace: String,
+    pub name: String,
+    pub message: String,
+}
+
+/// `POST /api/v1/stacks/{namespace}/{name}/reconcile`
+///
+/// Annotates a PKO v2 `Stack` with `pulumi.com/reconcile-request` to trigger
+/// immediate reconciliation without restarting the workspace pod.
+pub async fn reconcile_stack(
+    auth: AuthSession,
+    State(state): State<AppState>,
+    AxumPath((namespace, name)): AxumPath<(String, String)>,
+) -> Result<Json<ReconcileStackResponse>, ServerError> {
+    validate_dns_label(&namespace, "namespace")?;
+    validate_dns_label(&name, "name")?;
+    let tenant = namespace.strip_prefix("tenant-").unwrap_or(&namespace);
+    auth.require_tenant_access(tenant)?;
+
+    let message = state
+        .state_provider
+        .reconcile_stack(&namespace, &name)
+        .await?;
+    Ok(Json(ReconcileStackResponse {
+        reconciled: true,
+        namespace,
+        name,
+        message,
+    }))
+}
+
 /// Response body for `POST /api/v1/stacks/{namespace}/{name}/force-delete`.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]

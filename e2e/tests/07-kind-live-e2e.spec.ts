@@ -296,7 +296,11 @@ async function signInViaRauthy(
   await page.goto('/');
   await expect(page.getByText('Keel Control Plane')).toBeVisible();
 
-  if (await page.getByText('Authentication Required').isVisible()) {
+  const authRequired = page.getByText('Authentication Required');
+  const mgmtStack = page.getByText('management-cluster-core', { exact: true });
+  await expect(authRequired.or(mgmtStack)).toBeVisible({ timeout: 30_000 });
+
+  if (await authRequired.isVisible()) {
     await page
       .getByRole('button', { name: /Sign in with OIDC/i })
       .first()
@@ -330,6 +334,22 @@ async function signInViaRauthy(
   });
 }
 
+function resolveE2eAdminPassword(): string {
+  if (process.env.KEEL_ADMIN_PASSWORD?.trim()) {
+    return process.env.KEEL_ADMIN_PASSWORD.trim();
+  }
+  if (process.env.KEEL_E2E_REUSE_CLUSTER !== '0') {
+    const savedPassPath = path.resolve(process.cwd(), '../target/keel-dex-password');
+    if (fs.existsSync(savedPassPath)) {
+      const saved = fs.readFileSync(savedPassPath, 'utf-8').trim();
+      if (saved) {
+        return saved;
+      }
+    }
+  }
+  return 'KeelE2eAdminPass123!';
+}
+
 // Note: `keel bootstrap init --target kind` provisions the `kind` management cluster
 // via `deploy/bootstrap/kind/Pulumi.yaml` (`tehcyx/kind`) instead of direct `kind create cluster`.
 test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', () => {
@@ -342,7 +362,7 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
   let createdMgmtCluster = false;
   let serveProc: ChildProcess | null = null;
   let tmpRepoDir: string | null = null;
-  const adminPassword = process.env.KEEL_ADMIN_PASSWORD || 'KeelE2eAdminPass123!';
+  const adminPassword = resolveE2eAdminPassword();
   const acmePassword = process.env.KEEL_ACME_PASSWORD || 'KeelE2eAcmePass123!';
 
   test.beforeAll(async () => {

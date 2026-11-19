@@ -384,4 +384,46 @@ describe("PreviewInspectorView component", () => {
       expect(screen.getByText("Pull Requests (3)")).toBeInTheDocument()
     })
   })
+
+  it("supports keyboard selection in PR list and handles reject failure branches", async () => {
+    vi.mocked(api.getProposals).mockResolvedValue([
+      mockProposals[0],
+      {
+        ...mockProposals[0],
+        id: "102",
+        title: "Second PR",
+        branch: "keel/second",
+      },
+    ])
+    vi.mocked(api.getProposalPreview).mockResolvedValue(mockPreview)
+    vi.mocked(api.rejectProposal)
+      .mockResolvedValueOnce({ success: false, message: "" })
+      .mockRejectedValueOnce("reject string error")
+
+    render(<PreviewInspectorView />)
+
+    const secondPr = await screen.findByText("Second PR")
+    const card = secondPr.closest("[role='button']") as HTMLElement
+    fireEvent.keyDown(card, { key: "Enter" })
+    fireEvent.keyDown(card, { key: " " })
+
+    await waitFor(() => {
+      expect(api.getProposalPreview).toHaveBeenCalledWith("102")
+    })
+
+    const rejectBtn = screen.getByRole("button", { name: /Reject PR/i })
+    fireEvent.click(rejectBtn)
+    await waitFor(() => {
+      expect(screen.getByRole("alert")).toHaveTextContent(
+        "Failed to reject PR proposal"
+      )
+    })
+
+    fireEvent.click(rejectBtn)
+    await waitFor(() => {
+      expect(screen.getByRole("alert")).toHaveTextContent(
+        "Reject operation failed"
+      )
+    })
+  })
 })

@@ -134,7 +134,7 @@ Monitor deployment progress, Flagger canary weights, and live SSE events in **To
 From **Topology Map**:
 
 - **Edit:** Click **Edit** on any infrastructure stack or application release to load its persisted configuration into **Catalog & Form Wizard** and open an update PR.
-- **Restart / Reconcile:** Click **Restart Workspace** on an infrastructure stack to restart its PKO v2 `Workspace` pod, or **Reconcile Now** on an application release to trigger immediate Flux CD reconciliation (`reconcile.fluxcd.io/requestedAt`).
+- **Reconcile / Restart:** Click **Reconcile Now** on an infrastructure stack (annotates the PKO v2 `Stack` with `pulumi.com/reconcile-request`) or on an application release (annotates the Flux CD resource with `reconcile.fluxcd.io/requestedAt`) to trigger immediate reconciliation. To restart a wedged PKO v2 `Workspace` pod, open **Inspect** → **Advanced** → **Restart Workspace**.
 - **Delete:** Click **Delete** on any stack or release to open a removal PR. After merging, the resource transitions to `Deleting` until Flux CD and PKO v2 finish tearing down the underlying cluster/cloud resources.
 
 ## 7. Direct VM SSH Access (Web Portal & CLI)

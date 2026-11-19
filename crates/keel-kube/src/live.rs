@@ -181,6 +181,13 @@ pub trait LiveStatusSource: Send + Sync {
         ))
     }
 
+    /// Annotates a PKO v2 `Stack` with `pulumi.com/reconcile-request`.
+    async fn reconcile_stack(&self, _namespace: &str, _name: &str) -> Result<String, KubeError> {
+        Err(KubeError::InvalidInput(
+            "Live Kubernetes cluster connection required to reconcile stack".to_string(),
+        ))
+    }
+
     /// Clears finalizers on a stuck/terminating PKO v2 `Stack` and deletes it if not already terminating.
     async fn force_delete_stack(&self, _namespace: &str, _name: &str) -> Result<String, KubeError> {
         Err(KubeError::InvalidInput(
@@ -1028,6 +1035,30 @@ impl LiveStatusSource for KubeClusterStatusReader {
             .await?;
         Ok(format!(
             "Triggered rollout restart for StatefulSet {namespace}/{sts_name}"
+        ))
+    }
+
+    async fn reconcile_stack(&self, namespace: &str, name: &str) -> Result<String, KubeError> {
+        let ar = ApiResource {
+            group: "pulumi.com".to_string(),
+            version: "v1".to_string(),
+            api_version: "pulumi.com/v1".to_string(),
+            kind: "Stack".to_string(),
+            plural: "stacks".to_string(),
+        };
+        let api: Api<DynamicObject> = Api::namespaced_with(self.client.clone(), namespace, &ar);
+        let requested_at = Utc::now().to_rfc3339();
+        let patch = json!({
+            "metadata": {
+                "annotations": {
+                    "pulumi.com/reconcile-request": requested_at
+                }
+            }
+        });
+        api.patch(name, &PatchParams::default(), &Patch::Merge(&patch))
+            .await?;
+        Ok(format!(
+            "Requested reconciliation for Stack {namespace}/{name}"
         ))
     }
 

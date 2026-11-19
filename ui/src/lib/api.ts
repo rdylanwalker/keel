@@ -662,6 +662,30 @@ export async function restartStackWorkspace(
   return handleResponse<RestartStackResponse>(res)
 }
 
+export async function reconcileStack(
+  namespace: string,
+  name: string
+): Promise<{
+  reconciled: boolean
+  namespace: string
+  name: string
+  message: string
+}> {
+  const res = await fetch(
+    `/api/v1/stacks/${encodeURIComponent(namespace)}/${encodeURIComponent(name)}/reconcile`,
+    {
+      method: "POST",
+      headers: getHeaders(),
+    }
+  )
+  return handleResponse<{
+    reconciled: boolean
+    namespace: string
+    name: string
+    message: string
+  }>(res)
+}
+
 export async function forceDeleteStack(
   namespace: string,
   name: string

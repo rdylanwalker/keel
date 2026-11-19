@@ -163,6 +163,12 @@ pub trait ClusterStateProvider: Send + Sync {
         ))
     }
 
+    async fn reconcile_stack(&self, _namespace: &str, _name: &str) -> Result<String, ServerError> {
+        Err(ServerError::BadRequest(
+            "Live Kubernetes cluster connection required to reconcile stack".to_string(),
+        ))
+    }
+
     async fn force_delete_stack(
         &self,
         _namespace: &str,
@@ -793,6 +799,13 @@ impl ClusterStateProvider for KubeClusterStateProvider {
             .restart_stack_workspace(namespace, name)
             .await
             .map_err(|e| ServerError::Internal(format!("Rollout restart failed: {e}")))
+    }
+
+    async fn reconcile_stack(&self, namespace: &str, name: &str) -> Result<String, ServerError> {
+        self.live
+            .reconcile_stack(namespace, name)
+            .await
+            .map_err(|e| ServerError::Internal(format!("Stack reconcile failed: {e}")))
     }
 
     async fn force_delete_stack(&self, namespace: &str, name: &str) -> Result<String, ServerError> {

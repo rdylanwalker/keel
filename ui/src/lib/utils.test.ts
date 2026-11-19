@@ -1,5 +1,11 @@
 import { describe, it, expect, afterEach } from "vitest"
-import { cn, jsonToYaml, isDemoMode } from "./utils"
+import {
+  cn,
+  jsonToYaml,
+  isDemoMode,
+  formatForgeProvider,
+  isStackSshSupported,
+} from "./utils"
 
 describe("cn utility", () => {
   it("merges tailwind class names cleanly", () => {
@@ -24,6 +30,33 @@ describe("jsonToYaml utility", () => {
     expect(jsonToYaml({ name: "test", nested: { val: 1 } })).toContain(
       "name: test"
     )
+    expect(jsonToYaml(() => {})).toContain("=>")
+  })
+})
+
+describe("formatForgeProvider utility", () => {
+  it("formats known and custom forge provider names", () => {
+    expect(formatForgeProvider("forgejo")).toBe("Forgejo")
+    expect(formatForgeProvider("gitea")).toBe("Gitea")
+    expect(formatForgeProvider("github")).toBe("GitHub")
+    expect(formatForgeProvider("gitlab")).toBe("GitLab")
+    expect(formatForgeProvider("local")).toBe("Local Git")
+    expect(formatForgeProvider("")).toBe("Local Git")
+    expect(formatForgeProvider(undefined)).toBe("Local Git")
+    expect(formatForgeProvider("bitbucket")).toBe("Bitbucket")
+  })
+})
+
+describe("isStackSshSupported utility", () => {
+  it("identifies SSH-capable VM stacks vs non-VM stacks", () => {
+    expect(isStackSshSupported({ name: "vm-1", provider: "azure" })).toBe(true)
+    expect(isStackSshSupported({ name: "vm-2", provider: "kind" })).toBe(false)
+    expect(
+      isStackSshSupported({ name: "management-cluster-core", provider: "" })
+    ).toBe(false)
+    expect(isStackSshSupported({ name: "x", type: "management" })).toBe(false)
+    expect(isStackSshSupported({ name: "postgres-managed" })).toBe(false)
+    expect(isStackSshSupported({ name: "canary-gateway-config" })).toBe(false)
   })
 })
 

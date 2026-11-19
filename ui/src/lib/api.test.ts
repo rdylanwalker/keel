@@ -27,6 +27,7 @@ import {
   deleteRelease,
   getBundleConfig,
   restartStackWorkspace,
+  reconcileStack,
   forceDeleteStack,
   unlockStack,
   reconcileRelease,
@@ -664,9 +665,10 @@ describe("api client module", () => {
     await restartStackWorkspace("tenant-acme", "dev-kind")
     await forceDeleteStack("tenant-acme", "dev-kind")
     await unlockStack("tenant-acme", "dev-kind")
+    await reconcileStack("tenant-acme", "dev-kind")
     await reconcileRelease("tenant-acme", "podinfo")
 
-    expect(fetchMock).toHaveBeenCalledTimes(12)
+    expect(fetchMock).toHaveBeenCalledTimes(13)
     expect(fetchMock).toHaveBeenCalledWith(
       "/api/v1/stacks/tenant-acme/dev-kind/unlock",
       expect.objectContaining({ method: "POST" })

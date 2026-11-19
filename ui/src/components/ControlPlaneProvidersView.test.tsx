@@ -328,4 +328,56 @@ describe("ControlPlaneProvidersView component", () => {
       )
     })
   })
+
+  it("uses demo addons fallback when getCoreAddons is empty in demo mode and handles refresh errors", async () => {
+    window.history.replaceState({}, "", "/?demo=true")
+    vi.mocked(api.getCoreAddons).mockResolvedValue([])
+    vi.mocked(api.getStacksWithMeta)
+      .mockResolvedValueOnce({
+        stacks: [],
+        gitRepoUrl: "https://git.example.com/org/infra.git",
+        forgeProvider: "forgejo",
+        stateBackend: "s3://keel-state",
+      })
+      .mockResolvedValueOnce({
+        stacks: [],
+        gitRepoUrl: "https://git.example.com/org/infra.git",
+        forgeProvider: "forgejo",
+        stateBackend: "s3://keel-state",
+      })
+      .mockRejectedValueOnce(new Error("API error (401): unauthorized"))
+      .mockRejectedValueOnce("non-error failure")
+
+    render(<ControlPlaneProvidersView />)
+
+    await waitFor(() => {
+      expect(
+        screen.getByText("Management Plane Base Addons")
+      ).toBeInTheDocument()
+    })
+
+    const refreshBtn = screen.getByRole("button", { name: /Refresh/i })
+    // 1st refresh: succeeds with demo addons fallback
+    fireEvent.click(refreshBtn)
+    await waitFor(() => {
+      expect(api.getStacksWithMeta).toHaveBeenCalledTimes(2)
+    })
+
+    // 2nd refresh: 401 in demo mode is suppressed
+    fireEvent.click(refreshBtn)
+    await waitFor(() => {
+      expect(api.getStacksWithMeta).toHaveBeenCalledTimes(3)
+    })
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument()
+
+    // 3rd refresh: non-Error string surfaces fallback alert
+    fireEvent.click(refreshBtn)
+    await waitFor(() => {
+      expect(screen.getByRole("alert")).toHaveTextContent(
+        "Failed to load control plane & provider state"
+      )
+    })
+
+    window.history.replaceState({}, "", "/")
+  })
 })

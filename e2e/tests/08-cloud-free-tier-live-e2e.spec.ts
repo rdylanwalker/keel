@@ -170,7 +170,11 @@ async function signInViaRauthy(
   await page.goto(BASE_URL);
   await expect(page.getByText('Keel Control Plane')).toBeVisible();
 
-  if (await page.getByText('Authentication Required').isVisible()) {
+  const authRequired = page.getByText('Authentication Required');
+  const mgmtStack = page.getByText('management-cluster-core', { exact: true });
+  await expect(authRequired.or(mgmtStack)).toBeVisible({ timeout: 30_000 });
+
+  if (await authRequired.isVisible()) {
     await page
       .getByRole('button', { name: /Sign in with OIDC/i })
       .first()
@@ -584,13 +588,35 @@ test.describe('08 - Multi-Cloud Free-Tier Dual-Guard Contract & Blueprint Valida
   });
 });
 
+const LIVE_ENABLED = process.env.KEEL_E2E_LIVE === '1';
+
+function resolveE2eAdminPassword(): string {
+  if (process.env.KEEL_ADMIN_PASSWORD?.trim()) {
+    return process.env.KEEL_ADMIN_PASSWORD.trim();
+  }
+  if (process.env.KEEL_E2E_REUSE_CLUSTER !== '0') {
+    const savedPassPath = path.resolve(process.cwd(), '../target/keel-dex-password');
+    if (fs.existsSync(savedPassPath)) {
+      const saved = fs.readFileSync(savedPassPath, 'utf-8').trim();
+      if (saved) {
+        return saved;
+      }
+    }
+  }
+  return 'KeelE2eAdminPass123!';
+}
+
 test.describe('08.1 - Multi-Cloud Free-Tier Stage 1 Live E2E (kind Management Cluster -> Cloud VMs)', () => {
   test.describe.configure({ mode: 'serial' });
+  test.skip(
+    !LIVE_ENABLED,
+    'Set KEEL_E2E_LIVE=1 (or run `pnpm --dir e2e test:live:cloud`) to run live multi-cloud E2E',
+  );
 
   let createdMgmtCluster = false;
   let serveProc: ChildProcess | null = null;
   let tmpRepoDir: string | null = null;
-  const adminPassword = process.env.KEEL_ADMIN_PASSWORD || 'KeelE2eAdminPass123!';
+  const adminPassword = resolveE2eAdminPassword();
 
   const anyCloudEnabled =
     resolveCloudTargetGate('aws').enabled ||
@@ -598,7 +624,7 @@ test.describe('08.1 - Multi-Cloud Free-Tier Stage 1 Live E2E (kind Management Cl
     resolveCloudTargetGate('gcp').enabled;
 
   test.beforeAll(async () => {
-    if (!anyCloudEnabled) {
+    if (!LIVE_ENABLED || !anyCloudEnabled) {
       return;
     }
 

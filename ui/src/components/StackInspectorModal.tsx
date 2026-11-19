@@ -12,6 +12,8 @@ import {
   Minimize2,
   Trash2,
   Unlock,
+  ChevronDown,
+  ChevronRight,
 } from "lucide-react"
 import { StackDiagnostics } from "../types/api"
 import {
@@ -60,6 +62,7 @@ export const StackInspectorModal: React.FC<StackInspectorModalProps> = ({
   const [banner, setBanner] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [isSshModalOpen, setIsSshModalOpen] = useState(false)
+  const [showAdvanced, setShowAdvanced] = useState(false)
   const isProtectedStack =
     namespace === "flux-system" && name === "management-cluster-core"
   const isStackLocked =
@@ -307,19 +310,6 @@ export const StackInspectorModal: React.FC<StackInspectorModalProps> = ({
               >
                 <Unlock className="h-3.5 w-3.5" />
                 <span>{unlocking ? "Unlocking..." : "Unlock Stack"}</span>
-              </button>
-            )}
-            {kind === "stack" && (
-              <button
-                type="button"
-                onClick={handleRestart}
-                disabled={restarting || forceDeleting || unlocking}
-                className="flex items-center space-x-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 border border-amber-500/30 transition-colors cursor-pointer disabled:opacity-50"
-              >
-                <RotateCw
-                  className={`h-3.5 w-3.5 ${restarting ? "animate-spin" : ""}`}
-                />
-                <span>{restarting ? "Restarting..." : "Rollout Restart"}</span>
               </button>
             )}
             {kind === "stack" && !isProtectedStack && (
@@ -662,6 +652,54 @@ export const StackInspectorModal: React.FC<StackInspectorModalProps> = ({
               </div>
             </div>
           </div>
+
+          {kind === "stack" && (
+            <div className="shrink-0 rounded-xl border border-slate-800 bg-slate-950/60 overflow-hidden">
+              <button
+                type="button"
+                data-testid="inspector-advanced-toggle"
+                onClick={() => setShowAdvanced((prev) => !prev)}
+                className="w-full flex items-center justify-between px-4 py-2.5 text-xs font-semibold uppercase tracking-wider text-slate-400 hover:text-slate-200 hover:bg-slate-900/60 transition-colors cursor-pointer"
+              >
+                <span>Advanced</span>
+                {showAdvanced ? (
+                  <ChevronDown className="h-4 w-4" />
+                ) : (
+                  <ChevronRight className="h-4 w-4" />
+                )}
+              </button>
+              {showAdvanced && (
+                <div className="px-4 py-3 border-t border-slate-800 flex flex-wrap items-center justify-between gap-3">
+                  <div className="space-y-0.5">
+                    <p className="text-xs font-medium text-slate-200">
+                      Restart Workspace Pod
+                    </p>
+                    <p className="text-[11px] text-slate-400">
+                      Triggers a Kubernetes rollout restart on the{" "}
+                      <code className="font-mono text-slate-300">
+                        {name}-workspace
+                      </code>{" "}
+                      StatefulSet if the workspace pod is wedged or stale.
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    data-testid="inspector-restart-workspace-btn"
+                    onClick={handleRestart}
+                    disabled={restarting || forceDeleting || unlocking}
+                    className="flex items-center space-x-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 border border-amber-500/30 transition-colors cursor-pointer disabled:opacity-50"
+                  >
+                    <RotateCw
+                      className={`h-3.5 w-3.5 ${restarting ? "animate-spin" : ""}`}
+                    />
+                    <span>
+                      {restarting ? "Restarting..." : "Restart Workspace"}
+                    </span>
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
         </div>
       </div>
       {isSshModalOpen && (
