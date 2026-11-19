@@ -720,4 +720,260 @@ mod tests {
             .await
             .unwrap();
     }
+
+    struct MiniWsClient {
+        stream: tokio::net::TcpStream,
+    }
+
+    impl MiniWsClient {
+        async fn connect(addr: std::net::SocketAddr, path: &str) -> Self {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let req = format!(
+                "GET {path} HTTP/1.1\r\nHost: {addr}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
+            );
+            stream.write_all(req.as_bytes()).await.unwrap();
+            let mut buf = Vec::new();
+            let mut byte = [0u8; 1];
+            while !buf.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte).await.unwrap();
+                buf.push(byte[0]);
+            }
+            let hdr = String::from_utf8_lossy(&buf);
+            assert!(
+                hdr.starts_with("HTTP/1.1 101"),
+                "unexpected ws handshake: {hdr}"
+            );
+            Self { stream }
+        }
+
+        async fn send_text(&mut self, text: &str) {
+            use tokio::io::AsyncWriteExt;
+            let payload = text.as_bytes();
+            let mut frame = Vec::new();
+            frame.push(0x81); // FIN + text
+            let len = payload.len();
+            if len < 126 {
+                frame.push(0x80 | (len as u8));
+            } else {
+                frame.push(0x80 | 126);
+                frame.extend_from_slice(&(len as u16).to_be_bytes());
+            }
+            let mask = [0x12, 0x34, 0x56, 0x78];
+            frame.extend_from_slice(&mask);
+            for (i, b) in payload.iter().enumerate() {
+                frame.push(b ^ mask[i % 4]);
+            }
+            self.stream.write_all(&frame).await.unwrap();
+        }
+
+        async fn recv_text(&mut self) -> String {
+            use tokio::io::AsyncReadExt;
+            loop {
+                let mut hdr = [0u8; 2];
+                self.stream.read_exact(&mut hdr).await.unwrap();
+                let opcode = hdr[0] & 0x0f;
+                let masked = (hdr[1] & 0x80) != 0;
+                let mut len = (hdr[1] & 0x7f) as usize;
+                if len == 126 {
+                    let mut ext = [0u8; 2];
+                    self.stream.read_exact(&mut ext).await.unwrap();
+                    len = u16::from_be_bytes(ext) as usize;
+                } else if len == 127 {
+                    let mut ext = [0u8; 8];
+                    self.stream.read_exact(&mut ext).await.unwrap();
+                    len = u64::from_be_bytes(ext) as usize;
+                }
+                let mask = if masked {
+                    let mut m = [0u8; 4];
+                    self.stream.read_exact(&mut m).await.unwrap();
+                    Some(m)
+                } else {
+                    None
+                };
+                let mut payload = vec![0u8; len];
+                self.stream.read_exact(&mut payload).await.unwrap();
+                if let Some(m) = mask {
+                    for (i, b) in payload.iter_mut().enumerate() {
+                        *b ^= m[i % 4];
+                    }
+                }
+                if opcode == 0x8 {
+                    panic!("unexpected close frame");
+                }
+                if opcode == 0x1 {
+                    return String::from_utf8(payload).unwrap();
+                }
+            }
+        }
+    }
+
+    fn test_ssh_info(
+        provider: &str,
+        stack_name: &str,
+        host: &str,
+        port: u16,
+    ) -> StackSshInfoResponse {
+        StackSshInfoResponse {
+            tenant: "default".to_string(),
+            namespace: "tenant-default".to_string(),
+            stack_name: stack_name.to_string(),
+            provider: provider.to_string(),
+            ssh_host: host.to_string(),
+            ssh_user: "ubuntu".to_string(),
+            ssh_port: port,
+            has_saved_ssh_key: false,
+            ssh_command: format!("ssh ubuntu@{host} -p {port}"),
+            cli_command: format!("keel infra ssh {stack_name}"),
+            cli_exec_command: format!("keel infra ssh {stack_name} --"),
+        }
+    }
+
+    async fn spawn_ws_handler(
+        info: StackSshInfoResponse,
+        saved_key: Option<String>,
+    ) -> std::net::SocketAddr {
+        use axum::Router;
+        use axum::extract::ws::WebSocketUpgrade;
+        use axum::routing::get;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            "/ws",
+            get(move |ws: WebSocketUpgrade| {
+                let info = info.clone();
+                let saved_key = saved_key.clone();
+                async move {
+                    ws.on_upgrade(move |socket| {
+                        handle_stack_ssh_ws(socket, info, saved_key, "tester".to_string())
+                    })
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn handle_stack_ssh_ws_error_gates_and_full_pty_bridge() {
+        // 1. Unsupported infra returns Error + Disconnected
+        let addr = spawn_ws_handler(test_ssh_info("kind", "e2e-kind", "127.0.0.1", 22), None).await;
+        let mut ws = MiniWsClient::connect(addr, "/ws").await;
+        let msg1 = ws.recv_text().await;
+        assert!(msg1.contains("SSH is not supported"));
+        assert!(ws.recv_text().await.contains("disconnected"));
+
+        // 2. Missing SSH key returns Error + Disconnected
+        let addr =
+            spawn_ws_handler(test_ssh_info("proxmox", "pve-vm", "127.0.0.1", 22), None).await;
+        let mut ws = MiniWsClient::connect(addr, "/ws").await;
+        ws.send_text(r#"{"type":"connect","cols":80,"rows":24}"#)
+            .await;
+        assert!(
+            ws.recv_text()
+                .await
+                .contains("No SSH private key available")
+        );
+        assert!(ws.recv_text().await.contains("disconnected"));
+
+        // 3. Invalid host / user / PEM returns Error + Disconnected
+        let addr = spawn_ws_handler(
+            test_ssh_info("proxmox", "pve-vm", "127.0.0.1", 22),
+            Some("not-a-pem-key".to_string()),
+        )
+        .await;
+        let mut ws = MiniWsClient::connect(addr, "/ws").await;
+        ws.send_text(r#"{"type":"connect","host":"bad host!!"}"#)
+            .await;
+        assert!(ws.recv_text().await.contains("Invalid SSH host"));
+        assert!(ws.recv_text().await.contains("disconnected"));
+
+        let mut ws = MiniWsClient::connect(addr, "/ws").await;
+        ws.send_text(r#"{"type":"connect","user":"bad user!!"}"#)
+            .await;
+        assert!(ws.recv_text().await.contains("Invalid SSH username"));
+        assert!(ws.recv_text().await.contains("disconnected"));
+
+        let mut ws = MiniWsClient::connect(addr, "/ws").await;
+        ws.send_text(r#"{"type":"connect"}"#).await;
+        assert!(
+            ws.recv_text()
+                .await
+                .contains("Failed to parse SSH private key")
+        );
+        assert!(ws.recv_text().await.contains("disconnected"));
+
+        // 4. Full WebSocket-to-SSH PTY session against TestSshServer
+        let host_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
+        let client_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
+        let client_pem = client_key
+            .to_openssh(russh::keys::ssh_key::LineEnding::LF)
+            .unwrap()
+            .to_string();
+
+        let server_cfg = Arc::new(server::Config {
+            keys: vec![host_key],
+            ..Default::default()
+        });
+        let ssh_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ssh_port = ssh_listener.local_addr().unwrap().port();
+        let mut srv = TestSshServer {
+            expected_pubkey: client_key.public_key().clone(),
+        };
+        tokio::spawn(async move {
+            if let Ok((stream, addr)) = ssh_listener.accept().await {
+                let handler = server::Server::new_client(&mut srv, Some(addr));
+                let _ = server::run_stream(server_cfg, stream, handler).await;
+            }
+        });
+
+        let addr = spawn_ws_handler(
+            test_ssh_info("proxmox", "pve-vm", "127.0.0.1", ssh_port),
+            None,
+        )
+        .await;
+        let mut ws = MiniWsClient::connect(addr, "/ws").await;
+
+        // Invalid frame and non-connect frame before connect
+        ws.send_text("not-json").await;
+        assert!(ws.recv_text().await.contains("Invalid WebSocket SSH frame"));
+        ws.send_text(r#"{"type":"input","data":"ls\n"}"#).await;
+        assert!(
+            ws.recv_text()
+                .await
+                .contains("Expected initial 'connect' frame")
+        );
+
+        // Connect with ephemeral private_key
+        let connect_msg = serde_json::json!({
+            "type": "connect",
+            "cols": 100,
+            "rows": 30,
+            "host": "127.0.0.1",
+            "user": "ubuntu",
+            "port": ssh_port,
+            "privateKey": client_pem
+        })
+        .to_string();
+        ws.send_text(&connect_msg).await;
+
+        let connected = ws.recv_text().await;
+        assert!(connected.contains("connected"));
+        let prompt = ws.recv_text().await;
+        assert!(prompt.contains("ubuntu@test-vm:~$"));
+
+        // Send Input, Resize, and Disconnect
+        ws.send_text(r#"{"type":"input","data":"whoami\n"}"#).await;
+        let out = ws.recv_text().await;
+        assert!(out.contains("exec:whoami"));
+
+        ws.send_text(r#"{"type":"resize","cols":120,"rows":40}"#)
+            .await;
+        ws.send_text(r#"{"type":"disconnect"}"#).await;
+        let disc = ws.recv_text().await;
+        assert!(disc.contains("disconnected"));
+    }
 }

@@ -7615,4 +7615,396 @@ spec:
         assert_eq!(clean_candidate_ssh_host("-oProxyCommand=evil"), None);
         assert_eq!(clean_candidate_ssh_host("192.168.1.0/24"), None);
     }
+
+    #[tokio::test]
+    async fn healthz_metrics_providers_and_tenants_crud() {
+        let (_tmp, state, _workdir) = setup_test_state().await;
+
+        assert_eq!(healthz().await, "OK");
+        let metrics_resp = metrics(State(state.clone())).await;
+        assert_eq!(metrics_resp.status(), StatusCode::OK);
+
+        // Providers list & toggle
+        let Json(providers) = list_providers(test_auth(), State(state.clone()))
+            .await
+            .expect("list_providers");
+        assert!(!providers.providers.is_empty());
+        let first_id = providers.providers[0].id.clone();
+        let target_enabled = !providers.providers[0].enabled;
+        let Json(toggled) = toggle_provider(
+            test_auth(),
+            State(state.clone()),
+            AxumPath(first_id.clone()),
+            Json(ToggleProviderRequest {
+                enabled: target_enabled,
+            }),
+        )
+        .await
+        .expect("toggle_provider");
+        assert_eq!(toggled.provider.enabled, target_enabled);
+
+        // Create tenant, list tenants, reject deleting "default", delete created tenant
+        let (status, Json(created)) = create_tenant(
+            test_auth(),
+            State(state.clone()),
+            Json(CreateTenantRequest {
+                id: "acme".to_string(),
+            }),
+        )
+        .await
+        .expect("create_tenant");
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(created.tenant.id, "acme");
+
+        let _ = merge_proposal(
+            test_auth(),
+            State(state.clone()),
+            AxumPath(created.proposal.id.clone()),
+        )
+        .await
+        .expect("merge create_tenant proposal");
+
+        let Json(tenants) = list_tenants(test_auth(), State(state.clone()))
+            .await
+            .expect("list_tenants");
+        assert!(tenants.tenants.iter().any(|t| t.id == "acme"));
+
+        let default_del = delete_tenant(
+            test_auth(),
+            State(state.clone()),
+            AxumPath("default".to_string()),
+        )
+        .await
+        .expect_err("cannot delete default tenant");
+        assert!(matches!(default_del, ServerError::BadRequest(_)));
+
+        let Json(deleted) = delete_tenant(
+            test_auth(),
+            State(state.clone()),
+            AxumPath("acme".to_string()),
+        )
+        .await
+        .expect("delete_tenant");
+        assert_eq!(deleted.id, "acme");
+    }
+
+    #[tokio::test]
+    async fn proposal_reject_reopen_and_profile_git_credentials() {
+        let (_tmp, state, _workdir) = setup_test_state().await;
+
+        // Upgrade creates a PR; test list_proposals, reject_proposal, reopen_proposal
+        let req = UpgradeManagementAddonRequest {
+            version: Some("4.55.0".to_string()),
+            values: json!({ "s3": { "enableAuth": true } }),
+        };
+        let (status, Json(upgrade)) = upgrade_management_addon(
+            test_auth(),
+            State(state.clone()),
+            AxumPath("s3-state-backend".to_string()),
+            Json(req),
+        )
+        .await
+        .expect("upgrade_management_addon");
+        assert_eq!(status, StatusCode::CREATED);
+        let pr_id = upgrade.proposal.id.clone();
+
+        let Json(open_list) = list_proposals(
+            test_auth(),
+            State(state.clone()),
+            axum::extract::Query(ListProposalsQuery {
+                status: Some("open".to_string()),
+                tenant: None,
+            }),
+        )
+        .await
+        .expect("list_proposals");
+        assert!(open_list.proposals.iter().any(|p| p.id == pr_id));
+
+        let Json(rejected) =
+            reject_proposal(test_auth(), State(state.clone()), AxumPath(pr_id.clone()))
+                .await
+                .expect("reject_proposal");
+        assert_eq!(rejected.proposal.state, PullRequestState::Closed);
+
+        let Json(reopened) =
+            reopen_proposal(test_auth(), State(state.clone()), AxumPath(pr_id.clone()))
+                .await
+                .expect("reopen_proposal");
+        assert_eq!(reopened.proposal.state, PullRequestState::Open);
+
+        // Profile Git credentials
+        let Json(creds_resp) = put_git_credentials(
+            test_auth(),
+            State(state.clone()),
+            Json(UpdateGitCredentialsRequest {
+                username: Some("git".to_string()),
+                ssh_private_key: Some(
+                    "-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n-----END OPENSSH PRIVATE KEY-----"
+                        .to_string(),
+                ),
+                personal_access_token: Some("ghp_test123".to_string()),
+            }),
+        )
+        .await
+        .expect("put_git_credentials");
+        assert!(creds_resp.stored);
+        assert!(creds_resp.has_ssh_key);
+        assert!(creds_resp.has_personal_access_token);
+    }
+
+    #[tokio::test]
+    async fn stack_and_release_diagnostics_actions_and_delete_guards() {
+        let (_tmp, state, _workdir) = setup_test_state().await;
+
+        // Diagnostics return fallback empty diagnostics without live k8s cluster
+        let Json(s_diag) = get_stack_diagnostics(
+            test_auth(),
+            State(state.clone()),
+            AxumPath(("tenant-default".to_string(), "vm-1".to_string())),
+        )
+        .await
+        .expect("get_stack_diagnostics fallback");
+        assert_eq!(s_diag.name, "vm-1");
+        assert!(
+            restart_stack_workspace(
+                test_auth(),
+                State(state.clone()),
+                AxumPath(("tenant-default".to_string(), "vm-1".to_string())),
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            reconcile_stack(
+                test_auth(),
+                State(state.clone()),
+                AxumPath(("tenant-default".to_string(), "vm-1".to_string())),
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            force_delete_stack(
+                test_auth(),
+                State(state.clone()),
+                AxumPath(("tenant-default".to_string(), "vm-1".to_string())),
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            unlock_stack(
+                test_auth(),
+                State(state.clone()),
+                AxumPath(("tenant-default".to_string(), "vm-1".to_string())),
+            )
+            .await
+            .is_err()
+        );
+        let Json(r_diag) = get_release_diagnostics(
+            test_auth(),
+            State(state.clone()),
+            AxumPath(("tenant-default".to_string(), "podinfo".to_string())),
+        )
+        .await
+        .expect("get_release_diagnostics fallback");
+        assert_eq!(r_diag.name, "podinfo");
+        assert!(
+            reconcile_release(
+                test_auth(),
+                State(state.clone()),
+                AxumPath(("tenant-default".to_string(), "podinfo".to_string())),
+            )
+            .await
+            .is_err()
+        );
+
+        // Protected stack cannot be deleted
+        let del_protected = delete_stack(
+            test_auth(),
+            State(state.clone()),
+            AxumPath((
+                "flux-system".to_string(),
+                "management-cluster-core".to_string(),
+            )),
+        )
+        .await
+        .expect_err("cannot delete management-cluster-core");
+        assert!(matches!(
+            del_protected,
+            ServerError::BadRequest(_) | ServerError::Forbidden(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn update_catalog_item_config_queries_and_delete_release() {
+        let (_tmp, state, workdir) = setup_test_state().await;
+
+        // Seed an app catalog item, a tenant app release, and a tenant infra stack on main
+        tokio::fs::create_dir_all(workdir.join("catalog/apps/podinfo"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            workdir.join("catalog/apps/podinfo/catalog.yaml"),
+            r#"apiVersion: keel.io/v1alpha1
+kind: CatalogApplication
+metadata:
+  id: podinfo
+  name: Podinfo
+  description: Demo app
+  category: web
+  runtime: helm
+spec:
+  upstream:
+    repoURL: https://stefanprodan.github.io/podinfo
+    chart: podinfo
+    version: "6.5.0"
+  schema:
+    type: object
+    properties:
+      replicaCount:
+        type: integer
+"#,
+        )
+        .await
+        .unwrap();
+
+        tokio::fs::create_dir_all(workdir.join("tenants/default/apps/podinfo"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            workdir.join("tenants/default/apps/podinfo/values.yaml"),
+            "replicaCount: 2\n",
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            workdir.join("tenants/default/apps/podinfo/helmrelease.yaml"),
+            r#"apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: podinfo
+  namespace: tenant-default
+  labels:
+    keel.io/catalog-id: podinfo
+spec:
+  interval: 5m
+  chart:
+    spec:
+      chart: podinfo
+      version: "6.5.0"
+  values:
+    replicaCount: 2
+"#,
+        )
+        .await
+        .unwrap();
+
+        tokio::fs::create_dir_all(workdir.join("tenants/default/infra/vm-1"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            workdir.join("tenants/default/infra/vm-1/stack.yaml"),
+            r#"apiVersion: pulumi.com/v1
+kind: Stack
+metadata:
+  name: vm-1
+  namespace: tenant-default
+  labels:
+    keel.io/catalog-id: proxmox-vm
+    keel.io/provider: proxmox
+spec:
+  stack: organization/proxmox-vm/default-vm-1
+  backend: s3://keel-state
+  config:
+    vmName: vm-1
+"#,
+        )
+        .await
+        .unwrap();
+
+        let git = GitRunner::new();
+        git.add(&workdir, ["."]).await.unwrap();
+        git.commit(
+            &workdir,
+            "feat: seed podinfo and vm-1",
+            &CommitAuthor::new("Keel Test", "test@keel.local"),
+        )
+        .await
+        .unwrap();
+        git.push(&workdir, "origin", "HEAD:refs/heads/main")
+            .await
+            .unwrap();
+
+        // 1. Update catalog item creates a PR
+        let (status, Json(updated)) = update_catalog_item(
+            test_auth(),
+            State(state.clone()),
+            AxumPath(("app".to_string(), "podinfo".to_string())),
+            Json(UpdateCatalogItemRequest {
+                name: "Podinfo Updated".to_string(),
+                category: "web".to_string(),
+                description: Some("Updated description".to_string()),
+                runtime: Some(AppRuntime::Helm),
+                repo_url: Some("https://stefanprodan.github.io/podinfo".to_string()),
+                chart: Some("podinfo".to_string()),
+                version: Some("6.6.0".to_string()),
+                path: None,
+                flagger_supported: Some(true),
+                provider: None,
+                pulumi_runtime: None,
+                entrypoint: None,
+                protect_by_default: None,
+                pulumi_yaml: None,
+                manifests_yaml: None,
+                default_engine: None,
+                items: None,
+                schema: None,
+            }),
+        )
+        .await
+        .expect("update_catalog_item");
+        assert_eq!(status, StatusCode::OK);
+        assert!(updated.proposal.title.contains("podinfo"));
+
+        // 2. get_release_config & get_stack_config
+        let Json(rel_cfg) = get_release_config(
+            test_auth(),
+            State(state.clone()),
+            AxumPath(("tenant-default".to_string(), "podinfo".to_string())),
+        )
+        .await
+        .expect("get_release_config");
+        assert_eq!(rel_cfg.catalog_id, "podinfo");
+        assert_eq!(rel_cfg.values["replicaCount"], 2);
+
+        let Json(stack_cfg) = get_stack_config(
+            test_auth(),
+            State(state.clone()),
+            AxumPath(("tenant-default".to_string(), "vm-1".to_string())),
+        )
+        .await
+        .expect("get_stack_config");
+        assert_eq!(stack_cfg.catalog_id, "vm-1");
+
+        // 3. delete_release on non-protected tenant release creates a PR
+        let Json(del_rel) = delete_release(
+            test_auth(),
+            State(state.clone()),
+            AxumPath(("tenant-default".to_string(), "podinfo".to_string())),
+        )
+        .await
+        .expect("delete_release");
+        assert!(!del_rel.proposal.id.is_empty());
+
+        // 4. events_stream SSE endpoint
+        let sse_resp = events_stream(
+            test_auth(),
+            State(state.clone()),
+            axum::extract::Query(EventsStreamQuery { namespace: None }),
+        )
+        .await
+        .into_response();
+        assert_eq!(sse_resp.status(), StatusCode::OK);
+    }
 }

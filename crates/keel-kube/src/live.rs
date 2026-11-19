@@ -1876,4 +1876,546 @@ mod tests {
         let meta = extract_resource_metadata(&obj, "pulumi.com/v1", "Stack");
         assert!(meta.deletion_timestamp.is_some());
     }
+
+    struct StubLiveStatus;
+
+    #[async_trait]
+    impl LiveStatusSource for StubLiveStatus {
+        async fn stack_statuses(&self) -> HashMap<(String, String), LiveResourceStatus> {
+            HashMap::from([(
+                ("tenant-a".to_string(), "s1".to_string()),
+                LiveResourceStatus::Ready,
+            )])
+        }
+
+        async fn release_statuses(&self) -> HashMap<(String, String), LiveResourceStatus> {
+            HashMap::from([(
+                ("tenant-a".to_string(), "r1".to_string()),
+                LiveResourceStatus::Synced,
+            )])
+        }
+    }
+
+    #[tokio::test]
+    async fn live_status_source_default_methods_cover_fallbacks() {
+        let stub = StubLiveStatus;
+        let s_details = stub.stack_status_details().await;
+        assert_eq!(
+            s_details
+                .get(&("tenant-a".to_string(), "s1".to_string()))
+                .unwrap()
+                .status,
+            LiveResourceStatus::Ready
+        );
+        let r_details = stub.release_status_details().await;
+        assert_eq!(
+            r_details
+                .get(&("tenant-a".to_string(), "r1".to_string()))
+                .unwrap()
+                .status,
+            LiveResourceStatus::Synced
+        );
+        assert!(stub.canary_statuses().await.is_empty());
+        assert!(stub.stack_diagnostics("tenant-a", "s1").await.is_none());
+        assert!(stub.release_diagnostics("tenant-a", "r1").await.is_none());
+        assert!(
+            stub.restart_stack_workspace("tenant-a", "s1")
+                .await
+                .is_err()
+        );
+        assert!(stub.reconcile_stack("tenant-a", "s1").await.is_err());
+        assert!(stub.force_delete_stack("tenant-a", "s1").await.is_err());
+        assert!(stub.unlock_stack("tenant-a", "s1").await.is_err());
+        assert!(stub.reconcile_release("tenant-a", "r1").await.is_err());
+        assert!(stub.stack_outputs("tenant-a", "s1").await.is_empty());
+    }
+
+    async fn spawn_mock_k8s_server<F>(handler: F) -> String
+    where
+        F: Fn(&str, &str) -> (u16, String) + Send + Sync + 'static,
+    {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handler = std::sync::Arc::new(handler);
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let handler = std::sync::Arc::clone(&handler);
+                tokio::spawn(async move {
+                    let (read_half, mut write_half) = stream.split();
+                    let mut reader = BufReader::new(read_half);
+                    loop {
+                        let mut request_line = String::new();
+                        match reader.read_line(&mut request_line).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => {}
+                        }
+                        let parts: Vec<&str> = request_line.split_whitespace().collect();
+                        if parts.len() < 2 {
+                            break;
+                        }
+                        let method = parts[0].to_string();
+                        let path = parts[1].to_string();
+
+                        let mut content_length: usize = 0;
+                        loop {
+                            let mut hdr = String::new();
+                            if reader.read_line(&mut hdr).await.unwrap_or(0) == 0 {
+                                break;
+                            }
+                            let trimmed = hdr.trim();
+                            if trimmed.is_empty() {
+                                break;
+                            }
+                            if let Some((k, v)) = trimmed.split_once(':')
+                                && k.eq_ignore_ascii_case("content-length")
+                            {
+                                content_length = v.trim().parse().unwrap_or(0);
+                            }
+                        }
+                        if content_length > 0 {
+                            let mut buf = vec![0u8; content_length];
+                            let _ =
+                                tokio::io::AsyncReadExt::read_exact(&mut reader, &mut buf).await;
+                        }
+
+                        let (status_code, body) = handler(&method, &path);
+                        let reason = match status_code {
+                            200 => "OK",
+                            404 => "Not Found",
+                            _ => "Internal Server Error",
+                        };
+                        let resp = format!(
+                            "HTTP/1.1 {status_code} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{body}",
+                            body.len()
+                        );
+                        if write_half.write_all(resp.as_bytes()).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+
+        format!("http://127.0.0.1:{}", addr.port())
+    }
+
+    fn mock_k8s_client(base_url: &str) -> Client {
+        let cfg = kube::Config::new(base_url.parse().unwrap());
+        Client::try_from(cfg).unwrap()
+    }
+
+    #[tokio::test]
+    async fn kube_cluster_status_reader_queries_stacks_releases_canaries_secrets_and_actions() {
+        let url = spawn_mock_k8s_server(|method, path| {
+            let path_only = path.split('?').next().unwrap_or(path);
+            match (method, path_only) {
+                ("GET", "/api/v1/namespaces/tenant-a/secrets/my-stack-outputs") => (
+                    200,
+                    json!({
+                        "apiVersion": "v1",
+                        "kind": "Secret",
+                        "metadata": { "name": "my-stack-outputs", "namespace": "tenant-a" },
+                        "data": {
+                            "endpoint": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"10.0.0.5")
+                        }
+                    })
+                    .to_string(),
+                ),
+                ("GET", "/apis/pulumi.com/v1/stacks") => (
+                    200,
+                    json!({
+                        "apiVersion": "pulumi.com/v1",
+                        "kind": "StackList",
+                        "metadata": {},
+                        "items": [
+                            {
+                                "apiVersion": "pulumi.com/v1",
+                                "kind": "Stack",
+                                "metadata": {
+                                    "name": "my-stack",
+                                    "namespace": "tenant-a",
+                                    "creationTimestamp": "2026-11-19T00:00:00Z"
+                                },
+                                "spec": { "backend": "s3://keel-state" },
+                                "status": {
+                                    "conditions": [{ "type": "Ready", "status": "True", "reason": "Succeeded" }],
+                                    "lastUpdate": { "lastResyncTime": "2026-11-19T01:00:00Z", "resourceChanges": { "create": 3 } }
+                                }
+                            },
+                            {
+                                "apiVersion": "pulumi.com/v1",
+                                "kind": "Stack",
+                                "metadata": {
+                                    "name": "deleting-stack",
+                                    "namespace": "tenant-a",
+                                    "deletionTimestamp": "2026-11-19T02:00:00Z"
+                                }
+                            }
+                        ]
+                    })
+                    .to_string(),
+                ),
+                ("GET", "/apis/kustomize.toolkit.fluxcd.io/v1/kustomizations") => (
+                    200,
+                    json!({
+                        "apiVersion": "kustomize.toolkit.fluxcd.io/v1",
+                        "kind": "KustomizationList",
+                        "metadata": {},
+                        "items": [
+                            {
+                                "apiVersion": "kustomize.toolkit.fluxcd.io/v1",
+                                "kind": "Kustomization",
+                                "metadata": { "name": "management-cluster-core", "namespace": "flux-system" },
+                                "status": {
+                                    "conditions": [{ "type": "Ready", "status": "True", "reason": "ReconciliationSucceeded" }]
+                                }
+                            },
+                            {
+                                "apiVersion": "kustomize.toolkit.fluxcd.io/v1",
+                                "kind": "Kustomization",
+                                "metadata": { "name": "stack-wrapper", "namespace": "tenant-a" },
+                                "spec": {
+                                    "healthChecks": [{ "kind": "Stack", "name": "my-stack" }]
+                                }
+                            }
+                        ]
+                    })
+                    .to_string(),
+                ),
+                ("GET", "/apis/helm.toolkit.fluxcd.io/v2/helmreleases") => (
+                    200,
+                    json!({
+                        "apiVersion": "helm.toolkit.fluxcd.io/v2",
+                        "kind": "HelmReleaseList",
+                        "metadata": {},
+                        "items": [
+                            {
+                                "apiVersion": "helm.toolkit.fluxcd.io/v2",
+                                "kind": "HelmRelease",
+                                "metadata": { "name": "podinfo", "namespace": "tenant-a" },
+                                "status": {
+                                    "conditions": [{ "type": "Ready", "status": "True", "reason": "InstallSucceeded" }]
+                                }
+                            }
+                        ]
+                    })
+                    .to_string(),
+                ),
+                ("GET", "/apis/flagger.app/v1beta1/canaries") => (
+                    200,
+                    json!({
+                        "apiVersion": "flagger.app/v1beta1",
+                        "kind": "CanaryList",
+                        "metadata": {},
+                        "items": [
+                            {
+                                "apiVersion": "flagger.app/v1beta1",
+                                "kind": "Canary",
+                                "metadata": { "name": "podinfo", "namespace": "tenant-a" },
+                                "spec": { "targetRef": { "name": "podinfo" } },
+                                "status": {
+                                    "phase": "Succeeded",
+                                    "canaryWeight": 0,
+                                    "lastTransitionTime": "2026-11-19T01:00:00Z"
+                                }
+                            }
+                        ]
+                    })
+                    .to_string(),
+                ),
+                ("GET", "/apis/apps/v1/deployments") => (
+                    200,
+                    json!({
+                        "apiVersion": "apps/v1",
+                        "kind": "DeploymentList",
+                        "metadata": {},
+                        "items": [
+                            {
+                                "apiVersion": "apps/v1",
+                                "kind": "Deployment",
+                                "metadata": {
+                                    "name": "podinfo-primary",
+                                    "namespace": "tenant-a",
+                                    "labels": { "app.kubernetes.io/version": "6.5.0" }
+                                }
+                            }
+                        ]
+                    })
+                    .to_string(),
+                ),
+                ("GET", "/api/v1/namespaces/keel-system/services") => (
+                    200,
+                    json!({
+                        "apiVersion": "v1",
+                        "kind": "ServiceList",
+                        "metadata": {},
+                        "items": [{ "metadata": { "name": "prometheus" } }]
+                    })
+                    .to_string(),
+                ),
+                ("GET", "/api/v1/namespaces/keel-system/services/http:prometheus:80/proxy/api/v1/query") => (
+                    200,
+                    json!({
+                        "status": "success",
+                        "data": {
+                            "resultType": "vector",
+                            "result": [{
+                                "metric": { "keel_route": "tenant-a/podinfo" },
+                                "value": [1700000000, "1.25"]
+                            }]
+                        }
+                    })
+                    .to_string(),
+                ),
+                ("GET", "/api/v1/secrets") => (
+                    200,
+                    json!({
+                        "apiVersion": "v1",
+                        "kind": "SecretList",
+                        "metadata": {},
+                        "items": []
+                    })
+                    .to_string(),
+                ),
+                ("GET", "/apis/pulumi.com/v1/namespaces/tenant-a/stacks/my-stack") => (
+                    200,
+                    json!({
+                        "apiVersion": "pulumi.com/v1",
+                        "kind": "Stack",
+                        "metadata": { "name": "my-stack", "namespace": "tenant-a" },
+                        "spec": { "backend": "s3://keel-state" },
+                        "status": {
+                            "conditions": [{ "type": "Ready", "status": "True", "reason": "Succeeded" }],
+                            "lastUpdate": { "state": "succeeded", "resourceChanges": { "create": 2 } }
+                        }
+                    })
+                    .to_string(),
+                ),
+                ("GET", "/api/v1/namespaces/flux-system/services/keel-docker-proxy") => (
+                    200,
+                    json!({ "apiVersion": "v1", "kind": "Service", "metadata": { "name": "keel-docker-proxy" } }).to_string(),
+                ),
+                ("GET", "/api/v1/namespaces/tenant-a/pods/my-stack-workspace-0") => (
+                    200,
+                    json!({
+                        "apiVersion": "v1",
+                        "kind": "Pod",
+                        "metadata": { "name": "my-stack-workspace-0", "namespace": "tenant-a" },
+                        "status": { "phase": "Running" }
+                    })
+                    .to_string(),
+                ),
+                ("GET", "/api/v1/namespaces/tenant-a/pods/my-stack-workspace-0/log") => (
+                    200,
+                    "Updating stack...\nSucceeded\n".to_string(),
+                ),
+                ("GET", "/api/v1/namespaces/tenant-a/events") => (
+                    200,
+                    json!({
+                        "apiVersion": "v1",
+                        "kind": "EventList",
+                        "metadata": {},
+                        "items": [
+                            {
+                                "metadata": { "name": "ev-1", "namespace": "tenant-a" },
+                                "involvedObject": { "name": "my-stack" },
+                                "type": "Normal",
+                                "reason": "Updated",
+                                "message": "Stack updated",
+                                "count": 1
+                            },
+                            {
+                                "metadata": { "name": "ev-2", "namespace": "tenant-a" },
+                                "involvedObject": { "name": "podinfo" },
+                                "type": "Normal",
+                                "reason": "Synced",
+                                "message": "HelmRelease synced",
+                                "count": 1
+                            }
+                        ]
+                    })
+                    .to_string(),
+                ),
+                ("GET", "/apis/helm.toolkit.fluxcd.io/v2/namespaces/tenant-a/helmreleases/podinfo") => (
+                    200,
+                    json!({
+                        "apiVersion": "helm.toolkit.fluxcd.io/v2",
+                        "kind": "HelmRelease",
+                        "metadata": { "name": "podinfo", "namespace": "tenant-a" },
+                        "status": { "conditions": [{ "type": "Ready", "status": "True", "reason": "InstallSucceeded" }] }
+                    })
+                    .to_string(),
+                ),
+                ("GET", "/api/v1/namespaces/tenant-a/pods") => (
+                    200,
+                    json!({
+                        "apiVersion": "v1",
+                        "kind": "PodList",
+                        "metadata": {},
+                        "items": [{
+                            "apiVersion": "v1",
+                            "kind": "Pod",
+                            "metadata": {
+                                "name": "podinfo-abc",
+                                "namespace": "tenant-a",
+                                "labels": { "app.kubernetes.io/instance": "podinfo" }
+                            },
+                            "status": { "phase": "Running" }
+                        }]
+                    })
+                    .to_string(),
+                ),
+                ("GET", "/api/v1/namespaces/tenant-a/pods/podinfo-abc/log") => (
+                    200,
+                    "podinfo listening on 9898\n".to_string(),
+                ),
+                ("PATCH", "/apis/apps/v1/namespaces/tenant-a/statefulsets/my-stack-workspace") => (
+                    200,
+                    json!({
+                        "apiVersion": "apps/v1",
+                        "kind": "StatefulSet",
+                        "metadata": { "name": "my-stack-workspace", "namespace": "tenant-a" }
+                    })
+                    .to_string(),
+                ),
+                ("PATCH", "/apis/pulumi.com/v1/namespaces/tenant-a/stacks/my-stack")
+                | ("DELETE", "/apis/pulumi.com/v1/namespaces/tenant-a/stacks/my-stack")
+                | ("PATCH", "/apis/kustomize.toolkit.fluxcd.io/v1/namespaces/tenant-a/kustomizations/ks-only") => (
+                    200,
+                    json!({ "apiVersion": "v1", "kind": "Status", "status": "Success" }).to_string(),
+                ),
+                ("PATCH", "/apis/helm.toolkit.fluxcd.io/v2/namespaces/tenant-a/helmreleases/podinfo") => (
+                    200,
+                    json!({ "apiVersion": "helm.toolkit.fluxcd.io/v2", "kind": "HelmRelease" }).to_string(),
+                ),
+                ("PATCH", "/apis/helm.toolkit.fluxcd.io/v2/namespaces/tenant-a/helmreleases/ks-only") => (
+                    404,
+                    json!({ "kind": "Status", "status": "Failure", "code": 404, "message": "not found", "reason": "NotFound" }).to_string(),
+                ),
+                _ => (
+                    404,
+                    json!({ "kind": "Status", "status": "Failure", "code": 404, "message": "not found", "reason": "NotFound" }).to_string(),
+                ),
+            }
+        })
+        .await;
+
+        let reader = KubeClusterStatusReader::from_client(mock_k8s_client(&url));
+        let _ = reader.client();
+
+        assert_eq!(
+            reader
+                .read_secret_key("tenant-a", "my-stack-outputs", "endpoint")
+                .await
+                .as_deref(),
+            Some("10.0.0.5")
+        );
+        assert_eq!(
+            reader
+                .stack_outputs("tenant-a", "my-stack")
+                .await
+                .get("endpoint")
+                .map(String::as_str),
+            Some("10.0.0.5")
+        );
+        assert_eq!(
+            reader
+                .read_stack_backend("tenant-a", "my-stack")
+                .await
+                .as_deref(),
+            Some("s3://keel-state")
+        );
+        assert!(reader.has_docker_proxy_service().await);
+
+        let stacks = reader.stack_statuses().await;
+        assert_eq!(
+            stacks.get(&("tenant-a".to_string(), "my-stack".to_string())),
+            Some(&LiveResourceStatus::Synced)
+        );
+        assert_eq!(
+            stacks.get(&("tenant-a".to_string(), "deleting-stack".to_string())),
+            Some(&LiveResourceStatus::Deleting)
+        );
+        assert_eq!(
+            stacks.get(&(
+                "flux-system".to_string(),
+                "management-cluster-core".to_string()
+            )),
+            Some(&LiveResourceStatus::Synced)
+        );
+
+        let stack_details = reader.stack_status_details().await;
+        assert!(stack_details.contains_key(&("tenant-a".to_string(), "my-stack".to_string())));
+
+        let releases = reader.release_statuses().await;
+        assert_eq!(
+            releases.get(&("tenant-a".to_string(), "podinfo".to_string())),
+            Some(&LiveResourceStatus::Ready)
+        );
+        let release_details = reader.release_status_details().await;
+        assert!(release_details.contains_key(&("tenant-a".to_string(), "podinfo".to_string())));
+
+        let canaries = reader.canary_statuses().await;
+        let canary = canaries
+            .get(&("tenant-a".to_string(), "podinfo".to_string()))
+            .unwrap();
+        assert_eq!(canary.status, LiveResourceStatus::Ready);
+        assert_eq!(canary.primary_version.as_deref(), Some("6.5.0"));
+        assert_eq!(canary.error_rate, Some(1.25));
+
+        let stack_diag = reader
+            .stack_diagnostics("tenant-a", "my-stack")
+            .await
+            .unwrap();
+        assert_eq!(stack_diag.workspace_phase.as_deref(), Some("Running"));
+        assert_eq!(stack_diag.events.len(), 1);
+        assert_eq!(stack_diag.logs, vec!["Updating stack...", "Succeeded"]);
+
+        let rel_diag = reader
+            .release_diagnostics("tenant-a", "podinfo")
+            .await
+            .unwrap();
+        assert_eq!(rel_diag.workspace_pod.as_deref(), Some("podinfo-abc"));
+        assert_eq!(rel_diag.events.len(), 1);
+
+        assert!(
+            reader
+                .restart_stack_workspace("tenant-a", "my-stack")
+                .await
+                .is_ok()
+        );
+        assert!(reader.reconcile_stack("tenant-a", "my-stack").await.is_ok());
+        assert!(
+            reader
+                .reconcile_release("tenant-a", "podinfo")
+                .await
+                .is_ok()
+        );
+        assert!(
+            reader
+                .reconcile_release("tenant-a", "ks-only")
+                .await
+                .is_ok()
+        );
+
+        // Protected stack cannot be force-deleted
+        assert!(
+            reader
+                .force_delete_stack("flux-system", "management-cluster-core")
+                .await
+                .is_err()
+        );
+        let force_msg = reader
+            .force_delete_stack("tenant-a", "my-stack")
+            .await
+            .unwrap();
+        assert!(force_msg.contains("Cleared finalizers and force-deleted Stack tenant-a/my-stack"));
+    }
 }

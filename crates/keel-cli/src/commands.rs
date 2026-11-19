@@ -5947,4 +5947,170 @@ spec:
                 .is_none()
         );
     }
+
+    #[tokio::test]
+    async fn cli_context_token_persistence_and_url_and_values_helpers() {
+        let tmp = TempTestDir::new("cli-helpers");
+        let creds_path = tmp.path().join("nested/credentials.json");
+        let ctx = CliContext::with_credentials_path(&creds_path);
+
+        assert_eq!(
+            normalize_server_url("https://keel.local:8080/").unwrap(),
+            "https://keel.local:8080"
+        );
+        assert!(normalize_server_url("ftp://keel.local").is_err());
+        assert!(normalize_server_url("").is_err());
+
+        ctx.save_session_token("https://keel.local:8080/", "tok-secret-123")
+            .unwrap();
+        assert_eq!(
+            ctx.load_session_token("https://keel.local:8080").as_deref(),
+            Some("tok-secret-123")
+        );
+        assert_eq!(ctx.load_session_token("https://other.local"), None);
+
+        let override_ctx =
+            CliContext::with_credentials_path(&creds_path).with_session_token("mem-tok");
+        assert_eq!(
+            override_ctx
+                .load_session_token("https://other.local")
+                .as_deref(),
+            Some("mem-tok")
+        );
+
+        assert_eq!(
+            default_bare_repo_for_workdir(Path::new("/tmp/keel-gitops")),
+            PathBuf::from("/tmp/keel-gitops.git")
+        );
+        assert!(is_relative_local_remote("origin-dir"));
+        assert!(!is_relative_local_remote("/abs/path"));
+        assert!(!is_relative_local_remote("https://github.com/org/repo"));
+
+        // load_values_file cases
+        let empty_file = tmp.path().join("empty.yaml");
+        tokio::fs::write(&empty_file, "   \n").await.unwrap();
+        assert_eq!(load_values_file(&empty_file).await.unwrap(), json!({}));
+
+        let valid_file = tmp.path().join("vals.yaml");
+        tokio::fs::write(&valid_file, "replicaCount: 2\n")
+            .await
+            .unwrap();
+        assert_eq!(
+            load_values_file(&valid_file).await.unwrap()["replicaCount"],
+            2
+        );
+
+        assert!(
+            load_values_file(&tmp.path().join("missing.yaml"))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_and_infra_force_delete_and_unlock_against_mock_server() {
+        use axum::Router;
+        use axum::routing::post;
+        use clap::Parser;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_url = format!("http://127.0.0.1:{}", addr.port());
+
+        let app = Router::new()
+            .route(
+                "/api/v1/stacks/tenant-default/my-vm/force-delete",
+                post(|| async {
+                    axum::Json(json!({ "message": "Force-deleted tenant-default/my-vm" }))
+                }),
+            )
+            .route(
+                "/api/v1/stacks/tenant-default/my-vm/unlock",
+                post(|| async {
+                    axum::Json(json!({ "message": "Unlocked tenant-default/my-vm" }))
+                }),
+            )
+            .route(
+                "/api/v1/stacks",
+                axum::routing::get(|| async {
+                    axum::Json(json!({
+                        "stacks": [{
+                            "name": "my-vm",
+                            "tenant": "default",
+                            "namespace": "tenant-default",
+                            "provider": "proxmox",
+                            "stack": "org/proj/my-vm",
+                            "preview": false,
+                            "protect": false,
+                            "status": "Ready",
+                            "stackType": "vm"
+                        }]
+                    }))
+                }),
+            )
+            .route(
+                "/api/v1/proposals/42/preview",
+                axum::routing::get(|| async {
+                    axum::Json(json!({
+                        "prId": "42",
+                        "url": "http://local/pr/42",
+                        "state": "open",
+                        "sourceBranch": "keel/test",
+                        "targetBranch": "main",
+                        "proposal": {
+                            "id": "42",
+                            "title": "feat: test",
+                            "branch": "keel/test",
+                            "base": "main",
+                            "state": "open",
+                            "url": "http://local/pr/42",
+                            "author": "keel"
+                        },
+                        "report": PreviewReport::default()
+                    }))
+                }),
+            );
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let tmp = TempTestDir::new("cli-dispatch");
+        let ctx = CliContext::with_credentials_path(tmp.path().join("creds.json"))
+            .with_session_token("test-bearer");
+
+        let cli = Cli::try_parse_from([
+            "keel",
+            "infra",
+            "force-delete",
+            "my-vm",
+            "--server",
+            &server_url,
+        ])
+        .unwrap();
+        let out = dispatch(&cli, &ctx).await.unwrap();
+        assert!(out.contains("Force-deleted tenant-default/my-vm"));
+
+        let cli =
+            Cli::try_parse_from(["keel", "infra", "unlock", "my-vm", "--server", &server_url])
+                .unwrap();
+        let out = dispatch(&cli, &ctx).await.unwrap();
+        assert!(out.contains("Unlocked tenant-default/my-vm"));
+
+        let cli = Cli::try_parse_from(["keel", "infra", "list", "--server", &server_url]).unwrap();
+        let out = dispatch(&cli, &ctx).await.unwrap();
+        assert!(out.contains("No infrastructure stacks found") || out.contains("NAME"));
+
+        let cli = Cli::try_parse_from([
+            "keel",
+            "preview",
+            "status",
+            "--pr",
+            "42",
+            "--server",
+            &server_url,
+        ])
+        .unwrap();
+        let out = dispatch(&cli, &ctx).await.unwrap();
+        assert!(out.contains("PR #42") || out.contains("my-vm"));
+    }
 }

@@ -924,3 +924,542 @@ fn url_encode_component(input: &str) -> String {
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::Router;
+    use axum::body::Body;
+    use axum::http::Request;
+    use axum::middleware;
+    use axum::routing::{get, post};
+    use jsonwebtoken::{EncodingKey, Header, encode};
+    use keel_core::OidcConfig;
+    use keel_git::{GitRunner, LocalGitProvider};
+    use keel_kube::{InMemorySecretStore, TelemetryMux};
+    use serde_json::json;
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    const TEST_ED25519_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIEHTjl7kWr8Ms/aazqxV5Dg4GBB6U7dw6rkd1ozfHJpc\n-----END PRIVATE KEY-----\n";
+    const TEST_ED25519_X: &str = "MzdB74SujNsw41A0r_Z-PuCEw_OqK4KToymtSTaOUA8";
+
+    async fn make_auth_state_async(oidc: Option<OidcConfig>) -> (tempfile::TempDir, AppState) {
+        let tmp = tempfile::tempdir().unwrap();
+        let bare = tmp.path().join("bare.git");
+        let workdir = tmp.path().join("work");
+        tokio::fs::create_dir_all(&bare).await.unwrap();
+        tokio::fs::create_dir_all(&workdir).await.unwrap();
+        let state = AppState::new(
+            Arc::new(LocalGitProvider::new(&bare)),
+            Arc::new(InMemorySecretStore::new()),
+            TelemetryMux::default(),
+            GitRunner::new(),
+            &workdir,
+            bare.to_string_lossy().to_string(),
+            AuthPhase::OidcActive,
+        );
+        if let Some(cfg) = oidc {
+            *state.oidc_config.write().await = Some(cfg);
+        }
+        (tmp, state)
+    }
+
+    #[test]
+    fn auth_session_rbac_and_token_roundtrip() {
+        let admin = AuthSession {
+            claims: SessionClaims {
+                sub: "alice".to_string(),
+                email: Some("alice@keel.local".to_string()),
+                name: Some("Alice".to_string()),
+                groups: vec!["keel-admins".to_string()],
+                auth_phase: AuthPhase::OidcActive,
+                exp: Utc::now().timestamp() + 3600,
+            },
+        };
+        assert!(admin.is_admin());
+        assert!(admin.require_admin().is_ok());
+        assert!(admin.is_tenant_admin("acme"));
+        assert!(admin.require_tenant_admin("acme").is_ok());
+        assert!(admin.require_tenant_access("acme").is_ok());
+
+        let break_glass = AuthSession {
+            claims: SessionClaims {
+                sub: "breakglass".to_string(),
+                email: None,
+                name: None,
+                groups: vec![],
+                auth_phase: AuthPhase::BreakGlass,
+                exp: Utc::now().timestamp() + 3600,
+            },
+        };
+        assert!(break_glass.is_admin());
+
+        let tenant_admin = AuthSession {
+            claims: SessionClaims {
+                sub: "bob".to_string(),
+                email: None,
+                name: None,
+                groups: vec!["acme-admin".to_string()],
+                auth_phase: AuthPhase::OidcActive,
+                exp: Utc::now().timestamp() + 3600,
+            },
+        };
+        assert!(!tenant_admin.is_admin());
+        assert!(tenant_admin.require_admin().is_err());
+        assert!(tenant_admin.is_tenant_admin("acme"));
+        assert!(!tenant_admin.is_tenant_admin("other"));
+        assert!(tenant_admin.require_tenant_admin("other").is_err());
+        assert!(tenant_admin.require_tenant_access("acme").is_ok());
+        assert!(tenant_admin.require_tenant_access("other").is_err());
+
+        let tenant_member = AuthSession {
+            claims: SessionClaims {
+                sub: "carol".to_string(),
+                email: None,
+                name: None,
+                groups: vec!["tenant-acme".to_string()],
+                auth_phase: AuthPhase::OidcActive,
+                exp: Utc::now().timestamp() + 3600,
+            },
+        };
+        assert!(!tenant_member.is_tenant_admin("acme"));
+        assert!(tenant_member.require_tenant_access("acme").is_ok());
+
+        let key = [7u8; 32];
+        let token = encrypt_session_token(&key, &admin.claims).unwrap();
+        let decoded = decrypt_session_token(&key, &token).unwrap();
+        assert_eq!(decoded, admin.claims);
+        assert!(decrypt_session_token(&key, "!!!not-base64!!!").is_err());
+        assert!(decrypt_session_token(&[8u8; 32], &token).is_err());
+    }
+
+    #[test]
+    fn redirect_uri_and_host_validation_cases() {
+        assert!(is_valid_host_header("keel.local:8080"));
+        assert!(!is_valid_host_header(""));
+        assert!(!is_valid_host_header("evil@keel.local"));
+        assert!(!is_valid_host_header("keel.local/path"));
+
+        assert!(
+            validate_oidc_redirect_uri(
+                "http://127.0.0.1:8080/api/v1/auth/callback",
+                "http://127.0.0.1:8080/api/v1/auth/callback",
+                None
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_oidc_redirect_uri(
+                "https://keel.example.com/api/v1/auth/callback",
+                "http://127.0.0.1:8080/api/v1/auth/callback",
+                Some("keel.example.com")
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_oidc_redirect_uri(
+                "ftp://keel.example.com/cb",
+                "http://127.0.0.1:8080/api/v1/auth/callback",
+                None
+            )
+            .is_err()
+        );
+        assert!(
+            validate_oidc_redirect_uri(
+                "https://evil.example.com/api/v1/auth/callback",
+                "http://127.0.0.1:8080/api/v1/auth/callback",
+                Some("keel.example.com")
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_session_extractor_and_status_and_logout() {
+        let (_tmp, state) = make_auth_state_async(None).await;
+        let key = state
+            .secret_store
+            .get_or_create_session_key()
+            .await
+            .unwrap();
+
+        let app = Router::new()
+            .route("/status", get(auth_status))
+            .route("/logout", post(logout))
+            .route(
+                "/protected",
+                get(|session: AuthSession| async move { session.claims.sub }),
+            )
+            .with_state(state.clone());
+
+        // Unauthenticated status
+        let resp = app
+            .clone()
+            .oneshot(Request::get("/status").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let status: AuthStatusResponse = serde_json::from_slice(&body).unwrap();
+        assert!(!status.authenticated);
+        assert!(!status.oidc_enabled);
+
+        // Missing session -> 401
+        let resp = app
+            .clone()
+            .oneshot(Request::get("/protected").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // Expired session -> 401
+        let expired_claims = SessionClaims {
+            sub: "expired".to_string(),
+            email: None,
+            name: None,
+            groups: vec![],
+            auth_phase: AuthPhase::OidcActive,
+            exp: Utc::now().timestamp() - 10,
+        };
+        let expired_tok = encrypt_session_token(&key, &expired_claims).unwrap();
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::get("/protected")
+                    .header(AUTHORIZATION, format!("Bearer {expired_tok}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // Valid session cookie -> 200 and authenticated status
+        let valid_claims = SessionClaims {
+            sub: "alice".to_string(),
+            email: Some("alice@keel.local".to_string()),
+            name: Some("Alice".to_string()),
+            groups: vec!["keel-admins".to_string()],
+            auth_phase: AuthPhase::OidcActive,
+            exp: Utc::now().timestamp() + 3600,
+        };
+        let valid_tok = encrypt_session_token(&key, &valid_claims).unwrap();
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::get("/protected")
+                    .header(COOKIE, format!("{SESSION_COOKIE_NAME}={valid_tok}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::get("/status")
+                    .header(COOKIE, format!("{SESSION_COOKIE_NAME}={valid_tok}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let status: AuthStatusResponse = serde_json::from_slice(&body).unwrap();
+        assert!(status.authenticated);
+        assert!(status.is_admin);
+        assert_eq!(status.sub.as_deref(), Some("alice"));
+
+        // Logout clears cookies
+        let resp = app
+            .oneshot(Request::post("/logout").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let cookies: Vec<&str> = resp
+            .headers()
+            .get_all(SET_COOKIE)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .collect();
+        assert!(cookies.iter().any(|c| c.contains("keel_session=;")));
+        assert!(cookies.iter().any(|c| c.contains("keel_logged_out=1;")));
+    }
+
+    #[tokio::test]
+    async fn csrf_origin_guard_blocks_cross_origin_cookie_mutations() {
+        let app = Router::new()
+            .route("/mutate", post(|| async { StatusCode::OK }))
+            .layer(middleware::from_fn(csrf_origin_guard));
+
+        // Cross-origin Origin header with session cookie -> 403
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/mutate")
+                    .header("host", "keel.local")
+                    .header("origin", "https://evil.example.com")
+                    .header(COOKIE, format!("{SESSION_COOKIE_NAME}=tok"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        // Cross-origin Referer header with session cookie -> 403
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/mutate")
+                    .header("host", "keel.local")
+                    .header("referer", "https://evil.example.com/page")
+                    .header(COOKIE, format!("{SESSION_COOKIE_NAME}=tok"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        // Same-origin Origin header -> 200
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/mutate")
+                    .header("host", "keel.local:8080")
+                    .header("origin", "http://keel.local:8080")
+                    .header(COOKIE, format!("{SESSION_COOKIE_NAME}=tok"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Bearer token bypasses cookie CSRF guard -> 200
+        let resp = app
+            .oneshot(
+                Request::post("/mutate")
+                    .header("host", "keel.local")
+                    .header("origin", "https://evil.example.com")
+                    .header(AUTHORIZATION, "Bearer cli-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn oidc_login_and_callback_end_to_end_with_mock_idp() {
+        // Spin up a mock OIDC IdP with discovery, token, and JWKS endpoints
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let idp_addr = listener.local_addr().unwrap();
+        let issuer = format!("http://127.0.0.1:{}", idp_addr.port());
+        let issuer_clone = issuer.clone();
+
+        let idp_router = Router::new()
+            .route(
+                "/.well-known/openid-configuration",
+                get({
+                    let iss = issuer_clone.clone();
+                    move || {
+                        let iss = iss.clone();
+                        async move {
+                            Json(json!({
+                                "issuer": iss,
+                                "authorization_endpoint": format!("{iss}/auth"),
+                                "token_endpoint": format!("{iss}/token"),
+                                "jwks_uri": format!("{iss}/keys")
+                            }))
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/keys",
+                get(|| async {
+                    Json(json!({
+                        "keys": [{
+                            "kty": "OKP",
+                            "crv": "Ed25519",
+                            "x": TEST_ED25519_X,
+                            "kid": "test-ed25519",
+                            "alg": "EdDSA",
+                            "use": "sig"
+                        }]
+                    }))
+                }),
+            )
+            .route(
+                "/token",
+                post({
+                    let iss = issuer_clone.clone();
+                    move || {
+                        let iss = iss.clone();
+                        async move {
+                            let mut header = Header::new(Algorithm::EdDSA);
+                            header.kid = Some("test-ed25519".to_string());
+                            let exp = Utc::now().timestamp() + 300;
+                            let claims = json!({
+                                "iss": iss,
+                                "aud": "keel-cli",
+                                "sub": "user-123",
+                                "email": "user@keel.local",
+                                "name": "Test User",
+                                "groups": ["keel-admins"],
+                                "exp": exp,
+                                "iat": Utc::now().timestamp()
+                            });
+                            let key =
+                                EncodingKey::from_ed_pem(TEST_ED25519_PEM.as_bytes()).unwrap();
+                            let id_token = encode(&header, &claims, &key).unwrap();
+                            Json(json!({ "id_token": id_token }))
+                        }
+                    }
+                }),
+            );
+
+        tokio::spawn(async move {
+            axum::serve(listener, idp_router).await.unwrap();
+        });
+
+        let oidc_cfg = OidcConfig {
+            enabled: true,
+            issuer_url: issuer.clone(),
+            client_id: "keel-cli".to_string(),
+            redirect_url: "http://127.0.0.1:8080/api/v1/auth/callback".to_string(),
+            scopes: vec!["openid".to_string(), "profile".to_string()],
+        };
+        let (_tmp, state) = make_auth_state_async(Some(oidc_cfg)).await;
+        let app = Router::new()
+            .route("/api/v1/auth/login", get(oidc_login))
+            .route("/api/v1/auth/callback", get(oidc_callback))
+            .with_state(state.clone());
+
+        // 1. Login initiates PKCE redirect and sets keel_pkce cookie
+        let login_resp = app
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/auth/login?prompt=login")
+                    .header("host", "127.0.0.1:8080")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(login_resp.status(), StatusCode::FOUND);
+        let location = login_resp
+            .headers()
+            .get(LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(location.contains("code_challenge_method=S256"));
+        assert!(location.contains("prompt=login"));
+        let loc_url = Url::parse(&location).unwrap();
+        let state_param = loc_url
+            .query_pairs()
+            .find(|(k, _)| k == "state")
+            .unwrap()
+            .1
+            .to_string();
+
+        let pkce_cookie = login_resp
+            .headers()
+            .get_all(SET_COOKIE)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .find(|c| c.starts_with("keel_pkce="))
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string();
+
+        // 2. Callback with valid code + state + PKCE cookie returns JSON session
+        let cb_resp = app
+            .clone()
+            .oneshot(
+                Request::get(format!(
+                    "/api/v1/auth/callback?code=auth-code-1&state={state_param}"
+                ))
+                .header(COOKIE, &pkce_cookie)
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cb_resp.status(), StatusCode::OK);
+        let cb_cookies: Vec<&str> = cb_resp
+            .headers()
+            .get_all(SET_COOKIE)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .collect();
+        assert!(cb_cookies.iter().any(|c| c.starts_with("keel_session=")));
+
+        // 3. Callback with Accept: text/html redirects to /
+        let html_resp = app
+            .clone()
+            .oneshot(
+                Request::get(format!(
+                    "/api/v1/auth/callback?code=auth-code-2&state={state_param}"
+                ))
+                .header(COOKIE, &pkce_cookie)
+                .header(ACCEPT, "text/html")
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(html_resp.status(), StatusCode::FOUND);
+        assert_eq!(html_resp.headers().get(LOCATION).unwrap(), "/");
+
+        // 4. Error paths on callback
+        let err_resp = app
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/auth/callback?error=access_denied")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(err_resp.status(), StatusCode::UNAUTHORIZED);
+
+        let mismatch_resp = app
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/auth/callback?code=c&state=wrong")
+                    .header(COOKIE, &pkce_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(mismatch_resp.status(), StatusCode::UNAUTHORIZED);
+
+        let missing_code = app
+            .oneshot(
+                Request::get("/api/v1/auth/callback?state=abc")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing_code.status(), StatusCode::BAD_REQUEST);
+    }
+}
