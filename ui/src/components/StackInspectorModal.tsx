@@ -17,21 +17,28 @@ import {
   getStackDiagnostics,
   restartStackWorkspace,
 } from "../lib/api"
+import { VmSshModal } from "./VmSshModal"
 
-interface StackInspectorModalProps {
+export interface StackInspectorModalProps {
   namespace: string
   name: string
   kind?: "stack" | "release"
+  tenant?: string
+  provider?: string
   onClose: () => void
   onRestarted?: () => void
+  onOpenSsh?: () => void
 }
 
 export const StackInspectorModal: React.FC<StackInspectorModalProps> = ({
   namespace,
   name,
   kind = "stack",
+  tenant,
+  provider,
   onClose,
   onRestarted,
+  onOpenSsh,
 }) => {
   const [diag, setDiag] = useState<StackDiagnostics | null>(null)
   const [loading, setLoading] = useState(true)
@@ -40,6 +47,7 @@ export const StackInspectorModal: React.FC<StackInspectorModalProps> = ({
   const [isFullscreen, setIsFullscreen] = useState(false)
   const [banner, setBanner] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [isSshModalOpen, setIsSshModalOpen] = useState(false)
 
   const fetchDiag = useCallback(
     () =>
@@ -179,6 +187,23 @@ export const StackInspectorModal: React.FC<StackInspectorModalProps> = ({
               />
               <span>Refresh</span>
             </button>
+            {kind === "stack" && (
+              <button
+                type="button"
+                data-testid="inspector-ssh-btn"
+                onClick={() => {
+                  if (onOpenSsh) {
+                    onOpenSsh()
+                  } else {
+                    setIsSshModalOpen(true)
+                  }
+                }}
+                className="flex items-center space-x-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-300 border border-emerald-500/30 transition-colors cursor-pointer"
+              >
+                <Terminal className="h-3.5 w-3.5" />
+                <span>SSH / Connect</span>
+              </button>
+            )}
             {kind === "stack" && (
               <button
                 type="button"
@@ -487,6 +512,15 @@ export const StackInspectorModal: React.FC<StackInspectorModalProps> = ({
           </div>
         </div>
       </div>
+      {isSshModalOpen && (
+        <VmSshModal
+          stackName={name}
+          namespace={namespace}
+          tenant={tenant || "default"}
+          provider={provider}
+          onClose={() => setIsSshModalOpen(false)}
+        />
+      )}
     </div>
   )
 }

@@ -32,6 +32,7 @@ import {
 } from "../lib/api"
 import { isDemoMode } from "../lib/utils"
 import { StackInspectorModal } from "./StackInspectorModal"
+import { VmSshModal } from "./VmSshModal"
 import { StatusBadge } from "./StatusBadge"
 import { BundleBadge } from "./BundleBadge"
 import { PrNotificationBanner } from "./PrNotificationBanner"
@@ -187,6 +188,14 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
     namespace: string
     name: string
     kind?: "stack" | "release"
+    tenant?: string
+    provider?: string
+  } | null>(null)
+  const [sshStack, setSshStack] = useState<{
+    stackName: string
+    namespace: string
+    tenant: string
+    provider?: string
   } | null>(null)
   const [restartingStackKey, setRestartingStackKey] = useState<string | null>(
     null
@@ -533,10 +542,32 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
               )}
               <button
                 type="button"
+                data-testid={`stack-ssh-btn-${stack.name}`}
+                title="SSH Connect"
+                aria-label={`SSH connect to stack ${stack.name}`}
+                onClick={() =>
+                  setSshStack({
+                    stackName: stack.name,
+                    namespace: ns,
+                    tenant: stack.tenant || "default",
+                    provider: stack.provider,
+                  })
+                }
+                className="p-1.5 rounded-md bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 transition-colors cursor-pointer"
+              >
+                <Terminal className="h-3.5 w-3.5" />
+              </button>
+              <button
+                type="button"
                 title="Inspect"
                 aria-label={`Inspect stack ${stack.name}`}
                 onClick={() =>
-                  setInspectedStack({ namespace: ns, name: stack.name })
+                  setInspectedStack({
+                    namespace: ns,
+                    name: stack.name,
+                    tenant: stack.tenant,
+                    provider: stack.provider,
+                  })
                 }
                 className="p-1.5 rounded-md bg-indigo-500/10 hover:bg-indigo-500/20 text-indigo-300 border border-indigo-500/30 transition-colors cursor-pointer"
               >
@@ -1383,8 +1414,28 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
           namespace={inspectedStack.namespace}
           name={inspectedStack.name}
           kind={inspectedStack.kind}
+          tenant={inspectedStack.tenant}
+          provider={inspectedStack.provider}
           onClose={() => setInspectedStack(null)}
           onRestarted={fetchTopology}
+          onOpenSsh={() => {
+            setSshStack({
+              stackName: inspectedStack.name,
+              namespace: inspectedStack.namespace,
+              tenant: inspectedStack.tenant || "default",
+              provider: inspectedStack.provider,
+            })
+          }}
+        />
+      )}
+
+      {sshStack && (
+        <VmSshModal
+          stackName={sshStack.stackName}
+          namespace={sshStack.namespace}
+          tenant={sshStack.tenant}
+          provider={sshStack.provider}
+          onClose={() => setSshStack(null)}
         />
       )}
     </div>

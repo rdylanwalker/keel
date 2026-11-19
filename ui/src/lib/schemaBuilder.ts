@@ -606,3 +606,23 @@ export function extractSchemaDefaults(
   }
   return result
 }
+
+/**
+ * Scans for `${var_name}` and `${var_name:=default}` placeholders
+ * and returns unique variable names in order of appearance.
+ */
+export function extractManifestVariables(manifestsYaml: string): string[] {
+  if (!manifestsYaml) return []
+  const regex = /\$\{([A-Za-z_][A-Za-z0-9_]*)(?::=[^}]*)?\}/g
+  const seen = new Set<string>()
+  const vars: string[] = []
+  let match: RegExpExecArray | null
+  while ((match = regex.exec(manifestsYaml)) !== null) {
+    const varName = match[1]
+    if (!seen.has(varName)) {
+      seen.add(varName)
+      vars.push(varName)
+    }
+  }
+  return vars
+}

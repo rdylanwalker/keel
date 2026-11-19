@@ -42,7 +42,9 @@ import {
   PROVIDER_CREDENTIAL_PRESETS,
   SchemaFieldDraft,
   deriveFieldsFromPulumiYaml,
+  extractManifestVariables,
   fieldsToSchemaJson,
+  humanizeFieldName,
   schemaJsonToFields,
 } from "../lib/schemaBuilder"
 import { SchemaFieldsEditor } from "./SchemaFieldsEditor"
@@ -50,6 +52,39 @@ import {
   DeployInstanceInitialConfig,
   DeployInstanceModal,
 } from "./DeployInstanceModal"
+
+const DEFAULT_STARTER_MANIFEST = `apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: \${appName}
+  labels:
+    app: \${appName}
+spec:
+  replicas: \${replicas:=2}
+  selector:
+    matchLabels:
+      app: \${appName}
+  template:
+    metadata:
+      labels:
+        app: \${appName}
+    spec:
+      containers:
+        - name: app
+          image: nginx:alpine
+          ports:
+            - containerPort: 80
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: \${appName}
+spec:
+  selector:
+    app: \${appName}
+  ports:
+    - port: 80
+      targetPort: 80`
 
 const DEMO_TENANTS: TenantSummary[] = [
   { id: "default", namespace: "tenant-default" },
@@ -284,6 +319,8 @@ export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
     protectByDefault: false,
     terraformProvider: "",
     pulumiYaml: "",
+    manifestsYaml: "",
+    defaultEngine: "flux",
   })
 
   useEffect(() => {
@@ -500,6 +537,8 @@ export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
       protectByDefault: false,
       terraformProvider: "",
       pulumiYaml: "",
+      manifestsYaml: "",
+      defaultEngine: "flux",
       items: [],
     })
     setIsAddAppModalOpen(true)
@@ -534,7 +573,13 @@ export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
             ? "Platform"
             : "Applications"),
       description: item.description || "",
-      runtime: (item.runtime as "helm" | "kustomize") || "helm",
+      runtime: (item.runtime as "helm" | "kustomize" | "manifest") || "helm",
+      manifestsYaml:
+        item.manifestsYaml ||
+        (item.runtime === "manifest" ? DEFAULT_STARTER_MANIFEST : ""),
+      defaultEngine:
+        item.defaultEngine ||
+        (item.runtime === "manifest" ? "flux" : undefined),
       repoUrl: item.repoUrl || "",
       chart: item.chart || "",
       version: item.version || "",
@@ -560,10 +605,11 @@ export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
     e.preventDefault()
     const isInfra = appForm.kind === "infra"
     const isBundle = appForm.kind === "bundle"
+    const isManifest = appForm.kind === "app" && appForm.runtime === "manifest"
     if (
       !appForm.id.trim() ||
       !appForm.name.trim() ||
-      (!isInfra && !isBundle && !appForm.repoUrl?.trim()) ||
+      (!isInfra && !isBundle && !isManifest && !appForm.repoUrl?.trim()) ||
       (isBundle && (!appForm.items || appForm.items.length === 0))
     )
       return
@@ -644,7 +690,17 @@ export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
                   ? { description: appForm.description.trim() }
                   : {}),
               runtime: appForm.runtime || "helm",
-              repoUrl: appForm.repoUrl?.trim() || "",
+              ...(appForm.runtime === "manifest"
+                ? {
+                    manifestsYaml:
+                      appForm.manifestsYaml || DEFAULT_STARTER_MANIFEST,
+                    defaultEngine: appForm.defaultEngine || "flux",
+                  }
+                : {}),
+              repoUrl:
+                appForm.runtime === "manifest" && !appForm.repoUrl?.trim()
+                  ? "https://kubernetes.io/docs/concepts/overview/working-with-objects/"
+                  : appForm.repoUrl?.trim() || "",
               chart: isEditing
                 ? (appForm.chart?.trim() ?? "")
                 : appForm.chart?.trim() || undefined,
@@ -652,10 +708,18 @@ export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
                 ? (appForm.version?.trim() ?? "")
                 : appForm.version?.trim() || undefined,
               ...(isEditing
-                ? { path: appForm.path?.trim() ?? "" }
-                : appForm.path?.trim()
-                  ? { path: appForm.path.trim() }
-                  : {}),
+                ? {
+                    path:
+                      appForm.runtime === "manifest" && !appForm.path?.trim()
+                        ? "./manifests.yaml"
+                        : (appForm.path?.trim() ?? ""),
+                  }
+                : {
+                    path:
+                      appForm.runtime === "manifest" && !appForm.path?.trim()
+                        ? "./manifests.yaml"
+                        : appForm.path?.trim() || undefined,
+                  }),
               flaggerSupported: !!appForm.flaggerSupported,
               ...(parsedSchema ? { schema: parsedSchema } : {}),
             }
@@ -669,6 +733,8 @@ export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
               category: payload.category,
               description: payload.description,
               runtime: payload.runtime,
+              manifestsYaml: payload.manifestsYaml,
+              defaultEngine: payload.defaultEngine,
               repoUrl: payload.repoUrl,
               chart: payload.chart,
               version: payload.version,
@@ -707,6 +773,8 @@ export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
         protectByDefault: false,
         terraformProvider: "",
         pulumiYaml: "",
+        manifestsYaml: "",
+        defaultEngine: "flux",
         items: [],
       })
     } catch (err) {
@@ -720,6 +788,33 @@ export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
     } finally {
       setAppLoading(false)
     }
+  }
+
+  const handleExtractManifestVars = () => {
+    const yaml = appForm.manifestsYaml || DEFAULT_STARTER_MANIFEST
+    const extracted = extractManifestVariables(yaml)
+    const existingNames = new Set(schemaFields.map((f) => f.name))
+    const newFields: SchemaFieldDraft[] = []
+
+    for (const varName of extracted) {
+      if (!existingNames.has(varName)) {
+        const isSecret = /secret|token|password|key/i.test(varName)
+        newFields.push({
+          name: varName,
+          title: humanizeFieldName(varName),
+          type: "string",
+          defaultValue: "",
+          required: true,
+          secret: isSecret,
+        })
+        existingNames.add(varName)
+      }
+    }
+
+    const updated = [...schemaFields, ...newFields]
+    setSchemaFields(updated)
+    setSchemaJsonText(fieldsToSchemaJson(updated, schemaJsonText))
+    setShowSchemaEditor(true)
   }
 
   return (
@@ -1337,32 +1432,116 @@ export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
                       <select
                         id="app-runtime"
                         value={appForm.runtime || "helm"}
-                        onChange={(e) =>
+                        onChange={(e) => {
+                          const val = e.target.value as
+                            "helm" | "kustomize" | "manifest"
                           setAppForm((prev) => ({
                             ...prev,
-                            runtime: e.target.value as "helm" | "kustomize",
+                            runtime: val,
+                            ...(val === "manifest" && !prev.manifestsYaml
+                              ? { manifestsYaml: DEFAULT_STARTER_MANIFEST }
+                              : {}),
+                            ...(val === "manifest" && !prev.defaultEngine
+                              ? { defaultEngine: "flux" }
+                              : {}),
                           }))
-                        }
+                        }}
                         className="w-full px-3 py-2 bg-slate-950 border border-slate-800 rounded-lg text-xs text-slate-100 focus:outline-none focus:ring-1 focus:ring-indigo-500"
                       >
                         <option value="helm">helm</option>
                         <option value="kustomize">kustomize</option>
+                        <option value="manifest">
+                          Raw K8s Manifest / Template
+                        </option>
                       </select>
                     </div>
                   </div>
+
+                  {appForm.runtime === "manifest" && (
+                    <div className="space-y-4">
+                      <div>
+                        <label
+                          htmlFor="app-default-engine"
+                          className="block text-xs text-slate-300 font-medium mb-1"
+                        >
+                          Action Engine (Default) *
+                        </label>
+                        <select
+                          id="app-default-engine"
+                          data-testid="catalog-action-engine-select"
+                          value={appForm.defaultEngine || "flux"}
+                          onChange={(e) =>
+                            setAppForm((prev) => ({
+                              ...prev,
+                              defaultEngine: e.target.value as
+                                "flux" | "pulumi",
+                            }))
+                          }
+                          className="w-full px-3 py-2 bg-slate-950 border border-slate-800 rounded-lg text-xs text-slate-100 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                        >
+                          <option value="flux">
+                            Flux CD (Kustomization + postBuild substitution)
+                          </option>
+                          <option value="pulumi">
+                            Pulumi (PKO v2 Stack + ConfigGroup preview)
+                          </option>
+                        </select>
+                      </div>
+
+                      <div>
+                        <div className="flex items-center justify-between mb-1">
+                          <label
+                            htmlFor="app-manifests-yaml"
+                            className="block text-xs text-slate-300 font-medium"
+                          >
+                            Kubernetes Manifest YAML *
+                          </label>
+                          <button
+                            type="button"
+                            data-testid="extract-manifest-vars-btn"
+                            onClick={handleExtractManifestVars}
+                            className="text-[11px] font-medium text-emerald-400 hover:text-emerald-300 transition-colors cursor-pointer flex items-center gap-1"
+                          >
+                            Auto-Extract `${`var`}` Fields
+                          </button>
+                        </div>
+                        <textarea
+                          id="app-manifests-yaml"
+                          data-testid="catalog-manifests-yaml-input"
+                          rows={10}
+                          value={appForm.manifestsYaml ?? ""}
+                          onChange={(e) =>
+                            setAppForm((prev) => ({
+                              ...prev,
+                              manifestsYaml: e.target.value,
+                            }))
+                          }
+                          placeholder={DEFAULT_STARTER_MANIFEST}
+                          className="w-full px-3 py-2 bg-slate-950 border border-slate-800 rounded-lg text-xs text-slate-100 placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-indigo-500 font-mono text-[11px] leading-relaxed"
+                        />
+                      </div>
+                    </div>
+                  )}
 
                   <div>
                     <label
                       htmlFor="app-repourl"
                       className="block text-xs text-slate-300 font-medium mb-1"
                     >
-                      Repository URL *
+                      Repository URL{" "}
+                      {appForm.runtime === "manifest"
+                        ? "(Optional for Raw Manifests)"
+                        : "*"}
                     </label>
                     <input
                       id="app-repourl"
                       type="text"
-                      required
-                      placeholder="https://github.com/stefanprodan/podinfo"
+                      required={appForm.runtime !== "manifest"}
+                      placeholder={
+                        appForm.runtime === "manifest"
+                          ? "https://kubernetes.io/docs/concepts/overview/working-with-objects/ (optional)"
+                          : "https://github.com/stefanprodan/podinfo"
+                      }
                       value={appForm.repoUrl || ""}
                       onChange={(e) =>
                         setAppForm((prev) => ({
@@ -2063,6 +2242,17 @@ export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
                       )}
                     </div>
                   )}
+                  {appForm.kind === "app" && appForm.runtime === "manifest" && (
+                    <div className="flex flex-wrap items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={handleExtractManifestVars}
+                        className="text-[11px] font-medium text-emerald-400 hover:text-emerald-300 transition-colors cursor-pointer"
+                      >
+                        Auto-Extract `${`var`}` Fields
+                      </button>
+                    </div>
+                  )}
                 </div>
                 {showSchemaEditor && (
                   <div className="mt-2.5 space-y-3">
@@ -2160,6 +2350,7 @@ export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
                     !appForm.name.trim() ||
                     (appForm.kind !== "infra" &&
                       appForm.kind !== "bundle" &&
+                      appForm.runtime !== "manifest" &&
                       !appForm.repoUrl?.trim()) ||
                     (appForm.kind === "bundle" &&
                       (!appForm.items ||

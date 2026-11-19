@@ -150,4 +150,24 @@ describe("StackInspectorModal component", () => {
       screen.queryByRole("button", { name: /Rollout Restart/i })
     ).not.toBeInTheDocument()
   })
+
+  it("renders SSH / Connect button for stacks and triggers onOpenSsh", async () => {
+    vi.mocked(api.getStackDiagnostics).mockResolvedValue(sampleDiagnostics)
+    const onOpenSsh = vi.fn()
+
+    render(
+      <StackInspectorModal
+        namespace="tenant-acme"
+        name="prod-cluster"
+        kind="stack"
+        onClose={onClose}
+        onOpenSsh={onOpenSsh}
+      />
+    )
+
+    const sshBtn = await screen.findByTestId("inspector-ssh-btn")
+    expect(sshBtn).toBeInTheDocument()
+    fireEvent.click(sshBtn)
+    expect(onOpenSsh).toHaveBeenCalled()
+  })
 })

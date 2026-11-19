@@ -34,6 +34,7 @@ import {
   upgradeManagementAddon,
   rollbackManagementAddon,
   createEventSourceStream,
+  fetchStackSshInfo,
 } from "./api"
 
 describe("api client module", () => {
@@ -806,5 +807,34 @@ describe("api client module", () => {
     expect(rollbackProposal).toMatchObject({
       id: "401",
     })
+  })
+
+  it("fetches stack SSH info from /api/v1/stacks/{ns}/{name}/ssh-info", async () => {
+    const mockSshInfo = {
+      stackName: "pve-workload",
+      namespace: "tenant-acme",
+      tenant: "acme",
+      provider: "proxmox",
+      sshHost: "192.168.1.150",
+      sshUser: "debian",
+      sshPort: 22,
+      sshCommand: "ssh debian@192.168.1.150 -p 22",
+      cliCommand: "keel infra ssh pve-workload --tenant acme",
+      cliExecCommand: "keel infra ssh pve-workload --tenant acme --exec",
+      hasSavedSshKey: true,
+    }
+
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => mockSshInfo,
+    })
+    vi.stubGlobal("fetch", fetchMock)
+
+    const info = await fetchStackSshInfo("tenant-acme", "pve-workload")
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/v1/stacks/tenant-acme/pve-workload/ssh-info",
+      expect.any(Object)
+    )
+    expect(info).toEqual(mockSshInfo)
   })
 })

@@ -386,4 +386,145 @@ describe("DeployInstanceModal component", () => {
       expect(onClose).toHaveBeenCalled()
     })
   })
+
+  it("renders Action Engine selector for raw manifest catalog apps and passes actionEngine in proposal payload", async () => {
+    vi.mocked(api.createProposal).mockResolvedValueOnce({
+      id: "99",
+      title: "Deploy custom-manifest",
+      branch: "keel/acme/custom-manifest-99",
+      author: "user",
+      tenant: "acme",
+      status: "open",
+      createdAt: "just now",
+    })
+
+    const manifestItem: CatalogItem = {
+      id: "custom-manifest",
+      name: "Custom K8s Manifest",
+      description: "Direct K8s manifest app",
+      type: "app",
+      category: "Applications",
+      version: "1.0.0",
+      runtime: "manifest",
+      defaultEngine: "flux",
+      schema: {
+        type: "object",
+        properties: {
+          appName: { type: "string", default: "my-app" },
+        },
+      },
+    }
+
+    render(
+      <DeployInstanceModal
+        isOpen={true}
+        onClose={onClose}
+        catalogItem={manifestItem}
+        tenant="acme"
+        onProposalCreated={onProposalCreated}
+      />
+    )
+
+    // Action Engine selector is present and defaulted to flux
+    const engineSelect = screen.getByTestId("deploy-action-engine-select")
+    expect(engineSelect).toHaveValue("flux")
+
+    // Change to pulumi
+    fireEvent.change(engineSelect, { target: { value: "pulumi" } })
+    expect(engineSelect).toHaveValue("pulumi")
+
+    // Submit
+    fireEvent.click(
+      screen.getByRole("button", { name: /Submit & Open Git PR Proposal/i })
+    )
+
+    await waitFor(() => {
+      expect(api.createProposal).toHaveBeenCalledWith(
+        expect.objectContaining({
+          catalogId: "custom-manifest",
+          tenant: "acme",
+          actionEngine: "pulumi",
+        })
+      )
+      expect(onProposalCreated).toHaveBeenCalled()
+      expect(onClose).toHaveBeenCalled()
+    })
+  })
+
+  it("supports initialConfig with actionEngine and switching between flux and pulumi", async () => {
+    vi.mocked(api.createProposal).mockResolvedValueOnce({
+      id: "100",
+      title: "Deploy manifest app",
+      branch: "keel/acme/manifest-100",
+      author: "user",
+      tenant: "acme",
+      status: "open",
+      createdAt: "just now",
+    })
+
+    const manifestItem: CatalogItem = {
+      id: "manifest-app",
+      name: "Manifest App",
+      description: "Direct manifest app",
+      type: "app",
+      category: "Applications",
+      version: "1.0.0",
+      runtime: "manifest",
+      defaultEngine: "pulumi",
+      schema: { type: "object", properties: {} },
+    }
+
+    render(
+      <DeployInstanceModal
+        isOpen={true}
+        onClose={vi.fn()}
+        catalogItem={manifestItem}
+        initialConfig={{
+          actionEngine: "pulumi",
+          name: "manifest-app",
+          tenant: "acme",
+        }}
+        tenant="acme"
+        onProposalCreated={vi.fn()}
+      />
+    )
+
+    const engineSelect = screen.getByTestId("deploy-action-engine-select")
+    expect(engineSelect).toHaveValue("pulumi")
+
+    // Switch to flux
+    fireEvent.change(engineSelect, { target: { value: "flux" } })
+    expect(engineSelect).toHaveValue("flux")
+
+    fireEvent.click(
+      screen.getByRole("button", { name: /Submit & Open Git PR Proposal/i })
+    )
+
+    await waitFor(() => {
+      expect(api.createProposal).toHaveBeenCalledWith(
+        expect.objectContaining({
+          catalogId: "manifest-app",
+          actionEngine: "flux",
+        })
+      )
+    })
+  })
+
+  it("handles sync upstream schema failure gracefully", async () => {
+    vi.mocked(api.fetchCatalogSchema).mockRejectedValueOnce(
+      new Error("Schema fetch failed")
+    )
+
+    render(
+      <DeployInstanceModal
+        isOpen={true}
+        onClose={vi.fn()}
+        catalogItem={sampleAppItem}
+        tenant="acme"
+      />
+    )
+
+    fireEvent.click(screen.getByRole("button", { name: /Sync Upstream/i }))
+    expect(await screen.findByText("Schema fetch failed")).toBeInTheDocument()
+  })
 })

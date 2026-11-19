@@ -134,6 +134,7 @@ export interface DeployInstanceInitialConfig {
   targetCluster?: string
   targetNamespace?: string
   canary?: boolean
+  actionEngine?: "flux" | "pulumi"
 }
 
 export interface DeployInstanceModalProps {
@@ -225,6 +226,13 @@ const DeployInstanceModalBody: React.FC<DeployInstanceModalProps> = ({
   const [localTenant, setLocalTenant] = useState<string>(
     () => initialConfig?.tenant ?? tenant
   )
+  const [actionEngine, setActionEngine] = useState<"flux" | "pulumi">(() => {
+    return (
+      initialConfig?.actionEngine ??
+      (resolvedCatalogItem?.defaultEngine as "flux" | "pulumi") ??
+      "flux"
+    )
+  })
   const [loading, setLoading] = useState(false)
   const [syncingSchema, setSyncingSchema] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -355,6 +363,7 @@ const DeployInstanceModalBody: React.FC<DeployInstanceModalProps> = ({
         enableCanary
           ? { canary: true }
           : {}),
+        ...(activeItem.runtime === "manifest" ? { actionEngine } : {}),
       })
       onProposalCreated?.(proposal)
       onClose()
@@ -469,6 +478,28 @@ const DeployInstanceModalBody: React.FC<DeployInstanceModalProps> = ({
               placeholder={activeItem.id}
               className="w-full bg-slate-950 border border-slate-800 text-xs text-slate-200 rounded-lg px-3 py-1.5 focus:outline-none focus:ring-1 focus:ring-indigo-500 font-mono"
             />
+          </div>
+        )}
+        {activeItem.runtime === "manifest" && (
+          <div>
+            <label
+              htmlFor="deploy-action-engine-select"
+              className="block text-[11px] font-medium text-slate-300 mb-1"
+            >
+              Action Engine
+            </label>
+            <select
+              id="deploy-action-engine-select"
+              data-testid="deploy-action-engine-select"
+              value={actionEngine}
+              onChange={(e) =>
+                setActionEngine(e.target.value as "flux" | "pulumi")
+              }
+              className="w-full bg-slate-950 border border-slate-800 text-xs text-slate-200 rounded-lg px-3 py-1.5 focus:outline-none focus:ring-1 focus:ring-indigo-500 font-mono"
+            >
+              <option value="flux">Flux CD (Kustomization)</option>
+              <option value="pulumi">Pulumi (PKO v2 Stack)</option>
+            </select>
           </div>
         )}
         {(isManagementAddon || activeItem.type === "app") && (

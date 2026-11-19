@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest"
 import {
   PROVIDER_CREDENTIAL_PRESETS,
   deriveFieldsFromPulumiYaml,
+  extractManifestVariables,
   fieldsToSchemaJson,
   humanizeFieldName,
   schemaJsonToFields,
@@ -321,5 +322,43 @@ config:
       title: "Tags",
       properties: {},
     })
+  })
+
+  it("extracts unique manifest variables in order with or without defaults", () => {
+    const yaml = `
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: \${appName}
+spec:
+  replicas: \${replicas:=2}
+  template:
+    spec:
+      containers:
+        - name: app
+          image: \${image:=nginx:alpine}
+          env:
+            - name: API_KEY
+              value: \${api_key}
+            - name: DUPLICATE_APP
+              value: \${appName}
+            - name: DB_PASSWORD
+              value: \${db_password:=secret}
+`
+    const vars = extractManifestVariables(yaml)
+    expect(vars).toEqual([
+      "appName",
+      "replicas",
+      "image",
+      "api_key",
+      "db_password",
+    ])
+  })
+
+  it("returns empty array when manifestsYaml is empty or has no variables", () => {
+    expect(extractManifestVariables("")).toEqual([])
+    expect(
+      extractManifestVariables("kind: Namespace\nmetadata:\n  name: production")
+    ).toEqual([])
   })
 })

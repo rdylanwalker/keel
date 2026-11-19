@@ -18,7 +18,9 @@ export interface CreateCatalogItemPayload {
   name: string
   category: string
   description?: string
-  runtime?: "helm" | "kustomize"
+  runtime?: "helm" | "kustomize" | "manifest"
+  manifestsYaml?: string
+  defaultEngine?: "flux" | "pulumi"
   repoUrl?: string
   chart?: string
   version?: string
@@ -57,7 +59,9 @@ export interface CatalogItem {
   repoUrl?: string
   chart?: string
   path?: string
-  runtime?: string
+  runtime?: "helm" | "kustomize" | "manifest" | string
+  manifestsYaml?: string
+  defaultEngine?: "flux" | "pulumi"
   flaggerSupported?: boolean
   defaultCanary?: boolean
   pulumiRuntime?: "yaml" | "hcl" | "opentofu-bridge"
@@ -163,6 +167,20 @@ export interface StackDiagnostics {
   logs: string[]
 }
 
+export interface StackSshInfo {
+  stackName: string
+  namespace: string
+  tenant: string
+  provider: string
+  sshHost: string
+  sshUser: string
+  sshPort: number
+  sshCommand: string
+  cliCommand: string
+  cliExecCommand: string
+  hasSavedSshKey: boolean
+}
+
 export interface RestartStackResponse {
   restarted: boolean
   namespace: string
@@ -233,6 +251,7 @@ export interface ReleaseConfig {
   targetCluster?: string
   targetNamespace?: string
   canary?: boolean
+  actionEngine?: "flux" | "pulumi"
   values: Record<string, unknown>
 }
 
@@ -247,6 +266,7 @@ export interface CreateProposalPayload {
   kind?: "app" | "infra" | "bundle"
   targetCluster?: string
   canary?: boolean
+  actionEngine?: "flux" | "pulumi"
 }
 
 export interface UpgradeManagementAddonPayload {

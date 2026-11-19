@@ -1570,4 +1570,109 @@ describe("CatalogWizardView component and jsonToYaml helper", () => {
         .value
     ).toContain("terraform-provider")
   })
+
+  it("supports raw Kubernetes manifest / template apps with auto-extracting vars and engine selection", async () => {
+    vi.mocked(api.getCatalog).mockResolvedValue(mockCatalog)
+    vi.mocked(api.createCatalogApp).mockResolvedValue({
+      id: "401",
+      title: "Add Catalog Item custom-nginx",
+      branch: "keel/catalog/401",
+      author: "user",
+      tenant: "default",
+      status: "open",
+      createdAt: "just now",
+    })
+
+    render(<CatalogWizardView />)
+
+    fireEvent.click(screen.getByRole("button", { name: /^Add Catalog Item$/i }))
+
+    fireEvent.change(screen.getByLabelText(/(App|Item) ID \*/i), {
+      target: { value: "custom-nginx" },
+    })
+    fireEvent.change(screen.getByLabelText(/(App|Item) Name \*/i), {
+      target: { value: "Custom Nginx" },
+    })
+    fireEvent.change(screen.getByLabelText(/Category \*/i), {
+      target: { value: "Applications" },
+    })
+
+    // Switch runtime to manifest
+    fireEvent.change(screen.getByLabelText(/Runtime \*/i), {
+      target: { value: "manifest" },
+    })
+
+    // Verify Action Engine selector is displayed
+    const engineSelect = screen.getByTestId("catalog-action-engine-select")
+    expect(engineSelect).toHaveValue("flux")
+    fireEvent.change(engineSelect, { target: { value: "pulumi" } })
+    expect(engineSelect).toHaveValue("pulumi")
+
+    // Verify Manifest YAML input is present and pre-populated with starter template
+    const manifestInput = screen.getByTestId(
+      "catalog-manifests-yaml-input"
+    ) as HTMLTextAreaElement
+    expect(manifestInput.value).toContain("${appName}")
+    expect(manifestInput.value).toContain("${replicas:=2}")
+
+    // Change manifest YAML with custom ${var} and secret token
+    fireEvent.change(manifestInput, {
+      target: {
+        value: `
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: \${serviceName}
+spec:
+  replicas: \${replicaCount:=3}
+  template:
+    spec:
+      containers:
+        - name: app
+          image: nginx:latest
+          env:
+            - name: API_TOKEN
+              value: \${api_token}
+`,
+      },
+    })
+
+    // Click Auto-Extract ${var} Fields
+    fireEvent.click(screen.getByTestId("extract-manifest-vars-btn"))
+
+    // Schema editor should now be open with the 3 fields
+    const schemaTextarea = screen.getByLabelText(
+      /JSON Schema/i
+    ) as HTMLTextAreaElement
+    const parsedSchema = JSON.parse(schemaTextarea.value)
+    expect(parsedSchema.required).toEqual([
+      "serviceName",
+      "replicaCount",
+      "api_token",
+    ])
+    // api_token should be automatically marked as secret
+    expect(parsedSchema.properties.api_token.writeOnly).toBe(true)
+    expect(parsedSchema.properties.api_token.format).toBe("password")
+
+    // Submit proposal without repoUrl (repoUrl should default gracefully)
+    fireEvent.click(
+      screen.getByRole("button", { name: /Submit App PR Proposal/i })
+    )
+
+    await waitFor(() => {
+      expect(api.createCatalogApp).toHaveBeenCalledWith(
+        expect.objectContaining({
+          kind: "app",
+          id: "custom-nginx",
+          name: "Custom Nginx",
+          runtime: "manifest",
+          defaultEngine: "pulumi",
+          repoUrl:
+            "https://kubernetes.io/docs/concepts/overview/working-with-objects/",
+          path: "./manifests.yaml",
+          manifestsYaml: expect.stringContaining("${serviceName}"),
+        })
+      )
+    })
+  })
 })

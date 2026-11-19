@@ -13,10 +13,12 @@ import {
   ReleaseSummary,
   RestartStackResponse,
   StackDiagnostics,
+  StackSshInfo,
   StackSummary,
   TenantSummary,
   UpgradeManagementAddonPayload,
 } from "../types/api"
+import { isDemoMode } from "./utils"
 
 let inMemoryToken: string | null = null
 
@@ -88,6 +90,7 @@ interface RawCatalogEntry {
     category?: string
     runtime?: string
     provider?: string
+    defaultEngine?: "flux" | "pulumi"
   }
   spec?: {
     upstream?: {
@@ -96,6 +99,8 @@ interface RawCatalogEntry {
       version?: string
       path?: string
     }
+    manifestsYaml?: string
+    defaultEngine?: "flux" | "pulumi"
     progressiveDelivery?: {
       flaggerSupported?: boolean
       defaultCanary?: boolean
@@ -135,6 +140,8 @@ function mapCatalogApplication(app: RawCatalogEntry): CatalogItem {
     chart: app.spec?.upstream?.chart,
     path: app.spec?.upstream?.path,
     runtime: app.metadata?.runtime,
+    manifestsYaml: app.spec?.manifestsYaml,
+    defaultEngine: app.spec?.defaultEngine ?? app.metadata?.defaultEngine,
     flaggerSupported: app.spec?.progressiveDelivery?.flaggerSupported ?? false,
     defaultCanary: app.spec?.progressiveDelivery?.defaultCanary ?? false,
     serviceUrl: app.spec?.serviceUrl,
@@ -471,6 +478,58 @@ export async function getStackDiagnostics(
     { headers: getHeaders() }
   )
   return handleResponse<StackDiagnostics>(res)
+}
+
+export async function fetchStackSshInfo(
+  namespace: string,
+  name: string
+): Promise<StackSshInfo> {
+  if (isDemoMode()) {
+    const tenant = namespace.startsWith("tenant-")
+      ? namespace.replace("tenant-", "")
+      : namespace
+    return {
+      stackName: name,
+      namespace,
+      tenant,
+      provider: "proxmox",
+      sshHost: "192.168.1.150",
+      sshUser: "debian",
+      sshPort: 22,
+      sshCommand: `ssh debian@192.168.1.150 -p 22`,
+      cliCommand: `keel infra ssh ${name} --tenant ${tenant}`,
+      cliExecCommand: `keel infra ssh ${name} --tenant ${tenant} --exec`,
+      hasSavedSshKey: true,
+    }
+  }
+
+  try {
+    const res = await fetch(
+      `/api/v1/stacks/${encodeURIComponent(namespace)}/${encodeURIComponent(name)}/ssh-info`,
+      { headers: getHeaders() }
+    )
+    return await handleResponse<StackSshInfo>(res)
+  } catch (err) {
+    if (isDemoMode()) {
+      const tenant = namespace.startsWith("tenant-")
+        ? namespace.replace("tenant-", "")
+        : namespace
+      return {
+        stackName: name,
+        namespace,
+        tenant,
+        provider: "proxmox",
+        sshHost: "192.168.1.150",
+        sshUser: "debian",
+        sshPort: 22,
+        sshCommand: `ssh debian@192.168.1.150 -p 22`,
+        cliCommand: `keel infra ssh ${name} --tenant ${tenant}`,
+        cliExecCommand: `keel infra ssh ${name} --tenant ${tenant} --exec`,
+        hasSavedSshKey: true,
+      }
+    }
+    throw err
+  }
 }
 
 export async function getReleaseDiagnostics(

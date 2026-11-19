@@ -36,6 +36,19 @@ vi.mock("../lib/api", () => ({
     outputs: {},
   }),
   createEventSourceStream: vi.fn(() => ({ close: vi.fn() })),
+  fetchStackSshInfo: vi.fn().mockResolvedValue({
+    stackName: "live-proxmox-stack",
+    namespace: "tenant-acme",
+    tenant: "acme",
+    provider: "proxmox",
+    sshHost: "192.168.1.150",
+    sshUser: "debian",
+    sshPort: 22,
+    sshCommand: "ssh debian@192.168.1.150 -p 22",
+    cliCommand: "keel infra ssh live-proxmox-stack --tenant acme",
+    cliExecCommand: "keel infra ssh live-proxmox-stack --tenant acme --exec",
+    hasSavedSshKey: true,
+  }),
 }))
 
 const mockLiveStacks: StackSummary[] = [
@@ -741,5 +754,31 @@ describe("TopologyView component", () => {
     await waitFor(() => {
       expect(screen.queryByRole("alert")).not.toBeInTheDocument()
     })
+  })
+
+  it("opens VmSshModal when clicking stack SSH button", async () => {
+    vi.mocked(api.getStacksWithMeta).mockResolvedValue({
+      stacks: mockLiveStacks,
+    })
+
+    render(<TopologyView />)
+
+    const sshBtn = await screen.findByTestId("stack-ssh-btn-live-proxmox-stack")
+    expect(sshBtn).toBeInTheDocument()
+    fireEvent.click(sshBtn)
+
+    expect(
+      await screen.findByRole("dialog", {
+        name: "SSH Connect - live-proxmox-stack",
+      })
+    ).toBeInTheDocument()
+
+    // Close the SSH modal
+    fireEvent.click(screen.getByTestId("vm-ssh-modal-close-btn"))
+    expect(
+      screen.queryByRole("dialog", {
+        name: "SSH Connect - live-proxmox-stack",
+      })
+    ).not.toBeInTheDocument()
   })
 })
