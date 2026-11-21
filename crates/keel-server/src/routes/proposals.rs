@@ -9,31 +9,33 @@ use keel_core::{
     AppRuntime, BundleItemKind, CatalogApplication, CatalogBundle, CatalogManifest,
     KEEL_PREVIEWS_NAMESPACE, ManifestEngine, SopsManager, partition_values_by_schema,
     render_helm_values_yaml, render_manifest_template, tenant_namespace, validate_dns_label,
-    validate_k8s_manifests_yaml, validate_schema_values,
+    validate_k8s_manifests_yaml, validate_schema_values, verify_rendered_manifest_structure,
 };
 use keel_git::{
     PullRequestComment, PullRequestInfo, PullRequestState, parse_proposal_branch_tenant,
+    validate_commit_sha,
 };
 use keel_kube::{
-    CrdReconcileStatus, CrdWatchEvent, FlaggerCanarySpecInput, FluxDependencyRef,
-    FluxHealthCheckRef, FluxKustomizationSpecInput, FluxSubstituteReference,
-    GITHUB_TOKEN_SECRET_NAME, HelmChartSourceKind, HelmChartSourceRef, HelmReleaseSpecInput,
-    HelmValuesSecretRef, RemoteKubeConfigRef, TenantAgeKey, WatchedCrdKind,
+    FlaggerCanarySpecInput, FluxDependencyRef, FluxHealthCheckRef, FluxKustomizationSpecInput,
+    FluxSubstituteReference, GITHUB_TOKEN_SECRET_NAME, HelmChartSourceKind, HelmChartSourceRef,
+    HelmReleaseSpecInput, HelmValuesSecretRef, RemoteKubeConfigRef, TenantAgeKey,
     generate_flux_kustomization_manifest, synthesize_canary_gateway_network_policy_yaml,
     synthesize_flagger_canary_yaml, synthesize_flux_kustomization_yaml,
     synthesize_helm_release_yaml,
 };
 use keel_pko::{
     ChangeOp, EphemeralPreviewParams, GcPlan, PkoStack, PreviewReport, PreviewResourceCandidate,
-    PreviewSummary, ResourceDiff, TenantStackParams, attach_github_token_env_ref,
-    attach_s3_credentials_env_refs, build_preview_branch, format_markdown_report, plan_preview_gc,
-    synthesize_ephemeral_preview, synthesize_k8s_manifest_pulumi_yaml, synthesize_tenant_stack,
+    PreviewRunStatus, PreviewSecretCopy, PreviewSource, PreviewSummary, ResourceDiff,
+    TenantStackParams, attach_github_token_env_ref, attach_s3_credentials_env_refs,
+    build_preview_branch, format_markdown_report, synthesize_ephemeral_preview,
+    synthesize_k8s_manifest_pulumi_yaml, synthesize_tenant_stack,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::auth::AuthSession;
 use crate::error::ServerError;
+use crate::preview_lifecycle::launch_pko_preview;
 use crate::state::{AppState, CachedPreview};
 
 use super::{
@@ -135,19 +137,186 @@ pub struct CreateProposalResponse {
     pub report: PreviewReport,
 }
 
+/// Resolves the Pulumi project name a tenant Stack must use: the `name` of the Pulumi.yaml that
+/// is actually committed next to the Stack. That is the blueprint's `Pulumi.yaml`, or, when the
+/// blueprint ships none, the generated one named after the instance (`fallback`). The catalog
+/// display name is never used. The result is sanitized to Pulumi's project-name charset.
 async fn read_pulumi_project_name(pulumi_yaml_path: &Path, fallback: &str) -> String {
-    let Ok(raw) = tokio::fs::read_to_string(pulumi_yaml_path).await else {
-        return fallback.to_string();
+    let raw = tokio::fs::read_to_string(pulumi_yaml_path).await.ok();
+    pulumi_project_name_from_yaml(raw.as_deref(), fallback)
+}
+
+fn pulumi_project_name_from_yaml(raw: Option<&str>, fallback: &str) -> String {
+    let declared = raw
+        .and_then(|r| serde_yml::from_str::<serde_json::Value>(r).ok())
+        .and_then(|doc| {
+            doc.get("name")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        });
+    sanitize_pulumi_project_name(declared.as_deref().unwrap_or(fallback))
+}
+
+/// Maps a name to Pulumi's project-name charset (`[A-Za-z0-9_.-]`), collapsing other runs to `-`.
+fn sanitize_pulumi_project_name(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut last_dash = false;
+    for c in raw.trim().chars() {
+        if c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-' {
+            out.push(c);
+            last_dash = c == '-';
+        } else if !last_dash {
+            out.push('-');
+            last_dash = true;
+        }
+    }
+    let trimmed = out.trim_matches('-');
+    if trimmed.is_empty() {
+        "project".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Returns the tenant-scoped Pulumi DIY backend (`s3://<bucket>/tenants/<id>?...`) so tenant
+/// Stack state lands under the prefix the tenant's scoped SeaweedFS identity can access.
+fn tenant_stack_backend_url(state: &AppState, tenant: &str) -> Result<String, ServerError> {
+    keel_kube::tenant::tenant_s3_backend_url(&state.backend_url, tenant).map_err(|e| {
+        ServerError::Internal(format!(
+            "cannot derive tenant state backend for `{tenant}`: {e}"
+        ))
+    })
+}
+
+/// Ensures `tenant_ns` holds the tenant's state credentials before a Pulumi Stack is committed:
+///
+/// * a mirror of the tenant's own scoped S3 identity, attached to the Stack's `envRefs`;
+/// * the tenant state encryption passphrase (`keel-pulumi-passphrase`) the Stack workspace
+///   sources `PULUMI_CONFIG_PASSPHRASE` from.
+///
+/// Fails closed with `409 Conflict` when either is missing (after one lazy provisioning attempt),
+/// rather than committing a Stack that can never reach or decrypt its state (and never falling
+/// back to the control-plane admin keys or an empty passphrase).
+async fn attach_tenant_state_credentials(
+    state: &AppState,
+    tenant: &str,
+    tenant_ns: &str,
+    env_refs: &mut std::collections::BTreeMap<String, keel_pko::PkoEnvRef>,
+) -> Result<(), ServerError> {
+    attach_tenant_s3_credentials(state, tenant, tenant_ns, env_refs).await?;
+    require_tenant_pulumi_passphrase(state, tenant, tenant_ns).await
+}
+
+/// Fails closed (`409`) unless `tenant_ns` holds a usable Pulumi state passphrase. A missing
+/// passphrase is provisioned lazily only through the tenant provisioner (which creates it
+/// alongside the scoped S3 identity); the server never invents one on the proposal path.
+async fn require_tenant_pulumi_passphrase(
+    state: &AppState,
+    tenant: &str,
+    tenant_ns: &str,
+) -> Result<(), ServerError> {
+    if !state.require_pulumi_passphrase {
+        return Ok(());
+    }
+    let present = |r: Result<bool, keel_kube::KubeError>| match r {
+        Ok(p) => Ok(p),
+        Err(e) => {
+            tracing::error!(tenant, error = %e, "failed to read tenant Pulumi state passphrase");
+            Err(ServerError::Conflict(format!(
+                "tenant `{tenant}` Pulumi state passphrase is unreadable; re-run tenant provisioning"
+            )))
+        }
     };
-    let Ok(doc) = serde_yml::from_str::<serde_json::Value>(&raw) else {
-        return fallback.to_string();
+    if present(state.secret_store.has_pulumi_passphrase(tenant_ns).await)? {
+        return Ok(());
+    }
+    if provision_missing_tenant_identity(state, tenant).await?
+        && present(state.secret_store.has_pulumi_passphrase(tenant_ns).await)?
+    {
+        return Ok(());
+    }
+    Err(ServerError::Conflict(format!(
+        "tenant `{tenant}` has no Pulumi state passphrase (`{tenant_ns}/{}`, key `{}`); \
+         run tenant provisioning before creating Pulumi stacks",
+        keel_pko::PULUMI_PASSPHRASE_SECRET_NAME,
+        keel_pko::PULUMI_PASSPHRASE_SECRET_KEY
+    )))
+}
+
+/// Ensures `tenant_ns` holds a mirror of the tenant's own scoped S3 identity and attaches it to
+/// the tenant Stack's `envRefs` (`409` when the tenant has no scoped state credentials).
+async fn attach_tenant_s3_credentials(
+    state: &AppState,
+    tenant: &str,
+    tenant_ns: &str,
+    env_refs: &mut std::collections::BTreeMap<String, keel_pko::PkoEnvRef>,
+) -> Result<(), ServerError> {
+    let Some(ref s3_secret) = state.s3_credentials_secret else {
+        return Ok(());
     };
-    doc.get("name")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or(fallback)
-        .to_string()
+    match state
+        .secret_store
+        .ensure_s3_credentials_in_namespace(tenant_ns)
+        .await
+    {
+        Ok(true) => {
+            attach_s3_credentials_env_refs(env_refs, s3_secret);
+            Ok(())
+        }
+        Ok(false) => {
+            if provision_missing_tenant_identity(state, tenant).await?
+                && let Ok(true) = state
+                    .secret_store
+                    .ensure_s3_credentials_in_namespace(tenant_ns)
+                    .await
+            {
+                attach_s3_credentials_env_refs(env_refs, s3_secret);
+                return Ok(());
+            }
+            Err(ServerError::Conflict(format!(
+                "tenant `{tenant}` has no scoped state credentials \
+                 (`{tenant_ns}/{}`); run tenant provisioning before creating Pulumi stacks",
+                keel_kube::tenant::TENANT_S3_CREDENTIALS_SECRET_NAME
+            )))
+        }
+        Err(e) => {
+            tracing::error!(tenant, error = %e, "failed to mirror tenant scoped state credentials");
+            Err(ServerError::Conflict(format!(
+                "tenant `{tenant}` scoped state credentials are unusable; re-run tenant provisioning"
+            )))
+        }
+    }
+}
+
+/// Lazily provisions a tenant's scoped S3 identity when a provisioner is configured (e.g. the
+/// tenant was onboarded through the API before its namespace existed). Returns `Ok(true)` when an
+/// identity is now in place.
+async fn provision_missing_tenant_identity(
+    state: &AppState,
+    tenant: &str,
+) -> Result<bool, ServerError> {
+    let Some(provisioner) = state.tenant_s3_provisioner.as_ref() else {
+        return Ok(false);
+    };
+    match provisioner.provision_tenant_s3_identity(tenant).await {
+        Ok(keel_kube::TenantS3ProvisionOutcome::NamespaceMissing) => Ok(false),
+        Ok(outcome) => {
+            tracing::info!(
+                tenant,
+                ?outcome,
+                "provisioned tenant scoped S3 state identity"
+            );
+            Ok(true)
+        }
+        Err(e) => {
+            tracing::error!(tenant, error = %e, "tenant scoped S3 identity provisioning failed");
+            Err(ServerError::ServiceUnavailable(format!(
+                "could not provision scoped state credentials for tenant `{tenant}`; retry later"
+            )))
+        }
+    }
 }
 
 fn populate_stack_config_from_values(
@@ -169,13 +338,9 @@ fn populate_stack_config_from_values(
     }
 }
 
-fn build_infra_secret_manifest_yaml(
-    secret_name: &str,
-    namespace: &str,
-    secret_values: &Value,
-) -> Result<(String, Vec<String>), ServerError> {
-    let mut string_data = serde_json::Map::new();
-    let mut keys = Vec::new();
+/// Renders schema secret values into `stringData` form (nulls dropped, scalars stringified).
+fn render_secret_string_data(secret_values: &Value) -> std::collections::BTreeMap<String, String> {
+    let mut out = std::collections::BTreeMap::new();
     if let Some(obj) = secret_values.as_object() {
         for (key, val) in obj {
             let rendered = match val {
@@ -185,9 +350,63 @@ fn build_infra_secret_manifest_yaml(
                 Value::Number(n) => n.to_string(),
                 Value::Array(_) | Value::Object(_) => val.to_string(),
             };
-            keys.push(key.clone());
-            string_data.insert(key.clone(), Value::String(rendered));
+            out.insert(key.clone(), rendered);
         }
+    }
+    out
+}
+
+/// Secrets the preview runner already mirrors with tenant-scoped values (state backend, forge
+/// token); tenant Stack refs to them are never copied into a preview.
+fn preview_runner_managed_secrets(state: &AppState) -> std::collections::BTreeSet<String> {
+    let mut out = std::collections::BTreeSet::from([
+        keel_kube::S3_CREDENTIALS_SECRET_NAME.to_string(),
+        keel_kube::GITHUB_TOKEN_SECRET_NAME.to_string(),
+        keel_kube::tenant::TENANT_S3_CREDENTIALS_SECRET_NAME.to_string(),
+    ]);
+    if let Some(name) = &state.s3_credentials_secret {
+        out.insert(name.clone());
+    }
+    out
+}
+
+/// Plans provider-credential Secret copies for a tenant preview and rewrites its refs. The PR's
+/// own `<instance>-secrets` values (not yet decrypted into the tenant namespace by Flux for a
+/// brand-new stack) are attached as `proposed_data` so the preview evaluates the PR.
+fn plan_preview_credentials(
+    state: &AppState,
+    params: &mut EphemeralPreviewParams,
+    tenant_stack: &PkoStack,
+    instance_secret_name: &str,
+    proposed_secret_values: &Value,
+) -> Result<Vec<PreviewSecretCopy>, ServerError> {
+    let mut copies =
+        params.inherit_tenant_credentials(tenant_stack, &preview_runner_managed_secrets(state))?;
+    let proposed = render_secret_string_data(proposed_secret_values);
+    for copy in &mut copies {
+        if copy.source_name == instance_secret_name && !proposed.is_empty() {
+            copy.proposed_data = Some(
+                proposed
+                    .iter()
+                    .filter(|(k, _)| copy.keys.contains(*k))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+            );
+        }
+    }
+    Ok(copies)
+}
+
+fn build_infra_secret_manifest_yaml(
+    secret_name: &str,
+    namespace: &str,
+    secret_values: &Value,
+) -> Result<(String, Vec<String>), ServerError> {
+    let mut string_data = serde_json::Map::new();
+    let mut keys = Vec::new();
+    for (key, rendered) in render_secret_string_data(secret_values) {
+        keys.push(key.clone());
+        string_data.insert(key, Value::String(rendered));
     }
     let secret_doc = json!({
         "apiVersion": "v1",
@@ -425,10 +644,14 @@ pub async fn create_proposal(
                 .map(|r| r.rel_dir)
                 .unwrap_or_else(|| format!("tenants/{}/apps/{instance_name}", req.tenant));
             let raw_manifests = load_catalog_app_raw_manifests(&state.repo_workdir, app).await;
-            let mut rendered = render_manifest_template(&raw_manifests, &partitioned.normal_values);
+            let mut rendered =
+                render_manifest_template(&raw_manifests, &partitioned.normal_values)?;
             if !rendered.ends_with('\n') {
                 rendered.push('\n');
             }
+            // Fail closed before anything is committed: rendered values must not add documents
+            // or change resource kinds relative to the catalog-authored template.
+            verify_rendered_manifest_structure(&raw_manifests, &rendered)?;
             rendered_manifest_template_yaml = Some(rendered.clone());
 
             let remote_kc = req
@@ -541,7 +764,7 @@ pub async fn create_proposal(
                             "organization/{instance_name}/{}-{instance_name}",
                             req.tenant
                         ),
-                        &state.backend_url,
+                        tenant_stack_backend_url(&state, &req.tenant)?,
                         "keel-gitops",
                         &rel_dir,
                     );
@@ -566,13 +789,13 @@ pub async fn create_proposal(
                         &infra_secret_name,
                         &infra_secret_keys,
                     );
-                    if let Some(ref s3_secret) = state.s3_credentials_secret {
-                        let _ = state
-                            .secret_store
-                            .ensure_s3_credentials_in_namespace(&tenant_ns)
-                            .await;
-                        attach_s3_credentials_env_refs(&mut stack_params.env_refs, s3_secret);
-                    }
+                    attach_tenant_state_credentials(
+                        &state,
+                        &req.tenant,
+                        &tenant_ns,
+                        &mut stack_params.env_refs,
+                    )
+                    .await?;
                     if matches!(
                         state
                             .secret_store
@@ -740,7 +963,7 @@ pub async fn create_proposal(
                 .join(&req.catalog_id)
                 .join("Pulumi.yaml");
             let pulumi_project =
-                read_pulumi_project_name(&blueprint_pulumi_path, &bp.metadata.name).await;
+                read_pulumi_project_name(&blueprint_pulumi_path, &instance_name).await;
             let mut stack_params = TenantStackParams::new(
                 &req.tenant,
                 &instance_name,
@@ -748,7 +971,7 @@ pub async fn create_proposal(
                     "organization/{pulumi_project}/{}-{instance_name}",
                     req.tenant
                 ),
-                &state.backend_url,
+                tenant_stack_backend_url(&state, &req.tenant)?,
                 "keel-gitops",
                 &rel_dir,
             );
@@ -787,13 +1010,13 @@ pub async fn create_proposal(
                 &infra_secret_keys,
             );
             let tenant_ns = tenant_namespace(&req.tenant)?;
-            if let Some(ref s3_secret) = state.s3_credentials_secret {
-                let _ = state
-                    .secret_store
-                    .ensure_s3_credentials_in_namespace(&tenant_ns)
-                    .await;
-                attach_s3_credentials_env_refs(&mut stack_params.env_refs, s3_secret);
-            }
+            attach_tenant_state_credentials(
+                &state,
+                &req.tenant,
+                &tenant_ns,
+                &mut stack_params.env_refs,
+            )
+            .await?;
             if matches!(
                 state
                     .secret_store
@@ -1317,36 +1540,37 @@ pub async fn create_proposal(
         (sha, is_update)
     };
 
-    let mode_tag = if is_update { "[Update]" } else { "[New]" };
-    let pr_title = req
-        .title
-        .map(|t| format!("{mode_tag} {t}"))
-        .unwrap_or_else(|| {
-            format!(
-                "{mode_tag} feat({}): {} {}",
-                req.tenant,
-                if is_app { "deploy" } else { "provision" },
-                instance_name
-            )
-        });
-    let pr_body = req.body.unwrap_or_else(|| {
-        format!(
-            "{mode_tag} Automated proposal for tenant `{}` (`{}`)\n\n- Action: {}\n- Commit: `{}`\n- Path: `{}`",
-            req.tenant,
-            req.catalog_id,
-            if is_update {
-                "Update existing instance"
-            } else {
-                "Create new instance"
-            },
-            commit_sha,
-            rel_dir
-        )
-    });
+    let verb = match (is_update, is_app) {
+        (true, _) => "update",
+        (false, true) => "deploy",
+        (false, false) => "provision",
+    };
+    let pr_title = proposal_pr_title(req.title.as_deref(), &req.tenant, verb, &instance_name);
+    let summary = format!(
+        "Automated proposal for tenant `{}` (`{}`)\n\n- Action: {}\n- Commit: `{}`\n- Path: `{}`",
+        req.tenant,
+        req.catalog_id,
+        if is_update {
+            "Update existing instance"
+        } else {
+            "Create new instance"
+        },
+        commit_sha,
+        rel_dir
+    );
+    let pr_body = proposal_pr_body(
+        req.title.as_deref(),
+        &pr_title,
+        req.body.as_deref(),
+        &summary,
+    );
 
     let pr = open_pr_for_session(&state, &auth, &req.tenant, &branch, pr_title, pr_body).await?;
+    audit_proposal_event("create", &auth, Some(&req.tenant), &pr);
 
-    // Synthesize ephemeral PKO v2 preview CRs in `keel-previews`
+    // Ephemeral PKO v2 preview in `keel-previews` (`SDD.md` §4.2): only Pulumi-backed changes
+    // (infra blueprints, Pulumi-engine manifest apps) have a program PKO can preview.
+    let pko_backed = !is_app || manifest_engine == Some(ManifestEngine::Pulumi);
     let mut preview_params = EphemeralPreviewParams::for_action(
         &pr.id,
         &req.tenant,
@@ -1357,7 +1581,10 @@ pub async fn create_proposal(
         format!("organization/{instance_name}-pr-{}/{}", pr.id, req.tenant),
         &state.backend_url,
     )?;
-    if !is_app || manifest_engine == Some(ManifestEngine::Pulumi) {
+    preview_params.head_sha = Some(commit_sha.clone());
+    let mut preview_blocker: Option<String> = None;
+    let mut preview_secret_copies: Vec<PreviewSecretCopy> = Vec::new();
+    if pko_backed {
         populate_stack_config_from_values(&mut preview_params.config, &partitioned.normal_values);
         if let CatalogManifest::InfraBlueprint(bp) = &manifest
             && bp.spec.outputs.iter().any(|o| o == "kubeconfig")
@@ -1370,75 +1597,47 @@ pub async fn create_proposal(
                 .config
                 .insert("kubeconfigSecretNamespace".to_string(), tenant_ns.clone());
         }
-        if let Some(ref s3_secret) = state.s3_credentials_secret {
-            let _ = state
-                .secret_store
-                .ensure_s3_credentials_in_namespace(KEEL_PREVIEWS_NAMESPACE)
-                .await;
-            attach_s3_credentials_env_refs(&mut preview_params.env_refs, s3_secret);
+        if let Ok(tenant_stack) = PkoStack::from_yaml(&manifest_yaml) {
+            preview_params.inherit_tenant_stack(&tenant_stack);
+            preview_secret_copies = plan_preview_credentials(
+                &state,
+                &mut preview_params,
+                &tenant_stack,
+                &infra_secret_name,
+                &partitioned.secret_values,
+            )?;
         }
-        if matches!(
-            state
-                .secret_store
-                .ensure_github_token_in_namespace(KEEL_PREVIEWS_NAMESPACE)
-                .await,
-            Ok(true)
-        ) {
-            attach_github_token_env_ref(&mut preview_params.env_refs, GITHUB_TOKEN_SECRET_NAME);
+        // The preview workspace always decrypts with the tenant's state passphrase (copied into
+        // `keel-previews` per preview); never an empty one.
+        let passphrase_copy = preview_params.passphrase_secret_copy()?;
+        if !preview_secret_copies
+            .iter()
+            .any(|c| c.target_name == passphrase_copy.target_name)
+        {
+            preview_secret_copies.push(passphrase_copy);
         }
+        preview_blocker =
+            attach_preview_cluster_inputs(&state, &req.tenant, &mut preview_params).await;
     }
     let preview_stack = synthesize_ephemeral_preview(&preview_params)?;
-
-    let mut preview_resources = vec![ResourceDiff {
-        urn: format!(
-            "urn:pulumi:pr-{}::{}::{}::{}",
-            pr.id, req.tenant, preview_resource_type, instance_name
+    let run = match (pko_backed, preview_blocker) {
+        (false, _) => PreviewRunStatus::not_executed(
+            "Flux-managed change: no Pulumi program to preview; report synthesized from the proposed manifests",
         ),
-        resource_type: preview_resource_type.to_string(),
-        name: instance_name.clone(),
-        op: ChangeOp::Create,
-        changed_fields: vec!["spec".to_string()],
-    }];
-    if manifest_engine == Some(ManifestEngine::Pulumi)
-        && let Some(ref rendered_manifests) = rendered_manifest_template_yaml
-        && let Ok(docs) = validate_k8s_manifests_yaml(rendered_manifests)
-    {
-        for doc in docs {
-            let api_v = doc
-                .get("apiVersion")
-                .and_then(Value::as_str)
-                .unwrap_or("v1");
-            let kind = doc
-                .get("kind")
-                .and_then(Value::as_str)
-                .unwrap_or("Resource");
-            let name = doc
-                .pointer("/metadata/name")
-                .and_then(Value::as_str)
-                .unwrap_or(&instance_name);
-            let k8s_type = format!("kubernetes:{api_v}:{kind}");
-            preview_resources.push(ResourceDiff {
-                urn: format!(
-                    "urn:pulumi:pr-{}::{}::{}::{}",
-                    pr.id, req.tenant, k8s_type, name
-                ),
-                resource_type: k8s_type,
-                name: name.to_string(),
-                op: ChangeOp::Create,
-                changed_fields: vec!["metadata".to_string(), "spec".to_string()],
-            });
-        }
-    }
-
-    let report = PreviewReport {
-        summary: PreviewSummary {
-            create: preview_resources.len(),
-            ..PreviewSummary::default()
-        },
-        resources: preview_resources,
+        (true, Some(reason)) => PreviewRunStatus::not_executed(reason),
+        (true, None) => launch_pko_preview(&state, &preview_stack, &preview_secret_copies).await,
     };
 
-    let markdown = format_markdown_report(&report, &pr.id);
+    let report = synthesize_proposal_report(
+        &pr.id,
+        &req.tenant,
+        preview_resource_type,
+        &instance_name,
+        rendered_manifest_template_yaml.as_deref(),
+        run,
+    );
+
+    let markdown = simulated_preview_markdown(&report, &pr.id);
     if let Err(err) = state.forge.post_preview_comment(&pr.id, &markdown).await {
         tracing::warn!(pr_id = %pr.id, error = %err, "Failed to post preview comment to forge");
     }
@@ -1453,15 +1652,6 @@ pub async fn create_proposal(
         },
     );
 
-    state.telemetry.publish(CrdWatchEvent::new(
-        WatchedCrdKind::Stack,
-        KEEL_PREVIEWS_NAMESPACE,
-        &preview_stack.stack.metadata.name,
-        CrdReconcileStatus::Previewing,
-        format!("Ephemeral preview created for PR #{} ({})", pr.id, branch),
-        Some(commit_sha),
-    ));
-
     Ok((
         StatusCode::CREATED,
         Json(CreateProposalResponse {
@@ -1471,6 +1661,110 @@ pub async fn create_proposal(
             report,
         }),
     ))
+}
+
+/// Resolves cluster-side preview inputs for `tenant` (OPEN-9): the tenant's **scoped** S3 state
+/// identity mirrored into `keel-previews` (never the control-plane admin keys) and the tenant's
+/// cluster-reachable Flux Git source + read-only credentials. Returns a human-readable reason
+/// when the PKO preview cannot run (rendered as `notExecuted`).
+async fn attach_preview_cluster_inputs(
+    state: &AppState,
+    tenant: &str,
+    params: &mut EphemeralPreviewParams,
+) -> Option<String> {
+    let Some(cluster) = state.preview_cluster.clone() else {
+        return Some("No live cluster connected: PKO preview not executed".to_string());
+    };
+    let prereqs = match cluster.ensure_preview_prerequisites(tenant).await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(tenant, error = %e, "preview prerequisites unavailable");
+            return Some(format!(
+                "Preview prerequisites unavailable for tenant `{tenant}`: PKO preview not executed"
+            ));
+        }
+    };
+    if let Some(url) = prereqs.git_url {
+        params.repo_url = url;
+        params.git_secret_name = prereqs.git_secret;
+    }
+    if params.backend_url.starts_with("s3://") {
+        match prereqs.s3_secret {
+            Some(secret) => attach_s3_credentials_env_refs(&mut params.env_refs, &secret),
+            None if state.s3_credentials_secret.is_some() => {
+                return Some(format!(
+                    "Tenant `{tenant}` has no scoped state credentials: PKO preview not executed"
+                ));
+            }
+            None => {}
+        }
+    }
+    if matches!(
+        state
+            .secret_store
+            .ensure_github_token_in_namespace(KEEL_PREVIEWS_NAMESPACE)
+            .await,
+        Ok(true)
+    ) {
+        attach_github_token_env_ref(&mut params.env_refs, GITHUB_TOKEN_SECRET_NAME);
+    }
+    params.docker_host = state.docker_proxy_url.clone();
+    None
+}
+
+/// Builds the creation-time report: a control-plane synthesis (`source: synthesized`) listing
+/// the proposed top-level object plus every rendered manifest document (UI-14), annotated with
+/// the PKO run status. Real PKO results replace it once the run finishes.
+fn synthesize_proposal_report(
+    pr_id: &str,
+    tenant: &str,
+    resource_type: &str,
+    instance_name: &str,
+    rendered_manifests: Option<&str>,
+    run: PreviewRunStatus,
+) -> PreviewReport {
+    let mut resources = vec![ResourceDiff {
+        urn: format!("urn:pulumi:pr-{pr_id}::{tenant}::{resource_type}::{instance_name}"),
+        resource_type: resource_type.to_string(),
+        name: instance_name.to_string(),
+        op: ChangeOp::Create,
+        changed_fields: vec!["spec".to_string()],
+    }];
+    if let Some(rendered) = rendered_manifests
+        && let Ok(docs) = validate_k8s_manifests_yaml(rendered)
+    {
+        for doc in docs {
+            let api_v = doc
+                .get("apiVersion")
+                .and_then(Value::as_str)
+                .unwrap_or("v1");
+            let kind = doc
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or("Resource");
+            let name = doc
+                .pointer("/metadata/name")
+                .and_then(Value::as_str)
+                .unwrap_or(instance_name);
+            let k8s_type = format!("kubernetes:{api_v}:{kind}");
+            resources.push(ResourceDiff {
+                urn: format!("urn:pulumi:pr-{pr_id}::{tenant}::{k8s_type}::{name}"),
+                resource_type: k8s_type,
+                name: name.to_string(),
+                op: ChangeOp::Create,
+                changed_fields: vec!["metadata".to_string(), "spec".to_string()],
+            });
+        }
+    }
+    PreviewReport {
+        summary: PreviewSummary {
+            create: resources.len(),
+            ..PreviewSummary::default()
+        },
+        resources,
+        source: PreviewSource::Synthesized,
+        run: Some(run),
+    }
 }
 
 async fn create_bundle_proposal(
@@ -1783,7 +2077,7 @@ async fn create_bundle_proposal(
                     .join(&item.catalog_ref)
                     .join("Pulumi.yaml");
                 let pulumi_project =
-                    read_pulumi_project_name(&blueprint_pulumi_path, &bp.metadata.name).await;
+                    read_pulumi_project_name(&blueprint_pulumi_path, &item_resource_name).await;
                 let mut stack_params = TenantStackParams::new(
                     &req.tenant,
                     &item_resource_name,
@@ -1791,7 +2085,7 @@ async fn create_bundle_proposal(
                         "organization/{pulumi_project}/{}-{item_resource_name}",
                         req.tenant
                     ),
-                    &state.backend_url,
+                    tenant_stack_backend_url(&state, &req.tenant)?,
                     "keel-gitops",
                     &item_rel_dir,
                 );
@@ -1832,13 +2126,13 @@ async fn create_bundle_proposal(
                 if bp.metadata.provider == "kind" {
                     stack_params.docker_host = state.docker_proxy_url.clone();
                 }
-                if let Some(ref s3_secret) = state.s3_credentials_secret {
-                    let _ = state
-                        .secret_store
-                        .ensure_s3_credentials_in_namespace(&tenant_ns)
-                        .await;
-                    attach_s3_credentials_env_refs(&mut stack_params.env_refs, s3_secret);
-                }
+                attach_tenant_state_credentials(
+                    &state,
+                    &req.tenant,
+                    &tenant_ns,
+                    &mut stack_params.env_refs,
+                )
+                .await?;
                 if matches!(
                     state
                         .secret_store
@@ -2071,32 +2365,42 @@ async fn create_bundle_proposal(
         (sha, is_update)
     };
 
-    let mode_tag = if is_update { "[Update]" } else { "[New]" };
-    let pr_title = req
-        .title
-        .map(|t| format!("{mode_tag} {t}"))
-        .unwrap_or_else(|| {
-            format!(
-                "{mode_tag} feat({}): deploy bundle {instance_name}",
-                req.tenant
-            )
-        });
-    let pr_body = req.body.unwrap_or_else(|| {
-        format!(
-            "{mode_tag} Automated bundle proposal for tenant `{}` (`{}`)\n\n- Items: {}\n- Commit: `{}`\n- Path: `{}`",
-            req.tenant,
-            req.catalog_id,
-            prepared_items
-                .iter()
-                .map(|i| i.id.as_str())
-                .collect::<Vec<_>>()
-                .join(" -> "),
-            commit_sha,
-            bundle_rel_dir
-        )
-    });
+    let pr_title = proposal_pr_title(
+        req.title.as_deref(),
+        &req.tenant,
+        if is_update {
+            "update bundle"
+        } else {
+            "deploy bundle"
+        },
+        &instance_name,
+    );
+    let summary = format!(
+        "Automated bundle proposal for tenant `{}` (`{}`)\n\n- Action: {}\n- Items: {}\n- Commit: `{}`\n- Path: `{}`",
+        req.tenant,
+        req.catalog_id,
+        if is_update {
+            "Update existing bundle"
+        } else {
+            "Create new bundle"
+        },
+        prepared_items
+            .iter()
+            .map(|i| i.id.as_str())
+            .collect::<Vec<_>>()
+            .join(" -> "),
+        commit_sha,
+        bundle_rel_dir
+    );
+    let pr_body = proposal_pr_body(
+        req.title.as_deref(),
+        &pr_title,
+        req.body.as_deref(),
+        &summary,
+    );
 
     let pr = open_pr_for_session(&state, &auth, &req.tenant, &branch, pr_title, pr_body).await?;
+    audit_proposal_event("create", &auth, Some(&req.tenant), &pr);
 
     let mut preview_params = EphemeralPreviewParams::for_action(
         &pr.id,
@@ -2108,23 +2412,10 @@ async fn create_bundle_proposal(
         format!("organization/{instance_name}-pr-{}/{}", pr.id, req.tenant),
         &state.backend_url,
     )?;
-    preview_params.docker_host = state.docker_proxy_url.clone();
-    if let Some(ref s3_secret) = state.s3_credentials_secret {
-        let _ = state
-            .secret_store
-            .ensure_s3_credentials_in_namespace(KEEL_PREVIEWS_NAMESPACE)
-            .await;
-        attach_s3_credentials_env_refs(&mut preview_params.env_refs, s3_secret);
-    }
-    if matches!(
-        state
-            .secret_store
-            .ensure_github_token_in_namespace(KEEL_PREVIEWS_NAMESPACE)
-            .await,
-        Ok(true)
-    ) {
-        attach_github_token_env_ref(&mut preview_params.env_refs, GITHUB_TOKEN_SECRET_NAME);
-    }
+    // Bundles span several Stacks/HelmReleases with `dependsOn` ordering; a single PKO preview
+    // cannot evaluate them, so the bundle preview Stack is synthesized but never applied (and
+    // never carries control-plane admin S3 keys, OPEN-9).
+    preview_params.head_sha = Some(commit_sha.clone());
     let preview_stack = synthesize_ephemeral_preview(&preview_params)?;
 
     let resources: Vec<ResourceDiff> = prepared_items
@@ -2165,9 +2456,13 @@ async fn create_bundle_proposal(
             ..PreviewSummary::default()
         },
         resources,
+        source: PreviewSource::Synthesized,
+        run: Some(PreviewRunStatus::not_executed(
+            "Bundle proposal: per-item PKO previews are not executed; report synthesized from the bundle plan",
+        )),
     };
 
-    let markdown = format_markdown_report(&report, &pr.id);
+    let markdown = simulated_preview_markdown(&report, &pr.id);
     if let Err(err) = state.forge.post_preview_comment(&pr.id, &markdown).await {
         tracing::warn!(pr_id = %pr.id, error = %err, "Failed to post preview comment to forge");
     }
@@ -2181,18 +2476,6 @@ async fn create_bundle_proposal(
             candidates,
         },
     );
-
-    state.telemetry.publish(CrdWatchEvent::new(
-        WatchedCrdKind::Stack,
-        KEEL_PREVIEWS_NAMESPACE,
-        &preview_stack.stack.metadata.name,
-        CrdReconcileStatus::Previewing,
-        format!(
-            "Ephemeral bundle preview created for PR #{} ({})",
-            pr.id, branch
-        ),
-        Some(commit_sha),
-    ));
 
     Ok((
         StatusCode::CREATED,
@@ -2351,8 +2634,38 @@ pub(crate) fn synthesize_report_from_git_diff(pr_id: &str, git_diff: &str) -> Pr
         &mut summary,
     );
 
-    PreviewReport { resources, summary }
+    PreviewReport {
+        resources,
+        summary,
+        source: PreviewSource::Synthesized,
+        run: None,
+    }
 }
+
+/// Banner prepended to PR comments for control-plane-synthesized previews.
+const SIMULATED_PREVIEW_NOTICE: &str = "> **Simulated diff — PKO preview not executed.** This report was synthesized by the Keel control plane from the proposed manifests; it is not the output of a `pulumi preview` run and does not include policy evaluation.\n\n";
+
+/// Renders the PR comment markdown, flagging synthesized reports as simulated.
+fn simulated_preview_markdown(report: &PreviewReport, pr_id: &str) -> String {
+    let body = format_markdown_report(report, pr_id);
+    if report.source != PreviewSource::Synthesized {
+        return body;
+    }
+    let pko_in_flight = report.run.as_ref().is_some_and(|r| {
+        matches!(
+            r.phase,
+            keel_pko::PreviewPhase::Pending | keel_pko::PreviewPhase::Running
+        )
+    });
+    if pko_in_flight {
+        format!("{PROVISIONAL_PREVIEW_NOTICE}{body}")
+    } else {
+        format!("{SIMULATED_PREVIEW_NOTICE}{body}")
+    }
+}
+
+/// Banner for the creation-time comment while the real PKO preview is still running.
+const PROVISIONAL_PREVIEW_NOTICE: &str = "> **Provisional diff — PKO preview running.** This summary was synthesized by the Keel control plane from the proposed manifests; the real `pulumi preview` results will be posted as a follow-up comment when the ephemeral PKO preview completes.\n\n";
 
 /// `GET /api/v1/proposals/{pr_id}/preview`
 pub async fn get_proposal_preview(
@@ -2372,6 +2685,10 @@ pub async fn get_proposal_preview(
             auth.require_admin()?;
         }
     }
+    // Cluster-persisted PKO report first (survives restarts / shared across replicas), then the
+    // optional in-memory cache, then a synthesis from the Git diff.
+    let (cluster_report, live_run) =
+        crate::preview_lifecycle::load_cluster_preview(&state, &pr_id).await;
     let cached_report = state
         .preview_cache
         .read()
@@ -2379,30 +2696,23 @@ pub async fn get_proposal_preview(
         .get(&pr_id)
         .map(|c| c.report.clone());
 
-    let git_diff = if tokio::fs::try_exists(state.repo_workdir.join(".git"))
-        .await
-        .unwrap_or(false)
-    {
-        let _git_guard = state.git_lock.lock().await;
-        let _ = state.git_runner.fetch(&state.repo_workdir, "origin").await;
-        let base_ref = format!("origin/{}", pr.target_branch);
-        let head_ref = format!("origin/{}", pr.source_branch);
-        state
-            .git_runner
-            .diff_refs(&state.repo_workdir, &base_ref, &head_ref)
-            .await
-            .ok()
-            .filter(|d| !d.is_empty())
-    } else {
-        None
-    };
+    let git_diff = compute_pr_git_diff(&state, &pr).await;
 
-    let report = match cached_report {
-        Some(r) => r,
-        None => match git_diff.as_deref() {
-            Some(diff) => synthesize_report_from_git_diff(&pr_id, diff),
-            None => PreviewReport::default(),
-        },
+    let report = match (cluster_report, cached_report) {
+        (Some(r), _) => r,
+        (None, cached) => {
+            let mut r = match cached {
+                Some(r) => r,
+                None => match git_diff.as_deref() {
+                    Some(diff) => synthesize_report_from_git_diff(&pr_id, diff),
+                    None => PreviewReport::default(),
+                },
+            };
+            if let Some(live) = live_run {
+                r.run = Some(live);
+            }
+            r
+        }
     };
 
     Ok(Json(ProposalPreviewResponse {
@@ -2425,6 +2735,18 @@ pub struct MergeProposalResponse {
     pub gc_plan: GcPlan,
 }
 
+/// Rejects path traversal (`..` segments), absolute paths, backslashes, and NUL/control characters
+/// so that prefix checks such as `tenants/<id>/` cannot be bypassed.
+fn is_safe_repo_relative_path(path: &str) -> bool {
+    !path.is_empty()
+        && !path.starts_with('/')
+        && !path.starts_with('~')
+        && !path.contains('\\')
+        && !path.contains("..")
+        && !path.chars().any(char::is_control)
+        && !path.split('/').any(|seg| seg == ".")
+}
+
 /// Validates that a PR's changed files are strictly scoped to `tenants/<tenant>/` (excluding `rbac.yaml`)
 /// and only tenant-scoped additions/removals in `tenants/kustomization.yaml`.
 fn validate_tenant_admin_pr_paths(
@@ -2444,6 +2766,11 @@ fn validate_tenant_admin_pr_paths(
         let trimmed = path.trim();
         if trimmed.is_empty() {
             continue;
+        }
+        if !is_safe_repo_relative_path(trimmed) {
+            return Err(ServerError::Forbidden(format!(
+                "Tenant administrators cannot manage PRs touching unsafe path '{trimmed}'"
+            )));
         }
         if trimmed == rbac_path {
             return Err(ServerError::Forbidden(format!(
@@ -2487,7 +2814,7 @@ fn validate_tenant_admin_pr_paths(
                                 .to_string(),
                         ));
                     };
-                    if !entry.starts_with(&kustomize_prefix) {
+                    if !is_safe_repo_relative_path(entry) || !entry.starts_with(&kustomize_prefix) {
                         return Err(ServerError::Forbidden(format!(
                             "Tenant administrators cannot modify '{entry}' in 'tenants/kustomization.yaml'"
                         )));
@@ -2505,21 +2832,28 @@ fn validate_tenant_admin_pr_paths(
 
 /// Authorizes `merge_proposal`, `reject_proposal`, and `reopen_proposal` for either cluster admins
 /// (`keel-admins`) or tenant-scoped admins (`tenant-<id>-admin`) when the PR is strictly scoped to `<id>`.
+///
+/// For tenant administrators, returns the exact source-branch head SHA whose file scope was
+/// verified, so callers can pin the subsequent forge operation to that commit.
 async fn require_pr_tenant_admin_access(
     auth: &AuthSession,
     state: &AppState,
     pr_id: &str,
     expected_state: Option<PullRequestState>,
-) -> Result<(), ServerError> {
+) -> Result<Option<String>, ServerError> {
     if auth.is_admin() {
-        return Ok(());
+        return Ok(None);
     }
 
-    let prs = state.forge.list_pull_requests(None, expected_state).await?;
-    let pr = prs
-        .into_iter()
-        .find(|p| p.id == pr_id)
-        .ok_or_else(|| ServerError::NotFound(format!("Pull request '{pr_id}' not found")))?;
+    // Direct lookup: paginated list scans could miss older PRs (OPEN-18).
+    let pr = state.forge.get_pull_request(pr_id).await?;
+    if let Some(expected) = expected_state
+        && pr.state != expected
+    {
+        return Err(ServerError::NotFound(format!(
+            "Pull request '{pr_id}' is not {expected}"
+        )));
+    }
 
     let tenant = parse_proposal_branch_tenant(&pr.source_branch).ok_or_else(|| {
         ServerError::Forbidden(format!(
@@ -2528,6 +2862,12 @@ async fn require_pr_tenant_admin_access(
         ))
     })?;
     auth.require_tenant_admin(tenant)?;
+    if pr.target_branch != "main" {
+        return Err(ServerError::Forbidden(format!(
+            "Tenant administrators can only manage PRs targeting 'main' (PR #{pr_id} targets '{}')",
+            pr.target_branch
+        )));
+    }
 
     if !tokio::fs::try_exists(state.repo_workdir.join(".git"))
         .await
@@ -2538,10 +2878,23 @@ async fn require_pr_tenant_admin_access(
         ));
     }
 
-    let (changed_files, kustomization_diff) = {
+    let (head_sha, changed_files, kustomization_diff) = {
         let _git_guard = state.git_lock.lock().await;
         let _ = state.git_runner.fetch(&state.repo_workdir, "origin").await;
-        let range = format!("origin/main...origin/{}", pr.source_branch);
+        // Resolve the branch head once; the scope check and the merge are both pinned to it so a
+        // push between verification and merge cannot smuggle in unverified changes.
+        let head_sha = state
+            .git_runner
+            .rev_parse(&state.repo_workdir, &format!("origin/{}", pr.source_branch))
+            .await
+            .ok()
+            .filter(|sha| validate_commit_sha(sha).is_ok())
+            .ok_or_else(|| {
+                ServerError::Forbidden(format!(
+                    "Unable to resolve head commit of PR #{pr_id} for tenant administrator"
+                ))
+            })?;
+        let range = format!("origin/{}...{head_sha}", pr.target_branch);
         let files = state
             .git_runner
             .diff_name_only(&state.repo_workdir, &range)
@@ -2561,10 +2914,37 @@ async fn require_pr_tenant_admin_access(
         } else {
             None
         };
-        (files, k_diff)
+        (head_sha, files, k_diff)
     };
 
-    validate_tenant_admin_pr_paths(tenant, &changed_files, kustomization_diff.as_deref())
+    validate_tenant_admin_pr_paths(tenant, &changed_files, kustomization_diff.as_deref())?;
+    Ok(Some(head_sha))
+}
+
+/// Resolves the head SHA a cluster-admin merge is pinned to: the fetched `origin/<branch>` commit
+/// when a Git workdir is available, else the forge-reported PR head. Returns `None` only when no
+/// valid commit id can be determined (the forge then merges its current head).
+async fn resolve_merge_head_sha(
+    state: &AppState,
+    pr_id: &str,
+) -> Result<Option<String>, ServerError> {
+    let pr = state.forge.get_pull_request(pr_id).await?;
+    if tokio::fs::try_exists(state.repo_workdir.join(".git"))
+        .await
+        .unwrap_or(false)
+    {
+        let _git_guard = state.git_lock.lock().await;
+        let _ = state.git_runner.fetch(&state.repo_workdir, "origin").await;
+        if let Ok(sha) = state
+            .git_runner
+            .rev_parse(&state.repo_workdir, &format!("origin/{}", pr.source_branch))
+            .await
+            && validate_commit_sha(&sha).is_ok()
+        {
+            return Ok(Some(sha));
+        }
+    }
+    Ok(validate_commit_sha(&pr.head_sha).ok().map(str::to_string))
 }
 
 /// `POST /api/v1/proposals/{pr_id}/merge`
@@ -2573,23 +2953,56 @@ pub async fn merge_proposal(
     State(state): State<AppState>,
     AxumPath(pr_id): AxumPath<String>,
 ) -> Result<Json<MergeProposalResponse>, ServerError> {
-    require_pr_tenant_admin_access(&auth, &state, &pr_id, Some(PullRequestState::Open)).await?;
-    let merged = state.forge.merge_pull_request(&pr_id).await?;
+    let verified_sha =
+        require_pr_tenant_admin_access(&auth, &state, &pr_id, Some(PullRequestState::Open)).await?;
+    let head_sha = match verified_sha {
+        Some(sha) => Some(sha),
+        None => resolve_merge_head_sha(&state, &pr_id).await?,
+    };
+    // Derive live Stack deletions from the PR's actual diff (removed `tenants/<id>/**/stack.yaml`
+    // at the pinned head), never from free-form title text (OPEN-11).
+    let stack_deletions = match head_sha.as_deref() {
+        Some(sha)
+            if tokio::fs::try_exists(state.repo_workdir.join(".git"))
+                .await
+                .unwrap_or(false) =>
+        {
+            let pr = state.forge.get_pull_request(&pr_id).await?;
+            let _git_guard = state.git_lock.lock().await;
+            plan_stack_deletions_for_pr(&state, &pr, sha).await
+        }
+        _ => Vec::new(),
+    };
 
-    if merged.title.starts_with("[Delete]")
-        && let Some((_, raw_stack)) = merged.title.split_once("remove stack ")
-    {
-        let stack_name = raw_stack.trim();
-        let tenant = merged
-            .tenant
-            .as_deref()
-            .or_else(|| parse_proposal_branch_tenant(&merged.source_branch))
-            .unwrap_or("default");
-        if let Ok(tenant_ns) = tenant_namespace(tenant) {
-            let _ = state
-                .state_provider
-                .delete_tenant_stack(&tenant_ns, stack_name)
-                .await;
+    // The forge refuses the merge if the PR head moved after verification.
+    let merged = state
+        .forge
+        .merge_pull_request(&pr_id, head_sha.as_deref())
+        .await?;
+    audit_proposal_event("merge", &auth, pr_tenant(&merged), &merged);
+
+    for del in &stack_deletions {
+        match state
+            .state_provider
+            .delete_tenant_stack(&del.namespace, &del.name)
+            .await
+        {
+            Ok(_) => tracing::info!(
+                target: "keel::audit",
+                action = "stack.delete",
+                user = %auth.claims.sub,
+                tenant = %del.tenant,
+                stack = %del.name,
+                pr_id = %merged.id,
+                "deleted Stack removed by merged proposal"
+            ),
+            Err(e) => tracing::warn!(
+                tenant = %del.tenant,
+                stack = %del.name,
+                pr_id = %merged.id,
+                error = %e,
+                "failed to delete Stack removed by merged proposal"
+            ),
         }
     }
 
@@ -2612,7 +3025,9 @@ pub async fn merge_proposal(
             .filter(|p| p.enabled)
             .map(|p| p.id)
             .collect();
-        if let Ok(policy_val) = keel_kube::build_restrict_pulumi_providers_policy(&enabled_ids) {
+        if let Ok(policy_val) =
+            keel_kube::build_restrict_pulumi_providers_policy_for_registry(&enabled_ids)
+        {
             let _ = state
                 .state_provider
                 .apply_cluster_policy(
@@ -2623,22 +3038,7 @@ pub async fn merge_proposal(
         }
     }
 
-    let cached = state.preview_cache.write().await.remove(&pr_id);
-    let gc_plan = if let Some(entry) = cached {
-        let plan = plan_preview_gc(&entry.candidates, &[pr_id.as_str()]);
-        let _ = state.state_provider.execute_preview_gc(&plan).await;
-        state.telemetry.publish(CrdWatchEvent::new(
-            WatchedCrdKind::Stack,
-            KEEL_PREVIEWS_NAMESPACE,
-            &entry.preview_stack.stack.metadata.name,
-            CrdReconcileStatus::Deleted,
-            format!("Garbage-collected ephemeral preview for merged PR #{pr_id}"),
-            Some(merged.head_sha.clone()),
-        ));
-        plan
-    } else {
-        GcPlan::default()
-    };
+    let gc_plan = crate::preview_lifecycle::gc_preview_for_pr(&state, &pr_id, "merged").await;
 
     Ok(Json(MergeProposalResponse {
         proposal: merged,
@@ -2656,23 +3056,9 @@ pub async fn reject_proposal(
 ) -> Result<Json<MergeProposalResponse>, ServerError> {
     require_pr_tenant_admin_access(&auth, &state, &pr_id, Some(PullRequestState::Open)).await?;
     let closed = state.forge.close_pull_request(&pr_id).await?;
+    audit_proposal_event("close", &auth, pr_tenant(&closed), &closed);
 
-    let cached = state.preview_cache.write().await.remove(&pr_id);
-    let gc_plan = if let Some(entry) = cached {
-        let plan = plan_preview_gc(&entry.candidates, &[pr_id.as_str()]);
-        let _ = state.state_provider.execute_preview_gc(&plan).await;
-        state.telemetry.publish(CrdWatchEvent::new(
-            WatchedCrdKind::Stack,
-            KEEL_PREVIEWS_NAMESPACE,
-            &entry.preview_stack.stack.metadata.name,
-            CrdReconcileStatus::Deleted,
-            format!("Garbage-collected ephemeral preview for rejected PR #{pr_id}"),
-            Some(closed.head_sha.clone()),
-        ));
-        plan
-    } else {
-        GcPlan::default()
-    };
+    let gc_plan = crate::preview_lifecycle::gc_preview_for_pr(&state, &pr_id, "rejected").await;
 
     Ok(Json(MergeProposalResponse {
         proposal: closed,
@@ -2690,9 +3076,551 @@ pub async fn reopen_proposal(
 ) -> Result<Json<MergeProposalResponse>, ServerError> {
     require_pr_tenant_admin_access(&auth, &state, &pr_id, Some(PullRequestState::Closed)).await?;
     let reopened = state.forge.reopen_pull_request(&pr_id).await?;
+    audit_proposal_event("reopen", &auth, pr_tenant(&reopened), &reopened);
 
     Ok(Json(MergeProposalResponse {
         proposal: reopened,
         gc_plan: GcPlan::default(),
     }))
+}
+
+// ============================================================================
+// Git diff, deletion planning, titles & audit helpers (OPEN-2, OPEN-11, OPEN-13, UI-15, CLI-15)
+// ============================================================================
+
+/// Private ref namespace used by read-only handlers so their fetches never race the
+/// `refs/remotes/origin/*` updates performed by mutation paths under `git_lock`.
+pub(crate) const READ_REF_NAMESPACE: &str = "keel-read/origin";
+
+/// Repeated read-path fetches of the same branch are coalesced within this window.
+const READ_FETCH_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Upper bound on a read-path network fetch; the git child is killed on expiry.
+const READ_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+type FetchDebounceMap = std::collections::HashMap<(std::path::PathBuf, String), std::time::Instant>;
+
+static LAST_READ_FETCH: std::sync::LazyLock<std::sync::Mutex<FetchDebounceMap>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(FetchDebounceMap::new()));
+
+/// Fetches `branches` into [`READ_REF_NAMESPACE`] **without** taking `git_lock`, debounced per
+/// `(workdir, branch)` and bounded by a short timeout. Failures are logged and tolerated: callers
+/// fall back to the last known `origin/*` refs.
+pub(crate) async fn fetch_branches_for_read(state: &AppState, branches: &[&str]) {
+    let now = std::time::Instant::now();
+    let due: Vec<&str> = {
+        let mut map = LAST_READ_FETCH
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        map.retain(|_, at| now.duration_since(*at) < READ_FETCH_DEBOUNCE * 6);
+        branches
+            .iter()
+            .copied()
+            .filter(|b| {
+                let key = (state.repo_workdir.clone(), (*b).to_string());
+                match map.get(&key) {
+                    Some(at) if now.duration_since(*at) < READ_FETCH_DEBOUNCE => false,
+                    _ => {
+                        map.insert(key, now);
+                        true
+                    }
+                }
+            })
+            .collect()
+    };
+    if due.is_empty() {
+        return;
+    }
+    if let Err(e) = state
+        .git_runner
+        .fetch_branches_isolated(
+            &state.repo_workdir,
+            "origin",
+            &due,
+            READ_REF_NAMESPACE,
+            READ_FETCH_TIMEOUT,
+        )
+        .await
+    {
+        tracing::debug!(error = %e, "read-path git fetch failed; using last known refs");
+    }
+}
+
+/// Resolves the freshest locally known ref for remote `branch`: the read-path namespace when
+/// present, else `origin/<branch>`.
+pub(crate) async fn resolve_read_ref(state: &AppState, branch: &str) -> String {
+    let isolated = format!("refs/{READ_REF_NAMESPACE}/{branch}");
+    if state
+        .git_runner
+        .ref_exists(&state.repo_workdir, &isolated)
+        .await
+        .unwrap_or(false)
+    {
+        isolated
+    } else {
+        format!("origin/{branch}")
+    }
+}
+
+/// Computes the diff a PR actually proposes (OPEN-2), never a two-dot diff against current `main`:
+///
+/// - open/closed PRs: `<target>...<head>` (merge-base three-dot),
+/// - merged PRs: `<recorded base>...<head>` when the forge recorded a base, else the merge
+///   commit's first-parent diff, else three-dot against the target.
+///
+/// Reads refs/objects only (no checkout), so it does not need `git_lock`.
+pub(crate) async fn compute_pr_git_diff(state: &AppState, pr: &PullRequestInfo) -> Option<String> {
+    if !tokio::fs::try_exists(state.repo_workdir.join(".git"))
+        .await
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    let mut branches = vec![pr.target_branch.as_str()];
+    if pr.state != PullRequestState::Merged {
+        branches.push(pr.source_branch.as_str());
+    }
+    fetch_branches_for_read(state, &branches).await;
+
+    let target_ref = resolve_read_ref(state, &pr.target_branch).await;
+    let runner = &state.git_runner;
+    let dir = &state.repo_workdir;
+    let head_sha = validate_commit_sha(&pr.head_sha).ok();
+    let diff = match pr.state {
+        PullRequestState::Merged => {
+            let base = pr
+                .base_sha
+                .as_deref()
+                .and_then(|b| validate_commit_sha(b).ok());
+            let merge = pr
+                .merge_commit_sha
+                .as_deref()
+                .and_then(|m| validate_commit_sha(m).ok());
+            let mut out = None;
+            if let (Some(base), Some(head)) = (base, head_sha) {
+                out = runner.diff_refs(dir, base, head).await.ok();
+            }
+            if out.as_deref().is_none_or(str::is_empty)
+                && let Some(merge) = merge
+            {
+                out = runner.diff_first_parent(dir, merge).await.ok();
+            }
+            if out.as_deref().is_none_or(str::is_empty)
+                && let Some(head) = head_sha
+            {
+                out = runner.diff_refs(dir, &target_ref, head).await.ok();
+            }
+            out
+        }
+        PullRequestState::Open | PullRequestState::Closed => {
+            let source_ref = resolve_read_ref(state, &pr.source_branch).await;
+            match runner.diff_refs(dir, &target_ref, &source_ref).await {
+                Ok(d) => Some(d),
+                Err(_) => match head_sha {
+                    Some(head) => runner.diff_refs(dir, &target_ref, head).await.ok(),
+                    None => None,
+                },
+            }
+        }
+    };
+    diff.filter(|d| !d.trim().is_empty())
+}
+
+/// A PKO `Stack` removed by a PR, derived from the PR's actual diff (never from its title).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StackDeletion {
+    pub tenant: String,
+    pub namespace: String,
+    pub name: String,
+}
+
+/// Extracts `(tenant, path)` for deleted `stack.yaml` manifests under `tenants/<tenant>/...`.
+fn deleted_stack_manifest_paths(deleted_files: &[String]) -> Vec<(String, String)> {
+    deleted_files
+        .iter()
+        .map(|p| p.trim())
+        .filter(|p| is_safe_repo_relative_path(p))
+        .filter_map(|p| {
+            let parts: Vec<&str> = p.split('/').collect();
+            if parts.len() >= 4
+                && parts[0] == "tenants"
+                && parts.last() == Some(&"stack.yaml")
+                && validate_dns_label(parts[1], "tenant").is_ok()
+            {
+                Some((parts[1].to_string(), p.to_string()))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Parses a deleted `stack.yaml` (as it existed at the merge-base) into a [`StackDeletion`],
+/// requiring `kind: Stack` and a namespace equal to the owning tenant's namespace.
+fn parse_deleted_stack_manifest(tenant: &str, raw_yaml: &str) -> Option<StackDeletion> {
+    let expected_ns = tenant_namespace(tenant).ok()?;
+    let doc: Value = serde_yml::from_str(raw_yaml).ok()?;
+    if doc.get("kind").and_then(Value::as_str) != Some("Stack") {
+        return None;
+    }
+    let meta = doc.get("metadata")?;
+    let name = meta.get("name").and_then(Value::as_str)?.trim();
+    validate_dns_label(name, "stack").ok()?;
+    let namespace = meta
+        .get("namespace")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or(expected_ns.as_str());
+    if namespace != expected_ns {
+        tracing::warn!(
+            tenant,
+            namespace,
+            stack = name,
+            "Ignoring deleted Stack manifest whose namespace does not match its tenant directory"
+        );
+        return None;
+    }
+    Some(StackDeletion {
+        tenant: tenant.to_string(),
+        namespace: expected_ns,
+        name: name.to_string(),
+    })
+}
+
+/// Plans live `Stack` deletions for a PR from its real diff (OPEN-11): every `stack.yaml` removed
+/// under `tenants/<id>/` between the merge-base and `head_sha`. Must be called with `git_lock`
+/// held after `origin` was fetched.
+async fn plan_stack_deletions_for_pr(
+    state: &AppState,
+    pr: &PullRequestInfo,
+    head_sha: &str,
+) -> Vec<StackDeletion> {
+    let target_ref = format!("origin/{}", pr.target_branch);
+    let runner = &state.git_runner;
+    let dir = &state.repo_workdir;
+    let Ok(deleted) = runner.diff_deleted_files(dir, &target_ref, head_sha).await else {
+        return Vec::new();
+    };
+    let candidates = deleted_stack_manifest_paths(&deleted);
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+    let Ok(base) = runner.merge_base(dir, &target_ref, head_sha).await else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (tenant, path) in candidates {
+        if let Ok(Some(raw)) = runner.read_file_at_ref(dir, &base, &path).await
+            && let Some(del) = parse_deleted_stack_manifest(&tenant, &raw)
+        {
+            out.push(del);
+        }
+    }
+    out
+}
+
+/// Returns `true` when `title` already follows Conventional Commits (`type(scope)!: subject`).
+pub(crate) fn is_conventional_commit_title(title: &str) -> bool {
+    const TYPES: &[&str] = &[
+        "feat", "fix", "chore", "docs", "refactor", "revert", "perf", "test", "ci", "build",
+        "style",
+    ];
+    let Some((head, subject)) = title.split_once(": ") else {
+        return false;
+    };
+    if subject.trim().is_empty() {
+        return false;
+    }
+    let head = head.strip_suffix('!').unwrap_or(head);
+    let (kind, scope) = match head.split_once('(') {
+        Some((k, rest)) => match rest.strip_suffix(')') {
+            Some(scope) if !scope.is_empty() && !scope.contains(['(', ')']) => (k, Some(scope)),
+            _ => return false,
+        },
+        None => (head, None),
+    };
+    TYPES.contains(&kind) && scope.is_none_or(|s| !s.chars().any(char::is_whitespace))
+}
+
+/// Builds the PR title for a tenant workload proposal (UI-15): a caller-supplied title is kept
+/// only when it is already a Conventional Commit; otherwise the server-generated
+/// `feat(<tenant>): <verb> <name>` title is used so UI and CLI proposals are uniform.
+pub(crate) fn proposal_pr_title(
+    requested: Option<&str>,
+    tenant: &str,
+    verb: &str,
+    name: &str,
+) -> String {
+    match requested.map(str::trim).filter(|t| !t.is_empty()) {
+        Some(t) if is_conventional_commit_title(t) => t.to_string(),
+        _ => format!("feat({tenant}): {verb} {name}"),
+    }
+}
+
+/// Builds an informative PR body: caller-supplied body (or a non-conventional caller title that
+/// was replaced by the generated title) followed by the server-generated summary.
+pub(crate) fn proposal_pr_body(
+    requested_title: Option<&str>,
+    final_title: &str,
+    requested_body: Option<&str>,
+    summary: &str,
+) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(t) = requested_title.map(str::trim).filter(|t| !t.is_empty())
+        && t != final_title
+    {
+        parts.push(format!("**{t}**"));
+    }
+    if let Some(b) = requested_body.map(str::trim).filter(|b| !b.is_empty()) {
+        parts.push(b.to_string());
+    }
+    parts.push(summary.to_string());
+    parts.join("\n\n")
+}
+
+/// Emits a structured audit log line for proposal lifecycle actions (NFR-OBS). Never logs secrets.
+pub(crate) fn audit_proposal_event(
+    action: &str,
+    auth: &AuthSession,
+    tenant: Option<&str>,
+    pr: &PullRequestInfo,
+) {
+    tracing::info!(
+        target: "keel::audit",
+        action,
+        user = %auth.claims.sub,
+        tenant = tenant.unwrap_or("-"),
+        pr_id = %pr.id,
+        branch = %pr.source_branch,
+        state = %pr.state,
+        "proposal {action}"
+    );
+}
+
+fn pr_tenant(pr: &PullRequestInfo) -> Option<&str> {
+    pr.tenant
+        .as_deref()
+        .or_else(|| parse_proposal_branch_tenant(&pr.source_branch))
+}
+
+#[cfg(test)]
+mod proposal_workflow_helper_tests {
+    use super::*;
+
+    #[test]
+    fn pulumi_project_name_matches_committed_pulumi_yaml_never_display_name() {
+        // Blueprint ships a Pulumi.yaml: its `name` wins.
+        assert_eq!(
+            pulumi_project_name_from_yaml(Some("name: kind-cluster\nruntime: yaml\n"), "kc1"),
+            "kind-cluster"
+        );
+        // No blueprint Pulumi.yaml: the generated one is named after the instance.
+        assert_eq!(pulumi_project_name_from_yaml(None, "kc1"), "kc1");
+        assert_eq!(
+            pulumi_project_name_from_yaml(Some("runtime: yaml\n"), "kc1"),
+            "kc1"
+        );
+        assert_eq!(
+            pulumi_project_name_from_yaml(Some(": not yaml ["), "kc1"),
+            "kc1"
+        );
+        // Names outside Pulumi's charset are sanitized (no spaces in `organization/<p>/<s>`).
+        assert_eq!(
+            pulumi_project_name_from_yaml(Some("name: Local kind Cluster\n"), "kc1"),
+            "Local-kind-Cluster"
+        );
+        assert_eq!(sanitize_pulumi_project_name("  a//b__c.d "), "a-b__c.d");
+        assert_eq!(sanitize_pulumi_project_name("***"), "project");
+    }
+
+    #[test]
+    fn conventional_titles_are_detected_and_enforced() {
+        for ok in [
+            "feat(acme): deploy redis",
+            "fix(acme): bump chart",
+            "chore(catalog): delete app podinfo",
+            "feat!: breaking",
+            "revert(core-addon): rollback kyverno",
+        ] {
+            assert!(is_conventional_commit_title(ok), "{ok}");
+        }
+        for bad in [
+            "[New] feat(acme): deploy redis",
+            "Deploy Redis for acme",
+            "feat(acme):",
+            "feat(): x",
+            "feat(a b): x",
+            "wip(acme): x",
+        ] {
+            assert!(!is_conventional_commit_title(bad), "{bad}");
+        }
+        assert_eq!(
+            proposal_pr_title(Some("Deploy Redis for acme"), "acme", "deploy", "redis"),
+            "feat(acme): deploy redis"
+        );
+        assert_eq!(
+            proposal_pr_title(Some("fix(acme): pin redis"), "acme", "update", "redis"),
+            "fix(acme): pin redis"
+        );
+        assert_eq!(
+            proposal_pr_title(None, "acme", "provision", "vm-1"),
+            "feat(acme): provision vm-1"
+        );
+        let body = proposal_pr_body(
+            Some("Deploy Redis for acme"),
+            "feat(acme): deploy redis",
+            Some("please review"),
+            "Automated proposal",
+        );
+        assert_eq!(
+            body,
+            "**Deploy Redis for acme**\n\nplease review\n\nAutomated proposal"
+        );
+        assert_eq!(
+            proposal_pr_body(None, "feat(acme): deploy redis", None, "S"),
+            "S"
+        );
+    }
+
+    #[test]
+    fn stack_deletions_derive_from_deleted_manifests_not_titles() {
+        let deleted = vec![
+            "tenants/acme/infra/db/stack.yaml".to_string(),
+            "tenants/acme/infra/db/values.yaml".to_string(),
+            "tenants/acme/bundles/web/vm/stack.yaml".to_string(),
+            "tenants/../etc/stack.yaml".to_string(),
+            "deploy/stack.yaml".to_string(),
+            "tenants/stack.yaml".to_string(),
+        ];
+        assert_eq!(
+            deleted_stack_manifest_paths(&deleted),
+            vec![
+                (
+                    "acme".to_string(),
+                    "tenants/acme/infra/db/stack.yaml".to_string()
+                ),
+                (
+                    "acme".to_string(),
+                    "tenants/acme/bundles/web/vm/stack.yaml".to_string()
+                ),
+            ]
+        );
+
+        let ok = "apiVersion: pulumi.com/v1\nkind: Stack\nmetadata:\n  name: db\n  namespace: tenant-acme\n";
+        assert_eq!(
+            parse_deleted_stack_manifest("acme", ok),
+            Some(StackDeletion {
+                tenant: "acme".to_string(),
+                namespace: "tenant-acme".to_string(),
+                name: "db".to_string(),
+            })
+        );
+        let no_ns = "kind: Stack\nmetadata:\n  name: web-vm\n";
+        assert_eq!(
+            parse_deleted_stack_manifest("acme", no_ns).map(|d| d.namespace),
+            Some("tenant-acme".to_string())
+        );
+        // Cross-tenant namespace, wrong kind, or invalid names are ignored.
+        let foreign = "kind: Stack\nmetadata:\n  name: db\n  namespace: tenant-globex\n";
+        assert!(parse_deleted_stack_manifest("acme", foreign).is_none());
+        assert!(
+            parse_deleted_stack_manifest("acme", "kind: ConfigMap\nmetadata:\n  name: db\n")
+                .is_none()
+        );
+        assert!(
+            parse_deleted_stack_manifest("acme", "kind: Stack\nmetadata:\n  name: Bad_Name\n")
+                .is_none()
+        );
+        assert!(parse_deleted_stack_manifest("acme", ": not yaml :").is_none());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn files(paths: &[&str]) -> Vec<String> {
+        paths.iter().map(|p| (*p).to_string()).collect()
+    }
+
+    #[test]
+    fn synthesized_preview_markdown_is_marked_simulated() {
+        let report = synthesize_report_from_git_diff("7", "");
+        assert_eq!(report.source, PreviewSource::Synthesized);
+        let md = simulated_preview_markdown(&report, "7");
+        assert!(md.starts_with("> **Simulated diff"));
+        let pko = PreviewReport {
+            source: PreviewSource::Pko,
+            ..PreviewReport::default()
+        };
+        assert!(!simulated_preview_markdown(&pko, "7").contains("Simulated diff"));
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["source"], "synthesized");
+    }
+
+    #[test]
+    fn safe_repo_relative_path_rejects_traversal_absolute_and_backslashes() {
+        assert!(is_safe_repo_relative_path(
+            "tenants/acme/apps/x/values.yaml"
+        ));
+        assert!(is_safe_repo_relative_path(
+            "acme/apps/x/flux-kustomization.yaml"
+        ));
+        for bad in [
+            "",
+            "/etc/passwd",
+            "~/x",
+            "tenants/acme/../other/rbac.yaml",
+            "acme/../other",
+            "..",
+            "tenants\\acme\\x",
+            "tenants/acme/./x",
+            "tenants/acme/\u{0}x",
+        ] {
+            assert!(!is_safe_repo_relative_path(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn tenant_admin_pr_paths_reject_traversal_and_foreign_entries() {
+        assert!(
+            validate_tenant_admin_pr_paths(
+                "acme",
+                &files(&["tenants/acme/apps/redis/values.yaml"]),
+                None
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_tenant_admin_pr_paths(
+                "acme",
+                &files(&["tenants/acme/../globex/apps/redis/values.yaml"]),
+                None
+            )
+            .is_err()
+        );
+        assert!(
+            validate_tenant_admin_pr_paths("acme", &files(&["tenants/acme/rbac.yaml"]), None)
+                .is_err()
+        );
+        assert!(validate_tenant_admin_pr_paths("acme", &files(&["deploy/x.yaml"]), None).is_err());
+        assert!(validate_tenant_admin_pr_paths("acme", &[], None).is_err());
+
+        let k = files(&["tenants/kustomization.yaml"]);
+        let ok_diff = "--- a/tenants/kustomization.yaml\n+++ b/tenants/kustomization.yaml\n@@ -1 +1 @@\n+  - acme/apps/redis/flux-kustomization.yaml\n";
+        assert!(validate_tenant_admin_pr_paths("acme", &k, Some(ok_diff)).is_ok());
+        for bad_entry in [
+            "acme/../globex/rbac.yaml",
+            "/acme/x.yaml",
+            "acme\\..\\globex",
+            "globex/apps/x.yaml",
+        ] {
+            let diff = format!("+  - {bad_entry}\n");
+            assert!(
+                validate_tenant_admin_pr_paths("acme", &k, Some(&diff)).is_err(),
+                "{bad_entry:?}"
+            );
+        }
+        assert!(validate_tenant_admin_pr_paths("acme", &k, None).is_err());
+    }
 }

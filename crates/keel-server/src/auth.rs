@@ -57,10 +57,48 @@ pub struct AuthSession {
     pub claims: SessionClaims,
 }
 
+/// Environment variable holding the comma-separated break-glass administrator allowlist
+/// (OIDC `sub` or `email`, case-insensitive). Defaults to the Stage 0 bootstrap admin.
+pub const BREAK_GLASS_ADMINS_ENV: &str = "KEEL_BREAK_GLASS_ADMINS";
+
+/// Default break-glass administrator identity (the Stage 0 bootstrap admin, `SDD.md` §6.1).
+pub const DEFAULT_BREAK_GLASS_ADMIN: &str = "admin@keel.local";
+
+/// Group prefix mapping IdP groups to tenants: `tenant-<id>` (member), `tenant-<id>-admin` (admin).
+pub const TENANT_GROUP_PREFIX: &str = "tenant-";
+
+/// Returns the configured break-glass administrator allowlist (lower-cased).
+fn break_glass_admin_allowlist() -> Vec<String> {
+    let raw = std::env::var(BREAK_GLASS_ADMINS_ENV)
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_BREAK_GLASS_ADMIN.to_string());
+    raw.split(',')
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// Returns `true` when `claims` identify an allowlisted break-glass administrator.
+fn is_break_glass_identity(claims: &SessionClaims) -> bool {
+    let allow = break_glass_admin_allowlist();
+    let sub = claims.sub.trim().to_ascii_lowercase();
+    let email = claims
+        .email
+        .as_deref()
+        .map(|e| e.trim().to_ascii_lowercase());
+    allow
+        .iter()
+        .any(|a| *a == sub || email.as_deref() == Some(a.as_str()))
+}
+
 impl AuthSession {
-    /// Returns `true` when the caller holds cluster-administrator privileges.
+    /// Returns `true` when the caller holds cluster-administrator privileges: membership of
+    /// `keel-admins`, or — only while the control plane is in the `BreakGlass` phase — being an
+    /// allowlisted break-glass identity ([`BREAK_GLASS_ADMINS_ENV`], default `admin@keel.local`).
+    /// Ordinary OIDC users never gain admin merely because the phase is `BreakGlass` (OPEN-12).
     pub fn is_admin(&self) -> bool {
-        self.claims.auth_phase == AuthPhase::BreakGlass
+        (self.claims.auth_phase == AuthPhase::BreakGlass && is_break_glass_identity(&self.claims))
             || self
                 .claims
                 .groups
@@ -80,17 +118,25 @@ impl AuthSession {
     }
 
     /// Returns `true` when the caller holds cluster-admin or tenant-scoped admin privileges for `tenant_id`
-    /// (member of `keel-admins`, `tenant-<tenant_id>-admin`, or `<tenant_id>-admin`).
+    /// (member of `keel-admins` or of the explicit group `tenant-<tenant_id>-admin`).
+    ///
+    /// Bare `<tenant_id>` / `<tenant_id>-admin` group names are intentionally **not** honored so an
+    /// unrelated IdP group that happens to equal a tenant id cannot grant access (OPEN-12).
     pub fn is_tenant_admin(&self, tenant_id: &str) -> bool {
         if self.is_admin() {
             return true;
         }
-        let prefixed = format!("tenant-{tenant_id}-admin");
-        let short = format!("{tenant_id}-admin");
-        self.claims
-            .groups
-            .iter()
-            .any(|g| g == &prefixed || g == &short)
+        let prefixed = format!("{TENANT_GROUP_PREFIX}{tenant_id}-admin");
+        self.claims.groups.iter().any(|g| g == &prefixed)
+    }
+
+    /// Returns `true` when the caller administers at least one tenant (`tenant-<id>-admin`).
+    pub fn is_any_tenant_admin(&self) -> bool {
+        self.claims.groups.iter().any(|g| {
+            g.strip_prefix(TENANT_GROUP_PREFIX)
+                .and_then(|rest| rest.strip_suffix("-admin"))
+                .is_some_and(|id| !id.is_empty())
+        })
     }
 
     /// Enforces tenant-scoped admin privileges for `tenant_id`, returning `403 Forbidden` otherwise.
@@ -104,18 +150,13 @@ impl AuthSession {
         }
     }
 
-    /// Enforces access to `tenant_id` (cluster admin, tenant admin, or member of `<tenant_id>` / `tenant-<tenant_id>`).
+    /// Enforces access to `tenant_id` (cluster admin, tenant admin, or member of `tenant-<tenant_id>`).
     pub fn require_tenant_access(&self, tenant_id: &str) -> Result<(), ServerError> {
         if self.is_tenant_admin(tenant_id) {
             return Ok(());
         }
-        let prefixed = format!("tenant-{tenant_id}");
-        if self
-            .claims
-            .groups
-            .iter()
-            .any(|g| g == tenant_id || g == &prefixed)
-        {
+        let prefixed = format!("{TENANT_GROUP_PREFIX}{tenant_id}");
+        if self.claims.groups.iter().any(|g| g == &prefixed) {
             Ok(())
         } else {
             Err(ServerError::Forbidden(format!(
@@ -142,6 +183,15 @@ impl FromRequestParts<AppState> for AuthSession {
         if claims.exp <= Utc::now().timestamp() {
             return Err(ServerError::Unauthorized(
                 "Authentication session has expired".to_string(),
+            ));
+        }
+        // Sessions are bound to the auth phase they were issued under: a phase transition
+        // (e.g. leaving break-glass) invalidates every outstanding session (OPEN-12).
+        let current_phase = *state.auth_phase.read().await;
+        if claims.auth_phase != current_phase {
+            return Err(ServerError::Unauthorized(
+                "Authentication session was issued under a different auth phase; please log in again"
+                    .to_string(),
             ));
         }
 
@@ -406,6 +456,7 @@ pub async fn auth_status(
         && let Ok(session_key) = state.secret_store.get_or_create_session_key().await
         && let Ok(claims) = decrypt_session_token(&session_key, &token)
         && claims.exp > Utc::now().timestamp()
+        && claims.auth_phase == phase
     {
         authenticated = true;
         sub = Some(claims.sub.clone());
@@ -433,6 +484,21 @@ struct PkceStatePayload {
     code_verifier: String,
     redirect_uri: String,
     exp: i64,
+    /// OIDC `nonce` sent in the authorization request and required in the returned `id_token`.
+    #[serde(default)]
+    nonce: Option<String>,
+    /// Present when the flow was started by the CLI loopback login (`/api/v1/auth/cli/login`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cli: Option<CliLoginBinding>,
+}
+
+/// CLI loopback binding carried through the browser OIDC round-trip inside the encrypted PKCE cookie.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CliLoginBinding {
+    redirect_uri: String,
+    state: String,
+    code_challenge: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -443,14 +509,97 @@ pub struct OidcLoginQuery {
     pub prompt: Option<String>,
 }
 
+fn random_b64(len: usize) -> String {
+    let mut bytes = vec![0u8; len];
+    rand::rng().fill_bytes(&mut bytes);
+    URL_SAFE_NO_PAD.encode(bytes)
+}
+
 /// `GET /api/v1/auth/login`
 ///
-/// Initiates the OIDC Authorization Code + PKCE (`S256`) flow, storing the PKCE verifier
-/// in a short-lived `AES-256-GCM` encrypted `HttpOnly; SameSite=Lax` cookie.
+/// Initiates the OIDC Authorization Code + PKCE (`S256`) flow, storing the PKCE verifier, state,
+/// and OIDC `nonce` in a short-lived `AES-256-GCM` encrypted `HttpOnly; SameSite=Lax` cookie.
 pub async fn oidc_login(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<OidcLoginQuery>,
+) -> Result<Response, ServerError> {
+    begin_oidc_flow(
+        &state,
+        &headers,
+        query.redirect_uri,
+        query.prompt.as_deref(),
+        None,
+    )
+    .await
+}
+
+/// Query parameters for `GET /api/v1/auth/cli/login` (RFC 8252 loopback CLI login).
+#[derive(Debug, Deserialize)]
+pub struct CliLoginQuery {
+    /// `http://127.0.0.1:<port>/callback` or `http://[::1]:<port>/callback`.
+    pub redirect_uri: String,
+    /// CLI-generated opaque state echoed back to the loopback listener.
+    pub state: String,
+    /// `BASE64URL(SHA256(code_verifier))`; the verifier never leaves the CLI until exchange.
+    pub code_challenge: String,
+    #[serde(default)]
+    pub code_challenge_method: Option<String>,
+    #[serde(default)]
+    pub prompt: Option<String>,
+}
+
+/// `GET /api/v1/auth/cli/login`
+///
+/// Browser entrypoint for `keel auth login`: validates the CLI loopback `redirect_uri`, `state`,
+/// and PKCE `code_challenge`, then starts the regular server-side OIDC flow. After the IdP
+/// callback the browser is redirected to the loopback URI with a one-time `code` that the CLI
+/// redeems at `POST /api/v1/auth/cli/exchange` together with its `code_verifier`.
+pub async fn cli_login(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<CliLoginQuery>,
+) -> Result<Response, ServerError> {
+    let redirect_uri = validate_cli_loopback_redirect_uri(&query.redirect_uri)?;
+    if !is_valid_cli_state(&query.state) {
+        return Err(ServerError::BadRequest(
+            "state must be 8-256 URL-safe characters".to_string(),
+        ));
+    }
+    if query
+        .code_challenge_method
+        .as_deref()
+        .is_some_and(|m| m != "S256")
+    {
+        return Err(ServerError::BadRequest(
+            "code_challenge_method must be S256".to_string(),
+        ));
+    }
+    if !is_valid_pkce_challenge(&query.code_challenge) {
+        return Err(ServerError::BadRequest(
+            "code_challenge must be a 43-128 character base64url S256 digest".to_string(),
+        ));
+    }
+    begin_oidc_flow(
+        &state,
+        &headers,
+        None,
+        query.prompt.as_deref(),
+        Some(CliLoginBinding {
+            redirect_uri,
+            state: query.state,
+            code_challenge: query.code_challenge,
+        }),
+    )
+    .await
+}
+
+async fn begin_oidc_flow(
+    state: &AppState,
+    headers: &HeaderMap,
+    requested_redirect: Option<String>,
+    prompt: Option<&str>,
+    cli: Option<CliLoginBinding>,
 ) -> Result<Response, ServerError> {
     let oidc_guard = state.oidc_config.read().await;
     let Some(oidc) = oidc_guard.as_ref().filter(|c| c.enabled) else {
@@ -459,24 +608,20 @@ pub async fn oidc_login(
         ));
     };
 
-    let mut verifier_bytes = [0u8; 32];
-    let mut state_bytes = [0u8; 16];
-    rand::rng().fill_bytes(&mut verifier_bytes);
-    rand::rng().fill_bytes(&mut state_bytes);
-
-    let code_verifier = URL_SAFE_NO_PAD.encode(verifier_bytes);
-    let state_nonce = URL_SAFE_NO_PAD.encode(state_bytes);
+    let code_verifier = random_b64(32);
+    let state_nonce = random_b64(16);
+    let oidc_nonce = random_b64(16);
     let challenge_digest = Sha256::digest(code_verifier.as_bytes());
     let code_challenge = URL_SAFE_NO_PAD.encode(challenge_digest);
 
-    let secure = is_secure_request(&headers);
+    let secure = is_secure_request(headers);
     let validated_host = headers
         .get(axum::http::header::HOST)
         .and_then(|v| v.to_str().ok())
         .map(str::trim)
         .filter(|h| is_valid_host_header(h));
 
-    let redirect_uri = if let Some(requested) = query.redirect_uri.filter(|u| !u.trim().is_empty())
+    let redirect_uri = if let Some(requested) = requested_redirect.filter(|u| !u.trim().is_empty())
     {
         validate_oidc_redirect_uri(&requested, &oidc.redirect_url, validated_host)?
     } else if let Some(host) = validated_host {
@@ -491,6 +636,8 @@ pub async fn oidc_login(
         code_verifier,
         redirect_uri: redirect_uri.clone(),
         exp: Utc::now().timestamp() + PKCE_TTL_SECONDS,
+        nonce: Some(oidc_nonce.clone()),
+        cli,
     };
 
     let session_key = state.secret_store.get_or_create_session_key().await?;
@@ -511,11 +658,11 @@ pub async fn oidc_login(
     } else {
         '?'
     };
-    let force_reauth = query.prompt.as_deref() == Some("login")
-        || extract_cookie_value(&headers, LOGGED_OUT_COOKIE_NAME).is_some_and(|v| v == "1");
+    let force_reauth = prompt == Some("login")
+        || extract_cookie_value(headers, LOGGED_OUT_COOKIE_NAME).is_some_and(|v| v == "1");
     let prompt_param = if force_reauth { "&prompt=login" } else { "" };
     let auth_url = format!(
-        "{authorization_endpoint}{sep}response_type=code&client_id={}&redirect_uri={}&scope={scopes}&state={state_nonce}&code_challenge={code_challenge}&code_challenge_method=S256{prompt_param}",
+        "{authorization_endpoint}{sep}response_type=code&client_id={}&redirect_uri={}&scope={scopes}&state={state_nonce}&nonce={oidc_nonce}&code_challenge={code_challenge}&code_challenge_method=S256{prompt_param}",
         percent_encode(&oidc.client_id),
         percent_encode(&redirect_uri),
     );
@@ -551,6 +698,8 @@ struct OidcTokenResponse {
 #[derive(Debug, Deserialize)]
 struct JwtClaimsSubset {
     sub: String,
+    #[serde(default)]
+    nonce: Option<String>,
     #[serde(default)]
     email: Option<String>,
     #[serde(default)]
@@ -655,6 +804,13 @@ pub async fn oidc_callback(
         &id_token,
     )
     .await?;
+    if let Some(expected_nonce) = pkce.nonce.as_deref()
+        && jwt_claims.nonce.as_deref() != Some(expected_nonce)
+    {
+        return Err(ServerError::Unauthorized(
+            "OIDC id_token nonce mismatch (possible token replay)".to_string(),
+        ));
+    }
     let phase = *state.auth_phase.read().await;
     let claims = SessionClaims {
         sub: jwt_claims.sub.clone(),
@@ -666,6 +822,31 @@ pub async fn oidc_callback(
     };
 
     let secure = is_secure_request(&headers);
+    if let Some(cli) = pkce.cli {
+        // CLI loopback login: hand the browser a one-time code bound to the CLI's PKCE challenge
+        // and loopback URI; no browser session cookie is issued.
+        let code = issue_cli_code(&session_key, &claims, &cli)?;
+        let target = format!(
+            "{}?code={}&state={}",
+            cli.redirect_uri,
+            percent_encode(&code),
+            percent_encode(&cli.state)
+        );
+        let location = HeaderValue::from_str(&target)
+            .map_err(|e| ServerError::Internal(format!("Invalid CLI redirect URL: {e}")))?;
+        tracing::info!(
+            target: "keel::audit",
+            action = "auth.cli_code_issued",
+            user = %claims.sub,
+            "issued one-time CLI login code"
+        );
+        let mut resp = StatusCode::FOUND.into_response();
+        resp.headers_mut().insert(LOCATION, location);
+        resp.headers_mut()
+            .append(SET_COOKIE, build_pkce_cookie_header("", 0, secure)?);
+        return Ok(resp);
+    }
+
     let session_token = encrypt_session_token(&session_key, &claims)?;
     let session_cookie = build_session_cookie_header(&session_token, SESSION_TTL_SECONDS, secure)?;
     let clear_pkce_cookie = build_pkce_cookie_header("", 0, secure)?;
@@ -790,6 +971,201 @@ async fn verify_oidc_id_token(
     Ok(token_data.claims)
 }
 
+/// Lifetime of a one-time CLI login code (seconds).
+const CLI_CODE_TTL_SECONDS: i64 = 60;
+
+/// Discriminator embedded in CLI codes so they can never be confused with session tokens.
+const CLI_CODE_TYPE: &str = "keel-cli-code";
+
+/// Encrypted payload of a one-time CLI login code.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CliCodePayload {
+    typ: String,
+    jti: String,
+    claims: SessionClaims,
+    code_challenge: String,
+    redirect_uri: String,
+    exp: i64,
+}
+
+/// Process-local replay cache of redeemed CLI code ids (`jti` → expiry). Codes are additionally
+/// bound to the CLI-held PKCE verifier and expire after [`CLI_CODE_TTL_SECONDS`], so a code is
+/// useless without the verifier even on a replica that has not seen it.
+static REDEEMED_CLI_CODES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, i64>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+fn issue_cli_code(
+    session_key: &[u8; 32],
+    claims: &SessionClaims,
+    cli: &CliLoginBinding,
+) -> Result<String, ServerError> {
+    let payload = CliCodePayload {
+        typ: CLI_CODE_TYPE.to_string(),
+        jti: random_b64(16),
+        claims: claims.clone(),
+        code_challenge: cli.code_challenge.clone(),
+        redirect_uri: cli.redirect_uri.clone(),
+        exp: Utc::now().timestamp() + CLI_CODE_TTL_SECONDS,
+    };
+    let json = serde_json::to_vec(&payload)
+        .map_err(|e| ServerError::Internal(format!("Failed to serialize CLI code: {e}")))?;
+    let sealed = EnvelopeCrypto::new(*session_key).encrypt(&json)?;
+    Ok(URL_SAFE_NO_PAD.encode(sealed.as_bytes()))
+}
+
+/// Request body for `POST /api/v1/auth/cli/exchange`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CliExchangeRequest {
+    pub code: String,
+    pub code_verifier: String,
+    pub redirect_uri: String,
+}
+
+/// Response body for `POST /api/v1/auth/cli/exchange`.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CliExchangeResponse {
+    /// Opaque session token; send as `Authorization: Bearer <sessionToken>`.
+    pub session_token: String,
+    pub token_type: String,
+    /// Unix timestamp (seconds) when the session expires.
+    pub expires_at: i64,
+    pub sub: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    pub phase: AuthPhase,
+    pub is_admin: bool,
+}
+
+/// `POST /api/v1/auth/cli/exchange`
+///
+/// Redeems a one-time CLI login code (from the loopback redirect) for a Bearer session token.
+/// Requires the PKCE `codeVerifier` whose S256 digest was sent to `/api/v1/auth/cli/login` and
+/// the exact same loopback `redirectUri`. Codes expire after 60 s and are single-use.
+pub async fn cli_exchange(
+    State(state): State<AppState>,
+    Json(req): Json<CliExchangeRequest>,
+) -> Result<Json<CliExchangeResponse>, ServerError> {
+    let invalid = || ServerError::Unauthorized("Invalid or expired CLI login code".to_string());
+    if req.code.len() > 16 * 1024 || !is_valid_pkce_verifier(&req.code_verifier) {
+        return Err(invalid());
+    }
+    let session_key = state.secret_store.get_or_create_session_key().await?;
+    let raw = URL_SAFE_NO_PAD
+        .decode(req.code.trim())
+        .map_err(|_| invalid())?;
+    let sealed = std::str::from_utf8(&raw).map_err(|_| invalid())?;
+    let plain = EnvelopeCrypto::new(session_key)
+        .decrypt(sealed)
+        .map_err(|_| invalid())?;
+    let payload: CliCodePayload = serde_json::from_slice(&plain).map_err(|_| invalid())?;
+    let now = Utc::now().timestamp();
+    if payload.typ != CLI_CODE_TYPE || payload.exp <= now {
+        return Err(invalid());
+    }
+    if payload.redirect_uri != req.redirect_uri.trim() {
+        return Err(invalid());
+    }
+    let digest = URL_SAFE_NO_PAD.encode(Sha256::digest(req.code_verifier.as_bytes()));
+    if !constant_time_eq(digest.as_bytes(), payload.code_challenge.as_bytes()) {
+        return Err(invalid());
+    }
+    {
+        let mut used = REDEEMED_CLI_CODES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        used.retain(|_, exp| *exp > now);
+        if used.insert(payload.jti.clone(), payload.exp).is_some() {
+            return Err(invalid());
+        }
+    }
+    let phase = *state.auth_phase.read().await;
+    if payload.claims.auth_phase != phase {
+        return Err(invalid());
+    }
+
+    let mut claims = payload.claims;
+    claims.exp = now + SESSION_TTL_SECONDS;
+    let session_token = encrypt_session_token(&session_key, &claims)?;
+    tracing::info!(
+        target: "keel::audit",
+        action = "auth.cli_login",
+        user = %claims.sub,
+        "CLI session issued via loopback login"
+    );
+    let is_admin = AuthSession {
+        claims: claims.clone(),
+    }
+    .is_admin();
+    Ok(Json(CliExchangeResponse {
+        session_token,
+        token_type: "Bearer".to_string(),
+        expires_at: claims.exp,
+        sub: claims.sub,
+        email: claims.email,
+        phase,
+        is_admin,
+    }))
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// Validates an RFC 8252 loopback redirect: `http://127.0.0.1:<port>/callback` or
+/// `http://[::1]:<port>/callback` with an explicit non-zero port and no userinfo/query/fragment.
+fn validate_cli_loopback_redirect_uri(raw: &str) -> Result<String, ServerError> {
+    let bad = || {
+        ServerError::BadRequest(
+            "redirect_uri must be http://127.0.0.1:<port>/callback or http://[::1]:<port>/callback"
+                .to_string(),
+        )
+    };
+    let url = Url::parse(raw.trim()).map_err(|_| bad())?;
+    let loopback_host = matches!(
+        url.host(),
+        Some(url::Host::Ipv4(ip)) if ip == std::net::Ipv4Addr::LOCALHOST
+    ) || matches!(
+        url.host(),
+        Some(url::Host::Ipv6(ip)) if ip == std::net::Ipv6Addr::LOCALHOST
+    );
+    if url.scheme() != "http"
+        || !loopback_host
+        || url.port().is_none_or(|p| p == 0)
+        || url.path() != "/callback"
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return Err(bad());
+    }
+    Ok(url.to_string())
+}
+
+fn is_url_safe_token(v: &str) -> bool {
+    v.chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~'))
+}
+
+fn is_valid_cli_state(v: &str) -> bool {
+    (8..=256).contains(&v.len()) && is_url_safe_token(v)
+}
+
+fn is_valid_pkce_challenge(v: &str) -> bool {
+    (43..=128).contains(&v.len())
+        && v.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+}
+
+/// RFC 7636 §4.1: 43-128 characters of `[A-Z a-z 0-9 - . _ ~]`.
+fn is_valid_pkce_verifier(v: &str) -> bool {
+    (43..=128).contains(&v.len()) && is_url_safe_token(v)
+}
+
 fn is_valid_host_header(host: &str) -> bool {
     !host.is_empty()
         && !host.contains('@')
@@ -840,7 +1216,14 @@ fn validate_oidc_redirect_uri(
     ))
 }
 
-/// Enforces same-origin `Origin` / `Referer` validation on cookie-authenticated state-changing requests.
+/// Enforces same-origin validation on cookie-authenticated requests (OPEN-29):
+///
+/// - state-changing methods (`POST`/`PUT`/`PATCH`/`DELETE`) carrying the session cookie must
+///   present a same-origin `Origin`, `Referer`, or `Sec-Fetch-Site: same-origin|none`; requests
+///   where all three are absent are rejected;
+/// - WebSocket upgrades must carry a same-origin `Origin` when cookie-authenticated;
+/// - requests authenticated with `Authorization: Bearer` (CLI) are exempt, since browsers cannot
+///   attach that header cross-site without a CORS preflight.
 pub(crate) async fn csrf_origin_guard(
     req: axum::extract::Request,
     next: axum::middleware::Next,
@@ -853,8 +1236,12 @@ pub(crate) async fn csrf_origin_guard(
             | axum::http::Method::DELETE
             | axum::http::Method::PATCH
     );
-    if is_mutating {
-        let headers = req.headers();
+    let headers = req.headers();
+    let is_ws_upgrade = headers
+        .get(axum::http::header::UPGRADE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.trim().eq_ignore_ascii_case("websocket"));
+    if is_mutating || is_ws_upgrade {
         let has_bearer = headers
             .get(AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
@@ -863,10 +1250,13 @@ pub(crate) async fn csrf_origin_guard(
             extract_cookie_value(headers, SESSION_COOKIE_NAME).is_some_and(|v| !v.is_empty());
 
         if has_session_cookie && !has_bearer {
-            let host = headers
+            // Effective request authority: `Host` (HTTP/1.1) or the URI authority (HTTP/2).
+            let host_owned = headers
                 .get(axum::http::header::HOST)
                 .and_then(|v| v.to_str().ok())
-                .map(str::trim);
+                .map(|h| h.trim().to_string())
+                .or_else(|| req.uri().authority().map(|a| a.as_str().to_string()));
+            let host = host_owned.as_deref();
             let origin_hdr = headers
                 .get(axum::http::header::ORIGIN)
                 .and_then(|v| v.to_str().ok())
@@ -875,11 +1265,11 @@ pub(crate) async fn csrf_origin_guard(
                 .get(axum::http::header::REFERER)
                 .and_then(|v| v.to_str().ok())
                 .map(str::trim);
-
             let sec_fetch_site = headers
                 .get("sec-fetch-site")
                 .and_then(|v| v.to_str().ok())
                 .map(str::trim);
+
             if let Some(site) = sec_fetch_site
                 && !site.eq_ignore_ascii_case("same-origin")
                 && !site.eq_ignore_ascii_case("none")
@@ -897,6 +1287,10 @@ pub(crate) async fn csrf_origin_guard(
                         "Cross-origin request rejected by CSRF guard".to_string(),
                     ));
                 }
+            } else if is_ws_upgrade && host.is_some() {
+                return Err(ServerError::Forbidden(
+                    "WebSocket upgrade requires a same-origin Origin header".to_string(),
+                ));
             } else if let Some(referer_raw) = referer_hdr {
                 let referer_url = Url::parse(referer_raw)
                     .map_err(|_| ServerError::Forbidden("Invalid Referer header".to_string()))?;
@@ -905,6 +1299,13 @@ pub(crate) async fn csrf_origin_guard(
                         "Cross-origin Referer rejected by CSRF guard".to_string(),
                     ));
                 }
+            } else if sec_fetch_site.is_none() && host.is_some() {
+                // No provenance signal at all on a cookie-authenticated mutation: fail closed.
+                // (Requests without any authority cannot originate from a browser.)
+                return Err(ServerError::Forbidden(
+                    "Cookie-authenticated mutation without Origin/Referer/Sec-Fetch-Site rejected by CSRF guard"
+                        .to_string(),
+                ));
             }
         }
     }
@@ -983,24 +1384,56 @@ mod tests {
         assert!(admin.require_tenant_admin("acme").is_ok());
         assert!(admin.require_tenant_access("acme").is_ok());
 
-        let break_glass = AuthSession {
+        // Break-glass phase grants admin only to the allowlisted bootstrap admin identity.
+        let break_glass_admin = AuthSession {
             claims: SessionClaims {
-                sub: "breakglass".to_string(),
-                email: None,
+                sub: "CiQ0ZDk5".to_string(),
+                email: Some("Admin@Keel.Local".to_string()),
                 name: None,
                 groups: vec![],
                 auth_phase: AuthPhase::BreakGlass,
                 exp: Utc::now().timestamp() + 3600,
             },
         };
-        assert!(break_glass.is_admin());
+        assert!(break_glass_admin.is_admin());
+        let break_glass_other = AuthSession {
+            claims: SessionClaims {
+                sub: "mallory".to_string(),
+                email: Some("mallory@keel.local".to_string()),
+                name: None,
+                groups: vec!["tenant-acme".to_string()],
+                auth_phase: AuthPhase::BreakGlass,
+                exp: Utc::now().timestamp() + 3600,
+            },
+        };
+        assert!(!break_glass_other.is_admin());
+        assert!(break_glass_other.require_tenant_access("acme").is_ok());
+        // Same identity outside break-glass is an ordinary user.
+        let mut normal_phase_admin_email = break_glass_admin.clone();
+        normal_phase_admin_email.claims.auth_phase = AuthPhase::OidcActive;
+        assert!(!normal_phase_admin_email.is_admin());
+
+        // Bare group names equal to a tenant id (or `<id>-admin`) grant nothing.
+        let bare_groups = AuthSession {
+            claims: SessionClaims {
+                sub: "eve".to_string(),
+                email: None,
+                name: None,
+                groups: vec!["acme".to_string(), "acme-admin".to_string()],
+                auth_phase: AuthPhase::OidcActive,
+                exp: Utc::now().timestamp() + 3600,
+            },
+        };
+        assert!(!bare_groups.is_tenant_admin("acme"));
+        assert!(bare_groups.require_tenant_access("acme").is_err());
+        assert!(!bare_groups.is_any_tenant_admin());
 
         let tenant_admin = AuthSession {
             claims: SessionClaims {
                 sub: "bob".to_string(),
                 email: None,
                 name: None,
-                groups: vec!["acme-admin".to_string()],
+                groups: vec!["tenant-acme-admin".to_string()],
                 auth_phase: AuthPhase::OidcActive,
                 exp: Utc::now().timestamp() + 3600,
             },
@@ -1012,6 +1445,7 @@ mod tests {
         assert!(tenant_admin.require_tenant_admin("other").is_err());
         assert!(tenant_admin.require_tenant_access("acme").is_ok());
         assert!(tenant_admin.require_tenant_access("other").is_err());
+        assert!(tenant_admin.is_any_tenant_admin());
 
         let tenant_member = AuthSession {
             claims: SessionClaims {
@@ -1024,6 +1458,7 @@ mod tests {
             },
         };
         assert!(!tenant_member.is_tenant_admin("acme"));
+        assert!(!tenant_member.is_any_tenant_admin());
         assert!(tenant_member.require_tenant_access("acme").is_ok());
 
         let key = [7u8; 32];
@@ -1131,6 +1566,28 @@ mod tests {
             .oneshot(
                 Request::get("/protected")
                     .header(AUTHORIZATION, format!("Bearer {expired_tok}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // Session issued under a different auth phase -> 401 (re-evaluated on phase change)
+        let other_phase = SessionClaims {
+            sub: "alice".to_string(),
+            email: None,
+            name: None,
+            groups: vec!["keel-admins".to_string()],
+            auth_phase: AuthPhase::BreakGlass,
+            exp: Utc::now().timestamp() + 3600,
+        };
+        let other_phase_tok = encrypt_session_token(&key, &other_phase).unwrap();
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::get("/protected")
+                    .header(AUTHORIZATION, format!("Bearer {other_phase_tok}"))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1261,6 +1718,74 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 
+        // Cookie-authenticated mutation with no Origin/Referer/Sec-Fetch-Site -> 403
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/mutate")
+                    .header("host", "keel.local")
+                    .header(COOKIE, format!("{SESSION_COOKIE_NAME}=tok"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        // Sec-Fetch-Site: same-origin alone is sufficient provenance -> 200
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/mutate")
+                    .header("host", "keel.local")
+                    .header("sec-fetch-site", "same-origin")
+                    .header(COOKIE, format!("{SESSION_COOKIE_NAME}=tok"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Cookie-less mutation (e.g. CLI code exchange) is not subject to the cookie CSRF guard
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/mutate")
+                    .header("host", "keel.local")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // WebSocket upgrades: cookie-authenticated without Origin -> 403, cross-origin -> 403,
+        // same-origin -> passes through to the handler.
+        let ws_app = Router::new()
+            .route("/ws", get(|| async { StatusCode::OK }))
+            .layer(middleware::from_fn(csrf_origin_guard));
+        for (origin, expected) in [
+            (None, StatusCode::FORBIDDEN),
+            (Some("https://evil.example.com"), StatusCode::FORBIDDEN),
+            (Some("https://keel.local"), StatusCode::OK),
+        ] {
+            let mut builder = Request::get("/ws")
+                .header("host", "keel.local")
+                .header("upgrade", "websocket")
+                .header("connection", "upgrade")
+                .header(COOKIE, format!("{SESSION_COOKIE_NAME}=tok"));
+            if let Some(o) = origin {
+                builder = builder.header("origin", o);
+            }
+            let resp = ws_app
+                .clone()
+                .oneshot(builder.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), expected, "origin={origin:?}");
+        }
+
         // Bearer token bypasses cookie CSRF guard -> 200
         let resp = app
             .oneshot(
@@ -1283,6 +1808,9 @@ mod tests {
         let idp_addr = listener.local_addr().unwrap();
         let issuer = format!("http://127.0.0.1:{}", idp_addr.port());
         let issuer_clone = issuer.clone();
+        // Nonce the mock IdP embeds in issued id_tokens (set from each authorization request).
+        let idp_nonce: Arc<std::sync::Mutex<String>> = Arc::default();
+        let idp_nonce_tok = idp_nonce.clone();
 
         let idp_router = Router::new()
             .route(
@@ -1323,6 +1851,7 @@ mod tests {
                     let iss = issuer_clone.clone();
                     move || {
                         let iss = iss.clone();
+                        let nonce = idp_nonce_tok.lock().unwrap().clone();
                         async move {
                             let mut header = Header::new(Algorithm::EdDSA);
                             header.kid = Some("test-ed25519".to_string());
@@ -1334,6 +1863,7 @@ mod tests {
                                 "email": "user@keel.local",
                                 "name": "Test User",
                                 "groups": ["keel-admins"],
+                                "nonce": nonce,
                                 "exp": exp,
                                 "iat": Utc::now().timestamp()
                             });
@@ -1361,7 +1891,16 @@ mod tests {
         let app = Router::new()
             .route("/api/v1/auth/login", get(oidc_login))
             .route("/api/v1/auth/callback", get(oidc_callback))
+            .route("/api/v1/auth/cli/login", get(cli_login))
+            .route("/api/v1/auth/cli/exchange", post(cli_exchange))
             .with_state(state.clone());
+        let query_param = |loc: &str, key: &str| {
+            Url::parse(loc)
+                .unwrap()
+                .query_pairs()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.to_string())
+        };
 
         // 1. Login initiates PKCE redirect and sets keel_pkce cookie
         let login_resp = app
@@ -1384,6 +1923,9 @@ mod tests {
             .to_string();
         assert!(location.contains("code_challenge_method=S256"));
         assert!(location.contains("prompt=login"));
+        let nonce = query_param(&location, "nonce").expect("nonce in authorization request");
+        assert!(nonce.len() >= 16);
+        *idp_nonce.lock().unwrap() = nonce.clone();
         let loc_url = Url::parse(&location).unwrap();
         let state_param = loc_url
             .query_pairs()
@@ -1468,6 +2010,7 @@ mod tests {
         assert_eq!(mismatch_resp.status(), StatusCode::UNAUTHORIZED);
 
         let missing_code = app
+            .clone()
             .oneshot(
                 Request::get("/api/v1/auth/callback?state=abc")
                     .body(Body::empty())
@@ -1476,5 +2019,232 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(missing_code.status(), StatusCode::BAD_REQUEST);
+
+        // 5. id_token carrying a different nonce is rejected (replay protection)
+        *idp_nonce.lock().unwrap() = "some-other-nonce".to_string();
+        let replay = app
+            .clone()
+            .oneshot(
+                Request::get(format!(
+                    "/api/v1/auth/callback?code=auth-code-3&state={state_param}"
+                ))
+                .header(COOKIE, &pkce_cookie)
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), StatusCode::UNAUTHORIZED);
+
+        // 6. CLI loopback login: invalid loopback/challenge inputs are rejected up front
+        let verifier = URL_SAFE_NO_PAD.encode([42u8; 32]);
+        let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+        let loopback = "http://127.0.0.1:53682/callback";
+        for bad_query in [
+            format!(
+                "redirect_uri={}&state=cli-state-123&code_challenge={challenge}",
+                percent_encode("http://evil.example.com:53682/callback")
+            ),
+            format!(
+                "redirect_uri={}&state=cli-state-123&code_challenge={challenge}",
+                percent_encode("http://127.0.0.1/callback")
+            ),
+            format!(
+                "redirect_uri={}&state=x&code_challenge={challenge}",
+                percent_encode(loopback)
+            ),
+            format!(
+                "redirect_uri={}&state=cli-state-123&code_challenge=short",
+                percent_encode(loopback)
+            ),
+            format!(
+                "redirect_uri={}&state=cli-state-123&code_challenge={challenge}&code_challenge_method=plain",
+                percent_encode(loopback)
+            ),
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::get(format!("/api/v1/auth/cli/login?{bad_query}"))
+                        .header("host", "127.0.0.1:8080")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{bad_query}");
+        }
+
+        // 7. CLI loopback login happy path: login -> IdP -> callback -> loopback code -> exchange
+        let cli_login_resp = app
+            .clone()
+            .oneshot(
+                Request::get(format!(
+                    "/api/v1/auth/cli/login?redirect_uri={}&state=cli-state-123&code_challenge={challenge}&code_challenge_method=S256",
+                    percent_encode(loopback)
+                ))
+                .header("host", "127.0.0.1:8080")
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cli_login_resp.status(), StatusCode::FOUND);
+        let idp_location = cli_login_resp
+            .headers()
+            .get(LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        // The IdP is always redirected back to the server callback, never to the loopback URI.
+        assert_eq!(
+            query_param(&idp_location, "redirect_uri").as_deref(),
+            Some("http://127.0.0.1:8080/api/v1/auth/callback")
+        );
+        *idp_nonce.lock().unwrap() = query_param(&idp_location, "nonce").unwrap();
+        let server_state = query_param(&idp_location, "state").unwrap();
+        let cli_pkce_cookie = cli_login_resp
+            .headers()
+            .get_all(SET_COOKIE)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .find(|c| c.starts_with("keel_pkce="))
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string();
+        let cli_cb = app
+            .clone()
+            .oneshot(
+                Request::get(format!(
+                    "/api/v1/auth/callback?code=auth-code-cli&state={server_state}"
+                ))
+                .header(COOKIE, &cli_pkce_cookie)
+                .header(ACCEPT, "text/html")
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cli_cb.status(), StatusCode::FOUND);
+        assert!(
+            !cli_cb
+                .headers()
+                .get_all(SET_COOKIE)
+                .iter()
+                .filter_map(|v| v.to_str().ok())
+                .any(|c| c.starts_with("keel_session=") && !c.starts_with("keel_session=;")),
+            "CLI login must not set a browser session cookie"
+        );
+        let loopback_location = cli_cb
+            .headers()
+            .get(LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(loopback_location.starts_with("http://127.0.0.1:53682/callback?code="));
+        assert_eq!(
+            query_param(&loopback_location, "state").as_deref(),
+            Some("cli-state-123")
+        );
+        let cli_code = query_param(&loopback_location, "code").unwrap();
+
+        let exchange = |code: String, verifier: String, redirect: &str| {
+            Request::post("/api/v1/auth/cli/exchange")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "code": code, "codeVerifier": verifier, "redirectUri": redirect })
+                        .to_string(),
+                ))
+                .unwrap()
+        };
+        // Wrong verifier and wrong redirect URI are rejected without consuming the code.
+        let wrong_verifier = URL_SAFE_NO_PAD.encode([7u8; 32]);
+        let resp = app
+            .clone()
+            .oneshot(exchange(cli_code.clone(), wrong_verifier, loopback))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let resp = app
+            .clone()
+            .oneshot(exchange(
+                cli_code.clone(),
+                verifier.clone(),
+                "http://127.0.0.1:1/callback",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        let resp = app
+            .clone()
+            .oneshot(exchange(cli_code.clone(), verifier.clone(), loopback))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let exchanged: CliExchangeResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(exchanged.token_type, "Bearer");
+        assert_eq!(exchanged.sub, "user-123");
+        assert!(exchanged.is_admin);
+        let key = state
+            .secret_store
+            .get_or_create_session_key()
+            .await
+            .unwrap();
+        let claims = decrypt_session_token(&key, &exchanged.session_token).unwrap();
+        assert_eq!(claims.sub, "user-123");
+        assert_eq!(claims.exp, exchanged.expires_at);
+
+        // Single use: replaying the code fails.
+        let resp = app
+            .clone()
+            .oneshot(exchange(cli_code.clone(), verifier.clone(), loopback))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // A CLI code is never accepted as a session token.
+        assert!(decrypt_session_token(&key, &cli_code).is_err());
+    }
+
+    #[test]
+    fn cli_loopback_and_pkce_validators() {
+        assert_eq!(
+            validate_cli_loopback_redirect_uri("http://127.0.0.1:8123/callback").unwrap(),
+            "http://127.0.0.1:8123/callback"
+        );
+        assert!(validate_cli_loopback_redirect_uri("http://[::1]:8123/callback").is_ok());
+        for bad in [
+            "https://127.0.0.1:8123/callback",
+            "http://localhost:8123/callback",
+            "http://127.0.0.2:8123/callback",
+            "http://127.0.0.1/callback",
+            "http://127.0.0.1:8123/other",
+            "http://127.0.0.1:8123/callback?x=1",
+            "http://127.0.0.1:8123/callback#frag",
+            "http://user@127.0.0.1:8123/callback",
+            "http://10.0.0.1:8123/callback",
+        ] {
+            assert!(validate_cli_loopback_redirect_uri(bad).is_err(), "{bad}");
+        }
+        assert!(is_valid_cli_state("abcdefgh"));
+        assert!(!is_valid_cli_state("short"));
+        assert!(!is_valid_cli_state("has space in it"));
+        assert!(is_valid_pkce_challenge(&"a".repeat(43)));
+        assert!(!is_valid_pkce_challenge(&"a".repeat(42)));
+        assert!(!is_valid_pkce_challenge(&format!("{}=", "a".repeat(43))));
+        assert!(is_valid_pkce_verifier(&"a".repeat(43)));
+        assert!(!is_valid_pkce_verifier(&"a".repeat(129)));
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"ab"));
     }
 }

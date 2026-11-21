@@ -23,7 +23,16 @@ struct TestFixture {
     secret_store: Arc<InMemorySecretStore>,
 }
 
+/// Fixture for a provisioned tenant `acme` (its Pulumi state passphrase Secret exists).
 async fn setup_fixture() -> TestFixture {
+    let fixture = setup_fixture_without_tenant_passphrase().await;
+    SecretStateStore::ensure_pulumi_passphrase(fixture.secret_store.as_ref(), "tenant-acme")
+        .await
+        .unwrap();
+    fixture
+}
+
+async fn setup_fixture_without_tenant_passphrase() -> TestFixture {
     let temp_dir = tempfile::tempdir().expect("create tempdir");
     let bare_repo = temp_dir.path().join("remote.git");
     let workdir = temp_dir.path().join("workdir");
@@ -308,6 +317,45 @@ async fn test_healthz_metrics_and_spa_fallback() {
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_security_headers_on_spa_api_and_rejected_responses() {
+    let fixture = setup_fixture().await;
+    *fixture.state.oidc_config.write().await = Some(OidcConfig {
+        enabled: true,
+        issuer_url: "https://idp.keel.local:8888/auth/v1".to_string(),
+        client_id: "keel-ui".to_string(),
+        redirect_url: "https://keel.local/api/v1/auth/callback".to_string(),
+        scopes: vec!["openid".to_string()],
+    });
+    let app = build_router(fixture.state.clone());
+    let expected_csp = "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; font-src 'self' data:; frame-ancestors 'none'; base-uri 'self'; form-action 'self' https://idp.keel.local:8888";
+    for (method, uri) in [
+        (Method::GET, "/"),
+        (Method::GET, "/proposals/42"),
+        (Method::GET, "/api/v1/catalog"), // 401 without session
+        (Method::GET, "/healthz"),
+        (Method::POST, "/api/v1/tenants"), // CSRF / auth rejection
+    ] {
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method.clone())
+                    .uri(uri)
+                    .header("origin", "https://evil.example")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let h = res.headers();
+        assert_eq!(h["content-security-policy"], expected_csp, "{method} {uri}");
+        assert_eq!(h["x-content-type-options"], "nosniff", "{uri}");
+        assert_eq!(h["referrer-policy"], "no-referrer", "{uri}");
+        assert_eq!(h["x-frame-options"], "DENY", "{uri}");
+    }
 }
 
 #[tokio::test]
@@ -1035,6 +1083,23 @@ async fn test_tenants_list_create_delete_and_protect_default() {
             .starts_with("keel/payments/create-tenant-")
     );
     assert_eq!(create_json["proposal"]["state"], "open");
+
+    // The tenant bundle grants keel-server its per-tenant access (keel-server-tenant RoleBinding).
+    let branch = create_json["branch"].as_str().unwrap();
+    let shown = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&fixture.state.repo_workdir)
+        .args(["show", &format!("{branch}:tenants/payments/rbac.yaml")])
+        .output()
+        .unwrap();
+    assert!(
+        shown.status.success(),
+        "{}",
+        String::from_utf8_lossy(&shown.stderr)
+    );
+    let rbac = String::from_utf8(shown.stdout).unwrap();
+    assert!(rbac.contains("name: keel-server-tenant"));
+    assert!(rbac.contains("namespace: keel-system"));
 
     let ev = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
         .await
@@ -1788,9 +1853,10 @@ kind: Stack
 metadata:
   name: management-cluster-core
   namespace: flux-system
+  labels:
+    keel.io/protect: "true"
 spec:
   stack: keel/management/core
-  protect: true
 "#,
     )
     .await
@@ -1835,7 +1901,7 @@ async fn test_force_delete_stack_endpoint_guardrails() {
         .unwrap();
     assert_eq!(unauth_res.status(), StatusCode::UNAUTHORIZED);
 
-    // 2. Protected management-cluster-core stack -> 403 Forbidden
+    // 2. Protected management-cluster-core stack -> 409 Conflict
     let protected_res = app
         .clone()
         .oneshot(
@@ -1848,7 +1914,7 @@ async fn test_force_delete_stack_endpoint_guardrails() {
         )
         .await
         .unwrap();
-    assert_eq!(protected_res.status(), StatusCode::FORBIDDEN);
+    assert_eq!(protected_res.status(), StatusCode::CONFLICT);
 
     // 3. Cross-tenant access -> 403 Forbidden
     let tenant_cookie =
@@ -1867,8 +1933,9 @@ async fn test_force_delete_stack_endpoint_guardrails() {
         .unwrap();
     assert_eq!(cross_tenant_res.status(), StatusCode::FORBIDDEN);
 
-    // 4. Repo-only state provider without live cluster -> 400 BadRequest
-    let repo_only_res = app
+    // 4. Unknown stack (neither in Git nor live) -> 404 before any live-cluster check.
+    let missing_res = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method(Method::POST)
@@ -1879,7 +1946,31 @@ async fn test_force_delete_stack_endpoint_guardrails() {
         )
         .await
         .unwrap();
-    assert_eq!(repo_only_res.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(missing_res.status(), StatusCode::NOT_FOUND);
+
+    // 5. Known stack on the repo-only provider (no live cluster) -> 503 Service Unavailable.
+    for action in ["force-delete", "unlock", "restart"] {
+        assert_eq!(
+            post_status(
+                &app,
+                &format!("/api/v1/stacks/tenant-acme/acme-net/{action}"),
+                &cookie
+            )
+            .await,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{action}"
+        );
+        assert_eq!(
+            post_status(
+                &app,
+                &format!("/api/v1/stacks/tenant-acme/does-not-exist/{action}"),
+                &cookie
+            )
+            .await,
+            StatusCode::NOT_FOUND,
+            "{action}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -2118,7 +2209,7 @@ async fn test_proposal_supports_multiple_instances_version_and_target_namespace(
         created["proposal"]["title"]
             .as_str()
             .unwrap()
-            .starts_with("[New]")
+            .starts_with("feat(") // Conventional Commit title (UI-15)
     );
     let branch = created["branch"].as_str().unwrap();
 
@@ -2153,7 +2244,7 @@ async fn test_proposal_supports_multiple_instances_version_and_target_namespace(
     .unwrap();
     assert!(repo_yaml.contains("name: grafana-staging-repo"));
 
-    // Updating an existing instance (tenants/acme/apps/redis) tags the PR as [Update]
+    // Updating an existing instance (tenants/acme/apps/redis) yields a `feat(<tenant>): update <name>` PR title
     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     let update_res = app
         .clone()
@@ -2184,7 +2275,7 @@ async fn test_proposal_supports_multiple_instances_version_and_target_namespace(
         updated["proposal"]["title"]
             .as_str()
             .unwrap()
-            .starts_with("[Update]")
+            .contains("): update ") // Conventional Commit update title (UI-15)
     );
 
     // GET /api/v1/releases/{namespace}/{name}/config returns persisted values & metadata
@@ -2365,7 +2456,7 @@ spec:
     let resources = prop_json["report"]["resources"].as_array().unwrap();
     assert_eq!(resources.len(), 2);
     assert!(
-        resources[1]["changed_fields"]
+        resources[1]["changedFields"]
             .as_array()
             .unwrap()
             .iter()
@@ -2560,7 +2651,7 @@ spec:
         edit_stack_json["proposal"]["title"]
             .as_str()
             .unwrap()
-            .starts_with("[Update]")
+            .contains("): update ") // Conventional Commit update title (UI-15)
     );
     fixture
         .state
@@ -2631,7 +2722,7 @@ spec:
         edit_app_json["proposal"]["title"]
             .as_str()
             .unwrap()
-            .starts_with("[Update]")
+            .contains("): update ") // Conventional Commit update title (UI-15)
     );
     fixture
         .state
@@ -3870,4 +3961,1457 @@ async fn test_security_ssrf_rbac_csrf_and_open_redirect_guards() {
         .await
         .unwrap();
     assert_eq!(open_redirect_res.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_manifest_template_injection_is_neutralised_or_rejected() {
+    let fixture = setup_fixture().await;
+    tokio::fs::create_dir_all(
+        fixture
+            .state
+            .repo_workdir
+            .join("catalog/apps/echo-manifest"),
+    )
+    .await
+    .unwrap();
+    tokio::fs::write(
+        fixture
+            .state
+            .repo_workdir
+            .join("catalog/apps/echo-manifest/catalog.yaml"),
+        r#"apiVersion: keel.io/v1alpha1
+kind: CatalogApplication
+metadata:
+  id: echo-manifest
+  name: Echo Manifest
+  category: utilities
+  runtime: manifest
+spec:
+  defaultEngine: pulumi
+  upstream:
+    repoURL: https://example.invalid/echo
+    path: ./manifests.yaml
+    version: 1.0.0
+  schema:
+    type: object
+    properties:
+      message:
+        type: string
+      image:
+        type: string
+"#,
+    )
+    .await
+    .unwrap();
+    tokio::fs::write(
+        fixture
+            .state
+            .repo_workdir
+            .join("catalog/apps/echo-manifest/manifests.yaml"),
+        r#"apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: echo-config
+data:
+  message: ${message}
+  image: repo/${image:=echo}:1.0
+"#,
+    )
+    .await
+    .unwrap();
+
+    let git = &fixture.state.git_runner;
+    let workdir = &fixture.state.repo_workdir;
+    git.add(workdir, ["."]).await.unwrap();
+    git.commit(
+        workdir,
+        "chore: seed echo-manifest catalog app",
+        &CommitAuthor::new("Keel Seed", "seed@keel.local"),
+    )
+    .await
+    .unwrap();
+    git.push(workdir, "origin", "HEAD:refs/heads/main")
+        .await
+        .unwrap();
+
+    let cookie = login_and_get_cookie(&fixture).await;
+    let app = build_router(fixture.state.clone());
+
+    let propose = |values: Value, name: &str| {
+        Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/proposals")
+            .header(COOKIE, &cookie)
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({
+                    "tenant": "acme",
+                    "catalogId": "echo-manifest",
+                    "name": name,
+                    "values": values
+                })
+                .to_string(),
+            ))
+            .unwrap()
+    };
+
+    // Embedded placeholder with a newline/document separator is rejected before any commit.
+    let res = app
+        .clone()
+        .oneshot(propose(
+            json!({ "image": "x\n---\napiVersion: v1\nkind: Secret\nmetadata:\n  name: pwned" }),
+            "echo-bad",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+    // Whole-scalar injection attempt is quoted: still exactly one ConfigMap, no Secret.
+    let res = app
+        .clone()
+        .oneshot(propose(
+            json!({ "message": "hi\n---\napiVersion: v1\nkind: Secret\nmetadata:\n  name: pwned" }),
+            "echo-ok",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let body: Value =
+        serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(body["report"]["source"], "synthesized");
+    let resources = body["report"]["resources"].as_array().unwrap();
+    assert!(
+        resources
+            .iter()
+            .all(|r| !r["resourceType"].as_str().unwrap_or("").contains("Secret")),
+        "{resources:?}"
+    );
+    assert!(
+        resources
+            .iter()
+            .any(|r| r["resourceType"] == "kubernetes:v1:ConfigMap" && r["name"] == "echo-config")
+    );
+}
+
+/// Tenant PKO Stacks must use the tenant-scoped state prefix (`tenants/<id>`) and the tenant's
+/// own scoped S3 identity; without one the server fails closed (409) instead of committing.
+#[tokio::test]
+async fn test_tenant_stack_uses_scoped_state_backend_and_fails_closed_without_identity() {
+    use k8s_openapi::ByteString;
+    use k8s_openapi::api::core::v1::Secret;
+    use keel_kube::secret_store::SecretBackend;
+    use std::collections::BTreeMap;
+
+    let fixture = setup_fixture().await;
+    let mut state = fixture
+        .state
+        .clone()
+        .with_s3_credentials_secret(Some("keel-s3-credentials".to_string()));
+    state.backend_url =
+        "s3://pulumi-state?endpoint=seaweedfs:8333&region=us-east-1&s3ForcePathStyle=true"
+            .to_string();
+    let cookie = login_and_get_cookie(&fixture).await;
+    let app = build_router(state.clone());
+
+    let propose = |name: &str| {
+        Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/proposals")
+            .header(COOKIE, &cookie)
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({
+                    "tenant": "acme",
+                    "catalogId": "proxmox-vm",
+                    "kind": "infra",
+                    "name": name,
+                    "values": { "cores": 2 }
+                })
+                .to_string(),
+            ))
+            .unwrap()
+    };
+
+    // 1. No scoped tenant identity -> 409, nothing committed, admin keys never mirrored.
+    let res = app.clone().oneshot(propose("vm-noid")).await.unwrap();
+    assert_eq!(res.status(), StatusCode::CONFLICT);
+    let body: Value =
+        serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("no scoped state credentials"),
+        "{body}"
+    );
+    assert!(
+        fixture
+            .secret_store
+            .inspect_raw_secret("tenant-acme", "keel-s3-credentials")
+            .await
+            .is_none()
+    );
+    let open = fixture
+        .state
+        .forge
+        .list_open_pull_requests(None)
+        .await
+        .unwrap();
+    assert!(open.is_empty(), "no PR may be opened: {open:?}");
+
+    // 2. Seed the scoped tenant identity -> 201 with tenant-prefixed backend + mirrored creds.
+    let mut data = BTreeMap::new();
+    data.insert(
+        "accessKey".to_string(),
+        ByteString(b"TENANTACCESSKEY0001".to_vec()),
+    );
+    data.insert(
+        "secretKey".to_string(),
+        ByteString(b"tenantsecretkey00000000000000001".to_vec()),
+    );
+    fixture
+        .secret_store
+        .upsert_secret(
+            "tenant-acme",
+            Secret {
+                metadata: k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
+                    name: Some("keel-tenant-s3-credentials".to_string()),
+                    namespace: Some("tenant-acme".to_string()),
+                    ..Default::default()
+                },
+                data: Some(data),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let res = app.clone().oneshot(propose("vm-scoped")).await.unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let body: Value =
+        serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let branch = body["branch"].as_str().unwrap().to_string();
+    // Ephemeral previews diff against the tenant's own scoped state prefix (OPEN-9) and never
+    // reference the control-plane admin S3 keys.
+    assert_eq!(
+        body["previewStack"]["spec"]["backend"],
+        "s3://pulumi-state/tenants/acme?endpoint=seaweedfs:8333&region=us-east-1&s3ForcePathStyle=true"
+    );
+    assert!(body["previewStack"]["spec"]["envRefs"]["AWS_ACCESS_KEY_ID"].is_null());
+    assert_eq!(body["report"]["run"]["phase"], "notExecuted");
+
+    state
+        .git_runner
+        .checkout_branch(&state.repo_workdir, &branch)
+        .await
+        .unwrap();
+    let stack_yaml = tokio::fs::read_to_string(
+        state
+            .repo_workdir
+            .join("tenants/acme/infra/vm-scoped/stack.yaml"),
+    )
+    .await
+    .unwrap();
+    state
+        .git_runner
+        .checkout_branch(&state.repo_workdir, "main")
+        .await
+        .unwrap();
+    let stack: Value = serde_yml::from_str(&stack_yaml).unwrap();
+    assert_eq!(
+        stack["spec"]["backend"],
+        "s3://pulumi-state/tenants/acme?endpoint=seaweedfs:8333&region=us-east-1&s3ForcePathStyle=true"
+    );
+    assert_eq!(
+        stack["spec"]["envRefs"]["AWS_ACCESS_KEY_ID"]["secret"]["name"],
+        "keel-s3-credentials"
+    );
+    let mirror = fixture
+        .secret_store
+        .inspect_raw_secret("tenant-acme", "keel-s3-credentials")
+        .await
+        .expect("tenant mirror of scoped identity");
+    assert_eq!(
+        mirror.data.unwrap()["accessKey"].0,
+        b"TENANTACCESSKEY0001".to_vec()
+    );
+}
+
+/// When a tenant has no scoped identity yet, the proposal path lazily provisions it through the
+/// configured `TenantS3IdentityProvisioner` (kube-rs exec in production) once the namespace exists.
+#[tokio::test]
+async fn test_tenant_stack_lazily_provisions_scoped_identity() {
+    use keel_kube::{
+        SeaweedFsIdentityOps, TenantS3IdentityProvisioner, TenantS3ProvisionOutcome,
+        provision_tenant_s3_identity_with,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct MockProvisioner {
+        store: Arc<InMemorySecretStore>,
+        namespace_present: bool,
+        calls: AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl SeaweedFsIdentityOps for MockProvisioner {
+        async fn namespace_exists(&self, _ns: &str) -> Result<bool, keel_kube::KubeError> {
+            Ok(self.namespace_present)
+        }
+        async fn run_weed_shell(&self, script: &str) -> Result<(), keel_kube::KubeError> {
+            assert!(script.contains("-user=keel-tenant-acme"));
+            assert!(script.contains("pulumi-state/tenants/acme/*"));
+            Ok(())
+        }
+    }
+    #[async_trait::async_trait]
+    impl TenantS3IdentityProvisioner for MockProvisioner {
+        async fn provision_tenant_s3_identity(
+            &self,
+            tenant_id: &str,
+        ) -> Result<TenantS3ProvisionOutcome, keel_kube::KubeError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            provision_tenant_s3_identity_with(
+                self.store.as_ref(),
+                self,
+                "s3://pulumi-state?endpoint=seaweedfs:8333",
+                tenant_id,
+            )
+            .await
+        }
+    }
+
+    let fixture = setup_fixture().await;
+    let cookie = login_and_get_cookie(&fixture).await;
+    let propose = |name: &str| {
+        Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/proposals")
+            .header(COOKIE, &cookie)
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({
+                    "tenant": "acme",
+                    "catalogId": "proxmox-vm",
+                    "kind": "infra",
+                    "name": name,
+                    "values": { "cores": 2 }
+                })
+                .to_string(),
+            ))
+            .unwrap()
+    };
+
+    // Namespace not reconciled yet -> provisioner is a no-op and the server fails closed.
+    let missing = Arc::new(MockProvisioner {
+        store: fixture.secret_store.clone(),
+        namespace_present: false,
+        calls: AtomicUsize::new(0),
+    });
+    let app = build_router(
+        fixture
+            .state
+            .clone()
+            .with_s3_credentials_secret(Some("keel-s3-credentials".to_string()))
+            .with_tenant_s3_provisioner(Some(missing.clone())),
+    );
+    let res = app.oneshot(propose("vm-a")).await.unwrap();
+    assert_eq!(res.status(), StatusCode::CONFLICT);
+    assert_eq!(missing.calls.load(Ordering::SeqCst), 1);
+
+    // Namespace present -> identity provisioned on demand, Stack proposal succeeds.
+    let present = Arc::new(MockProvisioner {
+        store: fixture.secret_store.clone(),
+        namespace_present: true,
+        calls: AtomicUsize::new(0),
+    });
+    let app = build_router(
+        fixture
+            .state
+            .clone()
+            .with_s3_credentials_secret(Some("keel-s3-credentials".to_string()))
+            .with_tenant_s3_provisioner(Some(present.clone())),
+    );
+    let res = app.clone().oneshot(propose("vm-b")).await.unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    assert_eq!(present.calls.load(Ordering::SeqCst), 1);
+    let mirror = fixture
+        .secret_store
+        .inspect_raw_secret("tenant-acme", "keel-s3-credentials")
+        .await
+        .expect("scoped identity mirrored for PKO envRefs");
+    assert!(
+        String::from_utf8(mirror.data.unwrap()["accessKey"].0.clone())
+            .unwrap()
+            .starts_with("KEEL")
+    );
+
+    // Identity now exists -> no further provisioning round-trips.
+    let res = app.oneshot(propose("vm-c")).await.unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    assert_eq!(present.calls.load(Ordering::SeqCst), 1);
+}
+
+async fn post_status(app: &axum::Router, uri: &str, cookie: &str) -> StatusCode {
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(uri)
+                .header(COOKIE, cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+}
+
+async fn get_json_status(app: &axum::Router, uri: &str, cookie: &str) -> (StatusCode, Value) {
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(uri)
+                .header(COOKIE, cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = res.status();
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+#[tokio::test]
+async fn test_out_of_band_stack_operations_require_tenant_admin_and_refuse_protected() {
+    let fixture = setup_fixture().await;
+    let app = build_router(fixture.state.clone());
+    let member = login_with_groups(&fixture, "member@acme", vec!["tenant-acme"]).await;
+    let tenant_admin = login_with_groups(&fixture, "admin@acme", vec!["tenant-acme-admin"]).await;
+
+    // OPEN-11: tenant members may not run force-delete / unlock / restart.
+    for action in ["force-delete", "unlock", "restart"] {
+        let uri = format!("/api/v1/stacks/tenant-acme/acme-net/{action}");
+        assert_eq!(
+            post_status(&app, &uri, &member).await,
+            StatusCode::FORBIDDEN,
+            "{action}"
+        );
+        // Tenant admins pass authorization; the repo-only provider then reports no live cluster.
+        assert_eq!(
+            post_status(&app, &uri, &tenant_admin).await,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{action}"
+        );
+    }
+    // Non-tenant namespaces require cluster admin.
+    assert_eq!(
+        post_status(
+            &app,
+            "/api/v1/stacks/flux-system/core/unlock",
+            &tenant_admin
+        )
+        .await,
+        StatusCode::FORBIDDEN
+    );
+
+    // OPEN-1: a stack protected via the canonical `keel.io/protect` label (or spec.config.protect)
+    // is refused with 409 before any live mutation.
+    let dir = fixture
+        .state
+        .repo_workdir
+        .join("tenants/acme/infra/locked-vm");
+    tokio::fs::create_dir_all(&dir).await.unwrap();
+    tokio::fs::write(
+        dir.join("stack.yaml"),
+        "apiVersion: pulumi.com/v1\nkind: Stack\nmetadata:\n  name: locked-vm\n  namespace: tenant-acme\n  labels:\n    keel.io/tenant: acme\n    keel.io/protect: \"true\"\nspec:\n  stack: acme/locked-vm\n",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        post_status(
+            &app,
+            "/api/v1/stacks/tenant-acme/locked-vm/force-delete",
+            &tenant_admin
+        )
+        .await,
+        StatusCode::CONFLICT
+    );
+
+    // OPEN-16: the PROTECT column reflects the canonical label.
+    let (status, body) = get_json_status(&app, "/api/v1/stacks?tenant=acme", &tenant_admin).await;
+    assert_eq!(status, StatusCode::OK);
+    let locked = body["stacks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["name"] == "locked-vm")
+        .unwrap();
+    assert_eq!(locked["protect"], true);
+}
+
+#[tokio::test]
+async fn test_ssh_info_rejects_unknown_and_non_vm_stacks() {
+    let fixture = setup_fixture().await;
+    let cookie = login_and_get_cookie(&fixture).await;
+    let app = build_router(fixture.state.clone());
+
+    // OPEN-17: unknown stack -> 404 (no fabricated `<stack>.<tenant>.local` target).
+    let (status, _) =
+        get_json_status(&app, "/api/v1/stacks/tenant-acme/ghost/ssh-info", &cookie).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Non-VM stack (`acme-net` is a network service) -> 422.
+    let (status, body) = get_json_status(
+        &app,
+        "/api/v1/stacks/tenant-acme/acme-net/ssh-info",
+        &cookie,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("SSH not supported for service"),
+        "{body}"
+    );
+
+    // Existing VM stack still resolves.
+    let dir = fixture.state.repo_workdir.join("tenants/acme/infra/web-vm");
+    tokio::fs::create_dir_all(&dir).await.unwrap();
+    tokio::fs::write(
+        dir.join("stack.yaml"),
+        "apiVersion: pulumi.com/v1\nkind: Stack\nmetadata:\n  name: web-vm\n  namespace: tenant-acme\n  labels:\n    keel.io/tenant: acme\n    keel.io/provider: proxmox\n    keel.io/resource-kind: vm\nspec:\n  stack: acme/web-vm\n",
+    )
+    .await
+    .unwrap();
+    let (status, body) =
+        get_json_status(&app, "/api/v1/stacks/tenant-acme/web-vm/ssh-info", &cookie).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["stackName"], "web-vm");
+    assert_eq!(body["provider"], "proxmox");
+}
+
+// ============================================================================
+// Git/forge correctness, proposal flow & auth hardening
+// (OPEN-2, OPEN-11, OPEN-12, OPEN-14, OPEN-29, CLI-15)
+// ============================================================================
+
+/// Records `delete_tenant_stack` calls so merge-time Stack deletions can be asserted.
+#[derive(Default)]
+struct RecordingStateProvider {
+    deleted: std::sync::Mutex<Vec<(String, String)>>,
+}
+
+#[async_trait::async_trait]
+impl keel_server::ClusterStateProvider for RecordingStateProvider {
+    async fn list_stacks(
+        &self,
+        _tenant: Option<&str>,
+        _provider: Option<&str>,
+    ) -> Result<Vec<keel_server::StackSummary>, keel_server::ServerError> {
+        Ok(Vec::new())
+    }
+
+    async fn list_releases(
+        &self,
+        _tenant: Option<&str>,
+    ) -> Result<Vec<keel_server::ReleaseSummary>, keel_server::ServerError> {
+        Ok(Vec::new())
+    }
+
+    async fn delete_tenant_stack(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> Result<bool, keel_server::ServerError> {
+        self.deleted
+            .lock()
+            .unwrap()
+            .push((namespace.to_string(), name.to_string()));
+        Ok(true)
+    }
+}
+
+async fn send_json(
+    app: &axum::Router,
+    method: Method,
+    uri: &str,
+    cookie: &str,
+    body: Option<Value>,
+) -> (StatusCode, Value) {
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(COOKIE, cookie);
+    let req_body = match body {
+        Some(b) => {
+            builder = builder.header(CONTENT_TYPE, "application/json");
+            Body::from(b.to_string())
+        }
+        None => Body::empty(),
+    };
+    let res = app
+        .clone()
+        .oneshot(builder.body(req_body).unwrap())
+        .await
+        .unwrap();
+    let status = res.status();
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let json = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    (status, json)
+}
+
+#[tokio::test]
+async fn test_pr_diff_is_merge_base_and_merge_deletes_stacks_from_diff() {
+    let fixture = setup_fixture().await;
+    let recorder = Arc::new(RecordingStateProvider::default());
+    let state = fixture.state.clone().with_state_provider(recorder.clone());
+    let app = build_router(state.clone());
+    let cookie = login_and_get_cookie(&fixture).await;
+
+    // PR1 deletes the seeded `tenants/acme/infra/net` stack (metadata.name: acme-net);
+    // PR2 deletes the `redis` release. Both branch from the same `main`.
+    let (status, pr1) = send_json(
+        &app,
+        Method::DELETE,
+        "/api/v1/stacks/tenant-acme/net",
+        &cookie,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{pr1}");
+    let pr1_id = pr1["proposal"]["id"].as_str().unwrap().to_string();
+    // PullRequestInfo is camelCase on the wire (CLI-15).
+    assert!(pr1["proposal"]["sourceBranch"].is_string());
+    assert!(pr1["proposal"].get("source_branch").is_none());
+    let (status, pr2) = send_json(
+        &app,
+        Method::DELETE,
+        "/api/v1/releases/tenant-acme/redis",
+        &cookie,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{pr2}");
+    let pr2_id = pr2["proposal"]["id"].as_str().unwrap().to_string();
+
+    // Merge PR1: the live Stack deletion is derived from the removed manifest (name `acme-net`),
+    // not from the PR title text.
+    let (status, merged) = send_json(
+        &app,
+        Method::POST,
+        &format!("/api/v1/proposals/{pr1_id}/merge"),
+        &cookie,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{merged}");
+    assert_eq!(merged["proposal"]["state"], "merged");
+    assert_eq!(
+        recorder.deleted.lock().unwrap().clone(),
+        vec![("tenant-acme".to_string(), "acme-net".to_string())]
+    );
+
+    // `main` moves on further with an unrelated commit pushed from another clone.
+    let other = fixture._temp_dir.path().join("other-clone");
+    let git = GitRunner::new();
+    git.clone(&state.remote_url, &other).await.unwrap();
+    tokio::fs::write(other.join("unrelated-change.yaml"), "x: 1\n")
+        .await
+        .unwrap();
+    git.add(&other, ["unrelated-change.yaml"]).await.unwrap();
+    git.commit(
+        &other,
+        "chore: unrelated",
+        &CommitAuthor::new("Other", "other@keel.local"),
+    )
+    .await
+    .unwrap();
+    git.push(&other, "origin", "main").await.unwrap();
+
+    // Open PR2 diff only shows its own change: neither PR1's merged deletion nor the unrelated
+    // commit (two-dot vs current main would show both, reversed).
+    let (status, preview) = send_json(
+        &app,
+        Method::GET,
+        &format!("/api/v1/proposals/{pr2_id}/preview"),
+        &cookie,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{preview}");
+    let diff = preview["gitDiff"].as_str().unwrap_or_default();
+    assert!(diff.contains("tenants/acme/apps/redis"), "{diff}");
+    assert!(!diff.contains("unrelated-change.yaml"), "{diff}");
+    assert!(!diff.contains("tenants/acme/infra/net"), "{diff}");
+
+    // Merged PR1 diff uses the recorded merge-base, excluding later main commits.
+    let (status, preview) = send_json(
+        &app,
+        Method::GET,
+        &format!("/api/v1/proposals/{pr1_id}/preview"),
+        &cookie,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{preview}");
+    let diff = preview["gitDiff"].as_str().unwrap_or_default();
+    assert!(diff.contains("tenants/acme/infra/net/stack.yaml"), "{diff}");
+    assert!(!diff.contains("unrelated-change.yaml"), "{diff}");
+    assert!(!diff.contains("tenants/acme/apps/redis"), "{diff}");
+}
+
+#[tokio::test]
+async fn test_reject_response_is_camel_case_and_titles_are_conventional() {
+    let fixture = setup_fixture().await;
+    let app = build_router(fixture.state.clone());
+    let cookie = login_and_get_cookie(&fixture).await;
+
+    let (status, deleted) = send_json(
+        &app,
+        Method::DELETE,
+        "/api/v1/releases/tenant-acme/redis",
+        &cookie,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{deleted}");
+    let pr_id = deleted["proposal"]["id"].as_str().unwrap().to_string();
+
+    let (status, rejected) = send_json(
+        &app,
+        Method::POST,
+        &format!("/api/v1/proposals/{pr_id}/reject"),
+        &cookie,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{rejected}");
+    assert_eq!(rejected["proposal"]["state"], "closed");
+    assert!(rejected["proposal"]["sourceBranch"].is_string());
+    assert!(rejected["proposal"]["headSha"].is_string());
+    assert!(rejected["proposal"].get("source_branch").is_none());
+    assert!(rejected["gcPlan"].is_object());
+
+    // A UI-style free-form title is replaced by a Conventional Commit title (kept in the body).
+    let (status, created) = send_json(
+        &app,
+        Method::POST,
+        "/api/v1/proposals",
+        &cookie,
+        Some(json!({
+            "tenant": "acme",
+            "catalogId": "grafana",
+            "name": "dash",
+            "title": "Deploy Grafana for acme",
+            "values": { "replicas": 1 }
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    assert_eq!(created["proposal"]["title"], "feat(acme): deploy dash");
+    assert!(
+        created["proposal"]["body"]
+            .as_str()
+            .unwrap()
+            .contains("Deploy Grafana for acme")
+    );
+}
+
+#[tokio::test]
+async fn test_auth_hardening_csrf_group_mapping_and_fetch_schema_rbac() {
+    let fixture = setup_fixture().await;
+    let app = build_router(fixture.state.clone());
+    let admin_cookie = login_and_get_cookie(&fixture).await;
+
+    // CSRF: cookie-authenticated mutation with a Host but no Origin/Referer/Sec-Fetch-Site -> 403.
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/tenants")
+                .header(COOKIE, &admin_cookie)
+                .header("host", "keel.local")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({ "id": "gamma" }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+
+    // Tenant ids ending in `-admin` are reserved (group-name collision guard).
+    let (status, body) = send_json(
+        &app,
+        Method::POST,
+        "/api/v1/tenants",
+        &admin_cookie,
+        Some(json!({ "id": "acme-admin" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    // A bare IdP group equal to the tenant id no longer grants tenant access.
+    let bare = login_with_groups(&fixture, "eve@keel.local", vec!["acme"]).await;
+    let (status, _) = send_json(
+        &app,
+        Method::GET,
+        "/api/v1/proposals?tenant=acme",
+        &bare,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let member = login_with_groups(&fixture, "carol@keel.local", vec!["tenant-acme"]).await;
+    let (status, _) = send_json(
+        &app,
+        Method::GET,
+        "/api/v1/proposals?tenant=acme",
+        &member,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // fetch-schema is restricted to admins / tenant admins (SSRF surface).
+    let (status, _) = send_json(
+        &app,
+        Method::POST,
+        "/api/v1/catalog/fetch-schema",
+        &member,
+        Some(json!({ "repoUrl": "https://charts.example.com", "chart": "x" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    // Tenant admin passes RBAC but private targets are still rejected before any fetch.
+    let tenant_admin =
+        login_with_groups(&fixture, "bob@keel.local", vec!["tenant-acme-admin"]).await;
+    for repo in [
+        "http://127.0.0.1:8080/charts",
+        "http://[::ffff:10.0.0.1]/charts",
+        "https://svc.cluster.local/charts",
+        "http://169.254.169.254/latest",
+    ] {
+        let (status, body) = send_json(
+            &app,
+            Method::POST,
+            "/api/v1/catalog/fetch-schema",
+            &tenant_admin,
+            Some(json!({ "repoUrl": repo, "chart": "x" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{repo}: {body}");
+    }
+
+    // CLI loopback login endpoint validates the loopback redirect before touching OIDC.
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/auth/cli/exchange")
+                .method(Method::POST)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "code": "bogus",
+                        "codeVerifier": "a".repeat(43),
+                        "redirectUri": "http://127.0.0.1:5000/callback"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// OPEN-5/OPEN-9/OPEN-10: Pulumi-backed proposals apply a real preview `Stack` into
+/// `keel-previews`; PKO results are collected from cluster state (not process memory), published
+/// to the PR, and the preview is garbage-collected once the PR is closed — even after a restart.
+#[tokio::test]
+async fn test_pko_preview_lifecycle_is_applied_published_and_gced_from_cluster_state() {
+    use keel_kube::{InMemoryPreviewCluster, PreviewCluster, PreviewPrerequisites};
+
+    let fixture = setup_fixture().await;
+    let cluster = InMemoryPreviewCluster::new().with_prerequisites(PreviewPrerequisites {
+        s3_secret: Some("keel-preview-s3-acme".to_string()),
+        git_url: Some("http://forgejo.keel-system.svc:3000/keel/infra-gitops.git".to_string()),
+        git_secret: Some("keel-preview-git-acme".to_string()),
+    });
+    cluster.put_tenant_secret(
+        "acme",
+        "keel-pulumi-passphrase",
+        &[("passphrase", "tenant-pass")],
+    );
+    let state = fixture
+        .state
+        .clone()
+        .with_preview_cluster(Some(Arc::new(cluster.clone())));
+    let cookie = login_and_get_cookie(&fixture).await;
+    let app = build_router(state.clone());
+
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/proposals")
+                .header(COOKIE, &cookie)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "tenant": "acme",
+                        "catalogId": "proxmox-vm",
+                        "kind": "infra",
+                        "name": "vm-preview",
+                        "values": { "cores": 2 }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let body: Value =
+        serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let pr_id = body["proposal"]["id"].as_str().unwrap().to_string();
+    let stack_name = format!("preview-stack-pr-{pr_id}");
+    assert_eq!(body["report"]["source"], "synthesized");
+    assert_eq!(body["report"]["run"]["phase"], "pending");
+    assert_eq!(
+        body["report"]["run"]["stack"],
+        format!("keel-previews/{stack_name}")
+    );
+
+    // The applied preview Stack is a real `spec.preview: true` Stack with persisted identity,
+    // the tenant-scoped backend/credentials, and the tenant's cluster Git source.
+    let applied = cluster.stack(&stack_name).expect("preview Stack applied");
+    assert_eq!(applied["spec"]["preview"], true);
+    assert_eq!(applied["spec"]["destroyOnFinalize"], false);
+    assert_eq!(
+        applied["metadata"]["labels"]["keel.io/pr-id"],
+        pr_id.as_str()
+    );
+    assert_eq!(applied["metadata"]["labels"]["keel.io/tenant"], "acme");
+    assert_eq!(applied["metadata"]["labels"]["keel.io/provider"], "proxmox");
+    assert!(applied["metadata"]["annotations"]["keel.io/head-sha"].is_string());
+    assert!(
+        applied["spec"]["backend"]
+            .as_str()
+            .unwrap()
+            .starts_with("s3://pulumi-state/tenants/acme")
+    );
+    assert_eq!(
+        applied["spec"]["envRefs"]["AWS_ACCESS_KEY_ID"]["secret"]["name"],
+        "keel-preview-s3-acme"
+    );
+    assert!(
+        applied["spec"]["stack"]
+            .as_str()
+            .unwrap()
+            .ends_with("/acme-vm-preview")
+    );
+    let repos = cluster.list_preview_git_repositories().await.unwrap();
+    assert_eq!(
+        repos[0]["spec"]["url"],
+        "http://forgejo.keel-system.svc:3000/keel/infra-gitops.git"
+    );
+    assert_eq!(
+        repos[0]["spec"]["secretRef"]["name"],
+        "keel-preview-git-acme"
+    );
+
+    // PKO finishes the preview; a *fresh* server state (restart: empty in-memory cache) collects
+    // and publishes the real plan from cluster state only.
+    cluster.set_stack_status(
+        &stack_name,
+        json!({ "lastUpdate": {
+            "name": "u1", "generation": 1, "state": "succeeded",
+            "lastAttemptedCommit": "keel/acme/x@sha1:feedface"
+        } }),
+    );
+    cluster.put_workspace_log(
+        &stack_name,
+        "Previewing update (acme-vm-preview):\n  + proxmoxve:VM/virtualMachine:VirtualMachine: (create)\n    [urn=urn:pulumi:acme-vm-preview::vm::proxmoxve:VM/virtualMachine:VirtualMachine::vm-preview]\nResources:\n    + 1 to create\n    1 unchanged\n",
+    );
+    let restarted = fixture
+        .state
+        .clone()
+        .with_preview_cluster(Some(Arc::new(cluster.clone())));
+    restarted.preview_cache.write().await.clear();
+    let outcome = keel_server::preview_lifecycle::reconcile_previews_once(&restarted).await;
+    assert_eq!(outcome.published, 1, "{outcome:?}");
+    // Second pass is idempotent (reported commit recorded on the Stack).
+    let again = keel_server::preview_lifecycle::reconcile_previews_once(&restarted).await;
+    assert_eq!(again.published, 0);
+    assert_eq!(
+        cluster.stack(&stack_name).unwrap()["metadata"]["annotations"]["keel.io/preview-reported-commit"],
+        "feedface"
+    );
+
+    let res = build_router(restarted.clone())
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/proposals/{pr_id}/preview"))
+                .header(COOKIE, &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let preview: Value =
+        serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(preview["report"]["source"], "pko");
+    assert_eq!(preview["report"]["run"]["phase"], "succeeded");
+    assert_eq!(preview["report"]["summary"]["create"], 1);
+    assert_eq!(preview["report"]["summary"]["same"], 1);
+    assert_eq!(preview["report"]["resources"][0]["name"], "vm-preview");
+    let comments = preview["comments"].as_array().unwrap();
+    assert!(
+        comments
+            .iter()
+            .any(|c| c.to_string().contains("PKO preview:** Succeeded")),
+        "{comments:?}"
+    );
+
+    // Closing the PR out-of-band (not via the API) is still GC'd by the reconciler.
+    restarted.forge.close_pull_request(&pr_id).await.unwrap();
+    let outcome = keel_server::preview_lifecycle::reconcile_previews_once(&restarted).await;
+    assert_eq!(outcome.deleted, 2, "{outcome:?}");
+    assert!(cluster.stack_names().is_empty());
+    assert!(cluster.git_repository_names().is_empty());
+}
+
+/// A rejected preview apply (e.g. Kyverno admission denial) is reported honestly as `failed`, and
+/// Flux-only proposals are labelled `notExecuted` instead of claiming a preview Stack.
+#[tokio::test]
+async fn test_pko_preview_apply_failure_is_reported_honestly() {
+    use keel_kube::InMemoryPreviewCluster;
+
+    let fixture = setup_fixture().await;
+    let cluster = InMemoryPreviewCluster::new();
+    cluster.fail_applies_with("admission webhook denied: restrict-pulumi-providers");
+    let state = fixture
+        .state
+        .clone()
+        .with_preview_cluster(Some(Arc::new(cluster.clone())));
+    let cookie = login_and_get_cookie(&fixture).await;
+    let res = build_router(state)
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/proposals")
+                .header(COOKIE, &cookie)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "tenant": "acme",
+                        "catalogId": "proxmox-vm",
+                        "kind": "infra",
+                        "name": "vm-denied",
+                        "values": { "cores": 2 }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let body: Value =
+        serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(body["report"]["run"]["phase"], "failed");
+    assert!(
+        body["report"]["run"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("restrict-pulumi-providers")
+    );
+    assert!(body["report"]["run"]["stack"].is_null());
+    assert!(cluster.stack_names().is_empty());
+}
+
+/// Seeds a provider-credential infra blueprint (`writeOnly` GOOGLE_CREDENTIALS) on `main`.
+async fn seed_credential_blueprint(fixture: &TestFixture) {
+    let bp_dir = fixture.state.repo_workdir.join("catalog/infra/gcp-free-vm");
+    tokio::fs::create_dir_all(&bp_dir).await.unwrap();
+    tokio::fs::write(
+        bp_dir.join("catalog.yaml"),
+        r#"apiVersion: keel.io/v1alpha1
+kind: CatalogInfraBlueprint
+metadata:
+  id: gcp-free-vm
+  name: GCP Free VM
+  category: Compute
+  provider: proxmox
+spec:
+  pulumiRuntime: yaml
+  entrypoint: Pulumi.yaml
+  protectByDefault: false
+  schema:
+    type: object
+    required:
+      - vmName
+    properties:
+      vmName:
+        type: string
+        default: keel-free-vm
+      GOOGLE_CREDENTIALS:
+        type: string
+        writeOnly: true
+"#,
+    )
+    .await
+    .unwrap();
+    tokio::fs::write(
+        bp_dir.join("Pulumi.yaml"),
+        "name: gcp-free-vm\nruntime: yaml\nresources: {}\n",
+    )
+    .await
+    .unwrap();
+    // A pre-existing instance whose Stack still points at the legacy (un-prefixed) backend.
+    let legacy_dir = fixture
+        .state
+        .repo_workdir
+        .join("tenants/acme/infra/legacy-vm");
+    tokio::fs::create_dir_all(&legacy_dir).await.unwrap();
+    tokio::fs::write(
+        legacy_dir.join("stack.yaml"),
+        r#"apiVersion: pulumi.com/v1
+kind: Stack
+metadata:
+  name: legacy-vm
+  namespace: tenant-acme
+spec:
+  stack: organization/gcp-free-vm/acme-legacy-vm
+  backend: s3://pulumi-state
+"#,
+    )
+    .await
+    .unwrap();
+    let git = &fixture.state.git_runner;
+    let wd = &fixture.state.repo_workdir;
+    git.add(
+        wd,
+        [
+            "catalog/infra/gcp-free-vm/catalog.yaml",
+            "catalog/infra/gcp-free-vm/Pulumi.yaml",
+            "tenants/acme/infra/legacy-vm/stack.yaml",
+        ],
+    )
+    .await
+    .unwrap();
+    git.commit(
+        wd,
+        "feat(catalog): add credential blueprint",
+        &CommitAuthor::new("Keel Seed", "seed@keel.local"),
+    )
+    .await
+    .unwrap();
+    git.push(wd, "origin", "HEAD:refs/heads/main")
+        .await
+        .unwrap();
+}
+
+async fn propose_infra(
+    app: &axum::Router,
+    cookie: &str,
+    values: Value,
+    name: &str,
+) -> (StatusCode, Value) {
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/proposals")
+                .header(COOKIE, cookie)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "tenant": "acme",
+                        "catalogId": "gcp-free-vm",
+                        "kind": "infra",
+                        "name": name,
+                        "values": values
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = res.status();
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or_else(|_| json!(String::from_utf8_lossy(&bytes))),
+    )
+}
+
+/// OPEN-9b + preview provider credentials: previews of brand-new *and* existing tenant stacks run
+/// on the tenant state prefix, and exactly the Secrets the tenant Stack references are copied into
+/// `keel-previews` under per-preview names (labelled, owned by the preview Stack, GC'd with it).
+#[tokio::test]
+async fn test_preview_uses_tenant_backend_and_copies_only_referenced_provider_secrets() {
+    use keel_kube::{InMemoryPreviewCluster, PREVIEW_PROVIDER_SECRET_KIND, PreviewPrerequisites};
+
+    let fixture = setup_fixture().await;
+    seed_credential_blueprint(&fixture).await;
+    let cluster = InMemoryPreviewCluster::new().with_prerequisites(PreviewPrerequisites {
+        s3_secret: Some("keel-preview-s3-acme".to_string()),
+        git_url: Some("http://forgejo.keel-system.svc:3000/keel/infra-gitops.git".to_string()),
+        git_secret: Some("keel-preview-git-acme".to_string()),
+    });
+    cluster.put_tenant_secret("acme", "unrelated-secret", &[("k", "v")]);
+    cluster.put_tenant_secret(
+        "acme",
+        "keel-pulumi-passphrase",
+        &[("passphrase", "tenant-pass")],
+    );
+    let state = fixture
+        .state
+        .clone()
+        .with_preview_cluster(Some(Arc::new(cluster.clone())));
+    let cookie = login_and_get_cookie(&fixture).await;
+    let app = build_router(state.clone());
+
+    // 1. Existing (legacy-backend) stack, no credentials in this change.
+    let (status, body) =
+        propose_infra(&app, &cookie, json!({ "vmName": "legacy" }), "legacy-vm").await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let pr = body["proposal"]["id"].as_str().unwrap().to_string();
+    let applied = cluster.stack(&format!("preview-stack-pr-{pr}")).unwrap();
+    assert_eq!(applied["spec"]["backend"], "s3://pulumi-state/tenants/acme");
+    assert_eq!(
+        body["previewStack"]["spec"]["backend"],
+        "s3://pulumi-state/tenants/acme"
+    );
+
+    // 2. Brand-new stack carrying a provider credential.
+    let (status, body) = propose_infra(
+        &app,
+        &cookie,
+        json!({ "vmName": "fresh", "GOOGLE_CREDENTIALS": "{\"type\":\"service_account\"}" }),
+        "fresh-vm",
+    )
+    .await;
+    if status == StatusCode::BAD_REQUEST {
+        // sops/age unavailable: secret fields are rejected rather than committed in plaintext.
+        assert!(body.to_string().contains("SOPS age key"), "{body}");
+        eprintln!("sops/age unavailable: skipping provider credential copy assertions");
+        return;
+    }
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let pr = body["proposal"]["id"].as_str().unwrap().to_string();
+    let stack_name = format!("preview-stack-pr-{pr}");
+    let applied = cluster.stack(&stack_name).unwrap();
+    assert_eq!(applied["spec"]["backend"], "s3://pulumi-state/tenants/acme");
+    let copy_name = format!("keel-preview-{pr}-fresh-vm-secrets");
+    assert_eq!(
+        applied["spec"]["envRefs"]["GOOGLE_CREDENTIALS"]["secret"]["name"],
+        copy_name.as_str()
+    );
+    assert_eq!(
+        applied["spec"]["envRefs"]["AWS_ACCESS_KEY_ID"]["secret"]["name"],
+        "keel-preview-s3-acme"
+    );
+    let this_pr_copies: Vec<String> = cluster
+        .preview_secret_names()
+        .into_iter()
+        .filter(|n| n.starts_with(&format!("keel-preview-{pr}-")))
+        .collect();
+    assert_eq!(
+        this_pr_copies,
+        vec![
+            copy_name.clone(),
+            format!("keel-preview-{pr}-keel-pulumi-passphrase")
+        ]
+    );
+    let copied = cluster.preview_secret(&copy_name).unwrap();
+    assert_eq!(copied.owner_stack, stack_name);
+    assert_eq!(copied.labels["keel.io/pr-id"], pr.as_str());
+    assert_eq!(copied.labels["keel.io/tenant"], "acme");
+    assert_eq!(
+        copied.labels["keel.io/secret-kind"],
+        PREVIEW_PROVIDER_SECRET_KIND
+    );
+    assert_eq!(
+        copied.data["GOOGLE_CREDENTIALS"],
+        b"{\"type\":\"service_account\"}".to_vec()
+    );
+    // The API response never echoes credential values.
+    assert!(!body.to_string().contains("service_account"));
+
+    // GC of the preview Stack removes its credential copies (ownerReference).
+    keel_server::preview_lifecycle::gc_preview_for_pr(&state, &pr, "test").await;
+    assert!(
+        !cluster
+            .preview_secret_names()
+            .iter()
+            .any(|n| n.starts_with(&format!("keel-preview-{pr}-")))
+    );
+}
+
+/// Per-tenant Pulumi state encryption: tenant Stacks and their previews source
+/// `PULUMI_CONFIG_PASSPHRASE` from the tenant's `keel-pulumi-passphrase` Secret (never an empty
+/// literal), previews receive a per-preview owned copy of it, and proposals fail closed (409)
+/// when the tenant has no passphrase Secret.
+#[tokio::test]
+async fn test_tenant_stacks_use_tenant_passphrase_secret_and_fail_closed_without_it() {
+    use keel_kube::{InMemoryPreviewCluster, PreviewPrerequisites};
+
+    let propose = |cookie: &str, name: &str| {
+        Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/proposals")
+            .header(COOKIE, cookie)
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({
+                    "tenant": "acme",
+                    "catalogId": "proxmox-vm",
+                    "kind": "infra",
+                    "name": name,
+                    "values": { "cores": 2 }
+                })
+                .to_string(),
+            ))
+            .unwrap()
+    };
+    let passphrase_env = |stack: &Value| -> Value {
+        stack["spec"]["workspaceTemplate"]["spec"]["podTemplate"]["spec"]["containers"][0]["env"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["name"] == "PULUMI_CONFIG_PASSPHRASE")
+            .cloned()
+            .expect("PULUMI_CONFIG_PASSPHRASE env present")
+    };
+
+    // 1. No tenant passphrase Secret -> 409 with a clear message; nothing committed.
+    let fixture = setup_fixture_without_tenant_passphrase().await;
+    let cookie = login_and_get_cookie(&fixture).await;
+    let app = build_router(fixture.state.clone());
+    let res = app
+        .clone()
+        .oneshot(propose(&cookie, "vm-nopass"))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CONFLICT);
+    let body: Value =
+        serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let msg = body["error"].as_str().unwrap();
+    assert!(msg.contains("no Pulumi state passphrase"), "{body}");
+    assert!(msg.contains("tenant-acme/keel-pulumi-passphrase"), "{body}");
+    assert!(
+        !fixture
+            .state
+            .repo_workdir
+            .join("tenants/acme/infra/vm-nopass")
+            .exists()
+    );
+    // The server never invents a passphrase on the proposal path.
+    assert!(
+        fixture
+            .secret_store
+            .inspect_raw_secret("tenant-acme", "keel-pulumi-passphrase")
+            .await
+            .is_none()
+    );
+
+    // 2. Provisioned tenant -> Stack + preview reference the passphrase via secretKeyRef only.
+    let fixture = setup_fixture().await;
+    let tenant_pass = String::from_utf8(
+        fixture
+            .secret_store
+            .inspect_raw_secret("tenant-acme", "keel-pulumi-passphrase")
+            .await
+            .unwrap()
+            .data
+            .unwrap()["passphrase"]
+            .0
+            .clone(),
+    )
+    .unwrap();
+    assert!(tenant_pass.len() >= 43);
+    let cluster = InMemoryPreviewCluster::new().with_prerequisites(PreviewPrerequisites {
+        s3_secret: Some("keel-preview-s3-acme".to_string()),
+        git_url: Some("http://forgejo.keel-system.svc:3000/keel/infra-gitops.git".to_string()),
+        git_secret: Some("keel-preview-git-acme".to_string()),
+    });
+    cluster.put_tenant_secret(
+        "acme",
+        "keel-pulumi-passphrase",
+        &[("passphrase", tenant_pass.as_str())],
+    );
+    let state = fixture
+        .state
+        .clone()
+        .with_preview_cluster(Some(Arc::new(cluster.clone())));
+    let cookie = login_and_get_cookie(&fixture).await;
+    let res = build_router(state)
+        .oneshot(propose(&cookie, "vm-pass"))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let raw = res.into_body().collect().await.unwrap().to_bytes();
+    let body_text = String::from_utf8(raw.to_vec()).unwrap();
+    assert!(
+        !body_text.contains(&tenant_pass),
+        "passphrase leaked in API response"
+    );
+    let body: Value = serde_json::from_str(&body_text).unwrap();
+    let pr = body["proposal"]["id"].as_str().unwrap().to_string();
+
+    // Tenant Stack committed on the PR branch.
+    let branch = body["branch"].as_str().unwrap();
+    let stack_yaml = fixture
+        .state
+        .git_runner
+        .show_file_at_ref(
+            &fixture.state.repo_workdir,
+            branch,
+            "tenants/acme/infra/vm-pass/stack.yaml",
+        )
+        .await
+        .unwrap()
+        .expect("tenant Stack committed on the PR branch");
+    assert!(!stack_yaml.contains(&tenant_pass));
+    let stack: Value = serde_yml::from_str(&stack_yaml).unwrap();
+    let env = passphrase_env(&stack);
+    assert!(env.get("value").is_none(), "{env}");
+    assert_eq!(
+        env["valueFrom"]["secretKeyRef"],
+        json!({ "name": "keel-pulumi-passphrase", "key": "passphrase" })
+    );
+
+    // Preview Stack references its per-preview copy; the copy is owned by the preview Stack.
+    let preview_stack = cluster
+        .stack(&format!("preview-stack-pr-{pr}"))
+        .expect("preview Stack applied");
+    let copy_name = format!("keel-preview-{pr}-keel-pulumi-passphrase");
+    let env = passphrase_env(&preview_stack);
+    assert!(env.get("value").is_none(), "{env}");
+    assert_eq!(
+        env["valueFrom"]["secretKeyRef"],
+        json!({ "name": copy_name, "key": "passphrase" })
+    );
+    let copy = cluster
+        .preview_secret(&copy_name)
+        .expect("tenant passphrase copied into keel-previews");
+    assert_eq!(copy.owner_stack, format!("preview-stack-pr-{pr}"));
+    assert_eq!(copy.labels["keel.io/tenant"], "acme");
+    assert_eq!(copy.data["passphrase"], tenant_pass.as_bytes().to_vec());
+    assert!(!preview_stack.to_string().contains(&tenant_pass));
 }

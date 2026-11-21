@@ -19,6 +19,41 @@ pub struct ErrorResponse {
     pub error: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub details: Option<Vec<SchemaFieldError>>,
+    /// Opaque id correlating a generic 5xx response with the full server-side log entry.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub correlation_id: Option<String>,
+}
+
+/// Logs the full internal error server-side under a fresh correlation id and returns a generic
+/// response body, so internal paths, command output, and upstream API messages never reach
+/// clients (`NFR-SEC-05`).
+fn opaque_error_response(
+    status: StatusCode,
+    category: &str,
+    err: &dyn std::fmt::Display,
+) -> Response {
+    let correlation_id = uuid::Uuid::new_v4().to_string();
+    tracing::error!(
+        correlation_id = %correlation_id,
+        status = status.as_u16(),
+        category,
+        error = %err,
+        "request failed with internal error"
+    );
+    let error = if status == StatusCode::BAD_GATEWAY {
+        format!("Upstream {category} request failed (correlation id: {correlation_id})")
+    } else {
+        format!("Internal server error (correlation id: {correlation_id})")
+    };
+    (
+        status,
+        Json(ErrorResponse {
+            error,
+            details: None,
+            correlation_id: Some(correlation_id),
+        }),
+    )
+        .into_response()
 }
 
 /// Unified server error type implementing [`IntoResponse`].
@@ -75,6 +110,7 @@ impl IntoResponse for ServerError {
                 Json(ErrorResponse {
                     error: msg,
                     details: None,
+                    correlation_id: None,
                 }),
             )
                 .into_response(),
@@ -83,6 +119,7 @@ impl IntoResponse for ServerError {
                 Json(ErrorResponse {
                     error: msg,
                     details: None,
+                    correlation_id: None,
                 }),
             )
                 .into_response(),
@@ -91,6 +128,7 @@ impl IntoResponse for ServerError {
                 Json(ErrorResponse {
                     error: msg,
                     details: None,
+                    correlation_id: None,
                 }),
             )
                 .into_response(),
@@ -99,6 +137,7 @@ impl IntoResponse for ServerError {
                 Json(ErrorResponse {
                     error: msg,
                     details: None,
+                    correlation_id: None,
                 }),
             )
                 .into_response(),
@@ -107,6 +146,7 @@ impl IntoResponse for ServerError {
                 Json(ErrorResponse {
                     error: msg,
                     details: None,
+                    correlation_id: None,
                 }),
             )
                 .into_response(),
@@ -115,6 +155,7 @@ impl IntoResponse for ServerError {
                 Json(ErrorResponse {
                     error: msg,
                     details: None,
+                    correlation_id: None,
                 }),
             )
                 .into_response(),
@@ -123,6 +164,7 @@ impl IntoResponse for ServerError {
                 Json(ErrorResponse {
                     error: "Payload failed JSON Schema validation".to_string(),
                     details: Some(errors),
+                    correlation_id: None,
                 }),
             )
                 .into_response(),
@@ -131,6 +173,7 @@ impl IntoResponse for ServerError {
                 Json(ErrorResponse {
                     error: "Payload failed JSON Schema validation".to_string(),
                     details: Some(errors),
+                    correlation_id: None,
                 }),
             )
                 .into_response(),
@@ -139,22 +182,19 @@ impl IntoResponse for ServerError {
                 Json(ErrorResponse {
                     error: msg,
                     details: None,
+                    correlation_id: None,
                 }),
             )
                 .into_response(),
-            Self::Core(err) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: err.to_string(),
-                    details: None,
-                }),
-            )
-                .into_response(),
+            Self::Core(err) => {
+                opaque_error_response(StatusCode::INTERNAL_SERVER_ERROR, "core", &err)
+            }
             Self::Forge(ForgeError::NotFound(id)) => (
                 StatusCode::NOT_FOUND,
                 Json(ErrorResponse {
                     error: format!("Proposal '{id}' not found"),
                     details: None,
+                    correlation_id: None,
                 }),
             )
                 .into_response(),
@@ -163,6 +203,7 @@ impl IntoResponse for ServerError {
                 Json(ErrorResponse {
                     error: format!("Proposal '{id}' cannot be modified in state '{state}'"),
                     details: None,
+                    correlation_id: None,
                 }),
             )
                 .into_response(),
@@ -171,6 +212,7 @@ impl IntoResponse for ServerError {
                 Json(ErrorResponse {
                     error: format!("Merge conflict on proposal '{id}': {reason}"),
                     details: None,
+                    correlation_id: None,
                 }),
             )
                 .into_response(),
@@ -179,81 +221,74 @@ impl IntoResponse for ServerError {
                 Json(ErrorResponse {
                     error: msg,
                     details: None,
+                    correlation_id: None,
                 }),
             )
                 .into_response(),
-            Self::Forge(err) => (
-                StatusCode::BAD_GATEWAY,
-                Json(ErrorResponse {
-                    error: err.to_string(),
-                    details: None,
-                }),
-            )
-                .into_response(),
+            Self::Forge(err) => opaque_error_response(StatusCode::BAD_GATEWAY, "forge", &err),
             Self::Git(GitError::InvalidArgument { field, reason }) => (
                 StatusCode::BAD_REQUEST,
                 Json(ErrorResponse {
                     error: format!("Invalid git argument ({field}): {reason}"),
                     details: None,
+                    correlation_id: None,
                 }),
             )
                 .into_response(),
-            Self::Git(err) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: err.to_string(),
-                    details: None,
-                }),
-            )
-                .into_response(),
+            Self::Git(err) => opaque_error_response(StatusCode::INTERNAL_SERVER_ERROR, "git", &err),
             Self::Pko(PkoError::Validation(msg)) => (
                 StatusCode::BAD_REQUEST,
                 Json(ErrorResponse {
                     error: msg,
                     details: None,
+                    correlation_id: None,
                 }),
             )
                 .into_response(),
-            Self::Pko(err) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: err.to_string(),
-                    details: None,
-                }),
-            )
-                .into_response(),
+            Self::Pko(err) => opaque_error_response(StatusCode::INTERNAL_SERVER_ERROR, "pko", &err),
             Self::Kube(KubeError::InvalidInput(msg)) => (
                 StatusCode::BAD_REQUEST,
                 Json(ErrorResponse {
                     error: msg,
                     details: None,
+                    correlation_id: None,
                 }),
             )
                 .into_response(),
-            Self::Kube(err) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: err.to_string(),
-                    details: None,
-                }),
-            )
-                .into_response(),
-            Self::Io(err) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: err.to_string(),
-                    details: None,
-                }),
-            )
-                .into_response(),
-            Self::Internal(msg) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
+            Self::Kube(KubeError::NotFound(msg)) => (
+                StatusCode::NOT_FOUND,
                 Json(ErrorResponse {
                     error: msg,
                     details: None,
+                    correlation_id: None,
                 }),
             )
                 .into_response(),
+            Self::Kube(KubeError::Conflict(msg)) => (
+                StatusCode::CONFLICT,
+                Json(ErrorResponse {
+                    error: msg,
+                    details: None,
+                    correlation_id: None,
+                }),
+            )
+                .into_response(),
+            Self::Kube(KubeError::Unavailable(msg)) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorResponse {
+                    error: msg,
+                    details: None,
+                    correlation_id: None,
+                }),
+            )
+                .into_response(),
+            Self::Kube(err) => {
+                opaque_error_response(StatusCode::INTERNAL_SERVER_ERROR, "kubernetes", &err)
+            }
+            Self::Io(err) => opaque_error_response(StatusCode::INTERNAL_SERVER_ERROR, "io", &err),
+            Self::Internal(msg) => {
+                opaque_error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal", &msg)
+            }
         }
     }
 }
@@ -377,5 +412,64 @@ mod tests {
             let res = err.into_response();
             assert_eq!(res.status(), expected);
         }
+    }
+
+    async fn body_json(res: Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn kube_not_found_and_conflict_map_to_4xx_with_message() {
+        let res =
+            ServerError::Kube(KubeError::NotFound("Stack 'db' not found".into())).into_response();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        let body = body_json(res).await;
+        assert_eq!(body["error"], "Stack 'db' not found");
+        assert!(
+            body.get("correlationId")
+                .is_none_or(serde_json::Value::is_null)
+        );
+
+        let res = ServerError::Kube(KubeError::Conflict("Stack 'db' is protected".into()))
+            .into_response();
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+        let body = body_json(res).await;
+        assert_eq!(body["error"], "Stack 'db' is protected");
+    }
+
+    #[tokio::test]
+    async fn internal_errors_are_opaque_with_correlation_id() {
+        let leaky = [
+            ServerError::Internal("/var/lib/keel/secret-path failed".into()),
+            ServerError::Io(std::io::Error::other("/var/lib/keel/secret-path")),
+            ServerError::Core(CoreError::CommandFailed {
+                program: "sops".into(),
+                message: "/var/lib/keel/secret-path".into(),
+            }),
+            ServerError::Forge(ForgeError::Api {
+                status: 500,
+                message: "/var/lib/keel/secret-path".into(),
+            }),
+            ServerError::Pko(PkoError::PreviewParse("/var/lib/keel/secret-path".into())),
+        ];
+        for err in leaky {
+            let body = body_json(err.into_response()).await;
+            let msg = body["error"].as_str().unwrap();
+            let cid = body["correlationId"].as_str().unwrap();
+            assert!(!msg.contains("secret-path"), "{msg}");
+            assert!(msg.contains(cid));
+            assert!(uuid::Uuid::parse_str(cid).is_ok());
+        }
+
+        // 4xx validation messages stay informative and carry no correlation id.
+        let body = body_json(
+            ServerError::Core(CoreError::Validation("field x bad".into())).into_response(),
+        )
+        .await;
+        assert_eq!(body["error"], "field x bad");
+        assert!(body.get("correlationId").is_none());
     }
 }

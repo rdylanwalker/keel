@@ -1469,16 +1469,94 @@ fn is_disallowed_ssrf_ip(ip: std::net::IpAddr) -> bool {
                 || v4.is_unspecified()
                 || v4.is_broadcast()
                 || v4.is_multicast()
+                || v4.octets()[0] == 0
                 || (v4.octets()[0] == 100 && (v4.octets()[1] & 0b1100_0000) == 64)
+                || (v4.octets()[0] == 198 && (v4.octets()[1] & 0xfe) == 18)
+                || v4.octets()[0] >= 240
         }
         std::net::IpAddr::V6(v6) => {
+            if let Some(mapped) = v6.to_ipv4_mapped() {
+                return is_disallowed_ssrf_ip(std::net::IpAddr::V4(mapped));
+            }
             v6.is_loopback()
                 || v6.is_unspecified()
                 || v6.is_multicast()
                 || (v6.segments()[0] & 0xfe00) == 0xfc00
                 || (v6.segments()[0] & 0xffc0) == 0xfe80
+                // NAT64 well-known prefix 64:ff9b::/96 can embed private IPv4 targets.
+                || (v6.segments()[0] == 0x64 && v6.segments()[1] == 0xff9b)
         }
     }
+}
+
+/// Upper bound for a downloaded Helm repository `index.yaml`.
+const MAX_HELM_INDEX_BYTES: usize = 32 * 1024 * 1024;
+/// Upper bound for a downloaded chart archive (`.tgz`).
+const MAX_HELM_CHART_BYTES: usize = 20 * 1024 * 1024;
+/// Upper bound on decompressed bytes scanned inside a chart archive (zip-bomb guard).
+const MAX_HELM_UNPACKED_BYTES: u64 = 64 * 1024 * 1024;
+/// Upper bound for `values.schema.json` / `values.yaml`.
+const MAX_SCHEMA_BYTES: usize = 2 * 1024 * 1024;
+/// Maximum manually-followed HTTP redirects (each hop is re-validated and re-pinned).
+const MAX_HELM_REDIRECTS: usize = 5;
+/// Overall deadline for fetching an upstream chart schema.
+const HELM_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+
+/// Validates URL shape (scheme, no credentials, no internal host names) and resolves the host
+/// **once**, rejecting any private/loopback/link-local address. The returned addresses are pinned
+/// for the actual connection so a second DNS answer (rebinding) can never be used.
+async fn resolve_public_addrs(
+    parsed: &url::Url,
+    allowed_schemes: &[&str],
+) -> Result<Vec<std::net::SocketAddr>, ServerError> {
+    if !allowed_schemes.contains(&parsed.scheme()) {
+        return Err(ServerError::BadRequest(format!(
+            "URL scheme must be one of: {}",
+            allowed_schemes.join(", ")
+        )));
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(ServerError::BadRequest(
+            "repoUrl must not contain embedded credentials".to_string(),
+        ));
+    }
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| ServerError::BadRequest("repoUrl must include a valid host".to_string()))?;
+    let lower = host.to_ascii_lowercase();
+    if lower == "localhost"
+        || lower.ends_with(".localhost")
+        || lower.ends_with(".local")
+        || lower.ends_with(".internal")
+        || lower.ends_with(".cluster.local")
+    {
+        return Err(ServerError::BadRequest(
+            "repoUrl host is not permitted (private/cluster-internal hosts are blocked)"
+                .to_string(),
+        ));
+    }
+    let port = parsed.port_or_known_default().unwrap_or(443);
+    let addrs: Vec<std::net::SocketAddr> = match parsed.host() {
+        Some(url::Host::Ipv4(ip)) => vec![(std::net::IpAddr::V4(ip), port).into()],
+        Some(url::Host::Ipv6(ip)) => vec![(std::net::IpAddr::V6(ip), port).into()],
+        _ => tokio::net::lookup_host((host, port))
+            .await
+            .map_err(|_| {
+                ServerError::BadRequest(format!("repoUrl host '{host}' could not be resolved"))
+            })?
+            .collect(),
+    };
+    if addrs.is_empty() {
+        return Err(ServerError::BadRequest(format!(
+            "repoUrl host '{host}' could not be resolved"
+        )));
+    }
+    if addrs.iter().any(|a| is_disallowed_ssrf_ip(a.ip())) {
+        return Err(ServerError::BadRequest(
+            "repoUrl resolves to a disallowed private/loopback/link-local IP".to_string(),
+        ));
+    }
+    Ok(addrs)
 }
 
 async fn validate_upstream_helm_repo_url(repo_url: &str) -> Result<url::Url, ServerError> {
@@ -1487,50 +1565,295 @@ async fn validate_upstream_helm_repo_url(repo_url: &str) -> Result<url::Url, Ser
             "repoUrl must be a valid http://, https://, or oci:// URL".to_string(),
         )
     })?;
-    if !matches!(parsed.scheme(), "http" | "https" | "oci") {
-        return Err(ServerError::BadRequest(
-            "repoUrl must start with http://, https://, or oci://".to_string(),
-        ));
+    resolve_public_addrs(&parsed, &["http", "https", "oci"]).await?;
+    Ok(parsed)
+}
+
+/// SSRF-hardened HTTP GET: every hop (including redirects, followed manually) is validated,
+/// resolved once, and connected via the pinned public addresses; the body is capped at `cap`.
+async fn ssrf_safe_http_get(url: url::Url, cap: usize) -> Result<Vec<u8>, ServerError> {
+    let mut current = url;
+    for _ in 0..=MAX_HELM_REDIRECTS {
+        let addrs = resolve_public_addrs(&current, &["http", "https"]).await?;
+        let mut builder = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(HELM_FETCH_TIMEOUT);
+        if let Some(domain) = current.domain() {
+            builder = builder.resolve_to_addrs(domain, &addrs);
+        }
+        let client = builder
+            .build()
+            .map_err(|e| ServerError::Internal(format!("failed to build HTTP client: {e}")))?;
+        let mut resp = client
+            .get(current.clone())
+            .send()
+            .await
+            .map_err(|e| ServerError::BadRequest(format!("upstream fetch failed: {e}")))?;
+        if resp.status().is_redirection() {
+            let loc = resp
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .ok_or_else(|| {
+                    ServerError::BadRequest("upstream redirect without Location".to_string())
+                })?;
+            current = current
+                .join(loc)
+                .map_err(|_| ServerError::BadRequest("invalid upstream redirect".to_string()))?;
+            continue;
+        }
+        if !resp.status().is_success() {
+            return Err(ServerError::BadRequest(format!(
+                "upstream returned HTTP {}",
+                resp.status()
+            )));
+        }
+        if resp.content_length().is_some_and(|l| l > cap as u64) {
+            return Err(ServerError::BadRequest(format!(
+                "upstream response exceeds {cap} byte limit"
+            )));
+        }
+        let mut buf = Vec::new();
+        while let Some(chunk) = resp
+            .chunk()
+            .await
+            .map_err(|e| ServerError::BadRequest(format!("upstream read failed: {e}")))?
+        {
+            if buf.len() + chunk.len() > cap {
+                return Err(ServerError::BadRequest(format!(
+                    "upstream response exceeds {cap} byte limit"
+                )));
+            }
+            buf.extend_from_slice(&chunk);
+        }
+        return Ok(buf);
     }
-    if parsed.username() != "" || parsed.password().is_some() {
-        return Err(ServerError::BadRequest(
-            "repoUrl must not contain embedded credentials".to_string(),
-        ));
+    Err(ServerError::BadRequest(
+        "too many upstream redirects".to_string(),
+    ))
+}
+
+/// Resolves the chart archive URL for `chart`/`version` from a classic Helm repository `index.yaml`.
+fn resolve_chart_url_from_index(
+    repo_base: &url::Url,
+    index_raw: &[u8],
+    chart: &str,
+    version: Option<&str>,
+) -> Result<url::Url, ServerError> {
+    let index: Value = serde_yml::from_slice(index_raw)
+        .map_err(|e| ServerError::BadRequest(format!("invalid upstream index.yaml: {e}")))?;
+    let entries = index
+        .get("entries")
+        .and_then(|e| e.get(chart))
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            ServerError::NotFound(format!("chart '{chart}' not found in repository index"))
+        })?;
+    let wanted = version.map(|v| v.trim().trim_start_matches('v'));
+    let entry = entries
+        .iter()
+        .find(|e| match wanted {
+            Some(w) => e
+                .get("version")
+                .and_then(Value::as_str)
+                .is_some_and(|v| v.trim_start_matches('v') == w),
+            None => true,
+        })
+        .ok_or_else(|| {
+            ServerError::NotFound(format!(
+                "chart '{chart}' version '{}' not found in repository index",
+                version.unwrap_or_default()
+            ))
+        })?;
+    let raw_url = entry
+        .get("urls")
+        .and_then(Value::as_array)
+        .and_then(|u| u.first())
+        .and_then(Value::as_str)
+        .ok_or_else(|| ServerError::BadRequest("chart index entry has no urls".to_string()))?;
+    let mut base = repo_base.clone();
+    if !base.path().ends_with('/') {
+        base.set_path(&format!("{}/", base.path()));
     }
-    let host = parsed
-        .host_str()
-        .ok_or_else(|| ServerError::BadRequest("repoUrl must include a valid host".to_string()))?;
-    if host.eq_ignore_ascii_case("localhost")
-        || host.ends_with(".local")
-        || host.ends_with(".internal")
-        || host.ends_with(".cluster.local")
-    {
-        return Err(ServerError::BadRequest(
-            "repoUrl host is not permitted (private/cluster-internal hosts are blocked)"
-                .to_string(),
-        ));
-    }
-    if let Ok(ip) = host
-        .trim_matches(|c| c == '[' || c == ']')
-        .parse::<std::net::IpAddr>()
-        && is_disallowed_ssrf_ip(ip)
-    {
-        return Err(ServerError::BadRequest(
-            "repoUrl IP address is not permitted (private/loopback/link-local ranges are blocked)"
-                .to_string(),
-        ));
-    }
-    let port = parsed.port_or_known_default().unwrap_or(443);
-    if let Ok(addrs) = tokio::net::lookup_host((host, port)).await {
-        for addr in addrs {
-            if is_disallowed_ssrf_ip(addr.ip()) {
-                return Err(ServerError::BadRequest(
-                    "repoUrl resolves to a disallowed private/loopback/link-local IP".to_string(),
-                ));
+    base.join(raw_url)
+        .map_err(|_| ServerError::BadRequest("invalid chart archive URL in index".to_string()))
+}
+
+/// Files of interest extracted from a chart archive's top-level chart directory.
+#[derive(Debug, Default)]
+struct ChartSchemaFiles {
+    values_schema_json: Option<Vec<u8>>,
+    values_yaml: Option<Vec<u8>>,
+}
+
+/// Minimal, bounded `.tgz` reader returning only `<chart>/values.schema.json` and
+/// `<chart>/values.yaml` from memory (nothing is written to disk). Decompression is capped at
+/// [`MAX_HELM_UNPACKED_BYTES`] and individual files at [`MAX_SCHEMA_BYTES`].
+fn extract_chart_schema_files(tgz: &[u8]) -> Result<ChartSchemaFiles, ServerError> {
+    use std::io::Read;
+    let bad = |m: &str| ServerError::BadRequest(format!("invalid chart archive: {m}"));
+    let mut reader = flate2::read::GzDecoder::new(tgz).take(MAX_HELM_UNPACKED_BYTES + 1);
+    let mut consumed: u64 = 0;
+    let mut out = ChartSchemaFiles::default();
+    let mut header = [0u8; 512];
+    loop {
+        if reader.read_exact(&mut header).is_err() {
+            break;
+        }
+        consumed += 512;
+        if header.iter().all(|b| *b == 0) {
+            break;
+        }
+        let field = |range: std::ops::Range<usize>| {
+            let raw = &header[range];
+            let end = raw.iter().position(|b| *b == 0).unwrap_or(raw.len());
+            String::from_utf8_lossy(&raw[..end]).into_owned()
+        };
+        let size_str = field(124..136);
+        let size = u64::from_str_radix(size_str.trim(), 8).map_err(|_| bad("bad entry size"))?;
+        let typeflag = header[156];
+        let name = field(0..100);
+        let prefix = if &header[257..262] == b"ustar" {
+            field(345..500)
+        } else {
+            String::new()
+        };
+        let path = if prefix.is_empty() {
+            name
+        } else {
+            format!("{prefix}/{name}")
+        };
+        let padded = size.div_ceil(512) * 512;
+        consumed += padded;
+        if consumed > MAX_HELM_UNPACKED_BYTES {
+            return Err(bad("decompressed size limit exceeded"));
+        }
+        let parts: Vec<&str> = path.trim_start_matches("./").split('/').collect();
+        let target = if matches!(typeflag, b'0' | 0) && parts.len() == 2 {
+            match parts[1] {
+                "values.schema.json" => Some(&mut out.values_schema_json),
+                "values.yaml" => Some(&mut out.values_yaml),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        match target {
+            Some(slot) => {
+                if size > MAX_SCHEMA_BYTES as u64 {
+                    return Err(ServerError::BadRequest(format!(
+                        "upstream {} exceeds 2 MiB size limit",
+                        parts[1]
+                    )));
+                }
+                let mut buf = vec![0u8; size as usize];
+                reader
+                    .read_exact(&mut buf)
+                    .map_err(|_| bad("truncated entry"))?;
+                let mut pad = vec![0u8; (padded - size) as usize];
+                reader
+                    .read_exact(&mut pad)
+                    .map_err(|_| bad("truncated entry"))?;
+                if slot.is_none() {
+                    *slot = Some(buf);
+                }
+            }
+            None => {
+                std::io::copy(&mut (&mut reader).take(padded), &mut std::io::sink())
+                    .map_err(|_| bad("truncated entry"))?;
             }
         }
     }
-    Ok(parsed)
+    Ok(out)
+}
+
+fn chart_schema_from_files(
+    chart: &str,
+    files: ChartSchemaFiles,
+) -> Result<(Value, String), ServerError> {
+    if let Some(raw) = files.values_schema_json {
+        let parsed: Value = serde_json::from_slice(&raw).map_err(|e| {
+            ServerError::Internal(format!("invalid upstream values.schema.json: {e}"))
+        })?;
+        return Ok((parsed, "values.schema.json".to_string()));
+    }
+    if let Some(raw) = files.values_yaml {
+        let parsed: Value = serde_yml::from_slice(&raw)
+            .map_err(|e| ServerError::Internal(format!("invalid upstream values.yaml: {e}")))?;
+        return Ok((
+            yaml_value_to_json_schema(&parsed),
+            "values.yaml".to_string(),
+        ));
+    }
+    Err(ServerError::NotFound(format!(
+        "chart '{chart}' contains neither values.schema.json nor values.yaml"
+    )))
+}
+
+/// RAII temp directory removed on drop (including early returns, timeouts, and panics).
+struct ScopedTempDir(std::path::PathBuf);
+
+impl Drop for ScopedTempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Pulls an OCI chart archive with the `helm` CLI (no `--untar`), bounded by a timeout that kills
+/// the child, and returns the archive bytes (size-capped).
+async fn helm_pull_oci_archive(
+    repo_url: &str,
+    chart: &str,
+    version: Option<&str>,
+) -> Result<Vec<u8>, ServerError> {
+    let tmp = ScopedTempDir(
+        std::env::temp_dir().join(format!("keel-helm-schema-{}", uuid::Uuid::new_v4())),
+    );
+    tokio::fs::create_dir_all(&tmp.0).await?;
+    let mut args = vec![
+        "pull".to_string(),
+        format!("{}/{}", repo_url.trim_end_matches('/'), chart),
+    ];
+    if let Some(v) = version {
+        args.push("--version".to_string());
+        args.push(v.to_string());
+    }
+    args.push("--destination".to_string());
+    args.push(tmp.0.to_string_lossy().to_string());
+
+    let child = tokio::process::Command::new("helm")
+        .args(&args)
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .output();
+    let output = tokio::time::timeout(HELM_FETCH_TIMEOUT, child)
+        .await
+        .map_err(|_| ServerError::Internal("helm pull timed out".to_string()))?
+        .map_err(|e| ServerError::Internal(format!("failed to invoke helm CLI: {e}")))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(ServerError::BadRequest(format!(
+            "helm pull failed: {}",
+            stderr.trim()
+        )));
+    }
+    let mut entries = tokio::fs::read_dir(&tmp.0).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        if path.extension().is_some_and(|e| e == "tgz") {
+            let meta = entry.metadata().await?;
+            if meta.len() > MAX_HELM_CHART_BYTES as u64 {
+                return Err(ServerError::BadRequest(
+                    "chart archive exceeds size limit".to_string(),
+                ));
+            }
+            return Ok(tokio::fs::read(&path).await?);
+        }
+    }
+    Err(ServerError::Internal(
+        "helm pull produced no chart archive".to_string(),
+    ))
 }
 
 async fn fetch_upstream_helm_schema(
@@ -1538,11 +1861,11 @@ async fn fetch_upstream_helm_schema(
     chart: &str,
     version: Option<&str>,
 ) -> Result<(Value, String), ServerError> {
-    const MAX_SCHEMA_BYTES: u64 = 2 * 1024 * 1024;
     let repo_url = repo_url.trim();
     let chart = chart.trim();
-    let _validated_url = validate_upstream_helm_repo_url(repo_url).await?;
+    let validated_url = validate_upstream_helm_repo_url(repo_url).await?;
     if chart.is_empty()
+        || chart.len() > 253
         || chart.starts_with('-')
         || chart.contains("..")
         || chart.contains('/')
@@ -1554,102 +1877,43 @@ async fn fetch_upstream_helm_schema(
             "invalid Helm chart name".to_string(),
         ));
     }
-    if let Some(v) = version {
-        let v = v.trim();
-        if v.starts_with('-') || v.contains('\0') || v.chars().any(char::is_whitespace) {
-            return Err(ServerError::BadRequest(
-                "invalid Helm chart version".to_string(),
-            ));
-        }
-    }
-
-    let tmp_dir = std::env::temp_dir().join(format!("keel-helm-schema-{}", uuid::Uuid::new_v4()));
-    tokio::fs::create_dir_all(&tmp_dir).await?;
-    let tmp_path = tmp_dir.to_string_lossy().to_string();
-
-    let mut args = vec!["pull".to_string()];
-    if repo_url.starts_with("oci://") {
-        args.push(format!("{}/{}", repo_url.trim_end_matches('/'), chart));
-    } else {
-        args.push(chart.to_string());
-        args.push("--repo".to_string());
-        args.push(repo_url.to_string());
-    }
-    if let Some(v) = version.map(str::trim).filter(|v| !v.is_empty()) {
-        args.push("--version".to_string());
-        args.push(v.to_string());
-    }
-    args.push("--untar".to_string());
-    args.push("--untardir".to_string());
-    args.push(tmp_path);
-
-    let output = tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        tokio::process::Command::new("helm").args(&args).output(),
-    )
-    .await
-    .map_err(|_| {
-        let _ = std::fs::remove_dir_all(&tmp_dir);
-        ServerError::Internal("helm pull timed out after 30s".to_string())
-    })?
-    .map_err(|e| ServerError::Internal(format!("failed to invoke helm CLI: {e}")))?;
-
-    if !output.status.success() {
-        let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(ServerError::Internal(format!(
-            "helm pull failed: {}",
-            stderr.trim()
-        )));
-    }
-
-    let chart_dir = tmp_dir.join(chart);
-    let schema_json_path = chart_dir.join("values.schema.json");
-    if tokio::fs::try_exists(&schema_json_path)
-        .await
-        .unwrap_or(false)
+    let version = version.map(str::trim).filter(|v| !v.is_empty());
+    if let Some(v) = version
+        && (v.starts_with('-')
+            || v.len() > 128
+            || v.contains('\0')
+            || v.chars().any(char::is_whitespace))
     {
-        let meta = tokio::fs::metadata(&schema_json_path).await?;
-        if meta.len() > MAX_SCHEMA_BYTES {
-            let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
-            return Err(ServerError::BadRequest(
-                "upstream values.schema.json exceeds 2 MiB size limit".to_string(),
-            ));
-        }
-        let raw = tokio::fs::read_to_string(&schema_json_path).await?;
-        let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
-        let parsed: Value = serde_json::from_str(&raw).map_err(|e| {
-            ServerError::Internal(format!("invalid upstream values.schema.json: {e}"))
-        })?;
-        return Ok((parsed, "values.schema.json".to_string()));
-    }
-
-    let values_yaml_path = chart_dir.join("values.yaml");
-    if tokio::fs::try_exists(&values_yaml_path)
-        .await
-        .unwrap_or(false)
-    {
-        let meta = tokio::fs::metadata(&values_yaml_path).await?;
-        if meta.len() > MAX_SCHEMA_BYTES {
-            let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
-            return Err(ServerError::BadRequest(
-                "upstream values.yaml exceeds 2 MiB size limit".to_string(),
-            ));
-        }
-        let raw = tokio::fs::read_to_string(&values_yaml_path).await?;
-        let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
-        let parsed: Value = serde_yml::from_str(&raw)
-            .map_err(|e| ServerError::Internal(format!("invalid upstream values.yaml: {e}")))?;
-        return Ok((
-            yaml_value_to_json_schema(&parsed),
-            "values.yaml".to_string(),
+        return Err(ServerError::BadRequest(
+            "invalid Helm chart version".to_string(),
         ));
     }
 
-    let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
-    Err(ServerError::NotFound(format!(
-        "chart '{chart}' contains neither values.schema.json nor values.yaml"
-    )))
+    let work = async {
+        let archive = if validated_url.scheme() == "oci" {
+            // NOTE: helm performs its own DNS resolution for OCI registries; the up-front
+            // validation above blocks literal/initially-private targets but cannot pin IPs.
+            helm_pull_oci_archive(repo_url, chart, version).await?
+        } else {
+            let mut index_url = validated_url.clone();
+            if !index_url.path().ends_with('/') {
+                index_url.set_path(&format!("{}/", index_url.path()));
+            }
+            let index_url = index_url
+                .join("index.yaml")
+                .map_err(|_| ServerError::BadRequest("invalid repoUrl".to_string()))?;
+            let index = ssrf_safe_http_get(index_url, MAX_HELM_INDEX_BYTES).await?;
+            let chart_url = resolve_chart_url_from_index(&validated_url, &index, chart, version)?;
+            ssrf_safe_http_get(chart_url, MAX_HELM_CHART_BYTES).await?
+        };
+        let files = tokio::task::spawn_blocking(move || extract_chart_schema_files(&archive))
+            .await
+            .map_err(|e| ServerError::Internal(format!("chart extraction task failed: {e}")))??;
+        chart_schema_from_files(chart, files)
+    };
+    tokio::time::timeout(HELM_FETCH_TIMEOUT, work)
+        .await
+        .map_err(|_| ServerError::Internal("upstream chart schema fetch timed out".to_string()))?
 }
 
 /// `POST /api/v1/catalog/fetch-schema`
@@ -1657,9 +1921,16 @@ async fn fetch_upstream_helm_schema(
 /// Pulls the upstream Helm chart and returns its `values.schema.json` (or a JSON Schema inferred
 /// from `values.yaml`) so Catalog forms mirror upstream chart configuration options.
 pub async fn fetch_catalog_schema(
-    _auth: AuthSession,
+    auth: AuthSession,
     Json(req): Json<FetchCatalogSchemaRequest>,
 ) -> Result<Json<FetchCatalogSchemaResponse>, ServerError> {
+    // Outbound fetches are an SSRF surface: restrict to catalog curators (OPEN-14).
+    if !auth.is_admin() && !auth.is_any_tenant_admin() {
+        return Err(ServerError::Forbidden(
+            "Fetching upstream chart schemas requires administrator or tenant-administrator privileges"
+                .to_string(),
+        ));
+    }
     let (schema, source) =
         fetch_upstream_helm_schema(&req.repo_url, &req.chart, req.version.as_deref()).await?;
     Ok(Json(FetchCatalogSchemaResponse { schema, source }))
@@ -1761,8 +2032,10 @@ pub async fn delete_catalog_item(
         (commit_sha, name)
     };
 
-    let title = format!("Delete catalog {normalized_kind}: {display_name}");
-    let description = format!("This PR deletes the `{id}` catalog {normalized_kind}.");
+    let title = format!("chore(catalog): delete {normalized_kind} {id}");
+    let description = format!(
+        "Automated catalog removal proposal for `{id}` ({display_name})\n\n- Kind: {normalized_kind}\n- Removed: `{rel_dir}`"
+    );
     let proposal =
         open_pr_for_session(&state, &auth, "catalog", &branch, title, description).await?;
 

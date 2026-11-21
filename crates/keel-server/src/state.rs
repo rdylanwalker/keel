@@ -12,8 +12,8 @@ use async_trait::async_trait;
 use keel_core::{AuthPhase, InfraResourceKind, OidcConfig, split_yaml_documents};
 use keel_git::{ForgeProvider, GitRunner, LocalGitProvider};
 use keel_kube::{
-    InMemorySecretStore, LiveResourceStatus, LiveStatusSource, SecretStateStore, StackDiagnostics,
-    TelemetryMux,
+    InMemorySecretStore, LiveResourceInfo, LiveResourceStatus, LiveStatusSource, SecretStateStore,
+    StackDiagnostics, TelemetryMux,
 };
 use keel_pko::{GcPlan, PreviewReport, PreviewResourceCandidate, PreviewStack};
 use serde::{Deserialize, Serialize};
@@ -142,13 +142,13 @@ pub trait ClusterStateProvider: Send + Sync {
         _namespace: &str,
         _name: &str,
     ) -> Result<String, ServerError> {
-        Err(ServerError::BadRequest(
+        Err(ServerError::ServiceUnavailable(
             "Live Kubernetes cluster connection required to restart stack workspace".to_string(),
         ))
     }
 
     async fn reconcile_stack(&self, _namespace: &str, _name: &str) -> Result<String, ServerError> {
-        Err(ServerError::BadRequest(
+        Err(ServerError::ServiceUnavailable(
             "Live Kubernetes cluster connection required to reconcile stack".to_string(),
         ))
     }
@@ -158,13 +158,13 @@ pub trait ClusterStateProvider: Send + Sync {
         _namespace: &str,
         _name: &str,
     ) -> Result<String, ServerError> {
-        Err(ServerError::BadRequest(
+        Err(ServerError::ServiceUnavailable(
             "Live Kubernetes cluster connection required to force-delete stack".to_string(),
         ))
     }
 
     async fn unlock_stack(&self, _namespace: &str, _name: &str) -> Result<String, ServerError> {
-        Err(ServerError::BadRequest(
+        Err(ServerError::ServiceUnavailable(
             "Live Kubernetes cluster connection required to unlock stack".to_string(),
         ))
     }
@@ -174,13 +174,24 @@ pub trait ClusterStateProvider: Send + Sync {
         _namespace: &str,
         _name: &str,
     ) -> Result<String, ServerError> {
-        Err(ServerError::BadRequest(
+        Err(ServerError::ServiceUnavailable(
             "Live Kubernetes cluster connection required to reconcile release".to_string(),
         ))
     }
 
     async fn stack_outputs(&self, _namespace: &str, _name: &str) -> HashMap<String, String> {
         HashMap::new()
+    }
+
+    /// Live Flux `HelmRelease`/`Kustomization` status for management-plane namespaces
+    /// (`keel-system`, `flux-system`) keyed by `(namespace, name)`; empty without a live cluster.
+    async fn management_addon_statuses(&self) -> HashMap<(String, String), LiveResourceInfo> {
+        HashMap::new()
+    }
+
+    /// Whether live Kubernetes status is available (false for the offline Git-only provider).
+    fn has_live_status(&self) -> bool {
+        false
     }
 
     async fn execute_preview_gc(&self, _plan: &GcPlan) -> Result<usize, ServerError> {
@@ -259,11 +270,29 @@ fn infer_stack_resource_kind(
     }
 }
 
+/// Pseudo-tenant label reported for the protected management control-plane stack (`flux-system`).
+pub const MANAGEMENT_TENANT: &str = "management";
+
+/// Status reported for a live tenant `Stack` that is absent from Git `main` but not terminating.
+pub const STACK_STATUS_ORPHANED: &str = "Orphaned";
+
 impl RepoClusterStateProvider {
     pub fn new(repo_workdir: impl Into<PathBuf>) -> Self {
         Self {
             repo_workdir: repo_workdir.into(),
         }
+    }
+
+    /// Reads the Stage 0 `bootstrapTarget` (e.g. `kind`, `aws`) from `.keel/config.yaml`, used as
+    /// the provider of the management control-plane stack.
+    fn bootstrap_target(&self) -> Option<String> {
+        let raw = std::fs::read_to_string(self.repo_workdir.join(".keel/config.yaml")).ok()?;
+        let doc = serde_yml::from_str::<Value>(&raw).ok()?;
+        doc.get("bootstrapTarget")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
     }
 
     fn collect_yaml_files(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -370,10 +399,9 @@ impl ClusterStateProvider for RepoClusterStateProvider {
                     .pointer("/spec/preview")
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
-                let protect = val
-                    .pointer("/spec/protect")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false);
+                // Same semantics as `keel_pko::PkoStack::is_protected` (`keel.io/protect` label or
+                // `spec.config.protect`), shared with the force-delete guard (`NFR-REL-01`).
+                let protect = keel_kube::is_stack_manifest_protected(&val);
                 let doc_tenant = val
                     .pointer("/metadata/labels/keel.io~1tenant")
                     .and_then(Value::as_str)
@@ -436,6 +464,17 @@ impl ClusterStateProvider for RepoClusterStateProvider {
                     is_manifest_runtime,
                 );
 
+                let doc_tenant = if stack_type == "management" {
+                    doc_tenant.or_else(|| Some(MANAGEMENT_TENANT.to_string()))
+                } else {
+                    doc_tenant
+                };
+                let doc_provider = if stack_type == "management" {
+                    doc_provider.or_else(|| self.bootstrap_target())
+                } else {
+                    doc_provider
+                };
+
                 stacks.push(StackSummary {
                     name,
                     namespace,
@@ -465,9 +504,9 @@ impl ClusterStateProvider for RepoClusterStateProvider {
                 StackSummary {
                     name: "management-cluster-core".to_string(),
                     namespace: "flux-system".to_string(),
-                    tenant: None,
+                    tenant: Some(MANAGEMENT_TENANT.to_string()),
                     stack: "keel/management/core".to_string(),
-                    provider: None,
+                    provider: self.bootstrap_target(),
                     stack_type: "management".to_string(),
                     preview: false,
                     protect: true,
@@ -703,56 +742,87 @@ impl ClusterStateProvider for KubeClusterStateProvider {
         let mut stacks = self.repo.list_stacks(tenant, provider).await?;
         let live = self.live.stack_status_details().await;
         for stack in &mut stacks {
-            if let Some(info) = live.get(&(stack.namespace.clone(), stack.name.clone())) {
+            let is_management = stack.stack_type == "management";
+            let info = live
+                .get(&(stack.namespace.clone(), stack.name.clone()))
+                .or_else(|| {
+                    is_management
+                        .then(|| {
+                            live.get(&("flux-system".to_string(), "core-addons".to_string()))
+                                .or_else(|| {
+                                    live.get(&(
+                                        "flux-system".to_string(),
+                                        "flux-system".to_string(),
+                                    ))
+                                })
+                        })
+                        .flatten()
+                });
+            if let Some(info) = info {
                 stack.status = Self::status_label(&info.status);
                 stack.last_synced = info.last_synced.clone();
                 if info.resource_count.is_some() {
                     stack.resource_count = info.resource_count;
                 }
-            } else if stack.name == "management-cluster-core"
-                && let Some(info) = live
-                    .get(&("flux-system".to_string(), "core-addons".to_string()))
-                    .or_else(|| live.get(&("flux-system".to_string(), "flux-system".to_string())))
-            {
-                stack.status = Self::status_label(&info.status);
-                stack.last_synced = info.last_synced.clone();
-                if info.resource_count.is_some() {
-                    stack.resource_count = info.resource_count;
+                stack.protect = stack.protect || info.protected;
+                if stack.provider.is_none() {
+                    stack.provider = info.provider.clone();
                 }
             }
         }
-        // Keep any live tenant-* stack that is absent from Git `main` (awaiting Flux prune or mid-termination)
+        // Keep any live tenant-* stack that is absent from Git `main`. Such a stack is only
+        // "Deleting" when the API server reports a `deletionTimestamp`; otherwise it is reported
+        // honestly as `Orphaned` (live, but not declared in Git / awaiting Flux prune).
         for ((ns, name), info) in &live {
             if !ns.starts_with("tenant-") {
                 continue;
             }
-            let inferred_tenant = ns.strip_prefix("tenant-");
+            let inferred_tenant = info
+                .tenant
+                .as_deref()
+                .or_else(|| ns.strip_prefix("tenant-"));
             if let Some(t_filter) = tenant
                 && inferred_tenant != Some(t_filter)
             {
                 continue;
             }
+            if let Some(p_filter) = provider
+                && info.provider.as_deref() != Some(p_filter)
+            {
+                continue;
+            }
             if !stacks.iter().any(|s| s.namespace == *ns && s.name == *name) {
-                let stack_type = infer_stack_type(name, ns, None, None);
-                let resource_kind =
-                    infer_stack_resource_kind(name, ns, None, None, None, false, false);
+                let stack_type = infer_stack_type(name, ns, info.provider.as_deref(), None);
+                let resource_kind = infer_stack_resource_kind(
+                    name,
+                    ns,
+                    info.provider.as_deref(),
+                    None,
+                    None,
+                    false,
+                    false,
+                );
 
                 stacks.push(StackSummary {
                     name: name.clone(),
                     namespace: ns.clone(),
                     tenant: inferred_tenant.map(str::to_owned),
                     stack: name.clone(),
-                    provider: None,
+                    provider: info.provider.clone(),
                     stack_type,
                     preview: false,
-                    protect: false,
+                    protect: info.protected,
                     resource_kind: Some(resource_kind),
                     catalog_id: None,
                     bundle: None,
                     bundle_item: None,
                     resource_count: info.resource_count,
                     last_synced: info.last_synced.clone(),
-                    status: "Deleting".to_string(),
+                    status: if info.terminating {
+                        "Deleting".to_string()
+                    } else {
+                        STACK_STATUS_ORPHANED.to_string()
+                    },
                 });
             }
         }
@@ -864,34 +934,28 @@ impl ClusterStateProvider for KubeClusterStateProvider {
         self.live
             .restart_stack_workspace(namespace, name)
             .await
-            .map_err(|e| ServerError::Internal(format!("Rollout restart failed: {e}")))
+            .map_err(|e| map_live_action_error(e, "Rollout restart failed"))
     }
 
     async fn reconcile_stack(&self, namespace: &str, name: &str) -> Result<String, ServerError> {
         self.live
             .reconcile_stack(namespace, name)
             .await
-            .map_err(|e| ServerError::Internal(format!("Stack reconcile failed: {e}")))
+            .map_err(|e| map_live_action_error(e, "Stack reconcile failed"))
     }
 
     async fn force_delete_stack(&self, namespace: &str, name: &str) -> Result<String, ServerError> {
         self.live
             .force_delete_stack(namespace, name)
             .await
-            .map_err(|e| match e {
-                keel_kube::KubeError::InvalidInput(msg) => ServerError::BadRequest(msg),
-                other => ServerError::Internal(format!("Force-delete stack failed: {other}")),
-            })
+            .map_err(|e| map_live_action_error(e, "Force-delete stack failed"))
     }
 
     async fn unlock_stack(&self, namespace: &str, name: &str) -> Result<String, ServerError> {
         self.live
             .unlock_stack(namespace, name)
             .await
-            .map_err(|e| match e {
-                keel_kube::KubeError::InvalidInput(msg) => ServerError::BadRequest(msg),
-                other => ServerError::Internal(format!("Unlock stack failed: {other}")),
-            })
+            .map_err(|e| map_live_action_error(e, "Unlock stack failed"))
     }
 
     async fn reconcile_release(&self, namespace: &str, name: &str) -> Result<String, ServerError> {
@@ -903,6 +967,19 @@ impl ClusterStateProvider for KubeClusterStateProvider {
 
     async fn stack_outputs(&self, namespace: &str, name: &str) -> HashMap<String, String> {
         self.live.stack_outputs(namespace, name).await
+    }
+
+    async fn management_addon_statuses(&self) -> HashMap<(String, String), LiveResourceInfo> {
+        self.live
+            .release_status_details()
+            .await
+            .into_iter()
+            .filter(|((ns, _), _)| ns == keel_core::KEEL_SYSTEM_NAMESPACE || ns == "flux-system")
+            .collect()
+    }
+
+    fn has_live_status(&self) -> bool {
+        true
     }
 
     async fn execute_preview_gc(&self, plan: &GcPlan) -> Result<usize, ServerError> {
@@ -953,6 +1030,17 @@ impl ClusterStateProvider for KubeClusterStateProvider {
     }
 }
 
+/// Maps typed [`keel_kube::KubeError`]s from live Stack actions onto HTTP-facing [`ServerError`]s:
+/// `NotFound` -> 404, `Conflict` (e.g. protected Stack) -> 409, `InvalidInput` -> 400, else 500.
+pub(crate) fn map_live_action_error(err: keel_kube::KubeError, context: &str) -> ServerError {
+    match err {
+        keel_kube::KubeError::NotFound(msg) => ServerError::NotFound(msg),
+        keel_kube::KubeError::Conflict(msg) => ServerError::Conflict(msg),
+        keel_kube::KubeError::InvalidInput(msg) => ServerError::BadRequest(msg),
+        other => ServerError::Internal(format!("{context}: {other}")),
+    }
+}
+
 /// Cached ephemeral preview state for a PR (in-memory view of `keel-previews` CRs & diff report).
 #[derive(Debug, Clone)]
 pub struct CachedPreview {
@@ -976,9 +1064,19 @@ pub struct AppState {
     pub state_provider: Arc<dyn ClusterStateProvider>,
     pub backend_url: String,
     pub s3_credentials_secret: Option<String>,
+    /// Provisions per-tenant scoped SeaweedFS S3 identities (`None` without a live cluster).
+    pub tenant_s3_provisioner: Option<Arc<dyn keel_kube::TenantS3IdentityProvisioner>>,
     pub docker_proxy_url: Option<String>,
     pub git_lock: Arc<Mutex<()>>,
+    /// Optional read-through cache of preview reports; the cluster (`keel-previews` preview
+    /// `Stack` labels/annotations + report `ConfigMap`) is the source of truth (OPEN-10).
     pub preview_cache: Arc<RwLock<HashMap<String, CachedPreview>>>,
+    /// Live ephemeral PKO preview runner (`None` without a cluster ⇒ synthesized previews only).
+    pub preview_cluster: Option<Arc<dyn keel_kube::PreviewCluster>>,
+    /// Fail closed (`409`) on Pulumi Stack proposals whose tenant has no
+    /// `keel-pulumi-passphrase` Secret. Defaults to `true`; only cluster-less local dev (in-memory
+    /// Secret store, Stacks are never applied) turns it off.
+    pub require_pulumi_passphrase: bool,
 }
 
 impl AppState {
@@ -1008,10 +1106,28 @@ impl AppState {
             state_provider,
             backend_url: "s3://pulumi-state".to_string(),
             s3_credentials_secret: None,
+            tenant_s3_provisioner: None,
             docker_proxy_url: None,
             git_lock: Arc::new(Mutex::new(())),
             preview_cache: Arc::new(RwLock::new(HashMap::new())),
+            preview_cluster: None,
+            require_pulumi_passphrase: true,
         }
+    }
+
+    /// Configures the live ephemeral PKO preview runner (`keel-previews`).
+    pub fn with_preview_cluster(
+        mut self,
+        cluster: Option<Arc<dyn keel_kube::PreviewCluster>>,
+    ) -> Self {
+        self.preview_cluster = cluster;
+        self
+    }
+
+    /// Enables/disables the tenant Pulumi state passphrase gate on Stack proposals.
+    pub fn with_require_pulumi_passphrase(mut self, required: bool) -> Self {
+        self.require_pulumi_passphrase = required;
+        self
     }
 
     /// Configures an optional `DOCKER_HOST` proxy endpoint for local `kind`-in-`kind` PKO workspaces.
@@ -1028,6 +1144,15 @@ impl AppState {
 
     pub fn with_s3_credentials_secret(mut self, secret_name: Option<String>) -> Self {
         self.s3_credentials_secret = secret_name;
+        self
+    }
+
+    /// Configures the per-tenant scoped S3 identity provisioner (`SDD.md` §6.3).
+    pub fn with_tenant_s3_provisioner(
+        mut self,
+        provisioner: Option<Arc<dyn keel_kube::TenantS3IdentityProvisioner>>,
+    ) -> Self {
+        self.tenant_s3_provisioner = provisioner;
         self
     }
 
@@ -1231,5 +1356,156 @@ mod tests {
             infer_stack_type("custom", "tenant-acme", Some("aws"), Some("workload")),
             "workload"
         );
+    }
+
+    struct DetailLiveStatus {
+        stacks: HashMap<(String, String), keel_kube::LiveResourceInfo>,
+    }
+
+    #[async_trait]
+    impl LiveStatusSource for DetailLiveStatus {
+        async fn stack_statuses(&self) -> HashMap<(String, String), LiveResourceStatus> {
+            self.stacks
+                .iter()
+                .map(|(k, v)| (k.clone(), v.status.clone()))
+                .collect()
+        }
+        async fn release_statuses(&self) -> HashMap<(String, String), LiveResourceStatus> {
+            HashMap::new()
+        }
+        async fn stack_status_details(
+            &self,
+        ) -> HashMap<(String, String), keel_kube::LiveResourceInfo> {
+            self.stacks.clone()
+        }
+    }
+
+    fn live_info(
+        status: LiveResourceStatus,
+        provider: Option<&str>,
+        terminating: bool,
+        protected: bool,
+    ) -> keel_kube::LiveResourceInfo {
+        let mut info = keel_kube::LiveResourceInfo::from_status(status);
+        info.provider = provider.map(str::to_owned);
+        info.terminating = terminating;
+        info.protected = protected;
+        info.resource_count = Some(7);
+        info
+    }
+
+    #[tokio::test]
+    async fn protect_column_uses_canonical_label_and_spec_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let infra = tmp.path().join("tenants/acme/infra");
+        std::fs::create_dir_all(&infra).unwrap();
+        std::fs::write(
+            infra.join("a.yaml"),
+            "apiVersion: pulumi.com/v1\nkind: Stack\nmetadata:\n  name: a\n  namespace: tenant-acme\n  labels:\n    keel.io/protect: \"true\"\nspec:\n  stack: a\n",
+        )
+        .unwrap();
+        std::fs::write(
+            infra.join("b.yaml"),
+            "apiVersion: pulumi.com/v1\nkind: Stack\nmetadata:\n  name: b\n  namespace: tenant-acme\nspec:\n  stack: b\n  config:\n    protect: \"true\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            infra.join("c.yaml"),
+            "apiVersion: pulumi.com/v1\nkind: Stack\nmetadata:\n  name: c\n  namespace: tenant-acme\n  labels:\n    keel.io/protected: \"true\"\nspec:\n  stack: c\n",
+        )
+        .unwrap();
+        let stacks = RepoClusterStateProvider::new(tmp.path())
+            .list_stacks(Some("acme"), None)
+            .await
+            .unwrap();
+        let by = |n: &str| stacks.iter().find(|s| s.name == n).unwrap().protect;
+        assert!(by("a"));
+        assert!(by("b"));
+        assert!(!by("c"));
+    }
+
+    #[tokio::test]
+    async fn live_only_stacks_respect_provider_filter_and_report_orphaned_vs_deleting() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".keel")).unwrap();
+        std::fs::write(
+            tmp.path().join(".keel/config.yaml"),
+            "apiVersion: keel.io/v1alpha1\nkind: KeelConfig\nbootstrapTarget: kind\n",
+        )
+        .unwrap();
+        let mut stacks = HashMap::new();
+        stacks.insert(
+            ("tenant-acme".to_string(), "aws-vm".to_string()),
+            live_info(LiveResourceStatus::Synced, Some("aws"), false, true),
+        );
+        stacks.insert(
+            ("tenant-acme".to_string(), "pve-vm".to_string()),
+            live_info(LiveResourceStatus::Deleting, Some("proxmox"), true, false),
+        );
+        stacks.insert(
+            ("tenant-other".to_string(), "aws-other".to_string()),
+            live_info(LiveResourceStatus::Synced, Some("aws"), false, false),
+        );
+        stacks.insert(
+            (
+                "flux-system".to_string(),
+                "management-cluster-core".to_string(),
+            ),
+            live_info(LiveResourceStatus::Synced, None, false, true),
+        );
+        let provider = KubeClusterStateProvider::new(
+            RepoClusterStateProvider::new(tmp.path()),
+            Arc::new(DetailLiveStatus { stacks }),
+        );
+
+        let aws = provider.list_stacks(None, Some("aws")).await.unwrap();
+        let names: Vec<&str> = aws.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"aws-vm") && names.contains(&"aws-other"));
+        assert!(!names.contains(&"pve-vm"), "{names:?}");
+        let aws_vm = aws.iter().find(|s| s.name == "aws-vm").unwrap();
+        assert_eq!(aws_vm.status, STACK_STATUS_ORPHANED);
+        assert!(aws_vm.protect);
+        assert_eq!(aws_vm.provider.as_deref(), Some("aws"));
+
+        let acme_aws = provider
+            .list_stacks(Some("acme"), Some("aws"))
+            .await
+            .unwrap();
+        assert_eq!(acme_aws.len(), 1);
+        assert_eq!(acme_aws[0].name, "aws-vm");
+
+        let all = provider.list_stacks(None, None).await.unwrap();
+        let pve = all.iter().find(|s| s.name == "pve-vm").unwrap();
+        assert_eq!(pve.status, "Deleting");
+        let mgmt = all
+            .iter()
+            .find(|s| s.name == "management-cluster-core")
+            .unwrap();
+        assert_eq!(mgmt.tenant.as_deref(), Some(MANAGEMENT_TENANT));
+        assert_eq!(mgmt.provider.as_deref(), Some("kind"));
+        assert_eq!(mgmt.resource_count, Some(7));
+        assert!(mgmt.protect);
+        assert_eq!(mgmt.status, "Synced");
+    }
+
+    #[test]
+    fn live_action_errors_map_to_http_semantics() {
+        use keel_kube::KubeError;
+        assert!(matches!(
+            map_live_action_error(KubeError::NotFound("x".into()), "c"),
+            ServerError::NotFound(_)
+        ));
+        assert!(matches!(
+            map_live_action_error(KubeError::Conflict("x".into()), "c"),
+            ServerError::Conflict(_)
+        ));
+        assert!(matches!(
+            map_live_action_error(KubeError::InvalidInput("x".into()), "c"),
+            ServerError::BadRequest(_)
+        ));
+        assert!(matches!(
+            map_live_action_error(KubeError::Crypto("x".into()), "c"),
+            ServerError::Internal(_)
+        ));
     }
 }

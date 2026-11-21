@@ -237,6 +237,14 @@ pub async fn create_tenant(
 ) -> Result<(StatusCode, Json<CreateTenantResponse>), ServerError> {
     auth.require_admin()?;
     validate_dns_label(&req.id, "id")?;
+    // `tenant-<id>-admin` is the tenant-admin IdP group; an id ending in `-admin` would make the
+    // member group of `<x>-admin` collide with the admin group of `<x>` (OPEN-12).
+    if req.id.ends_with("-admin") {
+        return Err(ServerError::BadRequest(
+            "Tenant id must not end with '-admin' (reserved for the tenant-<id>-admin group)"
+                .to_string(),
+        ));
+    }
     let namespace = tenant_namespace(&req.id)?;
 
     let rel_dir = format!("tenants/{}", req.id);
@@ -263,6 +271,37 @@ pub async fn create_tenant(
                 error = %err,
                 "Deferred storing tenant SOPS age key until tenant namespace exists in cluster"
             );
+        }
+    }
+
+    // Best-effort tenant Pulumi state passphrase (create-if-absent, never rotated). Deferred to
+    // tenant provisioning when the namespace does not exist yet.
+    if let Err(err) = state
+        .secret_store
+        .ensure_pulumi_passphrase(&namespace)
+        .await
+    {
+        tracing::debug!(
+            tenant = %req.id,
+            error = %err,
+            "Deferred tenant Pulumi state passphrase until tenant namespace exists in cluster"
+        );
+    }
+
+    // Best-effort scoped S3 state identity (`tenants/<id>/*` only). The namespace usually only
+    // exists after the onboarding PR merges; the proposal path then provisions lazily.
+    if let Some(provisioner) = state.tenant_s3_provisioner.as_ref() {
+        match provisioner.provision_tenant_s3_identity(&req.id).await {
+            Ok(outcome) => tracing::info!(
+                tenant = %req.id,
+                ?outcome,
+                "Tenant scoped S3 state identity provisioning"
+            ),
+            Err(err) => tracing::warn!(
+                tenant = %req.id,
+                error = %err,
+                "Deferred tenant scoped S3 state identity provisioning"
+            ),
         }
     }
 
@@ -437,7 +476,7 @@ pub async fn delete_tenant(
             staged_paths.push("tenants/kustomization.yaml".to_string());
         }
 
-        let commit_msg = format!("feat({id}): delete tenant {id}");
+        let commit_msg = format!("chore({id}): delete tenant {id}");
         stage_commit_push_and_return_to_main(&state, &auth, &branch, &commit_msg, &staged_paths)
             .await?
     };
@@ -447,7 +486,7 @@ pub async fn delete_tenant(
         &auth,
         &id,
         &branch,
-        format!("feat({id}): delete tenant {id}"),
+        format!("chore({id}): delete tenant {id}"),
         format!(
             "Automated tenant decommission proposal for `{id}`\n\n- Commit: `{commit_sha}`\n- Removed: `{rel_dir}`"
         ),

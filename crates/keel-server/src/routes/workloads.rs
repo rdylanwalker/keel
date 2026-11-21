@@ -6,8 +6,8 @@ use axum::extract::{Path as AxumPath, Query, State};
 use axum::response::IntoResponse;
 use chrono::Utc;
 use keel_core::{
-    CatalogManifest, StackSshInfoResponse, parse_catalog, resolve_ssh_target_from_sources,
-    validate_dns_label,
+    CatalogManifest, InfraResourceKind, StackSshInfoResponse, parse_catalog,
+    resolve_ssh_target_from_sources, validate_dns_label,
 };
 use keel_git::PullRequestInfo;
 use keel_kube::StackDiagnostics;
@@ -20,7 +20,7 @@ use crate::error::ServerError;
 use crate::state::{AppState, ReleaseSummary, StackSummary};
 
 use super::{
-    open_pr_for_session, resolve_tenant_resource_dir, serialize_tenants_kustomization,
+    RepoReader, open_pr_for_session, resolve_tenant_resource_dir, serialize_tenants_kustomization,
     stage_commit_push_and_return_to_main,
 };
 
@@ -306,9 +306,9 @@ async fn delete_gitops_resource_pr(
         &auth,
         tenant,
         &branch,
-        format!("[Delete] feat({tenant}): remove {kind_label} {name}"),
+        format!("chore({tenant}): delete {kind_label} {name}"),
         format!(
-            "[Delete] Automated decommission proposal for `{name}` in `{namespace}`\n\n- Commit: `{commit_sha}`\n- Removed: `{removed_rel_dir}`"
+            "Automated decommission proposal for `{name}` in `{namespace}`\n\n- Commit: `{commit_sha}`\n- Removed: `{removed_rel_dir}`"
         ),
     )
     .await?;
@@ -335,69 +335,77 @@ pub async fn get_stack_config(
 
     let tenant = namespace.strip_prefix("tenant-").unwrap_or(&namespace);
     auth.require_tenant_access(tenant)?;
-    let Some(resolved) =
-        resolve_tenant_resource_dir(&state.repo_workdir, tenant, "infra", &name).await
-    else {
-        return Err(ServerError::NotFound(format!(
-            "Stack '{name}' not found in tenant '{tenant}'"
-        )));
-    };
-    let infra_dir = state.repo_workdir.join(&resolved.rel_dir);
 
-    let values_path = infra_dir.join("values.yaml");
-    let values = if tokio::fs::try_exists(&values_path).await.unwrap_or(false) {
-        let raw = tokio::fs::read_to_string(&values_path).await?;
-        serde_yml::from_str::<Value>(&raw).unwrap_or_else(|_| json!({}))
-    } else {
-        json!({})
-    };
-
-    let mut catalog_id = name.clone();
-    if tokio::fs::try_exists(
-        state
-            .repo_workdir
-            .join("catalog/infra")
-            .join(&name)
-            .join("catalog.yaml"),
-    )
-    .await
-    .unwrap_or(false)
+    // Prefer committed `origin/main` state read without touching the shared worktree (`OPEN-13`).
+    if let Some(reader) = RepoReader::committed(&state).await
+        && let Some(resp) = read_stack_config(&reader, tenant, &name).await
     {
-        catalog_id = name.clone();
-    } else {
-        let stack_path = infra_dir.join("stack.yaml");
-        if let Ok(raw) = tokio::fs::read_to_string(&stack_path).await
-            && let Ok(doc) = serde_yml::from_str::<Value>(&raw)
-            && let Some(provider) = doc
-                .pointer("/metadata/labels/keel.io~1provider")
-                .and_then(Value::as_str)
-            && let Ok(mut entries) =
-                tokio::fs::read_dir(state.repo_workdir.join("catalog/infra")).await
-        {
-            while let Ok(Some(entry)) = entries.next_entry().await {
-                let candidate = entry.path().join("catalog.yaml");
-                if let Ok(cat_raw) = tokio::fs::read_to_string(&candidate).await
-                    && let Ok(CatalogManifest::InfraBlueprint(bp)) = parse_catalog(&cat_raw)
-                    && bp.metadata.provider == provider
-                {
-                    catalog_id = bp.metadata.id;
-                    break;
-                }
+        return Ok(Json(resp));
+    }
+    // Fall back to the checked-out worktree, read under the shared git lock so concurrent
+    // branch checkouts by mutating handlers cannot interleave with these reads.
+    let _guard = state.git_lock.lock().await;
+    let reader = RepoReader::Worktree {
+        root: &state.repo_workdir,
+    };
+    read_stack_config(&reader, tenant, &name)
+        .await
+        .map(Json)
+        .ok_or_else(|| {
+            ServerError::NotFound(format!("Stack '{name}' not found in tenant '{tenant}'"))
+        })
+}
+
+/// Reads `values.yaml` + catalog id for an infra stack through `reader`; `None` if the stack dir is absent.
+async fn read_stack_config(
+    reader: &RepoReader<'_>,
+    tenant: &str,
+    name: &str,
+) -> Option<ReleaseConfigResponse> {
+    let resolved = reader
+        .resolve_tenant_resource_dir(tenant, "infra", name)
+        .await?;
+    let dir = resolved.rel_dir;
+
+    let values = match reader.read(&format!("{dir}/values.yaml")).await {
+        Some(raw) => serde_yml::from_str::<Value>(&raw).unwrap_or_else(|_| json!({})),
+        None => json!({}),
+    };
+
+    let mut catalog_id = name.to_string();
+    if !reader
+        .exists(&format!("catalog/infra/{name}/catalog.yaml"))
+        .await
+        && let Some(raw) = reader.read(&format!("{dir}/stack.yaml")).await
+        && let Ok(doc) = serde_yml::from_str::<Value>(&raw)
+        && let Some(provider) = doc
+            .pointer("/metadata/labels/keel.io~1provider")
+            .and_then(Value::as_str)
+    {
+        for entry in reader.list_dir("catalog/infra").await {
+            if let Some(cat_raw) = reader
+                .read(&format!("catalog/infra/{entry}/catalog.yaml"))
+                .await
+                && let Ok(CatalogManifest::InfraBlueprint(bp)) = parse_catalog(&cat_raw)
+                && bp.metadata.provider == provider
+            {
+                catalog_id = bp.metadata.id;
+                break;
             }
         }
     }
 
-    Ok(Json(ReleaseConfigResponse {
+    Some(ReleaseConfigResponse {
         catalog_id,
         tenant: tenant.to_string(),
-        name,
+        name: name.to_string(),
         version: None,
         target_cluster: None,
         target_namespace: None,
         canary: None,
         action_engine: None,
         values,
-    }))
+    })
 }
 
 /// Response body for `GET /api/v1/releases/{namespace}/{name}/config`.
@@ -651,6 +659,91 @@ pub async fn get_bundle_config(
     }))
 }
 
+/// Authorizes an out-of-band live Stack operation (`restart`, `force-delete`, `unlock`):
+/// tenant namespaces require tenant-admin (or cluster admin); any other namespace requires
+/// cluster admin (`OPEN-11`). Returns the tenant id (or the namespace for non-tenant namespaces).
+fn require_stack_operator<'a>(
+    auth: &AuthSession,
+    namespace: &'a str,
+) -> Result<&'a str, ServerError> {
+    match namespace.strip_prefix("tenant-") {
+        Some(tenant) => {
+            auth.require_tenant_admin(tenant)?;
+            Ok(tenant)
+        }
+        None => {
+            auth.require_admin()?;
+            Ok(namespace)
+        }
+    }
+}
+
+/// Emits a `keel::audit` record for an out-of-band live Stack operation.
+fn audit_stack_operation(
+    auth: &AuthSession,
+    action: &str,
+    tenant: &str,
+    namespace: &str,
+    name: &str,
+    outcome: Result<&String, &ServerError>,
+) {
+    match outcome {
+        Ok(_) => tracing::warn!(
+            target: "keel::audit",
+            user = %auth.claims.sub,
+            action,
+            tenant,
+            namespace,
+            stack = name,
+            outcome = "success",
+            "Out-of-band live Stack operation executed"
+        ),
+        Err(err) => tracing::warn!(
+            target: "keel::audit",
+            user = %auth.claims.sub,
+            action,
+            tenant,
+            namespace,
+            stack = name,
+            outcome = "failure",
+            error = %err,
+            "Out-of-band live Stack operation failed"
+        ),
+    }
+}
+
+/// Resolves `namespace/name` against the declared (Git) + live Stack inventory so out-of-band
+/// operations on unknown stacks return `404` before any "live cluster required" (`503`) check.
+/// Returns the matched stacks list for further guards. Inventory read failures do not block.
+async fn require_known_stack(
+    state: &AppState,
+    namespace: &str,
+    name: &str,
+) -> Result<Vec<crate::state::StackSummary>, ServerError> {
+    match state
+        .state_provider
+        .list_stacks(namespace.strip_prefix("tenant-"), None)
+        .await
+    {
+        Ok(stacks) => {
+            if stacks
+                .iter()
+                .any(|s| s.namespace == namespace && s.name == name)
+            {
+                Ok(stacks)
+            } else {
+                Err(ServerError::NotFound(format!(
+                    "Stack {namespace}/{name} not found in Git or the live cluster"
+                )))
+            }
+        }
+        Err(err) => {
+            tracing::warn!(namespace, name, error = %err, "stack inventory unavailable; skipping existence check");
+            Ok(Vec::new())
+        }
+    }
+}
+
 /// Response body for `POST /api/v1/stacks/{namespace}/{name}/restart`.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -671,13 +764,25 @@ pub async fn restart_stack_workspace(
 ) -> Result<Json<RestartStackResponse>, ServerError> {
     validate_dns_label(&namespace, "namespace")?;
     validate_dns_label(&name, "name")?;
-    let tenant = namespace.strip_prefix("tenant-").unwrap_or(&namespace);
-    auth.require_tenant_access(tenant)?;
+    let tenant = require_stack_operator(&auth, &namespace)?;
+    if let Err(err) = require_known_stack(&state, &namespace, &name).await {
+        audit_stack_operation(&auth, "restart", tenant, &namespace, &name, Err(&err));
+        return Err(err);
+    }
 
-    let message = state
+    let outcome = state
         .state_provider
         .restart_stack_workspace(&namespace, &name)
-        .await?;
+        .await;
+    audit_stack_operation(
+        &auth,
+        "restart",
+        tenant,
+        &namespace,
+        &name,
+        outcome.as_ref(),
+    );
+    let message = outcome?;
     Ok(Json(RestartStackResponse {
         restarted: true,
         namespace,
@@ -709,6 +814,7 @@ pub async fn reconcile_stack(
     validate_dns_label(&name, "name")?;
     let tenant = namespace.strip_prefix("tenant-").unwrap_or(&namespace);
     auth.require_tenant_access(tenant)?;
+    require_known_stack(&state, &namespace, &name).await?;
 
     let message = state
         .state_provider
@@ -742,18 +848,48 @@ pub async fn force_delete_stack(
 ) -> Result<Json<ForceDeleteStackResponse>, ServerError> {
     validate_dns_label(&namespace, "namespace")?;
     validate_dns_label(&name, "name")?;
+    let tenant = require_stack_operator(&auth, &namespace)?;
     if namespace == "flux-system" && name == keel_pko::MANAGEMENT_CORE_STACK_NAME {
-        return Err(ServerError::Forbidden(
+        let err = ServerError::Conflict(
             "Cannot force-delete protected management-cluster-core stack".to_string(),
-        ));
+        );
+        audit_stack_operation(&auth, "force-delete", tenant, &namespace, &name, Err(&err));
+        return Err(err);
     }
-    let tenant = namespace.strip_prefix("tenant-").unwrap_or(&namespace);
-    auth.require_tenant_access(tenant)?;
 
-    let message = state
+    let stacks = match require_known_stack(&state, &namespace, &name).await {
+        Ok(stacks) => stacks,
+        Err(err) => {
+            audit_stack_operation(&auth, "force-delete", tenant, &namespace, &name, Err(&err));
+            return Err(err);
+        }
+    };
+    // Refuse protected stacks declared in Git as well (the live guard also checks the cluster object).
+    if stacks
+        .iter()
+        .any(|s| s.namespace == namespace && s.name == name && s.protect)
+    {
+        let err = ServerError::Conflict(format!(
+            "Cannot force-delete protected Stack {namespace}/{name}; remove `{}` / `spec.config.protect` via a GitOps PR first",
+            keel_pko::stack::LABEL_PROTECT
+        ));
+        audit_stack_operation(&auth, "force-delete", tenant, &namespace, &name, Err(&err));
+        return Err(err);
+    }
+
+    let outcome = state
         .state_provider
         .force_delete_stack(&namespace, &name)
-        .await?;
+        .await;
+    audit_stack_operation(
+        &auth,
+        "force-delete",
+        tenant,
+        &namespace,
+        &name,
+        outcome.as_ref(),
+    );
+    let message = outcome?;
     Ok(Json(ForceDeleteStackResponse {
         force_deleted: true,
         namespace,
@@ -783,10 +919,15 @@ pub async fn unlock_stack(
 ) -> Result<Json<UnlockStackResponse>, ServerError> {
     validate_dns_label(&namespace, "namespace")?;
     validate_dns_label(&name, "name")?;
-    let tenant = namespace.strip_prefix("tenant-").unwrap_or(&namespace);
-    auth.require_tenant_access(tenant)?;
+    let tenant = require_stack_operator(&auth, &namespace)?;
+    if let Err(err) = require_known_stack(&state, &namespace, &name).await {
+        audit_stack_operation(&auth, "unlock", tenant, &namespace, &name, Err(&err));
+        return Err(err);
+    }
 
-    let message = state.state_provider.unlock_stack(&namespace, &name).await?;
+    let outcome = state.state_provider.unlock_stack(&namespace, &name).await;
+    audit_stack_operation(&auth, "unlock", tenant, &namespace, &name, outcome.as_ref());
+    let message = outcome?;
     Ok(Json(UnlockStackResponse {
         unlocked: true,
         namespace,
@@ -795,17 +936,94 @@ pub async fn unlock_stack(
     }))
 }
 
+/// Resolved SSH target plus server-side-only session material.
+struct ResolvedStackSsh {
+    info: StackSshInfoResponse,
+    saved_ssh_key: Option<String>,
+    /// Expected host key / fingerprint published by the stack (`sshHostKeyFingerprint`, ...).
+    expected_host_key: Option<String>,
+}
+
+/// Error from SSH target resolution: a regular [`ServerError`] or `422 Unprocessable Entity` for
+/// stacks that exist but do not represent an SSH-reachable VM (`OPEN-17`).
+#[derive(Debug)]
+pub enum SshInfoError {
+    Server(ServerError),
+    Unsupported(String),
+}
+
+impl From<ServerError> for SshInfoError {
+    fn from(err: ServerError) -> Self {
+        Self::Server(err)
+    }
+}
+
+impl IntoResponse for SshInfoError {
+    fn into_response(self) -> axum::response::Response {
+        match self {
+            Self::Server(err) => err.into_response(),
+            Self::Unsupported(msg) => (
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                Json(crate::error::ErrorResponse {
+                    error: msg,
+                    details: None,
+                    correlation_id: None,
+                }),
+            )
+                .into_response(),
+        }
+    }
+}
+
+/// Reads `stack.yaml`, `values.yaml`, and `Pulumi.yaml` documents for an infra stack via `reader`.
+async fn read_stack_ssh_docs(
+    reader: &RepoReader<'_>,
+    tenant: &str,
+    name: &str,
+) -> Option<(Option<Value>, Option<Value>, Option<Value>)> {
+    let dir = reader
+        .resolve_tenant_resource_dir(tenant, "infra", name)
+        .await?
+        .rel_dir;
+    let parse = |raw: Option<String>| raw.and_then(|r| serde_yml::from_str::<Value>(&r).ok());
+    Some((
+        parse(reader.read(&format!("{dir}/stack.yaml")).await),
+        parse(reader.read(&format!("{dir}/values.yaml")).await),
+        parse(reader.read(&format!("{dir}/Pulumi.yaml")).await),
+    ))
+}
+
 async fn resolve_stack_ssh_info(
     state: &AppState,
     auth: &AuthSession,
     namespace: &str,
     name: &str,
-) -> Result<(StackSshInfoResponse, Option<String>), ServerError> {
-    validate_dns_label(namespace, "namespace")?;
-    validate_dns_label(name, "name")?;
+) -> Result<ResolvedStackSsh, SshInfoError> {
+    validate_dns_label(namespace, "namespace").map_err(ServerError::from)?;
+    validate_dns_label(name, "name").map_err(ServerError::from)?;
     let tenant = namespace.strip_prefix("tenant-").unwrap_or(namespace);
-    validate_dns_label(tenant, "tenant")?;
+    validate_dns_label(tenant, "tenant").map_err(ServerError::from)?;
     auth.require_tenant_access(tenant)?;
+
+    // The stack must exist (in Git or live) and be a VM; never fabricate a target (`OPEN-17`).
+    let summary = state
+        .state_provider
+        .list_stacks(Some(tenant), None)
+        .await?
+        .into_iter()
+        .find(|s| s.name == name && s.namespace == namespace)
+        .ok_or_else(|| {
+            ServerError::NotFound(format!(
+                "Stack '{name}' not found in namespace '{namespace}'"
+            ))
+        })?;
+    if let Some(kind) = summary.resource_kind
+        && kind != InfraResourceKind::Vm
+    {
+        return Err(SshInfoError::Unsupported(format!(
+            "SSH not supported for {kind} stack '{name}'; only VM stacks expose SSH targets"
+        )));
+    }
 
     let saved_ssh_key = if let Ok(key) = state.secret_store.get_or_create_session_key().await {
         state
@@ -824,32 +1042,25 @@ async fn resolve_stack_ssh_info(
 
     let live_outputs = state.state_provider.stack_outputs(namespace, name).await;
 
-    let infra_dir =
-        match resolve_tenant_resource_dir(&state.repo_workdir, tenant, "infra", name).await {
-            Some(resolved) => state.repo_workdir.join(resolved.rel_dir),
-            None => state
-                .repo_workdir
-                .join("tenants")
-                .join(tenant)
-                .join("infra")
-                .join(name),
-        };
+    // Prefer committed `origin/main` (no worktree access); fall back to the worktree under `git_lock`.
+    let committed = match RepoReader::committed(state).await {
+        Some(reader) => read_stack_ssh_docs(&reader, tenant, name).await,
+        None => None,
+    };
+    let (stack_doc, values_doc, pulumi_doc) = match committed {
+        Some(docs) => docs,
+        None => {
+            let _guard = state.git_lock.lock().await;
+            let reader = RepoReader::Worktree {
+                root: &state.repo_workdir,
+            };
+            read_stack_ssh_docs(&reader, tenant, name)
+                .await
+                .unwrap_or((None, None, None))
+        }
+    };
 
-    let stack_doc = tokio::fs::read_to_string(infra_dir.join("stack.yaml"))
-        .await
-        .ok()
-        .and_then(|raw| serde_yml::from_str::<Value>(&raw).ok());
-    let values_doc = tokio::fs::read_to_string(infra_dir.join("values.yaml"))
-        .await
-        .ok()
-        .and_then(|raw| serde_yml::from_str::<Value>(&raw).ok());
-    let pulumi_doc = tokio::fs::read_to_string(infra_dir.join("Pulumi.yaml"))
-        .await
-        .ok()
-        .and_then(|raw| serde_yml::from_str::<Value>(&raw).ok());
-
-    let mut provider_override = None;
-    if stack_doc
+    let provider_override = if stack_doc
         .as_ref()
         .and_then(|d| {
             d.pointer("/metadata/labels/keel.io~1provider")
@@ -857,13 +1068,11 @@ async fn resolve_stack_ssh_info(
         })
         .and_then(Value::as_str)
         .is_none()
-        && let Ok(stacks) = state.state_provider.list_stacks(Some(tenant), None).await
     {
-        provider_override = stacks
-            .into_iter()
-            .find(|s| s.name == name)
-            .and_then(|s| s.provider);
-    }
+        summary.provider.clone()
+    } else {
+        None
+    };
 
     let info = resolve_ssh_target_from_sources(
         name,
@@ -876,8 +1085,27 @@ async fn resolve_stack_ssh_info(
         pulumi_doc.as_ref(),
         has_saved_ssh_key,
     );
+    if !crate::ssh::is_ssh_supported_infra(&info.provider, name) {
+        return Err(SshInfoError::Unsupported(format!(
+            "SSH not supported for {} stack '{name}'",
+            if info.provider.is_empty() {
+                "this"
+            } else {
+                info.provider.as_str()
+            }
+        )));
+    }
+    let expected_host_key = keel_core::models::resolve_ssh_host_key_from_sources(
+        &live_outputs,
+        values_doc.as_ref(),
+        stack_doc.as_ref(),
+    );
 
-    Ok((info, saved_ssh_key))
+    Ok(ResolvedStackSsh {
+        info,
+        saved_ssh_key,
+        expected_host_key,
+    })
 }
 
 /// `GET /api/v1/stacks/{namespace}/{name}/ssh-info`
@@ -888,22 +1116,35 @@ pub async fn get_stack_ssh_info(
     auth: AuthSession,
     State(state): State<AppState>,
     AxumPath((namespace, name)): AxumPath<(String, String)>,
-) -> Result<Json<StackSshInfoResponse>, ServerError> {
-    let (info, _saved_key) = resolve_stack_ssh_info(&state, &auth, &namespace, &name).await?;
-    Ok(Json(info))
+) -> Result<Json<StackSshInfoResponse>, SshInfoError> {
+    let resolved = resolve_stack_ssh_info(&state, &auth, &namespace, &name).await?;
+    Ok(Json(resolved.info))
 }
 
 /// `GET /api/v1/stacks/{namespace}/{name}/ssh/ws`
 ///
 /// Upgrades an authenticated tenant-authorized request to an interactive WebSocket SSH terminal bridge.
+///
+/// Authorization: any tenant member may open a session, but only to the stack-resolved target
+/// (host/port pinned from Pulumi outputs / GitOps manifests). Supplying a custom target (only
+/// possible when the stack has no resolved endpoint) additionally requires tenant-admin
+/// privileges, and such targets must resolve to public addresses. When the stack publishes an
+/// expected host key (`sshHostKeyFingerprint` / `sshHostKey`), the server key is enforced.
 pub async fn stack_ssh_ws(
     auth: AuthSession,
     State(state): State<AppState>,
     AxumPath((namespace, name)): AxumPath<(String, String)>,
     ws: WebSocketUpgrade,
-) -> Result<impl IntoResponse, ServerError> {
-    let (ssh_info, saved_ssh_key) =
-        resolve_stack_ssh_info(&state, &auth, &namespace, &name).await?;
+) -> Result<impl IntoResponse, SshInfoError> {
+    let ResolvedStackSsh {
+        info: ssh_info,
+        saved_ssh_key,
+        expected_host_key,
+    } = resolve_stack_ssh_info(&state, &auth, &namespace, &name).await?;
+    let policy = crate::ssh::SshSessionPolicy {
+        allow_unresolved_target_override: auth.is_tenant_admin(&ssh_info.tenant),
+        expected_host_key,
+    };
     tracing::info!(
         target: "keel::audit",
         user = %auth.claims.sub,
@@ -913,11 +1154,12 @@ pub async fn stack_ssh_ws(
         ssh_host = %ssh_info.ssh_host,
         ssh_user = %ssh_info.ssh_user,
         ssh_port = ssh_info.ssh_port,
+        host_key_pinned = policy.expected_host_key.is_some(),
         "WebSocket SSH session initiated"
     );
     let user_sub = auth.claims.sub.clone();
     Ok(ws.on_upgrade(move |socket| {
-        crate::ssh::handle_stack_ssh_ws(socket, ssh_info, saved_ssh_key, user_sub)
+        crate::ssh::handle_stack_ssh_ws(socket, ssh_info, saved_ssh_key, user_sub, policy)
     }))
 }
 

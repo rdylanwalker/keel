@@ -5,7 +5,9 @@
 
 pub mod auth;
 pub mod error;
+pub mod preview_lifecycle;
 pub mod routes;
+pub mod security;
 pub mod spa;
 pub mod ssh;
 pub mod state;
@@ -15,8 +17,9 @@ use axum::routing::{delete, get, post, put};
 use tower_http::trace::TraceLayer;
 
 pub use auth::{
-    AuthLoginResponse, AuthLogoutResponse, AuthSession, AuthStatusResponse, PKCE_COOKIE_NAME,
-    SESSION_COOKIE_NAME, SessionClaims, decrypt_session_token, encrypt_session_token,
+    AuthLoginResponse, AuthLogoutResponse, AuthSession, AuthStatusResponse, CliExchangeRequest,
+    CliExchangeResponse, PKCE_COOKIE_NAME, SESSION_COOKIE_NAME, SessionClaims,
+    decrypt_session_token, encrypt_session_token,
 };
 pub use error::{ErrorResponse, ServerError};
 pub use keel_core::StackSshInfoResponse;
@@ -28,6 +31,7 @@ pub use state::{
 
 /// Builds the complete stateless Axum [`Router`] with all REST, SSE, auth, and embedded SPA routes.
 pub fn build_router(state: AppState) -> Router {
+    let security_state = state.clone();
     Router::new()
         // Operational endpoints
         .route("/healthz", get(routes::healthz))
@@ -37,6 +41,9 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/auth/login", get(auth::oidc_login))
         .route("/api/v1/auth/callback", get(auth::oidc_callback))
         .route("/api/v1/auth/logout", post(auth::logout))
+        // CLI loopback login (RFC 8252): browser entrypoint + one-time code exchange
+        .route("/api/v1/auth/cli/login", get(auth::cli_login))
+        .route("/api/v1/auth/cli/exchange", post(auth::cli_exchange))
         // Protected REST & SSE API surface
         .route(
             "/api/v1/catalog",
@@ -130,6 +137,10 @@ pub fn build_router(state: AppState) -> Router {
             post(routes::reconcile_release),
         )
         .route(
+            "/api/v1/management/addons",
+            get(routes::list_management_addons),
+        )
+        .route(
             "/api/v1/management/addons/{id}/upgrade",
             post(routes::upgrade_management_addon),
         )
@@ -151,6 +162,11 @@ pub fn build_router(state: AppState) -> Router {
         // Embedded React + Shadcn SPA fallback
         .fallback(spa::spa_fallback)
         .layer(axum::middleware::from_fn(auth::csrf_origin_guard))
+        // Outermost (after CSRF) so rejected responses carry the security headers too.
+        .layer(axum::middleware::from_fn_with_state(
+            security_state,
+            security::security_headers,
+        ))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }

@@ -215,6 +215,126 @@ pub(crate) struct ResolvedTenantResource {
     pub bundle_item: Option<(String, String)>,
 }
 
+/// Git ref holding committed, merged GitOps state read by GET handlers (`OPEN-13`).
+pub(crate) const COMMITTED_GITOPS_REF: &str = "origin/main";
+
+/// Read-only view over GitOps repository content: either a committed ref (read via
+/// `git show <ref>:<path>` without touching the shared worktree, so no `git_lock` is needed) or
+/// the checked-out worktree (callers must hold `AppState::git_lock` while using it).
+pub(crate) enum RepoReader<'a> {
+    AtRef {
+        state: &'a AppState,
+        rev: &'static str,
+    },
+    Worktree {
+        root: &'a Path,
+    },
+}
+
+impl<'a> RepoReader<'a> {
+    /// Returns a committed-ref reader for `origin/main` when that ref exists locally.
+    pub(crate) async fn committed(state: &'a AppState) -> Option<Self> {
+        let exists = state
+            .git_runner
+            .ref_exists(&state.repo_workdir, "refs/remotes/origin/main")
+            .await
+            .unwrap_or(false);
+        exists.then_some(Self::AtRef {
+            state,
+            rev: COMMITTED_GITOPS_REF,
+        })
+    }
+
+    pub(crate) async fn read(&self, rel: &str) -> Option<String> {
+        match self {
+            Self::AtRef { state, rev } => state
+                .git_runner
+                .read_file_at_ref(&state.repo_workdir, rev, rel)
+                .await
+                .ok()
+                .flatten(),
+            Self::Worktree { root } => tokio::fs::read_to_string(root.join(rel)).await.ok(),
+        }
+    }
+
+    pub(crate) async fn exists(&self, rel: &str) -> bool {
+        match self {
+            Self::AtRef { state, rev } => state
+                .git_runner
+                .path_exists_at_ref(&state.repo_workdir, rev, rel)
+                .await
+                .unwrap_or(false),
+            Self::Worktree { root } => tokio::fs::try_exists(root.join(rel)).await.unwrap_or(false),
+        }
+    }
+
+    /// Lists entry names (files and directories) directly under `rel`.
+    pub(crate) async fn list_dir(&self, rel: &str) -> Vec<String> {
+        match self {
+            Self::AtRef { state, rev } => state
+                .git_runner
+                .list_dir_at_ref(&state.repo_workdir, rev, rel)
+                .await
+                .unwrap_or_default(),
+            Self::Worktree { root } => {
+                let mut out = Vec::new();
+                if let Ok(mut entries) = tokio::fs::read_dir(root.join(rel)).await {
+                    while let Ok(Some(entry)) = entries.next_entry().await {
+                        if let Some(n) = entry.file_name().to_str() {
+                            out.push(n.to_string());
+                        }
+                    }
+                }
+                out.sort();
+                out
+            }
+        }
+    }
+
+    /// [`resolve_tenant_resource_dir`] equivalent operating through this reader.
+    pub(crate) async fn resolve_tenant_resource_dir(
+        &self,
+        tenant: &str,
+        subdir: &str,
+        name: &str,
+    ) -> Option<ResolvedTenantResource> {
+        let direct_rel_dir = format!("tenants/{tenant}/{subdir}/{name}");
+        if self.exists(&direct_rel_dir).await {
+            return Some(ResolvedTenantResource {
+                rel_dir: direct_rel_dir,
+                bundle_item: None,
+            });
+        }
+        for b_str in self.list_dir(&format!("tenants/{tenant}/bundles")).await {
+            let Some(item_suffix) = name.strip_prefix(&format!("{b_str}-")) else {
+                continue;
+            };
+            let candidate = format!("tenants/{tenant}/bundles/{b_str}/{item_suffix}");
+            if !self.exists(&candidate).await {
+                continue;
+            }
+            let kind_matches = match subdir {
+                "infra" => self.exists(&format!("{candidate}/stack.yaml")).await,
+                "apps" => {
+                    self.exists(&format!("{candidate}/helmrelease.yaml")).await
+                        || self
+                            .exists(&format!("{candidate}/helmrelease-canary.yaml"))
+                            .await
+                        || self.exists(&format!("{candidate}/manifests.yaml")).await
+                }
+                _ => true,
+            };
+            if kind_matches {
+                return Some(ResolvedTenantResource {
+                    rel_dir: candidate,
+                    bundle_item: Some((b_str.clone(), item_suffix.to_string())),
+                });
+            }
+        }
+        None
+    }
+}
+
 pub(crate) async fn resolve_tenant_resource_dir(
     repo_workdir: &Path,
     tenant: &str,
@@ -446,6 +566,13 @@ spec:
 
         let forge = Arc::new(LocalGitProvider::new(&bare_repo));
         let secret_store = Arc::new(InMemorySecretStore::new());
+        // Provisioned tenant: Pulumi Stack proposals require its state passphrase Secret.
+        keel_kube::SecretStateStore::ensure_pulumi_passphrase(
+            secret_store.as_ref(),
+            "tenant-default",
+        )
+        .await
+        .unwrap();
         let state = AppState::new(
             forge,
             secret_store,
@@ -963,7 +1090,19 @@ data:
     async fn stack_ssh_info_resolves_configured_and_fallback_targets_and_simulated_shell() {
         let (_tmp, state, workdir) = setup_test_state().await;
 
-        // 1. Fallback across multiple providers when stack directory is not yet materialized on disk
+        // 0. Unknown stacks are rejected with 404 instead of fabricating a target (`OPEN-17`).
+        let ghost = get_stack_ssh_info(
+            test_auth(),
+            State(state.clone()),
+            AxumPath(("tenant-default".to_string(), "ghost-vm".to_string())),
+        )
+        .await;
+        assert!(matches!(
+            ghost,
+            Err(SshInfoError::Server(ServerError::NotFound(_)))
+        ));
+
+        // 1. Fallback across multiple providers for existing VM stacks that have no outputs yet
         for (stack_name, expected_provider, expected_user) in [
             ("proxmox-vm-1", "proxmox", "ubuntu"),
             ("aws-vm-1", "aws", "ubuntu"),
@@ -971,6 +1110,16 @@ data:
             ("gcp-vm-1", "gcp", "debian"),
             ("hetzner-vm-1", "hetzner", "root"),
         ] {
+            let dir = workdir.join("tenants/default/infra").join(stack_name);
+            tokio::fs::create_dir_all(&dir).await.unwrap();
+            tokio::fs::write(
+                dir.join("stack.yaml"),
+                format!(
+                    "apiVersion: pulumi.com/v1\nkind: Stack\nmetadata:\n  name: {stack_name}\n  namespace: tenant-default\n  labels:\n    keel.io/provider: {expected_provider}\n    keel.io/resource-kind: vm\nspec:\n  stack: {stack_name}\n"
+                ),
+            )
+            .await
+            .unwrap();
             let Json(fallback_info) = get_stack_ssh_info(
                 test_auth(),
                 State(state.clone()),
@@ -1081,6 +1230,26 @@ spec:
         assert_eq!(custom_info.ssh_port, 2200);
 
         // 3. Verify SSH capability gating across providers
+        // Non-VM stacks (e.g. a `kind` cluster) are rejected with 422.
+        let cluster_dir = workdir.join("tenants/default/infra/dev-cluster");
+        tokio::fs::create_dir_all(&cluster_dir).await.unwrap();
+        tokio::fs::write(
+            cluster_dir.join("stack.yaml"),
+            "apiVersion: pulumi.com/v1\nkind: Stack\nmetadata:\n  name: dev-cluster\n  namespace: tenant-default\n  labels:\n    keel.io/provider: kind\nspec:\n  stack: dev-cluster\n",
+        )
+        .await
+        .unwrap();
+        let cluster = get_stack_ssh_info(
+            test_auth(),
+            State(state.clone()),
+            AxumPath(("tenant-default".to_string(), "dev-cluster".to_string())),
+        )
+        .await;
+        assert!(
+            matches!(&cluster, Err(SshInfoError::Unsupported(msg)) if msg.contains("SSH not supported for cluster")),
+            "{cluster:?}"
+        );
+
         assert!(crate::ssh::is_ssh_supported_infra(
             &vm_info.provider,
             &vm_info.stack_name

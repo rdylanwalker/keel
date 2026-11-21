@@ -1,15 +1,17 @@
 //! Real `russh` WebSocket-to-SSH PTY bridge (`SDD.md` §7.3).
 
-use std::sync::Arc;
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::extract::ws::{Message, WebSocket};
 use futures::StreamExt;
+use keel_core::models::{is_private_or_internal_ip, is_unresolved_ssh_target};
 use keel_core::{
     StackSshInfoResponse, clean_candidate_ssh_host, clean_candidate_ssh_user,
     is_private_or_internal_ssh_host,
 };
-use russh::keys::{PrivateKeyWithHashAlg, decode_secret_key};
+use russh::keys::{HashAlg, PrivateKeyWithHashAlg, PublicKey, decode_secret_key};
 use russh::{ChannelMsg, client};
 use serde::{Deserialize, Serialize};
 
@@ -76,11 +78,17 @@ pub(crate) enum SshWsClientMessage {
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub(crate) enum SshWsServerMessage {
+    #[serde(rename_all = "camelCase")]
     Connected {
         host: String,
         user: String,
         port: u16,
         message: String,
+        /// `SHA256:<base64>` fingerprint of the host key presented by the SSH server.
+        host_key_fingerprint: Option<String>,
+        /// `true` when the fingerprint matched an expected host key from the stack outputs;
+        /// `false` means the key was accepted unverified and the UI should display it.
+        host_key_verified: bool,
     },
     Output {
         data: String,
@@ -98,16 +106,223 @@ async fn send_ws_json(socket: &mut WebSocket, msg: &SshWsServerMessage) -> Resul
     Ok(())
 }
 
-struct SshClientHandler;
+/// Per-session security policy computed by the authenticated HTTP layer
+/// (`routes::workloads::stack_ssh_ws`).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SshSessionPolicy {
+    /// Raw expected host key(s) from stack outputs / GitOps config (`sshHostKeyFingerprint`,
+    /// `sshHostKey`, ...): `SHA256:<base64>` fingerprints and/or OpenSSH public key lines,
+    /// separated by newlines or commas. When present, the server key **must** match.
+    pub expected_host_key: Option<String>,
+    /// Whether the caller may supply an SSH target when the stack has no resolved endpoint.
+    /// Granted only to tenant administrators; tenant members are restricted to stack-resolved
+    /// targets.
+    pub allow_unresolved_target_override: bool,
+}
+
+/// Final SSH connection target selected for a session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConnectTarget {
+    pub host: String,
+    pub port: u16,
+    /// `true` when the target came from stack outputs / GitOps manifests (trusted: may live on
+    /// private networks, e.g. Proxmox/kind VMs). `false` for client-supplied targets, which must
+    /// resolve exclusively to public addresses.
+    pub trusted: bool,
+}
+
+/// Selects the SSH target for a session.
+///
+/// Design: stack-resolved targets (Pulumi outputs / `values.yaml` / `stack.yaml`) are trusted,
+/// because they are produced by the tenant's reviewed GitOps/PKO pipeline and commonly point at
+/// RFC 1918 VMs. Client-supplied `host`/`port` values are therefore only accepted when they are
+/// identical to the resolved target (the UI always echoes them back). Only if the stack has **no**
+/// resolved endpoint may a tenant administrator supply one, and that host must not be a private,
+/// loopback, link-local, CGNAT, ULA, or cluster-internal name/address (re-checked after DNS
+/// resolution by [`pick_vetted_socket_addr`]).
+pub(crate) fn select_connect_target(
+    info: &StackSshInfoResponse,
+    req_host: Option<&str>,
+    req_port: Option<u16>,
+    allow_unresolved_override: bool,
+) -> Result<ConnectTarget, String> {
+    let req_host = match req_host.map(str::trim).filter(|h| !h.is_empty()) {
+        Some(h) => Some(clean_candidate_ssh_host(h).ok_or_else(|| "Invalid SSH host".to_string())?),
+        None => None,
+    };
+    let req_port = req_port.filter(|p| *p > 0);
+
+    if !is_unresolved_ssh_target(info) {
+        if let Some(h) = req_host.as_deref()
+            && !h.eq_ignore_ascii_case(&info.ssh_host)
+        {
+            return Err(
+                "Refusing SSH host override: this stack's SSH target is pinned to its resolved endpoint"
+                    .to_string(),
+            );
+        }
+        if let Some(p) = req_port
+            && p != info.ssh_port
+        {
+            return Err(
+                "Refusing SSH port override: this stack's SSH target is pinned to its resolved endpoint"
+                    .to_string(),
+            );
+        }
+        return Ok(ConnectTarget {
+            host: info.ssh_host.clone(),
+            port: info.ssh_port,
+            trusted: true,
+        });
+    }
+
+    if !allow_unresolved_override {
+        return Err(
+            "SSH target for this stack could not be resolved from its outputs; only tenant administrators may supply a target host"
+                .to_string(),
+        );
+    }
+    let Some(host) = req_host else {
+        return Err(
+            "SSH target for this stack could not be resolved from its outputs; supply a public target host"
+                .to_string(),
+        );
+    };
+    if is_private_or_internal_ssh_host(&host) {
+        return Err(
+            "Refusing SSH host override targeting private, loopback, or cluster-internal address"
+                .to_string(),
+        );
+    }
+    Ok(ConnectTarget {
+        host,
+        port: req_port.unwrap_or(22),
+        trusted: false,
+    })
+}
+
+/// Picks the socket address to connect to from a DNS resolution result. For untrusted
+/// (client-supplied) targets **every** resolved address must be public, which defeats DNS
+/// rebinding: the vetted `SocketAddr` itself (not the hostname) is then passed to `connect`.
+pub(crate) fn pick_vetted_socket_addr(
+    addrs: &[SocketAddr],
+    trusted: bool,
+) -> Result<SocketAddr, String> {
+    let Some(first) = addrs.first() else {
+        return Err("SSH target hostname did not resolve to any address".to_string());
+    };
+    if !trusted && addrs.iter().any(|a| is_private_or_internal_ip(a.ip())) {
+        return Err(
+            "Refusing SSH target: hostname resolves to a private, loopback, or cluster-internal address"
+                .to_string(),
+        );
+    }
+    Ok(*first)
+}
+
+async fn resolve_vetted_socket_addr(target: &ConnectTarget) -> Result<SocketAddr, String> {
+    let addrs: Vec<SocketAddr> = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::net::lookup_host((target.host.as_str(), target.port)),
+    )
+    .await
+    .map_err(|_| format!("DNS resolution for SSH host '{}' timed out", target.host))?
+    .map_err(|e| format!("DNS resolution for SSH host '{}' failed: {e}", target.host))?
+    .collect();
+    pick_vetted_socket_addr(&addrs, target.trusted)
+}
+
+/// Parses expected host key material into normalized `SHA256:<base64-nopad>` fingerprints.
+///
+/// Accepts a list separated by newlines or commas whose entries are either fingerprints
+/// (`SHA256:...`) or OpenSSH public keys (`ssh-ed25519 AAAA... [comment]`, optionally prefixed by
+/// a `known_hosts` host field). Any unparsable entry fails closed so a misconfigured pin never
+/// silently degrades to unverified connections.
+pub(crate) fn parse_expected_host_fingerprints(raw: &str) -> Result<Vec<String>, String> {
+    let mut out = Vec::new();
+    for entry in raw
+        .split(['\n', ','])
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+    {
+        if let Some(rest) = entry.strip_prefix("SHA256:") {
+            let b64 = rest.trim().trim_end_matches('=');
+            if b64.is_empty()
+                || !b64
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/')
+            {
+                return Err("Invalid expected SSH host key fingerprint".to_string());
+            }
+            out.push(format!("SHA256:{b64}"));
+            continue;
+        }
+        let without_host = entry
+            .split_once(char::is_whitespace)
+            .map(|(_, r)| r.trim())
+            .unwrap_or("");
+        let parsed = PublicKey::from_openssh(entry)
+            .or_else(|_| PublicKey::from_openssh(without_host))
+            .map_err(|_| {
+                "Unsupported expected SSH host key format (expected `SHA256:<base64>` or an OpenSSH public key)"
+                    .to_string()
+            })?;
+        out.push(parsed.fingerprint(HashAlg::Sha256).to_string());
+    }
+    if out.is_empty() {
+        return Err("Expected SSH host key is empty".to_string());
+    }
+    Ok(out)
+}
+
+/// Computes the `SHA256:<base64>` fingerprint of the key presented by the SSH server.
+fn server_key_fingerprint(key: &russh::keys::PublicKeyOrCertificate) -> String {
+    match key {
+        russh::keys::PublicKeyOrCertificate::PublicKey { key, .. } => {
+            key.fingerprint(HashAlg::Sha256).to_string()
+        }
+        russh::keys::PublicKeyOrCertificate::Certificate(cert) => {
+            cert.public_key().fingerprint(HashAlg::Sha256).to_string()
+        }
+    }
+}
+
+/// Returns `true` when `observed` is acceptable: no pin configured, or it matches a pinned key.
+pub(crate) fn host_key_matches(expected: &[String], observed: &str) -> bool {
+    expected.is_empty() || expected.iter().any(|e| e == observed)
+}
+
+struct SshClientHandler {
+    expected_fingerprints: Vec<String>,
+    observed_fingerprint: Arc<Mutex<Option<String>>>,
+}
+
+impl SshClientHandler {
+    fn new(expected_fingerprints: Vec<String>) -> (Self, Arc<Mutex<Option<String>>>) {
+        let observed = Arc::new(Mutex::new(None));
+        (
+            Self {
+                expected_fingerprints,
+                observed_fingerprint: observed.clone(),
+            },
+            observed,
+        )
+    }
+}
 
 impl client::Handler for SshClientHandler {
     type Error = russh::Error;
 
     async fn check_server_key(
         &mut self,
-        _server_public_key: &russh::keys::PublicKeyOrCertificate,
+        server_public_key: &russh::keys::PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
-        Ok(true)
+        let fingerprint = server_key_fingerprint(server_public_key);
+        let ok = host_key_matches(&self.expected_fingerprints, &fingerprint);
+        if let Ok(mut slot) = self.observed_fingerprint.lock() {
+            *slot = Some(fingerprint);
+        }
+        Ok(ok)
     }
 }
 
@@ -117,6 +332,7 @@ pub(crate) async fn handle_stack_ssh_ws(
     ssh_info: StackSshInfoResponse,
     saved_ssh_key: Option<String>,
     user_subject: String,
+    policy: SshSessionPolicy,
 ) {
     if !is_ssh_supported_infra(&ssh_info.provider, &ssh_info.stack_name) {
         let _ = send_ws_json(
@@ -133,9 +349,22 @@ pub(crate) async fn handle_stack_ssh_ws(
         return;
     }
 
+    let expected_fingerprints = match policy.expected_host_key.as_deref() {
+        Some(raw) => match parse_expected_host_fingerprints(raw) {
+            Ok(fps) => fps,
+            Err(message) => {
+                let _ = send_ws_json(&mut socket, &SshWsServerMessage::Error { message }).await;
+                let _ = send_ws_json(&mut socket, &SshWsServerMessage::Disconnected).await;
+                return;
+            }
+        },
+        None => Vec::new(),
+    };
+
     let mut active_user = ssh_info.ssh_user.clone();
-    let mut active_port = ssh_info.ssh_port;
-    let mut active_host = ssh_info.ssh_host.clone();
+    let active_port: u16;
+    let active_host: String;
+    let target_trusted: bool;
     let mut cols: u16 = 80;
     let mut rows: u16 = 24;
     let ephemeral_key: Option<String>;
@@ -153,32 +382,21 @@ pub(crate) async fn handle_stack_ssh_ws(
                         port,
                         private_key,
                     }) => {
-                        if let Some(h) = host.as_deref() {
-                            if let Some(cleaned) = clean_candidate_ssh_host(h) {
-                                if cleaned != ssh_info.ssh_host
-                                    && is_private_or_internal_ssh_host(&cleaned)
-                                {
-                                    let _ = send_ws_json(
-                                        &mut socket,
-                                        &SshWsServerMessage::Error {
-                                            message: "Refusing SSH host override targeting private, loopback, or cluster-internal address".to_string(),
-                                        },
-                                    )
-                                    .await;
-                                    let _ = send_ws_json(
-                                        &mut socket,
-                                        &SshWsServerMessage::Disconnected,
-                                    )
-                                    .await;
-                                    return;
-                                }
-                                active_host = cleaned;
-                            } else {
+                        match select_connect_target(
+                            &ssh_info,
+                            host.as_deref(),
+                            port,
+                            policy.allow_unresolved_target_override,
+                        ) {
+                            Ok(target) => {
+                                active_host = target.host;
+                                active_port = target.port;
+                                target_trusted = target.trusted;
+                            }
+                            Err(message) => {
                                 let _ = send_ws_json(
                                     &mut socket,
-                                    &SshWsServerMessage::Error {
-                                        message: "Invalid SSH host".to_string(),
-                                    },
+                                    &SshWsServerMessage::Error { message },
                                 )
                                 .await;
                                 let _ =
@@ -203,9 +421,6 @@ pub(crate) async fn handle_stack_ssh_ws(
                                         .await;
                                 return;
                             }
-                        }
-                        if let Some(p) = port.filter(|p| *p > 0) {
-                            active_port = p;
                         }
                         if let Some(c) = req_cols.filter(|c| *c > 0) {
                             cols = c;
@@ -280,28 +495,54 @@ pub(crate) async fn handle_stack_ssh_ws(
         ..Default::default()
     });
 
+    let target = ConnectTarget {
+        host: active_host.clone(),
+        port: active_port,
+        trusted: target_trusted,
+    };
+    let socket_addr = match resolve_vetted_socket_addr(&target).await {
+        Ok(addr) => addr,
+        Err(message) => {
+            let _ = send_ws_json(&mut socket, &SshWsServerMessage::Error { message }).await;
+            let _ = send_ws_json(&mut socket, &SshWsServerMessage::Disconnected).await;
+            return;
+        }
+    };
+
+    let (handler, observed_fingerprint) = SshClientHandler::new(expected_fingerprints.clone());
     let mut session = match tokio::time::timeout(
         Duration::from_secs(15),
-        client::connect(
-            config,
-            (active_host.as_str(), active_port),
-            SshClientHandler,
-        ),
+        client::connect(config, socket_addr, handler),
     )
     .await
     {
         Ok(Ok(s)) => s,
         Ok(Err(err)) => {
-            let _ = send_ws_json(
-                &mut socket,
-                &SshWsServerMessage::Error {
-                    message: format!(
-                        "SSH connection to {}@{}:{} failed: {err}",
-                        active_user, active_host, active_port
-                    ),
-                },
-            )
-            .await;
+            let observed = observed_fingerprint.lock().ok().and_then(|g| g.clone());
+            let message = match observed {
+                Some(fp) if !host_key_matches(&expected_fingerprints, &fp) => {
+                    tracing::warn!(
+                        target: "keel::audit",
+                        user = %user_subject,
+                        tenant = %ssh_info.tenant,
+                        stack = %ssh_info.stack_name,
+                        ssh_host = %active_host,
+                        presented = %fp,
+                        "SSH host key verification failed"
+                    );
+                    format!(
+                        "SSH host key verification failed for {}:{}: server presented {fp}, expected {}",
+                        active_host,
+                        active_port,
+                        expected_fingerprints.join(", ")
+                    )
+                }
+                _ => format!(
+                    "SSH connection to {}@{}:{} failed: {err}",
+                    active_user, active_host, active_port
+                ),
+            };
+            let _ = send_ws_json(&mut socket, &SshWsServerMessage::Error { message }).await;
             let _ = send_ws_json(&mut socket, &SshWsServerMessage::Disconnected).await;
             return;
         }
@@ -405,34 +646,72 @@ pub(crate) async fn handle_stack_ssh_ws(
         return;
     }
 
+    let host_key_fingerprint = observed_fingerprint.lock().ok().and_then(|g| g.clone());
+    let host_key_verified = !expected_fingerprints.is_empty() && host_key_fingerprint.is_some();
+    tracing::info!(
+        target: "keel::audit",
+        user = %user_subject,
+        tenant = %ssh_info.tenant,
+        stack = %ssh_info.stack_name,
+        ssh_host = %active_host,
+        ssh_port = active_port,
+        host_key_fingerprint = host_key_fingerprint.as_deref().unwrap_or("unknown"),
+        host_key_verified,
+        "WebSocket SSH session established"
+    );
+    let verification_note = match (&host_key_fingerprint, host_key_verified) {
+        (Some(fp), true) => format!(" (host key {fp} verified)"),
+        (Some(fp), false) => format!(
+            " (host key {fp} NOT verified: no expected host key published in stack outputs)"
+        ),
+        (None, _) => String::new(),
+    };
     let _ = send_ws_json(
         &mut socket,
         &SshWsServerMessage::Connected {
             host: active_host.clone(),
             user: active_user.clone(),
             port: active_port,
-            message: format!("Connected to {active_user}@{active_host}:{active_port}"),
+            message: format!(
+                "Connected to {active_user}@{active_host}:{active_port}{verification_note}"
+            ),
+            host_key_fingerprint,
+            host_key_verified,
         },
     )
     .await;
 
+    // SSH channel chunks can split multi-byte UTF-8 sequences; decode stdout and stderr streams
+    // incrementally so characters straddling a chunk boundary are not replaced with U+FFFD.
+    let mut stdout_decoder = Utf8StreamDecoder::default();
+    let mut stderr_decoder = Utf8StreamDecoder::default();
     loop {
         tokio::select! {
             msg = channel.wait() => {
                 match msg {
                     Some(ChannelMsg::Data { data }) => {
-                        let text = String::from_utf8_lossy(&data).into_owned();
+                        let text = stdout_decoder.decode(&data);
+                        if text.is_empty() {
+                            continue;
+                        }
                         if send_ws_json(&mut socket, &SshWsServerMessage::Output { data: text }).await.is_err() {
                             break;
                         }
                     }
                     Some(ChannelMsg::ExtendedData { data, .. }) => {
-                        let text = String::from_utf8_lossy(&data).into_owned();
+                        let text = stderr_decoder.decode(&data);
+                        if text.is_empty() {
+                            continue;
+                        }
                         if send_ws_json(&mut socket, &SshWsServerMessage::Output { data: text }).await.is_err() {
                             break;
                         }
                     }
                     Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => {
+                        let tail = format!("{}{}", stdout_decoder.finish(), stderr_decoder.finish());
+                        if !tail.is_empty() {
+                            let _ = send_ws_json(&mut socket, &SshWsServerMessage::Output { data: tail }).await;
+                        }
                         let _ = send_ws_json(&mut socket, &SshWsServerMessage::Disconnected).await;
                         break;
                     }
@@ -491,6 +770,56 @@ pub(crate) async fn handle_stack_ssh_ws(
         .await;
 }
 
+/// Incremental UTF-8 decoder for byte streams delivered in arbitrary chunks.
+///
+/// Incomplete trailing sequences (at most 3 bytes) are carried over to the next chunk; genuinely
+/// invalid bytes are replaced with U+FFFD exactly like [`String::from_utf8_lossy`].
+#[derive(Debug, Default)]
+pub(crate) struct Utf8StreamDecoder {
+    pending: Vec<u8>,
+}
+
+impl Utf8StreamDecoder {
+    /// Decodes `chunk` (prefixed with any carried-over bytes), returning all complete characters.
+    pub(crate) fn decode(&mut self, chunk: &[u8]) -> String {
+        let mut buf = std::mem::take(&mut self.pending);
+        buf.extend_from_slice(chunk);
+        let mut out = String::with_capacity(buf.len());
+        let mut rest: &[u8] = &buf;
+        loop {
+            match std::str::from_utf8(rest) {
+                Ok(valid) => {
+                    out.push_str(valid);
+                    break;
+                }
+                Err(err) => {
+                    let (valid, after) = rest.split_at(err.valid_up_to());
+                    // `valid_up_to` guarantees this prefix is valid UTF-8.
+                    out.push_str(std::str::from_utf8(valid).unwrap_or_default());
+                    match err.error_len() {
+                        Some(len) => {
+                            out.push(char::REPLACEMENT_CHARACTER);
+                            rest = &after[len..];
+                        }
+                        None => {
+                            // Truncated sequence at the end of the chunk: wait for more bytes.
+                            self.pending = after.to_vec();
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Flushes any incomplete trailing bytes (lossily) at end of stream.
+    pub(crate) fn finish(&mut self) -> String {
+        let pending = std::mem::take(&mut self.pending);
+        String::from_utf8_lossy(&pending).into_owned()
+    }
+}
+
 /// Establishes a real `russh` SSH connection, authenticates with the given PEM private key,
 /// requests a PTY, and opens an interactive shell channel.
 #[cfg(test)]
@@ -516,7 +845,8 @@ async fn connect_and_open_pty_shell(
         inactivity_timeout: Some(Duration::from_secs(30)),
         ..Default::default()
     });
-    let mut session = client::connect(config, (host, port), SshClientHandler)
+    let (handler, _observed) = SshClientHandler::new(Vec::new());
+    let mut session = client::connect(config, (host, port), handler)
         .await
         .map_err(|e| format!("SSH connect failed: {e}"))?;
     let best_hash = session
@@ -554,6 +884,40 @@ mod tests {
     use russh::server::{self, Auth, Msg, Session};
     use russh::{Channel, ChannelId};
     use tokio::net::TcpListener;
+
+    #[test]
+    fn utf8_stream_decoder_carries_split_multibyte_chars_across_chunks() {
+        let text = "héllo → 世界 🚀";
+        let bytes = text.as_bytes();
+        // Split at every possible boundary, including inside 2-, 3- and 4-byte sequences.
+        for split in 0..=bytes.len() {
+            let mut dec = Utf8StreamDecoder::default();
+            let mut out = dec.decode(&bytes[..split]);
+            out.push_str(&dec.decode(&bytes[split..]));
+            out.push_str(&dec.finish());
+            assert_eq!(out, text, "split at {split}");
+        }
+        // Byte-at-a-time delivery of a 4-byte emoji emits nothing until complete.
+        let mut dec = Utf8StreamDecoder::default();
+        let rocket = "🚀".as_bytes();
+        assert_eq!(dec.decode(&rocket[..1]), "");
+        assert_eq!(dec.decode(&rocket[1..2]), "");
+        assert_eq!(dec.decode(&rocket[2..3]), "");
+        assert_eq!(dec.decode(&rocket[3..]), "🚀");
+        assert_eq!(dec.finish(), "");
+    }
+
+    #[test]
+    fn utf8_stream_decoder_replaces_invalid_bytes_and_flushes_truncated_tail() {
+        let mut dec = Utf8StreamDecoder::default();
+        assert_eq!(dec.decode(b"a\xffb"), "a\u{FFFD}b");
+        // Truncated 3-byte sequence is held, then flushed lossily at end of stream.
+        assert_eq!(dec.decode(&[b'x', 0xE4, 0xB8]), "x");
+        assert_eq!(dec.finish(), "\u{FFFD}");
+        // Invalid continuation after a held lead byte is replaced, not swallowed.
+        assert_eq!(dec.decode(&[0xE4]), "");
+        assert_eq!(dec.decode(b"z"), "\u{FFFD}z");
+    }
 
     #[test]
     fn ssh_supported_infra_gates_kind_and_non_vm_stacks() {
@@ -851,6 +1215,14 @@ mod tests {
         info: StackSshInfoResponse,
         saved_key: Option<String>,
     ) -> std::net::SocketAddr {
+        spawn_ws_handler_with_policy(info, saved_key, SshSessionPolicy::default()).await
+    }
+
+    async fn spawn_ws_handler_with_policy(
+        info: StackSshInfoResponse,
+        saved_key: Option<String>,
+        policy: SshSessionPolicy,
+    ) -> std::net::SocketAddr {
         use axum::Router;
         use axum::extract::ws::WebSocketUpgrade;
         use axum::routing::get;
@@ -862,9 +1234,10 @@ mod tests {
             get(move |ws: WebSocketUpgrade| {
                 let info = info.clone();
                 let saved_key = saved_key.clone();
+                let policy = policy.clone();
                 async move {
                     ws.on_upgrade(move |socket| {
-                        handle_stack_ssh_ws(socket, info, saved_key, "tester".to_string())
+                        handle_stack_ssh_ws(socket, info, saved_key, "tester".to_string(), policy)
                     })
                 }
             }),
@@ -912,11 +1285,7 @@ mod tests {
         let mut ws = MiniWsClient::connect(addr, "/ws").await;
         ws.send_text(r#"{"type":"connect","host":"169.254.169.254"}"#)
             .await;
-        assert!(
-            ws.recv_text()
-                .await
-                .contains("Refusing SSH host override targeting private")
-        );
+        assert!(ws.recv_text().await.contains("Refusing SSH host override"));
         assert!(ws.recv_text().await.contains("disconnected"));
 
         let mut ws = MiniWsClient::connect(addr, "/ws").await;
@@ -990,6 +1359,8 @@ mod tests {
 
         let connected = ws.recv_text().await;
         assert!(connected.contains("connected"));
+        assert!(connected.contains("\"hostKeyFingerprint\":\"SHA256:"));
+        assert!(connected.contains("\"hostKeyVerified\":false"));
         let prompt = ws.recv_text().await;
         assert!(prompt.contains("ubuntu@test-vm:~$"));
 
@@ -1003,5 +1374,203 @@ mod tests {
         ws.send_text(r#"{"type":"disconnect"}"#).await;
         let disc = ws.recv_text().await;
         assert!(disc.contains("disconnected"));
+    }
+
+    #[test]
+    fn select_connect_target_pins_resolved_targets() {
+        let info = test_ssh_info("proxmox", "pve-vm", "192.168.10.25", 22);
+        // Resolved private target is trusted; echoing it back is fine.
+        let t = select_connect_target(&info, Some("192.168.10.25"), Some(22), false).unwrap();
+        assert_eq!(
+            t,
+            ConnectTarget {
+                host: "192.168.10.25".to_string(),
+                port: 22,
+                trusted: true
+            }
+        );
+        let t = select_connect_target(&info, None, None, false).unwrap();
+        assert!(t.trusted);
+        // Overrides that differ are refused, even for admins and even for public hosts.
+        let err = select_connect_target(&info, Some("203.0.113.5"), None, true).unwrap_err();
+        assert!(err.contains("Refusing SSH host override"));
+        let err = select_connect_target(&info, None, Some(2222), true).unwrap_err();
+        assert!(err.contains("Refusing SSH port override"));
+        let err = select_connect_target(&info, Some("bad host!!"), None, true).unwrap_err();
+        assert_eq!(err, "Invalid SSH host");
+    }
+
+    #[test]
+    fn select_connect_target_unresolved_requires_admin_and_public_host() {
+        let info = test_ssh_info("proxmox", "pve-vm", "pve-vm.default.local", 22);
+        let err = select_connect_target(&info, Some("203.0.113.5"), None, false).unwrap_err();
+        assert!(err.contains("only tenant administrators"));
+        let err = select_connect_target(&info, None, None, true).unwrap_err();
+        assert!(err.contains("supply a public target host"));
+        for internal in [
+            "10.0.0.5",
+            "169.254.169.254",
+            "127.0.0.1",
+            "kubernetes.default.svc",
+            "fd00::1",
+            "100.64.1.1",
+        ] {
+            let err = select_connect_target(&info, Some(internal), None, true).unwrap_err();
+            assert!(err.contains("Refusing SSH host override"), "{internal}");
+        }
+        let t = select_connect_target(&info, Some("203.0.113.5"), Some(2222), true).unwrap();
+        assert_eq!(
+            t,
+            ConnectTarget {
+                host: "203.0.113.5".to_string(),
+                port: 2222,
+                trusted: false
+            }
+        );
+    }
+
+    #[test]
+    fn pick_vetted_socket_addr_blocks_rebinding_for_untrusted_targets() {
+        let public: SocketAddr = "203.0.113.5:22".parse().unwrap();
+        let private: SocketAddr = "10.0.0.5:22".parse().unwrap();
+        let metadata: SocketAddr = "169.254.169.254:22".parse().unwrap();
+        assert_eq!(pick_vetted_socket_addr(&[public], false).unwrap(), public);
+        assert!(pick_vetted_socket_addr(&[public, private], false).is_err());
+        assert!(pick_vetted_socket_addr(&[metadata], false).is_err());
+        assert_eq!(pick_vetted_socket_addr(&[private], true).unwrap(), private);
+        assert!(pick_vetted_socket_addr(&[], true).is_err());
+    }
+
+    #[test]
+    fn parse_expected_host_fingerprints_accepts_fingerprints_and_public_keys() {
+        let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
+        let pubkey = key.public_key().to_openssh().unwrap();
+        let fp = key.public_key().fingerprint(HashAlg::Sha256).to_string();
+        assert!(fp.starts_with("SHA256:"));
+
+        assert_eq!(
+            parse_expected_host_fingerprints(&pubkey).unwrap(),
+            vec![fp.clone()]
+        );
+        assert_eq!(
+            parse_expected_host_fingerprints(&format!("vm.example.com {pubkey}")).unwrap(),
+            vec![fp.clone()]
+        );
+        assert_eq!(
+            parse_expected_host_fingerprints(&format!("{fp}=, SHA256:abc+/9\n")).unwrap(),
+            vec![fp.clone(), "SHA256:abc+/9".to_string()]
+        );
+        assert!(parse_expected_host_fingerprints("SHA256:").is_err());
+        assert!(parse_expected_host_fingerprints("SHA256:not valid!").is_err());
+        assert!(parse_expected_host_fingerprints("garbage").is_err());
+        assert!(parse_expected_host_fingerprints(" , ").is_err());
+
+        assert!(host_key_matches(&[], &fp));
+        assert!(host_key_matches(std::slice::from_ref(&fp), &fp));
+        assert!(!host_key_matches(&["SHA256:other".to_string()], &fp));
+    }
+
+    async fn spawn_test_ssh_server(
+        host_key: PrivateKey,
+        client_pubkey: russh::keys::PublicKey,
+    ) -> u16 {
+        let server_cfg = Arc::new(server::Config {
+            keys: vec![host_key],
+            ..Default::default()
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut srv = TestSshServer {
+            expected_pubkey: client_pubkey,
+        };
+        tokio::spawn(async move {
+            if let Ok((stream, addr)) = listener.accept().await {
+                let handler = server::Server::new_client(&mut srv, Some(addr));
+                let _ = server::run_stream(server_cfg, stream, handler).await;
+            }
+        });
+        port
+    }
+
+    #[tokio::test]
+    async fn handle_stack_ssh_ws_enforces_pinned_host_key() {
+        let host_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
+        let host_fp = host_key
+            .public_key()
+            .fingerprint(HashAlg::Sha256)
+            .to_string();
+        let other_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
+        let other_pub = other_key.public_key().to_openssh().unwrap();
+        let client_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
+        let client_pem = client_key
+            .to_openssh(russh::keys::ssh_key::LineEnding::LF)
+            .unwrap()
+            .to_string();
+
+        // Mismatched pin -> refused with a host key verification error.
+        let port = spawn_test_ssh_server(host_key.clone(), client_key.public_key().clone()).await;
+        let addr = spawn_ws_handler_with_policy(
+            test_ssh_info("proxmox", "pve-vm", "127.0.0.1", port),
+            Some(client_pem.clone()),
+            SshSessionPolicy {
+                expected_host_key: Some(other_pub),
+                allow_unresolved_target_override: false,
+            },
+        )
+        .await;
+        let mut ws = MiniWsClient::connect(addr, "/ws").await;
+        ws.send_text(r#"{"type":"connect"}"#).await;
+        let err = ws.recv_text().await;
+        assert!(err.contains("host key verification failed"), "{err}");
+        assert!(err.contains(&host_fp));
+        assert!(ws.recv_text().await.contains("disconnected"));
+
+        // Matching pin -> connected and reported as verified.
+        let port = spawn_test_ssh_server(host_key, client_key.public_key().clone()).await;
+        let addr = spawn_ws_handler_with_policy(
+            test_ssh_info("proxmox", "pve-vm", "127.0.0.1", port),
+            Some(client_pem),
+            SshSessionPolicy {
+                expected_host_key: Some(host_fp.clone()),
+                allow_unresolved_target_override: false,
+            },
+        )
+        .await;
+        let mut ws = MiniWsClient::connect(addr, "/ws").await;
+        ws.send_text(r#"{"type":"connect"}"#).await;
+        let connected = ws.recv_text().await;
+        assert!(
+            connected.contains("\"hostKeyVerified\":true"),
+            "{connected}"
+        );
+        assert!(connected.contains(&host_fp));
+
+        // Invalid pin configuration fails closed before connecting.
+        let addr = spawn_ws_handler_with_policy(
+            test_ssh_info("proxmox", "pve-vm", "127.0.0.1", 22),
+            None,
+            SshSessionPolicy {
+                expected_host_key: Some("garbage".to_string()),
+                allow_unresolved_target_override: false,
+            },
+        )
+        .await;
+        let mut ws = MiniWsClient::connect(addr, "/ws").await;
+        assert!(
+            ws.recv_text()
+                .await
+                .contains("Unsupported expected SSH host key format")
+        );
+
+        // Unresolved target: tenant members cannot supply their own host.
+        let addr = spawn_ws_handler(
+            test_ssh_info("proxmox", "pve-vm", "pve-vm.default.local", 22),
+            None,
+        )
+        .await;
+        let mut ws = MiniWsClient::connect(addr, "/ws").await;
+        ws.send_text(r#"{"type":"connect","host":"203.0.113.5"}"#)
+            .await;
+        assert!(ws.recv_text().await.contains("only tenant administrators"));
     }
 }
