@@ -32,9 +32,12 @@ serve *ARGS:
     cargo run --bin keel -- serve --bind 127.0.0.1:8080 {{ARGS}}
 
 # Start keel with a temporary Git repo seeded from deploy/catalog/ and demo UI data
+# (`?demo=true` fixtures are compiled out of production bundles, so the SPA is rebuilt with
+# VITE_ENABLE_DEMO=true; run `just build-ui` afterwards to restore a production bundle)
 serve-demo:
     #!/usr/bin/env bash
     set -euo pipefail
+    VITE_ENABLE_DEMO=true pnpm --dir ui build
     tmp_dir=$(mktemp -d)
     trap 'rm -rf "$tmp_dir"' EXIT
     git init --bare "$tmp_dir/bare.git" >/dev/null
@@ -152,14 +155,18 @@ build-init-serve *ARGS: build
         --repo-dir "$repo_dir" \
         "${init_args[@]+"${init_args[@]}"}" | tee "$init_log"
 
+    init_user=$(awk -F'Admin Username:[[:space:]]*' '/^Admin Username:/ {print $2; exit}' "$init_log" || true)
+    if [ -n "$init_user" ]; then
+        printf '%s' "$init_user" > target/keel-admin-username
+    fi
     if [ -n "${KEEL_ADMIN_PASSWORD:-}" ]; then
-        printf '%s' "$KEEL_ADMIN_PASSWORD" > target/keel-dex-password
-        chmod 600 target/keel-dex-password
+        printf '%s' "$KEEL_ADMIN_PASSWORD" > target/keel-admin-password
+        chmod 600 target/keel-admin-password
     else
         init_pass=$(awk -F'Admin Password:[[:space:]]*' '/^Admin Password:/ {print $2; exit}' "$init_log" || true)
         if [ -n "$init_pass" ] && [ "$init_pass" != "[PROVIDED VIA CLI]" ]; then
-            printf '%s' "$init_pass" > target/keel-dex-password
-            chmod 600 target/keel-dex-password
+            printf '%s' "$init_pass" > target/keel-admin-password
+            chmod 600 target/keel-admin-password
         fi
     fi
 
@@ -230,58 +237,39 @@ _start-serve *ARGS:
     grep "Keel Control Plane listening on " "$log_file" | head -n 1
     clean_log=$(sed 's/\x1b\[[0-9;]*m//g' "$log_file")
     forgejo_port=$(printf '%s\n' "$clean_log" | awk -F'local_port=' '/Started automatic port-forward to in-cluster Forgejo/ {print $2; exit}')
-    dex_port=$(printf '%s\n' "$clean_log" | awk -F'local_port=' '/Started automatic port-forward to in-cluster Dex OIDC/ {print $2; exit}')
+    gateway_port=$(printf '%s\n' "$clean_log" | awk -F'local_port=' '/Started automatic port-forward to Envoy Gateway/ {print $2; exit}')
     if [ -n "$forgejo_port" ]; then
         echo "Forgejo Local URL:       http://127.0.0.1:$forgejo_port"
     fi
-    if [ -n "$dex_port" ]; then
-        echo "Dex OIDC Local URL:      http://127.0.0.1:$dex_port/dex"
+    if [ -n "$gateway_port" ]; then
+        echo "Rauthy OIDC (gateway):   port-forwarded on 127.0.0.1:$gateway_port (https://idp.keel.local:8888/auth/v1/admin)"
+    fi
+
+    admin_user="${KEEL_ADMIN_USERNAME:-}"
+    if [ -z "$admin_user" ] && [ -f "target/keel-admin-username" ]; then
+        admin_user=$(cat "target/keel-admin-username" 2>/dev/null || true)
+    fi
+    admin_pass="${KEEL_ADMIN_PASSWORD:-}"
+    if [ -z "$admin_pass" ] && [ -f "target/keel-admin-password" ]; then
+        admin_pass=$(cat "target/keel-admin-password" 2>/dev/null || true)
+    fi
+    if [ -n "$admin_user" ]; then
+        echo "Rauthy Admin Username:   $admin_user"
+    fi
+    if [ -n "$admin_pass" ]; then
+        echo "Rauthy Admin Password:   $admin_pass"
+    elif [ -n "$admin_user" ]; then
+        echo "Rauthy Admin Password:   <not stored; set KEEL_ADMIN_PASSWORD or use the Rauthy admin UI password reset>"
     fi
 
     if command -v kubectl >/dev/null 2>&1; then
-        dex_email=$(kubectl get secret -n keel-system dex-config -o jsonpath='{.data.config\.yaml}' 2>/dev/null | base64 -d 2>/dev/null | awk '/email:/ {print $NF; exit}' || true)
-        if [ -n "$dex_email" ]; then
-            echo "Dex OIDC Admin Email:    $dex_email"
-            dex_pass="${KEEL_ADMIN_PASSWORD:-}"
-            if [ -z "$dex_pass" ] && [ -f "target/keel-dex-password" ]; then
-                dex_pass=$(cat "target/keel-dex-password" 2>/dev/null || true)
-            fi
-            if [ -z "$dex_pass" ]; then
-                dex_pass=$(kubectl get secret -n keel-system dex-admin -o jsonpath='{.data.password}' 2>/dev/null | base64 -d 2>/dev/null || true)
-            fi
-            if [ -n "$dex_pass" ]; then
-                echo "Dex OIDC Admin Password: $dex_pass"
-            else
-                echo "Dex OIDC Admin Password: <not recoverable from bcrypt hash in dex-config; run 'just dex-reset-password' or set KEEL_ADMIN_PASSWORD>"
-            fi
-        fi
-        forgejo_user=$(kubectl get secret -n keel-system forgejo-admin -o jsonpath='{.data.username}' 2>/dev/null | base64 -d 2>/dev/null || true)
-        forgejo_pass=$(kubectl get secret -n keel-system forgejo-admin -o jsonpath='{.data.password}' 2>/dev/null | base64 -d 2>/dev/null || true)
+        forgejo_user=$(kubectl get secret -n keel-system keel-forgejo-admin -o jsonpath='{.data.username}' 2>/dev/null | base64 -d 2>/dev/null || true)
+        forgejo_pass=$(kubectl get secret -n keel-system keel-forgejo-admin -o jsonpath='{.data.password}' 2>/dev/null | base64 -d 2>/dev/null || true)
         if [ -n "$forgejo_user" ] && [ -n "$forgejo_pass" ]; then
             echo "Forgejo Admin Username:  $forgejo_user"
             echo "Forgejo Admin Password:  $forgejo_pass"
         fi
     fi
-
-# Reset the in-cluster Dex OIDC admin password, restart Dex, and save it for `just build-serve`
-dex-reset-password password="":
-    #!/usr/bin/env bash
-    set -euo pipefail
-    new_pass="{{password}}"
-    if [ -z "$new_pass" ]; then
-        new_pass=$(python3 -c 'import secrets, string; alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789"; print("".join(secrets.choice(alphabet) for _ in range(20)))')
-    fi
-    new_hash=$(python3 -c 'import sys, bcrypt; print(bcrypt.hashpw(sys.argv[1].encode(), bcrypt.gensalt(rounds=12)).decode())' "$new_pass")
-    current_cfg=$(kubectl get secret -n keel-system dex-config -o jsonpath='{.data.config\.yaml}' | base64 -d)
-    updated_cfg=$(python3 -c 'import re, sys; cfg, h = sys.argv[1], sys.argv[2]; print(re.sub(r"(?m)^(\s*hash:\s*).*$", lambda m: f"{m.group(1)}\"{h}\"", cfg, count=1), end="")' "$current_cfg" "$new_hash")
-    kubectl create secret generic dex-config -n keel-system --from-literal=config.yaml="$updated_cfg" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
-    kubectl rollout restart deployment/dex -n keel-system >/dev/null
-    kubectl rollout status deployment/dex -n keel-system --timeout=60s >/dev/null
-    mkdir -p target
-    printf '%s' "$new_pass" > target/keel-dex-password
-    chmod 600 target/keel-dex-password
-    echo "Updated Dex admin password in keel-system/dex-config and restarted Dex."
-    echo "Dex OIDC Admin Password: $new_pass"
 
 # Format Rust, UI, and E2E code
 fmt:
@@ -509,7 +497,7 @@ down cluster_name="keel-mgmt" repo_dir="./keel-gitops":
         fi
     done
 
-    rm -f target/keel-dex-password
+    rm -f target/keel-admin-password target/keel-admin-username target/keel-dex-password
 
 alias cleanup := down
 
