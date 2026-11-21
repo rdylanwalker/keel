@@ -5,6 +5,7 @@ import {
   buildDeployProposalPayload,
   CUSTOM_CLUSTER,
   DeployTargetState,
+  dedicatedNamespace,
   deployPlacementError,
   requiresRemoteCluster,
   resolveTargetCluster,
@@ -92,5 +93,34 @@ describe("deploy placement helpers", () => {
         {}
       )
     ).toMatchObject({ targetCluster: "w-kubeconfig", targetNamespace: "fl" })
+  })
+
+  it("pins cluster-scoped apps with a dedicated namespace to it", () => {
+    const operator = {
+      ...app,
+      placementScope: "cluster" as const,
+      placementNamespace: "flux-system",
+    }
+    expect(dedicatedNamespace(operator)).toBe("flux-system")
+    expect(dedicatedNamespace({ ...app, placementNamespace: "x" })).toBe(
+      undefined
+    )
+    expect(dedicatedNamespace(null)).toBeUndefined()
+    for (const targetNamespace of ["", "tenant-acme"]) {
+      expect(
+        buildDeployProposalPayload(
+          operator,
+          { ...target, targetCluster: "w-kubeconfig", targetNamespace },
+          {}
+        )
+      ).toMatchObject({
+        targetCluster: "w-kubeconfig",
+        targetNamespace: "flux-system",
+      })
+    }
+    // Management cluster: no namespace (the placement error blocks submission anyway).
+    expect(buildDeployProposalPayload(operator, target, {})).not.toHaveProperty(
+      "targetNamespace"
+    )
   })
 })

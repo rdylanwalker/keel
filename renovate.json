@@ -112,6 +112,48 @@
       "automerge": true
     },
     {
+      "description": "Management add-on chart kyverno and its catalog/apps twin: one PR bumps catalog/core, catalog/apps, the seed HelmRelease and the Stage 0 Pulumi release together (keel-cli drift tests); reviewed manually because the management plane runs it",
+      "matchManagers": [
+        "custom.regex"
+      ],
+      "matchFileNames": [
+        "deploy/**"
+      ],
+      "matchDepNames": [
+        "kyverno"
+      ],
+      "groupName": "kyverno-chart",
+      "automerge": false
+    },
+    {
+      "description": "Management add-on chart flux2 and its catalog/apps twin: one PR bumps catalog/core, catalog/apps, the seed HelmRelease and the Stage 0 Pulumi release together (keel-cli drift tests); reviewed manually because the management plane runs it",
+      "matchManagers": [
+        "custom.regex"
+      ],
+      "matchFileNames": [
+        "deploy/**"
+      ],
+      "matchDepNames": [
+        "ghcr.io/fluxcd-community/charts/flux2"
+      ],
+      "groupName": "flux2-chart",
+      "automerge": false
+    },
+    {
+      "description": "Management add-on chart pulumi-kubernetes-operator and its catalog/apps twin: one PR bumps catalog/core, catalog/apps, the seed HelmRelease and the Stage 0 Pulumi release together (keel-cli drift tests); reviewed manually because the management plane runs it",
+      "matchManagers": [
+        "custom.regex"
+      ],
+      "matchFileNames": [
+        "deploy/**"
+      ],
+      "matchDepNames": [
+        "ghcr.io/pulumi/helm-charts/pulumi-kubernetes-operator"
+      ],
+      "groupName": "pulumi-kubernetes-operator-chart",
+      "automerge": false
+    },
+    {
       "description": "Pinned semantic-release toolchain (release/package.json + package-lock.json)",
       "matchManagers": [
         "npm"
@@ -140,6 +182,18 @@
       ],
       "matchStrings": [
         "# renovate: datasource=(?<datasource>[a-z-]+?) depName=(?<depName>\\S+?)(?: versioning=(?<versioning>\\S+?))?\\s+(?:ARG )?[A-Z0-9_]+(?:=|: )\"?(?<currentValue>[^\\s\"]+)\"?"
+      ]
+    },
+    {
+      "customType": "regex",
+      "description": "Helm chart versions of management add-ons and their catalog/apps twins, annotated with `# renovate: datasource=... depName=... [registryUrl=...]` on the line above `version:` (catalog/core, catalog/apps, seed core-addons, Stage 0 Pulumi programs)",
+      "managerFilePatterns": [
+        "/^deploy/catalog/(core|apps)/[^/]+/catalog\\.yaml$/",
+        "/^deploy/seed/core-addons/[^/]+\\.yaml$/",
+        "/^deploy/bootstrap/[^/]+/Pulumi\\.yaml$/"
+      ],
+      "matchStrings": [
+        "# renovate: datasource=(?<datasource>[a-z-]+?) depName=(?<depName>\\S+?)(?: registryUrl=(?<registryUrl>\\S+?))?\\s+version: \"?(?<currentValue>[^\\s\"]+)\"?"
       ]
     }
   ]

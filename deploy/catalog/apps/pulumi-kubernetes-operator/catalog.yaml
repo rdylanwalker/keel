@@ -1,0 +1,113 @@
+# Pulumi Kubernetes Operator Workload Cluster Catalog Application (`SDD.md` §2.1, §5.1)
+# Self-service twin of `catalog/core/pulumi-kubernetes-operator` (Keel's own PKO v2 in
+# `keel-system`): same chart and version (a drift test in `keel-cli` fails when they differ),
+# reusing the seed install config of `deploy/seed/core-addons/pko.yaml` (hardened container
+# security context, CRDs replaced on upgrade). The management-only parts (the Keel management /
+# preview ServiceAccounts and the `restrict-pulumi-providers` Kyverno policy) are not installed.
+apiVersion: keel.io/v1alpha1
+kind: CatalogApplication
+metadata:
+  id: pulumi-kubernetes-operator
+  name: Pulumi Kubernetes Operator
+  description: PKO v2 for a workload cluster, so its own teams can run Pulumi Stack objects (Pulumi YAML, Terraform providers) there. Install once per cluster.
+  category: platform
+  runtime: helm
+spec:
+  upstream:
+    chart: pulumi-kubernetes-operator
+    repoURL: oci://ghcr.io/pulumi/helm-charts
+    # renovate: datasource=docker depName=ghcr.io/pulumi/helm-charts/pulumi-kubernetes-operator
+    version: "2.10.1"
+  # The chart installs cluster-scoped resources (the pulumi.com / auto.pulumi.com CRDs and
+  # cluster-wide ClusterRoles/Bindings), so it may only target a remote workload cluster (the
+  # management cluster runs catalog/core/pulumi-kubernetes-operator). The operator watches Stacks
+  # in every namespace: one install per cluster. Dedicated `pulumi-kubernetes-operator` namespace
+  # (a request without targetNamespace installs there; any other namespace is rejected), so the
+  # operator never shares the tenant's `tenant-<id>` namespace with its other apps.
+  placement:
+    scope: cluster
+    namespace: pulumi-kubernetes-operator
+  # The chart ships its CRDs in `crds/`: replace them on upgrade like the seed HelmRelease, so a
+  # version bump also updates the CRDs (Flux's default skips them on upgrade).
+  crdPolicy: CreateReplace
+  progressiveDelivery:
+    flaggerSupported: false
+    defaultCanary: false
+  # Known-good management config (`deploy/seed/core-addons/pko.yaml`) plus the chart's
+  # non-root pod security context. Locked values make the form the whole interface: values the
+  # schema does not declare (image, extraEnv, sidecars, ServiceAccount, RBAC rules) are rejected.
+  lockedValues:
+    podSecurityContext:
+      runAsNonRoot: true
+      runAsUser: 65532
+      runAsGroup: 65532
+      seccompProfile:
+        type: RuntimeDefault
+    securityContext:
+      allowPrivilegeEscalation: false
+      seccompProfile:
+        type: RuntimeDefault
+      capabilities:
+        drop:
+          - ALL
+  schema:
+    type: object
+    properties:
+      replicaCount:
+        type: integer
+        title: Operator Replicas
+        description: Extra replicas are leader-election standbys; one is enough for most clusters.
+        default: 1
+        minimum: 1
+        maximum: 3
+      controller:
+        type: object
+        title: Operator Controller
+        properties:
+          logLevel:
+            type: string
+            title: Log Level
+            default: info
+            enum:
+              - debug
+              - info
+              - error
+          logFormat:
+            type: string
+            title: Log Format
+            default: console
+            enum:
+              - console
+              - json
+      resources:
+        type: object
+        title: Resources
+        properties:
+          requests:
+            type: object
+            title: Requests
+            properties:
+              cpu:
+                type: string
+                title: CPU Request
+                default: 200m
+                pattern: "^[0-9]+(\\.[0-9]+)?m?$"
+              memory:
+                type: string
+                title: Memory Request
+                default: 128Mi
+                pattern: "^[0-9]+(Mi|Gi)$"
+          limits:
+            type: object
+            title: Limits
+            properties:
+              cpu:
+                type: string
+                title: CPU Limit
+                default: 200m
+                pattern: "^[0-9]+(\\.[0-9]+)?m?$"
+              memory:
+                type: string
+                title: Memory Limit
+                default: 128Mi
+                pattern: "^[0-9]+(Mi|Gi)$"

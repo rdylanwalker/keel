@@ -322,4 +322,72 @@ test.describe('02 - Catalog Dynamic Forms & PR Proposal Generation', () => {
     expect(JSON.stringify(await undeclared.json())).toContain('filer.httpRoute');
     await api.dispose();
   });
+
+  test('02.9 - Kyverno, PKO and Flux twins are workload-cluster only, use dedicated namespaces and pin the core versions', async () => {
+    const api = await apiAs(USERS.admin);
+    const catalog = await (await api.get('/api/v1/catalog')).json();
+    const apps = catalog.applications as Array<{
+      metadata: { id: string; runtime: string };
+      spec: { placement?: { scope?: string; namespace?: string }; upstream: { version?: string } };
+    }>;
+    for (const [id, version, namespace] of [
+      ['kyverno', '3.10.0', 'kyverno'],
+      ['pulumi-kubernetes-operator', '2.10.1', 'pulumi-kubernetes-operator'],
+      ['flux2', '2.20.0', 'flux-system'],
+    ]) {
+      const app = apps.find((a) => a.metadata.id === id);
+      expect(app?.metadata.runtime, id).toBe('helm');
+      expect(app?.spec.placement?.scope, id).toBe('cluster');
+      // Dedicated install namespace, never the tenant's shared `tenant-<id>`.
+      expect(app?.spec.placement?.namespace, id).toBe(namespace);
+      expect(app?.spec.upstream.version, id).toBe(version);
+
+      // Cluster-wide CRDs, RBAC and webhooks never land on the management cluster.
+      const local = await api.post('/api/v1/proposals', {
+        data: { tenant: 'acme', catalogId: id, name: uniq(id.slice(0, 8)), values: {} },
+      });
+      expect(local.status(), id).toBe(400);
+    }
+
+    // The form is the whole interface: chart values outside the schema are rejected.
+    const undeclared = await api.post('/api/v1/proposals', {
+      data: {
+        tenant: 'acme',
+        catalogId: 'flux2',
+        name: uniq('flux'),
+        targetCluster: 'workload-kubeconfig',
+        targetNamespace: 'flux-system',
+        values: { multitenancy: { enabled: true }, extraObjects: [{ kind: 'ClusterRoleBinding' }] },
+      },
+    });
+    expect(undeclared.status()).toBe(400);
+    expect(JSON.stringify(await undeclared.json())).toContain('extraObjects');
+
+    // Any namespace other than the dedicated one is rejected.
+    const sharedNs = await api.post('/api/v1/proposals', {
+      data: {
+        tenant: 'acme',
+        catalogId: 'kyverno',
+        name: uniq('kyverno'),
+        targetCluster: 'workload-kubeconfig',
+        targetNamespace: 'tenant-acme',
+        values: {},
+      },
+    });
+    expect(sharedNs.status()).toBe(400);
+    expect(JSON.stringify(await sharedNs.json())).toContain('spec.placement.namespace');
+
+    // The Flux multi-tenancy lockdown switch is required (no server-side schema defaults).
+    const noLockdown = await api.post('/api/v1/proposals', {
+      data: {
+        tenant: 'acme',
+        catalogId: 'flux2',
+        name: uniq('flux'),
+        targetCluster: 'workload-kubeconfig',
+        values: {},
+      },
+    });
+    expect(noLockdown.status()).toBe(422);
+    await api.dispose();
+  });
 });

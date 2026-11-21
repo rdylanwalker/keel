@@ -940,6 +940,40 @@ describe("DeployInstanceModal cluster-scoped placement", () => {
     )
   })
 
+  it("pins the target namespace of apps with a dedicated placement namespace", async () => {
+    render(
+      <DeployInstanceModal
+        isOpen
+        onClose={vi.fn()}
+        catalogItem={{
+          ...clusterScopedItem,
+          id: "flux2",
+          name: "Flux CD",
+          placementNamespace: "flux-system",
+        }}
+        tenant="acme"
+        stacks={[kindStack]}
+      />
+    )
+    const namespaceInput = screen.getByLabelText(/Target Namespace/i)
+    expect(namespaceInput).toHaveValue("flux-system")
+    expect(namespaceInput).toBeDisabled()
+    expect(namespaceInput).toHaveAttribute(
+      "title",
+      expect.stringMatching(/dedicated flux-system namespace/)
+    )
+    submit()
+    await waitFor(() =>
+      expect(api.createProposal).toHaveBeenCalledWith(
+        expect.objectContaining({
+          catalogId: "flux2",
+          targetCluster: "dev-kind-kubeconfig",
+          targetNamespace: "flux-system",
+        })
+      )
+    )
+  })
+
   it("preselects the first workload cluster for cluster-scoped apps", async () => {
     render(
       <DeployInstanceModal

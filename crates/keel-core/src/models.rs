@@ -1047,12 +1047,49 @@ impl FromStr for PlacementScope {
     }
 }
 
+/// Flux `HelmRelease` CRD lifecycle policy for a chart's `crds/` directory
+/// (`spec.crdPolicy`, `runtime: helm` only), rendered into `spec.install.crds` and
+/// `spec.upgrade.crds`. Omitted means Flux's defaults (`Create` on install, `Skip` on upgrade),
+/// which never update CRDs on a chart upgrade; charts shipping their CRDs in `crds/` (e.g. the
+/// Pulumi Kubernetes Operator) declare `CreateReplace` so a version bump also updates them.
+/// Charts that template their CRDs are unaffected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum HelmCrdPolicy {
+    Skip,
+    Create,
+    CreateReplace,
+}
+
+impl HelmCrdPolicy {
+    /// The Flux `HelmRelease` `install.crds` / `upgrade.crds` value.
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Skip => "Skip",
+            Self::Create => "Create",
+            Self::CreateReplace => "CreateReplace",
+        }
+    }
+}
+
+impl fmt::Display for HelmCrdPolicy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Declarative placement rule of a `CatalogApplication` (`spec.placement`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlacementSpec {
     #[serde(default)]
     pub scope: PlacementScope,
+    /// Dedicated install namespace on the remote workload cluster (`scope: cluster` only), e.g.
+    /// `flux-system` for a cluster-wide operator. A proposal without `targetNamespace` installs
+    /// there, and any other `targetNamespace` is rejected, so the operator never lands in the
+    /// tenant's shared `tenant-<id>` namespace (where namespace-wide chart NetworkPolicies or
+    /// webhook namespace exclusions would affect the tenant's other apps).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
 }
 
 impl PlacementSpec {
@@ -1249,6 +1286,10 @@ pub struct CatalogAppSpec {
     /// succeed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub immutable_values: Vec<String>,
+    /// Flux CRD lifecycle for the chart's `crds/` directory (`runtime: helm` only); see
+    /// [`HelmCrdPolicy`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub crd_policy: Option<HelmCrdPolicy>,
 }
 
 /// Git-stored `keel.io/v1alpha1` `CatalogApplication` definition (`SDD.md` §5.1).
@@ -1357,16 +1398,34 @@ impl CatalogApplication {
         for hook in &self.spec.companion_infrastructure {
             validate_dns_label(&hook.blueprint, "companionInfrastructure.blueprint")?;
         }
+        if let Some(ns) = &self.spec.placement.namespace {
+            validate_dns_label(ns, "spec.placement.namespace")?;
+            if !self.spec.placement.requires_remote_cluster() {
+                return Err(CoreError::Validation(
+                    "spec.placement.namespace requires spec.placement.scope: cluster (management \
+                     cluster installs are confined to the tenant namespace)"
+                        .to_string(),
+                ));
+            }
+            if ns.starts_with("tenant-") {
+                return Err(CoreError::Validation(format!(
+                    "spec.placement.namespace '{ns}' must be a dedicated namespace, not a tenant \
+                     namespace"
+                )));
+            }
+        }
         if (!self.spec.gateway_routes.is_empty()
             || self.spec.network_policy.is_some()
             || self.spec.locked_values.is_some()
-            || !self.spec.immutable_values.is_empty())
+            || !self.spec.immutable_values.is_empty()
+            || self.spec.crd_policy.is_some())
             && self.metadata.runtime != AppRuntime::Helm
         {
             return Err(CoreError::Validation(
-                "spec.gatewayRoutes, spec.networkPolicy, spec.lockedValues and \
-                 spec.immutableValues are only supported for runtime: helm (manifest apps \
-                 declare their HTTPRoute/NetworkPolicy and fixed settings in the template)"
+                "spec.gatewayRoutes, spec.networkPolicy, spec.lockedValues, \
+                 spec.immutableValues and spec.crdPolicy are only supported for runtime: helm \
+                 (manifest apps declare their HTTPRoute/NetworkPolicy and fixed settings in the \
+                 template)"
                     .to_string(),
             ));
         }
@@ -1428,6 +1487,29 @@ impl CatalogApplication {
             )));
         }
         Ok(())
+    }
+
+    /// Resolves the remote install namespace of a proposal under `spec.placement.namespace`:
+    /// without a dedicated namespace the trimmed, non-empty `requested` namespace is returned
+    /// unchanged; with one, an absent/empty request resolves to it and any other namespace is
+    /// rejected.
+    pub fn resolve_target_namespace(
+        &self,
+        requested: Option<&str>,
+    ) -> Result<Option<String>, CoreError> {
+        let requested = requested.map(str::trim).filter(|s| !s.is_empty());
+        match (self.spec.placement.namespace.as_deref(), requested) {
+            (None, requested) => Ok(requested.map(str::to_string)),
+            (Some(dedicated), None) => Ok(Some(dedicated.to_string())),
+            (Some(dedicated), Some(requested)) if requested == dedicated => {
+                Ok(Some(dedicated.to_string()))
+            }
+            (Some(dedicated), Some(requested)) => Err(CoreError::Validation(format!(
+                "Catalog application '{}' installs into the dedicated namespace '{dedicated}' \
+                 (spec.placement.namespace); targetNamespace '{requested}' is not allowed",
+                self.metadata.id
+            ))),
+        }
     }
 
     /// Rejects a `scope: namespaced` `runtime: manifest` app whose manifests declare well-known
@@ -2640,6 +2722,7 @@ mod tests {
                 network_policy: None,
                 locked_values: None,
                 immutable_values: Vec::new(),
+                crd_policy: None,
             },
         };
         assert!(app.validate().is_ok());
@@ -2651,6 +2734,9 @@ mod tests {
         let mut manifest_immutable = app.clone();
         manifest_immutable.spec.immutable_values = vec!["persistence.size".to_string()];
         assert!(manifest_immutable.validate().is_err());
+        let mut manifest_crds = app.clone();
+        manifest_crds.spec.crd_policy = Some(HelmCrdPolicy::CreateReplace);
+        assert!(manifest_crds.validate().is_err());
         assert!(!app.strict_values());
 
         let mut helm_app = app;
@@ -2704,6 +2790,31 @@ mod tests {
         assert!(locked.strict_values());
         locked.spec.locked_values = Some(serde_json::json!(["not", "an", "object"]));
         assert!(locked.validate().is_err());
+
+        // `spec.crdPolicy` parses Flux's exact spelling only and is omitted when unset.
+        let mut crds = helm_app.clone();
+        crds.spec.crd_policy = Some(HelmCrdPolicy::CreateReplace);
+        assert!(crds.validate().is_ok());
+        let yaml = serde_yml::to_string(&crds).unwrap();
+        assert!(yaml.contains("crdPolicy: CreateReplace"), "{yaml}");
+        assert_eq!(
+            serde_yml::from_str::<CatalogApplication>(&yaml).unwrap(),
+            crds
+        );
+        assert!(
+            !serde_yml::to_string(&helm_app)
+                .unwrap()
+                .contains("crdPolicy")
+        );
+        for (policy, flux) in [
+            (HelmCrdPolicy::Skip, "Skip"),
+            (HelmCrdPolicy::Create, "Create"),
+            (HelmCrdPolicy::CreateReplace, "CreateReplace"),
+        ] {
+            assert_eq!(policy.as_str(), flux);
+            assert_eq!(policy.to_string(), flux);
+        }
+        assert!(serde_yml::from_str::<HelmCrdPolicy>("replace").is_err());
     }
 
     #[test]

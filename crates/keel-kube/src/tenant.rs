@@ -527,6 +527,10 @@ pub struct HelmReleaseSpecInput {
     /// `metadata.annotations` (e.g. `keel.io/route-hostnames`).
     #[serde(default)]
     pub annotations: BTreeMap<String, String>,
+    /// `spec.install.crds` / `spec.upgrade.crds` (catalog `spec.crdPolicy`); `None` keeps
+    /// Flux's defaults (`Create` on install, `Skip` on upgrade).
+    #[serde(default)]
+    pub crds: Option<keel_core::HelmCrdPolicy>,
 }
 
 /// `HelmRelease` annotation listing (comma-separated) the Gateway route hostnames a Helm catalog
@@ -556,6 +560,7 @@ impl HelmReleaseSpecInput {
             depends_on: Vec::new(),
             extra_labels: BTreeMap::new(),
             annotations: BTreeMap::new(),
+            crds: None,
         }
     }
 
@@ -672,6 +677,14 @@ pub fn synthesize_helm_release(input: &HelmReleaseSpecInput) -> Result<Value, Ku
             Value::String(target_ns.clone()),
         );
         spec.insert("install".to_string(), json!({ "createNamespace": true }));
+    }
+
+    if let Some(policy) = input.crds {
+        let install = spec
+            .entry("install".to_string())
+            .or_insert_with(|| json!({}));
+        install["crds"] = Value::String(policy.as_str().to_string());
+        spec.insert("upgrade".to_string(), json!({ "crds": policy.as_str() }));
     }
 
     if let Some(values) = &input.values {
@@ -2393,6 +2406,40 @@ mod tests {
             hr["metadata"]["annotations"][ROUTE_HOSTNAMES_ANNOTATION],
             "git.acme.example"
         );
+    }
+
+    #[test]
+    fn helm_release_crd_policy_sets_install_and_upgrade_crds() {
+        let mut input = HelmReleaseSpecInput::new(
+            "acme",
+            "pko",
+            "pulumi-kubernetes-operator",
+            HelmChartSourceRef {
+                kind: HelmChartSourceKind::HelmRepository,
+                name: "pko-repo".to_string(),
+                namespace: None,
+            },
+        );
+        // Unset: Flux defaults (no `install`/`upgrade` blocks on a local release).
+        let hr = synthesize_helm_release(&input).unwrap();
+        assert!(hr["spec"].get("install").is_none());
+        assert!(hr["spec"].get("upgrade").is_none());
+
+        input.crds = Some(keel_core::HelmCrdPolicy::CreateReplace);
+        let hr = synthesize_helm_release(&input).unwrap();
+        assert_eq!(hr["spec"]["install"], json!({ "crds": "CreateReplace" }));
+        assert_eq!(hr["spec"]["upgrade"], json!({ "crds": "CreateReplace" }));
+
+        // Remote targets keep `createNamespace` next to the CRD policy.
+        input.kube_config = Some(RemoteKubeConfigRef::with_key("workload", "kubeconfig"));
+        input.target_namespace = Some("pulumi-system".to_string());
+        let hr = synthesize_helm_release(&input).unwrap();
+        assert_eq!(
+            hr["spec"]["install"],
+            json!({ "createNamespace": true, "crds": "CreateReplace" })
+        );
+        assert_eq!(hr["spec"]["upgrade"]["crds"], "CreateReplace");
+        assert_eq!(hr["spec"]["targetNamespace"], "pulumi-system");
     }
 
     #[test]

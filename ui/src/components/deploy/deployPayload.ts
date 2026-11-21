@@ -25,6 +25,18 @@ export function requiresRemoteCluster(
   return item?.type === "app" && item.placementScope === "cluster"
 }
 
+/**
+ * Dedicated install namespace of a cluster-scoped app (`spec.placement.namespace`), which the
+ * server enforces for remote installs; `undefined` when the user picks the namespace.
+ */
+export function dedicatedNamespace(
+  item: CatalogItem | null | undefined
+): string | undefined {
+  return requiresRemoteCluster(item) && item?.placementNamespace
+    ? item.placementNamespace
+    : undefined
+}
+
 /** Remote kubeconfig Secret selected for an app, or `undefined` for the management cluster. */
 export function resolveTargetCluster(
   item: CatalogItem,
@@ -59,7 +71,9 @@ export function buildDeployProposalPayload(
   const resolvedTargetCluster = resolveTargetCluster(item, target)
   const name = target.instanceName.trim()
   const version = target.chartVersion.trim()
-  const targetNs = resolvedTargetCluster ? target.targetNamespace.trim() : ""
+  const targetNs = resolvedTargetCluster
+    ? (dedicatedNamespace(item) ?? target.targetNamespace.trim())
+    : ""
   const isCustomName = Boolean(name) && name !== item.id
   return {
     catalogId: item.id,

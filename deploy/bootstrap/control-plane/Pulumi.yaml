@@ -125,6 +125,7 @@ resources:
       chart: oci://ghcr.io/fluxcd-community/charts/flux2
       # Pinned: latest stable flux2 community chart (Flux v2.x controllers) at time of pinning,
       # confirmed via `helm show chart oci://ghcr.io/fluxcd-community/charts/flux2`. Renovate bumps it.
+      # renovate: datasource=docker depName=ghcr.io/fluxcd-community/charts/flux2
       version: "2.20.0"
       namespace: flux-system
       createNamespace: true
@@ -177,6 +178,7 @@ resources:
     properties:
       name: kyverno
       chart: kyverno
+      # renovate: datasource=helm depName=kyverno registryUrl=https://kyverno.github.io/kyverno/
       version: "3.10.0"
       repositoryOpts:
         repo: https://kyverno.github.io/kyverno/
@@ -225,6 +227,7 @@ resources:
       name: pulumi-kubernetes-operator
       chart: oci://ghcr.io/pulumi/helm-charts/pulumi-kubernetes-operator
       # Pinned; must match deploy/seed/core-addons/pko.yaml (Flux adopts this release).
+      # renovate: datasource=docker depName=ghcr.io/pulumi/helm-charts/pulumi-kubernetes-operator
       version: "2.10.1"
       namespace: keel-system
       createNamespace: true

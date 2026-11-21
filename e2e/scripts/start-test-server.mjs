@@ -266,7 +266,14 @@ async function main() {
   const rauthyCatalogDir = path.join(workDir, 'catalog', 'core', 'rauthy');
   const certManagerCatalogDir = path.join(workDir, 'catalog', 'apps', 'cert-manager');
   // Self-service Helm twins of management-plane base add-ons (built-in catalog entries).
-  const selfServiceHelmApps = ['forgejo', 'seaweedfs'];
+  const selfServiceHelmApps = [
+    'forgejo',
+    'seaweedfs',
+    // Workload-cluster twins of the management operators (`scope: cluster`).
+    'kyverno',
+    'pulumi-kubernetes-operator',
+    'flux2',
+  ];
   const coreAddonsDir = path.join(workDir, 'clusters', 'management', 'core-addons');
   const tenantAcmeInfra = path.join(workDir, 'tenants', 'acme', 'infra', 'net');
 

@@ -524,11 +524,13 @@ pub async fn register_catalog_app(
                     default_engine: parsed_default_engine,
                     placement: PlacementSpec {
                         scope: req.placement_scope.unwrap_or_default(),
+                        namespace: None,
                     },
                     gateway_routes: Vec::new(),
                     network_policy: None,
                     locked_values: None,
                     immutable_values: Vec::new(),
+                    crd_policy: None,
                 },
             };
             application.validate()?;
@@ -916,7 +918,8 @@ pub async fn register_catalog_app(
 }
 
 /// Rejects a bundle `kind: app` item that references a `spec.placement.scope: cluster` app without
-/// `targetClusterFrom`. GUI bundle deploys never send a request `targetCluster`, so such an item
+/// `targetClusterFrom`, or that sets a `targetNamespace` other than the app's dedicated
+/// `spec.placement.namespace`. GUI bundle deploys never send a request `targetCluster`, so such an item
 /// could only ever be proposed onto the management cluster, which `POST /api/v1/proposals` rejects.
 fn ensure_bundle_item_placement(
     item: &CatalogBundleItem,
@@ -932,6 +935,9 @@ fn ensure_bundle_item_placement(
             item.id, app.metadata.id
         )));
     }
+    // A bundle item cannot move an app out of its dedicated `spec.placement.namespace`.
+    app.resolve_target_namespace(item.target_namespace.as_deref())
+        .map_err(|e| ServerError::BadRequest(format!("Bundle item '{}': {e}", item.id)))?;
     Ok(())
 }
 

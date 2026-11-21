@@ -11,6 +11,7 @@ spec:
   upstream:
     chart: oci://ghcr.io/pulumi/helm-charts/pulumi-kubernetes-operator
     repoURL: oci://ghcr.io/pulumi/helm-charts/pulumi-kubernetes-operator
+    # renovate: datasource=docker depName=ghcr.io/pulumi/helm-charts/pulumi-kubernetes-operator
     version: "2.10.1"
   progressiveDelivery:
     flaggerSupported: false

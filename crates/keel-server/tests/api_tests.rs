@@ -8330,3 +8330,370 @@ spec:
             .contains(&"acme/bundles/storage-stack/s3/config-kustomization.yaml".to_string())
     );
 }
+
+const KYVERNO_APP_CATALOG: &str = include_str!("../../../deploy/catalog/apps/kyverno/catalog.yaml");
+const PKO_APP_CATALOG: &str =
+    include_str!("../../../deploy/catalog/apps/pulumi-kubernetes-operator/catalog.yaml");
+const FLUX2_APP_CATALOG: &str = include_str!("../../../deploy/catalog/apps/flux2/catalog.yaml");
+
+/// Render test for the workload-cluster twins of the management operators (Kyverno, PKO, Flux):
+/// `scope: cluster` (400 on the management cluster), the upstream chart at the catalog/core
+/// version from a tenant-scoped (OCI where needed) HelmRepository, the remote `kubeConfig` and
+/// dedicated target namespace (`spec.placement.namespace`: the default when omitted, any other
+/// namespace rejected), the locked seed values merged, the chart's CRD policy, no NetworkPolicy
+/// (remote), and strict values (undeclared chart values rejected, HEAD unchanged).
+#[tokio::test]
+async fn test_workload_operator_catalog_apps_render_remote_helm_releases() {
+    let fixture = setup_fixture().await;
+    let cookie = login_and_get_cookie(&fixture).await;
+    let workdir = fixture.state.repo_workdir.clone();
+    let git = &fixture.state.git_runner;
+
+    struct Case {
+        id: &'static str,
+        raw: &'static str,
+        core: &'static str,
+        target_ns: &'static str,
+        values: Value,
+        undeclared: Value,
+        repo_url: &'static str,
+        oci: bool,
+        crds: Option<&'static str>,
+    }
+    let cases = [
+        Case {
+            id: "kyverno",
+            raw: KYVERNO_APP_CATALOG,
+            core: include_str!("../../../deploy/catalog/core/kyverno/catalog.yaml"),
+            target_ns: "kyverno",
+            values: json!({
+                "admissionController": { "replicas": 3 },
+                "features": { "policyExceptions": { "enabled": true } }
+            }),
+            // A webhook bypass knob outside the form.
+            undeclared: json!({ "config": { "webhooks": { "namespaceSelector": {} } } }),
+            repo_url: "https://kyverno.github.io/kyverno/",
+            oci: false,
+            crds: Some("CreateReplace"),
+        },
+        Case {
+            id: "pulumi-kubernetes-operator",
+            raw: PKO_APP_CATALOG,
+            core: include_str!(
+                "../../../deploy/catalog/core/pulumi-kubernetes-operator/catalog.yaml"
+            ),
+            target_ns: "pulumi-kubernetes-operator",
+            values: json!({ "replicaCount": 1, "controller": { "logLevel": "debug" } }),
+            undeclared: json!({ "extraSidecars": [{ "name": "x", "image": "busybox" }] }),
+            repo_url: "oci://ghcr.io/pulumi/helm-charts",
+            oci: true,
+            crds: Some("CreateReplace"),
+        },
+        Case {
+            id: "flux2",
+            raw: FLUX2_APP_CATALOG,
+            core: include_str!("../../../deploy/catalog/core/flux2/catalog.yaml"),
+            target_ns: "flux-system",
+            values: json!({ "multitenancy": { "enabled": true }, "logLevel": "info" }),
+            undeclared: json!({
+                "multitenancy": { "enabled": true },
+                "extraObjects": [{ "kind": "ClusterRoleBinding" }]
+            }),
+            repo_url: "oci://ghcr.io/fluxcd-community/charts",
+            oci: true,
+            crds: None,
+        },
+    ];
+
+    for case in cases {
+        let id = case.id;
+        seed_builtin_helm_catalog(&fixture, id, case.raw).await;
+        let core = keel_core::parse_catalog_application(case.core).unwrap();
+
+        // Cluster-wide CRDs/RBAC/webhooks: never into a management-cluster tenant namespace.
+        let (status, body) = post_proposal(
+            &fixture,
+            &cookie,
+            json!({ "tenant": "acme", "catalogId": id, "name": id, "values": case.values }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{id}: {body}");
+
+        // Values outside the schema are rejected before anything is committed.
+        let head_before = git.rev_parse(&workdir, "HEAD").await.unwrap();
+        let (status, body) = post_proposal(
+            &fixture,
+            &cookie,
+            json!({ "tenant": "acme", "catalogId": id, "name": id,
+                    "targetCluster": "workload-kubeconfig", "targetNamespace": case.target_ns,
+                    "values": case.undeclared }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{id}: {body}");
+        assert!(body.contains("not declared"), "{id}: {body}");
+        assert_eq!(
+            git.rev_parse(&workdir, "HEAD").await.unwrap(),
+            head_before,
+            "{id}"
+        );
+
+        // The operator only installs into its dedicated namespace: never the tenant's shared
+        // namespace (chart NetworkPolicies, Kyverno's own-namespace exclusion) or another one.
+        for other in ["tenant-acme", "apps"] {
+            let (status, body) = post_proposal(
+                &fixture,
+                &cookie,
+                json!({ "tenant": "acme", "catalogId": id, "name": id,
+                        "targetCluster": "workload-kubeconfig", "targetNamespace": other,
+                        "values": case.values }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{id}/{other}: {body}");
+            assert!(body.contains("spec.placement.namespace"), "{id}: {body}");
+        }
+        assert_eq!(
+            git.rev_parse(&workdir, "HEAD").await.unwrap(),
+            head_before,
+            "{id}"
+        );
+
+        // No targetNamespace: the dedicated namespace is the default.
+        let (status, body) = post_proposal(
+            &fixture,
+            &cookie,
+            json!({ "tenant": "acme", "catalogId": id, "name": id,
+                    "targetCluster": "workload-kubeconfig", "values": case.values }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{id}: {body}");
+        checkout_proposal_branch(&fixture, &body).await;
+        let dir = workdir.join(format!("tenants/acme/apps/{id}"));
+
+        let repo = read_yaml(&dir.join("helm-repository.yaml"));
+        assert_eq!(repo["metadata"]["namespace"], "tenant-acme", "{id}");
+        assert_eq!(repo["spec"]["url"], case.repo_url, "{id}");
+        assert_eq!(
+            repo["spec"].get("type").and_then(Value::as_str),
+            case.oci.then_some("oci"),
+            "{id}"
+        );
+
+        let hr = read_yaml(&dir.join("helmrelease.yaml"));
+        let chart = &hr["spec"]["chart"]["spec"];
+        assert_eq!(
+            chart["chart"],
+            json!(
+                core.spec
+                    .upstream
+                    .chart
+                    .as_deref()
+                    .unwrap()
+                    .rsplit('/')
+                    .next()
+            ),
+            "{id}"
+        );
+        assert_eq!(
+            chart["version"],
+            json!(core.spec.upstream.version.as_deref().unwrap()),
+            "{id}: catalog/core version"
+        );
+        assert_eq!(chart["sourceRef"]["namespace"], "tenant-acme", "{id}");
+        assert_eq!(
+            hr["spec"]["kubeConfig"]["secretRef"]["name"], "workload-kubeconfig",
+            "{id}"
+        );
+        assert_eq!(hr["spec"]["targetNamespace"], case.target_ns, "{id}");
+        assert_eq!(hr["spec"]["install"]["createNamespace"], true, "{id}");
+        assert_eq!(
+            hr["spec"]["install"].get("crds").and_then(Value::as_str),
+            case.crds,
+            "{id}"
+        );
+        assert_eq!(
+            hr["spec"]
+                .get("upgrade")
+                .and_then(|u| u.get("crds"))
+                .and_then(Value::as_str),
+            case.crds,
+            "{id}"
+        );
+        // Remote installs get no Keel NetworkPolicy and no secrets.
+        assert!(!dir.join("networkpolicy.yaml").exists(), "{id}");
+        assert!(hr["spec"].get("valuesFrom").is_none(), "{id}");
+
+        let values = &hr["spec"]["values"];
+        let locked: Value =
+            serde_yml::from_str::<Value>(case.raw).unwrap()["spec"]["lockedValues"].clone();
+        fn contains(haystack: &Value, needle: &Value) -> bool {
+            match (haystack, needle) {
+                (Value::Object(h), Value::Object(n)) => n
+                    .iter()
+                    .all(|(k, v)| h.get(k).is_some_and(|hv| contains(hv, v))),
+                _ => haystack == needle,
+            }
+        }
+        assert!(contains(values, &locked), "{id}: locked values not merged");
+        assert!(contains(values, &case.values), "{id}: form values lost");
+        // values.yaml keeps only the form values.
+        let form = read_yaml(&dir.join("values.yaml"));
+        assert_eq!(form, case.values, "{id}");
+
+        match id {
+            "kyverno" => {
+                assert_eq!(
+                    values["crds"]["groups"]["kyverno"]["clusterpolicies"],
+                    false
+                );
+                assert_eq!(values["admissionController"]["replicas"], 3);
+                // Exceptions only from the dedicated install namespace (never empty or `*`).
+                assert_eq!(
+                    values["features"]["policyExceptions"],
+                    json!({ "enabled": true, "namespace": "kyverno" })
+                );
+            }
+            "pulumi-kubernetes-operator" => {
+                assert_eq!(
+                    values["securityContext"]["capabilities"]["drop"],
+                    json!(["ALL"])
+                );
+                assert_eq!(values["podSecurityContext"]["runAsNonRoot"], true);
+            }
+            "flux2" => {
+                assert_eq!(values["multitenancy"]["enabled"], true);
+                assert_eq!(values["multitenancy"]["defaultServiceAccount"], "default");
+                assert_eq!(
+                    values["crds"]["annotations"]["helm.sh/resource-policy"],
+                    "keep"
+                );
+            }
+            _ => unreachable!(),
+        }
+
+        git.checkout_branch(&workdir, "main").await.unwrap();
+    }
+
+    let remote = |values: Value| {
+        json!({ "tenant": "acme", "catalogId": "flux2", "name": "flux-gitops",
+                "targetCluster": "workload-kubeconfig", "values": values })
+    };
+    let head_before = git.rev_parse(&workdir, "HEAD").await.unwrap();
+    // Keel applies no schema defaults server-side, so an API/CLI request without the Flux
+    // lockdown switch fails schema validation (422) instead of getting the chart default (lockdown off) next to
+    // the locked cluster-admin `privileged: true`.
+    for values in [
+        json!({}),
+        json!({ "logLevel": "info" }),
+        json!({ "multitenancy": {} }),
+    ] {
+        let (status, body) = post_proposal(&fixture, &cookie, remote(values.clone())).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{values}: {body}");
+        assert!(body.contains("is a required property"), "{body}");
+    }
+    // Kyverno's PolicyException namespace is locked: neither `*`, nor empty, nor another one.
+    for namespace in ["*", "", "kyverno"] {
+        let (status, body) = post_proposal(
+            &fixture,
+            &cookie,
+            json!({ "tenant": "acme", "catalogId": "kyverno", "name": "kyverno-x",
+                    "targetCluster": "workload-kubeconfig",
+                    "values": { "features": { "policyExceptions": {
+                        "enabled": true, "namespace": namespace } } } }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{namespace:?}: {body}");
+        assert!(body.contains("not declared"), "{body}");
+    }
+    assert_eq!(git.rev_parse(&workdir, "HEAD").await.unwrap(), head_before);
+
+    // An explicit opt-out is honoured (single-team clusters).
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        remote(json!({ "multitenancy": { "enabled": false } })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    checkout_proposal_branch(&fixture, &body).await;
+    let hr = read_yaml(&workdir.join("tenants/acme/apps/flux-gitops/helmrelease.yaml"));
+    assert_eq!(hr["spec"]["values"]["multitenancy"]["enabled"], false);
+    assert_eq!(hr["spec"]["targetNamespace"], "flux-system");
+    git.checkout_branch(&workdir, "main").await.unwrap();
+
+    // Bundle items get the same dedicated namespace: register/update and proposals reject
+    // another one, and an item without targetNamespace installs into it.
+    let (status, body) = send_text(
+        &fixture,
+        &cookie,
+        Method::POST,
+        "/api/v1/catalog",
+        json!({
+            "kind": "bundle",
+            "id": "vm-gitops",
+            "name": "VM + GitOps",
+            "category": "platform",
+            "items": [
+                { "id": "vm", "kind": "infra", "catalogRef": "proxmox-vm" },
+                {
+                    "id": "flux",
+                    "kind": "app",
+                    "catalogRef": "flux2",
+                    "dependsOn": ["vm"],
+                    "targetClusterFrom": "vm",
+                    "targetNamespace": "tenant-acme"
+                }
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("spec.placement.namespace"), "{body}");
+    let bundle = |item_ns: &str| {
+        format!(
+            r#"apiVersion: keel.io/v1alpha1
+kind: CatalogBundle
+metadata:
+  id: gitops-stack
+  name: GitOps Stack
+  category: platform
+spec:
+  items:
+    - id: flux
+      kind: app
+      catalogRef: flux2
+{item_ns}  schema:
+    type: object
+"#
+        )
+    };
+    commit_to_main(
+        &fixture,
+        &[(
+            "catalog/bundles/gitops-stack/catalog.yaml",
+            &bundle("      targetNamespace: tenant-acme\n"),
+        )],
+        "feat(catalog): gitops-stack bundle (wrong namespace)",
+    )
+    .await;
+    let flux_values = json!({ "flux": { "multitenancy": { "enabled": true } } });
+    let bundle_req = json!({ "tenant": "acme", "catalogId": "gitops-stack", "kind": "bundle",
+                             "targetCluster": "workload-kubeconfig", "values": flux_values });
+    let (status, body) = post_proposal(&fixture, &cookie, bundle_req.clone()).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("Bundle item 'flux'"), "{body}");
+    assert!(body.contains("spec.placement.namespace"), "{body}");
+
+    commit_to_main(
+        &fixture,
+        &[("catalog/bundles/gitops-stack/catalog.yaml", &bundle(""))],
+        "feat(catalog): gitops-stack bundle",
+    )
+    .await;
+    let (status, body) = post_proposal(&fixture, &cookie, bundle_req).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    checkout_proposal_branch(&fixture, &body).await;
+    let hr = read_yaml(&workdir.join("tenants/acme/bundles/gitops-stack/flux/helmrelease.yaml"));
+    assert_eq!(hr["spec"]["targetNamespace"], "flux-system");
+    assert_eq!(hr["spec"]["values"]["multitenancy"]["enabled"], true);
+    git.checkout_branch(&workdir, "main").await.unwrap();
+}

@@ -8,6 +8,7 @@ import { CatalogItem, StackSummary, TenantSummary } from "@/types/api"
 import {
   CUSTOM_CLUSTER,
   DeployTargetState,
+  dedicatedNamespace,
   requiresRemoteCluster,
 } from "./deployPayload"
 
@@ -33,6 +34,7 @@ export const InstanceTargetFields: React.FC<InstanceTargetFieldsProps> = ({
 }) => {
   const isApp = !isManagementAddon && item.type === "app"
   const clusterScoped = isApp && requiresRemoteCluster(item)
+  const fixedNamespace = isApp ? dedicatedNamespace(item) : undefined
   return (
     <div
       className={`grid grid-cols-1 gap-3 ${isApp ? "sm:grid-cols-2" : "sm:grid-cols-1"}`}
@@ -159,18 +161,23 @@ export const InstanceTargetFields: React.FC<InstanceTargetFieldsProps> = ({
             <Label htmlFor="target-namespace-input">Target Namespace</Label>
             <Input
               id="target-namespace-input"
-              value={state.targetCluster ? state.targetNamespace : ""}
+              value={
+                fixedNamespace ??
+                (state.targetCluster ? state.targetNamespace : "")
+              }
               onChange={(e) => onChange({ targetNamespace: e.target.value })}
-              disabled={!state.targetCluster}
+              disabled={!state.targetCluster || Boolean(fixedNamespace)}
               placeholder={
                 state.targetCluster
                   ? "e.g. apps-prod (optional)"
                   : `tenant-${state.tenant} (local)`
               }
               title={
-                state.targetCluster
-                  ? "Destination namespace on the remote workload cluster"
-                  : "Management cluster apps are isolated to the tenant namespace; select a remote Target Cluster to override"
+                fixedNamespace
+                  ? `${item.name} always installs into its dedicated ${fixedNamespace} namespace`
+                  : state.targetCluster
+                    ? "Destination namespace on the remote workload cluster"
+                    : "Management cluster apps are isolated to the tenant namespace; select a remote Target Cluster to override"
               }
             />
           </div>

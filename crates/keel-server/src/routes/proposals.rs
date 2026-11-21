@@ -1555,7 +1555,7 @@ async fn tenant_sops_recipients(state: &AppState, tenant: &str) -> Result<String
 pub async fn create_proposal(
     auth: AuthSession,
     State(state): State<AppState>,
-    Json(req): Json<CreateProposalRequest>,
+    Json(mut req): Json<CreateProposalRequest>,
 ) -> Result<(StatusCode, Json<CreateProposalResponse>), ServerError> {
     validate_dns_label(&req.tenant, "tenant")?;
     if req.tenant == crate::state::MANAGEMENT_TENANT {
@@ -1599,6 +1599,11 @@ pub async fn create_proposal(
     let (schema, action_label, is_app, manifest_engine) = match &manifest {
         CatalogManifest::Application(app) => {
             app.ensure_placement_allows(remote_target_cluster(req.target_cluster.as_deref()))
+                .map_err(|e| ServerError::BadRequest(e.to_string()))?;
+            // `spec.placement.namespace`: default an omitted targetNamespace to the app's
+            // dedicated namespace and reject any other one (never the shared `tenant-<id>`).
+            req.target_namespace = app
+                .resolve_target_namespace(req.target_namespace.as_deref())
                 .map_err(|e| ServerError::BadRequest(e.to_string()))?;
             if req.canary && !app.spec.progressive_delivery.flagger_supported {
                 return Err(ServerError::BadRequest(format!(
@@ -2053,6 +2058,7 @@ pub async fn create_proposal(
                 .filter(|s| !s.is_empty())
                 .map(ToString::to_string)
                 .or_else(|| app.spec.upstream.version.clone());
+            hr_input.crds = app.spec.crd_policy;
             if let Some(target) = remote_target_cluster(req.target_cluster.as_deref()) {
                 hr_input.kube_config = Some(RemoteKubeConfigRef::with_key(target, "kubeconfig"));
             }
@@ -3129,7 +3135,13 @@ async fn create_bundle_proposal(
                         item.id, app.metadata.id
                     )));
                 }
-                if let Some(target_ns) = &item.target_namespace
+                // `spec.placement.namespace` defaults/pins the item's remote namespace.
+                let item_target_namespace = app
+                    .resolve_target_namespace(item.target_namespace.as_deref())
+                    .map_err(|e| {
+                        ServerError::BadRequest(format!("Bundle item '{}': {e}", item.id))
+                    })?;
+                if let Some(target_ns) = &item_target_namespace
                     && item_kube_config.is_none()
                     && target_ns != &tenant_ns
                 {
@@ -3195,7 +3207,7 @@ async fn create_bundle_proposal(
                         normal_values: &partitioned.normal_values,
                         encrypted_secret_yaml: encrypted_secret.as_deref(),
                         kube_config: item_kube_config,
-                        target_namespace: item.target_namespace.clone(),
+                        target_namespace: item_target_namespace.clone(),
                         depends_on: item
                             .depends_on
                             .iter()
@@ -3236,7 +3248,7 @@ async fn create_bundle_proposal(
                             partitioned: &partitioned,
                             stored_secret: stored_item_secrets.get(&item.id),
                             remote: item_kube_config.is_some(),
-                            target_namespace: item.target_namespace.as_deref(),
+                            target_namespace: item_target_namespace.as_deref(),
                             extra_labels: bundle_labels.clone(),
                         },
                     )
@@ -3256,9 +3268,10 @@ async fn create_bundle_proposal(
                         },
                     );
                     hr_input.chart_version = app.spec.upstream.version.clone();
+                    hr_input.crds = app.spec.crd_policy;
                     hr_input.extra_labels = bundle_labels.clone();
                     hr_input.kube_config = item_kube_config;
-                    hr_input.target_namespace = item.target_namespace.clone();
+                    hr_input.target_namespace = item_target_namespace.clone();
 
                     for dep in &item.depends_on {
                         if item_kinds.get(dep.as_str()) == Some(&BundleItemKind::App) {

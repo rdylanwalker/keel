@@ -76,6 +76,11 @@ export interface CatalogItem {
   defaultEngine?: "flux" | "pulumi"
   /** Absent means `namespaced`. */
   placementScope?: PlacementScope
+  /**
+   * `spec.placement.namespace`: dedicated install namespace on the remote workload cluster
+   * (`cluster` apps only); the server rejects any other `targetNamespace`.
+   */
+  placementNamespace?: string
   flaggerSupported?: boolean
   defaultCanary?: boolean
   pulumiRuntime?: "yaml" | "hcl" | "opentofu-bridge"

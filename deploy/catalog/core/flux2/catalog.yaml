@@ -15,6 +15,7 @@ spec:
   upstream:
     chart: oci://ghcr.io/fluxcd-community/charts/flux2
     repoURL: oci://ghcr.io/fluxcd-community/charts/flux2
+    # renovate: datasource=docker depName=ghcr.io/fluxcd-community/charts/flux2
     version: "2.20.0"
   progressiveDelivery:
     flaggerSupported: false

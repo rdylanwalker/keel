@@ -779,6 +779,18 @@ const STARTER_FORGEJO_APP_YAML: &str =
 /// backend ([`CORE_CATALOG_S3_STATE_BACKEND_YAML`]); both pin the same chart version.
 const STARTER_SEAWEEDFS_APP_YAML: &str =
     include_str!("../../../../deploy/catalog/apps/seaweedfs/catalog.yaml");
+/// Self-service workload-cluster Kyverno (`runtime: helm`, `scope: cluster`), twin of Keel's own
+/// admission controller ([`CORE_CATALOG_KYVERNO_YAML`]); both pin the same chart version.
+const STARTER_KYVERNO_APP_YAML: &str =
+    include_str!("../../../../deploy/catalog/apps/kyverno/catalog.yaml");
+/// Self-service workload-cluster PKO v2 (`runtime: helm`, `scope: cluster`), twin of Keel's own
+/// operator ([`CORE_CATALOG_PKO_YAML`]); both pin the same chart version.
+const STARTER_PKO_APP_YAML: &str =
+    include_str!("../../../../deploy/catalog/apps/pulumi-kubernetes-operator/catalog.yaml");
+/// Self-service workload-cluster Flux (`runtime: helm`, `scope: cluster`), twin of Keel's own
+/// Flux ([`CORE_CATALOG_FLUX2_YAML`]); both pin the same chart version.
+const STARTER_FLUX2_APP_YAML: &str =
+    include_str!("../../../../deploy/catalog/apps/flux2/catalog.yaml");
 const CORE_CATALOG_ENVOY_GATEWAY_YAML: &str =
     include_str!("../../../../deploy/catalog/core/envoy-gateway/catalog.yaml");
 const CORE_CATALOG_PROMETHEUS_YAML: &str =
@@ -1501,6 +1513,20 @@ async fn initialize_seed_git_repo_with_push(
             "catalog/apps/seaweedfs/catalog.yaml".to_string(),
             STARTER_SEAWEEDFS_APP_YAML.to_string(),
         ));
+        // Workload-cluster twins of the management operators (`scope: cluster`).
+        for (path, contents) in [
+            (
+                "catalog/apps/kyverno/catalog.yaml",
+                STARTER_KYVERNO_APP_YAML,
+            ),
+            (
+                "catalog/apps/pulumi-kubernetes-operator/catalog.yaml",
+                STARTER_PKO_APP_YAML,
+            ),
+            ("catalog/apps/flux2/catalog.yaml", STARTER_FLUX2_APP_YAML),
+        ] {
+            files_to_write.push((path.to_string(), contents.to_string()));
+        }
     }
 
     let mut written_files = Vec::with_capacity(files_to_write.len());
@@ -3488,8 +3514,8 @@ mod security_hardening_tests {
                 .unwrap(),
             STARTER_RAUTHY_APP_MANIFESTS_YAML
         );
-        // Self-service tenant Forgejo and SeaweedFS (Helm) are seeded with or without
-        // `--with-forge` (they are independent of the management-plane forge/state backend).
+        // Self-service Forgejo, SeaweedFS and the workload-cluster operator twins (Helm) are
+        // seeded with or without `--with-forge` (independent of the management-plane add-ons).
         for (path, contents) in [
             (
                 "catalog/apps/forgejo/catalog.yaml",
@@ -3499,6 +3525,15 @@ mod security_hardening_tests {
                 "catalog/apps/seaweedfs/catalog.yaml",
                 STARTER_SEAWEEDFS_APP_YAML,
             ),
+            (
+                "catalog/apps/kyverno/catalog.yaml",
+                STARTER_KYVERNO_APP_YAML,
+            ),
+            (
+                "catalog/apps/pulumi-kubernetes-operator/catalog.yaml",
+                STARTER_PKO_APP_YAML,
+            ),
+            ("catalog/apps/flux2/catalog.yaml", STARTER_FLUX2_APP_YAML),
         ] {
             assert!(
                 res.written_files.iter().any(|p| p == path),
@@ -4288,5 +4323,313 @@ mod tenant_helm_app_tests {
         let admin = &schema["s3"]["properties"]["credentials"]["properties"]["admin"]["properties"];
         assert_eq!(admin["accessKey"]["format"], "password");
         assert_eq!(admin["secretKey"]["format"], "password");
+    }
+}
+
+/// Self-service workload-cluster twins of the management operators
+/// (`deploy/catalog/apps/{kyverno,pulumi-kubernetes-operator,flux2}`).
+#[cfg(test)]
+mod workload_operator_app_tests {
+    use super::*;
+
+    use serde_json::Value;
+
+    fn yaml(raw: &str) -> Value {
+        serde_yml::from_str(raw).unwrap()
+    }
+
+    /// The values an untouched form submits (`default` of every leaf).
+    fn schema_defaults(schema: &Value) -> Value {
+        let mut out = serde_json::Map::new();
+        if let Some(props) = schema["properties"].as_object() {
+            for (key, node) in props {
+                if node["type"] == "object" {
+                    let nested = schema_defaults(node);
+                    if nested.as_object().is_some_and(|o| !o.is_empty()) {
+                        out.insert(key.clone(), nested);
+                    }
+                } else if let Some(default) = node.get("default") {
+                    out.insert(key.clone(), default.clone());
+                }
+            }
+        }
+        Value::Object(out)
+    }
+
+    fn seed_helm_release(raw: &str) -> Value {
+        raw.split("\n---\n")
+            .map(yaml)
+            .find(|d| d["kind"] == "HelmRelease")
+            .expect("seed HelmRelease")
+    }
+
+    /// `(app id, catalog/apps, catalog/core, seed core-addon, Stage 0 Pulumi resource)`.
+    fn operator_twins() -> [(
+        &'static str,
+        &'static str,
+        &'static str,
+        &'static str,
+        &'static str,
+    ); 3] {
+        [
+            (
+                "kyverno",
+                STARTER_KYVERNO_APP_YAML,
+                CORE_CATALOG_KYVERNO_YAML,
+                SEED_CORE_ADDON_KYVERNO_YAML,
+                "kyverno",
+            ),
+            (
+                "pulumi-kubernetes-operator",
+                STARTER_PKO_APP_YAML,
+                CORE_CATALOG_PKO_YAML,
+                SEED_CORE_ADDON_PKO_YAML,
+                "pulumiKubernetesOperator",
+            ),
+            (
+                "flux2",
+                STARTER_FLUX2_APP_YAML,
+                CORE_CATALOG_FLUX2_YAML,
+                SEED_CORE_ADDON_FLUX2_YAML,
+                "flux2",
+            ),
+        ]
+    }
+
+    /// Number of `version: "<version>"` lines directly preceded by the Renovate annotation of
+    /// `dep_name` (the `renovate.json` custom regex manager bumps exactly those lines).
+    fn renovate_annotated_versions(raw: &str, dep_name: &str, version: &str) -> usize {
+        let lines: Vec<&str> = raw.lines().map(str::trim).collect();
+        lines
+            .windows(2)
+            .filter(|pair| {
+                pair[0].starts_with("# renovate: datasource=")
+                    && pair[0]
+                        .split_whitespace()
+                        .any(|f| f == format!("depName={dep_name}"))
+                    && pair[1] == format!("version: \"{version}\"")
+            })
+            .count()
+    }
+
+    /// Renovate bumps all four pins of each operator chart in one PR (`renovate.json`): every
+    /// pin carries the annotation, so a bump can never update only some of them.
+    #[test]
+    fn workload_operator_chart_pins_are_renovate_annotated() {
+        let renovate: Value =
+            serde_json::from_str(include_str!("../../../../renovate.json")).unwrap();
+        for (id, app_raw, core_raw, seed_raw, _) in operator_twins() {
+            let app = keel_core::parse_catalog_application(app_raw).unwrap();
+            let version = app.spec.upstream.version.clone().unwrap();
+            let repo = app.spec.upstream.repo_url.trim_end_matches('/');
+            let chart = app.spec.upstream.chart.clone().unwrap();
+            let dep_name = match repo.strip_prefix("oci://") {
+                Some(registry) => format!("{registry}/{chart}"),
+                None => chart,
+            };
+            for (file, raw) in [
+                ("catalog/apps", app_raw),
+                ("catalog/core", core_raw),
+                ("seed core-addon", seed_raw),
+            ] {
+                assert_eq!(
+                    renovate_annotated_versions(raw, &dep_name, &version),
+                    1,
+                    "{id}: {file} version pin lacks the Renovate annotation"
+                );
+            }
+            assert_eq!(
+                renovate_annotated_versions(state::CONTROL_PLANE_PULUMI_YAML, &dep_name, &version),
+                1,
+                "{id}: Stage 0 Pulumi version pin lacks the Renovate annotation"
+            );
+            // One grouped, manually reviewed PR per chart.
+            let rule = renovate["packageRules"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["matchDepNames"] == serde_json::json!([dep_name]))
+                .unwrap_or_else(|| panic!("{id}: no renovate packageRule"));
+            assert_eq!(rule["automerge"], false, "{id}");
+            assert!(rule["groupName"].is_string(), "{id}");
+        }
+    }
+
+    /// A version bump changes `catalog/core/<id>`, `catalog/apps/<id>`, the seed HelmRelease and
+    /// the Stage 0 Pulumi release together; any of them drifting fails here.
+    #[test]
+    fn workload_operator_apps_pin_their_core_chart_versions() {
+        let program: Value = serde_yml::from_str(state::CONTROL_PLANE_PULUMI_YAML).unwrap();
+        for (id, app_raw, core_raw, seed_raw, pulumi_resource) in operator_twins() {
+            let app = keel_core::parse_catalog_application(app_raw).unwrap();
+            let core = keel_core::parse_catalog_application(core_raw).unwrap();
+            assert_eq!(app.metadata.id, id);
+            assert_eq!(core.metadata.id, id);
+            assert_eq!(app.metadata.runtime, keel_core::AppRuntime::Helm);
+            assert_ne!(app.metadata.category, keel_core::MANAGEMENT_CORE_CATEGORY);
+            let version = app.spec.upstream.version.clone().unwrap();
+            assert_eq!(
+                Some(&version),
+                core.spec.upstream.version.as_ref(),
+                "catalog/apps/{id} version drifts from catalog/core/{id}"
+            );
+            let seed = seed_helm_release(seed_raw);
+            assert_eq!(
+                seed["spec"]["chart"]["spec"]["version"], version,
+                "catalog/apps/{id} version drifts from deploy/seed/core-addons"
+            );
+            let release = &program["resources"][pulumi_resource]["properties"];
+            assert_eq!(
+                release["version"], version,
+                "catalog/apps/{id} version drifts from the Stage 0 Pulumi release"
+            );
+            // Same chart: the core entry and Stage 0 spell OCI charts as a full reference.
+            let app_chart = app.spec.upstream.chart.clone().unwrap();
+            let app_repo = app.spec.upstream.repo_url.trim_end_matches('/').to_string();
+            let core_chart = core.spec.upstream.chart.clone().unwrap();
+            assert!(
+                core_chart == app_chart || core_chart == format!("{app_repo}/{app_chart}"),
+                "{id}: chart {app_repo} {app_chart} differs from core {core_chart}"
+            );
+            assert!(
+                core.spec.upstream.repo_url.starts_with(&app_repo),
+                "{id}: repoURL differs from core"
+            );
+            let stage0_chart = release["chart"].as_str().unwrap();
+            assert!(
+                stage0_chart == app_chart || stage0_chart == format!("{app_repo}/{app_chart}"),
+                "{id}: chart differs from Stage 0 {stage0_chart}"
+            );
+            // The tenant HelmRepository is `type: oci` exactly for OCI charts.
+            assert_eq!(
+                app_repo.starts_with("oci://"),
+                stage0_chart.starts_with("oci://"),
+                "{id}"
+            );
+            // Cluster-wide CRDs, RBAC and webhooks: remote workload clusters only, in a
+            // dedicated namespace (never the tenant's shared `tenant-<id>`).
+            assert!(app.spec.placement.requires_remote_cluster(), "{id}");
+            assert_eq!(
+                app.spec.placement.namespace.as_deref(),
+                Some(match id {
+                    "kyverno" => "kyverno",
+                    "pulumi-kubernetes-operator" => "pulumi-kubernetes-operator",
+                    _ => "flux-system",
+                }),
+                "{id}"
+            );
+            assert!(!app.spec.progressive_delivery.flagger_supported, "{id}");
+            // No management-cluster-only features (routes/NetworkPolicy target `tenant-<id>`).
+            assert!(app.spec.gateway_routes.is_empty(), "{id}");
+            assert!(app.spec.network_policy.is_none(), "{id}");
+            // The form is the whole interface (locked values imply strict values).
+            assert!(app.strict_values(), "{id}");
+            // No secret fields: nothing to SOPS-encrypt for an operator install.
+            assert!(!app_raw.contains("format: password"), "{id}");
+            // The form defaults validate against the schema and stay inside it.
+            let defaults = schema_defaults(&app.spec.schema);
+            keel_core::validate_schema_values(&app.spec.schema, &defaults)
+                .unwrap_or_else(|e| panic!("{id}: {e}"));
+            assert!(
+                keel_core::undeclared_value_paths(&app.spec.schema, &defaults).is_empty(),
+                "{id}"
+            );
+        }
+    }
+
+    /// The twins reuse the seed core-addon values that are not management specific.
+    #[test]
+    fn workload_operator_apps_reuse_seed_values() {
+        // Kyverno: only the CEL `policies.kyverno.io` CRDs; no `keel-system` exception namespace.
+        let kyverno = yaml(STARTER_KYVERNO_APP_YAML);
+        let seed = seed_helm_release(SEED_CORE_ADDON_KYVERNO_YAML);
+        assert_eq!(
+            kyverno["spec"]["lockedValues"]["crds"],
+            seed["spec"]["values"]["crds"]
+        );
+        assert_eq!(
+            kyverno["spec"]["crdPolicy"],
+            seed["spec"]["install"]["crds"]
+        );
+        assert_eq!(
+            kyverno["spec"]["crdPolicy"],
+            seed["spec"]["upgrade"]["crds"]
+        );
+        let schema = &kyverno["spec"]["schema"]["properties"];
+        assert_eq!(
+            schema["admissionController"]["properties"]["replicas"]["default"],
+            seed["spec"]["values"]["admissionController"]["replicas"]
+        );
+        let exceptions = &schema["features"]["properties"]["policyExceptions"]["properties"];
+        assert_eq!(exceptions["enabled"]["default"], false);
+        // The exception namespace is locked to the dedicated install namespace (never a form
+        // field: an empty value would make Kyverno read exceptions from every namespace).
+        assert!(exceptions.get("namespace").is_none());
+        assert_eq!(
+            kyverno["spec"]["lockedValues"]["features"]["policyExceptions"]["namespace"],
+            kyverno["spec"]["placement"]["namespace"]
+        );
+        assert_ne!(kyverno["spec"]["placement"]["namespace"], "keel-system");
+        assert!(!STARTER_KYVERNO_APP_YAML.contains("keel:policy-exceptions"));
+
+        // PKO: the seed's hardened container security context, CRDs replaced on upgrade.
+        let pko = yaml(STARTER_PKO_APP_YAML);
+        let seed = seed_helm_release(SEED_CORE_ADDON_PKO_YAML);
+        let locked = &pko["spec"]["lockedValues"];
+        assert_eq!(
+            locked["securityContext"],
+            seed["spec"]["values"]["securityContext"]
+        );
+        assert_eq!(locked["podSecurityContext"]["runAsNonRoot"], true);
+        assert_eq!(
+            locked["podSecurityContext"]["seccompProfile"]["type"],
+            "RuntimeDefault"
+        );
+        assert_eq!(pko["spec"]["crdPolicy"], "CreateReplace");
+        assert_eq!(pko["spec"]["crdPolicy"], seed["spec"]["install"]["crds"]);
+        assert_eq!(pko["spec"]["crdPolicy"], seed["spec"]["upgrade"]["crds"]);
+        assert_eq!(
+            pko["spec"]["schema"]["properties"]["replicaCount"]["default"],
+            seed["spec"]["values"]["replicaCount"]
+        );
+
+        // Flux: the multi-tenancy lockdown (on by default, optional) and CRDs kept on uninstall.
+        let flux = yaml(STARTER_FLUX2_APP_YAML);
+        let seed = seed_helm_release(SEED_CORE_ADDON_FLUX2_YAML);
+        let locked = &flux["spec"]["lockedValues"];
+        let seed_values = &seed["spec"]["values"];
+        assert_eq!(locked["crds"], seed_values["crds"]);
+        for key in ["defaultServiceAccount", "privileged"] {
+            assert_eq!(
+                locked["multitenancy"][key], seed_values["multitenancy"][key],
+                "multitenancy.{key}"
+            );
+        }
+        let schema = &flux["spec"]["schema"]["properties"];
+        assert_eq!(
+            schema["multitenancy"]["properties"]["enabled"]["default"],
+            seed_values["multitenancy"]["enabled"]
+        );
+        assert!(locked["multitenancy"].get("enabled").is_none());
+        // Keel applies no schema defaults server-side: the lockdown switch must be submitted.
+        let flux_app = keel_core::parse_catalog_application(STARTER_FLUX2_APP_YAML).unwrap();
+        for missing in [
+            serde_json::json!({}),
+            serde_json::json!({ "multitenancy": {} }),
+        ] {
+            assert!(
+                keel_core::validate_schema_values(&flux_app.spec.schema, &missing).is_err(),
+                "{missing}"
+            );
+        }
+        keel_core::validate_schema_values(
+            &flux_app.spec.schema,
+            &serde_json::json!({ "multitenancy": { "enabled": false } }),
+        )
+        .unwrap();
+        assert_eq!(
+            schema["logLevel"]["enum"],
+            yaml(CORE_CATALOG_FLUX2_YAML)["spec"]["schema"]["properties"]["logLevel"]["enum"]
+        );
     }
 }

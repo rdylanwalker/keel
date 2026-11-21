@@ -472,8 +472,16 @@ describe("api client module", () => {
               },
             },
             {
+              metadata: { id: "flux2", name: "Flux CD" },
+              spec: {
+                placement: { scope: "cluster", namespace: "flux-system" },
+              },
+            },
+            {
               metadata: { id: "podinfo", name: "Podinfo" },
-              spec: { placement: { scope: "namespaced" } },
+              spec: {
+                placement: { scope: "namespaced", namespace: "ignored" },
+              },
             },
             { metadata: { id: "dex", name: "Dex" }, spec: {} },
           ],
@@ -481,10 +489,13 @@ describe("api client module", () => {
       })
     )
     const catalog = await getCatalog()
-    expect(catalog.map((c) => [c.id, c.placementScope])).toEqual([
-      ["cert-manager", "cluster"],
-      ["podinfo", undefined],
-      ["dex", undefined],
+    expect(
+      catalog.map((c) => [c.id, c.placementScope, c.placementNamespace])
+    ).toEqual([
+      ["cert-manager", "cluster", undefined],
+      ["flux2", "cluster", "flux-system"],
+      ["podinfo", undefined, undefined],
+      ["dex", undefined, undefined],
     ])
   })
 

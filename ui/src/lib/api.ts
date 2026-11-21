@@ -149,6 +149,7 @@ interface RawCatalogEntry {
     defaultEngine?: "flux" | "pulumi"
     placement?: {
       scope?: string
+      namespace?: string
     }
     progressiveDelivery?: {
       flaggerSupported?: boolean
@@ -193,6 +194,9 @@ function mapCatalogApplication(app: RawCatalogEntry): CatalogItem {
     defaultEngine: app.spec?.defaultEngine ?? app.metadata?.defaultEngine,
     ...(app.spec?.placement?.scope === "cluster"
       ? { placementScope: "cluster" as const }
+      : {}),
+    ...(app.spec?.placement?.scope === "cluster" && app.spec.placement.namespace
+      ? { placementNamespace: app.spec.placement.namespace }
       : {}),
     flaggerSupported: app.spec?.progressiveDelivery?.flaggerSupported ?? false,
     defaultCanary: app.spec?.progressiveDelivery?.defaultCanary ?? false,

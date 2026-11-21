@@ -1,0 +1,117 @@
+# Flux CD Workload Cluster Catalog Application (`SDD.md` §2.1, §5.1, `NFR-SEC-02`)
+# Self-service twin of `catalog/core/flux2` (Keel's own Flux in `flux-system`): same
+# fluxcd-community chart and version (a drift test in `keel-cli` fails when they differ), reusing
+# the seed install config of `deploy/seed/core-addons/flux2.yaml` (multi-tenancy lockdown, CRDs
+# kept on uninstall).
+#
+# Use case: a workload cluster that runs its own GitOps for the teams on it (their own
+# GitRepository/Kustomization/HelmRelease objects, reconciled in-cluster from their repos), while
+# Keel's management Flux keeps reconciling this release from the management cluster through the
+# tenant's kubeconfig Secret. The management Flux never creates Flux objects on the workload
+# cluster (remote HelmReleases/Kustomizations stay on the management cluster), so the two Flux
+# installs do not share CRDs or objects. Conflicts to avoid: a second Flux install on the same
+# workload cluster (`flux bootstrap`, another instance of this app or a vendor add-on) also owns
+# the Flux CRDs and fails or fights over them, so install this app once per cluster and only on
+# clusters without Flux. This release does not create a GitRepository/Kustomization sync of its
+# own: the cluster's teams add those (or bootstrap them from Git through another catalog app).
+# The release always installs into `flux-system` (`spec.placement.namespace`).
+apiVersion: keel.io/v1alpha1
+kind: CatalogApplication
+metadata:
+  id: flux2
+  name: Flux CD
+  description: Flux GitOps controllers for a workload cluster that runs its own GitOps for the teams on it, installed into flux-system with the multi-tenancy lockdown on by default. Install once per cluster, only on clusters without Flux.
+  category: platform
+  runtime: helm
+spec:
+  upstream:
+    chart: flux2
+    repoURL: oci://ghcr.io/fluxcd-community/charts
+    # renovate: datasource=docker depName=ghcr.io/fluxcd-community/charts/flux2
+    version: "2.20.0"
+  # The chart installs cluster-scoped resources (the Flux CRDs and cluster-admin
+  # ClusterRoleBindings for its controllers), so it may only target a remote workload cluster
+  # (the management cluster runs catalog/core/flux2). Flux's CRDs are cluster-wide: one install
+  # per cluster.
+  # Dedicated `flux-system` namespace (Flux's standard layout): a request without targetNamespace
+  # installs there and any other namespace is rejected. Never the shared `tenant-<id>`: the chart's
+  # default NetworkPolicies (`policies.create: true`, `podSelector: {}`) restrict ingress to every
+  # pod of the release namespace.
+  placement:
+    scope: cluster
+    namespace: flux-system
+  progressiveDelivery:
+    flaggerSupported: false
+    defaultCanary: false
+  # Known-good management config (`deploy/seed/core-addons/flux2.yaml`). Locked values make the
+  # form the whole interface: values the schema does not declare (images, controller args,
+  # extraObjects, RBAC) are rejected.
+  lockedValues:
+    installCRDs: true
+    multitenancy:
+      # Applied when the lockdown is enabled: Kustomizations/HelmReleases without
+      # spec.serviceAccountName impersonate the permissionless `default` ServiceAccount.
+      defaultServiceAccount: default
+      # Controllers keep cluster-admin so they can impersonate the per-team ServiceAccounts.
+      privileged: true
+    # Flux CRDs survive a removal of this app, so every Flux object (and the workloads it
+    # manages) outlives an accidental uninstall and is re-adopted on reinstall.
+    crds:
+      annotations:
+        helm.sh/resource-policy: keep
+  # Keel applies no schema defaults server-side (only the form fills them in), so the lockdown
+  # switch is required: an API/CLI request has to opt out explicitly instead of silently getting
+  # the chart default (`multitenancy.enabled: false`) next to the locked `privileged: true`.
+  schema:
+    type: object
+    required:
+      - multitenancy
+    properties:
+      multitenancy:
+        type: object
+        title: Multi-Tenancy Lockdown
+        required:
+          - enabled
+        properties:
+          enabled:
+            type: boolean
+            title: Enable Multi-Tenancy Lockdown
+            description: Adds --no-cross-namespace-refs=true to every Flux controller and --default-service-account=default to the kustomize and helm controllers, so each team's Flux objects can only use their own namespace's sources and ServiceAccounts (like Keel's management Flux). Turn off only on single-team clusters.
+            default: true
+      watchAllNamespaces:
+        type: boolean
+        title: Watch All Namespaces
+        description: When off, the controllers only reconcile Flux objects in the install namespace.
+        default: true
+      logLevel:
+        type: string
+        title: Controller Log Level
+        default: info
+        enum:
+          - debug
+          - info
+          - error
+      notificationController:
+        type: object
+        title: Notification Controller
+        properties:
+          create:
+            type: boolean
+            title: Install Notification Controller (alerts, webhook receivers)
+            default: true
+      imageReflectionController:
+        type: object
+        title: Image Reflection Controller
+        properties:
+          create:
+            type: boolean
+            title: Install Image Reflection Controller (image scanning)
+            default: true
+      imageAutomationController:
+        type: object
+        title: Image Automation Controller
+        properties:
+          create:
+            type: boolean
+            title: Install Image Automation Controller (Git image updates)
+            default: true

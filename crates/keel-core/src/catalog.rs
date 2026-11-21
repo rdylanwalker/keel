@@ -1813,6 +1813,64 @@ metadata:
     }
 
     #[test]
+    fn test_catalog_application_placement_namespace() {
+        let with_placement = |placement: &str| {
+            AUTHENTIK_CATALOG_YAML.replace(
+                "  progressiveDelivery:",
+                &format!("  placement:\n{placement}  progressiveDelivery:"),
+            )
+        };
+        // No dedicated namespace: the requested namespace passes through (trimmed).
+        let plain = parse_catalog_application(AUTHENTIK_CATALOG_YAML).unwrap();
+        assert_eq!(plain.resolve_target_namespace(None).unwrap(), None);
+        assert_eq!(plain.resolve_target_namespace(Some("  ")).unwrap(), None);
+        assert_eq!(
+            plain.resolve_target_namespace(Some(" apps ")).unwrap(),
+            Some("apps".to_string())
+        );
+
+        let dedicated = parse_catalog_application(&with_placement(
+            "    scope: cluster\n    namespace: flux-system\n",
+        ))
+        .unwrap();
+        assert_eq!(
+            dedicated.spec.placement.namespace.as_deref(),
+            Some("flux-system")
+        );
+        assert!(
+            serde_yml::to_string(&dedicated)
+                .unwrap()
+                .contains("namespace: flux-system")
+        );
+        for requested in [None, Some(""), Some("flux-system"), Some(" flux-system ")] {
+            assert_eq!(
+                dedicated.resolve_target_namespace(requested).unwrap(),
+                Some("flux-system".to_string()),
+                "{requested:?}"
+            );
+        }
+        let err = dedicated
+            .resolve_target_namespace(Some("tenant-acme"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("spec.placement.namespace"), "{err}");
+        assert!(err.contains("tenant-acme"), "{err}");
+
+        // Only for scope: cluster, a valid DNS label and never a tenant namespace.
+        for bad in [
+            "    namespace: flux-system\n",
+            "    scope: namespaced\n    namespace: flux-system\n",
+            "    scope: cluster\n    namespace: Flux_System\n",
+            "    scope: cluster\n    namespace: tenant-acme\n",
+        ] {
+            assert!(
+                parse_catalog_application(&with_placement(bad)).is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
     fn test_built_in_catalog_app_placement_scopes() {
         // Charts verified (helm template, default values) to install CRDs, ClusterRoles/Bindings or
         // webhooks (dex 0.21.0 and authentik 2024.12.2 render a ClusterRole/ClusterRoleBinding).
@@ -1823,6 +1881,11 @@ metadata:
             include_str!("../../../deploy/catalog/apps/prometheus/catalog.yaml"),
             include_str!("../../../deploy/catalog/apps/dex/catalog.yaml"),
             include_str!("../../../deploy/catalog/apps/authentik/catalog.yaml"),
+            // Workload-cluster twins of the management operators (cluster-wide CRDs, RBAC and
+            // webhooks: Kyverno, PKO and Flux each own their CRDs once per cluster).
+            include_str!("../../../deploy/catalog/apps/kyverno/catalog.yaml"),
+            include_str!("../../../deploy/catalog/apps/pulumi-kubernetes-operator/catalog.yaml"),
+            include_str!("../../../deploy/catalog/apps/flux2/catalog.yaml"),
         ] {
             let app = parse_catalog_application(raw).unwrap();
             assert_eq!(

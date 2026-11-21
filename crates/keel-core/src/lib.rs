@@ -54,7 +54,7 @@ pub use models::{
     CatalogBlueprintMetadata, CatalogBlueprintSpec, CatalogBundle, CatalogBundleItem,
     CatalogBundleMetadata, CatalogBundleSpec, CatalogInfraBlueprint, CatalogManifest,
     CompanionInfraHook, DEFAULT_CLUSTER_NAME, DEFAULT_POLL_INTERVAL, ForgeConfig, ForgeKind,
-    HelmGatewayRouteSpec, HelmNetworkPolicySpec, InfraResourceKind, KeelConfig,
+    HelmCrdPolicy, HelmGatewayRouteSpec, HelmNetworkPolicySpec, InfraResourceKind, KeelConfig,
     MANAGEMENT_CORE_CATEGORY, ManifestEngine, OidcConfig, PlacementScope, PlacementSpec,
     ProgressiveDeliverySpec, ProviderEntry, ProviderRegistry, ResourceQuotaSpec, S3BackendConfig,
     StackSshInfoResponse, TenantConfig, UpstreamSource, clean_candidate_ssh_host,
