@@ -97,14 +97,21 @@ test.describe('02 - Catalog Dynamic Forms & PR Proposal Generation', () => {
 
     const files = branchFiles(created.branch);
     const dir = `tenants/acme/apps/${name}`;
-    expect(files).toContain(`${dir}/secrets.enc.yaml`);
+    // Helm secret fields: one SOPS-encrypted values fragment per field in `config/`, applied by
+    // the `<name>-config` Flux Kustomization and merged through `HelmRelease.spec.valuesFrom`.
+    expect(files).toContain(`${dir}/config/secrets.enc.yaml`);
+    expect(files).toContain(`${dir}/config-kustomization.yaml`);
+    expect(files).not.toContain(`${dir}/secrets.enc.yaml`);
     expect(files).toContain(`${dir}/values.yaml`);
+    expect(showFile(created.branch, 'tenants/kustomization.yaml')).toContain(
+      `acme/apps/${name}/config-kustomization.yaml`,
+    );
 
     // Plaintext secret appears nowhere in the branch tree or its commit message.
     expect(treeContains(created.branch, secret)).toBe(false);
     expect(git(['log', '-1', '--format=%B', created.branch])).not.toContain(secret);
 
-    const enc = showFile(created.branch, `${dir}/secrets.enc.yaml`);
+    const enc = showFile(created.branch, `${dir}/config/secrets.enc.yaml`);
     expect(enc).toMatch(/adminPassword: ENC\[AES256_GCM,/);
     expect(enc).toContain('sops:');
     expect(enc).toMatch(/recipient: age1/);
@@ -122,6 +129,9 @@ test.describe('02 - Catalog Dynamic Forms & PR Proposal Generation', () => {
     expect(hr).toContain('chart: podinfo');
     expect(hr).toContain('version: "6.5.0"');
     expect(hr).not.toContain(secret);
+    expect(hr).toContain('valuesFrom:');
+    expect(hr).toContain(`name: ${name}-secrets`);
+    expect(hr).toContain('valuesKey: adminPassword');
 
     // Nothing was committed to main (PR-only workflow).
     expect(treeContains('main', name)).toBe(false);
@@ -243,5 +253,73 @@ test.describe('02 - Catalog Dynamic Forms & PR Proposal Generation', () => {
       modal.getByText(/can only be deployed to a remote workload cluster/i),
     ).toBeVisible();
     expect(posted).toBe(0);
+  });
+
+  test('02.8 - Self-service Forgejo and SeaweedFS Helm apps are namespaced with guarded secrets and routes', async () => {
+    const api = await apiAs(USERS.admin);
+    const catalog = await (await api.get('/api/v1/catalog')).json();
+    const apps = catalog.applications as Array<{
+      metadata: { id: string; runtime: string };
+      spec: { placement?: { scope?: string }; upstream: { version?: string } };
+    }>;
+    for (const [id, version] of [
+      ['forgejo', '17.3.3'],
+      ['seaweedfs', '4.54.0'],
+    ]) {
+      const app = apps.find((a) => a.metadata.id === id);
+      expect(app?.metadata.runtime, id).toBe('helm');
+      expect(app?.spec.placement?.scope ?? 'namespaced', id).toBe('namespaced');
+      expect(app?.spec.upstream.version, id).toBe(version);
+    }
+
+    // Required secret fields are validated before anything is encrypted or committed.
+    const missingKeys = await api.post('/api/v1/proposals', {
+      data: { tenant: 'acme', catalogId: 'seaweedfs', name: uniq('s3'), values: { s3: {} } },
+    });
+    expect(missingKeys.status()).toBe(422);
+
+    // The chart's HTTPRoute may never claim a platform host on the shared keel-ingress Gateway.
+    const platformHost = await api.post('/api/v1/proposals', {
+      data: {
+        tenant: 'acme',
+        catalogId: 'forgejo',
+        name: uniq('git'),
+        values: {
+          gitea: {
+            admin: {
+              username: 'forgejo-admin',
+              email: 'ops@acme.example',
+              password: 'Forgejo-Admin#Passw0rd!',
+            },
+          },
+          httpRoute: { enabled: true, hostnames: ['forgejo.keel.local'] },
+        },
+      },
+    });
+    expect(platformHost.status()).toBe(400);
+    expect(JSON.stringify(await platformHost.json())).toContain('reserved platform host');
+
+    // Chart values outside the catalog schema (here a second, unguarded route) are rejected.
+    const undeclared = await api.post('/api/v1/proposals', {
+      data: {
+        tenant: 'acme',
+        catalogId: 'seaweedfs',
+        name: uniq('s3'),
+        values: {
+          s3: {
+            credentials: {
+              admin: {
+                accessKey: '0123456789abcdef0123',
+                secretKey: 'c2VjcmV0c2VjcmV0c2VjcmV0c2VjcmV0c2Vj',
+              },
+            },
+          },
+          filer: { httpRoute: { enabled: true } },
+        },
+      },
+    });
+    expect(undeclared.status()).toBe(400);
+    expect(JSON.stringify(await undeclared.json())).toContain('filer.httpRoute');
+    await api.dispose();
   });
 });

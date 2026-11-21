@@ -88,7 +88,7 @@ keel app install \
   --server http://127.0.0.1:8080
 ```
 
-5. Inspect the PR diff in **PR & Preview Inspector**—which synthesizes `helmrelease-canary.yaml`, `canary.yaml`, `networkpolicy-canary.yaml`, and SOPS-encrypted `secrets.enc.yaml`—and click **Merge PR**.
+5. Inspect the PR diff in **PR & Preview Inspector**—which synthesizes `helmrelease-canary.yaml`, `canary.yaml`, `networkpolicy-canary.yaml`, and, when the form's `apiToken` secret is set, the SOPS-encrypted `config/secrets.enc.yaml` with its `config-kustomization.yaml` (merged into the release through `HelmRelease.spec.valuesFrom`)—and click **Merge PR**.
 6. In **Topology Map**, wait for `podinfo` to reach `Ready` / `Initialized` in the **Flagger Canary Traffic Rollouts (Envoy Gateway)** panel.
 
 ### Step 2: Demonstrate a Live Canary Traffic Rollout

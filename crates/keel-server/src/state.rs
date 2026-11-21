@@ -634,6 +634,15 @@ impl ClusterStateProvider for RepoClusterStateProvider {
                 if !is_flux_release {
                     continue;
                 }
+                // `<instance>-config` Kustomizations (SOPS secrets of an app) are part of the
+                // app they configure, not releases of their own.
+                if kind == "Kustomization"
+                    && val
+                        .pointer("/metadata/labels/keel.io~1config-for")
+                        .is_some_and(|v| !v.is_null())
+                {
+                    continue;
+                }
                 let name = val
                     .pointer("/metadata/name")
                     .and_then(Value::as_str)
@@ -1487,6 +1496,34 @@ mod tests {
         assert_eq!(out_releases.len(), 1);
         assert_eq!(out_releases[0].name, "podinfo");
         assert_eq!(out_releases[0].status, "Ready");
+    }
+
+    /// A Helm app with secret fields commits a `<instance>-config` Flux Kustomization (labelled
+    /// `keel.io/config-for`) beside its HelmRelease: it must not show up as a second release.
+    #[tokio::test]
+    async fn list_releases_skips_helm_app_config_kustomization() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("tenants/acme/apps/git");
+        std::fs::create_dir_all(dir.join("config")).unwrap();
+        std::fs::write(
+            dir.join("helmrelease.yaml"),
+            "apiVersion: helm.toolkit.fluxcd.io/v2\nkind: HelmRelease\nmetadata:\n  name: git\n  namespace: tenant-acme\n  labels:\n    keel.io/tenant: acme\nspec:\n  chart:\n    spec:\n      chart: forgejo\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("config-kustomization.yaml"),
+            "apiVersion: kustomize.toolkit.fluxcd.io/v1\nkind: Kustomization\nmetadata:\n  name: git-config\n  namespace: tenant-acme\n  labels:\n    keel.io/tenant: acme\n    keel.io/catalog-id: forgejo\n    keel.io/config-for: git\nspec:\n  path: ./tenants/acme/apps/git/config\n",
+        )
+        .unwrap();
+        let releases = RepoClusterStateProvider::new(tmp.path())
+            .list_releases(Some("acme"))
+            .await
+            .unwrap();
+        assert_eq!(
+            releases.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+            vec!["git"]
+        );
+        assert_eq!(releases[0].runtime, "helm");
     }
 
     #[tokio::test]

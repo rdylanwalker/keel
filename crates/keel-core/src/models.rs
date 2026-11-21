@@ -1157,6 +1157,54 @@ pub struct CompanionInfraHook {
     pub bind_values: BTreeMap<String, serde_json::Value>,
 }
 
+/// A Gateway API route an upstream Helm chart renders from its own values
+/// (`spec.gatewayRoutes[]`, `runtime: helm` only). Keel never patches the chart: it reads the
+/// hostnames from the submitted values, applies the tenant route guards (no platform host, no
+/// hostname routed by another app, no catch-all route) and pins the route to the shared
+/// `keel-system/keel-ingress` HTTPS listeners (`SDD.md` §5.1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HelmGatewayRouteSpec {
+    /// Dot path of the boolean value that turns the route on (e.g. `httpRoute.enabled`); when
+    /// absent the route is always rendered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled_value: Option<String>,
+    /// Dot path of the route hostnames (a string or a list of strings), e.g. `httpRoute.hostnames`.
+    pub hostnames_value: String,
+    /// Dot path Keel overwrites with the `keel-ingress` HTTPS listener `parentRefs` (e.g.
+    /// `httpRoute.parentRefs`), so a tenant route can only attach to the shared Gateway.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_refs_value: Option<String>,
+}
+
+/// Keel-generated tenant `NetworkPolicy` for a Helm app (`spec.networkPolicy`, `runtime: helm`
+/// only). Tenant namespaces are `default-deny-all`; upstream charts rarely ship policies, so
+/// Keel commits one `NetworkPolicy` selecting the release's pods
+/// (`app.kubernetes.io/instance: <release>`). Cluster DNS egress is always allowed.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HelmNetworkPolicySpec {
+    /// TCP ports the Envoy Gateway proxies (`keel-system`) may reach (the route backends).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gateway_ingress_ports: Vec<u16>,
+    /// TCP ports any pod of the tenant namespace may reach (e.g. an S3 endpoint consumed by
+    /// other tenant apps). Consumer pods still need their own egress allowance.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub namespace_ingress_ports: Vec<u16>,
+    /// Pods of the release may reach each other on any port (multi-component charts).
+    #[serde(default)]
+    pub release_traffic: bool,
+    /// Egress to the `keel-ingress` Envoy proxy pods in `keel-system` on their HTTP(S) listener
+    /// ports only (e.g. an OIDC issuer routed through the shared Gateway); never to other
+    /// `keel-system` workloads.
+    #[serde(default)]
+    pub gateway_egress: bool,
+    /// Egress to public IPv4 addresses on TCP 80/443 (RFC 1918, CGNAT, link-local, loopback,
+    /// `0.0.0.0/8`, multicast and reserved ranges excluded), e.g. repository mirrors and webhooks.
+    #[serde(default)]
+    pub public_egress: bool,
+}
+
 /// Specification block for `CatalogApplication`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1183,6 +1231,24 @@ pub struct CatalogAppSpec {
     /// Placement rule; absent means `scope: namespaced` (backward compatible).
     #[serde(default, skip_serializing_if = "PlacementSpec::is_default")]
     pub placement: PlacementSpec,
+    /// Gateway API routes the Helm chart renders from its values (`runtime: helm` only).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gateway_routes: Vec<HelmGatewayRouteSpec>,
+    /// Keel-generated tenant `NetworkPolicy` for the release (`runtime: helm` only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_policy: Option<HelmNetworkPolicySpec>,
+    /// Chart values Keel always deep-merges over the submitted values into
+    /// `HelmRelease.spec.values` (`runtime: helm` only): the known-good tenant install config
+    /// (restricted Pod Security contexts, no cluster-scoped RBAC, bundled databases off) that the
+    /// form must not be able to drop or change. Never shown in the form; never secret.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locked_values: Option<serde_json::Value>,
+    /// Create-only value paths (`runtime: helm` only), e.g. PersistentVolumeClaim sizes and
+    /// storage classes rendered into immutable StatefulSet `volumeClaimTemplates`: an Edit that
+    /// changes one of them is rejected instead of committing a Helm upgrade that can never
+    /// succeed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub immutable_values: Vec<String>,
 }
 
 /// Git-stored `keel.io/v1alpha1` `CatalogApplication` definition (`SDD.md` §5.1).
@@ -1291,7 +1357,60 @@ impl CatalogApplication {
         for hook in &self.spec.companion_infrastructure {
             validate_dns_label(&hook.blueprint, "companionInfrastructure.blueprint")?;
         }
+        if (!self.spec.gateway_routes.is_empty()
+            || self.spec.network_policy.is_some()
+            || self.spec.locked_values.is_some()
+            || !self.spec.immutable_values.is_empty())
+            && self.metadata.runtime != AppRuntime::Helm
+        {
+            return Err(CoreError::Validation(
+                "spec.gatewayRoutes, spec.networkPolicy, spec.lockedValues and \
+                 spec.immutableValues are only supported for runtime: helm (manifest apps \
+                 declare their HTTPRoute/NetworkPolicy and fixed settings in the template)"
+                    .to_string(),
+            ));
+        }
+        if self
+            .spec
+            .locked_values
+            .as_ref()
+            .is_some_and(|v| !v.is_object())
+        {
+            return Err(CoreError::Validation(
+                "spec.lockedValues must be a Helm values object".to_string(),
+            ));
+        }
+        for route in &self.spec.gateway_routes {
+            validate_value_path(&route.hostnames_value, "gatewayRoutes[].hostnamesValue")?;
+            if let Some(path) = &route.enabled_value {
+                validate_value_path(path, "gatewayRoutes[].enabledValue")?;
+            }
+            if let Some(path) = &route.parent_refs_value {
+                validate_value_path(path, "gatewayRoutes[].parentRefsValue")?;
+            }
+        }
+        for path in &self.spec.immutable_values {
+            validate_value_path(path, "immutableValues[]")?;
+        }
+        if let Some(np) = &self.spec.network_policy
+            && (np.gateway_ingress_ports.contains(&0) || np.namespace_ingress_ports.contains(&0))
+        {
+            return Err(CoreError::Validation(
+                "spec.networkPolicy.gatewayIngressPorts / namespaceIngressPorts must be TCP \
+                 ports 1-65535"
+                    .to_string(),
+            ));
+        }
         Ok(())
+    }
+
+    /// Whether submitted values must stay inside `spec.schema` (fail closed on undeclared
+    /// keys). Implied by `spec.lockedValues` / `spec.gatewayRoutes`: their guarantees (locked
+    /// security contexts, guarded routes) only hold when no other chart value can be set, e.g.
+    /// a second chart route, `extraDeploy`, sidecars or another ServiceAccount.
+    pub fn strict_values(&self) -> bool {
+        self.metadata.runtime == AppRuntime::Helm
+            && (self.spec.locked_values.is_some() || !self.spec.gateway_routes.is_empty())
     }
 
     /// Enforces `spec.placement`: a `scope: cluster` app may only be installed into a remote
@@ -1329,6 +1448,26 @@ impl CatalogApplication {
              target a remote workload cluster",
             self.metadata.id,
             kinds.join(", ")
+        )))
+    }
+}
+
+/// Validates a dot-separated Helm value path (`a.b.c`): non-empty segments of
+/// `[A-Za-z0-9_-]` (no list indices).
+fn validate_value_path(path: &str, field: &str) -> Result<(), CoreError> {
+    let valid = !path.is_empty()
+        && path.split('.').all(|seg| {
+            !seg.is_empty()
+                && seg
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        });
+    if valid {
+        Ok(())
+    } else {
+        Err(CoreError::Validation(format!(
+            "spec.{field} '{}' must be a dot-separated value path such as httpRoute.hostnames",
+            path.escape_debug()
         )))
     }
 }
@@ -2497,13 +2636,74 @@ mod tests {
                 service_url: None,
                 default_engine: Some(ManifestEngine::Pulumi),
                 placement: PlacementSpec::default(),
+                gateway_routes: Vec::new(),
+                network_policy: None,
+                locked_values: None,
+                immutable_values: Vec::new(),
             },
         };
         assert!(app.validate().is_ok());
 
+        // Route/NetworkPolicy declarations are Helm-only.
+        let mut manifest_with_routes = app.clone();
+        manifest_with_routes.spec.network_policy = Some(HelmNetworkPolicySpec::default());
+        assert!(manifest_with_routes.validate().is_err());
+        let mut manifest_immutable = app.clone();
+        manifest_immutable.spec.immutable_values = vec!["persistence.size".to_string()];
+        assert!(manifest_immutable.validate().is_err());
+        assert!(!app.strict_values());
+
         let mut helm_app = app;
         helm_app.metadata.runtime = AppRuntime::Helm;
         assert!(helm_app.validate().is_err());
+
+        helm_app.spec.upstream.repo_url = "https://charts.example.com".to_string();
+        helm_app.spec.upstream.chart = Some("demo".to_string());
+        helm_app.spec.default_engine = None;
+        helm_app.spec.gateway_routes = vec![HelmGatewayRouteSpec {
+            enabled_value: Some("httpRoute.enabled".to_string()),
+            hostnames_value: "httpRoute.hostnames".to_string(),
+            parent_refs_value: Some("httpRoute.parentRefs".to_string()),
+        }];
+        helm_app.spec.network_policy = Some(HelmNetworkPolicySpec {
+            gateway_ingress_ports: vec![3000],
+            ..HelmNetworkPolicySpec::default()
+        });
+        assert!(helm_app.validate().is_ok());
+        for bad in ["", "a..b", "a[0].b", "a b", ".a"] {
+            let mut invalid = helm_app.clone();
+            invalid.spec.gateway_routes[0].hostnames_value = bad.to_string();
+            assert!(invalid.validate().is_err(), "{bad:?} must be rejected");
+        }
+        let mut zero_port = helm_app.clone();
+        zero_port.spec.network_policy = Some(HelmNetworkPolicySpec {
+            gateway_ingress_ports: vec![0],
+            ..HelmNetworkPolicySpec::default()
+        });
+        assert!(zero_port.validate().is_err());
+        let mut zero_ns_port = helm_app.clone();
+        zero_ns_port.spec.network_policy = Some(HelmNetworkPolicySpec {
+            namespace_ingress_ports: vec![0],
+            ..HelmNetworkPolicySpec::default()
+        });
+        assert!(zero_ns_port.validate().is_err());
+        let mut immutable = helm_app.clone();
+        immutable.spec.immutable_values = vec!["persistence.size".to_string()];
+        assert!(immutable.validate().is_ok());
+        immutable.spec.immutable_values = vec!["volume.dataDirs[0].size".to_string()];
+        assert!(immutable.validate().is_err());
+        // Declared routes imply strict values.
+        assert!(helm_app.strict_values());
+        let mut no_routes = helm_app.clone();
+        no_routes.spec.gateway_routes.clear();
+        assert!(!no_routes.strict_values());
+        let mut locked = helm_app.clone();
+        locked.spec.locked_values = Some(serde_json::json!({ "test": { "enabled": false } }));
+        assert!(locked.validate().is_ok());
+        locked.spec.gateway_routes.clear();
+        assert!(locked.strict_values());
+        locked.spec.locked_values = Some(serde_json::json!(["not", "an", "object"]));
+        assert!(locked.validate().is_err());
     }
 
     #[test]

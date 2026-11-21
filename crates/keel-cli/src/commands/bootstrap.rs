@@ -771,6 +771,14 @@ const STARTER_RAUTHY_APP_YAML: &str =
     include_str!("../../../../deploy/catalog/apps/rauthy/catalog.yaml");
 const STARTER_RAUTHY_APP_MANIFESTS_YAML: &str =
     include_str!("../../../../deploy/catalog/apps/rauthy/manifests.yaml");
+/// Self-service tenant Forgejo (`runtime: helm`), distinct from Keel's own management forge
+/// ([`CORE_CATALOG_FORGEJO_YAML`], `--with-forge`); both pin the same chart version.
+const STARTER_FORGEJO_APP_YAML: &str =
+    include_str!("../../../../deploy/catalog/apps/forgejo/catalog.yaml");
+/// Self-service tenant SeaweedFS S3 storage (`runtime: helm`), distinct from Keel's own state
+/// backend ([`CORE_CATALOG_S3_STATE_BACKEND_YAML`]); both pin the same chart version.
+const STARTER_SEAWEEDFS_APP_YAML: &str =
+    include_str!("../../../../deploy/catalog/apps/seaweedfs/catalog.yaml");
 const CORE_CATALOG_ENVOY_GATEWAY_YAML: &str =
     include_str!("../../../../deploy/catalog/core/envoy-gateway/catalog.yaml");
 const CORE_CATALOG_PROMETHEUS_YAML: &str =
@@ -1484,6 +1492,14 @@ async fn initialize_seed_git_repo_with_push(
         files_to_write.push((
             "catalog/apps/rauthy/manifests.yaml".to_string(),
             STARTER_RAUTHY_APP_MANIFESTS_YAML.to_string(),
+        ));
+        files_to_write.push((
+            "catalog/apps/forgejo/catalog.yaml".to_string(),
+            STARTER_FORGEJO_APP_YAML.to_string(),
+        ));
+        files_to_write.push((
+            "catalog/apps/seaweedfs/catalog.yaml".to_string(),
+            STARTER_SEAWEEDFS_APP_YAML.to_string(),
         ));
     }
 
@@ -3472,6 +3488,27 @@ mod security_hardening_tests {
                 .unwrap(),
             STARTER_RAUTHY_APP_MANIFESTS_YAML
         );
+        // Self-service tenant Forgejo and SeaweedFS (Helm) are seeded with or without
+        // `--with-forge` (they are independent of the management-plane forge/state backend).
+        for (path, contents) in [
+            (
+                "catalog/apps/forgejo/catalog.yaml",
+                STARTER_FORGEJO_APP_YAML,
+            ),
+            (
+                "catalog/apps/seaweedfs/catalog.yaml",
+                STARTER_SEAWEEDFS_APP_YAML,
+            ),
+        ] {
+            assert!(
+                res.written_files.iter().any(|p| p == path),
+                "{path} not seeded"
+            );
+            assert_eq!(
+                std::fs::read_to_string(res.repo_dir.join(path)).unwrap(),
+                contents
+            );
+        }
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -4107,5 +4144,149 @@ mod tenant_rauthy_app_tests {
             let hosts = keel_core::gateway_route_hostnames(&docs);
             assert!(keel_core::validate_route_hostnames(&hosts, &reserved).is_err());
         }
+    }
+}
+
+/// Self-service tenant Helm apps mirroring management-plane base add-ons
+/// (`deploy/catalog/apps/{forgejo,seaweedfs}`).
+#[cfg(test)]
+mod tenant_helm_app_tests {
+    use super::*;
+
+    use serde_json::Value;
+
+    fn yaml(raw: &str) -> Value {
+        serde_yml::from_str(raw).unwrap()
+    }
+
+    /// Bump the tenant app together with its catalog/core twin (and the seed HelmRelease /
+    /// Stage 0 Pulumi release, enforced by `core_catalog_versions_match_seed_core_addons`).
+    #[test]
+    fn tenant_helm_apps_pin_their_core_chart_versions() {
+        for (id, app_raw, core_raw) in [
+            (
+                "forgejo",
+                STARTER_FORGEJO_APP_YAML,
+                CORE_CATALOG_FORGEJO_YAML,
+            ),
+            (
+                "seaweedfs",
+                STARTER_SEAWEEDFS_APP_YAML,
+                CORE_CATALOG_S3_STATE_BACKEND_YAML,
+            ),
+        ] {
+            let app = keel_core::parse_catalog_application(app_raw).unwrap();
+            let core = keel_core::parse_catalog_application(core_raw).unwrap();
+            assert_eq!(app.metadata.id, id);
+            assert_eq!(app.metadata.runtime, keel_core::AppRuntime::Helm);
+            assert_ne!(app.metadata.category, keel_core::MANAGEMENT_CORE_CATEGORY);
+            assert_eq!(
+                app.spec.upstream.version, core.spec.upstream.version,
+                "catalog/apps/{id} version drifts from catalog/core/{}",
+                core.metadata.id
+            );
+            // Same chart: the core entry may spell the OCI chart as a full reference.
+            let app_chart = app.spec.upstream.chart.clone().unwrap();
+            let core_chart = core.spec.upstream.chart.clone().unwrap();
+            assert!(
+                core_chart == app_chart || core_chart.ends_with(&format!("/{app_chart}")),
+                "{id}: chart {app_chart} differs from core {core_chart}"
+            );
+            assert!(
+                core.spec
+                    .upstream
+                    .repo_url
+                    .starts_with(app.spec.upstream.repo_url.trim_end_matches('/')),
+                "{id}: repoURL differs from core"
+            );
+            // Namespaced: installable into the tenant namespace on the management cluster.
+            assert!(!app.spec.placement.requires_remote_cluster(), "{id}");
+            assert!(
+                app.spec.network_policy.is_some(),
+                "{id}: default-deny tenant"
+            );
+            assert!(!app.spec.progressive_delivery.flagger_supported);
+        }
+    }
+
+    /// The tenant variants reuse the seed core-addon values that matter and lock the
+    /// `restricted` Pod Security settings no form value can drop.
+    #[test]
+    fn tenant_helm_apps_reuse_core_values_with_restricted_pss() {
+        let forgejo = yaml(STARTER_FORGEJO_APP_YAML);
+        let locked = &forgejo["spec"]["lockedValues"];
+        let seed_forgejo = SEED_CORE_ADDON_FORGEJO_YAML
+            .split("\n---\n")
+            .map(yaml)
+            .find(|d| d["kind"] == "HelmRelease")
+            .unwrap();
+        let core_values = &seed_forgejo["spec"]["values"];
+        assert_eq!(
+            locked["gitea"]["config"]["database"],
+            core_values["gitea"]["config"]["database"]
+        );
+        assert_eq!(
+            locked["gitea"]["config"]["oauth2_client"],
+            core_values["gitea"]["config"]["oauth2_client"]
+        );
+        assert_eq!(locked["image"]["rootless"], true);
+        let csc = &locked["containerSecurityContext"];
+        assert_eq!(csc["allowPrivilegeEscalation"], false);
+        assert_eq!(csc["runAsNonRoot"], true);
+        assert_eq!(csc["capabilities"]["drop"][0], "ALL");
+        assert_eq!(csc["seccompProfile"]["type"], "RuntimeDefault");
+        // The admin password is a secret field; persistence defaults on.
+        let schema = &forgejo["spec"]["schema"]["properties"];
+        assert_eq!(
+            schema["gitea"]["properties"]["admin"]["properties"]["password"]["format"],
+            "password"
+        );
+        assert_eq!(schema["gitea"]["properties"]["oauth"]["writeOnly"], true);
+        assert_eq!(
+            schema["persistence"]["properties"]["enabled"]["default"],
+            true
+        );
+
+        let seaweedfs = yaml(STARTER_SEAWEEDFS_APP_YAML);
+        let locked = &seaweedfs["spec"]["lockedValues"];
+        let seed_s3 = yaml(SEED_CORE_ADDON_S3_SEAWEEDFS_YAML);
+        let core_values = &seed_s3["spec"]["values"];
+        assert_eq!(locked["global"]["seaweedfs"]["createClusterRole"], false);
+        assert_eq!(locked["s3"]["enabled"], core_values["s3"]["enabled"]);
+        assert_eq!(locked["s3"]["enableAuth"], core_values["s3"]["enableAuth"]);
+        let schema = &seaweedfs["spec"]["schema"]["properties"];
+        for component in ["master", "filer", "volume", "s3"] {
+            assert_eq!(
+                locked[component]["logs"], core_values[component]["logs"],
+                "{component} logs"
+            );
+            let csc = &locked[component]["containerSecurityContext"];
+            assert_eq!(csc["enabled"], true, "{component}");
+            assert_eq!(csc["allowPrivilegeEscalation"], false, "{component}");
+            assert_eq!(
+                csc["seccompProfile"]["type"], "RuntimeDefault",
+                "{component}"
+            );
+            assert_eq!(
+                locked[component]["podSecurityContext"]["runAsNonRoot"], true,
+                "{component}"
+            );
+        }
+        for (component, key) in [("master", "data"), ("filer", "data"), ("volume", "idx")] {
+            assert_eq!(
+                locked[component][key]["type"], core_values[component][key]["type"],
+                "{component}.{key}"
+            );
+            assert_eq!(
+                schema[component]["properties"][key]["properties"]["size"]["default"],
+                core_values[component][key]["size"],
+                "{component}.{key} size"
+            );
+        }
+        let data_dir = &schema["volume"]["properties"]["dataDirs"]["default"][0];
+        assert_eq!(data_dir, &core_values["volume"]["dataDirs"][0]);
+        let admin = &schema["s3"]["properties"]["credentials"]["properties"]["admin"]["properties"];
+        assert_eq!(admin["accessKey"]["format"], "password");
+        assert_eq!(admin["secretKey"]["format"], "password");
     }
 }

@@ -265,6 +265,8 @@ async function main() {
   const staticSiteCatalogDir = path.join(workDir, 'catalog', 'apps', 'static-site');
   const rauthyCatalogDir = path.join(workDir, 'catalog', 'core', 'rauthy');
   const certManagerCatalogDir = path.join(workDir, 'catalog', 'apps', 'cert-manager');
+  // Self-service Helm twins of management-plane base add-ons (built-in catalog entries).
+  const selfServiceHelmApps = ['forgejo', 'seaweedfs'];
   const coreAddonsDir = path.join(workDir, 'clusters', 'management', 'core-addons');
   const tenantAcmeInfra = path.join(workDir, 'tenants', 'acme', 'infra', 'net');
 
@@ -436,6 +438,14 @@ spec:
     path.resolve(__dirname, '../../deploy/catalog/apps/cert-manager/catalog.yaml'),
     path.join(certManagerCatalogDir, 'catalog.yaml'),
   );
+  for (const id of selfServiceHelmApps) {
+    const dir = path.join(workDir, 'catalog', 'apps', id);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.copyFileSync(
+      path.resolve(__dirname, `../../deploy/catalog/apps/${id}/catalog.yaml`),
+      path.join(dir, 'catalog.yaml'),
+    );
+  }
 
   fs.writeFileSync(
     path.join(rauthyCatalogDir, 'catalog.yaml'),

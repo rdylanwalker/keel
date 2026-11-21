@@ -524,7 +524,15 @@ pub struct HelmReleaseSpecInput {
     pub depends_on: Vec<FluxDependencyRef>,
     #[serde(default)]
     pub extra_labels: BTreeMap<String, String>,
+    /// `metadata.annotations` (e.g. `keel.io/route-hostnames`).
+    #[serde(default)]
+    pub annotations: BTreeMap<String, String>,
 }
+
+/// `HelmRelease` annotation listing (comma-separated) the Gateway route hostnames a Helm catalog
+/// app's chart renders (`spec.gatewayRoutes`), so later proposals can detect hostname claims
+/// without rendering the chart.
+pub const ROUTE_HOSTNAMES_ANNOTATION: &str = "keel.io/route-hostnames";
 
 impl HelmReleaseSpecInput {
     pub fn new(
@@ -547,6 +555,16 @@ impl HelmReleaseSpecInput {
             target_namespace: None,
             depends_on: Vec::new(),
             extra_labels: BTreeMap::new(),
+            annotations: BTreeMap::new(),
+        }
+    }
+
+    /// Helm release name Flux derives for this `HelmRelease` (`[<targetNamespace>-]<name>`,
+    /// no `spec.releaseName` is set), i.e. the pods' `app.kubernetes.io/instance` label.
+    pub fn helm_release_name(&self) -> String {
+        match &self.target_namespace {
+            Some(ns) => format!("{ns}-{}", self.release_name),
+            None => self.release_name.clone(),
         }
     }
 }
@@ -686,14 +704,19 @@ pub fn synthesize_helm_release(input: &HelmReleaseSpecInput) -> Result<Value, Ku
         labels.insert(k.clone(), v.clone());
     }
 
+    let mut metadata = json!({
+        "name": input.release_name,
+        "namespace": namespace,
+        "labels": labels,
+    });
+    if !input.annotations.is_empty() {
+        metadata["annotations"] = json!(input.annotations);
+    }
+
     Ok(json!({
         "apiVersion": "helm.toolkit.fluxcd.io/v2",
         "kind": "HelmRelease",
-        "metadata": {
-            "name": input.release_name,
-            "namespace": namespace,
-            "labels": labels,
-        },
+        "metadata": metadata,
         "spec": spec,
     }))
 }
@@ -1287,6 +1310,174 @@ pub fn synthesize_flux_manifest_app_kustomizations(
         synthesize_flux_kustomization_yaml(&config)?,
         synthesize_flux_kustomization_yaml(&app)?,
     ))
+}
+
+/// Synthesizes the `<name>-config` Flux `Kustomization` of a Helm app with secret fields (YAML).
+///
+/// It applies `<app_dir>/config/` (the SOPS-encrypted `<name>-secrets` `Secret`, one key per
+/// secret values fragment) in `tenant-<id>` of the **management** cluster, decrypting with the
+/// tenant `sops-age` Secret. The app's `HelmRelease` reads the fragments through
+/// `spec.valuesFrom`, which helm-controller resolves in the `HelmRelease` namespace (also for
+/// remote `kubeConfig` targets), so the Secret never leaves the management cluster.
+pub fn synthesize_helm_app_secrets_kustomization_yaml(
+    tenant_id: &str,
+    name: &str,
+    source_name: &str,
+    app_dir: &str,
+    extra_labels: &BTreeMap<String, String>,
+) -> Result<String, KubeError> {
+    let app_dir = app_dir.trim_start_matches("./").trim_end_matches('/');
+    let mut config = FluxKustomizationSpecInput::new(
+        tenant_id,
+        manifest_app_config_kustomization_name(name),
+        source_name,
+        format!("./{app_dir}/{MANIFEST_APP_CONFIG_DIR}"),
+    );
+    config.extra_labels = extra_labels.clone();
+    config
+        .extra_labels
+        .insert("keel.io/config-for".to_string(), name.to_string());
+    config.decryption_secret_name = Some(crate::TENANT_SOPS_AGE_SECRET_NAME.to_string());
+    synthesize_flux_kustomization_yaml(&config)
+}
+
+/// Label Envoy Gateway puts on the proxy pods of a Gateway (`keel-ingress`).
+pub const ENVOY_OWNING_GATEWAY_LABEL: &str = "gateway.envoyproxy.io/owning-gateway-name";
+
+/// Container ports of the `keel-ingress` Envoy proxy pods: Envoy Gateway maps listener ports
+/// below 1024 to `port + 10000` (HTTP 80 -> 10080, HTTPS 443 -> 10443); the local HTTPS
+/// listener keeps 8888. NetworkPolicies match the pod port after Service DNAT.
+pub const KEEL_INGRESS_PROXY_PORTS: [u16; 3] = [10080, 10443, 8888];
+
+/// Public IPv4 egress exclusions: RFC 1918, CGNAT, link-local (cloud metadata), loopback,
+/// "this network", multicast and reserved ranges.
+pub const PUBLIC_EGRESS_EXCEPT_CIDRS: [&str; 9] = [
+    "0.0.0.0/8",
+    "10.0.0.0/8",
+    "100.64.0.0/10",
+    "127.0.0.0/8",
+    "169.254.0.0/16",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "224.0.0.0/4",
+    "240.0.0.0/4",
+];
+
+fn tcp_ports(ports: &[u16]) -> Result<Vec<Value>, KubeError> {
+    if ports.contains(&0) {
+        return Err(KubeError::InvalidInput(
+            "NetworkPolicy ports must be >= 1".to_string(),
+        ));
+    }
+    Ok(ports
+        .iter()
+        .map(|p| json!({ "protocol": "TCP", "port": p }))
+        .collect())
+}
+
+/// Synthesizes the Keel-generated tenant `NetworkPolicy` (`allow-<name>-app`) of a Helm app
+/// declaring `spec.networkPolicy` (YAML). It selects the release's pods
+/// (`app.kubernetes.io/instance: <helm_release_name>`) through the tenant `default-deny-all`:
+///
+/// * cluster DNS egress, always;
+/// * ingress from the Envoy Gateway proxies (`keel-system`) on `gateway_ingress_ports`;
+/// * ingress from any pod of the tenant namespace on `namespace_ingress_ports`;
+/// * optionally release-internal traffic;
+/// * optionally egress to the `keel-ingress` proxy pods only (never other `keel-system`
+///   workloads such as the state backend or the management forge), on their listener ports;
+/// * optionally public IPv4 egress on TCP 80/443 (private, link-local and reserved ranges
+///   excluded).
+pub fn synthesize_helm_app_network_policy_yaml(
+    tenant_id: &str,
+    name: &str,
+    helm_release_name: &str,
+    spec: &keel_core::HelmNetworkPolicySpec,
+) -> Result<String, KubeError> {
+    let namespace = tenant_namespace(tenant_id)?;
+    validate_resource_name("name", name)?;
+    if helm_release_name.is_empty() || helm_release_name.len() > 63 {
+        return Err(KubeError::InvalidInput(format!(
+            "Helm release name `{helm_release_name}` must be 1-63 characters"
+        )));
+    }
+    let keel_system_selector = json!({
+        "matchLabels": { "kubernetes.io/metadata.name": "keel-system" }
+    });
+    let release_pods = json!({
+        "podSelector": {
+            "matchLabels": { "app.kubernetes.io/instance": helm_release_name }
+        }
+    });
+
+    let mut ingress = Vec::new();
+    if !spec.gateway_ingress_ports.is_empty() {
+        ingress.push(json!({
+            "from": [{ "namespaceSelector": keel_system_selector.clone() }],
+            "ports": tcp_ports(&spec.gateway_ingress_ports)?,
+        }));
+    }
+    if !spec.namespace_ingress_ports.is_empty() {
+        ingress.push(json!({
+            "from": [{ "podSelector": {} }],
+            "ports": tcp_ports(&spec.namespace_ingress_ports)?,
+        }));
+    }
+    let mut egress = vec![json!({
+        "to": [{
+            "namespaceSelector": {
+                "matchLabels": { "kubernetes.io/metadata.name": "kube-system" }
+            }
+        }],
+        "ports": [
+            { "protocol": "UDP", "port": 53 },
+            { "protocol": "TCP", "port": 53 }
+        ]
+    })];
+    if spec.release_traffic {
+        ingress.push(json!({ "from": [release_pods.clone()] }));
+        egress.push(json!({ "to": [release_pods.clone()] }));
+    }
+    if spec.gateway_egress {
+        egress.push(json!({
+            "to": [{
+                "namespaceSelector": keel_system_selector,
+                "podSelector": {
+                    "matchLabels": { ENVOY_OWNING_GATEWAY_LABEL: "keel-ingress" }
+                }
+            }],
+            "ports": tcp_ports(&KEEL_INGRESS_PROXY_PORTS)?,
+        }));
+    }
+    if spec.public_egress {
+        egress.push(json!({
+            "to": [{
+                "ipBlock": {
+                    "cidr": "0.0.0.0/0",
+                    "except": PUBLIC_EGRESS_EXCEPT_CIDRS,
+                }
+            }],
+            "ports": tcp_ports(&[80, 443])?,
+        }));
+    }
+
+    let mut labels = tenant_common_labels(tenant_id);
+    labels.insert("keel.io/app".to_string(), name.to_string());
+    let doc = json!({
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "NetworkPolicy",
+        "metadata": {
+            "name": format!("allow-{name}-app"),
+            "namespace": namespace,
+            "labels": labels,
+        },
+        "spec": {
+            "podSelector": release_pods["podSelector"],
+            "policyTypes": ["Ingress", "Egress"],
+            "ingress": ingress,
+            "egress": egress,
+        }
+    });
+    Ok(serde_yml::to_string(&doc)?)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2039,6 +2230,169 @@ mod tests {
         assert!(tenant_namespace("acme-").is_err());
         assert!(tenant_namespace("../flux-system").is_err());
         assert!(tenant_namespace(&"a".repeat(60)).is_err());
+    }
+
+    #[test]
+    fn helm_app_secrets_kustomization_and_network_policy() {
+        let labels = BTreeMap::from([("keel.io/catalog-id".to_string(), "forgejo".to_string())]);
+        let yaml = synthesize_helm_app_secrets_kustomization_yaml(
+            "acme",
+            "git",
+            "keel-gitops",
+            "./tenants/acme/apps/git/",
+            &labels,
+        )
+        .unwrap();
+        let k: Value = serde_yml::from_str(&yaml).unwrap();
+        assert_eq!(k["metadata"]["name"], "git-config");
+        assert_eq!(k["metadata"]["namespace"], "tenant-acme");
+        assert_eq!(k["metadata"]["labels"]["keel.io/config-for"], "git");
+        assert_eq!(k["metadata"]["labels"]["keel.io/catalog-id"], "forgejo");
+        assert_eq!(k["spec"]["path"], "./tenants/acme/apps/git/config");
+        assert_eq!(k["spec"]["targetNamespace"], "tenant-acme");
+        assert_eq!(k["spec"]["decryption"]["provider"], "sops");
+        assert_eq!(
+            k["spec"]["decryption"]["secretRef"]["name"],
+            crate::TENANT_SOPS_AGE_SECRET_NAME
+        );
+        assert!(k["spec"].get("kubeConfig").is_none());
+
+        let full = keel_core::HelmNetworkPolicySpec {
+            gateway_ingress_ports: vec![3000, 8333],
+            namespace_ingress_ports: vec![8333],
+            release_traffic: true,
+            gateway_egress: true,
+            public_egress: true,
+        };
+        let np: Value = serde_yml::from_str(
+            &synthesize_helm_app_network_policy_yaml("acme", "git", "git", &full).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(np["metadata"]["name"], "allow-git-app");
+        assert_eq!(np["metadata"]["namespace"], "tenant-acme");
+        assert_eq!(
+            np["spec"]["podSelector"]["matchLabels"]["app.kubernetes.io/instance"],
+            "git"
+        );
+        assert_eq!(np["spec"]["policyTypes"], json!(["Ingress", "Egress"]));
+        assert_eq!(
+            np["spec"]["ingress"][0]["from"][0]["namespaceSelector"]["matchLabels"]["kubernetes.io/metadata.name"],
+            "keel-system"
+        );
+        assert_eq!(np["spec"]["ingress"][0]["ports"][1]["port"], 8333);
+        // Any pod of the tenant namespace, on the declared ports only.
+        assert_eq!(
+            np["spec"]["ingress"][1]["from"],
+            json!([{ "podSelector": {} }])
+        );
+        assert_eq!(
+            np["spec"]["ingress"][1]["ports"],
+            json!([{ "protocol": "TCP", "port": 8333 }])
+        );
+        assert_eq!(
+            np["spec"]["ingress"][2]["from"][0]["podSelector"]["matchLabels"]["app.kubernetes.io/instance"],
+            "git"
+        );
+        let egress = np["spec"]["egress"].as_array().unwrap();
+        assert_eq!(egress.len(), 4);
+        assert_eq!(egress[0]["ports"][0]["port"], 53);
+        // Gateway egress: only the keel-ingress Envoy proxy pods, only their listener ports.
+        let gw = &egress[2]["to"][0];
+        assert_eq!(
+            gw["namespaceSelector"]["matchLabels"]["kubernetes.io/metadata.name"],
+            "keel-system"
+        );
+        assert_eq!(
+            gw["podSelector"]["matchLabels"]["gateway.envoyproxy.io/owning-gateway-name"],
+            "keel-ingress"
+        );
+        assert_eq!(
+            egress[2]["ports"],
+            json!([
+                { "protocol": "TCP", "port": 10080 },
+                { "protocol": "TCP", "port": 10443 },
+                { "protocol": "TCP", "port": 8888 }
+            ])
+        );
+        // Public egress: HTTP(S) only, private/link-local/reserved ranges excluded.
+        assert_eq!(egress[3]["to"][0]["ipBlock"]["cidr"], "0.0.0.0/0");
+        let except = egress[3]["to"][0]["ipBlock"]["except"].as_array().unwrap();
+        for cidr in [
+            "10.0.0.0/8",
+            "169.254.0.0/16",
+            "0.0.0.0/8",
+            "224.0.0.0/4",
+            "240.0.0.0/4",
+        ] {
+            assert!(except.contains(&json!(cidr)), "{cidr}");
+        }
+        assert_eq!(
+            egress[3]["ports"],
+            json!([
+                { "protocol": "TCP", "port": 80 },
+                { "protocol": "TCP", "port": 443 }
+            ])
+        );
+        let bad_port = keel_core::HelmNetworkPolicySpec {
+            namespace_ingress_ports: vec![0],
+            ..keel_core::HelmNetworkPolicySpec::default()
+        };
+        assert!(synthesize_helm_app_network_policy_yaml("acme", "git", "git", &bad_port).is_err());
+
+        // Minimal: DNS egress only, no ingress at all.
+        let minimal: Value = serde_yml::from_str(
+            &synthesize_helm_app_network_policy_yaml(
+                "acme",
+                "s3",
+                "tenant-acme-s3",
+                &keel_core::HelmNetworkPolicySpec::default(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(minimal["spec"]["ingress"], json!([]));
+        assert_eq!(minimal["spec"]["egress"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            minimal["spec"]["podSelector"]["matchLabels"]["app.kubernetes.io/instance"],
+            "tenant-acme-s3"
+        );
+        assert!(
+            synthesize_helm_app_network_policy_yaml(
+                "acme",
+                "s3",
+                "",
+                &keel_core::HelmNetworkPolicySpec::default()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn helm_release_annotations_and_release_name() {
+        let mut input = HelmReleaseSpecInput::new(
+            "acme",
+            "git",
+            "forgejo",
+            HelmChartSourceRef {
+                kind: HelmChartSourceKind::HelmRepository,
+                name: "git-repo".to_string(),
+                namespace: None,
+            },
+        );
+        assert_eq!(input.helm_release_name(), "git");
+        let hr = synthesize_helm_release(&input).unwrap();
+        assert!(hr["metadata"].get("annotations").is_none());
+        input.annotations.insert(
+            ROUTE_HOSTNAMES_ANNOTATION.to_string(),
+            "git.acme.example".to_string(),
+        );
+        input.target_namespace = Some("tenant-acme".to_string());
+        assert_eq!(input.helm_release_name(), "tenant-acme-git");
+        let hr = synthesize_helm_release(&input).unwrap();
+        assert_eq!(
+            hr["metadata"]["annotations"][ROUTE_HOSTNAMES_ANNOTATION],
+            "git.acme.example"
+        );
     }
 
     #[test]

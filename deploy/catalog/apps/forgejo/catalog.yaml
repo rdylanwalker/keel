@@ -1,0 +1,307 @@
+# Self-Service Forgejo Git Forge (`SDD.md` §5.1, `NFR-SEC-03`, `NFR-SEC-05`)
+#
+# Tenant-installable Forgejo from the upstream chart (`runtime: helm`, no fork or patch). This is
+# NOT Keel's own forge: the management-plane Forgejo (`catalog/core/forgejo`, `--with-forge`) hosts
+# the GitOps repository and is managed from the Topology Map. `upstream.version` is the chart
+# version and must stay equal to `catalog/core/forgejo` (bump both together; enforced by a keel-cli
+# test).
+#
+# Known-good config reused from `deploy/seed/core-addons/forgejo.yaml` /
+# `deploy/bootstrap/control-plane-forgejo/Pulumi.yaml` (SQLite, OAuth2 client settings), adapted for
+# a `restricted` tenant namespace through `lockedValues` (rootless image, non-root UID 1000,
+# no privilege escalation, all capabilities dropped, RuntimeDefault seccomp, read-only root
+# filesystem, no Helm test pod). Persistence is on by default (the chart keeps the PVC on
+# uninstall: `helm.sh/resource-policy: keep`).
+#
+# Secret fields (`format: password` / `writeOnly`): the admin password and the OIDC login sources
+# (client secrets) are SOPS-encrypted with the tenant `age` key into `config/secrets.enc.yaml`
+# (`<instance>-secrets`, one values fragment per field) and merged by helm-controller through
+# `HelmRelease.spec.valuesFrom`; Git and the HelmRelease only ever hold ciphertext.
+#
+# The chart's HTTPRoute (`httpRoute.*`) attaches to both HTTPS listeners of the shared
+# `keel-system/keel-ingress` Gateway (Keel pins `parentRefs`). Its hostname has no default (it
+# must be unique); Keel and the Kyverno `restrict-tenant-route-hostnames` policy reject platform
+# hosts (IdP, keel-server, Forgejo) and Keel rejects hostnames already routed by another app.
+# On the management cluster Keel also commits a NetworkPolicy (Gateway ingress on 3000, DNS,
+# egress to the `keel-ingress` Envoy proxies only for an OIDC issuer routed there, and public
+# HTTP(S) egress for OIDC discovery, mirrors and webhooks). Webhooks and migrations may not
+# target private networks (locked `webhook.ALLOWED_HOST_LIST` / `migrations.ALLOW_LOCALNETWORKS`).
+# Routes are management-cluster only: disable `httpRoute.enabled` for a remote workload cluster.
+#
+# Only the values in `schema` can be submitted (`lockedValues`/`gatewayRoutes` make Keel reject
+# undeclared values such as `extraDeploy`, `extraContainers` or a ServiceAccount override); the
+# chart's Ingress, TCPRoute and OpenShift Route stay off. The volume size, storage class and claim
+# name are create-only (`immutableValues`): resizing needs a manual PVC expansion.
+apiVersion: keel.io/v1alpha1
+kind: CatalogApplication
+metadata:
+  id: forgejo
+  name: Forgejo Git Forge
+  description: Self-service Forgejo Git forge (single replica, SQLite, persistent volume) with an optional public HTTPRoute on the shared keel-ingress Gateway and OpenID Connect login (e.g. a tenant Rauthy or Dex).
+  category: developer-tools
+  runtime: helm
+spec:
+  upstream:
+    chart: forgejo
+    repoURL: oci://code.forgejo.org/forgejo-helm
+    version: "17.3.3"
+  progressiveDelivery:
+    flaggerSupported: false
+    defaultCanary: false
+  gatewayRoutes:
+    - enabledValue: httpRoute.enabled
+      hostnamesValue: httpRoute.hostnames
+      parentRefsValue: httpRoute.parentRefs
+  networkPolicy:
+    gatewayIngressPorts:
+      - 3000
+    gatewayEgress: true
+    publicEgress: true
+  immutableValues:
+    - persistence.size
+    - persistence.storageClass
+    - persistence.claimName
+  lockedValues:
+    # Forgejo is not HA ready: one replica, replaced (not rolled) on the RWO volume.
+    replicaCount: 1
+    strategy:
+      type: Recreate
+    image:
+      rootless: true
+    test:
+      enabled: false
+    serviceAccount:
+      create: false
+      automountServiceAccountToken: false
+    podSecurityContext:
+      fsGroup: 1000
+      fsGroupChangePolicy: OnRootMismatch
+      runAsNonRoot: true
+      runAsUser: 1000
+      runAsGroup: 1000
+      seccompProfile:
+        type: RuntimeDefault
+    containerSecurityContext:
+      allowPrivilegeEscalation: false
+      capabilities:
+        drop:
+          - ALL
+      privileged: false
+      readOnlyRootFilesystem: true
+      runAsNonRoot: true
+      runAsUser: 1000
+      runAsGroup: 1000
+      seccompProfile:
+        type: RuntimeDefault
+    persistence:
+      create: true
+      mount: true
+      accessModes:
+        - ReadWriteOnce
+    httpRoute:
+      # keel-ingress terminates TLS: the derived ROOT_URL is https://<hostname>.
+      terminate: true
+    # Only the guarded HTTPRoute above may expose the release.
+    ingress:
+      enabled: false
+    tcpRoute:
+      enabled: false
+    route:
+      enabled: false
+    extraDeploy: []
+    gitea:
+      config:
+        database:
+          DB_TYPE: sqlite3
+        # No SSRF into the cluster or private networks through webhooks or repository migrations.
+        webhook:
+          ALLOWED_HOST_LIST: external
+        migrations:
+          ALLOW_LOCALNETWORKS: false
+        oauth2_client:
+          ENABLE_AUTO_REGISTRATION: true
+          ACCOUNT_LINKING: auto
+          USERNAME: userid
+          OPENID_CONNECT_SCOPES: openid email profile groups
+  schema:
+    type: object
+    required:
+      - gitea
+    properties:
+      gitea:
+        type: object
+        title: Forgejo
+        required:
+          - admin
+        properties:
+          admin:
+            type: object
+            title: Bootstrap Administrator
+            required:
+              - username
+              - email
+              - password
+            properties:
+              username:
+                type: string
+                title: Admin Username
+                description: Forgejo reserves 'admin'; pick another name.
+                pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,38}$"
+                not:
+                  pattern: "^[Aa][Dd][Mm][Ii][Nn]$"
+                default: forgejo-admin
+              email:
+                type: string
+                title: Admin Email
+                format: email
+                default: admin@keel.local
+              password:
+                type: string
+                title: Admin Password
+                description: 12-128 characters without whitespace.
+                format: password
+                writeOnly: true
+                pattern: "^\\S{12,128}$"
+              passwordMode:
+                type: string
+                title: Password Mode
+                description: keepUpdated re-applies this password on every start; the initialOnly modes set it once.
+                enum:
+                  - keepUpdated
+                  - initialOnlyNoReset
+                  - initialOnlyRequireReset
+                default: keepUpdated
+          config:
+            type: object
+            title: app.ini Settings
+            properties:
+              server:
+                type: object
+                title: Server
+                properties:
+                  ROOT_URL:
+                    type: string
+                    title: Public Root URL
+                    description: "Leave empty to derive https://<hostname> from the route. Set it when the Gateway listens on another port, e.g. https://git-<tenant>.keel.local:8888/ on the local kind cluster."
+                    pattern: "^(https?://[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._~/%-]*)?)?$"
+                    default: ""
+              service:
+                type: object
+                title: Registration
+                properties:
+                  DISABLE_REGISTRATION:
+                    type: boolean
+                    title: Disable All Registration
+                    default: false
+                  ALLOW_ONLY_EXTERNAL_REGISTRATION:
+                    type: boolean
+                    title: Only Allow Registration Through OIDC
+                    description: Local sign-up is disabled; users are created on their first OpenID Connect login (or by the admin).
+                    default: true
+          oauth:
+            type: array
+            title: OpenID Connect Login Sources
+            description: Optional. Stored SOPS-encrypted as a whole (client secrets included); on Edit, leave the list empty to keep the stored sources, or re-enter every source to replace them.
+            writeOnly: true
+            maxItems: 3
+            items:
+              type: object
+              required:
+                - name
+                - provider
+                - key
+                - secret
+                - autoDiscoverUrl
+              properties:
+                name:
+                  type: string
+                  title: Display Name
+                  description: Shown on the login button (e.g. rauthy); also the callback path /user/oauth2/<name>/callback.
+                  pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$"
+                provider:
+                  type: string
+                  title: Provider
+                  enum:
+                    - openidConnect
+                  default: openidConnect
+                # The chart renders these into its init shell script: no shell metacharacters.
+                key:
+                  type: string
+                  title: Client ID
+                  pattern: "^[A-Za-z0-9._~+/=-]{1,255}$"
+                secret:
+                  type: string
+                  title: Client Secret
+                  format: password
+                  pattern: "^[A-Za-z0-9._~+/=-]{1,255}$"
+                autoDiscoverUrl:
+                  type: string
+                  title: Discovery URL
+                  description: "Issuer discovery document, e.g. https://auth-<tenant>.example.com/auth/v1/.well-known/openid-configuration (Rauthy) or https://dex.example.com/.well-known/openid-configuration (Dex). It must serve a certificate the Forgejo image trusts."
+                  pattern: "^https://[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._~/%-]*)?$"
+      persistence:
+        type: object
+        title: Persistence
+        properties:
+          enabled:
+            type: boolean
+            title: Persistent Volume
+            description: Keep repositories and the SQLite database on a PersistentVolumeClaim (kept when the app is removed). Disabling it loses all data whenever the pod is replaced.
+            default: true
+          size:
+            type: string
+            title: Volume Size
+            description: Fixed after install (resizing needs a manual PersistentVolumeClaim expansion).
+            pattern: "^[1-9][0-9]*(Mi|Gi|Ti)$"
+            default: 10Gi
+          claimName:
+            type: string
+            title: Claim Name
+            description: Must be unique per Forgejo instance in the namespace. Fixed after install.
+            pattern: "^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$"
+            default: forgejo-data
+          storageClass:
+            type: string
+            title: Storage Class
+            description: Empty uses the cluster default. Fixed after install.
+            default: ""
+      httpRoute:
+        type: object
+        title: Public Route (keel-ingress)
+        properties:
+          enabled:
+            type: boolean
+            title: Expose Through keel-ingress
+            description: Management cluster only; turn it off when installing into a remote workload cluster.
+            default: true
+          hostnames:
+            type: array
+            title: Public Hostname
+            description: Unique DNS name routed by the keel-ingress Gateway (e.g. git-<tenant>.keel.local); required when exposed. Platform hosts (idp., keel., forgejo.) and hostnames already used by another app are rejected.
+            maxItems: 1
+            items:
+              type: string
+              format: hostname
+  uiSchema:
+    ui:order:
+      - httpRoute
+      - gitea
+      - persistence
+    gitea:
+      admin:
+        ui:order:
+          - username
+          - email
+          - password
+          - passwordMode
+        password:
+          ui:widget: password
+          ui:help: "Encrypted via SOPS + per-tenant age key before committing to Git (never stored in plaintext). Leave blank on Edit to keep it."
+      oauth:
+        items:
+          secret:
+            ui:widget: password
+    httpRoute:
+      hostnames:
+        items:
+          ui:placeholder: "git-<tenant>.keel.local"

@@ -1,0 +1,411 @@
+# Self-Service SeaweedFS S3 Object Storage (`SDD.md` §5.1, `NFR-SEC-03`, `NFR-SEC-05`)
+#
+# Tenant-installable SeaweedFS from the upstream chart (`runtime: helm`, no fork or patch). This is
+# NOT Keel's own state backend: the management-plane SeaweedFS (`catalog/core/s3-state-backend`)
+# stores Pulumi state and break-glass backups and is managed from the Topology Map.
+# `upstream.version` is the chart version and must stay equal to `catalog/core/s3-state-backend`
+# (bump both together; enforced by a keel-cli test).
+#
+# Known-good topology reused from `deploy/seed/core-addons/s3-seaweedfs.yaml` (one master, one
+# volume server, one filer and the S3 gateway with authentication, every data directory on a
+# PersistentVolumeClaim, logs on emptyDir), adapted for a `restricted` tenant namespace through
+# `lockedValues`: no ClusterRole/ClusterRoleBinding (`global.seaweedfs.createClusterRole: false`)
+# and non-root UID 1000, no privilege escalation, all capabilities dropped, RuntimeDefault
+# seccomp on every component.
+#
+# The S3 admin access/secret keys are secret fields: SOPS-encrypted with the tenant `age` key into
+# `config/secrets.enc.yaml` (`<instance>-secrets`) and merged by helm-controller through
+# `HelmRelease.spec.valuesFrom`; Git and the HelmRelease only ever hold ciphertext.
+#
+# Only the values in `schema` can be submitted (`lockedValues`/`gatewayRoutes` make Keel reject
+# undeclared values): the chart's other routes and ingresses (master, filer, volume, admin), the
+# optional admin/SFTP/worker/COSI/vector components and the volume resize hook (a `kubectl` Job
+# that needs kube-apiserver egress) are locked off. Volume sizes and the storage class are
+# create-only (`immutableValues`): they shape StatefulSet `volumeClaimTemplates`, which Kubernetes
+# never lets an upgrade change.
+#
+# Optional S3 HTTPRoute (`s3.httpRoute.*`) on both HTTPS listeners of the shared
+# `keel-system/keel-ingress` Gateway (Keel pins `parentRefs`; same hostname guards as every tenant
+# route; management cluster only). On the management cluster Keel commits a NetworkPolicy:
+# traffic between the release's pods, Gateway and same-namespace ingress to the S3 port (8333)
+# and DNS.
+apiVersion: keel.io/v1alpha1
+kind: CatalogApplication
+metadata:
+  id: seaweedfs
+  name: SeaweedFS S3 Storage
+  description: Self-service S3-compatible object storage (SeaweedFS master, volume, filer and authenticated S3 gateway on persistent volumes) with optional buckets and an optional public S3 HTTPRoute on the shared keel-ingress Gateway.
+  category: storage
+  runtime: helm
+spec:
+  upstream:
+    chart: seaweedfs
+    repoURL: https://seaweedfs.github.io/seaweedfs/helm
+    version: "4.54.0"
+  progressiveDelivery:
+    flaggerSupported: false
+    defaultCanary: false
+  gatewayRoutes:
+    - enabledValue: s3.httpRoute.enabled
+      hostnamesValue: s3.httpRoute.hostnames
+      parentRefsValue: s3.httpRoute.parentRefs
+  networkPolicy:
+    gatewayIngressPorts:
+      - 8333
+    # Other workloads of the tenant namespace may use the S3 endpoint.
+    namespaceIngressPorts:
+      - 8333
+    releaseTraffic: true
+  immutableValues:
+    - master.data.size
+    - filer.data.size
+    - volume.idx.size
+    - volume.dataDirs
+  lockedValues:
+    global:
+      seaweedfs:
+        createClusterRole: false
+    allInOne:
+      enabled: false
+    # Fixed topology: optional components stay off (COSI renders cluster-scoped RBAC).
+    admin:
+      enabled: false
+      ingress:
+        enabled: false
+      httpRoute:
+        enabled: false
+    sftp:
+      enabled: false
+    worker:
+      enabled: false
+    cosi:
+      enabled: false
+    vector:
+      enabled: false
+    s3:
+      enabled: true
+      enableAuth: true
+      ingress:
+        enabled: false
+      icebergIngress:
+        enabled: false
+      lanceIngress:
+        enabled: false
+      logs:
+        type: emptyDir
+      podSecurityContext:
+        enabled: true
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containerSecurityContext:
+        enabled: true
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        allowPrivilegeEscalation: false
+        privileged: false
+        capabilities:
+          drop:
+            - ALL
+        seccompProfile:
+          type: RuntimeDefault
+    master:
+      # Only the S3 gateway may be routed (`spec.gatewayRoutes`); master/filer/volume expose
+      # unauthenticated APIs.
+      ingress:
+        enabled: false
+      httpRoute:
+        enabled: false
+      logs:
+        type: emptyDir
+      data:
+        type: persistentVolumeClaim
+      podSecurityContext:
+        enabled: true
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containerSecurityContext:
+        enabled: true
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        allowPrivilegeEscalation: false
+        privileged: false
+        capabilities:
+          drop:
+            - ALL
+        seccompProfile:
+          type: RuntimeDefault
+    filer:
+      ingresses:
+        http:
+          enabled: false
+        grpc:
+          enabled: false
+      httpRoute:
+        enabled: false
+      logs:
+        type: emptyDir
+      data:
+        type: persistentVolumeClaim
+      podSecurityContext:
+        enabled: true
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containerSecurityContext:
+        enabled: true
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        allowPrivilegeEscalation: false
+        privileged: false
+        capabilities:
+          drop:
+            - ALL
+        seccompProfile:
+          type: RuntimeDefault
+    volume:
+      ingress:
+        enabled: false
+      httpRoute:
+        enabled: false
+      # The pre-upgrade PVC resize Job needs kube-apiserver access and an expandable
+      # StorageClass; sizes are create-only instead (`immutableValues`).
+      resizeHook:
+        enabled: false
+      logs:
+        type: emptyDir
+      idx:
+        type: persistentVolumeClaim
+      podSecurityContext:
+        enabled: true
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containerSecurityContext:
+        enabled: true
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        allowPrivilegeEscalation: false
+        privileged: false
+        capabilities:
+          drop:
+            - ALL
+        seccompProfile:
+          type: RuntimeDefault
+  schema:
+    type: object
+    required:
+      - s3
+    properties:
+      s3:
+        type: object
+        title: S3 Gateway
+        required:
+          - credentials
+        properties:
+          credentials:
+            type: object
+            title: Admin Credentials
+            required:
+              - admin
+            properties:
+              admin:
+                type: object
+                title: Admin Identity
+                required:
+                  - accessKey
+                  - secretKey
+                properties:
+                  accessKey:
+                    type: string
+                    title: Access Key ID
+                    description: "16-128 characters [A-Za-z0-9]. Generate with: openssl rand -hex 10"
+                    format: password
+                    writeOnly: true
+                    pattern: "^[A-Za-z0-9]{16,128}$"
+                  secretKey:
+                    type: string
+                    title: Secret Access Key
+                    description: "32-128 characters [A-Za-z0-9+/=]. Generate with: openssl rand -base64 30"
+                    format: password
+                    writeOnly: true
+                    pattern: "^[A-Za-z0-9+/=]{32,128}$"
+          createBuckets:
+            type: array
+            title: Buckets
+            description: Created (if missing) on install and upgrade.
+            maxItems: 20
+            default:
+              - name: data
+            items:
+              type: object
+              required:
+                - name
+              properties:
+                name:
+                  type: string
+                  title: Bucket Name
+                  pattern: "^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$"
+          httpRoute:
+            type: object
+            title: Public S3 Route (keel-ingress)
+            properties:
+              enabled:
+                type: boolean
+                title: Expose the S3 API Through keel-ingress
+                default: false
+              hostnames:
+                type: array
+                title: Public Hostname
+                description: Unique DNS name routed by the keel-ingress Gateway (e.g. s3-<tenant>.keel.local); required when exposed. Platform hosts and hostnames already used by another app are rejected. Management cluster only (keep the route off for a remote workload cluster).
+                maxItems: 1
+                items:
+                  type: string
+                  format: hostname
+      master:
+        type: object
+        title: Master Server
+        properties:
+          data:
+            type: object
+            properties:
+              size:
+                type: string
+                title: Master Volume Size
+                description: Fixed after install.
+                pattern: "^[1-9][0-9]*(Mi|Gi|Ti)$"
+                default: 1Gi
+      filer:
+        type: object
+        title: Filer
+        properties:
+          data:
+            type: object
+            properties:
+              size:
+                type: string
+                title: Filer Metadata Volume Size
+                description: Fixed after install.
+                pattern: "^[1-9][0-9]*(Mi|Gi|Ti)$"
+                default: 2Gi
+      volume:
+        type: object
+        title: Volume Server
+        properties:
+          idx:
+            type: object
+            properties:
+              size:
+                type: string
+                title: Index Volume Size
+                description: Fixed after install.
+                pattern: "^[1-9][0-9]*(Mi|Gi|Ti)$"
+                default: 2Gi
+          dataDirs:
+            type: array
+            title: Data Volume
+            description: Size and storage class are fixed after install.
+            minItems: 1
+            maxItems: 1
+            default:
+              - name: data1
+                type: persistentVolumeClaim
+                size: 10Gi
+                maxVolumes: 0
+            items:
+              type: object
+              required:
+                - name
+                - type
+                - size
+                - maxVolumes
+              additionalProperties: false
+              properties:
+                name:
+                  type: string
+                  const: data1
+                  default: data1
+                type:
+                  type: string
+                  const: persistentVolumeClaim
+                  default: persistentVolumeClaim
+                size:
+                  type: string
+                  title: Object Data Volume Size
+                  pattern: "^[1-9][0-9]*(Mi|Gi|Ti)$"
+                  default: 10Gi
+                maxVolumes:
+                  type: integer
+                  const: 0
+                  default: 0
+                storageClass:
+                  type: string
+                  title: Storage Class
+                  description: Empty uses the cluster default.
+      global:
+        type: object
+        title: Advanced
+        properties:
+          seaweedfs:
+            type: object
+            properties:
+              serviceAccountName:
+                type: string
+                title: ServiceAccount Name
+                description: Must be unique per SeaweedFS instance in the namespace.
+                pattern: "^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$"
+                default: seaweedfs
+  uiSchema:
+    ui:order:
+      - s3
+      - volume
+      - master
+      - filer
+      - global
+    s3:
+      ui:order:
+        - credentials
+        - createBuckets
+        - httpRoute
+      credentials:
+        admin:
+          accessKey:
+            ui:widget: password
+            ui:help: "Encrypted via SOPS + per-tenant age key before committing to Git. Leave blank on Edit to keep it."
+          secretKey:
+            ui:widget: password
+            ui:help: "Encrypted via SOPS + per-tenant age key before committing to Git. Leave blank on Edit to keep it."
+      httpRoute:
+        hostnames:
+          items:
+            ui:placeholder: "s3-<tenant>.keel.local"
+    volume:
+      dataDirs:
+        items:
+          name:
+            ui:widget: hidden
+          type:
+            ui:widget: hidden
+          maxVolumes:
+            ui:widget: hidden

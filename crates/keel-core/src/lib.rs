@@ -23,12 +23,14 @@ pub use bootstrap::{
 };
 pub use catalog::{
     CLUSTER_SCOPED_KINDS, DEFAULT_PLATFORM_BASE_DOMAIN, GATEWAY_ROUTE_KINDS, PLATFORM_HOST_LABELS,
-    PartitionedValues, PreparedHelmValues, SchemaFieldError, extract_manifest_variables,
-    extract_secret_field_paths, gateway_route_hostnames, is_secret_schema_node,
+    PartitionedValues, PreparedHelmValues, SchemaFieldError, changed_immutable_values,
+    extract_manifest_variables, extract_secret_field_paths, gateway_route_hostnames,
+    helm_secret_value_fragments, is_secret_schema_node, keel_ingress_parent_refs,
     manifest_cluster_scoped_kinds, parse_catalog, parse_catalog_application,
     parse_catalog_blueprint, parse_catalog_bundle, partition_values_by_schema,
     platform_reserved_hostnames, prepare_helm_values, render_helm_values_yaml,
-    render_manifest_template, replace_yaml_document, route_hostname_matches, split_yaml_documents,
+    render_manifest_template, replace_yaml_document, resolve_helm_gateway_routes,
+    route_hostname_matches, split_yaml_documents, undeclared_value_paths,
     validate_k8s_manifests_yaml, validate_route_hostnames, validate_schema_values,
     verify_rendered_manifest_structure, yaml_leading_comments,
 };
@@ -52,11 +54,12 @@ pub use models::{
     CatalogBlueprintMetadata, CatalogBlueprintSpec, CatalogBundle, CatalogBundleItem,
     CatalogBundleMetadata, CatalogBundleSpec, CatalogInfraBlueprint, CatalogManifest,
     CompanionInfraHook, DEFAULT_CLUSTER_NAME, DEFAULT_POLL_INTERVAL, ForgeConfig, ForgeKind,
-    InfraResourceKind, KeelConfig, MANAGEMENT_CORE_CATEGORY, ManifestEngine, OidcConfig,
-    PlacementScope, PlacementSpec, ProgressiveDeliverySpec, ProviderEntry, ProviderRegistry,
-    ResourceQuotaSpec, S3BackendConfig, StackSshInfoResponse, TenantConfig, UpstreamSource,
-    clean_candidate_ssh_host, clean_candidate_ssh_user, default_ssh_user_for_provider,
-    is_private_or_internal_ssh_host, resolve_ssh_target_from_sources,
+    HelmGatewayRouteSpec, HelmNetworkPolicySpec, InfraResourceKind, KeelConfig,
+    MANAGEMENT_CORE_CATEGORY, ManifestEngine, OidcConfig, PlacementScope, PlacementSpec,
+    ProgressiveDeliverySpec, ProviderEntry, ProviderRegistry, ResourceQuotaSpec, S3BackendConfig,
+    StackSshInfoResponse, TenantConfig, UpstreamSource, clean_candidate_ssh_host,
+    clean_candidate_ssh_user, default_ssh_user_for_provider, is_private_or_internal_ssh_host,
+    resolve_ssh_target_from_sources,
 };
 
 /// Flux CD controllers namespace (`SDD.md` §1).

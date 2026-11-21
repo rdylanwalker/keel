@@ -26,8 +26,22 @@ On a fresh repository, `keel bootstrap init` seeds these self-service apps into 
 | `cert-manager` | cert-manager | `helm` | Workload clusters only (`scope: cluster`) |
 | `dex` | Dex OIDC Provider | `helm` | Tenant-owned Dex. Workload clusters only (`scope: cluster`): the chart renders a `ClusterRole`/`ClusterRoleBinding` |
 | `rauthy` | Rauthy OIDC Provider | `manifest` (Flux) | Tenant-owned single-node Rauthy. Four required secret fields are SOPS-encrypted per tenant. Exposed through an `HTTPRoute` on the shared `keel-ingress` Gateway ([walkthrough](../getting-started/things-to-try.md#8-deploy-a-self-service-rauthy-oidc-provider-rauthy)) |
+| `forgejo` | Forgejo Git Forge | `helm` | Tenant-owned Forgejo (one rootless replica, SQLite, persistent volume on by default). Required admin password and optional OIDC login sources (client secrets) are SOPS-encrypted. Optional `HTTPRoute` on `keel-ingress` |
+| `seaweedfs` | SeaweedFS S3 Storage | `helm` | Tenant-owned S3 storage (master, volume, filer and authenticated S3 gateway on PVCs). Required S3 admin keys are SOPS-encrypted. Optional buckets and S3 `HTTPRoute` on `keel-ingress` |
 
-The tenant `rauthy` app is separate from Keel's own IdP. `catalog/core/rauthy` describes the protected management-plane Rauthy in `keel-system`. Admins manage it from the Topology Map, and it never appears in the tenant catalog. Both entries pin the same `ghcr.io/sebadob/rauthy` image tag and are bumped together.
+The tenant `rauthy`, `forgejo` and `seaweedfs` apps are separate from Keel's own management plane. `catalog/core/rauthy`, `catalog/core/forgejo` and `catalog/core/s3-state-backend` describe the protected management-plane IdP, forge and state backend in `keel-system`. Admins manage them from the Topology Map, and they never appear in the tenant catalog. Each tenant app reuses its management twin's known-good install config, adapted for a `restricted` tenant namespace, and pins the same version (`ghcr.io/sebadob/rauthy` tag, `forgejo` chart `17.3.3`, `seaweedfs` chart `4.54.0`). Tests fail when a pair drifts, so a version bump updates `catalog/core/<id>`, `catalog/apps/<id>`, the seed Flux object in `deploy/seed/core-addons/` and the Stage 0 Pulumi program together.
+
+Notes on the Helm twins:
+
+- **Forgejo:** Forgejo reserves the username `admin`. Leave *Public Root URL* empty to derive `https://<hostname>`; on the local `kind` Gateway set `https://git-<tenant>.keel.local:8888/`. The *OpenID Connect Login Sources* list is one secret field (it carries client secrets): on **Edit**, leave it empty to keep the stored sources or re-enter all of them. The discovery URL must be reachable from the pod and serve a certificate the Forgejo image trusts; the local `kind` CA is not trusted, and tenant hostnames are not resolvable inside the cluster unless your DNS resolves them.
+- **SeaweedFS:** generate keys with `openssl rand -hex 10` (access key) and `openssl rand -base64 30` (secret key). Inside the cluster the S3 endpoint is `http://<fullname>-s3.tenant-<tenant>.svc:8333`. `<fullname>` is the instance name, followed by `-seaweedfs` unless the name already contains `seaweedfs` (the default instance `seaweedfs` serves `seaweedfs-s3`). Through the optional route it is `https://<hostname>`. Change *ServiceAccount Name* when running a second instance in the same tenant namespace.
+  - On the management cluster, Keel's NetworkPolicy admits any pod of the same tenant namespace to port 8333. The tenant namespace denies all egress by default, though, so a consumer pod also needs its own egress rule to the S3 pods on 8333 (Keel only generates egress rules for apps whose catalog entry declares them). Other tenants cannot reach the endpoint.
+  - Only the S3 gateway can be routed. The master, filer, volume and admin APIs have no authentication, so their routes and ingresses stay off, as do the optional admin, SFTP, worker, COSI and vector components.
+- **Both apps:**
+  - The form is the whole interface. Keel rejects (`400`) values that the catalog schema does not declare, such as `extraDeploy`, sidecars, extra routes or a ServiceAccount override, and any value naming the tenant reconciler ServiceAccount `tenant-<id>-sa`.
+  - Volume sizes, storage classes and the Forgejo claim name are fixed after install. Kubernetes cannot change StatefulSet volume claim templates, and a PVC can only grow on a StorageClass with `allowVolumeExpansion`. An **Edit** that changes them is rejected (`400`). To grow a volume, expand the PersistentVolumeClaim by hand (`kubectl -n tenant-<tenant> patch pvc <claim> -p '{"spec":{"resources":{"requests":{"storage":"30Gi"}}}}'`) and keep the form value unchanged.
+  - Routes attach to the management cluster's `keel-ingress` Gateway. When installing into a remote workload cluster, turn the route off (Keel rejects an enabled route there with `400`) and expose the app through that cluster's own ingress.
+  - Both charts keep their PersistentVolumeClaims when the app is removed (Forgejo: `helm.sh/resource-policy: keep`; SeaweedFS: StatefulSet volume claims). SeaweedFS also keeps the `<fullname>-s3-secret` Secret, which holds the admin and read-only S3 keys in plaintext. Delete the claims and that Secret by hand. The chart recreates the Secret on every upgrade: the admin identity comes from your keys and stays the same, but the read-only identity gets new random keys each time.
 
 ## How Provider Blueprints Work
 
@@ -76,7 +90,7 @@ spec:
 
 ### Secret Partitioning (`writeOnly: true` / `format: password`)
 
-Any schema property marked with `writeOnly: true` or `format: password` is automatically partitioned out of plaintext `values.yaml` / `Stack.spec.config` and encrypted into a SOPS-encrypted Kubernetes `Secret` (`secret.enc.yaml`, named `<instance-name>-secrets`) using the tenant's `age` public key before staging to Git.
+Any schema property marked with `writeOnly: true` or `format: password` is automatically partitioned out of plaintext `values.yaml` / `Stack.spec.config` and encrypted into a SOPS-encrypted Kubernetes `Secret` (named `<instance-name>-secrets`) using the tenant's `age` public key before staging to Git. Infrastructure blueprints commit it as `secret.enc.yaml`; Helm apps and Flux manifest apps as `config/secrets.enc.yaml` (see [Helm app secrets](#helm-app-secrets-routes-and-networkpolicy)).
 
 For infrastructure blueprints (`CatalogInfraBlueprint`), Keel also binds each partitioned secret key to `Stack.spec.envRefs` using the **exact schema property name** as the environment variable name inside the PKO v2 workspace pod. Name credential properties after the environment variable expected by the Pulumi/OpenTofu provider (for example, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `GOOGLE_CREDENTIALS`, `HCLOUD_TOKEN`, or `CLOUDFLARE_API_TOKEN`).
 
@@ -135,6 +149,33 @@ Placement is a declarative guard declared by the catalog author. It gives early,
 - **Catalog Wizard:** tick *Installs cluster-scoped resources* to author `scope: cluster`.
 
 The built-in `cert-manager`, `envoy-gateway`, `flagger`, `prometheus`, `dex` and `authentik` apps are `scope: cluster`. `helm template` of their pinned charts with default values shows they install CRDs, webhooks or `ClusterRole`s. Prometheus has no CRDs, but its server and kube-state-metrics both create `ClusterRole`/`ClusterRoleBinding`s for cluster-wide scraping. Dex (`rbac.createClusterScoped: true`, used by its Kubernetes CRD storage) and authentik (`serviceAccount.create: true`, used by managed outposts) each render a `ClusterRole`/`ClusterRoleBinding`; turning those off would break those features.
+
+### Helm App Secrets, Routes and NetworkPolicy
+
+These apply to `runtime: helm` apps (single apps and bundle items):
+
+- **Secret fields** are committed as `config/secrets.enc.yaml`: one key per submitted secret field, named after its dot path (for example `gitea.admin.password`) and holding a Helm values fragment. `config-kustomization.yaml` (Flux `Kustomization <instance>-config`) decrypts it with the tenant `sops-age` Secret and applies it in the tenant namespace on the management cluster. The `HelmRelease` merges each key through `spec.valuesFrom` (`valuesKey: <path>`), so neither Git nor the `HelmRelease` object ever holds the plaintext, and remote workload clusters work too. A secret field left blank on **Edit** keeps its stored value. Secret fields inside lists are rejected; mark the whole list `writeOnly` instead. Apps proposed before this layout committed a root `secrets.enc.yaml` that nothing applied; the next **Edit** removes it, so re-enter those secrets.
+- **`spec.gatewayRoutes`** declares the Gateway API routes the chart renders from its own values:
+
+  ```yaml
+  spec:
+    gatewayRoutes:
+      - enabledValue: httpRoute.enabled      # optional boolean value path
+        hostnamesValue: httpRoute.hostnames  # string or list of hostnames
+        parentRefsValue: httpRoute.parentRefs
+  ```
+
+  An enabled route needs at least one hostname (a route without hostnames would catch every host on the shared listeners). Hostnames get the same checks as manifest app routes: platform hosts are rejected (`400`) and hostnames already routed by another app are rejected (`409`). Keel overwrites `parentRefsValue` with both HTTPS listeners of `keel-system/keel-ingress` and records the hostnames in the `keel.io/route-hostnames` annotation of the `HelmRelease`.
+  Routes only exist on the management cluster: an enabled route on a remote `targetCluster` is rejected (`400`).
+- **`spec.networkPolicy`** makes Keel commit `networkpolicy.yaml` for the release's pods (`app.kubernetes.io/instance: <release>`) through the tenant's `default-deny-all`. DNS egress is always allowed. Installs on a remote workload cluster get no policy. The options are:
+  - `gatewayIngressPorts`: ingress from the Envoy proxies in `keel-system` on these ports.
+  - `namespaceIngressPorts`: ingress from any pod of the same tenant namespace on these ports. The consumer pods still need their own egress rule.
+  - `releaseTraffic`: traffic between the release's own pods.
+  - `gatewayEgress`: egress to the `keel-ingress` Envoy proxy pods only (label `gateway.envoyproxy.io/owning-gateway-name: keel-ingress`, container ports 10080, 10443 and 8888), for example to reach an OIDC issuer routed there. Other `keel-system` workloads, such as the state backend or the management forge, stay unreachable.
+  - `publicEgress`: egress to public IPv4 addresses on TCP 80 and 443. Private (RFC 1918), CGNAT, link-local, loopback, `0.0.0.0/8`, multicast and reserved ranges are excluded.
+- **`spec.lockedValues`** are chart values merged over the form values into `HelmRelease.spec.values`. Use them for settings the form must not drop or change, such as restricted Pod Security contexts or turning off cluster-scoped RBAC. `values.yaml` keeps only the form values.
+- **Strict values:** an entry with `spec.lockedValues` or `spec.gatewayRoutes` only accepts values its schema declares. Every object schema counts as `additionalProperties: false` unless it sets `additionalProperties` itself. Anything else is rejected (`400`), because upstream charts accept far more values than the form exposes (extra routes, `extraDeploy`, sidecars, ServiceAccounts). Every Helm app also rejects values naming the tenant reconciler ServiceAccount `tenant-<id>-sa`.
+- **`spec.immutableValues`** lists create-only value paths, such as volume sizes and storage classes that end up in StatefulSet `volumeClaimTemplates`. An **Edit** that changes one of them compared to the committed `values.yaml` is rejected (`400`) instead of committing an upgrade that can never succeed.
 
 ## Raw Kubernetes Manifests & Templates (`runtime: manifest`)
 

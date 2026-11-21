@@ -163,6 +163,97 @@ describe("InterpretingValidator (eval-free rjsf validator)", () => {
     expect((rauthy.properties!.adminForceMfa as RJSFSchema).default).toBe(false)
   })
 
+  it("validates the self-service Forgejo and SeaweedFS Helm app schemas", () => {
+    const forgejo = catalogSchema("apps/forgejo")
+    const valid = {
+      gitea: {
+        admin: {
+          username: "forgejo-admin",
+          email: "ops@acme.example",
+          password: "Forgejo-Admin#Passw0rd!",
+          passwordMode: "keepUpdated",
+        },
+        oauth: [
+          {
+            name: "rauthy",
+            provider: "openidConnect",
+            key: "forgejo",
+            secret: "client-secret",
+            autoDiscoverUrl:
+              "https://auth.acme.example/auth/v1/.well-known/openid-configuration",
+          },
+        ],
+      },
+      persistence: { enabled: true, size: "10Gi", claimName: "forgejo-data" },
+      httpRoute: { enabled: true, hostnames: ["git-acme.keel.local"] },
+    }
+    expect(validator.validateFormData(valid, forgejo).errors).toEqual([])
+    // Forgejo reserves "admin" (case-insensitively); passwords are long and whitespace-free.
+    const bad = validator.validateFormData(
+      {
+        ...valid,
+        gitea: {
+          ...valid.gitea,
+          admin: {
+            ...valid.gitea.admin,
+            username: "Admin",
+            password: "short pw",
+          },
+        },
+      },
+      forgejo
+    )
+    expect(bad.errors.map((e) => `${e.property}:${e.name}`).sort()).toEqual([
+      ".gitea.admin.password:pattern",
+      ".gitea.admin.username:not",
+    ])
+    const admin = (
+      (forgejo.properties!.gitea as RJSFSchema).properties!.admin as RJSFSchema
+    ).properties!
+    expect((admin.password as RJSFSchema).format).toBe("password")
+    expect((admin.password as RJSFSchema).default).toBeUndefined()
+    // No shared default hostname: two tenants with defaults would collide on the Gateway.
+    const route = (forgejo.properties!.httpRoute as RJSFSchema).properties!
+    expect((route.hostnames as RJSFSchema).default).toBeUndefined()
+
+    const seaweedfs = catalogSchema("apps/seaweedfs")
+    const s3 = {
+      s3: {
+        credentials: {
+          admin: {
+            accessKey: "0123456789abcdef0123",
+            secretKey: "c2VjcmV0c2VjcmV0c2VjcmV0c2VjcmV0c2Vj",
+          },
+        },
+        createBuckets: [{ name: "artifacts" }],
+      },
+      volume: {
+        dataDirs: [
+          {
+            name: "data1",
+            type: "persistentVolumeClaim",
+            size: "10Gi",
+            maxVolumes: 0,
+          },
+        ],
+      },
+    }
+    expect(validator.validateFormData(s3, seaweedfs).errors).toEqual([])
+    // hostPath data directories would break the restricted Pod Security Standard.
+    const hostPath = validator.validateFormData(
+      {
+        ...s3,
+        volume: { dataDirs: [{ ...s3.volume.dataDirs[0], type: "hostPath" }] },
+      },
+      seaweedfs
+    )
+    expect(hostPath.errors.length).toBeGreaterThan(0)
+    const missing = validator.validateFormData({ s3: {} }, seaweedfs).errors
+    expect(
+      byName(missing, "required").map((e) => e.params.missingProperty)
+    ).toContain("credentials")
+  })
+
   it("produces AJV-compatible required errors with titles, errorSchema and friendly text", () => {
     const schema: RJSFSchema = {
       type: "object",

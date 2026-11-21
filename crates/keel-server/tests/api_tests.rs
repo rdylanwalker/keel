@@ -689,16 +689,51 @@ async fn test_proposal_create_preview_merge_and_stacks_releases() {
             .checkout_branch(&fixture.state.repo_workdir, secret_branch)
             .await
             .unwrap();
-        let enc_yaml = tokio::fs::read_to_string(
+        // Helm app secret fields: a SOPS-encrypted `<instance>-secrets` Secret (one values
+        // fragment per field) applied by `<instance>-config` and merged via `valuesFrom`.
+        let app_dir = fixture
+            .state
+            .repo_workdir
+            .join("tenants/acme/apps/grafana-secret-test");
+        let enc_yaml = tokio::fs::read_to_string(app_dir.join("config/secrets.enc.yaml"))
+            .await
+            .unwrap();
+        assert!(enc_yaml.contains("ENC[AES256_GCM,"));
+        assert!(enc_yaml.contains("adminPassword:"));
+        assert!(!enc_yaml.contains("super-secret-password"));
+        assert!(!app_dir.join("secrets.enc.yaml").exists());
+        let hr: Value = serde_yml::from_str(
+            &tokio::fs::read_to_string(app_dir.join("helmrelease.yaml"))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            hr["spec"]["valuesFrom"],
+            json!([{
+                "kind": "Secret",
+                "name": "grafana-secret-test-secrets",
+                "valuesKey": "adminPassword"
+            }])
+        );
+        assert!(!hr.to_string().contains("super-secret-password"));
+        let config_k: Value = serde_yml::from_str(
+            &tokio::fs::read_to_string(app_dir.join("config-kustomization.yaml"))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(config_k["metadata"]["name"], "grafana-secret-test-config");
+        assert_eq!(config_k["spec"]["decryption"]["provider"], "sops");
+        let tenants_k = tokio::fs::read_to_string(
             fixture
                 .state
                 .repo_workdir
-                .join("tenants/acme/apps/grafana-secret-test/secrets.enc.yaml"),
+                .join("tenants/kustomization.yaml"),
         )
         .await
         .unwrap();
-        assert!(enc_yaml.contains("ENC[AES256_GCM,"));
-        assert!(!enc_yaml.contains("super-secret-password"));
+        assert!(tenants_k.contains("acme/apps/grafana-secret-test/config-kustomization.yaml"));
         fixture
             .state
             .git_runner
@@ -7547,5 +7582,751 @@ async fn test_catalog_authoring_sets_placement_scope() {
     assert_eq!(
         updated["application"]["spec"]["placement"]["scope"],
         "cluster"
+    );
+}
+
+/// Seeds `catalog/apps/<id>/catalog.yaml` from the built-in `deploy/catalog/apps/<id>`.
+async fn seed_builtin_helm_catalog(fixture: &TestFixture, id: &str, raw: &str) {
+    let path = format!("catalog/apps/{id}/catalog.yaml");
+    commit_to_main(
+        fixture,
+        &[(&path, raw)],
+        &format!("feat(catalog): add {id}"),
+    )
+    .await;
+}
+
+const FORGEJO_APP_CATALOG: &str = include_str!("../../../deploy/catalog/apps/forgejo/catalog.yaml");
+const SEAWEEDFS_APP_CATALOG: &str =
+    include_str!("../../../deploy/catalog/apps/seaweedfs/catalog.yaml");
+const FORGEJO_ADMIN_PASSWORD: &str = "Forgejo-Admin#Passw0rd!";
+const FORGEJO_OIDC_SECRET: &str = "oidc-client-secret-0123456789";
+const SEAWEEDFS_ACCESS_KEY: &str = "0123456789abcdef0123";
+const SEAWEEDFS_SECRET_KEY: &str = "c2VjcmV0c2VjcmV0c2VjcmV0c2VjcmV0c2Vj";
+
+fn forgejo_values(hostname: &str) -> Value {
+    json!({
+        "gitea": {
+            "admin": {
+                "username": "forgejo-admin",
+                "email": "ops@acme.example",
+                "password": FORGEJO_ADMIN_PASSWORD,
+                "passwordMode": "keepUpdated"
+            },
+            "config": {
+                "server": { "ROOT_URL": "" },
+                "service": { "DISABLE_REGISTRATION": false, "ALLOW_ONLY_EXTERNAL_REGISTRATION": true }
+            },
+            "oauth": [{
+                "name": "rauthy",
+                "provider": "openidConnect",
+                "key": "forgejo",
+                "secret": FORGEJO_OIDC_SECRET,
+                "autoDiscoverUrl": "https://auth.acme.example/auth/v1/.well-known/openid-configuration"
+            }]
+        },
+        "persistence": { "enabled": true, "size": "20Gi", "claimName": "forgejo-data", "storageClass": "" },
+        "httpRoute": { "enabled": true, "hostnames": [hostname] }
+    })
+}
+
+fn seaweedfs_values() -> Value {
+    json!({
+        "s3": {
+            "credentials": { "admin": {
+                "accessKey": SEAWEEDFS_ACCESS_KEY,
+                "secretKey": SEAWEEDFS_SECRET_KEY
+            } },
+            "createBuckets": [{ "name": "artifacts" }],
+            "httpRoute": { "enabled": false }
+        },
+        "master": { "data": { "size": "1Gi" } },
+        "filer": { "data": { "size": "2Gi" } },
+        "volume": {
+            "idx": { "size": "2Gi" },
+            "dataDirs": [{ "name": "data1", "type": "persistentVolumeClaim", "size": "15Gi", "maxVolumes": 0 }]
+        }
+    })
+}
+
+fn read_yaml(path: &std::path::Path) -> Value {
+    serde_yml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+}
+
+async fn decrypt_tenant_secret(fixture: &TestFixture, ciphertext: &str) -> Value {
+    let age_key = fixture
+        .state
+        .secret_store
+        .get_tenant_age_key("acme")
+        .await
+        .unwrap()
+        .unwrap();
+    let plain = keel_core::SopsManager::new()
+        .decrypt_yaml(&age_key.secret_key, ciphertext)
+        .await
+        .unwrap();
+    serde_yml::from_str(&plain).unwrap()
+}
+
+/// Render test for the self-service Forgejo Helm app: the upstream chart from its OCI
+/// HelmRepository at the catalog/core version, the locked restricted-PSS values, the route pinned
+/// to keel-ingress, the NetworkPolicy, and secret fields only as SOPS ciphertext merged through
+/// `valuesFrom`. An Edit leaving the secrets blank keeps the stored ciphertext.
+#[tokio::test]
+async fn test_forgejo_catalog_app_renders_helm_release_with_encrypted_secrets() {
+    let fixture = setup_fixture().await;
+    let cookie = login_and_get_cookie(&fixture).await;
+    seed_builtin_helm_catalog(&fixture, "forgejo", FORGEJO_APP_CATALOG).await;
+    let workdir = fixture.state.repo_workdir.clone();
+    let dir = workdir.join("tenants/acme/apps/git");
+
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "forgejo", "name": "git",
+                "values": forgejo_values("git.acme.example") }),
+    )
+    .await;
+    if sops_unavailable(status, &body) {
+        return;
+    }
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    checkout_proposal_branch(&fixture, &body).await;
+
+    let committed = read_tree(&dir);
+    for secret in [FORGEJO_ADMIN_PASSWORD, FORGEJO_OIDC_SECRET] {
+        assert!(!committed.contains(secret), "secret committed in plaintext");
+    }
+    assert!(!dir.join("secrets.enc.yaml").exists());
+
+    let repo = read_yaml(&dir.join("helm-repository.yaml"));
+    assert_eq!(repo["spec"]["type"], "oci");
+    assert_eq!(repo["spec"]["url"], "oci://code.forgejo.org/forgejo-helm");
+
+    let hr = read_yaml(&dir.join("helmrelease.yaml"));
+    assert_eq!(hr["metadata"]["name"], "git");
+    assert_eq!(hr["spec"]["chart"]["spec"]["chart"], "forgejo");
+    assert_eq!(hr["spec"]["chart"]["spec"]["version"], "17.3.3");
+    assert_eq!(
+        hr["metadata"]["annotations"]["keel.io/route-hostnames"],
+        "git.acme.example"
+    );
+    let values = &hr["spec"]["values"];
+    // Locked known-good tenant config (restricted PSS) is always applied.
+    assert_eq!(values["image"]["rootless"], true);
+    assert_eq!(values["replicaCount"], 1);
+    assert_eq!(values["test"]["enabled"], false);
+    assert_eq!(values["podSecurityContext"]["runAsNonRoot"], true);
+    let csc = &values["containerSecurityContext"];
+    assert_eq!(csc["allowPrivilegeEscalation"], false);
+    assert_eq!(csc["capabilities"]["drop"], json!(["ALL"]));
+    assert_eq!(csc["seccompProfile"]["type"], "RuntimeDefault");
+    assert_eq!(values["gitea"]["config"]["database"]["DB_TYPE"], "sqlite3");
+    assert_eq!(values["gitea"]["admin"]["username"], "forgejo-admin");
+    assert!(values["gitea"]["admin"].get("password").is_none());
+    assert!(values["gitea"].get("oauth").is_none());
+    assert_eq!(values["persistence"]["size"], "20Gi");
+    assert_eq!(
+        values["httpRoute"]["hostnames"],
+        json!(["git.acme.example"])
+    );
+    assert_eq!(
+        values["httpRoute"]["parentRefs"],
+        keel_core::keel_ingress_parent_refs()
+    );
+    assert_eq!(
+        hr["spec"]["valuesFrom"],
+        json!([
+            { "kind": "Secret", "name": "git-secrets", "valuesKey": "gitea.admin.password" },
+            { "kind": "Secret", "name": "git-secrets", "valuesKey": "gitea.oauth" }
+        ])
+    );
+    // values.yaml keeps only the submitted (non-secret) form values.
+    let form_values = read_yaml(&dir.join("values.yaml"));
+    assert!(form_values.get("podSecurityContext").is_none());
+    assert!(form_values["httpRoute"].get("parentRefs").is_none());
+
+    let stored = std::fs::read_to_string(dir.join("config/secrets.enc.yaml")).unwrap();
+    assert_eq!(
+        sops_secret_keys(&stored),
+        vec!["gitea.admin.password", "gitea.oauth"]
+    );
+    let secret = decrypt_tenant_secret(&fixture, &stored).await;
+    assert_eq!(secret["metadata"]["name"], "git-secrets");
+    assert_eq!(secret["metadata"]["namespace"], "tenant-acme");
+    // helm-controller reconciles as soon as the Secret exists (no interval wait).
+    assert_eq!(
+        secret["metadata"]["labels"]["reconcile.fluxcd.io/watch"],
+        "Enabled"
+    );
+    let admin: Value = serde_yml::from_str(
+        secret["stringData"]["gitea.admin.password"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(admin["gitea"]["admin"]["password"], FORGEJO_ADMIN_PASSWORD);
+    let oauth: Value =
+        serde_yml::from_str(secret["stringData"]["gitea.oauth"].as_str().unwrap()).unwrap();
+    assert_eq!(oauth["gitea"]["oauth"][0]["secret"], FORGEJO_OIDC_SECRET);
+
+    let config_k = read_yaml(&dir.join("config-kustomization.yaml"));
+    assert_eq!(config_k["metadata"]["name"], "git-config");
+    assert_eq!(config_k["spec"]["path"], "./tenants/acme/apps/git/config");
+    assert_eq!(config_k["spec"]["decryption"]["provider"], "sops");
+    assert_eq!(
+        read_yaml(&dir.join("config/kustomization.yaml"))["resources"],
+        json!(["secrets.enc.yaml"])
+    );
+
+    let np = read_yaml(&dir.join("networkpolicy.yaml"));
+    assert_eq!(np["metadata"]["name"], "allow-git-app");
+    assert_eq!(
+        np["spec"]["podSelector"]["matchLabels"]["app.kubernetes.io/instance"],
+        "git"
+    );
+    assert_eq!(np["spec"]["ingress"][0]["ports"][0]["port"], 3000);
+    // Egress to keel-system reaches only the keel-ingress Envoy proxies, on their listener ports.
+    let gateway_egress = &np["spec"]["egress"][1];
+    assert_eq!(
+        gateway_egress["to"][0]["podSelector"]["matchLabels"]["gateway.envoyproxy.io/owning-gateway-name"],
+        "keel-ingress"
+    );
+    assert_eq!(
+        gateway_egress["ports"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["port"].as_u64().unwrap())
+            .collect::<Vec<_>>(),
+        vec![10080, 10443, 8888]
+    );
+    assert_eq!(np["spec"]["egress"][2]["ports"][1]["port"], 443);
+    // Only the guarded route may expose the release; no SSRF into private networks.
+    assert_eq!(values["extraDeploy"], json!([]));
+    assert_eq!(values["ingress"]["enabled"], false);
+    assert_eq!(values["tcpRoute"]["enabled"], false);
+    assert_eq!(
+        values["gitea"]["config"]["webhook"]["ALLOWED_HOST_LIST"],
+        "external"
+    );
+    assert_eq!(
+        values["gitea"]["config"]["migrations"]["ALLOW_LOCALNETWORKS"],
+        false
+    );
+
+    let resources = tenants_kustomization_resources(&fixture);
+    for file in [
+        "helmrelease.yaml",
+        "helm-repository.yaml",
+        "networkpolicy.yaml",
+        "config-kustomization.yaml",
+    ] {
+        let entry = format!("acme/apps/git/{file}");
+        assert!(resources.contains(&entry), "{entry} missing: {resources:?}");
+    }
+
+    // Edit without re-entering the secrets (the UI never receives them): the nested required
+    // password is relaxed because it is stored, and the ciphertext is kept verbatim.
+    merge_proposal_and_sync(&fixture, &cookie, &body).await;
+    let mut edit = forgejo_values("git.acme.example");
+    edit["gitea"]["admin"]
+        .as_object_mut()
+        .unwrap()
+        .remove("password");
+    edit["gitea"]["oauth"] = json!([]);
+    // Volume settings are create-only: Kubernetes cannot apply them to the existing PVC.
+    for (field, value) in [
+        ("size", json!("30Gi")),
+        ("storageClass", json!("fast")),
+        ("claimName", json!("other-data")),
+    ] {
+        let mut resize = edit.clone();
+        resize["persistence"][field] = value;
+        let (status, body) = post_proposal(
+            &fixture,
+            &cookie,
+            json!({ "tenant": "acme", "catalogId": "forgejo", "name": "git", "values": resize }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{field}: {body}");
+        assert!(
+            body.contains(&format!("persistence.{field}"))
+                && body.contains("cannot be changed after install"),
+            "{body}"
+        );
+    }
+    edit["gitea"]["admin"]["passwordMode"] = json!("initialOnlyNoReset");
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "forgejo", "name": "git", "values": edit }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    checkout_proposal_branch(&fixture, &body).await;
+    assert_eq!(
+        std::fs::read_to_string(dir.join("config/secrets.enc.yaml")).unwrap(),
+        stored
+    );
+    let hr = read_yaml(&dir.join("helmrelease.yaml"));
+    assert_eq!(
+        hr["spec"]["values"]["gitea"]["admin"]["passwordMode"],
+        "initialOnlyNoReset"
+    );
+    assert_eq!(hr["spec"]["values"]["persistence"]["size"], "20Gi");
+    assert_eq!(hr["spec"]["valuesFrom"].as_array().unwrap().len(), 2);
+    fixture
+        .state
+        .git_runner
+        .checkout_branch(&workdir, "main")
+        .await
+        .unwrap();
+
+    // A new instance still needs the admin password.
+    let mut missing = forgejo_values("git2.acme.example");
+    missing["gitea"]["admin"]
+        .as_object_mut()
+        .unwrap()
+        .remove("password");
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "forgejo", "name": "git2", "values": missing }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+}
+
+/// Helm app routes get the same guards as manifest app routes, before anything is committed:
+/// no catch-all route, no platform host, and no hostname claimed by another app (Helm apps
+/// record theirs in the `keel.io/route-hostnames` HelmRelease annotation).
+#[tokio::test]
+async fn test_helm_app_gateway_routes_are_guarded() {
+    let fixture = setup_fixture().await;
+    let cookie = login_and_get_cookie(&fixture).await;
+    seed_builtin_helm_catalog(&fixture, "forgejo", FORGEJO_APP_CATALOG).await;
+    seed_builtin_helm_catalog(&fixture, "seaweedfs", SEAWEEDFS_APP_CATALOG).await;
+    seed_rauthy_catalog(&fixture).await;
+    let git = &fixture.state.git_runner;
+    let workdir = &fixture.state.repo_workdir;
+    let head_before = git.rev_parse(workdir, "HEAD").await.unwrap();
+
+    // Enabled without a hostname would match every host on the shared listeners.
+    let mut catch_all = forgejo_values("unused.example");
+    catch_all["httpRoute"]["hostnames"] = json!([]);
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "forgejo", "values": catch_all }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("at least one hostname"), "{body}");
+
+    for host in ["forgejo.keel.local", "idp.keel.local", "keel.keel.local"] {
+        let (status, body) = post_proposal(
+            &fixture,
+            &cookie,
+            json!({ "tenant": "acme", "catalogId": "forgejo", "values": forgejo_values(host) }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{host}: {body}");
+        assert!(body.contains("reserved platform host"), "{body}");
+    }
+    assert_eq!(git.rev_parse(workdir, "HEAD").await.unwrap(), head_before);
+
+    // Forgejo claims git.acme.example on main.
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "forgejo",
+                "values": forgejo_values("git.acme.example") }),
+    )
+    .await;
+    if sops_unavailable(status, &body) {
+        return;
+    }
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    merge_proposal_and_sync(&fixture, &cookie, &body).await;
+
+    // Another tenant's SeaweedFS S3 route and a Rauthy manifest app may not take it over.
+    let mut s3 = seaweedfs_values();
+    s3["s3"]["httpRoute"] = json!({ "enabled": true, "hostnames": ["git.acme.example"] });
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "other", "catalogId": "seaweedfs", "values": s3 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body.contains("tenants/acme/apps/forgejo"), "{body}");
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "rauthy", "values": rauthy_values("git.acme.example") }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+
+    // Editing the owner itself is fine (its own claim is skipped).
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "forgejo",
+                "values": forgejo_values("git.acme.example") }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+}
+
+/// Apps with locked values / declared routes only accept values their schema declares: chart
+/// options outside the form (other routes, `extraDeploy`, sidecars, ServiceAccount overrides)
+/// would bypass the locks and route guards. Values naming the tenant reconciler ServiceAccount
+/// and shell metacharacters in the OIDC sources (rendered into the chart's init script) are
+/// rejected too. Nothing is committed.
+#[tokio::test]
+async fn test_helm_app_values_stay_inside_catalog_schema() {
+    let fixture = setup_fixture().await;
+    let cookie = login_and_get_cookie(&fixture).await;
+    seed_builtin_helm_catalog(&fixture, "forgejo", FORGEJO_APP_CATALOG).await;
+    seed_builtin_helm_catalog(&fixture, "seaweedfs", SEAWEEDFS_APP_CATALOG).await;
+    let git = &fixture.state.git_runner;
+    let workdir = &fixture.state.repo_workdir;
+    let head_before = git.rev_parse(workdir, "HEAD").await.unwrap();
+
+    let mut cases: Vec<(&str, Value, &str, StatusCode)> = Vec::new();
+    let mut filer_route = seaweedfs_values();
+    filer_route["filer"]["httpRoute"] = json!({
+        "enabled": true,
+        "parentRefs": [{ "name": "keel-ingress", "namespace": "keel-system" }]
+    });
+    cases.push((
+        "seaweedfs",
+        filer_route,
+        "filer.httpRoute",
+        StatusCode::BAD_REQUEST,
+    ));
+    let mut cosi = seaweedfs_values();
+    cosi["cosi"] = json!({ "enabled": true });
+    cases.push(("seaweedfs", cosi, "cosi", StatusCode::BAD_REQUEST));
+    let mut bucket_extra = seaweedfs_values();
+    bucket_extra["s3"]["createBuckets"] = json!([{ "name": "data", "anonymousRead": true }]);
+    cases.push((
+        "seaweedfs",
+        bucket_extra,
+        "s3.createBuckets[0].anonymousRead",
+        StatusCode::BAD_REQUEST,
+    ));
+    let mut reconciler_sa = seaweedfs_values();
+    reconciler_sa["global"] = json!({ "seaweedfs": { "serviceAccountName": "tenant-acme-sa" } });
+    cases.push((
+        "seaweedfs",
+        reconciler_sa,
+        "tenant-acme-sa",
+        StatusCode::BAD_REQUEST,
+    ));
+    let mut extra_deploy = forgejo_values("git.acme.example");
+    extra_deploy["extraDeploy"] = json!([{ "apiVersion": "v1", "kind": "ConfigMap" }]);
+    cases.push((
+        "forgejo",
+        extra_deploy,
+        "extraDeploy",
+        StatusCode::BAD_REQUEST,
+    ));
+    let mut service_account = forgejo_values("git.acme.example");
+    service_account["serviceAccount"] = json!({ "name": "tenant-acme-sa" });
+    cases.push((
+        "forgejo",
+        service_account,
+        "serviceAccount",
+        StatusCode::BAD_REQUEST,
+    ));
+    let mut webhook = forgejo_values("git.acme.example");
+    webhook["gitea"]["config"]["webhook"] = json!({ "ALLOWED_HOST_LIST": "*" });
+    cases.push((
+        "forgejo",
+        webhook,
+        "gitea.config.webhook",
+        StatusCode::BAD_REQUEST,
+    ));
+    let mut injection = forgejo_values("git.acme.example");
+    injection["gitea"]["oauth"][0]["secret"] =
+        json!("$(curl http://seaweedfs-filer.keel-system:8888/)");
+    cases.push((
+        "forgejo",
+        injection,
+        "/gitea/oauth/0/secret",
+        StatusCode::UNPROCESSABLE_ENTITY,
+    ));
+    let mut discovery = forgejo_values("git.acme.example");
+    discovery["gitea"]["oauth"][0]["autoDiscoverUrl"] = json!("https://x.example/`id`");
+    cases.push((
+        "forgejo",
+        discovery,
+        "/gitea/oauth/0/autoDiscoverUrl",
+        StatusCode::UNPROCESSABLE_ENTITY,
+    ));
+
+    for (catalog_id, values, needle, expected) in cases {
+        let (status, body) = post_proposal(
+            &fixture,
+            &cookie,
+            json!({ "tenant": "acme", "catalogId": catalog_id, "values": values }),
+        )
+        .await;
+        assert_eq!(status, expected, "{needle}: {body}");
+        assert!(body.contains(needle), "{needle}: {body}");
+    }
+    assert_eq!(git.rev_parse(workdir, "HEAD").await.unwrap(), head_before);
+}
+
+/// Render test for the self-service SeaweedFS Helm app: the upstream chart at the catalog/core
+/// version without cluster-scoped RBAC, restricted-PSS contexts on every component, persistent
+/// volumes, encrypted S3 credentials, an intra-release NetworkPolicy, and no route unless enabled.
+/// On a remote workload cluster no NetworkPolicy is committed (it would land on the management
+/// cluster) while the secrets still come from the management cluster through `valuesFrom`.
+#[tokio::test]
+async fn test_seaweedfs_catalog_app_renders_helm_release() {
+    let fixture = setup_fixture().await;
+    let cookie = login_and_get_cookie(&fixture).await;
+    seed_builtin_helm_catalog(&fixture, "seaweedfs", SEAWEEDFS_APP_CATALOG).await;
+    let workdir = fixture.state.repo_workdir.clone();
+    let dir = workdir.join("tenants/acme/apps/seaweedfs");
+
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "seaweedfs", "values": seaweedfs_values() }),
+    )
+    .await;
+    if sops_unavailable(status, &body) {
+        return;
+    }
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    checkout_proposal_branch(&fixture, &body).await;
+
+    let committed = read_tree(&dir);
+    for secret in [SEAWEEDFS_ACCESS_KEY, SEAWEEDFS_SECRET_KEY] {
+        assert!(!committed.contains(secret), "secret committed in plaintext");
+    }
+    let repo = read_yaml(&dir.join("helm-repository.yaml"));
+    assert_eq!(
+        repo["spec"]["url"],
+        "https://seaweedfs.github.io/seaweedfs/helm"
+    );
+    assert!(repo["spec"].get("type").is_none());
+
+    let hr = read_yaml(&dir.join("helmrelease.yaml"));
+    assert_eq!(hr["spec"]["chart"]["spec"]["chart"], "seaweedfs");
+    assert_eq!(hr["spec"]["chart"]["spec"]["version"], "4.54.0");
+    assert!(hr["metadata"].get("annotations").is_none());
+    let values = &hr["spec"]["values"];
+    assert_eq!(
+        values["global"]["seaweedfs"]["createClusterRole"], false,
+        "no ClusterRole/ClusterRoleBinding in a tenant namespace"
+    );
+    assert_eq!(
+        values["global"]["seaweedfs"]["serviceAccountName"],
+        Value::Null
+    );
+    assert_eq!(values["s3"]["enableAuth"], true);
+    for component in ["master", "filer", "volume", "s3"] {
+        let csc = &values[component]["containerSecurityContext"];
+        assert_eq!(csc["enabled"], true, "{component}");
+        assert_eq!(csc["runAsNonRoot"], true, "{component}");
+        assert_eq!(csc["allowPrivilegeEscalation"], false, "{component}");
+        assert_eq!(csc["capabilities"]["drop"], json!(["ALL"]), "{component}");
+        assert_eq!(
+            csc["seccompProfile"]["type"], "RuntimeDefault",
+            "{component}"
+        );
+        assert_eq!(
+            values[component]["podSecurityContext"]["enabled"], true,
+            "{component}"
+        );
+        assert_eq!(values[component]["logs"]["type"], "emptyDir", "{component}");
+    }
+    assert_eq!(values["master"]["data"]["type"], "persistentVolumeClaim");
+    assert_eq!(values["master"]["data"]["size"], "1Gi");
+    assert_eq!(values["volume"]["dataDirs"][0]["size"], "15Gi");
+    assert_eq!(
+        values["s3"]["createBuckets"],
+        json!([{ "name": "artifacts" }])
+    );
+    assert!(values["s3"].get("credentials").is_none());
+    assert_eq!(
+        hr["spec"]["valuesFrom"],
+        json!([
+            { "kind": "Secret", "name": "seaweedfs-secrets",
+              "valuesKey": "s3.credentials.admin.accessKey" },
+            { "kind": "Secret", "name": "seaweedfs-secrets",
+              "valuesKey": "s3.credentials.admin.secretKey" }
+        ])
+    );
+
+    let np = read_yaml(&dir.join("networkpolicy.yaml"));
+    assert_eq!(np["spec"]["ingress"][0]["ports"][0]["port"], 8333);
+    // Other workloads of the tenant namespace may use the S3 endpoint (and only that port).
+    assert_eq!(
+        np["spec"]["ingress"][1]["from"],
+        json!([{ "podSelector": {} }])
+    );
+    assert_eq!(
+        np["spec"]["ingress"][1]["ports"],
+        json!([{ "protocol": "TCP", "port": 8333 }])
+    );
+    assert_eq!(
+        np["spec"]["ingress"][2]["from"][0]["podSelector"]["matchLabels"]["app.kubernetes.io/instance"],
+        "seaweedfs"
+    );
+    // Only the S3 gateway may be routed; optional components and the resize hook stay off.
+    for component in ["master", "filer", "volume", "admin"] {
+        assert_eq!(
+            values[component]["httpRoute"]["enabled"], false,
+            "{component}"
+        );
+    }
+    for component in ["admin", "sftp", "worker", "cosi", "vector"] {
+        assert_eq!(values[component]["enabled"], false, "{component}");
+    }
+    assert_eq!(values["filer"]["ingresses"]["http"]["enabled"], false);
+    assert_eq!(values["volume"]["resizeHook"]["enabled"], false);
+
+    // hostPath data directories are not expressible (const), so restricted PSS holds.
+    fixture
+        .state
+        .git_runner
+        .checkout_branch(&workdir, "main")
+        .await
+        .unwrap();
+    let mut host_path = seaweedfs_values();
+    host_path["volume"]["dataDirs"][0]["type"] = json!("hostPath");
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "seaweedfs", "name": "s3-bad", "values": host_path }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+
+    // Routes attach to the management cluster's keel-ingress: not on a remote workload cluster.
+    let mut routed = seaweedfs_values();
+    routed["s3"]["httpRoute"] = json!({ "enabled": true, "hostnames": ["s3-edge.acme.example"] });
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "seaweedfs", "name": "s3-edge",
+                "targetCluster": "workload-kubeconfig", "values": routed }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("s3.httpRoute.enabled"), "{body}");
+
+    // Remote workload cluster: no NetworkPolicy file, secrets still via valuesFrom.
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "seaweedfs", "name": "s3-edge",
+                "targetCluster": "workload-kubeconfig", "values": seaweedfs_values() }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    checkout_proposal_branch(&fixture, &body).await;
+    let edge = workdir.join("tenants/acme/apps/s3-edge");
+    assert!(!edge.join("networkpolicy.yaml").exists());
+    let hr = read_yaml(&edge.join("helmrelease.yaml"));
+    assert_eq!(
+        hr["spec"]["kubeConfig"]["secretRef"]["name"],
+        "workload-kubeconfig"
+    );
+    assert_eq!(hr["spec"]["valuesFrom"].as_array().unwrap().len(), 2);
+    assert!(edge.join("config/secrets.enc.yaml").exists());
+    assert!(
+        !tenants_kustomization_resources(&fixture)
+            .iter()
+            .any(|r| r == "acme/apps/s3-edge/networkpolicy.yaml")
+    );
+    fixture
+        .state
+        .git_runner
+        .checkout_branch(&workdir, "main")
+        .await
+        .unwrap();
+}
+
+/// Bundle Helm items get the same secret layout as single Helm apps: the item's
+/// `<bundle>-<item>-config` Kustomization is registered in `tenants/kustomization.yaml`, the
+/// NetworkPolicy is applied with the item, and no legacy encrypted-values file is written.
+#[tokio::test]
+async fn test_bundle_helm_item_uses_secret_config_layout() {
+    let fixture = setup_fixture().await;
+    let cookie = login_and_get_cookie(&fixture).await;
+    seed_builtin_helm_catalog(&fixture, "seaweedfs", SEAWEEDFS_APP_CATALOG).await;
+    commit_to_main(
+        &fixture,
+        &[(
+            "catalog/bundles/storage-stack/catalog.yaml",
+            r#"apiVersion: keel.io/v1alpha1
+kind: CatalogBundle
+metadata:
+  id: storage-stack
+  name: Storage Stack
+  category: storage
+spec:
+  items:
+    - id: s3
+      kind: app
+      catalogRef: seaweedfs
+  schema:
+    type: object
+"#,
+        )],
+        "feat(catalog): storage-stack bundle",
+    )
+    .await;
+
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "storage-stack", "kind": "bundle",
+                "values": { "s3": seaweedfs_values() } }),
+    )
+    .await;
+    if sops_unavailable(status, &body) {
+        return;
+    }
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    checkout_proposal_branch(&fixture, &body).await;
+    let dir = fixture
+        .state
+        .repo_workdir
+        .join("tenants/acme/bundles/storage-stack/s3");
+    assert!(!dir.join("secrets.enc.yaml").exists());
+    assert!(!read_tree(&dir).contains(SEAWEEDFS_SECRET_KEY));
+    let hr = read_yaml(&dir.join("helmrelease.yaml"));
+    assert_eq!(
+        hr["spec"]["valuesFrom"][0]["name"],
+        "storage-stack-s3-secrets"
+    );
+    assert_eq!(
+        hr["spec"]["values"]["global"]["seaweedfs"]["createClusterRole"],
+        false
+    );
+    assert_eq!(
+        read_yaml(&dir.join("config-kustomization.yaml"))["metadata"]["name"],
+        "storage-stack-s3-config"
+    );
+    let item_k = read_yaml(&dir.join("kustomization.yaml"));
+    assert!(
+        item_k["resources"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("networkpolicy.yaml")),
+        "{item_k}"
+    );
+    assert!(
+        tenants_kustomization_resources(&fixture)
+            .contains(&"acme/bundles/storage-stack/s3/config-kustomization.yaml".to_string())
     );
 }

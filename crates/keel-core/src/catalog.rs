@@ -12,7 +12,7 @@ use crate::CoreError;
 use crate::models::{
     CATALOG_API_VERSION, CATALOG_APPLICATION_KIND, CATALOG_BUNDLE_KIND,
     CATALOG_INFRA_BLUEPRINT_KIND, CatalogApplication, CatalogBundle, CatalogInfraBlueprint,
-    CatalogManifest,
+    CatalogManifest, HelmGatewayRouteSpec,
 };
 
 /// Structured JSON Schema validation error tied to a specific instance field path.
@@ -135,10 +135,21 @@ pub fn validate_schema_values(schema: &Value, values: &Value) -> Result<(), Core
     let validator = compile_schema(schema)?;
     let mut errors: Vec<SchemaFieldError> = validator
         .iter_errors(values)
-        .map(|err| SchemaFieldError {
-            field_path: err.instance_path().to_string(),
-            schema_path: err.schema_path().to_string(),
-            message: err.to_string(),
+        .map(|err| {
+            let field_path = err.instance_path().to_string();
+            let schema_path = err.schema_path().to_string();
+            // Validation messages quote the offending value: never echo a secret field back.
+            let message = if instance_path_is_secret(schema, &field_path) {
+                let keyword = schema_path.rsplit('/').next().unwrap_or("schema");
+                format!("Secret value does not satisfy the '{keyword}' constraint")
+            } else {
+                err.to_string()
+            };
+            SchemaFieldError {
+                field_path,
+                schema_path,
+                message,
+            }
         })
         .collect();
 
@@ -153,6 +164,30 @@ pub fn validate_schema_values(schema: &Value, values: &Value) -> Result<(), Core
         });
         Err(CoreError::SchemaValidation(errors))
     }
+}
+
+/// Whether the value at JSON pointer `pointer` (e.g. `/gitea/oauth/0/secret`) lies inside a
+/// secret field of `schema` (the field itself or any enclosing node is secret).
+fn instance_path_is_secret(schema: &Value, pointer: &str) -> bool {
+    let mut node = schema;
+    if is_secret_schema_node(node) {
+        return true;
+    }
+    for raw in pointer.split('/').skip(1) {
+        let seg = raw.replace("~1", "/").replace("~0", "~");
+        let next = match node.get("items").filter(|i| i.is_object()) {
+            Some(items) if seg.parse::<usize>().is_ok() => Some(items),
+            _ => find_property_schema(node, &seg),
+        };
+        let Some(next) = next else {
+            return false;
+        };
+        if is_secret_schema_node(next) {
+            return true;
+        }
+        node = next;
+    }
+    false
 }
 
 /// Returns `true` if a JSON Schema property node marks a field as secret (`writeOnly: true` or `format: "password"`).
@@ -942,6 +977,255 @@ pub fn validate_route_hostnames(
     Ok(())
 }
 
+/// `parentRefs` pinning a tenant route to both HTTPS listeners of the shared
+/// `keel-system/keel-ingress` Gateway (`https-local` for the local kind CA, `https` otherwise),
+/// exactly like the built-in tenant manifest apps (e.g. Rauthy).
+pub fn keel_ingress_parent_refs() -> Value {
+    serde_json::json!([
+        { "name": "keel-ingress", "namespace": "keel-system", "sectionName": "https-local" },
+        { "name": "keel-ingress", "namespace": "keel-system", "sectionName": "https" },
+    ])
+}
+
+fn value_at_path<'a>(values: &'a Value, path: &str) -> Option<&'a Value> {
+    path.split('.').try_fold(values, |node, seg| node.get(seg))
+}
+
+fn set_value_at_path(values: &mut Value, path: &str, value: Value) -> Result<(), CoreError> {
+    let mut node = values;
+    let segments: Vec<&str> = path.split('.').collect();
+    for (i, seg) in segments.iter().enumerate() {
+        if !node.is_object() {
+            if node.is_null() {
+                *node = Value::Object(Map::new());
+            } else {
+                return Err(CoreError::Validation(format!(
+                    "Value '{}' must be an object to set '{path}'",
+                    segments[..i].join(".")
+                )));
+            }
+        }
+        let map = node.as_object_mut().expect("object checked above");
+        if i + 1 == segments.len() {
+            map.insert((*seg).to_string(), value);
+            return Ok(());
+        }
+        node = map.entry((*seg).to_string()).or_insert(Value::Null);
+    }
+    Ok(())
+}
+
+/// Applies the `spec.gatewayRoutes` declarations of a Helm catalog app to its submitted
+/// (non-secret) `values` and returns the lower-cased hostnames of every enabled route.
+///
+/// * A route is enabled when it has no `enabledValue`, or the value at that path is `true`.
+/// * An enabled route must carry at least one concrete hostname (a string or list of strings at
+///   `hostnamesValue`): a route without hostnames would match every host on the shared
+///   `keel-ingress` listeners.
+/// * `parentRefsValue` is overwritten with [`keel_ingress_parent_refs`], so the route can only
+///   attach to the shared Gateway's HTTPS listeners whatever the submitted values say.
+///
+/// The caller still checks the hostnames with [`validate_route_hostnames`] and against routes of
+/// other apps.
+pub fn resolve_helm_gateway_routes(
+    routes: &[HelmGatewayRouteSpec],
+    values: &mut Value,
+) -> Result<Vec<String>, CoreError> {
+    let mut hostnames = Vec::new();
+    for route in routes {
+        let enabled = match &route.enabled_value {
+            None => true,
+            Some(path) => value_at_path(values, path).and_then(Value::as_bool) == Some(true),
+        };
+        if !enabled {
+            continue;
+        }
+        let raw: Vec<String> = match value_at_path(values, &route.hostnames_value) {
+            Some(Value::String(host)) => vec![host.clone()],
+            Some(Value::Array(list)) => list
+                .iter()
+                .map(|v| {
+                    v.as_str().map(str::to_string).ok_or_else(|| {
+                        CoreError::Validation(format!(
+                            "'{}' must be a list of hostnames",
+                            route.hostnames_value
+                        ))
+                    })
+                })
+                .collect::<Result<_, _>>()?,
+            None | Some(Value::Null) => Vec::new(),
+            Some(_) => {
+                return Err(CoreError::Validation(format!(
+                    "'{}' must be a hostname or a list of hostnames",
+                    route.hostnames_value
+                )));
+            }
+        };
+        let route_hosts: Vec<String> = raw
+            .iter()
+            .map(|h| h.trim().to_ascii_lowercase())
+            .filter(|h| !h.is_empty())
+            .collect();
+        if route_hosts.is_empty() {
+            return Err(CoreError::Validation(format!(
+                "The route enabled by '{}' needs at least one hostname in '{}': a route without \
+                 hostnames would match every host on the shared keel-ingress Gateway",
+                route.enabled_value.as_deref().unwrap_or("the catalog"),
+                route.hostnames_value
+            )));
+        }
+        if let Some(path) = &route.parent_refs_value {
+            set_value_at_path(values, path, keel_ingress_parent_refs())?;
+        }
+        hostnames.extend(route_hosts);
+    }
+    Ok(hostnames)
+}
+
+/// Whether a schema node (or one of its `allOf`/`anyOf`/`oneOf` members) explicitly allows
+/// arbitrary extra keys (`additionalProperties: true`).
+fn allows_any_additional_property(schema: &Value) -> bool {
+    let Some(obj) = schema.as_object() else {
+        return false;
+    };
+    if obj.get("additionalProperties") == Some(&Value::Bool(true)) {
+        return true;
+    }
+    ["allOf", "anyOf", "oneOf"].iter().any(|c| {
+        obj.get(*c)
+            .and_then(Value::as_array)
+            .is_some_and(|subs| subs.iter().any(allows_any_additional_property))
+    })
+}
+
+fn collect_undeclared_paths(
+    schema: Option<&Value>,
+    value: &Value,
+    path: &str,
+    out: &mut Vec<String>,
+) {
+    match value {
+        Value::Object(map) => {
+            for (key, child) in map {
+                let child_path = if path.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{path}.{key}")
+                };
+                match schema.and_then(|s| find_property_schema(s, key)) {
+                    Some(child_schema) => {
+                        collect_undeclared_paths(Some(child_schema), child, &child_path, out);
+                    }
+                    None if schema.is_some_and(allows_any_additional_property) => {}
+                    None => out.push(child_path),
+                }
+            }
+        }
+        Value::Array(items) => {
+            let item_schema = schema
+                .and_then(Value::as_object)
+                .and_then(|o| o.get("items"))
+                .filter(|v| v.is_object());
+            for (i, item) in items.iter().enumerate() {
+                collect_undeclared_paths(item_schema, item, &format!("{path}[{i}]"), out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Returns the paths (`a.b`, `list[0].c`) of submitted `values` the catalog `schema` does not
+/// declare, treating every object schema as `additionalProperties: false` unless it explicitly
+/// sets `additionalProperties: true` (or a schema for the extra keys).
+///
+/// Used for Helm catalog apps with [`crate::CatalogApplication::strict_values`]: upstream charts
+/// accept far more values than the form exposes (extra routes, `extraDeploy`, sidecars,
+/// ServiceAccounts), and those would bypass the locked values and route guards.
+pub fn undeclared_value_paths(schema: &Value, values: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    collect_undeclared_paths(Some(schema), values, "", &mut out);
+    out.sort();
+    out
+}
+
+/// Returns the create-only `paths` (`spec.immutableValues`) whose value in `submitted` differs
+/// from the `committed` values (a missing value equals `null`).
+pub fn changed_immutable_values(
+    paths: &[String],
+    committed: &Value,
+    submitted: &Value,
+) -> Vec<String> {
+    let at = |values: &Value, path: &str| {
+        value_at_path(values, path)
+            .filter(|v| !v.is_null())
+            .cloned()
+    };
+    paths
+        .iter()
+        .filter(|path| at(committed, path) != at(submitted, path))
+        .cloned()
+        .collect()
+}
+
+/// Splits the secret values of a Helm app into one Helm values fragment per declared secret
+/// field: `(dot path, YAML document)` such as `("gitea.admin.password", "gitea:\n  admin:\n
+/// password: ...\n")`. Each fragment becomes one key of the SOPS-encrypted `<instance>-secrets`
+/// `Secret` and one `HelmRelease.spec.valuesFrom` entry (merged without `targetPath`, so values
+/// keep their exact string content). Secret fields submitted as `null`, `""`, `[]` or `{}` are
+/// treated as not submitted (an Edit keeps the stored value).
+///
+/// Fails closed for secret fields inside lists (`a[].b`): a list fragment would replace the whole
+/// list of the plaintext values. Mark the enclosing list itself secret instead.
+pub fn helm_secret_value_fragments(
+    secret_values: &Value,
+    secret_field_paths: &[String],
+) -> Result<std::collections::BTreeMap<String, String>, CoreError> {
+    let mut out = std::collections::BTreeMap::new();
+    for path in secret_field_paths {
+        if path.contains('[') {
+            let submitted_under_list = path
+                .split_once('[')
+                .map(|(prefix, _)| prefix)
+                .filter(|p| !p.is_empty())
+                .and_then(|prefix| value_at_path(secret_values, prefix))
+                .is_some_and(|v| !v.is_null());
+            if submitted_under_list {
+                return Err(CoreError::Validation(format!(
+                    "Secret field '{path}' is inside a list; Helm apps support secret fields in \
+                     objects only (mark the whole list writeOnly instead)"
+                )));
+            }
+            continue;
+        }
+        let Some(value) = value_at_path(secret_values, path) else {
+            continue;
+        };
+        let empty = match value {
+            Value::Null => true,
+            Value::String(s) => s.is_empty(),
+            Value::Array(a) => a.is_empty(),
+            Value::Object(o) => o.is_empty(),
+            _ => false,
+        };
+        if empty {
+            continue;
+        }
+        if !path
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        {
+            return Err(CoreError::Validation(format!(
+                "Secret field path '{path}' must only contain [-._a-zA-Z0-9] to be stored as a \
+                 Secret key"
+            )));
+        }
+        let mut fragment = Value::Object(Map::new());
+        set_value_at_path(&mut fragment, path, value.clone())?;
+        out.insert(path.clone(), render_helm_values_yaml(&fragment)?);
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -1552,6 +1836,10 @@ metadata:
             include_str!("../../../deploy/catalog/apps/podinfo/catalog.yaml"),
             include_str!("../../../deploy/catalog/apps/http-echo-manifest/catalog.yaml"),
             include_str!("../../../deploy/catalog/apps/rauthy/catalog.yaml"),
+            // `lockedValues` turn the charts' cluster-scoped RBAC off (seaweedfs
+            // `global.seaweedfs.createClusterRole: false`; forgejo renders none).
+            include_str!("../../../deploy/catalog/apps/forgejo/catalog.yaml"),
+            include_str!("../../../deploy/catalog/apps/seaweedfs/catalog.yaml"),
         ] {
             let app = parse_catalog_application(raw).unwrap();
             assert_eq!(
@@ -2032,6 +2320,264 @@ spec:
                 "auth.example.org".to_string(),
                 "grpc.example.org".to_string()
             ]
+        );
+    }
+
+    #[test]
+    fn test_resolve_helm_gateway_routes_guards_and_pins_parent_refs() {
+        let routes = vec![
+            HelmGatewayRouteSpec {
+                enabled_value: Some("httpRoute.enabled".to_string()),
+                hostnames_value: "httpRoute.hostnames".to_string(),
+                parent_refs_value: Some("httpRoute.parentRefs".to_string()),
+            },
+            HelmGatewayRouteSpec {
+                enabled_value: None,
+                hostnames_value: "s3.host".to_string(),
+                parent_refs_value: None,
+            },
+        ];
+        let mut values = json!({
+            "httpRoute": {
+                "enabled": true,
+                "hostnames": [" Git.Acme.Example "],
+                "parentRefs": [{ "name": "other-gateway", "namespace": "evil" }]
+            },
+            "s3": { "host": "s3.acme.example" }
+        });
+        let hosts = resolve_helm_gateway_routes(&routes, &mut values).unwrap();
+        assert_eq!(hosts, vec!["git.acme.example", "s3.acme.example"]);
+        // Submitted parentRefs never survive: the route is pinned to keel-ingress.
+        assert_eq!(
+            values["httpRoute"]["parentRefs"],
+            keel_ingress_parent_refs()
+        );
+
+        // Disabled routes are ignored (and not pinned).
+        let mut disabled =
+            json!({ "httpRoute": { "enabled": false }, "s3": { "host": "x.example" } });
+        assert_eq!(
+            resolve_helm_gateway_routes(&routes, &mut disabled).unwrap(),
+            vec!["x.example"]
+        );
+        assert!(disabled["httpRoute"].get("parentRefs").is_none());
+
+        // Enabled without hostnames would be a catch-all route on the shared Gateway.
+        for bad in [
+            json!({ "httpRoute": { "enabled": true }, "s3": { "host": "x.example" } }),
+            json!({ "httpRoute": { "enabled": true, "hostnames": [] }, "s3": { "host": "x.example" } }),
+            json!({ "httpRoute": { "enabled": true, "hostnames": ["  "] }, "s3": { "host": "x.example" } }),
+            json!({ "httpRoute": { "enabled": false } }),
+            json!({ "httpRoute": { "enabled": true, "hostnames": [1] }, "s3": { "host": "x" } }),
+            json!({ "httpRoute": { "enabled": true, "hostnames": {} }, "s3": { "host": "x" } }),
+        ] {
+            let mut v = bad.clone();
+            assert!(
+                resolve_helm_gateway_routes(&routes, &mut v).is_err(),
+                "{bad} must be rejected"
+            );
+        }
+
+        // parentRefs are created even when the parent object is absent.
+        let mut no_parent = json!({ "s3": { "host": "a.example" } });
+        let pinned = [HelmGatewayRouteSpec {
+            enabled_value: None,
+            hostnames_value: "s3.host".to_string(),
+            parent_refs_value: Some("s3.httpRoute.parentRefs".to_string()),
+        }];
+        resolve_helm_gateway_routes(&pinned, &mut no_parent).unwrap();
+        assert_eq!(
+            no_parent["s3"]["httpRoute"]["parentRefs"][1]["sectionName"],
+            "https"
+        );
+    }
+
+    #[test]
+    fn test_undeclared_value_paths_fail_closed() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "httpRoute": {
+                    "type": "object",
+                    "properties": {
+                        "enabled": { "type": "boolean" },
+                        "hostnames": { "type": "array", "items": { "type": "string" } }
+                    }
+                },
+                "buckets": {
+                    "type": "array",
+                    "items": { "type": "object", "properties": { "name": { "type": "string" } } }
+                },
+                "labels": { "type": "object", "additionalProperties": { "type": "string" } },
+                "free": { "type": "object", "additionalProperties": true },
+                "oneOf": { "allOf": [{ "properties": { "a": { "type": "string" } } }] },
+                "secret": { "type": "string", "writeOnly": true }
+            }
+        });
+        let ok = json!({
+            "httpRoute": { "enabled": true, "hostnames": ["a.example"] },
+            "buckets": [{ "name": "data" }],
+            "labels": { "team": "x" },
+            "free": { "anything": { "nested": true } },
+            "oneOf": { "a": "x" },
+            "secret": "s3cr3t"
+        });
+        assert!(undeclared_value_paths(&schema, &ok).is_empty());
+        let bad = json!({
+            "httpRoute": { "enabled": true, "parentRefs": [] },
+            "buckets": [{ "name": "data", "anonymousRead": true }],
+            "extraDeploy": [{ "kind": "Role" }],
+            "filer": { "httpRoute": { "enabled": true } },
+            "oneOf": { "b": "x" }
+        });
+        assert_eq!(
+            undeclared_value_paths(&schema, &bad),
+            vec![
+                "buckets[0].anonymousRead",
+                "extraDeploy",
+                "filer",
+                "httpRoute.parentRefs",
+                "oneOf.b"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_schema_errors_never_echo_secret_values() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string", "pattern": "^[a-z]+$" },
+                "token": { "type": "string", "writeOnly": true, "pattern": "^[a-z]+$" },
+                "oauth": {
+                    "type": "array",
+                    "writeOnly": true,
+                    "items": {
+                        "type": "object",
+                        "properties": { "secret": { "type": "string", "pattern": "^[a-z]+$" } }
+                    }
+                }
+            }
+        });
+        let values = json!({
+            "name": "Bad-Name",
+            "token": "TOP-SECRET-1",
+            "oauth": [{ "secret": "TOP-SECRET-2" }]
+        });
+        let Err(CoreError::SchemaValidation(errors)) = validate_schema_values(&schema, &values)
+        else {
+            panic!("expected schema errors");
+        };
+        let rendered = format!("{errors:?}");
+        assert!(!rendered.contains("TOP-SECRET"), "{rendered}");
+        assert!(
+            rendered.contains("Bad-Name"),
+            "non-secret values keep the detail"
+        );
+        assert_eq!(errors.len(), 3);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.field_path == "/oauth/0/secret" && e.message.contains("'pattern'"))
+        );
+    }
+
+    #[test]
+    fn test_changed_immutable_values() {
+        let paths = vec![
+            "persistence.size".to_string(),
+            "persistence.storageClass".to_string(),
+            "volume.dataDirs".to_string(),
+        ];
+        let committed = json!({
+            "persistence": { "size": "10Gi", "storageClass": null },
+            "volume": { "dataDirs": [{ "name": "data1", "size": "10Gi" }] }
+        });
+        assert!(changed_immutable_values(&paths, &committed, &committed).is_empty());
+        // Missing equals null.
+        let same = json!({
+            "persistence": { "size": "10Gi" },
+            "volume": { "dataDirs": [{ "name": "data1", "size": "10Gi" }] }
+        });
+        assert!(changed_immutable_values(&paths, &committed, &same).is_empty());
+        let changed = json!({
+            "persistence": { "size": "30Gi", "storageClass": "fast" },
+            "volume": { "dataDirs": [{ "name": "data1", "size": "20Gi" }] }
+        });
+        assert_eq!(
+            changed_immutable_values(&paths, &committed, &changed),
+            paths
+        );
+    }
+
+    #[test]
+    fn test_helm_secret_value_fragments() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "gitea": {
+                    "type": "object",
+                    "properties": {
+                        "admin": {
+                            "type": "object",
+                            "properties": {
+                                "username": { "type": "string" },
+                                "password": { "type": "string", "format": "password" }
+                            }
+                        },
+                        "oauth": {
+                            "type": "array",
+                            "writeOnly": true,
+                            "items": { "type": "object" }
+                        }
+                    }
+                },
+                "token": { "type": "string", "writeOnly": true },
+                "list": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": { "key": { "type": "string", "format": "password" } }
+                    }
+                }
+            }
+        });
+        let values = json!({
+            "gitea": {
+                "admin": { "username": "root", "password": "p,a=s{s}\"'1" },
+                "oauth": [{ "name": "rauthy", "secret": "s3cr3t" }]
+            },
+            "token": ""
+        });
+        let partitioned = partition_values_by_schema(&schema, &values).unwrap();
+        let fragments = helm_secret_value_fragments(
+            &partitioned.secret_values,
+            &partitioned.secret_field_paths,
+        )
+        .unwrap();
+        // Blank secrets are not submitted (an Edit keeps the stored value).
+        assert_eq!(
+            fragments.keys().collect::<Vec<_>>(),
+            vec!["gitea.admin.password", "gitea.oauth"]
+        );
+        let admin: Value = serde_yml::from_str(&fragments["gitea.admin.password"]).unwrap();
+        assert_eq!(
+            admin,
+            json!({ "gitea": { "admin": { "password": "p,a=s{s}\"'1" } } })
+        );
+        let oauth: Value = serde_yml::from_str(&fragments["gitea.oauth"]).unwrap();
+        assert_eq!(oauth["gitea"]["oauth"][0]["secret"], "s3cr3t");
+        assert!(partitioned.normal_values["gitea"].get("oauth").is_none());
+
+        // Secret fields inside lists fail closed once submitted.
+        let in_list = json!({ "list": [{ "key": "abc" }] });
+        let partitioned = partition_values_by_schema(&schema, &in_list).unwrap();
+        assert!(
+            helm_secret_value_fragments(
+                &partitioned.secret_values,
+                &partitioned.secret_field_paths
+            )
+            .is_err()
         );
     }
 }
