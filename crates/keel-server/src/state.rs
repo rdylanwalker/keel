@@ -77,7 +77,12 @@ fn infer_stack_type(
 }
 
 /// Summary of a Flux `HelmRelease` / `Kustomization` / Flagger `Canary` returned by `GET /api/v1/releases`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+///
+/// Management-plane add-ons (`clusters/management/core-addons/`) are reported to cluster admins as
+/// releases with `managementAddon: true`, `protected: true`, `tenant: "management"` and the extra
+/// `catalogId` / `addonKind` / `desiredVersion` / `conflict` fields; those fields are omitted for
+/// tenant releases so tenant payloads are unchanged.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReleaseSummary {
     pub name: String,
@@ -108,6 +113,24 @@ pub struct ReleaseSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_synced: Option<String>,
     pub status: String,
+    /// `true` for a protected management-plane core add-on (never for tenant releases).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub management_addon: bool,
+    /// `true` when the release cannot be deleted through the API (management add-ons).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub protected: bool,
+    /// `catalog/core` application id backing a management add-on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog_id: Option<String>,
+    /// Flux object kind reconciling a management add-on (`HelmRelease` or `Kustomization`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub addon_kind: Option<ManagementAddonKind>,
+    /// Desired chart version / image tag declared in Git for a management add-on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desired_version: Option<String>,
+    /// `true` when the management add-on id is defined by more than one Flux object in Git.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub conflict: bool,
 }
 
 /// Live management add-on key: Flux object `(kind, namespace, name)`.
@@ -125,6 +148,14 @@ pub trait ClusterStateProvider: Send + Sync {
 
     async fn list_releases(&self, tenant: Option<&str>)
     -> Result<Vec<ReleaseSummary>, ServerError>;
+
+    /// Management-plane core add-ons (`clusters/management/core-addons/`) as protected
+    /// releases, with live Flux status where available. Callers must restrict this to cluster
+    /// admins; it never includes the infrastructure root Kustomizations (`flux-system`,
+    /// `core-addons`, `keel-tenants`).
+    async fn list_management_addon_releases(&self) -> Result<Vec<ReleaseSummary>, ServerError> {
+        Ok(Vec::new())
+    }
 
     async fn stack_diagnostics(
         &self,
@@ -685,6 +716,7 @@ impl ClusterStateProvider for RepoClusterStateProvider {
                     bundle_item: doc_bundle_item,
                     last_synced: None,
                     status: "Pending".to_string(),
+                    ..ReleaseSummary::default()
                 });
             }
         }
@@ -712,6 +744,16 @@ impl ClusterStateProvider for RepoClusterStateProvider {
         releases.retain(|r| seen.insert((r.namespace.clone(), r.name.clone())));
 
         Ok(releases)
+    }
+
+    async fn list_management_addon_releases(&self) -> Result<Vec<ReleaseSummary>, ServerError> {
+        Ok(
+            crate::routes::management::read_desired_core_addons(&self.repo_workdir)
+                .await
+                .into_iter()
+                .map(crate::routes::management::management_addon_release)
+                .collect(),
+        )
     }
 }
 
@@ -910,10 +952,22 @@ impl ClusterStateProvider for KubeClusterStateProvider {
                     bundle_item: None,
                     last_synced: info.last_synced.clone(),
                     status: "Deleting".to_string(),
+                    ..ReleaseSummary::default()
                 });
             }
         }
         Ok(releases)
+    }
+
+    async fn list_management_addon_releases(&self) -> Result<Vec<ReleaseSummary>, ServerError> {
+        let mut addons =
+            crate::routes::management::read_desired_core_addons(&self.repo.repo_workdir).await;
+        let live = self.management_addon_statuses().await;
+        crate::routes::management::overlay_management_addon_statuses(&mut addons, &live);
+        Ok(addons
+            .into_iter()
+            .map(crate::routes::management::management_addon_release)
+            .collect())
     }
 
     async fn stack_diagnostics(
@@ -1265,6 +1319,82 @@ mod tests {
                 ),
             ])
         }
+    }
+
+    fn write_core_addons(root: &Path) {
+        let dir = root.join(keel_core::MANAGEMENT_CORE_ADDONS_DIR);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("kyverno.yaml"),
+            "apiVersion: helm.toolkit.fluxcd.io/v2\nkind: HelmRelease\nmetadata:\n  name: kyverno\n  namespace: keel-system\nspec:\n  chart:\n    spec:\n      chart: kyverno\n      version: \"3.4.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("rauthy.yaml"),
+            "apiVersion: kustomize.toolkit.fluxcd.io/v1\nkind: Kustomization\nmetadata:\n  name: rauthy\n  namespace: flux-system\nspec:\n  path: ./x\n  images:\n    - name: ghcr.io/sebadob/rauthy\n      newTag: 0.37.2\n",
+        )
+        .unwrap();
+        // Duplicate id across kinds -> conflict; root Kustomization -> never listed.
+        std::fs::write(
+            dir.join("extra.yaml"),
+            "apiVersion: helm.toolkit.fluxcd.io/v2\nkind: HelmRelease\nmetadata:\n  name: forgejo\n  namespace: flux-system\nspec:\n  chart:\n    spec:\n      chart: forgejo\n---\napiVersion: kustomize.toolkit.fluxcd.io/v1\nkind: Kustomization\nmetadata:\n  name: forgejo\n  namespace: flux-system\nspec:\n  path: ./y\n---\napiVersion: kustomize.toolkit.fluxcd.io/v1\nkind: Kustomization\nmetadata:\n  name: flux-system\n  namespace: flux-system\nspec:\n  path: ./clusters/management\n",
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn repo_provider_lists_management_addons_as_pending_releases() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_core_addons(tmp.path());
+        let provider = RepoClusterStateProvider::new(tmp.path());
+        let releases = provider.list_management_addon_releases().await.unwrap();
+        let names: Vec<(&str, Option<ManagementAddonKind>)> = releases
+            .iter()
+            .map(|r| (r.name.as_str(), r.addon_kind))
+            .collect();
+        assert_eq!(releases.len(), 4, "{names:?}");
+        assert!(releases.iter().all(|r| r.management_addon
+            && r.protected
+            && r.status == "Pending"
+            && r.tenant.as_deref() == Some(MANAGEMENT_TENANT)));
+        assert!(!releases.iter().any(|r| r.name == "flux-system"));
+        let kyverno = releases.iter().find(|r| r.name == "kyverno").unwrap();
+        assert_eq!(kyverno.chart, "kyverno");
+        assert_eq!(kyverno.version.as_deref(), Some("3.4.0"));
+        assert_eq!(kyverno.desired_version.as_deref(), Some("3.4.0"));
+        assert_eq!(kyverno.runtime, "helm");
+        assert!(!kyverno.conflict);
+        assert!(
+            releases
+                .iter()
+                .filter(|r| r.name == "forgejo")
+                .all(|r| r.conflict)
+        );
+        // Tenant listing is unaffected by core add-ons.
+        assert!(provider.list_releases(None).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn kube_provider_overlays_live_status_on_management_addon_releases() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_core_addons(tmp.path());
+        let provider = KubeClusterStateProvider::new(
+            RepoClusterStateProvider::new(tmp.path()),
+            Arc::new(KindSplitLiveStatus),
+        );
+        let releases = provider.list_management_addon_releases().await.unwrap();
+        let status = |name: &str| {
+            releases
+                .iter()
+                .find(|r| r.name == name)
+                .map(|r| r.status.clone())
+                .unwrap()
+        };
+        assert_eq!(status("kyverno"), "Ready");
+        assert_eq!(status("rauthy"), "Reconciling");
+        assert_eq!(status("forgejo"), "Pending");
+        // The `tenant-a/flagger` HelmRelease never masquerades as a management add-on.
+        assert!(!releases.iter().any(|r| r.namespace == "tenant-a"));
     }
 
     #[tokio::test]

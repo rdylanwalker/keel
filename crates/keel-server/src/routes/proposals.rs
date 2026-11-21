@@ -496,6 +496,15 @@ pub async fn create_proposal(
     Json(req): Json<CreateProposalRequest>,
 ) -> Result<(StatusCode, Json<CreateProposalResponse>), ServerError> {
     validate_dns_label(&req.tenant, "tenant")?;
+    if req.tenant == crate::state::MANAGEMENT_TENANT {
+        auth.require_admin()?;
+        return Err(ServerError::Conflict(
+            "Management-plane add-ons are not tenant applications; change them via \
+             POST /api/v1/management/addons/{id}/upgrade (or /rollback), which opens a reviewed \
+             GitOps PR"
+                .to_string(),
+        ));
+    }
     auth.require_tenant_access(&req.tenant)?;
     validate_dns_label(&req.catalog_id, "catalog_id")?;
 

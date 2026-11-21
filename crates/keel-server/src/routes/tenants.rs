@@ -245,6 +245,14 @@ pub async fn create_tenant(
                 .to_string(),
         ));
     }
+    // `management` is the pseudo-tenant of the management control plane (`GET /api/v1/stacks`,
+    // `GET /api/v1/releases?tenant=management`) and must never name a real tenant.
+    if req.id == crate::state::MANAGEMENT_TENANT {
+        return Err(ServerError::BadRequest(format!(
+            "Tenant id '{}' is reserved for the management control plane",
+            req.id
+        )));
+    }
     let namespace = tenant_namespace(&req.id)?;
 
     let rel_dir = format!("tenants/{}", req.id);

@@ -616,13 +616,338 @@ spec:
 
             match err {
                 ServerError::Forbidden(msg) => {
-                    assert_eq!(
-                        msg,
-                        "Protected management-plane base addon cannot be deleted via API"
+                    assert!(
+                        msg.contains("protected management-plane add-on")
+                            && msg.contains("/api/v1/management/addons/"),
+                        "unexpected message: {msg}"
                     );
                 }
                 other => panic!("expected Forbidden, got {other:?}"),
             }
+        }
+    }
+
+    fn tenant_member_auth(groups: &[&str]) -> AuthSession {
+        AuthSession {
+            claims: SessionClaims {
+                sub: "dev@keel.local".to_string(),
+                email: Some("dev@keel.local".to_string()),
+                name: Some("Dev".to_string()),
+                groups: groups.iter().map(|g| g.to_string()).collect(),
+                auth_phase: AuthPhase::OidcActive,
+                exp: Utc::now().timestamp() + 3600,
+            },
+        }
+    }
+
+    async fn write_flux_system_addons(workdir: &std::path::Path) {
+        tokio::fs::write(
+            workdir.join("clusters/management/core-addons/rauthy.yaml"),
+            r#"apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: rauthy
+  namespace: flux-system
+  labels:
+    keel.io/protect: "true"
+spec:
+  targetNamespace: keel-system
+  path: ./clusters/management/addons/rauthy
+  images:
+    - name: ghcr.io/sebadob/rauthy
+      newTag: 0.37.2
+"#,
+        )
+        .await
+        .unwrap();
+        // A mis-placed infrastructure root Kustomization must never be listed as an application.
+        tokio::fs::write(
+            workdir.join("clusters/management/core-addons/roots.yaml"),
+            r#"apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: core-addons
+  namespace: flux-system
+spec:
+  path: ./clusters/management/core-addons
+---
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: keel-tenants
+  namespace: flux-system
+spec:
+  path: ./tenants
+"#,
+        )
+        .await
+        .unwrap();
+        tokio::fs::create_dir_all(workdir.join("tenants/default/apps/podinfo"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            workdir.join("tenants/default/apps/podinfo/helmrelease.yaml"),
+            r#"apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: podinfo
+  namespace: tenant-default
+spec:
+  chart:
+    spec:
+      chart: podinfo
+      version: "6.7.0"
+"#,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_releases_includes_management_addons_for_admins_only() {
+        let (_tmp, state, workdir) = setup_test_state().await;
+        write_flux_system_addons(&workdir).await;
+
+        // Admin, no filter: tenant releases + management add-ons (never root Kustomizations).
+        let Json(all) = list_releases(
+            test_auth(),
+            State(state.clone()),
+            Query(ListReleasesQuery { tenant: None }),
+        )
+        .await
+        .expect("admin list_releases");
+        let names: Vec<&str> = all.releases.iter().map(|r| r.name.as_str()).collect();
+        assert!(names.contains(&"podinfo"), "{names:?}");
+        assert!(names.contains(&"rauthy"), "{names:?}");
+        assert!(names.contains(&"s3-state-backend"), "{names:?}");
+        assert!(!names.contains(&"core-addons") && !names.contains(&"keel-tenants"));
+
+        let rauthy = all.releases.iter().find(|r| r.name == "rauthy").unwrap();
+        assert!(rauthy.management_addon && rauthy.protected && !rauthy.conflict);
+        assert_eq!(rauthy.namespace, "flux-system");
+        assert_eq!(rauthy.tenant.as_deref(), Some("management"));
+        assert_eq!(rauthy.catalog_id.as_deref(), Some("rauthy"));
+        assert_eq!(
+            rauthy.addon_kind,
+            Some(keel_core::ManagementAddonKind::Kustomization)
+        );
+        assert_eq!(rauthy.desired_version.as_deref(), Some("0.37.2"));
+        assert_eq!(rauthy.runtime, "kustomize");
+        assert_eq!(rauthy.status, "Pending");
+        let json = serde_json::to_value(rauthy).unwrap();
+        assert_eq!(json["managementAddon"], json!(true));
+        assert_eq!(json["addonKind"], json!("Kustomization"));
+        assert_eq!(json["catalogId"], json!("rauthy"));
+
+        // Tenant payloads are unchanged (no management-only keys).
+        let podinfo = all.releases.iter().find(|r| r.name == "podinfo").unwrap();
+        let json = serde_json::to_value(podinfo).unwrap();
+        for key in [
+            "managementAddon",
+            "protected",
+            "catalogId",
+            "addonKind",
+            "desiredVersion",
+            "conflict",
+        ] {
+            assert!(json.get(key).is_none(), "tenant release leaked {key}");
+        }
+
+        // Admin, tenant filter: no management add-ons.
+        let Json(tenant_only) = list_releases(
+            test_auth(),
+            State(state.clone()),
+            Query(ListReleasesQuery {
+                tenant: Some("default".to_string()),
+            }),
+        )
+        .await
+        .expect("admin tenant list");
+        assert!(tenant_only.releases.iter().all(|r| !r.management_addon));
+        assert!(tenant_only.releases.iter().any(|r| r.name == "podinfo"));
+
+        // Admin, `tenant=management`: only management add-ons.
+        let Json(mgmt) = list_releases(
+            test_auth(),
+            State(state.clone()),
+            Query(ListReleasesQuery {
+                tenant: Some("management".to_string()),
+            }),
+        )
+        .await
+        .expect("admin management list");
+        assert!(!mgmt.releases.is_empty());
+        assert!(mgmt.releases.iter().all(|r| r.management_addon));
+
+        // Non-admin: never sees management add-ons, even via a `tenant-management` group.
+        let member = tenant_member_auth(&["tenant-default", "tenant-management"]);
+        let Json(user_all) = list_releases(
+            member.clone(),
+            State(state.clone()),
+            Query(ListReleasesQuery { tenant: None }),
+        )
+        .await
+        .expect("member list");
+        assert!(user_all.releases.iter().all(|r| !r.management_addon));
+        assert!(user_all.releases.iter().any(|r| r.name == "podinfo"));
+        let err = list_releases(
+            member,
+            State(state.clone()),
+            Query(ListReleasesQuery {
+                tenant: Some("management".to_string()),
+            }),
+        )
+        .await
+        .expect_err("non-admin management filter");
+        assert!(matches!(err, ServerError::Forbidden(_)));
+    }
+
+    #[tokio::test]
+    async fn management_addon_release_actions_are_guarded() {
+        let (_tmp, state, _workdir) = setup_test_state().await;
+        let rauthy = || AxumPath(("flux-system".to_string(), "rauthy".to_string()));
+        let member = tenant_member_auth(&["tenant-flux-system", "tenant-keel-system"]);
+
+        // Config edits are refused and point at the management PR endpoints.
+        let err = get_release_config(test_auth(), State(state.clone()), rauthy())
+            .await
+            .expect_err("config refused");
+        match err {
+            ServerError::Conflict(msg) => {
+                assert!(
+                    msg.contains("/api/v1/management/addons/rauthy/upgrade"),
+                    "{msg}"
+                )
+            }
+            other => panic!("expected Conflict, got {other:?}"),
+        }
+        let err = get_release_config(member.clone(), State(state.clone()), rauthy())
+            .await
+            .expect_err("config refused for non-admin");
+        assert!(matches!(err, ServerError::Forbidden(_)));
+
+        // Reconcile: admin-only outside tenant namespaces (the Git-only provider then reports
+        // that a live cluster is required, proving authorization passed).
+        let err = reconcile_release(test_auth(), State(state.clone()), rauthy())
+            .await
+            .expect_err("no live cluster");
+        assert!(matches!(err, ServerError::ServiceUnavailable(_)), "{err:?}");
+        let err = reconcile_release(member.clone(), State(state.clone()), rauthy())
+            .await
+            .expect_err("non-admin reconcile");
+        assert!(matches!(err, ServerError::Forbidden(_)));
+
+        // Diagnostics: admin-only.
+        let Json(diag) = get_release_diagnostics(test_auth(), State(state.clone()), rauthy())
+            .await
+            .expect("admin diagnostics");
+        assert_eq!(diag.namespace, "flux-system");
+        let err = get_release_diagnostics(member.clone(), State(state.clone()), rauthy())
+            .await
+            .expect_err("non-admin diagnostics");
+        assert!(matches!(err, ServerError::Forbidden(_)));
+
+        // Delete: always refused for management add-ons.
+        let err = delete_release(test_auth(), State(state.clone()), rauthy())
+            .await
+            .expect_err("delete refused");
+        assert!(matches!(err, ServerError::Forbidden(_)));
+
+        // Legacy add-ons in `keel-system` are guarded identically.
+        let kyverno = || AxumPath(("keel-system".to_string(), "kyverno".to_string()));
+        let err = get_release_config(test_auth(), State(state.clone()), kyverno())
+            .await
+            .expect_err("keel-system config refused");
+        match err {
+            ServerError::Conflict(msg) => {
+                assert!(
+                    msg.contains("/api/v1/management/addons/kyverno/upgrade"),
+                    "{msg}"
+                )
+            }
+            other => panic!("expected Conflict, got {other:?}"),
+        }
+        let err = delete_release(test_auth(), State(state.clone()), kyverno())
+            .await
+            .expect_err("keel-system delete refused");
+        assert!(matches!(err, ServerError::Forbidden(_)), "{err:?}");
+        let err = reconcile_release(test_auth(), State(state.clone()), kyverno())
+            .await
+            .expect_err("no live cluster");
+        assert!(matches!(err, ServerError::ServiceUnavailable(_)), "{err:?}");
+        let err = reconcile_release(member.clone(), State(state.clone()), kyverno())
+            .await
+            .expect_err("non-admin keel-system reconcile");
+        assert!(matches!(err, ServerError::Forbidden(_)), "{err:?}");
+
+        // Proposals and tenants cannot target the `management` pseudo-tenant.
+        let err = create_proposal(
+            test_auth(),
+            State(state.clone()),
+            Json(CreateProposalRequest {
+                tenant: "management".to_string(),
+                catalog_id: "s3-state-backend".to_string(),
+                kind: None,
+                name: None,
+                title: None,
+                body: None,
+                values: json!({}),
+                canary: false,
+                target_cluster: None,
+                version: None,
+                target_namespace: None,
+                action_engine: None,
+            }),
+        )
+        .await
+        .expect_err("management proposal refused");
+        assert!(matches!(err, ServerError::Conflict(_)), "{err:?}");
+        let err = create_tenant(
+            test_auth(),
+            State(state.clone()),
+            Json(CreateTenantRequest {
+                id: "management".to_string(),
+            }),
+        )
+        .await
+        .expect_err("reserved tenant id");
+        assert!(matches!(err, ServerError::BadRequest(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn delete_release_refuses_protect_labelled_tenant_release() {
+        let (_tmp, state, workdir) = setup_test_state().await;
+        let dir = workdir.join("tenants/default/apps/guarded");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(
+            dir.join("helmrelease.yaml"),
+            "apiVersion: helm.toolkit.fluxcd.io/v2\nkind: HelmRelease\nmetadata:\n  name: guarded\n  namespace: tenant-default\n  labels:\n    keel.io/protect: \"true\"\nspec: {}\n",
+        )
+        .await
+        .unwrap();
+        let git = GitRunner::new();
+        git.add(&workdir, ["."]).await.unwrap();
+        git.commit(
+            &workdir,
+            "chore: guarded release",
+            &CommitAuthor::new("Keel Seed", "seed@keel.local"),
+        )
+        .await
+        .unwrap();
+        git.push(&workdir, "origin", "HEAD:refs/heads/main")
+            .await
+            .unwrap();
+
+        let err = delete_release(
+            test_auth(),
+            State(state.clone()),
+            AxumPath(("tenant-default".to_string(), "guarded".to_string())),
+        )
+        .await
+        .expect_err("protected release");
+        match err {
+            ServerError::Forbidden(msg) => assert!(msg.contains("keel.io/protect"), "{msg}"),
+            other => panic!("expected Forbidden, got {other:?}"),
         }
     }
 

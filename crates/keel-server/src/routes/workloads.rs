@@ -17,7 +17,7 @@ use serde_json::{Value, json};
 
 use crate::auth::AuthSession;
 use crate::error::ServerError;
-use crate::state::{AppState, ReleaseSummary, StackSummary};
+use crate::state::{AppState, MANAGEMENT_TENANT, ReleaseSummary, StackSummary};
 
 use super::{
     RepoReader, open_pr_for_session, resolve_tenant_resource_dir, serialize_tenants_kustomization,
@@ -197,13 +197,12 @@ pub async fn delete_release(
     State(state): State<AppState>,
     AxumPath((namespace, name)): AxumPath<(String, String)>,
 ) -> Result<Json<DeleteResourceResponse>, ServerError> {
-    if matches!(
-        namespace.as_str(),
-        "keel-system" | "flux-system" | "kyverno"
-    ) {
-        return Err(ServerError::Forbidden(
-            "Protected management-plane base addon cannot be deleted via API".to_string(),
-        ));
+    if is_management_namespace(&namespace) || namespace == "kyverno" {
+        return Err(ServerError::Forbidden(format!(
+            "'{namespace}/{name}' is a protected management-plane add-on and cannot be deleted \
+             via the API; use the management add-on upgrade/rollback PR endpoints \
+             (/api/v1/management/addons/{{id}}) to change it"
+        )));
     }
     delete_gitops_resource_pr(auth, state, namespace, name, "apps").await
 }
@@ -252,6 +251,12 @@ async fn delete_gitops_resource_pr(
             )));
         };
         let rel_dir = resolved.rel_dir;
+        if subdir == "apps" && declares_protected_flux_object(&state.repo_workdir.join(&rel_dir)) {
+            return Err(ServerError::Forbidden(format!(
+                "Release '{name}' in '{namespace}' is labelled `keel.io/protect: \"true\"` and \
+                 cannot be deleted via the API; remove the label in Git first"
+            )));
+        }
 
         state
             .git_runner
@@ -319,6 +324,40 @@ async fn delete_gitops_resource_pr(
         proposal,
         branch,
     }))
+}
+
+/// `true` when any Flux `HelmRelease` / `Kustomization` manifest under `dir` carries the
+/// `keel.io/protect: "true"` anti-lockout label.
+fn declares_protected_flux_object(dir: &std::path::Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let path = entry.path();
+        if path.is_dir() {
+            return declares_protected_flux_object(&path);
+        }
+        let is_yaml = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("yaml") || e.eq_ignore_ascii_case("yml"));
+        if !is_yaml {
+            return false;
+        }
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            return false;
+        };
+        keel_core::split_yaml_documents(&raw).iter().any(|doc| {
+            serde_yml::from_str::<Value>(doc).ok().is_some_and(|val| {
+                let kind = val.get("kind").and_then(Value::as_str);
+                matches!(kind, Some("HelmRelease" | "Kustomization"))
+                    && val
+                        .pointer("/metadata/labels/keel.io~1protect")
+                        .and_then(Value::as_str)
+                        == Some("true")
+            })
+        })
+    })
 }
 
 /// `GET /api/v1/stacks/{namespace}/{name}/config`
@@ -439,6 +478,10 @@ pub async fn get_release_config(
 ) -> Result<Json<ReleaseConfigResponse>, ServerError> {
     validate_dns_label(&namespace, "namespace")?;
     validate_dns_label(&name, "name")?;
+    if is_management_namespace(&namespace) {
+        auth.require_admin()?;
+        return Err(management_addon_config_conflict(&namespace, &name));
+    }
 
     let tenant = namespace.strip_prefix("tenant-").unwrap_or(&namespace);
     auth.require_tenant_access(tenant)?;
@@ -1184,8 +1227,13 @@ pub async fn reconcile_release(
 ) -> Result<Json<ReconcileReleaseResponse>, ServerError> {
     validate_dns_label(&namespace, "namespace")?;
     validate_dns_label(&name, "name")?;
-    let tenant = namespace.strip_prefix("tenant-").unwrap_or(&namespace);
-    auth.require_tenant_access(tenant)?;
+    // Tenant namespaces need tenant access; any other namespace (e.g. management add-ons in
+    // `flux-system`) requires cluster admin. keel-server's `flux-system` Role + the Kyverno
+    // `protect-control-plane` policy only permit the `reconcile.fluxcd.io/requestedAt` patch.
+    match namespace.strip_prefix("tenant-") {
+        Some(tenant) => auth.require_tenant_access(tenant)?,
+        None => auth.require_admin()?,
+    }
 
     let message = state
         .state_provider
@@ -1214,11 +1262,24 @@ pub struct ReleasesResponse {
 }
 
 /// `GET /api/v1/releases`
+///
+/// Tenant releases are always filtered to the caller's tenants. For cluster admins the
+/// protected management-plane add-ons (`clusters/management/core-addons/`) are appended as
+/// releases with `managementAddon: true` when no `tenant` filter is set; `?tenant=management`
+/// (admin-only) returns only those add-ons. Non-admins never see them.
 pub async fn list_releases(
     auth: AuthSession,
     State(state): State<AppState>,
     Query(query): Query<ListReleasesQuery>,
 ) -> Result<Json<ReleasesResponse>, ServerError> {
+    if query.tenant.as_deref() == Some(MANAGEMENT_TENANT) {
+        auth.require_admin()?;
+        let releases = state
+            .state_provider
+            .list_management_addon_releases()
+            .await?;
+        return Ok(Json(ReleasesResponse { releases }));
+    }
     if let Some(ref tenant) = query.tenant {
         auth.require_tenant_access(tenant)?;
     }
@@ -1232,5 +1293,32 @@ pub async fn list_releases(
             auth.require_tenant_access(tenant).is_ok()
         });
     }
+    if query.tenant.is_none() && auth.is_admin() {
+        let addons = state
+            .state_provider
+            .list_management_addon_releases()
+            .await?;
+        releases.retain(|r| {
+            !addons
+                .iter()
+                .any(|a| a.namespace == r.namespace && a.name == r.name)
+        });
+        releases.extend(addons);
+    }
     Ok(Json(ReleasesResponse { releases }))
+}
+
+/// `true` for a release in a management-plane namespace (`flux-system` / `keel-system`), i.e. a
+/// protected management add-on that is never edited or deleted through the tenant release API.
+fn is_management_namespace(namespace: &str) -> bool {
+    namespace == keel_core::FLUX_SYSTEM_NAMESPACE || namespace == keel_core::KEEL_SYSTEM_NAMESPACE
+}
+
+/// `409` pointing callers at the management add-on PR endpoints.
+fn management_addon_config_conflict(namespace: &str, name: &str) -> ServerError {
+    ServerError::Conflict(format!(
+        "'{namespace}/{name}' is a protected management-plane add-on; change its version or \
+         values via POST /api/v1/management/addons/{name}/upgrade (or /rollback), which opens a \
+         reviewed GitOps PR"
+    ))
 }

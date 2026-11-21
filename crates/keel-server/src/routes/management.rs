@@ -26,7 +26,7 @@ use serde_json::Value;
 
 use crate::auth::AuthSession;
 use crate::error::ServerError;
-use crate::state::{AppState, ManagementAddonKey};
+use crate::state::{AppState, MANAGEMENT_TENANT, ManagementAddonKey, ReleaseSummary};
 
 use super::{open_pr_for_session, stage_commit_push_and_return_to_main};
 
@@ -312,9 +312,26 @@ fn duplicate_addon_conflict(id: &str, first: &str, second: &str) -> ServerError 
     ))
 }
 
+/// Flux `Kustomization`s that wire the GitOps tree itself (`clusters/management/flux-system`).
+/// They are infrastructure roots, never management add-ons, even if mis-placed under
+/// `core-addons/`.
+pub const MANAGEMENT_ROOT_KUSTOMIZATIONS: [&str; 3] =
+    ["flux-system", "core-addons", "keel-tenants"];
+
+/// `true` for an infrastructure root Flux `Kustomization` in `flux-system`.
+pub fn is_management_root_kustomization(
+    kind: ManagementAddonKind,
+    namespace: &str,
+    name: &str,
+) -> bool {
+    kind == ManagementAddonKind::Kustomization
+        && namespace == keel_core::FLUX_SYSTEM_NAMESPACE
+        && MANAGEMENT_ROOT_KUSTOMIZATIONS.contains(&name)
+}
+
 /// Reads desired management add-ons (Flux `HelmRelease`s and Flux `Kustomization`s in
 /// `keel-system` / `flux-system`) from Git.
-async fn read_desired_core_addons(repo_workdir: &Path) -> Vec<ManagementAddonStatus> {
+pub(crate) async fn read_desired_core_addons(repo_workdir: &Path) -> Vec<ManagementAddonStatus> {
     let Ok(files) = core_addon_yaml_files(repo_workdir).await else {
         return Vec::new();
     };
@@ -327,6 +344,9 @@ async fn read_desired_core_addons(repo_workdir: &Path) -> Vec<ManagementAddonSta
             let Some(addon) = management_addon_ref(&val) else {
                 continue;
             };
+            if is_management_root_kustomization(addon.kind, &addon.namespace, &addon.name) {
+                continue;
+            }
             addons.push(ManagementAddonStatus {
                 id: addon.name.clone(),
                 name: addon.name,
@@ -368,6 +388,33 @@ pub fn overlay_management_addon_statuses(
             addon.tracked = true;
             addon.last_synced = info.last_synced.clone();
         }
+    }
+}
+
+/// Maps a management add-on onto the `GET /api/v1/releases` shape so the Topology view can
+/// watch, diagnose and reconcile it like any other application. Management add-ons are always
+/// protected (they live in `flux-system` / `keel-system` and carry `keel.io/protect`).
+pub(crate) fn management_addon_release(addon: ManagementAddonStatus) -> ReleaseSummary {
+    let runtime = match addon.kind {
+        ManagementAddonKind::HelmRelease => "helm",
+        ManagementAddonKind::Kustomization => "kustomize",
+    };
+    ReleaseSummary {
+        chart: addon.chart.clone().unwrap_or_else(|| addon.id.clone()),
+        version: addon.desired_version.clone(),
+        runtime: runtime.to_string(),
+        tenant: Some(MANAGEMENT_TENANT.to_string()),
+        last_synced: addon.last_synced,
+        status: addon.status.unwrap_or_else(|| "Pending".to_string()),
+        management_addon: true,
+        protected: true,
+        catalog_id: Some(addon.id),
+        addon_kind: Some(addon.kind),
+        desired_version: addon.desired_version,
+        conflict: addon.conflict,
+        name: addon.name,
+        namespace: addon.namespace,
+        ..ReleaseSummary::default()
     }
 }
 
@@ -790,10 +837,22 @@ mod addon_status_tests {
     async fn offline_provider_reports_untracked_addons_from_git() {
         let tmp = tempfile::tempdir().unwrap();
         let state = state_with(tmp.path(), None);
+        // Infrastructure root Kustomizations mis-placed under `core-addons/` are never add-ons.
+        std::fs::write(
+            tmp.path().join("clusters/management/core-addons/roots.yaml"),
+            "apiVersion: kustomize.toolkit.fluxcd.io/v1\nkind: Kustomization\nmetadata:\n  name: core-addons\n  namespace: flux-system\nspec:\n  path: ./clusters/management/core-addons\n---\napiVersion: kustomize.toolkit.fluxcd.io/v1\nkind: Kustomization\nmetadata:\n  name: flux-system\n  namespace: flux-system\nspec:\n  path: ./clusters/management\n---\napiVersion: kustomize.toolkit.fluxcd.io/v1\nkind: Kustomization\nmetadata:\n  name: keel-tenants\n  namespace: flux-system\nspec:\n  path: ./tenants\n",
+        )
+        .unwrap();
         let Json(resp) = list_management_addons(session(&["keel-admins"]), State(state))
             .await
             .unwrap();
         assert!(!resp.live_status_available);
+        for root in ["core-addons", "flux-system", "keel-tenants"] {
+            assert!(
+                resp.addons.iter().all(|a| a.id != root),
+                "root Kustomization {root} listed as an add-on"
+            );
+        }
         assert_eq!(resp.addons.len(), 2);
         let flagger = resp.addons.iter().find(|a| a.id == "flagger").unwrap();
         assert_eq!(flagger.namespace, "keel-system");

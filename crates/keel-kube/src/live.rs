@@ -1113,7 +1113,7 @@ impl LiveStatusSource for KubeClusterStatusReader {
         };
         let hr_api: Api<DynamicObject> =
             Api::namespaced_with(self.client.clone(), namespace, &hr_ar);
-        let (mut conditions, mut metadata) = match hr_api.get(name).await {
+        let (mut conditions, mut metadata, mut workload_namespace) = match hr_api.get(name).await {
             Ok(obj) => (
                 extract_conditions(&obj.data),
                 Some(extract_resource_metadata(
@@ -1121,8 +1121,9 @@ impl LiveStatusSource for KubeClusterStatusReader {
                     "helm.toolkit.fluxcd.io/v2",
                     "HelmRelease",
                 )),
+                flux_workload_namespace(namespace, &obj.data),
             ),
-            Err(_) => (Vec::new(), None),
+            Err(_) => (Vec::new(), None, None),
         };
 
         if conditions.is_empty() && metadata.is_none() {
@@ -1142,10 +1143,19 @@ impl LiveStatusSource for KubeClusterStatusReader {
                     "kustomize.toolkit.fluxcd.io/v1",
                     "Kustomization",
                 ));
+                workload_namespace = flux_workload_namespace(namespace, &obj.data);
             }
         }
 
-        let pod_api: Api<Pod> = Api::namespaced(self.client.clone(), namespace);
+        // Management add-ons live in `flux-system` but deploy their workloads into
+        // `spec.targetNamespace` (e.g. `keel-system`): look for pods there, and merge events from
+        // both the Flux object's namespace and the workload namespace. The redirect is restricted
+        // to management namespaces (see `flux_workload_namespace`); tenant objects always stay in
+        // their own namespace so tenant-controlled spec fields can never widen the read scope.
+        let workload_namespace = workload_namespace
+            .filter(|ns| ns != namespace)
+            .unwrap_or_else(|| namespace.to_string());
+        let pod_api: Api<Pod> = Api::namespaced(self.client.clone(), &workload_namespace);
         let matched_pod = pod_api
             .list(&ListParams::default())
             .await
@@ -1198,11 +1208,17 @@ impl LiveStatusSource for KubeClusterStatusReader {
             None => (None, None, Vec::new()),
         };
 
-        let event_api: Api<K8sEvent> = Api::namespaced(self.client.clone(), namespace);
-        let mut events: Vec<ClusterEventSummary> = event_api
-            .list(&ListParams::default())
-            .await
-            .map(|list| {
+        let mut event_namespaces = vec![namespace.to_string()];
+        if workload_namespace != namespace {
+            event_namespaces.push(workload_namespace.clone());
+        }
+        let mut events: Vec<ClusterEventSummary> = Vec::new();
+        for ev_ns in &event_namespaces {
+            let event_api: Api<K8sEvent> = Api::namespaced(self.client.clone(), ev_ns);
+            let Ok(list) = event_api.list(&ListParams::default()).await else {
+                continue;
+            };
+            events.extend(
                 list.items
                     .into_iter()
                     .filter(|ev| {
@@ -1220,10 +1236,9 @@ impl LiveStatusSource for KubeClusterStatusReader {
                             .last_timestamp
                             .map(|t| t.0.to_string())
                             .or_else(|| ev.metadata.creation_timestamp.map(|t| t.0.to_string())),
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+                    }),
+            );
+        }
         events.sort_by(|a, b| b.last_seen.cmp(&a.last_seen));
         events.truncate(20);
 
@@ -1728,6 +1743,45 @@ pub fn extract_resource_metadata(
     }
 }
 
+/// Management namespaces whose Flux objects may redirect diagnostics to a workload namespace.
+const MANAGEMENT_FLUX_NAMESPACES: [&str; 2] = ["flux-system", "keel-system"];
+
+/// Namespace a management Flux `HelmRelease` / `Kustomization` deploys its workloads into:
+/// `spec.targetNamespace`, else (for plain-manifest Kustomizations) the namespace of the first
+/// `spec.healthChecks[]` entry.
+///
+/// Returns `None` (i.e. "stay in the object's own namespace") unless the object itself lives in
+/// a management namespace (`flux-system` / `keel-system`), does not target a remote cluster via
+/// `spec.kubeConfig`, and the resolved namespace is itself a management namespace. Tenant objects
+/// control these spec fields, so honouring them would let a tenant read pods, logs and events
+/// of other tenants (NFR-SEC-02).
+pub fn flux_workload_namespace(object_namespace: &str, data: &Value) -> Option<String> {
+    if !MANAGEMENT_FLUX_NAMESPACES.contains(&object_namespace) {
+        return None;
+    }
+    if data
+        .pointer("/spec/kubeConfig")
+        .is_some_and(|v| !v.is_null())
+    {
+        return None;
+    }
+    let non_empty = |v: &Value| {
+        v.as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    };
+    data.pointer("/spec/targetNamespace")
+        .and_then(non_empty)
+        .or_else(|| {
+            data.pointer("/spec/healthChecks")
+                .and_then(Value::as_array)?
+                .iter()
+                .find_map(|hc| hc.get("namespace").and_then(non_empty))
+        })
+        .filter(|ns| MANAGEMENT_FLUX_NAMESPACES.contains(&ns.as_str()))
+}
+
 pub fn extract_conditions(data: &Value) -> Vec<ResourceCondition> {
     let Some(arr) = data.pointer("/status/conditions").and_then(Value::as_array) else {
         return Vec::new();
@@ -2041,6 +2095,83 @@ pub fn force_delete_warning_suffix(data: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flux_workload_namespace_prefers_target_namespace_then_health_checks() {
+        assert_eq!(
+            flux_workload_namespace(
+                "flux-system",
+                &serde_json::json!({
+                    "spec": {"targetNamespace": "keel-system", "healthChecks": [{"namespace": "x"}]}
+                })
+            )
+            .as_deref(),
+            Some("keel-system")
+        );
+        assert_eq!(
+            flux_workload_namespace(
+                "flux-system",
+                &serde_json::json!({
+                    "spec": {"targetNamespace": " ", "healthChecks": [{"kind": "Deployment"}, {"namespace": "keel-system"}]}
+                })
+            )
+            .as_deref(),
+            Some("keel-system")
+        );
+        assert_eq!(
+            flux_workload_namespace("flux-system", &serde_json::json!({"spec": {}})),
+            None
+        );
+    }
+
+    #[test]
+    fn flux_workload_namespace_never_redirects_tenant_objects() {
+        // Tenant HelmRelease targeting another tenant, with and without a remote kubeConfig.
+        for spec in [
+            serde_json::json!({"spec": {"targetNamespace": "tenant-b"}}),
+            serde_json::json!({"spec": {
+                "targetNamespace": "tenant-b",
+                "kubeConfig": {"secretRef": {"name": "remote"}}
+            }}),
+            serde_json::json!({"spec": {"targetNamespace": "keel-system"}}),
+            // Tenant Kustomization whose healthChecks name another namespace.
+            serde_json::json!({"spec": {"healthChecks": [{"kind": "Deployment", "namespace": "tenant-b"}]}}),
+            serde_json::json!({"spec": {"healthChecks": [{"namespace": "keel-previews"}]}}),
+        ] {
+            assert_eq!(flux_workload_namespace("tenant-a", &spec), None, "{spec}");
+        }
+    }
+
+    #[test]
+    fn flux_workload_namespace_rejects_remote_or_non_management_targets() {
+        // Management object with a remote kubeConfig: workloads are not on this cluster.
+        assert_eq!(
+            flux_workload_namespace(
+                "flux-system",
+                &serde_json::json!({"spec": {
+                    "targetNamespace": "keel-system",
+                    "kubeConfig": {"secretRef": {"name": "remote"}}
+                }})
+            ),
+            None
+        );
+        // Management object pointing into a tenant namespace is never followed.
+        assert_eq!(
+            flux_workload_namespace(
+                "flux-system",
+                &serde_json::json!({"spec": {"targetNamespace": "tenant-b"}})
+            ),
+            None
+        );
+        assert_eq!(
+            flux_workload_namespace(
+                "keel-system",
+                &serde_json::json!({"spec": {"healthChecks": [{"namespace": "flux-system"}]}})
+            )
+            .as_deref(),
+            Some("flux-system")
+        );
+    }
 
     fn parse_kc(yaml: &str) -> kube::config::Kubeconfig {
         kube::config::Kubeconfig::from_yaml(yaml).expect("valid kubeconfig yaml")
