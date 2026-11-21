@@ -6,6 +6,7 @@ metadata:
   description: Provision a GCP Compute Engine virtual machine with SSH access (defaults to Always-Free e2-micro)
   category: compute
   provider: gcp
+  resourceKind: vm
 spec:
   pulumiRuntime: yaml
   entrypoint: Pulumi.yaml

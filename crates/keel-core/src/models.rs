@@ -850,6 +850,67 @@ impl TenantConfig {
     }
 }
 
+/// Infrastructure stack resource classification used for dashboard grouping,
+/// SSH capability gating, and deployment target cluster filtering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum InfraResourceKind {
+    #[serde(
+        alias = "VM",
+        alias = "Vm",
+        alias = "compute",
+        alias = "virtual-machine"
+    )]
+    Vm,
+    #[serde(
+        alias = "Cluster",
+        alias = "CLUSTER",
+        alias = "kubernetes-cluster",
+        alias = "kubernetes",
+        alias = "k8s"
+    )]
+    Cluster,
+    #[serde(
+        alias = "Service",
+        alias = "SERVICE",
+        alias = "database",
+        alias = "config",
+        alias = "progressive-delivery"
+    )]
+    Service,
+}
+
+impl InfraResourceKind {
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Vm => "vm",
+            Self::Cluster => "cluster",
+            Self::Service => "service",
+        }
+    }
+}
+
+impl fmt::Display for InfraResourceKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for InfraResourceKind {
+    type Err = CoreError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "vm" | "virtual-machine" | "compute" => Ok(Self::Vm),
+            "cluster" | "kubernetes-cluster" | "kubernetes" | "k8s" => Ok(Self::Cluster),
+            "service" | "database" | "config" | "progressive-delivery" => Ok(Self::Service),
+            other => Err(CoreError::Validation(format!(
+                "Unsupported InfraResourceKind '{other}'"
+            ))),
+        }
+    }
+}
+
 /// Application packaging runtime supported by Flux CD and PKO (`SDD.md` §5.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -943,6 +1004,10 @@ pub struct CatalogAppMetadata {
     pub description: Option<String>,
     pub category: String,
     pub runtime: AppRuntime,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub protected: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant: Option<String>,
 }
 
 /// Unmodified upstream Helm chart or Kustomize repository reference (`NFR-EXT-01`).
@@ -1040,6 +1105,9 @@ impl CatalogApplication {
                 "metadata.category must not be empty".to_string(),
             ));
         }
+        if let Some(ref t) = self.metadata.tenant {
+            validate_dns_label(t, "metadata.tenant")?;
+        }
         if self.metadata.runtime != AppRuntime::Manifest
             && self.spec.upstream.repo_url.trim().is_empty()
         {
@@ -1089,6 +1157,12 @@ pub struct CatalogBlueprintMetadata {
     pub description: Option<String>,
     pub category: String,
     pub provider: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_kind: Option<InfraResourceKind>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub protected: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant: Option<String>,
 }
 
 fn default_pulumi_runtime() -> String {
@@ -1153,6 +1227,9 @@ impl CatalogInfraBlueprint {
                 "metadata.category must not be empty".to_string(),
             ));
         }
+        if let Some(ref t) = self.metadata.tenant {
+            validate_dns_label(t, "metadata.tenant")?;
+        }
         if self.spec.entrypoint.trim().is_empty() {
             return Err(CoreError::Validation(
                 "spec.entrypoint must not be empty".to_string(),
@@ -1164,6 +1241,30 @@ impl CatalogInfraBlueprint {
             ));
         }
         Ok(())
+    }
+
+    pub fn effective_resource_kind(&self) -> InfraResourceKind {
+        if let Some(k) = self.metadata.resource_kind {
+            return k;
+        }
+        if self.spec.outputs.iter().any(|o| o == "kubeconfig")
+            || matches!(
+                self.metadata.category.to_ascii_lowercase().as_str(),
+                "kubernetes-cluster" | "kubernetes" | "cluster" | "k8s"
+            )
+            || self.metadata.provider.eq_ignore_ascii_case("kind")
+        {
+            InfraResourceKind::Cluster
+        } else if self.spec.outputs.iter().any(|o| o == "sshHost")
+            || matches!(
+                self.metadata.category.to_ascii_lowercase().as_str(),
+                "compute" | "vm" | "virtual-machine"
+            )
+        {
+            InfraResourceKind::Vm
+        } else {
+            InfraResourceKind::Service
+        }
     }
 }
 
@@ -1207,6 +1308,10 @@ pub struct CatalogBundleMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     pub category: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub protected: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant: Option<String>,
 }
 
 /// Specification block for `CatalogBundle`.
@@ -1257,6 +1362,9 @@ impl CatalogBundle {
             return Err(CoreError::Validation(
                 "metadata.category must not be empty".to_string(),
             ));
+        }
+        if let Some(ref t) = self.metadata.tenant {
+            validate_dns_label(t, "metadata.tenant")?;
         }
         if !self.spec.schema.is_object() {
             return Err(CoreError::Validation(
@@ -1405,6 +1513,24 @@ pub enum CatalogManifest {
     Application(Box<CatalogApplication>),
     InfraBlueprint(Box<CatalogInfraBlueprint>),
     Bundle(Box<CatalogBundle>),
+}
+
+impl CatalogManifest {
+    pub fn is_protected(&self) -> bool {
+        match self {
+            Self::Application(app) => app.metadata.protected,
+            Self::InfraBlueprint(bp) => bp.metadata.protected,
+            Self::Bundle(b) => b.metadata.protected,
+        }
+    }
+
+    pub fn tenant(&self) -> Option<&str> {
+        match self {
+            Self::Application(app) => app.metadata.tenant.as_deref(),
+            Self::InfraBlueprint(bp) => bp.metadata.tenant.as_deref(),
+            Self::Bundle(b) => b.metadata.tenant.as_deref(),
+        }
+    }
 }
 
 /// Resolved SSH connection metadata for a provisioned VM infrastructure stack (`GET /api/v1/stacks/{namespace}/{name}/ssh-info`).
@@ -2077,6 +2203,8 @@ mod tests {
                 description: None,
                 category: "Web".to_string(),
                 runtime: AppRuntime::Manifest,
+                protected: false,
+                tenant: None,
             },
             spec: CatalogAppSpec {
                 upstream: UpstreamSource::default(),

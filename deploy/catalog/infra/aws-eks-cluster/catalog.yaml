@@ -1,0 +1,60 @@
+apiVersion: keel.io/v1alpha1
+kind: CatalogInfraBlueprint
+metadata:
+  id: aws-eks-cluster
+  name: AWS EKS Managed Kubernetes Cluster
+  category: kubernetes-cluster
+  provider: aws
+  resourceKind: cluster
+spec:
+  entrypoint: Pulumi.yaml
+  outputs:
+    - clusterName
+    - endpoint
+    - kubeconfig
+  schema:
+    type: object
+    required:
+      - clusterName
+      - region
+      - kubernetesVersion
+      - nodeInstanceType
+      - desiredNodeCount
+    properties:
+      clusterName:
+        type: string
+        title: Cluster Name
+        pattern: "^[a-z0-9-]+$"
+      region:
+        type: string
+        title: AWS Region
+        default: us-east-1
+      kubernetesVersion:
+        type: string
+        title: Kubernetes Version
+        description: Amazon EKS Kubernetes control-plane version.
+        default: "1.35"
+        enum:
+          - "1.36"
+          - "1.35"
+          - "1.34"
+          - "1.33"
+      nodeInstanceType:
+        type: string
+        title: Node Instance Type
+        default: t3.medium
+      desiredNodeCount:
+        type: integer
+        title: Desired Node Count
+        minimum: 1
+        maximum: 10
+        default: 2
+      awsAccessKeyId:
+        type: string
+        title: AWS Access Key ID
+        writeOnly: true
+      awsSecretAccessKey:
+        type: string
+        title: AWS Secret Access Key
+        writeOnly: true
+        format: password

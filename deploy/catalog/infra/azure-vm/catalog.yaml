@@ -6,6 +6,7 @@ metadata:
   description: Provision an Azure Linux virtual machine with SSH access (defaults to free-tier Standard_B1s)
   category: compute
   provider: azure
+  resourceKind: vm
 spec:
   pulumiRuntime: yaml
   entrypoint: Pulumi.yaml

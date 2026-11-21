@@ -1,0 +1,65 @@
+apiVersion: keel.io/v1alpha1
+kind: CatalogInfraBlueprint
+metadata:
+  id: azure-aks-cluster
+  name: Azure AKS Managed Kubernetes Cluster
+  category: kubernetes-cluster
+  provider: azure
+  resourceKind: cluster
+spec:
+  entrypoint: Pulumi.yaml
+  outputs:
+    - clusterName
+    - endpoint
+    - kubeconfig
+  schema:
+    type: object
+    required:
+      - clusterName
+      - location
+      - kubernetesVersion
+      - vmSize
+      - nodeCount
+    properties:
+      clusterName:
+        type: string
+        title: Cluster Name
+        pattern: "^[a-z0-9-]+$"
+      location:
+        type: string
+        title: Azure Location
+        default: eastus
+      kubernetesVersion:
+        type: string
+        title: Kubernetes Version
+        description: Azure Kubernetes Service (AKS) control-plane version.
+        default: "1.35"
+        enum:
+          - "1.36"
+          - "1.35"
+          - "1.34"
+          - "1.33"
+      vmSize:
+        type: string
+        title: VM Size
+        default: Standard_DS2_v2
+      nodeCount:
+        type: integer
+        title: Node Count
+        minimum: 1
+        maximum: 10
+        default: 2
+      armClientId:
+        type: string
+        title: Azure Client ID
+      armTenantId:
+        type: string
+        title: Azure Tenant ID
+      armSubscriptionId:
+        type: string
+        title: Azure Subscription ID
+      armClientSecret:
+        type: string
+        title: Azure Client Secret
+        writeOnly: true
+        format: password

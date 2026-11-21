@@ -1,0 +1,152 @@
+name: aws-eks-cluster
+runtime: yaml
+description: AWS EKS Managed Kubernetes Cluster
+config:
+  clusterName:
+    type: string
+    default: eks-workload
+  region:
+    type: string
+    default: us-east-1
+  kubernetesVersion:
+    type: string
+    default: "1.35"
+  nodeInstanceType:
+    type: string
+    default: t3.medium
+  desiredNodeCount:
+    type: integer
+    default: 2
+  kubeconfigSecretName:
+    type: string
+    default: eks-workload-kubeconfig
+  kubeconfigSecretNamespace:
+    type: string
+    default: tenant-default
+
+resources:
+  eksClusterRole:
+    type: aws:iam:Role
+    properties:
+      assumeRolePolicy: |
+        {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Action": "sts:AssumeRole",
+              "Principal": { "Service": "eks.amazonaws.com" },
+              "Effect": "Allow",
+              "Sid": ""
+            }
+          ]
+        }
+      managedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSClusterPolicy
+
+  eksNodeRole:
+    type: aws:iam:Role
+    properties:
+      assumeRolePolicy: |
+        {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Action": "sts:AssumeRole",
+              "Principal": { "Service": "ec2.amazonaws.com" },
+              "Effect": "Allow",
+              "Sid": ""
+            }
+          ]
+        }
+      managedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy
+        - arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+
+  eksVpc:
+    type: aws:ec2:Vpc
+    properties:
+      cidrBlock: 10.0.0.0/16
+      enableDnsSupport: true
+      enableDnsHostnames: true
+
+  eksSubnet1:
+    type: aws:ec2:Subnet
+    properties:
+      vpcId: ${eksVpc.id}
+      cidrBlock: 10.0.1.0/24
+      availabilityZone: ${region}a
+
+  eksSubnet2:
+    type: aws:ec2:Subnet
+    properties:
+      vpcId: ${eksVpc.id}
+      cidrBlock: 10.0.2.0/24
+      availabilityZone: ${region}b
+
+  eksCluster:
+    type: aws:eks:Cluster
+    properties:
+      name: ${clusterName}
+      roleArn: ${eksClusterRole.arn}
+      version: ${kubernetesVersion}
+      vpcConfig:
+        subnetIds:
+          - ${eksSubnet1.id}
+          - ${eksSubnet2.id}
+
+  eksNodeGroup:
+    type: aws:eks:NodeGroup
+    properties:
+      clusterName: ${eksCluster.name}
+      nodeGroupName: ${clusterName}-ng
+      nodeRoleArn: ${eksNodeRole.arn}
+      subnetIds:
+        - ${eksSubnet1.id}
+        - ${eksSubnet2.id}
+      scalingConfig:
+        desiredSize: ${desiredNodeCount}
+        maxSize: ${desiredNodeCount}
+        minSize: ${desiredNodeCount}
+      instanceTypes:
+        - ${nodeInstanceType}
+
+  kubeconfigSecret:
+    type: kubernetes:core/v1:Secret
+    properties:
+      metadata:
+        name: ${kubeconfigSecretName}
+        namespace: ${kubeconfigSecretNamespace}
+      stringData:
+        kubeconfig:
+          fn::secret: |
+            apiVersion: v1
+            clusters:
+            - cluster:
+                server: ${eksCluster.endpoint}
+                certificate-authority-data: ${eksCluster.certificateAuthority.data}
+              name: kubernetes
+            contexts:
+            - context:
+                cluster: kubernetes
+                user: aws
+              name: aws
+            current-context: aws
+            kind: Config
+            preferences: {}
+            users:
+            - name: aws
+              user:
+                exec:
+                  apiVersion: client.authentication.k8s.io/v1beta1
+                  command: aws
+                  args:
+                    - "eks"
+                    - "get-token"
+                    - "--cluster-name"
+                    - "${eksCluster.name}"
+
+outputs:
+  clusterName: ${eksCluster.name}
+  endpoint: ${eksCluster.endpoint}
+  kubeconfig: ${kubeconfigSecret.metadata.name}

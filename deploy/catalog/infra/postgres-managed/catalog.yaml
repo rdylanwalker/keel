@@ -7,6 +7,7 @@ metadata:
   description: Provision an encrypted PostgreSQL database instance exporting connection details to tenant Secrets.
   category: database
   provider: aws
+  resourceKind: service
 spec:
   pulumiRuntime: yaml
   entrypoint: Pulumi.yaml

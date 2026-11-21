@@ -6,6 +6,7 @@ metadata:
   name: Canary Gateway & MetricTemplates
   description: Provisions Envoy GatewayClass (keel-envoy), Gateway (keel-ingress), and Flagger Prometheus MetricTemplates on a target Kubernetes cluster.
   provider: kubernetes
+  resourceKind: service
   category: progressive-delivery
 spec:
   pulumiPath: ./Pulumi.yaml

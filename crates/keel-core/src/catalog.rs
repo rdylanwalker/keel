@@ -1096,4 +1096,126 @@ spec:
         assert!(validate_k8s_manifests_yaml("apiVersion: v1\nkind: ConfigMap\n").is_err());
         assert!(validate_k8s_manifests_yaml("kind: ConfigMap\nmetadata:\n  name: test\n").is_err());
     }
+
+    #[test]
+    fn test_parse_and_validate_all_seed_infra_blueprints() {
+        use crate::models::InfraResourceKind;
+
+        let test_cases = vec![
+            (
+                "../../deploy/catalog/infra/kind-cluster/catalog.yaml",
+                InfraResourceKind::Cluster,
+                true,
+            ),
+            (
+                "../../deploy/catalog/infra/proxmox-k3s-cluster/catalog.yaml",
+                InfraResourceKind::Cluster,
+                false,
+            ),
+            (
+                "../../deploy/catalog/infra/aws-eks-cluster/catalog.yaml",
+                InfraResourceKind::Cluster,
+                true,
+            ),
+            (
+                "../../deploy/catalog/infra/gcp-gke-cluster/catalog.yaml",
+                InfraResourceKind::Cluster,
+                true,
+            ),
+            (
+                "../../deploy/catalog/infra/azure-aks-cluster/catalog.yaml",
+                InfraResourceKind::Cluster,
+                true,
+            ),
+            (
+                "../../deploy/catalog/infra/aws-vm/catalog.yaml",
+                InfraResourceKind::Vm,
+                false,
+            ),
+            (
+                "../../deploy/catalog/infra/azure-vm/catalog.yaml",
+                InfraResourceKind::Vm,
+                false,
+            ),
+            (
+                "../../deploy/catalog/infra/gcp-vm/catalog.yaml",
+                InfraResourceKind::Vm,
+                false,
+            ),
+            (
+                "../../deploy/catalog/infra/postgres-managed/catalog.yaml",
+                InfraResourceKind::Service,
+                false,
+            ),
+            (
+                "../../deploy/catalog/infra/canary-gateway-config/catalog.yaml",
+                InfraResourceKind::Service,
+                false,
+            ),
+        ];
+
+        for (path, expected_kind, expects_kubeconfig_secret) in test_cases {
+            let yaml =
+                std::fs::read_to_string(path).unwrap_or_else(|_| panic!("Failed to read {path}"));
+            let bp = parse_catalog_blueprint(&yaml).expect("Failed to parse blueprint");
+
+            assert_eq!(bp.effective_resource_kind(), expected_kind);
+
+            // Check Pulumi.yaml
+            let pulumi_yaml_path = std::path::Path::new(path)
+                .parent()
+                .unwrap()
+                .join("Pulumi.yaml");
+            let pulumi_yaml =
+                std::fs::read_to_string(&pulumi_yaml_path).expect("Failed to read Pulumi.yaml");
+
+            let parsed_pulumi: serde_yml::Value = serde_yml::from_str(&pulumi_yaml).unwrap();
+            assert!(parsed_pulumi.is_mapping());
+
+            if expects_kubeconfig_secret {
+                let k8s_version_default = bp
+                    .spec
+                    .schema
+                    .pointer("/properties/kubernetesVersion/default")
+                    .and_then(|v| v.as_str())
+                    .expect("Cluster blueprint must define properties.kubernetesVersion.default");
+                assert!(
+                    k8s_version_default.starts_with("1.35")
+                        || k8s_version_default.starts_with("v1.35"),
+                    "Expected cluster blueprint {} kubernetesVersion default to be 1.35.x, got {k8s_version_default}",
+                    bp.metadata.id
+                );
+
+                let pulumi_k8s_default = parsed_pulumi
+                    .get("config")
+                    .and_then(|c| c.get("kubernetesVersion"))
+                    .and_then(|kv| kv.get("default"))
+                    .and_then(|d| d.as_str())
+                    .expect("Cluster Pulumi.yaml must define config.kubernetesVersion.default");
+                assert!(
+                    pulumi_k8s_default.starts_with("1.35")
+                        || pulumi_k8s_default.starts_with("v1.35"),
+                    "Expected Pulumi.yaml {} config.kubernetesVersion.default to be 1.35.x, got {pulumi_k8s_default}",
+                    bp.metadata.id
+                );
+
+                let resources = parsed_pulumi
+                    .get("resources")
+                    .unwrap()
+                    .as_mapping()
+                    .unwrap();
+                let kubeconfig_secret = resources
+                    .get("kubeconfigSecret")
+                    .expect("Missing kubeconfigSecret in cluster blueprint");
+                let resource_type = kubeconfig_secret.get("type").unwrap().as_str().unwrap();
+                assert_eq!(resource_type, "kubernetes:core/v1:Secret");
+            }
+
+            // Test protected/tenant serialization round-trips
+            let roundtrip: String = serde_yml::to_string(&bp).unwrap();
+            let parsed2 = parse_catalog_blueprint(&roundtrip).unwrap();
+            assert_eq!(bp.metadata.protected, parsed2.metadata.protected);
+            assert_eq!(bp.metadata.tenant, parsed2.metadata.tenant);
+        }
+    }
 }

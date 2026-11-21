@@ -1,0 +1,91 @@
+name: azure-aks-cluster
+runtime: yaml
+description: Azure AKS Managed Kubernetes Cluster
+config:
+  clusterName:
+    type: string
+    default: aks-workload
+  location:
+    type: string
+    default: eastus
+  kubernetesVersion:
+    type: string
+    default: "1.35"
+  vmSize:
+    type: string
+    default: Standard_DS2_v2
+  nodeCount:
+    type: integer
+    default: 2
+  kubeconfigSecretName:
+    type: string
+    default: aks-workload-kubeconfig
+  kubeconfigSecretNamespace:
+    type: string
+    default: tenant-default
+
+resources:
+  resourceGroup:
+    type: azure-native:resources:ResourceGroup
+    properties:
+      resourceGroupName: ${clusterName}-rg
+      location: ${location}
+
+  aksCluster:
+    type: azure-native:containerservice:ManagedCluster
+    properties:
+      resourceGroupName: ${resourceGroup.name}
+      resourceName: ${clusterName}
+      location: ${resourceGroup.location}
+      kubernetesVersion: ${kubernetesVersion}
+      dnsPrefix: ${clusterName}
+      agentPoolProfiles:
+        - name: agentpool
+          count: ${nodeCount}
+          vmSize: ${vmSize}
+          mode: System
+          osType: Linux
+      identity:
+        type: SystemAssigned
+
+  kubeconfigSecret:
+    type: kubernetes:core/v1:Secret
+    properties:
+      metadata:
+        name: ${kubeconfigSecretName}
+        namespace: ${kubeconfigSecretNamespace}
+      stringData:
+        kubeconfig:
+          fn::secret: |
+            apiVersion: v1
+            clusters:
+            - cluster:
+                server: https://${aksCluster.fqdn}
+              name: aks
+            contexts:
+            - context:
+                cluster: aks
+                user: aksUser
+              name: aksContext
+            current-context: aksContext
+            kind: Config
+            preferences: {}
+            users:
+            - name: aksUser
+              user:
+                exec:
+                  apiVersion: client.authentication.k8s.io/v1beta1
+                  command: kubelogin
+                  args:
+                    - "get-token"
+                    - "--login"
+                    - "spn"
+                    - "--environment"
+                    - "AzurePublicCloud"
+                    - "--server-id"
+                    - "6dae42f8-4368-4678-94ff-3960e28e3630" # Default AKS server ID
+
+outputs:
+  clusterName: ${aksCluster.name}
+  endpoint: ${aksCluster.fqdn}
+  kubeconfig: ${kubeconfigSecret.metadata.name}

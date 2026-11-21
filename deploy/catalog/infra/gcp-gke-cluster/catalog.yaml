@@ -1,0 +1,60 @@
+apiVersion: keel.io/v1alpha1
+kind: CatalogInfraBlueprint
+metadata:
+  id: gcp-gke-cluster
+  name: GCP GKE Managed Kubernetes Cluster
+  category: kubernetes-cluster
+  provider: gcp
+  resourceKind: cluster
+spec:
+  entrypoint: Pulumi.yaml
+  outputs:
+    - clusterName
+    - endpoint
+    - kubeconfig
+  schema:
+    type: object
+    required:
+      - clusterName
+      - project
+      - zone
+      - kubernetesVersion
+      - machineType
+      - nodeCount
+    properties:
+      clusterName:
+        type: string
+        title: Cluster Name
+        pattern: "^[a-z0-9-]+$"
+      project:
+        type: string
+        title: GCP Project ID
+      zone:
+        type: string
+        title: GCP Zone
+        default: us-central1-a
+      kubernetesVersion:
+        type: string
+        title: Kubernetes Version
+        description: Google Kubernetes Engine (GKE) control-plane version.
+        default: "1.35"
+        enum:
+          - "1.36"
+          - "1.35"
+          - "1.34"
+          - "1.33"
+      machineType:
+        type: string
+        title: Machine Type
+        default: e2-medium
+      nodeCount:
+        type: integer
+        title: Node Count
+        minimum: 1
+        maximum: 10
+        default: 2
+      googleCredentials:
+        type: string
+        title: Google Cloud Credentials (JSON)
+        writeOnly: true
+        format: password

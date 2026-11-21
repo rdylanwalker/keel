@@ -33,9 +33,9 @@ pub use models::{
     CatalogBlueprintMetadata, CatalogBlueprintSpec, CatalogBundle, CatalogBundleItem,
     CatalogBundleMetadata, CatalogBundleSpec, CatalogInfraBlueprint, CatalogManifest,
     CompanionInfraHook, DEFAULT_CLUSTER_NAME, DEFAULT_POLL_INTERVAL, ForgeConfig, ForgeKind,
-    KeelConfig, ManifestEngine, OidcConfig, ProgressiveDeliverySpec, ProviderEntry,
-    ProviderRegistry, ResourceQuotaSpec, S3BackendConfig, StackSshInfoResponse, TenantConfig,
-    UpstreamSource, clean_candidate_ssh_host, clean_candidate_ssh_user,
+    InfraResourceKind, KeelConfig, ManifestEngine, OidcConfig, ProgressiveDeliverySpec,
+    ProviderEntry, ProviderRegistry, ResourceQuotaSpec, S3BackendConfig, StackSshInfoResponse,
+    TenantConfig, UpstreamSource, clean_candidate_ssh_host, clean_candidate_ssh_user,
     default_ssh_user_for_provider, is_private_or_internal_ssh_host,
     resolve_ssh_target_from_sources,
 };

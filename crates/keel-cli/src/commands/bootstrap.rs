@@ -457,6 +457,18 @@ const STARTER_KIND_CLUSTER_CATALOG_YAML: &str =
     include_str!("../../../../deploy/catalog/infra/kind-cluster/catalog.yaml");
 const STARTER_KIND_CLUSTER_PULUMI_YAML: &str =
     include_str!("../../../../deploy/catalog/infra/kind-cluster/Pulumi.yaml");
+const STARTER_AWS_EKS_CLUSTER_CATALOG_YAML: &str =
+    include_str!("../../../../deploy/catalog/infra/aws-eks-cluster/catalog.yaml");
+const STARTER_AWS_EKS_CLUSTER_PULUMI_YAML: &str =
+    include_str!("../../../../deploy/catalog/infra/aws-eks-cluster/Pulumi.yaml");
+const STARTER_GCP_GKE_CLUSTER_CATALOG_YAML: &str =
+    include_str!("../../../../deploy/catalog/infra/gcp-gke-cluster/catalog.yaml");
+const STARTER_GCP_GKE_CLUSTER_PULUMI_YAML: &str =
+    include_str!("../../../../deploy/catalog/infra/gcp-gke-cluster/Pulumi.yaml");
+const STARTER_AZURE_AKS_CLUSTER_CATALOG_YAML: &str =
+    include_str!("../../../../deploy/catalog/infra/azure-aks-cluster/catalog.yaml");
+const STARTER_AZURE_AKS_CLUSTER_PULUMI_YAML: &str =
+    include_str!("../../../../deploy/catalog/infra/azure-aks-cluster/Pulumi.yaml");
 const STARTER_AWS_VM_CATALOG_YAML: &str =
     include_str!("../../../../deploy/catalog/infra/aws-vm/catalog.yaml");
 const STARTER_AWS_VM_PULUMI_YAML: &str =
@@ -1249,6 +1261,30 @@ async fn initialize_seed_git_repo_with_push(
         files_to_write.push((
             "catalog/infra/kind-cluster/Pulumi.yaml",
             STARTER_KIND_CLUSTER_PULUMI_YAML.to_string(),
+        ));
+        files_to_write.push((
+            "catalog/infra/aws-eks-cluster/catalog.yaml",
+            STARTER_AWS_EKS_CLUSTER_CATALOG_YAML.to_string(),
+        ));
+        files_to_write.push((
+            "catalog/infra/aws-eks-cluster/Pulumi.yaml",
+            STARTER_AWS_EKS_CLUSTER_PULUMI_YAML.to_string(),
+        ));
+        files_to_write.push((
+            "catalog/infra/gcp-gke-cluster/catalog.yaml",
+            STARTER_GCP_GKE_CLUSTER_CATALOG_YAML.to_string(),
+        ));
+        files_to_write.push((
+            "catalog/infra/gcp-gke-cluster/Pulumi.yaml",
+            STARTER_GCP_GKE_CLUSTER_PULUMI_YAML.to_string(),
+        ));
+        files_to_write.push((
+            "catalog/infra/azure-aks-cluster/catalog.yaml",
+            STARTER_AZURE_AKS_CLUSTER_CATALOG_YAML.to_string(),
+        ));
+        files_to_write.push((
+            "catalog/infra/azure-aks-cluster/Pulumi.yaml",
+            STARTER_AZURE_AKS_CLUSTER_PULUMI_YAML.to_string(),
         ));
         files_to_write.push((
             "catalog/infra/aws-vm/catalog.yaml",

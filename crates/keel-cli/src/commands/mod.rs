@@ -893,6 +893,8 @@ spec:
             resource_count: Some(12),
             last_synced: Some("2026-11-15T10:00:00Z".to_string()),
             status: "Ready".to_string(),
+            catalog_id: Some("postgres-managed".to_string()),
+            resource_kind: Some(keel_core::models::InfraResourceKind::Service),
         }];
 
         let stack_table = format_stacks_output(&stacks, OutputFormat::Table).unwrap();

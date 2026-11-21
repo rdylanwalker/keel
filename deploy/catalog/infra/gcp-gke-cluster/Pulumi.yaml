@@ -1,0 +1,80 @@
+name: gcp-gke-cluster
+runtime: yaml
+description: GCP GKE Managed Kubernetes Cluster
+config:
+  clusterName:
+    type: string
+    default: gke-workload
+  project:
+    type: string
+    default: keel-gcp-project
+  zone:
+    type: string
+    default: us-central1-a
+  kubernetesVersion:
+    type: string
+    default: "1.35"
+  machineType:
+    type: string
+    default: e2-medium
+  nodeCount:
+    type: integer
+    default: 2
+  kubeconfigSecretName:
+    type: string
+    default: gke-workload-kubeconfig
+  kubeconfigSecretNamespace:
+    type: string
+    default: tenant-default
+
+resources:
+  gkeCluster:
+    type: gcp:container:Cluster
+    properties:
+      name: ${clusterName}
+      project: ${project}
+      location: ${zone}
+      initialNodeCount: ${nodeCount}
+      minMasterVersion: ${kubernetesVersion}
+      nodeConfig:
+        machineType: ${machineType}
+        oauthScopes:
+          - "https://www.googleapis.com/auth/compute"
+          - "https://www.googleapis.com/auth/devstorage.read_only"
+          - "https://www.googleapis.com/auth/logging.write"
+          - "https://www.googleapis.com/auth/monitoring"
+
+  kubeconfigSecret:
+    type: kubernetes:core/v1:Secret
+    properties:
+      metadata:
+        name: ${kubeconfigSecretName}
+        namespace: ${kubeconfigSecretNamespace}
+      stringData:
+        kubeconfig:
+          fn::secret: |
+            apiVersion: v1
+            clusters:
+            - cluster:
+                certificate-authority-data: ${gkeCluster.masterAuth.clusterCaCertificate}
+                server: https://${gkeCluster.endpoint}
+              name: gke-cluster
+            contexts:
+            - context:
+                cluster: gke-cluster
+                user: gke-user
+              name: gke-context
+            current-context: gke-context
+            kind: Config
+            preferences: {}
+            users:
+            - name: gke-user
+              user:
+                exec:
+                  apiVersion: client.authentication.k8s.io/v1beta1
+                  command: gke-gcloud-auth-plugin
+
+outputs:
+  clusterName: ${gkeCluster.name}
+  endpoint: ${gkeCluster.endpoint}
+  kubeconfig: ${kubeconfigSecret.metadata.name}

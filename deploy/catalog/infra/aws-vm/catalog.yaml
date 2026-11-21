@@ -6,6 +6,7 @@ metadata:
   description: Provision an AWS EC2 virtual machine with SSH access (defaults to free-tier t3.micro)
   category: compute
   provider: aws
+  resourceKind: vm
 spec:
   pulumiRuntime: yaml
   entrypoint: Pulumi.yaml
