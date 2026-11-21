@@ -2,7 +2,7 @@
 
 Stage 0 initializes the seed management cluster and GitOps repository layout (`clusters/management/`, `providers/registry.yaml`, `catalog/`, and `tenants/default/`).
 
-All Stage 0 targets produce the same seed control-plane layout (Flux CD, PKO v2, S3 state backend, SOPS/`age`, Kyverno, Envoy Gateway, and Flagger) regardless of where the management cluster runs.
+All Stage 0 targets produce the same seed control-plane layout (Flux CD, PKO v2, S3 state backend, SOPS/`age`, Kyverno, cert-manager, Envoy Gateway, Prometheus, Flagger, and the in-cluster Rauthy IdP unless you pass `--oidc-issuer` or `--oidc-provider none`) regardless of where the management cluster runs. After Stage 0, Flux adopts these components as protected management add-ons under `clusters/management/core-addons/`, so you upgrade and roll them back through Git.
 
 ## Supported Targets
 
@@ -136,16 +136,17 @@ These k3s-owned components are reconciled by k3s from `/var/lib/rancher/k3s/serv
 
 ### Core Controllers Installed Out of the Box
 
-By default, `keel bootstrap init` installs the core control-plane components onto the target cluster using `kubectl` and `helm`:
+By default, `keel bootstrap init` installs the core control-plane components with protected Stage 0 Pulumi programs. The Helm charts come from `deploy/bootstrap/control-plane/Pulumi.yaml` (stack `stage0-control-plane-<cluster>`), and in-cluster Rauthy comes from `deploy/bootstrap/control-plane-rauthy/Pulumi.yaml`. Raw seed manifests are applied with `kubectl`. After Stage 0, the protected HelmReleases and Kustomizations in `clusters/management/core-addons/` adopt each release in place, reconciled by the `flux-system/core-addons` Kustomization. From then on Flux owns these components, and you upgrade or roll back each one as a management add-on PR (`catalog/core/<id>`):
 
 - **Namespaces:** `flux-system`, `keel-system`, `keel-previews`
 - **SeaweedFS (`s3-state-backend`, chart `4.54.0`):** In-cluster S3-compatible state backend in `keel-system`, with the versioned `pulumi-state` bucket. Tenants get scoped identities limited to `tenants/<id>/*`, never the admin keys.
 - **Flux CD (`flux2`, chart `2.20.0`):** GitOps source, kustomize, and helm controllers in `flux-system`, with the multitenancy lockdown enabled (`--no-cross-namespace-refs=true`, default ServiceAccount impersonation). After Stage 0, the protected `flux-system/flux2` HelmRelease in `clusters/management/core-addons/flux2.yaml` adopts this release, so Flux upgrades and rolls back itself from Git
 - **Kyverno (chart `3.10.0`):** A single admission controller release in `keel-system`, plus Keel's seed policies (including `local-kind-docker-socket-exception` and `keel-docker-proxy` in `flux-system` when `--local-dev-docker-socket-exception` is passed)
 - **Pulumi Kubernetes Operator (PKO v2, chart `2.10.1`):** Infrastructure operator in `keel-system` plus the `management-cluster-core` `Stack`
-- **Envoy Gateway (`envoy-gateway`):** Gateway API controller in `keel-system` with `GatewayClass` `keel-envoy` and `Gateway` `keel-ingress` (HTTP ports `80` and `8888`)
+- **Envoy Gateway (`envoy-gateway`):** Gateway API controller in `keel-system` with `GatewayClass` `keel-envoy` and `Gateway` `keel-ingress` (HTTP on port `80`; HTTPS on `8888` and `443` using `keel-system/keel-wildcard-tls`)
 - **Prometheus (`prometheus`) & Flagger (`flagger`):** Telemetry (`http://prometheus.keel-system:9090`) and progressive canary delivery controller (`meshProvider: gatewayapi:v1`) in `keel-system`
-- **Rauthy (`rauthy`):** Lightweight Rust in-cluster OIDC identity provider in `keel-system` with built-in Admin UI (`https://idp.keel.local:8888/auth/v1/admin`) seeded with `keel-system/rauthy-config`, `keel-admins` + `tenant-default` groups, `keel-server` PKCE client, and initial admin credentials (configured with `restricted` PSS `securityContext`; skipped if `--oidc-issuer` or `--oidc-provider none` is supplied)
+- **cert-manager (`cert-manager`, chart `v1.21.3`):** Certificate controller in `keel-system` that issues the self-signed control-plane CA (`keel-ca-issuer`) and the `keel-system/keel-wildcard-tls` certificate used by the `keel-ingress` Gateway
+- **Rauthy (`rauthy`):** Lightweight Rust in-cluster OIDC identity provider in `keel-system` with built-in Admin UI (`https://idp.keel.local:8888/auth/v1/admin`) seeded with `keel-system/rauthy-config`, `keel-admins` + `tenant-default` groups, `keel-server` PKCE client, and initial admin credentials (configured with `restricted` PSS `securityContext`; skipped if `--oidc-issuer` or `--oidc-provider none` is supplied). After Stage 0, the protected Flux Kustomization `flux-system/rauthy` (`clusters/management/core-addons/rauthy.yaml`) adopts it from `clusters/management/addons/rauthy/`, with the version pinned by `spec.images[].newTag`; the `keel-system/rauthy-config` Secret stays Stage 0-managed and is never stored in Git
 
 To initialize only the cluster and GitOps repository without installing the core controllers onto the cluster, pass `--skip-core-install`:
 
@@ -157,11 +158,11 @@ keel bootstrap init \
   --repo-dir ./keel-gitops
 ```
 
-> **In-Cluster Flux Pull-Polling:** If `--repo-dir` points to a local filesystem path without a reachable HTTP/SSH Git remote (such as `--with-forge` or an external Forgejo/GitHub/GitLab repository), `keel bootstrap init` skips applying the in-cluster `GitRepository` resource because cluster pods cannot clone a host filesystem path.
+> **In-Cluster Flux Pull-Polling:** If the GitOps repository is not reachable over the network (no `--with-forge`, and no `--git-url` with an `http(s)://`, `ssh://` or `git://` URL), cluster pods cannot clone it. `keel bootstrap init` then skips the in-cluster Flux sync manifests (`GitRepository` and root `Kustomization`s), and the control-plane add-ons stay Stage 0-only: no Flux reconciliation, and no management API upgrades or rollbacks. Re-running `keel bootstrap init`/`recover` with a newer CLI does not apply newer add-on versions either. Bootstrap prints a note. To hand the add-ons to Flux, push the repository to a network Git remote and re-run with `--git-url`, or use `--with-forge`.
 
 ### Optional Add-ons, OIDC & Git Remotes
 
-- `--with-forge` — Installs an in-cluster Forgejo instance in `keel-system` and points Flux + `.keel/config.yaml` at it. Forgejo then becomes a Flux-managed management add-on (`clusters/management/core-addons/forgejo.yaml`, `catalog/core/forgejo`), Its data is ephemeral by default (persistence disabled): repositories are lost whenever the Forgejo pod is replaced, so the management API refuses Forgejo upgrades and rollbacks until you back up the repository (`forgejo dump` or a pushed mirror) and set `persistence.enabled: true` in `core-addons/forgejo.yaml` directly in Git.
+- `--with-forge` — Installs an in-cluster Forgejo instance in `keel-system` and points Flux + `.keel/config.yaml` at it. Forgejo then becomes a Flux-managed management add-on (`clusters/management/core-addons/forgejo.yaml`, `catalog/core/forgejo`). Its data is ephemeral by default (persistence disabled): repositories are lost whenever the Forgejo pod is replaced, so the management API refuses Forgejo upgrades and rollbacks until you back up the repository (`forgejo dump` or a pushed mirror) and set `persistence.enabled: true` in `core-addons/forgejo.yaml` directly in Git.
 - `--with-keel-server` — Runs `keel-server` inside the cluster as a Flux-managed management add-on (`clusters/management/core-addons/keel-server.yaml`, `clusters/management/addons/keel-server/`, `catalog/core/keel-server`). The image is pinned to the release of the `keel` CLI you bootstrap with. Requires `--repo-dir` plus either `--with-forge` or an HTTP(S) `--git-url` (not both), because the add-on reaches Git through the seed push and the pod clones the GitOps repository on start. See [Running keel-server In-Cluster](../operations/in-cluster-server.md).
 - `--git-url <URL>` — Connects an external GitHub, GitLab, or Forgejo/Gitea repository (with `KEEL_GIT_TOKEN` / `--git-token` for private repos and PRs). See [Git Repositories & Forges](git-repositories.md).
 - `--admin-username` / `--admin-password` — Customizes the initial admin account seeded into in-cluster Rauthy (`keel-system/rauthy-config`) and added to `keel-admins`. When omitted, `keel bootstrap init` generates a random password and prints it in the bootstrap summary.

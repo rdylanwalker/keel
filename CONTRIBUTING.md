@@ -31,7 +31,7 @@ keel/
 │   ├── keel-pko/           # PKO v2 Stack synthesis, ephemeral previews, PKO run mapping, diff parser
 │   ├── keel-kube/          # kube-rs watchers, SSE telemetry, tenant RBAC, preview runner, tenant S3 identities
 │   ├── keel-server/        # Stateless axum HTTP/SSE server, OIDC PKCE auth, preview lifecycle, embedded SPA
-│   └── keel-cli/           # clap CLI (bootstrap, recover, auth, proposal, catalog, app, infra, preview, tenant, serve)
+│   └── keel-cli/           # clap CLI (bootstrap {init, recover}, auth, proposal, catalog, app, infra, preview, tenant, serve)
 ├── ui/                     # React + TypeScript + Shadcn UI (components/ui) + Tailwind CSS + @rjsf/core + wterm
 ├── e2e/                    # Playwright suite (tests/, scripts/start-test-server.mjs, scripts/capture-screenshots.mjs)
 ├── deploy/                 # Stage 0 Pulumi programs, bootstrap manifests, in-cluster keel-server bundle, seed add-ons, catalog
@@ -287,7 +287,6 @@ If either guard is missing, the test suite skips that provider cleanly with an i
     * `KEEL_E2E_CLOUD_AZURE`: `1` (or `0`)
     * `KEEL_E2E_CLOUD_GCP`: `1` (or `0`)
     * (or `KEEL_E2E_CLOUD_ALL`: `1`)
-```
 
 ### Fast / Scoped Verification During Development
 
@@ -323,7 +322,7 @@ just agent-e2e
 
 ## Releases & Dependency Automation
 
-* **Releases:** Pushes to `main` trigger `release.yml`, which executes `ci.yml` and `e2e.yml` (`e2e-live-kind` + optional cloud E2E) via `workflow_call`. Gated behind `needs: [ci, e2e-live]` (`e2e.yml` runs the live `kind` job because `release.yml` passes `run_live: true`), `semantic-release` (installed with `npm ci` from the pinned `release/package-lock.json`) analyzes Conventional Commits, bumps `Cargo.toml` and `ui/package.json`, refreshes only the workspace entries in `Cargo.lock` (`cargo update --workspace`, then `cargo metadata --locked`), generates `CHANGELOG.md`, and creates a **draft** GitHub Release. Follow-up jobs then:
+* **Releases:** Pushes to `main` trigger `release.yml`, which executes `ci.yml` and `e2e.yml` (`e2e-live-kind` + optional cloud E2E) via `workflow_call`. Gated behind `needs: [ci, e2e-live]` (`e2e.yml` runs the live `kind` job because `release.yml` passes `run_live: true`), `semantic-release` (installed with `npm ci` from the pinned `release/package-lock.json`) analyzes Conventional Commits, bumps `Cargo.toml` and `ui/package.json`, refreshes only the workspace entries in `Cargo.lock` (`cargo update --workspace`, then `cargo metadata --locked`), pins the keel-server image tag to the new version in `deploy/bootstrap/keel-server/{kustomization,deployment}.yaml`, `deploy/seed/core-addons/keel-server.yaml` and `deploy/catalog/core/keel-server/catalog.yaml` (committed with the release), generates `CHANGELOG.md`, and creates a **draft** GitHub Release. Follow-up jobs then:
   * build `keel` with `--locked`: **static musl** Linux binaries via `cargo-zigbuild` (`x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`; linkage verified with `file`) plus `aarch64-apple-darwin` and `x86_64-pc-windows-msvc`, and the UI archive;
   * build the `Dockerfile` for `linux/amd64,linux/arm64` with buildx, push `ghcr.io/<owner>/keel:{<version>,latest}` with SBOM + `mode=max` provenance attestations, and **Cosign keyless**-sign the image digest;
   * build the HTML docs archive and CycloneDX SBOM, write `SHA256SUMS` and `keel-image.txt`, `cosign sign-blob --bundle` every asset (`<asset>.sigstore.json`), upload everything, and un-draft the release. A failure in any job leaves the release as a draft.

@@ -45,7 +45,7 @@ Building an internal platform usually forces a bad trade-off:
 ## Everyday Solutions, Out of the Box
 
 ### 1. Zero-to-Control-Plane in One Command
-Run `keel bootstrap init` from your laptop to stand up an identical seed control plane—complete with **Flux CD**, **Pulumi Kubernetes Operator (PKO v2)**, **SeaweedFS S3**, **SOPS + `age`**, **Rauthy** OIDC (or external OIDC), **Kyverno**, **Envoy Gateway + Flagger**, and optional in-cluster **Forgejo**—whether you start on local `kind`, an existing `kubeconfig`, Proxmox VE, or a public cloud.
+Run `keel bootstrap init` from your laptop to stand up an identical seed control plane—complete with **Flux CD** (self-managed), **Pulumi Kubernetes Operator (PKO v2)**, **SeaweedFS S3**, **SOPS + `age`**, **Rauthy** OIDC (or external OIDC), **Kyverno**, **cert-manager**, **Envoy Gateway + Prometheus + Flagger**, and optional in-cluster **Forgejo** (`--with-forge`) and **keel-server** (`--with-keel-server`)—whether you start on local `kind`, an existing `kubeconfig`, Proxmox VE, or a public cloud. When the GitOps repository is reachable over the network (not a local-path repo), Flux reconciles every component after Stage 0 as a protected management add-on (`clusters/management/core-addons/`) that cluster admins upgrade and roll back through PRs.
 
 ### 2. No More Blind Merges: Pre-Merge Infrastructure Previews
 Outside of initial bootstrap, Keel **never** commits directly to `main`. Every infrastructure or application change opens a Pull Request (`Forgejo/Gitea`, `GitHub`, `GitLab`, or local Git). Pulumi-backed changes then run a real `pulumi preview` in an ephemeral PKO v2 `preview: true` stack in `keel-previews`, and the `+ Create`, `~ Update`, `- Delete`, and `! Replace` results are posted to the PR, the web portal, and the CLI before anything touches production. Flux-only changes get a diff synthesized from the manifests, which is clearly marked as simulated. See [Pre-Merge PKO Previews](./docs/getting-started/previews.md).
@@ -110,7 +110,7 @@ keel bootstrap init \
   --repo-dir ./keel-gitops
 ```
 
-Save the **Admin Username** and **Admin Password** printed in the bootstrap summary (or pass `--admin-username` / `--admin-password` / `KEEL_ADMIN_PASSWORD`, or `--oidc-issuer`). Add `--with-forge` if you want an in-cluster Forgejo Git server so Flux CD can pull-poll inside `kind`.
+Save the **Admin Username** and **Admin Password** printed in the bootstrap summary (or pass `--admin-username` / `--admin-password` / `KEEL_ADMIN_PASSWORD`, or `--oidc-issuer`). Add `--with-forge` (an in-cluster Forgejo) or `--git-url <https-url>` (an external remote) so Flux CD can pull-poll the GitOps repository from inside `kind`. With only a local `--repo-dir`, the management add-ons stay Stage 0-only: Flux does not reconcile them, and you cannot upgrade or roll them back from the portal. To run `keel-server` in the cluster as a Flux-managed add-on, also add `--with-keel-server`. It needs exactly one of `--with-forge` or an HTTP(S) `--git-url` (see [Running keel-server In-Cluster](./docs/operations/in-cluster-server.md)).
 
 Stage 0 keeps its Pulumi state in `~/.config/keel/stage0/keel-mgmt/` and escrows it to S3. **On the first run it prints a one-time notice about the generated Pulumi passphrase: store that passphrase in your vault.**
 
@@ -179,7 +179,7 @@ keel app install \
   --canary
 ```
 
-> **Handling Provider Credentials (`writeOnly` Fields):** Non-secret form values are written to `Stack.spec.config`, while fields marked `"writeOnly": true` (such as `GOOGLE_CREDENTIALS`) are encrypted with SOPS + `age` into `secret.enc.yaml` and injected into the PKO v2 workspace pod via `Stack.spec.envRefs`. Enable cloud/hypervisor providers under **Topology → Providers** before provisioning.
+> **Handling Provider Credentials (`writeOnly` Fields):** Non-secret form values are written to `Stack.spec.config`, while fields marked `"writeOnly": true` (such as `GOOGLE_CREDENTIALS`) are encrypted with SOPS + `age` into `secret.enc.yaml` and injected into the PKO v2 workspace pod via `Stack.spec.envRefs`. Enable cloud/hypervisor providers on **Control Plane & Providers** (or in `providers/registry.yaml`) before provisioning.
 
 ### 5. Break-Glass Recovery & Teardown
 
@@ -287,13 +287,13 @@ Several great open-source tools solve individual slices of this problem—develo
 | Provider | Plugin | Default State | Status | Notes |
 | :--- | :--- | :--- | :---: | :--- |
 | **kind** | `tehcyx/kind` (TF bridge) | Enabled | ✅ | Provisions workload `kind` clusters in live E2E |
-| **Proxmox VE** | `bpg/proxmox` (TF bridge) | Disabled | ⚠️ | Enable via **Topology → Providers**; needs PVE feedback |
-| **AWS** | `pulumi/aws` | Disabled | ⚠️ | Enable via **Topology → Providers**; includes `aws-vm` blueprint; tested in live cloud E2E (`pnpm --dir e2e test:live:cloud`) |
-| **GCP** | `pulumi/gcp` | Disabled | ⚠️ | Enable via **Topology → Providers**; includes `gcp-vm` blueprint; tested in live cloud E2E (`pnpm --dir e2e test:live:cloud`) |
-| **Azure** | `pulumi/azure-native` | Disabled | ⚠️ | Enable via **Topology → Providers**; includes `azure-vm` blueprint; tested in live cloud E2E (`pnpm --dir e2e test:live:cloud`) |
-| **Hetzner Cloud** | `pulumi/hcloud` | Disabled | ⚠️ | Enable via **Topology → Providers**; needs live testing |
-| **Cloudflare** | `pulumi/cloudflare` | Disabled | ⚠️ | Enable via **Topology → Providers**; needs live testing |
-| **Custom OpenTofu / TF** | `terraform-provider` bridge | ✅ | Tested live (`hashicorp/random`); add dynamically via UI/API/Git PR without recompiling Keel |
+| **Proxmox VE** | `bpg/proxmox` (TF bridge) | Disabled | ⚠️ | Enable via **Control Plane & Providers**; needs PVE feedback |
+| **AWS** | `pulumi/aws` | Disabled | ⚠️ | Enable via **Control Plane & Providers**; includes `aws-vm` blueprint; tested in live cloud E2E (`pnpm --dir e2e test:live:cloud`) |
+| **GCP** | `pulumi/gcp` | Disabled | ⚠️ | Enable via **Control Plane & Providers**; includes `gcp-vm` blueprint; tested in live cloud E2E (`pnpm --dir e2e test:live:cloud`) |
+| **Azure** | `pulumi/azure-native` | Disabled | ⚠️ | Enable via **Control Plane & Providers**; includes `azure-vm` blueprint; tested in live cloud E2E (`pnpm --dir e2e test:live:cloud`) |
+| **Hetzner Cloud** | `pulumi/hcloud` | Disabled | ⚠️ | Enable via **Control Plane & Providers**; needs live testing |
+| **Cloudflare** | `pulumi/cloudflare` | Disabled | ⚠️ | Enable via **Control Plane & Providers**; needs live testing |
+| **Custom OpenTofu / TF** | `terraform-provider` bridge | Added on demand | ✅ | Tested live (`hashicorp/random`); add dynamically via UI/API/Git PR without recompiling Keel |
 
 ### Git Forges (`ForgeProvider`)
 

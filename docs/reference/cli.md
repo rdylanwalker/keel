@@ -50,8 +50,8 @@ keel auth status
 | `keel infra list [--tenant <id>] [--provider <id>] [--output table\|json]` | Lists PKO `Stack`s with live status. |
 | `keel infra provision --blueprint <ID> --tenant <id> --values-file <FILE>` | Validates values against a blueprint schema and opens a provisioning PR. |
 | `keel infra ssh <STACK> [--tenant <id>] [--user <u>] [--port <p>] [-i <key>] [--exec] [--output table\|json\|command]` | Prints SSH connection info for a VM stack, or with `--exec` runs `ssh` directly (no shell involved). `--tenant` defaults to `default`. Unknown stacks and stacks that are not VMs return an error instead of made-up connection info. |
-| `keel infra force-delete <STACK> [--tenant <id>] [--namespace <ns>] [--output ...]` | Clears finalizers and force-deletes a stuck PKO `Stack`. Requires tenant admin. Protected (`keel.io/protect`) stacks are refused. |
-| `keel infra unlock <STACK> [--tenant <id>] [--namespace <ns>] [--output ...]` | Cancels a stale Pulumi state lock and requests reconciliation. Requires tenant admin. |
+| `keel infra force-delete <STACK> [--tenant <id>] [--namespace <ns>] [--output ...]` | Clears finalizers and force-deletes a stuck PKO `Stack`. `--tenant` defaults to `default` and resolves to `tenant-<id>` unless `--namespace` is given. Requires tenant admin. Protected (`keel.io/protect`) stacks are refused. |
+| `keel infra unlock <STACK> [--tenant <id>] [--namespace <ns>] [--output ...]` | Cancels a stale Pulumi state lock and requests reconciliation. `--tenant` defaults to `default` and resolves to `tenant-<id>` unless `--namespace` is given. Requires tenant admin. |
 
 ## Tenants
 
@@ -63,7 +63,7 @@ keel auth status
 
 | Command | Description |
 | :--- | :--- |
-| `keel serve [--bind <ADDR>] [--repo-dir <DIR>] [--bare-repo <DIR>] [--config <FILE>] [--git-token <TOKEN>]` | Starts the stateless API/SSE server and the embedded SPA. `--bind` defaults to `127.0.0.1:8080`. `--git-token` can also be set with `KEEL_GIT_TOKEN`. See [Running keel-server In-Cluster](../operations/in-cluster-server.md). |
+| `keel serve [--bind <ADDR>] [--repo-dir <DIR>] [--bare-repo <DIR>] [--config <FILE>] [--git-token <TOKEN>] [--git-url <URL>] [--git-username <USER>]` | Starts the stateless API/SSE server and the embedded SPA. `--bind` defaults to `127.0.0.1:8080`. `--git-token` can also be set with `KEEL_GIT_TOKEN`. `--git-url` / `KEEL_GIT_URL` sets up `--repo-dir` from a remote GitOps repository: it clones when the directory is missing or empty and fetches otherwise. Credentials come only from `KEEL_GIT_TOKEN`, never from the URL. `--git-username` / `KEEL_GIT_USERNAME` is the HTTPS username paired with the token (default `keel`). See [Running keel-server In-Cluster](../operations/in-cluster-server.md). |
 
 ## Stage 0 Bootstrap & Recovery
 
@@ -80,16 +80,16 @@ keel auth status
 | `--cluster-name <NAME>` | Seed cluster name (DNS-1123 label). Default `keel-mgmt`. |
 | `--kubeconfig <FILE>`, `--context <CTX>` | Existing cluster to use (`--target kubeconfig`). |
 | `--proxmox-url <URL>`, `--region <R>`, `--distro <k3s\|talos>` | Settings for provider targets. |
-| `--with-forge` | Deploys an in-cluster Forgejo during Stage 0. |
+| `--with-forge` | Deploys an in-cluster Forgejo in `keel-system` during Stage 0. Bootstrap creates the `keel/infra-gitops` repository and the `keel-system/forge-token` Secret, then hands Forgejo to Flux as the protected `forgejo` management add-on (`clusters/management/core-addons/forgejo.yaml`, `catalog/core/forgejo`). Persistence is off by default, so the management API refuses Forgejo upgrades and rollbacks until you set `persistence.enabled: true` in Git. |
 | `--with-keel-server` | Runs `keel-server` in the cluster as the Flux-managed `keel-server` add-on, with the image pinned to this CLI's release. Needs `--repo-dir` plus either `--with-forge` or an HTTP(S) `--git-url` (not both). See [Running keel-server In-Cluster](../operations/in-cluster-server.md). |
 | `--git-url <URL>`, `--forge-type <local\|github\|gitlab\|forgejo\|gitea>`, `--forge-api-url <URL>`, `--git-token <T>` / `KEEL_GIT_TOKEN` | External Git repository and forge. |
 | `--oidc-provider <rauthy\|none>` | In-cluster IdP to deploy. Default `rauthy`. |
-| `--oidc-issuer <URL>`, `--oidc-client-id <ID>` | Use an external OIDC issuer instead. This disables in-cluster Rauthy. |
+| `--oidc-issuer <URL>`, `--oidc-client-id <ID>` | Use an external OIDC issuer instead. This disables in-cluster Rauthy. `--oidc-client-id` defaults to `keel-server`. |
 | `--oidc-public-url <URL>` | Public HTTPS URL of in-cluster Rauthy. Default `https://idp.keel.local:8888`. The issuer becomes `<url>/auth/v1`, and the Forgejo and portal hosts are derived from the parent domain (`forgejo.<domain>`, `keel.<domain>`). |
-| `--admin-username <U>`, `--admin-password <P>` / `KEEL_ADMIN_PASSWORD` | Initial Rauthy admin. The password is generated and printed once if you omit it. |
+| `--admin-username <U>`, `--admin-password <P>` / `KEEL_ADMIN_PASSWORD` | Initial Rauthy admin. `--admin-username` defaults to `admin@keel.local`. The password is generated and printed once if you omit it. |
 | `--local-dev-docker-socket-exception` | Adds a Kyverno `PolicyException` that gives local `kind` PKO workspaces Docker access. |
 | `--repo-dir <DIR>` | Local directory for the seed GitOps repository. |
-| `--skip-core-install` | Skips installing Flux, PKO, and Kyverno. |
+| `--skip-core-install` | Skips the Stage 0 control-plane install: the `control-plane*` Pulumi programs (Flux, PKO, Kyverno, SeaweedFS, Envoy Gateway, Prometheus, Flagger, cert-manager, Rauthy, and Forgejo with `--with-forge`), Forgejo repository/token provisioning, and the Stage 0 S3 state escrow. The cluster is still provisioned and the seed GitOps repository is still initialized. With `--with-keel-server`, you must create the `keel-system/forge-token` Secret yourself. |
 | `--pulumi-program-dir <DIR>` | Overrides the directory of the Stage 0 `Pulumi.yaml`. |
 
 Environment variables read by `bootstrap init`:

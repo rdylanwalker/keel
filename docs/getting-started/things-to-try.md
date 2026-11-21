@@ -52,8 +52,8 @@ keel infra provision \
 ### Step 3: Inspect the Preview & Merge
 
 1. Open **PR & Preview Inspector** (or run `keel preview status --pr <PR_NUMBER> --watch --server http://127.0.0.1:8080`).
-2. Review the **Git Diff** (`tenants/dev-team/infra/workload-dev.yaml`) and the **PKO v2 Diff** (`+ Create` for `kind:index:Cluster`).
-3. Click **Merge PR Proposal**.
+2. Review the **Git Diff (vs. main)** (`tenants/dev-team/infra/workload-dev.yaml`) and the **Resource Diff Tree** from the PKO v2 preview (`+ Create` for `kind:index:Cluster`).
+3. Click **Merge PR**.
 4. Once Flux CD and PKO v2 reconcile, verify the new cluster is running alongside your management cluster:
 
 ```bash
@@ -127,7 +127,7 @@ You can use the same management cluster to provision cloud infrastructure. This 
 ### Step 1: Enable the `aws` Provider
 
 1. Open **Control Plane & Providers** in the web portal.
-2. Locate the **Amazon Web Services (`aws`)** provider card and click **Enable Provider**.
+2. Locate the **Amazon Web Services (`aws`)** provider card and click **Enable**.
 3. Merge the generated PR updating `providers/registry.yaml`.
 
 ### Step 2: Add the `aws-eks` Blueprint to Your Catalog
@@ -145,7 +145,7 @@ You can use the same management cluster to provision cloud infrastructure. This 
    - **Node Instance Type:** `t3.micro`
    - **Desired Node Count:** `1`
    - **AWS Access Key ID / Secret Access Key:** Your IAM credentials
-3. Submit the PR and inspect the **PKO v2 Diff** in **PR & Preview Inspector** to verify the exact VPC, subnets, and EKS resources before any cloud resources are created.
+3. Submit the PR and inspect the **Resource Diff Tree** in **PR & Preview Inspector** to verify the exact VPC, subnets, and EKS resources before any cloud resources are created.
    > The ephemeral preview runs in `keel-previews` without your tenant's cloud credentials, which are deliberately not copied there. A cloud preview may therefore end in `failed`, leaving you with the provisional synthesized diff and the Git diff. See [Pre-Merge PKO Previews](previews.md#limitations).
 4. Merge the PR to start provisioning.
 
@@ -308,7 +308,7 @@ Deploy raw Kubernetes YAML templates without packaging a Helm chart, choosing be
    - **Flux CD Kustomization (`flux`):** Generates `manifests.yaml`, non-secret substitutions in `values-configmap.yaml`, and a Flux `Kustomization` using `postBuild.substituteFrom`.
    - **Pulumi PKO Stack (`pulumi`):** Generates `Pulumi.yaml` wrapping the rendered manifests in `kubernetes:yaml/v2:ConfigGroup` with a PKO v2 `Stack` and ephemeral PR preview diffing.
 5. Click **Submit & Open Git PR Proposal**.
-6. Inspect the PR in **PR & Preview Inspector** and click **Merge PR Proposal**.
+6. Inspect the PR in **PR & Preview Inspector** and click **Merge PR**.
 
 ### Step 2: Deploy via Keel CLI (`--engine flux` or `--engine pulumi`)
 
@@ -348,7 +348,7 @@ Once an infrastructure blueprint containing virtual machines has been provisione
 
 ### Step 1: Connect via the Web Portal
 1. In **Topology Map**, locate your provisioned VM stack card and click the **SSH** button (or open the **Stack Inspector** and click **SSH**).
-2. The **Connection Information** modal opens with resolved metadata:
+2. The **SSH Connect: `<stack>`** modal opens with resolved metadata:
    - `Host`: Public IPv4 address or DNS name
    - `User`: Configured username (`ubuntu`, `azureuser`, or `debian`)
    - `Port`: `22`

@@ -18,7 +18,7 @@ Infrastructure blueprints in `catalog/infra/` are gated by `providers/registry.y
 
 1. Open **Control Plane & Providers** in the web portal.
 2. Locate the provider card (for example, **kind**, **Proxmox VE**, **AWS**, **GCP**, **Azure**, **Hetzner**, or **Cloudflare**).
-3. Click **Enable Provider** to open a PR updating `providers/registry.yaml`.
+3. Click **Enable** to open a PR updating `providers/registry.yaml`.
 4. Click **Go to PR** and merge the PR in **PR & Preview Inspector**.
 
 > **Tip — Local `kind` provider:** `kind` is enabled by default in `providers/registry.yaml` so you can provision local workload `kind` clusters immediately.
@@ -87,9 +87,9 @@ keel preview status --pr 1 --watch --server http://127.0.0.1:8080
 ```
 
 - Review the **Git Diff** (the exact YAML manifests proposed under `tenants/<tenant>/infra/`, `tenants/<tenant>/apps/`, or `tenants/<tenant>/bundles/`).
-- Review the **PKO v2 Diff** (`+ Create`, `~ Update`, `- Delete`, `! Replace`). A **source** badge shows whether it came from a real `pulumi preview` (`pko`) or was simulated (`synthesized`), and the run status shows whether the PKO preview is still pending or running. See [Pre-Merge PKO Previews](previews.md).
+- Review the **Resource Diff Tree** (`+ Create`, `~ Update`, `- Delete`, `! Replace`). A **source** badge shows whether it came from a real `pulumi preview` (`pko`) or was simulated (`synthesized`), and the run status shows whether the PKO preview is still pending or running. See [Pre-Merge PKO Previews](previews.md).
 - Merging requires cluster admin or `tenant-<id>-admin`. The server pins the merge to the head SHA it verified.
-- Click **Merge PR Proposal** to merge into `main`, or **Reject PR** to close the proposal and garbage-collect ephemeral preview resources.
+- Click **Merge PR** to merge into `main`, or **Reject PR** to close the proposal and garbage-collect ephemeral preview resources.
 - If a proposal was closed by mistake, select it (e.g., under the **Closed** or **All** tab) and click **Reopen PR** to reopen it.
 - Use the status filter tabs (**Open**, **Merged**, **Closed**, **All**) to browse PR history directly from your configured Git forge.
 
@@ -164,7 +164,7 @@ Keel resolves SSH connection metadata (`sshHost`, `sshUser`, `sshPort`) directly
 
 ### Access via Web Portal
 1. In **Topology Map** or inside **Stack Inspector**, click the **SSH** action button on any provisioned VM stack card (e.g., `aws-vm`, `azure-vm`, `gcp-vm`).
-2. **Connection Information View:** Displays host, username, port, and one-click copyable commands:
+2. **SSH Connect: `<stack>` modal:** Displays host, username, port, and one-click copyable commands:
    - `ssh -p <port> <user>@<host>`
    - `keel infra ssh <stack-name> --tenant <tenant>`
    - `keel infra ssh <stack-name> --tenant <tenant> --exec`
