@@ -1,18 +1,28 @@
 //! Stage 0 seed control-plane synthesis and cluster bootstrap handlers (`keel bootstrap init`).
+//!
+//! Submodules: [`kube`] (`kubectl` helpers), [`s3`] (SeaweedFS + SigV4), [`state`] (durable
+//! Stage 0 Pulumi state, passphrase, S3 escrow, tenant state migration), [`forge`] (Forgejo and
+//! external repository provisioning) and [`addons`] (core add-on installation).
+
+pub(crate) mod addons;
+pub(crate) mod forge;
+pub(crate) mod kube;
+pub(crate) mod s3;
+pub(crate) mod state;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use keel_core::{
     AuthPhase, BootstrapConfig, BootstrapTarget, ClusterConnection, DEFAULT_POLL_INTERVAL,
-    FLUX_SYSTEM_NAMESPACE, ForgeConfig, ForgeKind, KEEL_PREVIEWS_NAMESPACE, KEEL_SYSTEM_NAMESPACE,
-    KeelConfig, OidcConfig, ProviderRegistry, SopsConfig, SopsManager, bootstrap_target_factory,
-    generate_admin_password,
+    FLUX_SYSTEM_NAMESPACE, ForgeConfig, ForgeKind, KEEL_SYSTEM_NAMESPACE, KeelConfig, OidcConfig,
+    ProviderRegistry, STAGE0_PASSPHRASE_FILE, SopsConfig, SopsManager, bootstrap_target_factory,
+    generate_admin_password, stage0_cluster_dir_in, stage0_state_root,
 };
 use keel_git::{CommitAuthor, GitCredentials, GitRunner, parse_remote_repo_url};
+use keel_kube::tenant::build_tenant_git_credentials_secret;
 use keel_kube::{
     DockerSocketExceptionConfig, KyvernoManifestBundle, KyvernoPolicyConfig,
     S3_CREDENTIALS_SECRET_NAME, TenantIsolationConfig, TenantManifestBundle,
@@ -23,13 +33,148 @@ use keel_pko::{
     LocalObjectReference, ManagementCoreStackParams, PkoStack, attach_s3_credentials_env_refs,
     synthesize_management_core_stack,
 };
-use reqwest::header::AUTHORIZATION;
-use reqwest::{Client, StatusCode};
-use serde_json::{Value, json};
+use serde_json::json;
 
 use crate::cli::BootstrapInitArgs;
 
 use super::{CliError, absolutize_path};
+use kube::KubeTarget;
+
+pub(crate) use forge::FORGE_TOKEN_SECRET_NAME;
+pub(crate) use kube::{TempPortForward, start_forgejo_port_forward, start_gateway_port_forward};
+pub use state::{TenantMigrationReport, TenantStackMigration};
+
+/// Default public URL of the in-cluster Rauthy IdP on local `kind` (Envoy Gateway port 8888).
+pub const DEFAULT_OIDC_PUBLIC_URL: &str = "https://idp.keel.local:8888";
+
+/// Public ingress coordinates for Stage 0 IdP / Forgejo / portal hosts, derived from
+/// `--oidc-public-url` (default [`DEFAULT_OIDC_PUBLIC_URL`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Stage0Ingress {
+    /// `https://<idp_host>[:port]` (no trailing slash).
+    pub idp_origin: String,
+    pub idp_host: String,
+    /// Domain shared by sibling hosts (`idp.keel.local` -> `keel.local`).
+    pub base_domain: String,
+    pub forgejo_host: String,
+    pub keel_host: String,
+    /// `:<port>` suffix (empty for the scheme default port).
+    pub port_suffix: String,
+}
+
+fn is_dns_hostname(host: &str) -> bool {
+    !host.is_empty()
+        && host.len() <= 253
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        })
+}
+
+impl Stage0Ingress {
+    /// Parses and validates `--oidc-public-url` (`https://<host>[:port]`, DNS host, no path).
+    pub fn from_public_url(raw: &str) -> Result<Self, CliError> {
+        let invalid = |why: &str| {
+            CliError::Validation(format!(
+                "invalid --oidc-public-url '{}': {why} (expected e.g. `https://idp.example.com`)",
+                raw.trim()
+            ))
+        };
+        let parsed = url::Url::parse(raw.trim()).map_err(|_| invalid("not a URL"))?;
+        if parsed.scheme() != "https" {
+            return Err(invalid("scheme must be https"));
+        }
+        if !(parsed.path().is_empty() || parsed.path() == "/")
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+            || !parsed.username().is_empty()
+        {
+            return Err(invalid(
+                "must not contain a path, query, fragment or credentials",
+            ));
+        }
+        let host = parsed
+            .host_str()
+            .map(str::to_ascii_lowercase)
+            .filter(|h| is_dns_hostname(h) && h.contains('.'))
+            .ok_or_else(|| invalid("host must be a DNS name with at least two labels"))?;
+        let port_suffix = parsed.port().map(|p| format!(":{p}")).unwrap_or_default();
+        let base_domain = host
+            .split_once('.')
+            .map(|(_, rest)| rest.to_string())
+            .unwrap_or_default();
+        Ok(Self {
+            idp_origin: format!("https://{host}{port_suffix}"),
+            forgejo_host: format!("forgejo.{base_domain}"),
+            keel_host: format!("keel.{base_domain}"),
+            idp_host: host,
+            base_domain,
+            port_suffix,
+        })
+    }
+
+    /// OIDC issuer served by Rauthy (`<origin>/auth/v1`).
+    pub fn issuer(&self) -> String {
+        format!("{}/auth/v1", self.idp_origin)
+    }
+
+    /// OIDC discovery document URL.
+    pub fn discovery_url(&self) -> String {
+        format!("{}/.well-known/openid-configuration", self.issuer())
+    }
+
+    pub fn forgejo_origin(&self) -> String {
+        format!("https://{}{}", self.forgejo_host, self.port_suffix)
+    }
+
+    pub fn keel_origin(&self) -> String {
+        format!("https://{}{}", self.keel_host, self.port_suffix)
+    }
+
+    /// `${VAR}` substitutions for `deploy/bootstrap/manifests/*.yaml`.
+    pub(crate) fn template_vars(&self) -> Vec<(&'static str, &str)> {
+        vec![
+            ("IDP_HOST", self.idp_host.as_str()),
+            ("FORGEJO_HOST", self.forgejo_host.as_str()),
+            ("KEEL_HOST", self.keel_host.as_str()),
+            ("BASE_DOMAIN", self.base_domain.as_str()),
+        ]
+    }
+}
+
+impl Default for Stage0Ingress {
+    fn default() -> Self {
+        Self::from_public_url(DEFAULT_OIDC_PUBLIC_URL).expect("default OIDC public URL is valid")
+    }
+}
+
+/// Substitutes `${NAME}` placeholders with DNS-safe values (rejecting anything else so templates
+/// can never be used for YAML injection) and fails on unknown placeholders.
+pub(crate) fn render_manifest(template: &str, vars: &[(&str, &str)]) -> Result<String, CliError> {
+    let mut out = template.to_string();
+    for (name, value) in vars {
+        if value.is_empty()
+            || !value
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-'))
+        {
+            return Err(CliError::Validation(format!(
+                "refusing to render manifest placeholder {name}={value:?}: not a DNS-safe value"
+            )));
+        }
+        out = out.replace(&format!("${{{name}}}"), value);
+    }
+    if let Some(idx) = out.find("${") {
+        let rest: String = out[idx..].chars().take(32).collect();
+        return Err(CliError::Validation(format!(
+            "unrendered manifest placeholder near `{rest}`"
+        )));
+    }
+    Ok(out)
+}
 
 /// Kyverno policy bundle generator with explicit control over the local-dev Docker socket
 /// `PolicyException` (`SDD.md` §6.2, `NFR-SEC-03`, `NFR-SEC-04`).
@@ -52,12 +197,14 @@ impl KyvernoPolicyGenerator {
     /// Creates a generator seeded with the Day-1 default allowed Pulumi providers (`keel_kube::kyverno`).
     pub fn with_default_providers(local_dev_docker_socket_exception: bool) -> Self {
         Self::new(
-            keel_kube::kyverno::default_allowed_pulumi_providers(),
+            keel_kube::pulumi_provider_allowlist(
+                &keel_kube::kyverno::default_allowed_pulumi_providers(),
+            ),
             local_dev_docker_socket_exception,
         )
     }
 
-    /// Synthesizes the baseline `ClusterPolicy` manifests and optional local-dev `PolicyException`.
+    /// Synthesizes the baseline `ValidatingPolicy` manifests and optional local-dev `PolicyException`.
     pub fn generate(&self) -> Result<KyvernoManifestBundle, CliError> {
         let cfg = KyvernoPolicyConfig {
             allowed_providers: self.allowed_providers.clone(),
@@ -102,6 +249,8 @@ pub struct SeedControlPlaneArtifacts {
     pub rauthy_config: Option<RauthySeedConfig>,
     /// Optional generated `age` keyfile contents for `flux-system/sops-age` (never logged).
     pub sops_age_keyfile: Option<String>,
+    /// Public ingress hosts for the IdP / Forgejo / portal (`--oidc-public-url`).
+    pub ingress: Stage0Ingress,
 }
 
 impl std::fmt::Debug for SeedControlPlaneArtifacts {
@@ -111,6 +260,7 @@ impl std::fmt::Debug for SeedControlPlaneArtifacts {
             .field("admin_username", &self.admin_username)
             .field("admin_password", &"[REDACTED]")
             .field("admin_password_generated", &self.admin_password_generated)
+            .field("ingress", &self.ingress)
             .field(
                 "rauthy_secret",
                 &self
@@ -137,6 +287,8 @@ pub struct BootstrapInitOutcome {
     pub connection: ClusterConnection,
     pub artifacts: SeedControlPlaneArtifacts,
     pub seed_repo: Option<SeedRepoInitResult>,
+    /// S3 escrow report for Stage 0 state (when core add-ons were installed).
+    pub stage0_backend_url: Option<String>,
     pub output: String,
 }
 
@@ -145,6 +297,16 @@ pub async fn synthesize_seed_control_plane(
     cfg: &BootstrapConfig,
     repo_url_override: Option<&str>,
 ) -> Result<SeedControlPlaneArtifacts, CliError> {
+    synthesize_seed_control_plane_with_ingress(cfg, repo_url_override, Stage0Ingress::default())
+        .await
+}
+
+/// [`synthesize_seed_control_plane`] with explicit Stage 0 ingress hosts (`--oidc-public-url`).
+pub async fn synthesize_seed_control_plane_with_ingress(
+    cfg: &BootstrapConfig,
+    repo_url_override: Option<&str>,
+    ingress: Stage0Ingress,
+) -> Result<SeedControlPlaneArtifacts, CliError> {
     cfg.validate()?;
 
     let mut provider_registry = ProviderRegistry::default_day1();
@@ -152,14 +314,14 @@ pub async fn synthesize_seed_control_plane(
         let _ = provider_registry.set_enabled(cfg.target.as_str(), true);
     }
     provider_registry.validate()?;
-    let mut enabled_provider_ids: Vec<String> = provider_registry
+    // Shared allowlist helper (also used by `keel serve` / proposals) always includes the
+    // built-in providers such as `kubernetes` (OPEN-3).
+    let enabled_ids: Vec<String> = provider_registry
         .enabled_providers()
         .into_iter()
         .map(|p| p.id.clone())
         .collect();
-    if !enabled_provider_ids.iter().any(|p| p == "kubernetes") {
-        enabled_provider_ids.push("kubernetes".to_string());
-    }
+    let enabled_provider_ids = keel_kube::pulumi_provider_allowlist(&enabled_ids);
 
     let repo_url = repo_url_override.map(str::to_owned).unwrap_or_else(|| {
         if cfg.with_forge {
@@ -177,9 +339,9 @@ pub async fn synthesize_seed_control_plane(
         .filter(|s| !s.is_empty())
         .map(str::to_string);
     let use_in_cluster_rauthy = external_oidc_issuer.is_none() && cfg.with_oidc;
-    let oidc_issuer = external_oidc_issuer.clone().or_else(|| {
-        use_in_cluster_rauthy.then(|| "https://idp.keel.local:8888/auth/v1".to_string())
-    });
+    let oidc_issuer = external_oidc_issuer
+        .clone()
+        .or_else(|| use_in_cluster_rauthy.then(|| ingress.issuer()));
     let oidc_client_id = cfg
         .oidc_client_id
         .as_deref()
@@ -323,6 +485,7 @@ pub async fn synthesize_seed_control_plane(
         );
         let enc_key_b64 = STANDARD.encode(enc_bytes);
 
+        let pub_url = format!("{}{}", ingress.idp_host, ingress.port_suffix);
         let config_toml = format!(
             "[access]\ncookie_mode = 'secure'\n\n\
              [bootstrap]\nbootstrap_dir = '/app/bootstrap'\n\n\
@@ -331,9 +494,11 @@ pub async fn synthesize_seed_control_plane(
              [encryption]\nkeys = ['{enc_key_id}/{enc_key_b64}']\nkey_active = '{enc_key_id}'\n\n\
              [logging]\nlevel = 'info'\n\n\
              [mfa]\nadmin_force_mfa = false\n\n\
-             [server]\nlisten_address = '0.0.0.0'\nport_http = 8080\nport_https = 8443\nscheme = 'http_https'\npub_url = 'idp.keel.local:8888'\nproxy_mode = true\ntrusted_proxies = ['10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16', '127.0.0.0/8']\n\n\
+             [server]\nlisten_address = '0.0.0.0'\nport_http = 8080\nport_https = 8443\nscheme = 'http_https'\npub_url = '{pub_url}'\nproxy_mode = true\ntrusted_proxies = ['10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16', '127.0.0.0/8']\n\n\
              [tls]\ngenerate_self_signed = true\n\n\
-             [webauthn]\nrp_id = 'idp.keel.local'\nrp_origin = 'https://idp.keel.local:8888'\nrp_name = 'Keel IAM'\n"
+             [webauthn]\nrp_id = '{rp_id}'\nrp_origin = '{rp_origin}'\nrp_name = 'Keel IAM'\n",
+            rp_id = ingress.idp_host,
+            rp_origin = ingress.idp_origin,
         );
 
         let groups_json = serde_json::to_string_pretty(&json!([
@@ -371,12 +536,12 @@ pub async fn synthesize_seed_control_plane(
             "redirect_uris": [
                 "http://127.0.0.1:8080/api/v1/auth/callback",
                 "http://localhost:8080/api/v1/auth/callback",
-                "http://keel.keel.local:8888/api/v1/auth/callback"
+                format!("{}/api/v1/auth/callback", ingress.keel_origin())
             ],
             "allowed_origins": [
                 "http://127.0.0.1:8080",
                 "http://localhost:8080",
-                "http://keel.keel.local:8888"
+                ingress.keel_origin()
             ],
             "enabled": true,
             "flows_enabled": ["authorization_code", "refresh_token"],
@@ -396,10 +561,10 @@ pub async fn synthesize_seed_control_plane(
                 "confidential": true,
                 "secret": { "Plain": forgejo_secret },
                 "redirect_uris": [
-                    "https://forgejo.keel.local:8888/user/oauth2/rauthy/callback"
+                    format!("{}/user/oauth2/rauthy/callback", ingress.forgejo_origin())
                 ],
                 "allowed_origins": [
-                    "https://forgejo.keel.local:8888"
+                    ingress.forgejo_origin()
                 ],
                 "enabled": true,
                 "flows_enabled": ["authorization_code", "refresh_token"],
@@ -440,6 +605,7 @@ pub async fn synthesize_seed_control_plane(
         admin_password_generated,
         rauthy_config,
         sops_age_keyfile,
+        ingress,
     })
 }
 
@@ -532,165 +698,31 @@ async fn is_dir_empty_or_missing(dir: &Path) -> bool {
     !matches!(entries.next_entry().await, Ok(Some(_)))
 }
 
-pub(crate) const FORGE_TOKEN_SECRET_NAME: &str = "forge-token";
+/// Environment variable supplying a dedicated **read-only** Git token for `tenant-default`'s
+/// Flux `GitRepository` when bootstrapping against an external forge (`--git-url`/`--git-token`).
+pub(crate) const TENANT_GIT_TOKEN_ENV: &str = "KEEL_TENANT_GIT_TOKEN";
 
-/// RAII guard for a background `kubectl port-forward` child process.
-pub(crate) struct TempPortForward {
-    pub(crate) local_port: u16,
-    child: tokio::process::Child,
-}
+/// Default tenant provisioned during Stage 0.
+pub(crate) const DEFAULT_TENANT_ID: &str = "default";
 
-impl Drop for TempPortForward {
-    fn drop(&mut self) {
-        let _ = self.child.start_kill();
-    }
-}
-
-pub(crate) async fn start_forgejo_port_forward(
-    context: Option<&str>,
-    kubeconfig: Option<&Path>,
-) -> Result<TempPortForward, CliError> {
-    let listener = std::net::TcpListener::bind("127.0.0.1:3000")
-        .or_else(|_| std::net::TcpListener::bind("127.0.0.1:0"))?;
-    let local_port = listener.local_addr()?.port();
-    drop(listener);
-
-    let mut cmd = tokio::process::Command::new("kubectl");
-    if let Some(kc) = kubeconfig {
-        cmd.arg("--kubeconfig").arg(kc);
-    }
-    if let Some(ctx) = context {
-        cmd.arg("--context").arg(ctx);
-    }
-    cmd.args([
-        "-n",
-        KEEL_SYSTEM_NAMESPACE,
-        "port-forward",
-        "svc/forgejo-http",
-        &format!("{local_port}:3000"),
-    ])
-    .stdout(std::process::Stdio::null())
-    .stderr(std::process::Stdio::null());
-
-    let child = cmd
-        .spawn()
-        .map_err(|e| CliError::Validation(format!("failed to spawn kubectl port-forward: {e}")))?;
-    let pf = TempPortForward { local_port, child };
-
-    let client = Client::builder()
-        .timeout(Duration::from_secs(2))
-        .build()
-        .map_err(|e| CliError::Validation(e.to_string()))?;
-    let health_url = format!("http://127.0.0.1:{local_port}/api/v1/version");
-
-    for _ in 0..40 {
-        if let Ok(resp) = client.get(&health_url).send().await
-            && resp.status().is_success()
-        {
-            return Ok(pf);
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
-
-    Err(CliError::Validation(format!(
-        "timed out waiting for Forgejo port-forward on 127.0.0.1:{local_port}"
-    )))
-}
-
-pub(crate) async fn start_gateway_port_forward(
-    context: Option<&str>,
-    kubeconfig: Option<&Path>,
-) -> Result<TempPortForward, CliError> {
-    let mut svc_cmd = tokio::process::Command::new("kubectl");
-    if let Some(kc) = kubeconfig {
-        svc_cmd.arg("--kubeconfig").arg(kc);
-    }
-    if let Some(ctx) = context {
-        svc_cmd.arg("--context").arg(ctx);
-    }
-    let svc_out = svc_cmd
-        .args([
-            "-n",
-            KEEL_SYSTEM_NAMESPACE,
-            "get",
-            "svc",
-            "-l",
-            "gateway.envoyproxy.io/owning-gateway-name=keel-ingress",
-            "-o",
-            "jsonpath={.items[0].metadata.name}",
-        ])
-        .output()
-        .await
-        .map_err(|e| CliError::Validation(format!("failed to query Envoy Gateway service: {e}")))?;
-    let svc_name = String::from_utf8_lossy(&svc_out.stdout).trim().to_string();
-    if svc_name.is_empty() {
-        return Err(CliError::Validation(
-            "Envoy Gateway service for keel-ingress not found in keel-system".to_string(),
-        ));
-    }
-
-    let listener = std::net::TcpListener::bind("127.0.0.1:8888")
-        .or_else(|_| std::net::TcpListener::bind("127.0.0.1:0"))?;
-    let local_port = listener.local_addr()?.port();
-    drop(listener);
-
-    let mut cmd = tokio::process::Command::new("kubectl");
-    if let Some(kc) = kubeconfig {
-        cmd.arg("--kubeconfig").arg(kc);
-    }
-    if let Some(ctx) = context {
-        cmd.arg("--context").arg(ctx);
-    }
-    cmd.args([
-        "-n",
-        KEEL_SYSTEM_NAMESPACE,
-        "port-forward",
-        &format!("svc/{svc_name}"),
-        &format!("{local_port}:8888"),
-    ])
-    .stdout(std::process::Stdio::null())
-    .stderr(std::process::Stdio::null());
-
-    let child = cmd
-        .spawn()
-        .map_err(|e| CliError::Validation(format!("failed to spawn kubectl port-forward: {e}")))?;
-    let pf = TempPortForward { local_port, child };
-
-    for _ in 0..40 {
-        if tokio::net::TcpStream::connect(("127.0.0.1", local_port))
-            .await
-            .is_ok()
-        {
-            return Ok(pf);
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
-
-    Err(CliError::Validation(format!(
-        "timed out waiting for Envoy Gateway / Rauthy port-forward on 127.0.0.1:{local_port}"
-    )))
-}
-
-/// Applies the `git-credentials` Secret to `flux-system` and ensures `tenant-default`
-/// exists so Kyverno's `sync-tenant-secrets` `GeneratingPolicy` automatically clones and
-/// synchronizes `git-credentials` into `tenant-default` and all future `tenant-*` namespaces.
-async fn apply_git_credentials_secret(
-    context: Option<&str>,
-    kubeconfig: Option<&Path>,
+/// Applies the control-plane `flux-system/git-credentials` Secret (used only by the
+/// `flux-system` `GitRepository`). It is never cloned into tenant namespaces; tenants receive a
+/// separate read-only credential via [`apply_tenant_git_credentials_secret`].
+pub(crate) async fn apply_git_credentials_secret(
+    target: KubeTarget<'_>,
     username: &str,
     password: &str,
 ) -> Result<(), CliError> {
-    let default_tenant_rbac =
-        TenantManifestBundle::synthesize(&TenantIsolationConfig::new("default"))?
-            .to_multi_doc_yaml()?;
-    run_kubectl_apply(context, kubeconfig, &default_tenant_rbac).await?;
-
     let creds_doc = serde_json::json!({
         "apiVersion": "v1",
         "kind": "Secret",
         "metadata": {
             "name": "git-credentials",
             "namespace": FLUX_SYSTEM_NAMESPACE,
+            "labels": {
+                "app.kubernetes.io/managed-by": "keel",
+                "keel.io/secret-kind": "control-plane-git-credentials",
+            },
         },
         "type": "Opaque",
         "stringData": {
@@ -698,366 +730,39 @@ async fn apply_git_credentials_secret(
             "password": password,
         },
     });
-    let creds_yaml = serde_yml::to_string(&creds_doc)?;
-    run_kubectl_apply(context, kubeconfig, &creds_yaml).await?;
-    Ok(())
+    target.apply(&serde_yml::to_string(&creds_doc)?).await
 }
 
-async fn provision_in_cluster_forgejo(
-    context: Option<&str>,
-    kubeconfig: Option<&Path>,
-    local_port: u16,
-    forgejo_oidc_secret: Option<&str>,
-) -> Result<String, CliError> {
-    let base = format!("http://127.0.0.1:{local_port}");
-    let client = Client::builder()
-        .timeout(Duration::from_secs(15))
-        .build()
-        .map_err(|e| CliError::Validation(e.to_string()))?;
+/// Ensures `tenant-<id>` exists and writes its **read-only** `git-credentials` Secret consumed by
+/// the tenant's Flux `GitRepository` (`keel-gitops`).
+pub(crate) async fn apply_tenant_git_credentials_secret(
+    target: KubeTarget<'_>,
+    tenant_id: &str,
+    username: &str,
+    read_only_token: &str,
+) -> Result<(), CliError> {
+    let tenant_rbac = TenantManifestBundle::synthesize(&TenantIsolationConfig::new(tenant_id))?
+        .to_multi_doc_yaml()?;
+    target.apply(&tenant_rbac).await?;
+    let doc = build_tenant_git_credentials_secret(tenant_id, username, read_only_token)?;
+    target.apply(&serde_yml::to_string(&doc)?).await
+}
 
-    let forgejo_user = "keel";
-    let forgejo_pass = std::env::var("KEEL_FORGEJO_ADMIN_PASSWORD")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "keel-admin-dev".to_string());
-
-    // 1. Ensure `keel/infra-gitops` repository exists (201 Created or 409 Already Exists)
-    let repo_resp = client
-        .post(format!("{base}/api/v1/user/repos"))
-        .basic_auth(forgejo_user, Some(forgejo_pass.as_str()))
-        .json(&serde_json::json!({
-            "name": "infra-gitops",
-            "private": true,
-            "auto_init": false
-        }))
-        .send()
-        .await
-        .map_err(|e| CliError::Validation(format!("Forgejo repo create failed: {e}")))?;
-    if !repo_resp.status().is_success() && repo_resp.status() != StatusCode::CONFLICT {
-        let status = repo_resp.status();
-        let body = repo_resp.text().await.unwrap_or_default();
-        return Err(CliError::Validation(format!(
-            "Forgejo repo create returned HTTP {status}: {body}"
-        )));
-    }
-
-    // 2. Mint a fresh API token for `keel serve`
-    let token_name = format!("keel-stage0-{}", chrono::Utc::now().timestamp());
-    let tok_resp = client
-        .post(format!("{base}/api/v1/users/keel/tokens"))
-        .basic_auth(forgejo_user, Some(forgejo_pass.as_str()))
-        .json(&serde_json::json!({
-            "name": token_name,
-            "scopes": ["write:repository", "write:issue", "read:user"]
-        }))
-        .send()
-        .await
-        .map_err(|e| CliError::Validation(format!("Forgejo token create failed: {e}")))?;
-    if !tok_resp.status().is_success() {
-        let status = tok_resp.status();
-        let body = tok_resp.text().await.unwrap_or_default();
-        return Err(CliError::Validation(format!(
-            "Forgejo token create returned HTTP {status}: {body}"
-        )));
-    }
-    let tok_json: Value = tok_resp
-        .json()
-        .await
-        .map_err(|e| CliError::Validation(format!("Forgejo token parse failed: {e}")))?;
-    let token = tok_json
-        .get("token")
-        .or_else(|| tok_json.get("sha1"))
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| {
-            CliError::Validation("Forgejo access token response missing token field".to_string())
-        })?
-        .to_string();
-
-    // 3. Persist token in `keel-system/forge-token` Secret for zero-config `keel serve`
-    let secret_doc = serde_json::json!({
-        "apiVersion": "v1",
-        "kind": "Secret",
-        "metadata": {
-            "name": FORGE_TOKEN_SECRET_NAME,
-            "namespace": KEEL_SYSTEM_NAMESPACE,
+/// Renders the Flux `HelmRelease` that adopts the Stage 0 Kyverno release in place, keeping
+/// `features.policyExceptions.enabled` identical to the Stage 0 install (no value drift).
+pub(crate) fn render_seed_kyverno_helmrelease(policy_exceptions: bool) -> String {
+    SEED_CORE_ADDON_KYVERNO_YAML.replace(
+        "enabled: true # keel:policy-exceptions",
+        if policy_exceptions {
+            "enabled: true # keel:policy-exceptions"
+        } else {
+            "enabled: false # keel:policy-exceptions"
         },
-        "type": "Opaque",
-        "stringData": {
-            "token": token,
-        },
-    });
-    let secret_yaml = serde_yml::to_string(&secret_doc)?;
-    run_kubectl_apply(context, kubeconfig, &secret_yaml).await?;
-
-    apply_git_credentials_secret(context, kubeconfig, forgejo_user, &token).await?;
-
-    // 4. Register Rauthy OIDC SSO provider in Forgejo when enabled
-    if let Some(oidc_secret) = forgejo_oidc_secret {
-        let mut list_cmd = tokio::process::Command::new("kubectl");
-        if let Some(kc) = kubeconfig {
-            list_cmd.arg("--kubeconfig").arg(kc);
-        }
-        if let Some(ctx) = context {
-            list_cmd.arg("--context").arg(ctx);
-        }
-        let list_out = list_cmd
-            .args([
-                "-n",
-                KEEL_SYSTEM_NAMESPACE,
-                "exec",
-                "deploy/forgejo",
-                "--",
-                "forgejo",
-                "admin",
-                "auth",
-                "list",
-            ])
-            .output()
-            .await;
-
-        let already_configured = list_out.as_ref().is_ok_and(|o| {
-            o.status.success() && String::from_utf8_lossy(&o.stdout).contains("rauthy")
-        });
-
-        if !already_configured {
-            let mut rauthy_wait = tokio::process::Command::new("kubectl");
-            if let Some(kc) = kubeconfig {
-                rauthy_wait.arg("--kubeconfig").arg(kc);
-            }
-            if let Some(ctx) = context {
-                rauthy_wait.arg("--context").arg(ctx);
-            }
-            let _ = rauthy_wait
-                .args([
-                    "-n",
-                    KEEL_SYSTEM_NAMESPACE,
-                    "rollout",
-                    "status",
-                    "statefulset/rauthy",
-                    "--timeout=120s",
-                ])
-                .output()
-                .await;
-
-            let mut registered = false;
-            let mut last_err = String::new();
-            for attempt in 1..=15 {
-                let mut add_cmd = tokio::process::Command::new("kubectl");
-                if let Some(kc) = kubeconfig {
-                    add_cmd.arg("--kubeconfig").arg(kc);
-                }
-                if let Some(ctx) = context {
-                    add_cmd.arg("--context").arg(ctx);
-                }
-                match add_cmd
-                    .args([
-                        "-n",
-                        KEEL_SYSTEM_NAMESPACE,
-                        "exec",
-                        "deploy/forgejo",
-                        "--",
-                        "env",
-                        "SSL_CERT_DIR=/etc/ssl/certs:/etc/ssl/keel-ca",
-                        "forgejo",
-                        "admin",
-                        "auth",
-                        "add-oauth",
-                        "--name",
-                        "rauthy",
-                        "--provider",
-                        "openidConnect",
-                        "--key",
-                        "forgejo",
-                        "--secret",
-                        oidc_secret,
-                        "--auto-discover-url",
-                        "https://idp.keel.local:8888/auth/v1/.well-known/openid-configuration",
-                        "--scopes",
-                        "openid email profile groups",
-                    ])
-                    .output()
-                    .await
-                {
-                    Ok(out) if out.status.success() => {
-                        tracing::info!(attempt, "Registered Rauthy OIDC SSO provider in Forgejo");
-                        registered = true;
-                        break;
-                    }
-                    Ok(out) => {
-                        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-                        if stderr.contains("already exists") {
-                            tracing::info!(
-                                "Rauthy OIDC SSO provider already registered in Forgejo"
-                            );
-                            registered = true;
-                            break;
-                        }
-                        last_err = stderr;
-                        tracing::debug!(
-                            attempt,
-                            error = %last_err,
-                            "Waiting for Rauthy OIDC discovery endpoint before registering in Forgejo"
-                        );
-                    }
-                    Err(err) => {
-                        last_err = err.to_string();
-                        tracing::debug!(
-                            attempt,
-                            error = %last_err,
-                            "Retrying forgejo admin auth add-oauth"
-                        );
-                    }
-                }
-                tokio::time::sleep(Duration::from_secs(3)).await;
-            }
-            if !registered {
-                tracing::warn!(
-                    error = %last_err,
-                    "Failed to register Rauthy OIDC SSO provider in Forgejo after retries (non-fatal)"
-                );
-            }
-        }
-
-        // Warm up Forgejo's in-memory OIDC provider so the first browser login redirect includes PKCE `code_challenge`.
-        if let Ok(no_redirect_client) = Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(Duration::from_secs(10))
-            .build()
-        {
-            let warmup_url = format!("{base}/user/oauth2/rauthy");
-            for attempt in 1..=3 {
-                match no_redirect_client.get(&warmup_url).send().await {
-                    Ok(resp) => {
-                        let has_pkce = resp
-                            .headers()
-                            .get(reqwest::header::LOCATION)
-                            .and_then(|v| v.to_str().ok())
-                            .is_some_and(|loc| loc.contains("code_challenge="));
-                        tracing::debug!(
-                            attempt,
-                            status = %resp.status(),
-                            has_pkce,
-                            "Warmed up Forgejo Rauthy OIDC redirect"
-                        );
-                        if has_pkce {
-                            break;
-                        }
-                    }
-                    Err(err) => {
-                        tracing::debug!(
-                            attempt,
-                            error = %err,
-                            "Forgejo Rauthy OIDC warm-up request failed (non-fatal)"
-                        );
-                    }
-                }
-                tokio::time::sleep(Duration::from_millis(250)).await;
-            }
-        }
-    }
-
-    Ok(token)
+    )
 }
 
-async fn ensure_external_repo_exists(
-    forge_kind: ForgeKind,
-    repo_url: &str,
-    api_url: Option<&str>,
-    token: &str,
-) {
-    let Ok(slug) = parse_remote_repo_url(repo_url) else {
-        return;
-    };
-    let Ok(client) = Client::builder().timeout(Duration::from_secs(15)).build() else {
-        return;
-    };
-
-    match forge_kind {
-        ForgeKind::GitHub => {
-            let base = api_url
-                .map(|u| u.trim_end_matches('/').to_string())
-                .unwrap_or_else(|| "https://api.github.com".to_string());
-            let check = client
-                .get(format!("{base}/repos/{}/{}", slug.owner, slug.repo))
-                .bearer_auth(token)
-                .header("User-Agent", "keel-cli")
-                .send()
-                .await;
-            if let Ok(resp) = check
-                && resp.status() == StatusCode::NOT_FOUND
-            {
-                // Try org repo first, then personal user repo
-                let org_resp = client
-                    .post(format!("{base}/orgs/{}/repos", slug.owner))
-                    .bearer_auth(token)
-                    .header("User-Agent", "keel-cli")
-                    .json(&serde_json::json!({ "name": slug.repo, "private": true }))
-                    .send()
-                    .await;
-                if org_resp.as_ref().is_ok_and(|r| r.status().is_success()) {
-                    tracing::info!(repo = %slug.project_path, "Created GitHub org repository");
-                } else {
-                    let user_resp = client
-                        .post(format!("{base}/user/repos"))
-                        .bearer_auth(token)
-                        .header("User-Agent", "keel-cli")
-                        .json(&serde_json::json!({ "name": slug.repo, "private": true }))
-                        .send()
-                        .await;
-                    if user_resp.as_ref().is_ok_and(|r| r.status().is_success()) {
-                        tracing::info!(repo = %slug.project_path, "Created GitHub user repository");
-                    }
-                }
-            }
-        }
-        ForgeKind::Forgejo | ForgeKind::Gitea => {
-            let base = api_url
-                .map(|u| {
-                    let t = u.trim_end_matches('/');
-                    t.strip_suffix("/api/v1").unwrap_or(t).to_string()
-                })
-                .unwrap_or_else(|| slug.origin_url.clone());
-            let check = client
-                .get(format!("{base}/api/v1/repos/{}/{}", slug.owner, slug.repo))
-                .header(AUTHORIZATION, format!("token {token}"))
-                .send()
-                .await;
-            if let Ok(resp) = check
-                && resp.status() == StatusCode::NOT_FOUND
-            {
-                let _ = client
-                    .post(format!("{base}/api/v1/user/repos"))
-                    .header(AUTHORIZATION, format!("token {token}"))
-                    .json(&serde_json::json!({ "name": slug.repo, "private": true }))
-                    .send()
-                    .await;
-            }
-        }
-        ForgeKind::GitLab => {
-            let base = api_url
-                .map(|u| u.trim_end_matches('/').to_string())
-                .unwrap_or_else(|| slug.origin_url.clone());
-            let encoded = slug.project_path.replace('/', "%2F");
-            let check = client
-                .get(format!("{base}/api/v4/projects/{encoded}"))
-                .header("PRIVATE-TOKEN", token)
-                .send()
-                .await;
-            if let Ok(resp) = check
-                && resp.status() == StatusCode::NOT_FOUND
-            {
-                let _ = client
-                    .post(format!("{base}/api/v4/projects"))
-                    .header("PRIVATE-TOKEN", token)
-                    .json(&serde_json::json!({ "name": slug.repo }))
-                    .send()
-                    .await;
-            }
-        }
-        ForgeKind::Local => {}
-    }
-}
+const DEFAULT_TENANT_NETWORK_POLICY_YAML: &str =
+    include_str!("../../../../deploy/bootstrap/manifests/default-tenant-network-policy.yaml");
 
 /// Initializes a local seed GitOps repository on `main` using [`GitRunner`] (zero shell calls).
 pub async fn initialize_seed_git_repo(
@@ -1075,29 +780,7 @@ pub(crate) fn render_default_tenant_git_repository_yaml(
         repo_yaml.push('\n');
     }
     Ok(format!(
-        "{repo_yaml}---\n\
-         apiVersion: networking.k8s.io/v1\n\
-         kind: NetworkPolicy\n\
-         metadata:\n\
-         \x20 name: allow-pko-workspace\n\
-         \x20 namespace: tenant-default\n\
-         spec:\n\
-         \x20 podSelector:\n\
-         \x20   matchLabels:\n\
-         \x20     auto.pulumi.com/component: workspace\n\
-         \x20 policyTypes:\n\
-         \x20 - Ingress\n\
-         \x20 - Egress\n\
-         \x20 ingress:\n\
-         \x20 - from:\n\
-         \x20   - namespaceSelector:\n\
-         \x20       matchLabels:\n\
-         \x20         kubernetes.io/metadata.name: {KEEL_SYSTEM_NAMESPACE}\n\
-         \x20   ports:\n\
-         \x20   - protocol: TCP\n\
-         \x20     port: 50051\n\
-         \x20 egress:\n\
-         \x20 - {{}}\n"
+        "{repo_yaml}---\n{DEFAULT_TENANT_NETWORK_POLICY_YAML}"
     ))
 }
 
@@ -1177,7 +860,9 @@ async fn initialize_seed_git_repo_with_push(
         ),
         (
             "clusters/management/core-addons/kyverno.yaml",
-            SEED_CORE_ADDON_KYVERNO_YAML.to_string(),
+            render_seed_kyverno_helmrelease(
+                artifacts.kyverno_bundle.policy_exception.is_some(),
+            ),
         ),
         (
             "clusters/management/core-addons/envoy-gateway.yaml",
@@ -1378,151 +1063,6 @@ async fn initialize_seed_git_repo_with_push(
     })
 }
 
-const CONTROL_PLANE_PULUMI_YAML: &str =
-    include_str!("../../../../deploy/bootstrap/control-plane/Pulumi.yaml");
-const CONTROL_PLANE_FORGEJO_PULUMI_YAML: &str =
-    include_str!("../../../../deploy/bootstrap/control-plane-forgejo/Pulumi.yaml");
-const CONTROL_PLANE_RAUTHY_PULUMI_YAML: &str =
-    include_str!("../../../../deploy/bootstrap/control-plane-rauthy/Pulumi.yaml");
-
-async fn run_kubectl_apply(
-    context: Option<&str>,
-    kubeconfig: Option<&Path>,
-    manifest_yaml: &str,
-) -> Result<(), CliError> {
-    use tokio::io::AsyncWriteExt;
-
-    let mut cmd = tokio::process::Command::new("kubectl");
-    if let Some(kc) = kubeconfig {
-        cmd.arg("--kubeconfig").arg(kc);
-    }
-    if let Some(ctx) = context {
-        cmd.arg("--context").arg(ctx);
-    }
-    cmd.args(["apply", "-f", "-"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-
-    let mut child = cmd.spawn().map_err(|e| {
-        CliError::Validation(format!(
-            "failed to invoke `kubectl` (is it installed and in PATH?): {e}"
-        ))
-    })?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(manifest_yaml.as_bytes()).await?;
-    }
-    let output = child.wait_with_output().await?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(CliError::Validation(format!(
-            "`kubectl apply` failed: {}",
-            stderr.trim()
-        )));
-    }
-    Ok(())
-}
-
-async fn materialize_control_plane_program_dir(
-    program_name: &str,
-    embedded_yaml: &str,
-    state_dir: &Path,
-) -> Result<PathBuf, CliError> {
-    let rel = PathBuf::from("deploy").join("bootstrap").join(program_name);
-    if rel.join("Pulumi.yaml").is_file() {
-        return Ok(rel);
-    }
-    let parent_rel = PathBuf::from("..").join(&rel);
-    if parent_rel.join("Pulumi.yaml").is_file() {
-        return Ok(parent_rel);
-    }
-
-    let embedded_dir = state_dir.join(format!("program-{program_name}"));
-    tokio::fs::create_dir_all(&embedded_dir).await?;
-    tokio::fs::write(embedded_dir.join("Pulumi.yaml"), embedded_yaml).await?;
-    Ok(embedded_dir)
-}
-
-async fn run_pulumi_cmd(program_dir: &Path, args: &[&str]) -> Result<(), CliError> {
-    let mut cmd = tokio::process::Command::new("pulumi");
-    cmd.args(args)
-        .current_dir(program_dir)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .env("PULUMI_SKIP_UPDATE_CHECK", "true");
-
-    if std::env::var_os("PULUMI_CONFIG_PASSPHRASE").is_none() {
-        cmd.env("PULUMI_CONFIG_PASSPHRASE", "");
-    }
-
-    let output = cmd.output().await.map_err(|e| {
-        CliError::Validation(format!(
-            "failed to invoke `pulumi` (is it installed and in PATH?): {e}"
-        ))
-    })?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let detail = if !stderr.is_empty() { stderr } else { stdout };
-        let subcmd = args.first().copied().unwrap_or_default();
-        return Err(CliError::Validation(format!(
-            "`pulumi {subcmd}` failed: {detail}"
-        )));
-    }
-    Ok(())
-}
-
-async fn run_pulumi_control_plane_stack(
-    program_name: &str,
-    embedded_yaml: &str,
-    cluster_name: &str,
-    config_pairs: &[(&str, &str, bool)],
-) -> Result<(), CliError> {
-    let stage0_root = std::env::temp_dir().join("keel-stage0-pulumi");
-    let state_dir = stage0_root
-        .join(format!("control-plane-{cluster_name}"))
-        .join(program_name);
-    tokio::fs::create_dir_all(&state_dir).await?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o700);
-        let _ = std::fs::set_permissions(&stage0_root, perms.clone());
-        if let Some(cluster_dir) = state_dir.parent() {
-            let _ = std::fs::set_permissions(cluster_dir, perms.clone());
-        }
-        std::fs::set_permissions(&state_dir, perms)?;
-    }
-    let program_dir =
-        materialize_control_plane_program_dir(program_name, embedded_yaml, &state_dir).await?;
-
-    let backend_url = format!("file://{}", state_dir.display());
-    let stack_name = format!("stage0-{program_name}-{cluster_name}");
-
-    run_pulumi_cmd(&program_dir, &["login", &backend_url]).await?;
-    run_pulumi_cmd(&program_dir, &["stack", "select", &stack_name, "--create"]).await?;
-
-    if !config_pairs.is_empty() {
-        let mut owned_args: Vec<String> = Vec::with_capacity(2 + config_pairs.len() * 2);
-        owned_args.push("config".to_string());
-        owned_args.push("set-all".to_string());
-        for &(key, value, is_secret) in config_pairs {
-            owned_args.push(if is_secret {
-                "--secret".to_string()
-            } else {
-                "--plaintext".to_string()
-            });
-            owned_args.push(format!("{key}={value}"));
-        }
-        let arg_refs: Vec<&str> = owned_args.iter().map(String::as_str).collect();
-        run_pulumi_cmd(&program_dir, &arg_refs).await?;
-    }
-
-    run_pulumi_cmd(&program_dir, &["up", "--yes", "--non-interactive"]).await?;
-    Ok(())
-}
-
 /// Infers `(ForgeKind, Option<api_url>)` from a remote `--git-url` and optional explicit overrides.
 pub(crate) fn infer_forge_config(
     git_url: &str,
@@ -1565,843 +1105,6 @@ pub(crate) fn infer_forge_config(
     };
 
     (kind, api_url)
-}
-
-async fn read_secret_key(
-    context: Option<&str>,
-    kubeconfig: Option<&Path>,
-    namespace: &str,
-    secret_name: &str,
-    key: &str,
-) -> Option<String> {
-    if key.is_empty()
-        || !key
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
-    {
-        return None;
-    }
-    let mut cmd = tokio::process::Command::new("kubectl");
-    if let Some(kc) = kubeconfig {
-        cmd.arg("--kubeconfig").arg(kc);
-    }
-    if let Some(ctx) = context {
-        cmd.arg("--context").arg(ctx);
-    }
-    let tmpl = format!("{{{{.data.{key} | base64decode}}}}");
-    let out = cmd
-        .args([
-            "-n",
-            namespace,
-            "get",
-            "secret",
-            secret_name,
-            "-o",
-            &format!("go-template={tmpl}"),
-        ])
-        .output()
-        .await
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let val = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if val.is_empty() { None } else { Some(val) }
-}
-
-async fn sync_in_cluster_s3_credentials_from_seaweedfs(
-    context: Option<&str>,
-    kubeconfig: Option<&Path>,
-) -> Result<(), CliError> {
-    const SEAWEEDFS_S3_SECRET: &str = "s3-state-backend-seaweedfs-s3-secret";
-    let access_key = read_secret_key(
-        context,
-        kubeconfig,
-        KEEL_SYSTEM_NAMESPACE,
-        SEAWEEDFS_S3_SECRET,
-        "admin_access_key_id",
-    )
-    .await
-    .ok_or_else(|| {
-        CliError::Validation(format!(
-            "missing `admin_access_key_id` in `{KEEL_SYSTEM_NAMESPACE}/{SEAWEEDFS_S3_SECRET}`"
-        ))
-    })?;
-    let secret_key = read_secret_key(
-        context,
-        kubeconfig,
-        KEEL_SYSTEM_NAMESPACE,
-        SEAWEEDFS_S3_SECRET,
-        "admin_secret_access_key",
-    )
-    .await
-    .ok_or_else(|| {
-        CliError::Validation(format!(
-            "missing `admin_secret_access_key` in `{KEEL_SYSTEM_NAMESPACE}/{SEAWEEDFS_S3_SECRET}`"
-        ))
-    })?;
-
-    let default_tenant_rbac =
-        TenantManifestBundle::synthesize(&TenantIsolationConfig::new("default"))?
-            .to_multi_doc_yaml()?;
-    run_kubectl_apply(context, kubeconfig, &default_tenant_rbac).await?;
-
-    for ns in [
-        KEEL_SYSTEM_NAMESPACE,
-        FLUX_SYSTEM_NAMESPACE,
-        KEEL_PREVIEWS_NAMESPACE,
-    ] {
-        let secret_doc = serde_json::json!({
-            "apiVersion": "v1",
-            "kind": "Secret",
-            "metadata": {
-                "name": S3_CREDENTIALS_SECRET_NAME,
-                "namespace": ns,
-                "labels": {
-                    "app.kubernetes.io/managed-by": "keel",
-                    "keel.io/secret-kind": "s3-credentials",
-                },
-            },
-            "type": "Opaque",
-            "stringData": {
-                "accessKey": access_key,
-                "secretKey": secret_key,
-            },
-        });
-        let secret_yaml = serde_yml::to_string(&secret_doc)?;
-        run_kubectl_apply(context, kubeconfig, &secret_yaml).await?;
-    }
-
-    Ok(())
-}
-
-async fn ensure_seaweedfs_pulumi_bucket(
-    context: Option<&str>,
-    kubeconfig: Option<&Path>,
-) -> Result<(), CliError> {
-    use tokio::io::AsyncWriteExt;
-
-    let mut cmd = tokio::process::Command::new("kubectl");
-    if let Some(kc) = kubeconfig {
-        cmd.arg("--kubeconfig").arg(kc);
-    }
-    if let Some(ctx) = context {
-        cmd.arg("--context").arg(ctx);
-    }
-    cmd.args([
-        "-n",
-        KEEL_SYSTEM_NAMESPACE,
-        "exec",
-        "-i",
-        "sts/s3-state-backend-seaweedfs-filer",
-        "--",
-        "weed",
-        "shell",
-        "-master=s3-state-backend-seaweedfs-master:9333",
-    ])
-    .stdin(std::process::Stdio::piped())
-    .stdout(std::process::Stdio::piped())
-    .stderr(std::process::Stdio::piped());
-
-    let mut child = cmd.spawn()?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(b"s3.bucket.create -name pulumi-state\n")
-            .await?;
-        drop(stdin);
-    }
-    let out = child.wait_with_output().await?;
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        if stderr.contains("already exists") || stdout.contains("already exists") {
-            return Ok(());
-        }
-        return Err(CliError::Validation(format!(
-            "failed to create `pulumi-state` bucket in SeaweedFS: {stderr}"
-        )));
-    }
-    Ok(())
-}
-
-/// Best-effort CoreDNS rewrite so in-cluster pods (such as Forgejo) resolve `idp.keel.local`
-/// and `forgejo.keel.local` to the Envoy Gateway proxy service in `keel-system`.
-async fn configure_coredns_local_rewrites(context: Option<&str>, kubeconfig: Option<&Path>) {
-    let mut svc_name = String::new();
-    for _ in 0..15 {
-        let mut cmd = tokio::process::Command::new("kubectl");
-        if let Some(kc) = kubeconfig {
-            cmd.arg("--kubeconfig").arg(kc);
-        }
-        if let Some(ctx) = context {
-            cmd.arg("--context").arg(ctx);
-        }
-        if let Ok(out) = cmd
-            .args([
-                "-n",
-                KEEL_SYSTEM_NAMESPACE,
-                "get",
-                "svc",
-                "-l",
-                "gateway.envoyproxy.io/owning-gateway-name=keel-ingress",
-                "-o",
-                "jsonpath={.items[0].metadata.name}",
-            ])
-            .output()
-            .await
-        {
-            let candidate = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if !candidate.is_empty() {
-                svc_name = candidate;
-                break;
-            }
-        }
-        tokio::time::sleep(Duration::from_secs(2)).await;
-    }
-
-    if svc_name.is_empty() {
-        tracing::warn!(
-            "Envoy Gateway service for keel-ingress not ready yet; skipping CoreDNS local rewrites"
-        );
-        return;
-    }
-
-    let mut get_cm = tokio::process::Command::new("kubectl");
-    if let Some(kc) = kubeconfig {
-        get_cm.arg("--kubeconfig").arg(kc);
-    }
-    if let Some(ctx) = context {
-        get_cm.arg("--context").arg(ctx);
-    }
-    let Ok(cm_out) = get_cm
-        .args([
-            "-n",
-            "kube-system",
-            "get",
-            "configmap",
-            "coredns",
-            "-o",
-            "jsonpath={.data.Corefile}",
-        ])
-        .output()
-        .await
-    else {
-        return;
-    };
-    if !cm_out.status.success() {
-        return;
-    }
-    let corefile = String::from_utf8_lossy(&cm_out.stdout).to_string();
-    if corefile.contains("idp.keel.local") {
-        return;
-    }
-    let target_fqdn = format!("{svc_name}.{KEEL_SYSTEM_NAMESPACE}.svc.cluster.local");
-    let rewrite_block = format!(
-        "    rewrite name exact idp.keel.local {target_fqdn}\n\
-         \x20   rewrite name exact forgejo.keel.local {target_fqdn}\n\
-         \x20   kubernetes cluster.local"
-    );
-    let updated_corefile = corefile.replacen("    kubernetes cluster.local", &rewrite_block, 1);
-    if updated_corefile == corefile {
-        return;
-    }
-
-    let cm_doc = serde_json::json!({
-        "apiVersion": "v1",
-        "kind": "ConfigMap",
-        "metadata": {
-            "name": "coredns",
-            "namespace": "kube-system",
-        },
-        "data": {
-            "Corefile": updated_corefile,
-        },
-    });
-    if let Ok(cm_yaml) = serde_yml::to_string(&cm_doc)
-        && run_kubectl_apply(context, kubeconfig, &cm_yaml)
-            .await
-            .is_ok()
-    {
-        let mut restart = tokio::process::Command::new("kubectl");
-        if let Some(kc) = kubeconfig {
-            restart.arg("--kubeconfig").arg(kc);
-        }
-        if let Some(ctx) = context {
-            restart.arg("--context").arg(ctx);
-        }
-        let _ = restart
-            .args([
-                "-n",
-                "kube-system",
-                "rollout",
-                "restart",
-                "deployment/coredns",
-            ])
-            .output()
-            .await;
-        let mut status = tokio::process::Command::new("kubectl");
-        if let Some(kc) = kubeconfig {
-            status.arg("--kubeconfig").arg(kc);
-        }
-        if let Some(ctx) = context {
-            status.arg("--context").arg(ctx);
-        }
-        let _ = status
-            .args([
-                "-n",
-                "kube-system",
-                "rollout",
-                "status",
-                "deployment/coredns",
-                "--timeout=60s",
-            ])
-            .output()
-            .await;
-        tracing::info!(
-            envoy_svc = %svc_name,
-            "Configured CoreDNS rewrites for idp.keel.local and forgejo.keel.local"
-        );
-    }
-}
-
-/// Installs Stage 0 core control-plane controllers (Flux CD, Kyverno, PKO v2, and optional Forgejo)
-/// and seed manifests onto the bootstrapped cluster unless `--skip-core-install` was specified.
-async fn install_stage0_core_addons(
-    connection: &ClusterConnection,
-    artifacts: &SeedControlPlaneArtifacts,
-    with_forge: bool,
-    git_token: Option<&str>,
-) -> Result<(), CliError> {
-    let ctx = connection.context.as_deref();
-    let kc = connection.kubeconfig_path.as_deref();
-
-    let sops_age_key =
-        match read_secret_key(ctx, kc, FLUX_SYSTEM_NAMESPACE, "sops-age", "age.agekey").await {
-            Some(existing) => existing,
-            None => artifacts.sops_age_keyfile.clone().unwrap_or_default(),
-        };
-    let enable_policy_exceptions = if artifacts.kyverno_bundle.policy_exception.is_some() {
-        "true"
-    } else {
-        "false"
-    };
-    let kube_context = ctx.unwrap_or("");
-
-    tracing::info!(
-        context = ?ctx,
-        "Deploying Stage 0 seed control-plane addons via Pulumi (`control-plane`)"
-    );
-    run_pulumi_control_plane_stack(
-        "control-plane",
-        CONTROL_PLANE_PULUMI_YAML,
-        &connection.cluster_name,
-        &[
-            ("kubeconfig", &connection.kubeconfig_yaml, true),
-            ("kubeContext", kube_context, false),
-            ("sopsAgeKey", &sops_age_key, true),
-            (
-                "enableKyvernoPolicyExceptions",
-                enable_policy_exceptions,
-                false,
-            ),
-        ],
-    )
-    .await?;
-
-    let needs_seaweedfs_sync = artifacts
-        .management_stack
-        .spec
-        .backend
-        .as_deref()
-        .is_some_and(|b| b.contains("s3-state-backend-seaweedfs-s3.keel-system.svc.cluster.local"));
-
-    let metric_templates_yaml = format!(
-        "apiVersion: flagger.app/v1beta1\n\
-         kind: MetricTemplate\n\
-         metadata:\n\
-         \x20 name: envoy-gateway-request-success-rate\n\
-         \x20 namespace: {KEEL_SYSTEM_NAMESPACE}\n\
-         \x20 labels:\n\
-         \x20   app.kubernetes.io/managed-by: keel\n\
-         spec:\n\
-         \x20 provider:\n\
-         \x20   type: prometheus\n\
-         \x20   address: http://prometheus.{KEEL_SYSTEM_NAMESPACE}:80\n\
-         \x20 query: |\n\
-         \x20   sum(rate(envoy_cluster_upstream_rq{{envoy_cluster_name=~\"httproute/{{{{ namespace }}}}/{{{{ target }}}}/.*\",envoy_response_code!~\"5.*\"}}[{{{{ interval }}}}]))\n\
-         \x20   /\n\
-         \x20   sum(rate(envoy_cluster_upstream_rq{{envoy_cluster_name=~\"httproute/{{{{ namespace }}}}/{{{{ target }}}}/.*\"}}[{{{{ interval }}}}]))\n\
-         \x20   * 100\n\
-         ---\n\
-         apiVersion: flagger.app/v1beta1\n\
-         kind: MetricTemplate\n\
-         metadata:\n\
-         \x20 name: envoy-gateway-request-duration\n\
-         \x20 namespace: {KEEL_SYSTEM_NAMESPACE}\n\
-         \x20 labels:\n\
-         \x20   app.kubernetes.io/managed-by: keel\n\
-         spec:\n\
-         \x20 provider:\n\
-         \x20   type: prometheus\n\
-         \x20   address: http://prometheus.{KEEL_SYSTEM_NAMESPACE}:80\n\
-         \x20 query: |\n\
-         \x20   histogram_quantile(0.99,\n\
-         \x20     sum(rate(envoy_cluster_upstream_rq_time_bucket{{envoy_cluster_name=~\"httproute/{{{{ namespace }}}}/{{{{ target }}}}/.*\"}}[{{{{ interval }}}}])) by (le)\n\
-         \x20   )\n"
-    );
-    let kyverno_yaml = artifacts.kyverno_bundle.to_multi_doc_yaml()?;
-    let docker_proxy_yaml = artifacts.kyverno_bundle.policy_exception.as_ref().map(|_| {
-        format!(
-            "apiVersion: apps/v1\n\
-             kind: Deployment\n\
-             metadata:\n\
-             \x20 name: keel-docker-proxy\n\
-             \x20 namespace: {FLUX_SYSTEM_NAMESPACE}\n\
-             \x20 labels:\n\
-             \x20   app.kubernetes.io/managed-by: keel\n\
-             \x20   keel.io/local-dev-only: \"true\"\n\
-             spec:\n\
-             \x20 replicas: 1\n\
-             \x20 selector:\n\
-             \x20   matchLabels:\n\
-             \x20     app: keel-docker-proxy\n\
-             \x20 template:\n\
-             \x20   metadata:\n\
-             \x20     labels:\n\
-             \x20       app: keel-docker-proxy\n\
-             \x20   spec:\n\
-             \x20     containers:\n\
-             \x20       - name: socat\n\
-             \x20         image: alpine/socat:latest\n\
-             \x20         args:\n\
-             \x20           - -t\n\
-             \x20           - \"600\"\n\
-             \x20           - TCP-LISTEN:2375,fork,reuseaddr\n\
-             \x20           - UNIX-CONNECT:/var/run/docker.sock\n\
-             \x20         ports:\n\
-             \x20           - containerPort: 2375\n\
-             \x20         volumeMounts:\n\
-             \x20           - name: docker-sock\n\
-             \x20             mountPath: /var/run/docker.sock\n\
-             \x20     volumes:\n\
-             \x20       - name: docker-sock\n\
-             \x20         hostPath:\n\
-             \x20           path: /var/run/docker.sock\n\
-             \x20           type: Socket\n\
-             ---\n\
-             apiVersion: v1\n\
-             kind: Service\n\
-             metadata:\n\
-             \x20 name: keel-docker-proxy\n\
-             \x20 namespace: {FLUX_SYSTEM_NAMESPACE}\n\
-             \x20 labels:\n\
-             \x20   app.kubernetes.io/managed-by: keel\n\
-             \x20   keel.io/local-dev-only: \"true\"\n\
-             spec:\n\
-             \x20 selector:\n\
-             \x20   app: keel-docker-proxy\n\
-             \x20 ports:\n\
-             \x20   - port: 2375\n\
-             \x20     targetPort: 2375\n\
-             ---\n\
-             apiVersion: networking.k8s.io/v1\n\
-             kind: NetworkPolicy\n\
-             metadata:\n\
-             \x20 name: allow-keel-docker-proxy\n\
-             \x20 namespace: {FLUX_SYSTEM_NAMESPACE}\n\
-             \x20 labels:\n\
-             \x20   app.kubernetes.io/managed-by: keel\n\
-             \x20   keel.io/local-dev-only: \"true\"\n\
-             spec:\n\
-             \x20 podSelector:\n\
-             \x20   matchLabels:\n\
-             \x20     app: keel-docker-proxy\n\
-             \x20 policyTypes:\n\
-             \x20   - Ingress\n\
-             \x20 ingress:\n\
-             \x20   - from:\n\
-             \x20       - namespaceSelector: {{}}\n\
-             \x20         podSelector:\n\
-             \x20           matchLabels:\n\
-             \x20             auto.pulumi.com/component: workspace\n\
-             \x20     ports:\n\
-             \x20       - port: 2375\n\
-             \x20         protocol: TCP\n"
-        )
-    });
-
-    let infra_setup_fut = async {
-        if needs_seaweedfs_sync {
-            sync_in_cluster_s3_credentials_from_seaweedfs(ctx, kc).await?;
-            ensure_seaweedfs_pulumi_bucket(ctx, kc).await?;
-        }
-        run_kubectl_apply(ctx, kc, &metric_templates_yaml).await?;
-        tracing::info!("Applying Kyverno policies & management core Stack");
-        let mut last_err = None;
-        for attempt in 1..=6 {
-            match run_kubectl_apply(ctx, kc, &kyverno_yaml).await {
-                Ok(()) => {
-                    last_err = None;
-                    break;
-                }
-                Err(err) => {
-                    let msg = err.to_string();
-                    let transient_webhook = msg.contains("failed calling webhook")
-                        || msg.contains("context deadline exceeded")
-                        || msg.contains("connection refused");
-                    if transient_webhook && attempt < 6 {
-                        tracing::warn!(
-                            attempt,
-                            "Kyverno webhook not ready yet; retrying policy apply in 5s: {msg}"
-                        );
-                        last_err = Some(err);
-                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                        continue;
-                    }
-                    return Err(err);
-                }
-            }
-        }
-        if let Some(err) = last_err {
-            return Err(err);
-        }
-        if let Some(ref proxy_yaml) = docker_proxy_yaml {
-            tracing::info!(
-                "Deploying local-dev Docker socket proxy in flux-system for nested kind"
-            );
-            run_kubectl_apply(ctx, kc, proxy_yaml).await?;
-        }
-        Ok::<(), CliError>(())
-    };
-
-    let rauthy_fut = async {
-        let Some(ref rauthy_cfg) = artifacts.rauthy_config else {
-            return Ok::<(), CliError>(());
-        };
-        tracing::info!("Applying cert-manager self-signed CA & keel-wildcard-tls Certificate");
-        let ca_yaml = format!(
-            "apiVersion: cert-manager.io/v1\n\
-             kind: ClusterIssuer\n\
-             metadata:\n\
-             \x20 name: keel-selfsigned\n\
-             \x20 labels:\n\
-             \x20   app.kubernetes.io/managed-by: keel\n\
-             spec:\n\
-             \x20 selfSigned: {{}}\n\
-             ---\n\
-             apiVersion: cert-manager.io/v1\n\
-             kind: Certificate\n\
-             metadata:\n\
-             \x20 name: keel-ca\n\
-             \x20 namespace: {KEEL_SYSTEM_NAMESPACE}\n\
-             \x20 labels:\n\
-             \x20   app.kubernetes.io/managed-by: keel\n\
-             spec:\n\
-             \x20 isCA: true\n\
-             \x20 commonName: keel-local-ca\n\
-             \x20 secretName: keel-ca-secret\n\
-             \x20 privateKey:\n\
-             \x20   algorithm: ECDSA\n\
-             \x20   size: 256\n\
-             \x20 issuerRef:\n\
-             \x20   name: keel-selfsigned\n\
-             \x20   kind: ClusterIssuer\n\
-             \x20   group: cert-manager.io\n\
-             ---\n\
-             apiVersion: cert-manager.io/v1\n\
-             kind: ClusterIssuer\n\
-             metadata:\n\
-             \x20 name: keel-ca-issuer\n\
-             \x20 labels:\n\
-             \x20   app.kubernetes.io/managed-by: keel\n\
-             spec:\n\
-             \x20 ca:\n\
-             \x20   secretName: keel-ca-secret\n\
-             ---\n\
-             apiVersion: cert-manager.io/v1\n\
-             kind: Certificate\n\
-             metadata:\n\
-             \x20 name: keel-wildcard-tls\n\
-             \x20 namespace: {KEEL_SYSTEM_NAMESPACE}\n\
-             \x20 labels:\n\
-             \x20   app.kubernetes.io/managed-by: keel\n\
-             spec:\n\
-             \x20 secretName: keel-wildcard-tls\n\
-             \x20 dnsNames:\n\
-             \x20   - \"*.keel.local\"\n\
-             \x20   - idp.keel.local\n\
-             \x20   - forgejo.keel.local\n\
-             \x20   - keel.keel.local\n\
-             \x20 issuerRef:\n\
-             \x20   name: keel-ca-issuer\n\
-             \x20   kind: ClusterIssuer\n\
-             \x20   group: cert-manager.io\n"
-        );
-        run_kubectl_apply(ctx, kc, &ca_yaml).await?;
-
-        for _ in 0..30 {
-            if read_secret_key(
-                ctx,
-                kc,
-                KEEL_SYSTEM_NAMESPACE,
-                "keel-wildcard-tls",
-                "tls.crt",
-            )
-            .await
-            .is_some()
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_secs(2)).await;
-        }
-
-        tracing::info!("Applying Envoy GatewayClass & keel-ingress Gateway (HTTPS port 8888)");
-        let gateway_yaml = format!(
-            "apiVersion: gateway.networking.k8s.io/v1\n\
-             kind: GatewayClass\n\
-             metadata:\n\
-             \x20 name: keel-envoy\n\
-             \x20 labels:\n\
-             \x20   app.kubernetes.io/managed-by: keel\n\
-             spec:\n\
-             \x20 controllerName: gateway.envoyproxy.io/gatewayclass-controller\n\
-             ---\n\
-             apiVersion: gateway.networking.k8s.io/v1\n\
-             kind: Gateway\n\
-             metadata:\n\
-             \x20 name: keel-ingress\n\
-             \x20 namespace: {KEEL_SYSTEM_NAMESPACE}\n\
-             \x20 labels:\n\
-             \x20   app.kubernetes.io/managed-by: keel\n\
-             spec:\n\
-             \x20 gatewayClassName: keel-envoy\n\
-             \x20 listeners:\n\
-             \x20   - name: http\n\
-             \x20     protocol: HTTP\n\
-             \x20     port: 80\n\
-             \x20     allowedRoutes:\n\
-             \x20       namespaces:\n\
-             \x20         from: All\n\
-             \x20   - name: https-local\n\
-             \x20     protocol: HTTPS\n\
-             \x20     port: 8888\n\
-             \x20     tls:\n\
-             \x20       mode: Terminate\n\
-             \x20       certificateRefs:\n\
-             \x20         - kind: Secret\n\
-             \x20           name: keel-wildcard-tls\n\
-             \x20     allowedRoutes:\n\
-             \x20       namespaces:\n\
-             \x20         from: All\n\
-             ---\n\
-             apiVersion: gateway.networking.k8s.io/v1\n\
-             kind: HTTPRoute\n\
-             metadata:\n\
-             \x20 name: rauthy-ingress\n\
-             \x20 namespace: {KEEL_SYSTEM_NAMESPACE}\n\
-             \x20 labels:\n\
-             \x20   app.kubernetes.io/managed-by: keel\n\
-             spec:\n\
-             \x20 parentRefs:\n\
-             \x20   - name: keel-ingress\n\
-             \x20     namespace: {KEEL_SYSTEM_NAMESPACE}\n\
-             \x20     sectionName: https-local\n\
-             \x20 hostnames:\n\
-             \x20   - idp.keel.local\n\
-             \x20 rules:\n\
-             \x20   - matches:\n\
-             \x20       - path:\n\
-             \x20           type: PathPrefix\n\
-             \x20           value: /\n\
-             \x20     backendRefs:\n\
-             \x20       - name: rauthy\n\
-             \x20         port: 8080\n"
-        );
-        run_kubectl_apply(ctx, kc, &gateway_yaml).await?;
-
-        let groups_b64 = STANDARD.encode(rauthy_cfg.groups_json.as_bytes());
-        let users_b64 = STANDARD.encode(rauthy_cfg.users_json.as_bytes());
-        let clients_b64 = STANDARD.encode(rauthy_cfg.clients_json.as_bytes());
-
-        tracing::info!(
-            "Installing Stage 0 Rauthy OIDC provider via Pulumi (`control-plane-rauthy`)"
-        );
-        run_pulumi_control_plane_stack(
-            "control-plane-rauthy",
-            CONTROL_PLANE_RAUTHY_PULUMI_YAML,
-            &connection.cluster_name,
-            &[
-                ("kubeconfig", &connection.kubeconfig_yaml, true),
-                ("kubeContext", kube_context, false),
-                ("rauthyConfigToml", &rauthy_cfg.config_toml, true),
-                ("rauthyGroupsB64", &groups_b64, false),
-                ("rauthyUsersB64", &users_b64, true),
-                ("rauthyClientsB64", &clients_b64, false),
-                ("rauthySecretName", &rauthy_cfg.secret_name, false),
-                ("rauthySecretNamespace", &rauthy_cfg.secret_namespace, false),
-            ],
-        )
-        .await
-    };
-
-    let forgejo_fut = async {
-        if !with_forge {
-            return Ok::<(), CliError>(());
-        }
-        tracing::info!(
-            "Installing in-cluster Forgejo Git forge via Pulumi (`control-plane-forgejo`)"
-        );
-        run_pulumi_control_plane_stack(
-            "control-plane-forgejo",
-            CONTROL_PLANE_FORGEJO_PULUMI_YAML,
-            &connection.cluster_name,
-            &[
-                ("kubeconfig", &connection.kubeconfig_yaml, true),
-                ("kubeContext", kube_context, false),
-            ],
-        )
-        .await
-    };
-
-    tokio::try_join!(infra_setup_fut, rauthy_fut, forgejo_fut)?;
-
-    if with_forge && artifacts.rauthy_config.is_some() {
-        let forgejo_route_yaml = format!(
-            "apiVersion: gateway.networking.k8s.io/v1\n\
-             kind: HTTPRoute\n\
-             metadata:\n\
-             \x20 name: forgejo-ingress\n\
-             \x20 namespace: {KEEL_SYSTEM_NAMESPACE}\n\
-             \x20 labels:\n\
-             \x20   app.kubernetes.io/managed-by: keel\n\
-             spec:\n\
-             \x20 parentRefs:\n\
-             \x20   - name: keel-ingress\n\
-             \x20     namespace: {KEEL_SYSTEM_NAMESPACE}\n\
-             \x20     sectionName: https-local\n\
-             \x20 hostnames:\n\
-             \x20   - forgejo.keel.local\n\
-             \x20 rules:\n\
-             \x20   - matches:\n\
-             \x20       - path:\n\
-             \x20           type: PathPrefix\n\
-             \x20           value: /\n\
-             \x20     backendRefs:\n\
-             \x20       - name: forgejo-http\n\
-             \x20         port: 3000\n"
-        );
-        run_kubectl_apply(ctx, kc, &forgejo_route_yaml).await?;
-        configure_coredns_local_rewrites(ctx, kc).await;
-    }
-
-    let mgmt_sa_name = artifacts
-        .management_stack
-        .spec
-        .service_account_name
-        .as_deref()
-        .unwrap_or("keel-management-pko");
-    let mgmt_rbac_yaml = format!(
-        "apiVersion: v1\n\
-         kind: ServiceAccount\n\
-         metadata:\n\
-         \x20 name: {mgmt_sa_name}\n\
-         \x20 namespace: {FLUX_SYSTEM_NAMESPACE}\n\
-         ---\n\
-         apiVersion: rbac.authorization.k8s.io/v1\n\
-         kind: ClusterRoleBinding\n\
-         metadata:\n\
-         \x20 name: {mgmt_sa_name}\n\
-         roleRef:\n\
-         \x20 apiGroup: rbac.authorization.k8s.io\n\
-         \x20 kind: ClusterRole\n\
-         \x20 name: cluster-admin\n\
-         subjects:\n\
-         - kind: ServiceAccount\n\
-         \x20 name: {mgmt_sa_name}\n\
-         \x20 namespace: {FLUX_SYSTEM_NAMESPACE}\n\
-         ---\n\
-         apiVersion: networking.k8s.io/v1\n\
-         kind: NetworkPolicy\n\
-         metadata:\n\
-         \x20 name: allow-pko-workspace\n\
-         \x20 namespace: {FLUX_SYSTEM_NAMESPACE}\n\
-         spec:\n\
-         \x20 podSelector:\n\
-         \x20   matchLabels:\n\
-         \x20     auto.pulumi.com/component: workspace\n\
-         \x20 policyTypes:\n\
-         \x20 - Ingress\n\
-         \x20 ingress:\n\
-         \x20 - from:\n\
-         \x20   - namespaceSelector:\n\
-         \x20       matchLabels:\n\
-         \x20         kubernetes.io/metadata.name: {KEEL_SYSTEM_NAMESPACE}\n\
-         \x20   ports:\n\
-         \x20   - protocol: TCP\n\
-         \x20     port: 50051\n\
-         ---\n\
-         apiVersion: networking.k8s.io/v1\n\
-         kind: NetworkPolicy\n\
-         metadata:\n\
-         \x20 name: allow-source-controller-artifacts\n\
-         \x20 namespace: {FLUX_SYSTEM_NAMESPACE}\n\
-         spec:\n\
-         \x20 podSelector:\n\
-         \x20   matchLabels:\n\
-         \x20     app: source-controller\n\
-         \x20 policyTypes:\n\
-         \x20 - Ingress\n\
-         \x20 ingress:\n\
-         \x20 - from:\n\
-         \x20   - namespaceSelector: {{}}\n\
-         \x20   ports:\n\
-         \x20   - protocol: TCP\n\
-         \x20     port: 9090\n"
-    );
-    run_kubectl_apply(ctx, kc, &mgmt_rbac_yaml).await?;
-
-    let mgmt_yaml = artifacts.management_stack.to_yaml()?;
-    run_kubectl_apply(ctx, kc, &mgmt_yaml).await?;
-
-    let repo_url = &artifacts.flux_git_repository.spec.url;
-    if repo_url.starts_with("http://")
-        || repo_url.starts_with("https://")
-        || repo_url.starts_with("ssh://")
-        || repo_url.starts_with("git://")
-    {
-        if let Some(token) = git_token.map(str::trim).filter(|t| !t.is_empty()) {
-            apply_git_credentials_secret(ctx, kc, "git", token).await?;
-        }
-        let git_repo_yaml = artifacts.flux_git_repository.to_yaml()?;
-        run_kubectl_apply(ctx, kc, &git_repo_yaml).await?;
-
-        let tenants_ks_yaml = format!(
-            "apiVersion: kustomize.toolkit.fluxcd.io/v1\n\
-             kind: Kustomization\n\
-             metadata:\n\
-             \x20 name: keel-tenants\n\
-             \x20 namespace: {FLUX_SYSTEM_NAMESPACE}\n\
-             spec:\n\
-             \x20 interval: 1m\n\
-             \x20 path: ./tenants\n\
-             \x20 prune: true\n\
-             \x20 sourceRef:\n\
-             \x20   kind: GitRepository\n\
-             \x20   name: {FLUX_SYSTEM_NAMESPACE}\n\
-             \x20 decryption:\n\
-             \x20   provider: sops\n\
-             \x20   secretRef:\n\
-             \x20     name: sops-age\n"
-        );
-        run_kubectl_apply(ctx, kc, &tenants_ks_yaml).await?;
-    } else {
-        tracing::info!(
-            url = %repo_url,
-            "Skipping in-cluster Flux GitRepository apply for local filesystem path; configure a reachable HTTP/SSH Git remote for cluster pull-polling"
-        );
-    }
-
-    Ok(())
 }
 
 #[cfg(debug_assertions)]
@@ -2497,6 +1200,10 @@ pub async fn execute_bootstrap_init_with_target(
 ) -> Result<BootstrapInitOutcome, CliError> {
     let cfg = args.to_bootstrap_config();
     cfg.validate()?;
+    let ingress = match args.oidc_public_url.as_deref() {
+        Some(url) => Stage0Ingress::from_public_url(url)?,
+        None => Stage0Ingress::default(),
+    };
 
     tracing::info!(
         target = %cfg.target,
@@ -2505,6 +1212,26 @@ pub async fn execute_bootstrap_init_with_target(
         skip_core_install = args.skip_core_install,
         "Executing Stage 0 bootstrap initialization"
     );
+
+    // Sample before any Stage 0 Pulumi run so a passphrase generated during this invocation
+    // (by the target driver or the control-plane stacks) triggers the one-time escrow notice.
+    let passphrase_preexisted = std::env::var_os("PULUMI_CONFIG_PASSPHRASE").is_some()
+        || stage0_cluster_dir_in(&stage0_state_root(), &cfg.cluster_name)
+            .join(STAGE0_PASSPHRASE_FILE)
+            .is_file();
+    if !args.skip_core_install && cfg.target == keel_core::BootstrapTargetKind::Kind {
+        keel_core::clear_stale_kind_stage0_state_in(&stage0_state_root(), &cfg.cluster_name).await;
+    }
+    let stage0 = if !args.skip_core_install {
+        // Migrates legacy `$TMP` state and resolves/generates the passphrase before the target
+        // driver runs Pulumi, so both use the same durable state root and passphrase.
+        Some(state::Stage0Context::prepare(
+            &cfg.cluster_name,
+            passphrase_preexisted,
+        )?)
+    } else {
+        None
+    };
 
     let connection = target.provision_cluster(&cfg).await?;
 
@@ -2524,7 +1251,9 @@ pub async fn execute_bootstrap_init_with_target(
             .transpose()?
             .map(|p| p.to_string_lossy().into_owned())
     };
-    let mut artifacts = synthesize_seed_control_plane(&cfg, repo_url_override.as_deref()).await?;
+    let mut artifacts =
+        synthesize_seed_control_plane_with_ingress(&cfg, repo_url_override.as_deref(), ingress)
+            .await?;
 
     if let Some(git_url) = args.git_url.as_deref() {
         let (kind, api_url) = infer_forge_config(
@@ -2548,19 +1277,32 @@ pub async fn execute_bootstrap_init_with_target(
         });
     }
 
+    let mut notes: Vec<String> = Vec::new();
+    let kube_target = KubeTarget::new(
+        connection.context.as_deref(),
+        connection.kubeconfig_path.as_deref(),
+    );
     if !args.skip_core_install {
-        install_stage0_core_addons(
-            &connection,
-            &artifacts,
-            cfg.with_forge,
-            args.git_token.as_deref(),
-        )
-        .await?;
+        let stage0 = stage0
+            .as_ref()
+            .expect("Stage 0 context is prepared when core install runs");
+        notes.extend(
+            addons::install_stage0_core_addons(
+                &connection,
+                &artifacts,
+                stage0,
+                cfg.with_forge,
+                args.git_token.as_deref(),
+            )
+            .await?,
+        );
     }
 
     let mut _forgejo_pf: Option<TempPortForward> = None;
     let mut push_url_override: Option<String> = None;
     let mut push_creds: Option<GitCredentials> = None;
+    // (repo URL, API base, token) for the post-push Forgejo API access check.
+    let mut forgejo_access_check: Option<(String, String, zeroize::Zeroizing<String>)> = None;
 
     if cfg.with_forge && !args.skip_core_install {
         tracing::info!("Provisioning `keel/infra-gitops` repository and API token in Forgejo");
@@ -2573,20 +1315,25 @@ pub async fn execute_bootstrap_init_with_target(
             .rauthy_config
             .as_ref()
             .and_then(|r| r.forgejo_oidc_secret.as_deref());
-        let token = provision_in_cluster_forgejo(
-            connection.context.as_deref(),
-            connection.kubeconfig_path.as_deref(),
+        let token = forge::provision_in_cluster_forgejo(
+            kube_target,
             pf.local_port,
             forgejo_oidc_secret,
+            &artifacts.ingress.discovery_url(),
         )
         .await?;
         push_url_override = Some(format!(
             "http://127.0.0.1:{}/keel/infra-gitops.git",
             pf.local_port
         ));
+        forgejo_access_check = Some((
+            format!("http://127.0.0.1:{}/keel/infra-gitops.git", pf.local_port),
+            format!("http://127.0.0.1:{}", pf.local_port),
+            token.clone(),
+        ));
         push_creds = Some(GitCredentials::HttpsBasic {
-            username: "keel".to_string(),
-            password_or_token: token,
+            username: forge::FORGEJO_ADMIN_USERNAME.to_string(),
+            password_or_token: token.as_str().to_string(),
         });
         _forgejo_pf = Some(pf);
     } else if args.git_url.is_some()
@@ -2596,13 +1343,21 @@ pub async fn execute_bootstrap_init_with_target(
             .map(str::trim)
             .filter(|t| !t.is_empty())
     {
-        ensure_external_repo_exists(
+        if let Err(err) = forge::ensure_external_repo_exists(
             artifacts.keel_config.forge.provider,
             &artifacts.keel_config.forge.repo_url,
             artifacts.keel_config.forge.api_url.as_deref(),
             token,
         )
-        .await;
+        .await
+        {
+            let msg = format!(
+                "could not verify/create remote repository {}: {err}. The seed commit will still be attempted; create the repository manually if the push fails",
+                artifacts.keel_config.forge.repo_url
+            );
+            tracing::warn!("{msg}");
+            notes.push(msg);
+        }
         push_creds = Some(GitCredentials::HttpsBasic {
             username: "git".to_string(),
             password_or_token: token.to_string(),
@@ -2623,12 +1378,65 @@ pub async fn execute_bootstrap_init_with_target(
         None
     };
 
-    let output = format_bootstrap_init_summary(&connection, &artifacts, seed_repo.as_ref());
+    // Verify the `keel serve` token against the real ForgeProvider now that the repository
+    // has content (the port-forward is still alive via `_forgejo_pf`).
+    if let Some((repo_url, api_base, token)) = forgejo_access_check.take()
+        && seed_repo.is_some()
+        && !forge::verify_forge_access(ForgeKind::Forgejo, &repo_url, Some(&api_base), &token).await
+    {
+        notes.push(
+            "Forgejo API access check failed after the seed push; `keel serve` may be unable to open PRs until the token in keel-system/forge-token is fixed".to_string(),
+        );
+    }
+
+    // Escrow Stage 0 state to the in-cluster versioned S3 bucket (break-glass, NFR-REL-01).
+    let mut stage0_backend_url = None;
+    if !args.skip_core_install
+        && let Some(stage0) = stage0.as_ref()
+    {
+        match state::sync_stage0_state_to_s3(kube_target, stage0).await {
+            Ok(report) => {
+                notes.push(format!(
+                    "Stage 0 state escrowed to {} ({} stacks; bucket versioning: {}{})",
+                    report.backend_url.split('?').next().unwrap_or_default(),
+                    report.stacks.len(),
+                    if report.versioning_enabled {
+                        "enabled"
+                    } else {
+                        "unavailable"
+                    },
+                    if report.snapshots.is_empty() {
+                        String::new()
+                    } else {
+                        format!("; snapshots: {}", report.snapshots.len())
+                    }
+                ));
+                stage0_backend_url = Some(report.backend_url);
+            }
+            Err(err) => {
+                let msg = format!(
+                    "Stage 0 state was NOT escrowed to S3 ({err}); the local copy remains in {}. Re-run `keel bootstrap init` to retry",
+                    stage0.backend_dir.display()
+                );
+                tracing::warn!("{msg}");
+                notes.push(msg);
+            }
+        }
+        if let Some(notice) = stage0.escrow_notice() {
+            notes.push(notice);
+        }
+    }
+
+    let mut output = format_bootstrap_init_summary(&connection, &artifacts, seed_repo.as_ref());
+    for note in &notes {
+        output.push_str(&format!("\nNote: {note}\n"));
+    }
 
     Ok(BootstrapInitOutcome {
         connection,
         artifacts,
         seed_repo,
+        stage0_backend_url,
         output,
     })
 }
@@ -2681,13 +1489,14 @@ fn format_bootstrap_init_summary(
             repo.initial_commit_sha
         ));
     }
+    let ingress = &artifacts.ingress;
     if let Some(ref rauthy) = artifacts.rauthy_config {
         out.push_str(&format!(
             "OIDC Provider:   Rauthy ({}/{})\n",
             KEEL_SYSTEM_NAMESPACE, RAUTHY_CONFIG_SECRET_NAME
         ));
-        out.push_str("OIDC Issuer:     https://idp.keel.local:8888/auth/v1\n");
-        out.push_str("IdP Admin UI:    https://idp.keel.local:8888/auth/v1/admin\n");
+        out.push_str(&format!("OIDC Issuer:     {}\n", ingress.issuer()));
+        out.push_str(&format!("IdP Admin UI:    {}/admin\n", ingress.issuer()));
         out.push_str(&format!("Admin Username:  {}\n", artifacts.admin_username));
         if artifacts.admin_password_generated {
             out.push_str(&format!("Admin Password:  {}\n", artifacts.admin_password));
@@ -2695,16 +1504,280 @@ fn format_bootstrap_init_summary(
             out.push_str("Admin Password:  [PROVIDED VIA CLI]\n");
         }
         if rauthy.forgejo_oidc_secret.is_some() {
-            out.push_str("Forgejo SSO URL: https://forgejo.keel.local:8888 (OAuth: rauthy)\n");
-            out.push_str(
-                "Local /etc/hosts: ensure `127.0.0.1 idp.keel.local forgejo.keel.local` is configured\n",
-            );
+            out.push_str(&format!(
+                "Forgejo SSO URL: {} (OAuth: rauthy)\n",
+                ingress.forgejo_origin()
+            ));
+            out.push_str(&format!(
+                "Local DNS:       ensure `{}` and `{}` resolve to the ingress (e.g. /etc/hosts 127.0.0.1)\n",
+                ingress.idp_host, ingress.forgejo_host
+            ));
         } else {
-            out.push_str("Local /etc/hosts: ensure `127.0.0.1 idp.keel.local` is configured\n");
+            out.push_str(&format!(
+                "Local DNS:       ensure `{}` resolves to the ingress (e.g. /etc/hosts 127.0.0.1)\n",
+                ingress.idp_host
+            ));
         }
     } else if let Some(ref oidc) = artifacts.keel_config.oidc {
         out.push_str(&format!("OIDC Issuer:     {}\n", oidc.issuer_url));
     }
     out.push_str("Portal URL:      http://127.0.0.1:8080\n");
     out
+}
+
+#[cfg(test)]
+mod security_hardening_tests {
+    use super::*;
+
+    use serde_json::Value;
+    use state::{CONTROL_PLANE_FORGEJO_PULUMI_YAML, CONTROL_PLANE_PULUMI_YAML};
+
+    #[test]
+    fn forgejo_program_has_no_hardcoded_admin_password() {
+        assert!(!CONTROL_PLANE_FORGEJO_PULUMI_YAML.contains("keel-admin-dev"));
+        let doc: Value = serde_yml::from_str(CONTROL_PLANE_FORGEJO_PULUMI_YAML).unwrap();
+        let admin = &doc["resources"]["forgejo"]["properties"]["values"]["gitea"]["admin"];
+        // The chart reads credentials from the Keel-managed Secret; no password in values.
+        assert_eq!(admin["existingSecret"], forge::FORGEJO_ADMIN_SECRET_NAME);
+        assert!(admin.get("password").is_none());
+        // Must not collide with the chart-owned `<release>-admin` Secret (Helm ownership check).
+        assert_ne!(forge::FORGEJO_ADMIN_SECRET_NAME, "forgejo-admin");
+    }
+
+    #[test]
+    fn control_plane_program_enables_flux_multitenancy_and_protects_core() {
+        let doc: Value = serde_yml::from_str(CONTROL_PLANE_PULUMI_YAML).unwrap();
+        let res = &doc["resources"];
+        let flux = &res["flux2"]["properties"];
+        assert!(flux["version"].as_str().is_some_and(|v| !v.is_empty()));
+        assert_eq!(flux["values"]["multitenancy"]["enabled"], true);
+        assert_eq!(
+            flux["values"]["multitenancy"]["defaultServiceAccount"],
+            "default"
+        );
+        for name in [
+            "fluxSystemNamespace",
+            "keelSystemNamespace",
+            "sopsAgeSecret",
+            "flux2",
+            "kyverno",
+            "pulumiKubernetesOperator",
+            "s3StateBackend",
+        ] {
+            assert_eq!(
+                res[name]["options"]["protect"], true,
+                "{name} must be protected"
+            );
+        }
+    }
+
+    #[test]
+    fn seed_policies_no_longer_clone_admin_credentials_into_tenants() {
+        let bundle = KyvernoPolicyGenerator::with_default_providers(false)
+            .generate()
+            .unwrap()
+            .to_multi_doc_yaml()
+            .unwrap();
+        assert!(!bundle.contains("GeneratingPolicy"));
+        assert!(!bundle.contains("keel-s3-credentials"));
+        assert!(bundle.contains("restrict-tenant-reconciler"));
+    }
+
+    #[test]
+    fn flux_helmreleases_adopt_stage0_releases_in_place() {
+        let program: Value = serde_yml::from_str(CONTROL_PLANE_PULUMI_YAML).unwrap();
+        for (resource, file) in [
+            ("kyverno", SEED_CORE_ADDON_KYVERNO_YAML),
+            ("pulumiKubernetesOperator", SEED_CORE_ADDON_PKO_YAML),
+            ("s3StateBackend", SEED_CORE_ADDON_S3_SEAWEEDFS_YAML),
+            ("envoyGateway", SEED_CORE_ADDON_ENVOY_GATEWAY_YAML),
+            ("prometheus", SEED_CORE_ADDON_PROMETHEUS_YAML),
+            ("flagger", SEED_CORE_ADDON_FLAGGER_YAML),
+            ("certManager", SEED_CORE_ADDON_CERT_MANAGER_YAML),
+        ] {
+            let p = &program["resources"][resource]["properties"];
+            let hr = file
+                .split("\n---\n")
+                .map(|d| serde_yml::from_str::<Value>(d).unwrap())
+                .find(|d| d["kind"] == "HelmRelease")
+                .unwrap_or_else(|| panic!("{resource}: no HelmRelease"));
+            assert_eq!(
+                hr["spec"]["releaseName"], p["name"],
+                "{resource} release name"
+            );
+            assert_eq!(
+                hr["metadata"]["namespace"], p["namespace"],
+                "{resource} namespace"
+            );
+            assert_eq!(
+                hr["spec"]["storageNamespace"], p["namespace"],
+                "{resource} storage ns"
+            );
+            assert!(hr["spec"].get("targetNamespace").is_none(), "{resource}");
+            let pinned = p["version"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{resource} unpinned"));
+            assert_eq!(
+                hr["spec"]["chart"]["spec"]["version"].as_str().unwrap(),
+                pinned,
+                "{resource} version drift between Stage 0 and Flux"
+            );
+        }
+        assert_eq!(
+            program["resources"]["kyverno"]["properties"]["namespace"],
+            "keel-system"
+        );
+        assert_eq!(
+            program["resources"]["kyverno"]["properties"]["version"],
+            "3.10.0"
+        );
+
+        let off: Value = serde_yml::from_str(&render_seed_kyverno_helmrelease(false)).unwrap();
+        assert_eq!(
+            off["spec"]["values"]["features"]["policyExceptions"]["enabled"],
+            false
+        );
+        let on: Value = serde_yml::from_str(&render_seed_kyverno_helmrelease(true)).unwrap();
+        assert_eq!(
+            on["spec"]["values"]["features"]["policyExceptions"]["enabled"],
+            true
+        );
+
+        // Deprecated `kyverno.io` policy CRDs are not installed (Keel uses only the CEL
+        // `policies.kyverno.io` kinds), identically in Stage 0 and the Flux handover release.
+        let stage0_crds = &program["resources"]["kyverno"]["properties"]["values"]["crds"];
+        assert_eq!(stage0_crds, &on["spec"]["values"]["crds"]);
+        for kind in [
+            "clusterpolicies",
+            "policies",
+            "policyexceptions",
+            "cleanuppolicies",
+            "clustercleanuppolicies",
+        ] {
+            assert_eq!(stage0_crds["groups"]["kyverno"][kind], false, "{kind}");
+        }
+    }
+
+    #[test]
+    fn core_catalog_versions_match_seed_core_addons() {
+        fn catalog_version(raw: &str) -> String {
+            let doc: Value = serde_yml::from_str(raw).unwrap();
+            doc["spec"]["upstream"]["version"]
+                .as_str()
+                .expect("catalog upstream version")
+                .to_string()
+        }
+        let seed_version = |file: &str| -> String {
+            file.split("\n---\n")
+                .map(|d| serde_yml::from_str::<Value>(d).unwrap())
+                .find(|d| d["kind"] == "HelmRelease")
+                .and_then(|hr| {
+                    hr["spec"]["chart"]["spec"]["version"]
+                        .as_str()
+                        .map(String::from)
+                })
+                .expect("seed HelmRelease version")
+        };
+        for (id, catalog, seed) in [
+            (
+                "kyverno",
+                include_str!("../../../../deploy/catalog/core/kyverno/catalog.yaml"),
+                SEED_CORE_ADDON_KYVERNO_YAML,
+            ),
+            (
+                "pulumi-kubernetes-operator",
+                include_str!(
+                    "../../../../deploy/catalog/core/pulumi-kubernetes-operator/catalog.yaml"
+                ),
+                SEED_CORE_ADDON_PKO_YAML,
+            ),
+            (
+                "s3-state-backend",
+                include_str!("../../../../deploy/catalog/core/s3-state-backend/catalog.yaml"),
+                SEED_CORE_ADDON_S3_SEAWEEDFS_YAML,
+            ),
+            (
+                "envoy-gateway",
+                include_str!("../../../../deploy/catalog/core/envoy-gateway/catalog.yaml"),
+                SEED_CORE_ADDON_ENVOY_GATEWAY_YAML,
+            ),
+            (
+                "prometheus",
+                include_str!("../../../../deploy/catalog/core/prometheus/catalog.yaml"),
+                SEED_CORE_ADDON_PROMETHEUS_YAML,
+            ),
+            (
+                "flagger",
+                include_str!("../../../../deploy/catalog/core/flagger/catalog.yaml"),
+                SEED_CORE_ADDON_FLAGGER_YAML,
+            ),
+            (
+                "cert-manager",
+                include_str!("../../../../deploy/catalog/core/cert-manager/catalog.yaml"),
+                SEED_CORE_ADDON_CERT_MANAGER_YAML,
+            ),
+        ] {
+            assert_eq!(
+                catalog_version(catalog),
+                seed_version(seed),
+                "{id}: deploy/catalog/core version drifts from deploy/seed/core-addons"
+            );
+        }
+        // Rauthy is a plain Kustomize addon: the catalog version tracks the pinned image tag.
+        let rauthy = catalog_version(include_str!(
+            "../../../../deploy/catalog/core/rauthy/catalog.yaml"
+        ));
+        assert!(
+            SEED_CORE_ADDON_RAUTHY_YAML.contains(&format!("ghcr.io/sebadob/rauthy:{rauthy}")),
+            "rauthy catalog version {rauthy} drifts from the seed image tag"
+        );
+    }
+
+    #[test]
+    fn oidc_public_url_derives_issuer_and_hosts() {
+        let d = Stage0Ingress::default();
+        assert_eq!(d.issuer(), "https://idp.keel.local:8888/auth/v1");
+        assert_eq!(d.forgejo_origin(), "https://forgejo.keel.local:8888");
+        let c = Stage0Ingress::from_public_url("https://IdP.Example.com/").unwrap();
+        assert_eq!(c.issuer(), "https://idp.example.com/auth/v1");
+        assert_eq!(c.forgejo_host, "forgejo.example.com");
+        assert_eq!(c.keel_origin(), "https://keel.example.com");
+        for bad in [
+            "http://idp.example.com",
+            "https://idp.example.com/path",
+            "https://localhost",
+            "https://idp.example.com?x=1",
+            "not a url",
+        ] {
+            assert!(Stage0Ingress::from_public_url(bad).is_err(), "{bad}");
+        }
+        assert!(render_manifest("a: ${X}", &[("X", "ok; rm -rf")]).is_err());
+        assert!(render_manifest("a: ${Y}", &[("X", "ok")]).is_err());
+    }
+
+    #[tokio::test]
+    async fn rauthy_config_uses_public_url() {
+        let cfg = BootstrapConfig {
+            with_forge: true,
+            ..BootstrapConfig::new(keel_core::BootstrapTargetKind::Kubeconfig)
+        };
+        let ingress = Stage0Ingress::from_public_url("https://idp.corp.example:9443").unwrap();
+        let a = synthesize_seed_control_plane_with_ingress(&cfg, None, ingress)
+            .await
+            .unwrap();
+        let r = a.rauthy_config.unwrap();
+        assert!(r.config_toml.contains("pub_url = 'idp.corp.example:9443'"));
+        assert!(
+            r.config_toml
+                .contains("rp_origin = 'https://idp.corp.example:9443'")
+        );
+        assert!(
+            r.clients_json
+                .contains("https://forgejo.corp.example:9443/user/oauth2/rauthy/callback")
+        );
+        assert_eq!(
+            a.keel_config.oidc.unwrap().issuer_url,
+            "https://idp.corp.example:9443/auth/v1"
+        );
+    }
 }

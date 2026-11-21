@@ -5,7 +5,6 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use keel_core::{BootstrapConfig, BootstrapDistro, BootstrapTargetKind, DEFAULT_CLUSTER_NAME};
-use keel_pko::MANAGEMENT_CORE_STACK_NAME;
 use serde::{Deserialize, Serialize};
 
 /// Default local address bound by `keel serve`.
@@ -22,13 +21,39 @@ pub const DEFAULT_S3_BUCKET: &str = "pulumi-state";
 #[command(
     name = "keel",
     version,
-    propagate_version = true,
     about = "Keel — GitOps-Driven, Self-Bootstrapping Control Plane CLI"
 )]
 pub struct Cli {
+    /// Keel server base URL for API commands (overrides per-command defaults)
+    #[arg(
+        long = "server",
+        global = true,
+        env = "KEEL_SERVER",
+        value_name = "URL"
+    )]
+    pub server: Option<String>,
+
+    /// Verbose errors: print the full error cause chain (repeat for more detail)
+    #[arg(short, long, global = true, action = clap::ArgAction::Count)]
+    pub verbose: u8,
+
     #[command(subcommand)]
     pub command: Commands,
 }
+
+impl Cli {
+    /// Server URL from `--server` / `KEEL_SERVER`, or [`DEFAULT_SERVER_URL`].
+    pub fn server_url(&self) -> String {
+        self.server
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| DEFAULT_SERVER_URL.to_string())
+    }
+}
+
+/// Help text shared by every `--tenant` flag.
+pub const TENANT_HELP: &str =
+    "Tenant ID as a bare id (e.g. `default`); a `tenant-` prefix is stripped";
 
 /// Top-level subcommand groups for `keel`.
 #[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
@@ -36,16 +61,22 @@ pub struct Cli {
 pub enum Commands {
     /// Stage 0 seed cluster bootstrap and break-glass S3 recovery
     Bootstrap(BootstrapArgs),
-    /// Authenticate the CLI against keel-server (Stage 0 token or OIDC PKCE)
+    /// Log in / out of keel-server (browser OIDC + PKCE loopback) and show session status
     Auth(AuthArgs),
     /// Start the stateless Axum API/SSE server and embedded React SPA
     Serve(ServeArgs),
     /// List and provision multi-provider Pulumi Kubernetes Operator (PKO v2) stacks
     Infra(InfraArgs),
-    /// Install upstream Helm/Kustomize catalog applications via Pull Requests
+    /// Install catalog applications via Pull Requests and list deployed releases
     App(AppArgs),
     /// Inspect ephemeral PKO v2 PR preview diffs and status
     Preview(PreviewArgs),
+    /// List, inspect, merge, or close change proposals (pull requests)
+    Proposal(ProposalArgs),
+    /// Browse the application / infrastructure catalog
+    Catalog(CatalogArgs),
+    /// Tenant maintenance (state migration)
+    Tenant(TenantArgs),
 }
 
 /// `keel bootstrap` subcommands.
@@ -61,7 +92,7 @@ pub struct BootstrapArgs {
 pub enum BootstrapCommands {
     /// Execute Stage 0 seed cluster bootstrap across local kind, kubeconfig, Proxmox, or cloud targets
     Init(BootstrapInitArgs),
-    /// Break-glass recovery pulling versioned Pulumi state from S3 to repair an unreachable control plane
+    /// Break-glass: re-apply escrowed Stage 0 Pulumi state from S3 (refresh + up) to repair the control plane
     Recover(BootstrapRecoverArgs),
 }
 
@@ -111,6 +142,11 @@ pub struct BootstrapInitArgs {
     /// OIDC client ID (defaults to `keel-server`)
     #[arg(long)]
     pub oidc_client_id: Option<String>,
+
+    /// Public HTTPS URL of the in-cluster Rauthy IdP; the issuer becomes `<url>/auth/v1` and the
+    /// Forgejo/portal hosts are derived from its parent domain (default `https://idp.keel.local:8888`)
+    #[arg(long, value_name = "URL")]
+    pub oidc_public_url: Option<String>,
 
     /// Initial admin username/email for Stage 0 Rauthy seeding (defaults to `admin@keel.local`)
     #[arg(long)]
@@ -177,19 +213,65 @@ impl BootstrapInitArgs {
 }
 
 /// Arguments for `keel bootstrap recover` (`SDD.md` §2.2, §7.2, `NFR-REL-01`).
+///
+/// Prerequisites: `pulumi` on PATH; S3 credentials in `AWS_ACCESS_KEY_ID` /
+/// `AWS_SECRET_ACCESS_KEY`; the Stage 0 passphrase in `PULUMI_CONFIG_PASSPHRASE`,
+/// `--passphrase-file`, or the local `~/.config/keel/stage0/<cluster>/pulumi-passphrase`.
 #[derive(Args, Debug, Clone, PartialEq, Eq)]
 pub struct BootstrapRecoverArgs {
-    /// S3-compatible state backend endpoint URL
-    #[arg(long)]
+    /// S3-compatible endpoint holding the escrowed state (e.g. `http://127.0.0.1:8333` via
+    /// `kubectl -n keel-system port-forward svc/s3-state-backend-seaweedfs-s3 8333:8333`)
+    #[arg(long, value_name = "URL")]
     pub s3_endpoint: String,
 
-    /// S3 bucket containing versioned Pulumi state snapshots
+    /// S3 bucket containing the versioned Pulumi state
     #[arg(long, default_value = DEFAULT_S3_BUCKET)]
     pub bucket: String,
 
-    /// Protected control-plane Pulumi stack name to recover
-    #[arg(long, default_value = MANAGEMENT_CORE_STACK_NAME)]
-    pub stack: String,
+    /// S3 region (must match the region used when the state was written)
+    #[arg(long, default_value = "us-east-1")]
+    pub region: String,
+
+    /// Seed management cluster name whose Stage 0 state (`stage0/<cluster>/`) is recovered
+    #[arg(long, default_value = DEFAULT_CLUSTER_NAME)]
+    pub cluster_name: String,
+
+    /// Stage 0 stack(s) to recover (repeatable; default: all stacks in the escrow manifest, or
+    /// `stage0-control-plane-<cluster>`)
+    #[arg(long = "stack", value_name = "STACK")]
+    pub stacks: Vec<String>,
+
+    /// Kubeconfig file for the (possibly new) cluster; overrides the escrowed `kubeconfig` config
+    #[arg(long)]
+    pub kubeconfig: Option<PathBuf>,
+
+    /// Kubeconfig context to target (overrides the escrowed `kubeContext` config)
+    #[arg(long)]
+    pub context: Option<String>,
+
+    /// File containing the Stage 0 Pulumi passphrase (instead of `PULUMI_CONFIG_PASSPHRASE`)
+    #[arg(long)]
+    pub passphrase_file: Option<PathBuf>,
+
+    /// Restore a specific S3 object version of the stack checkpoint before refresh/up
+    #[arg(long, conflicts_with = "snapshot")]
+    pub state_version: Option<String>,
+
+    /// Restore a timestamped snapshot (`stage0/<cluster>/snapshots/<stack>/<SNAPSHOT>.json`)
+    #[arg(long)]
+    pub snapshot: Option<String>,
+
+    /// List available state versions and snapshots, then exit
+    #[arg(long, default_value_t = false)]
+    pub list_versions: bool,
+
+    /// Skip `pulumi refresh` before `pulumi up`
+    #[arg(long, default_value_t = false)]
+    pub skip_refresh: bool,
+
+    /// Print the recovery plan without executing anything
+    #[arg(long, default_value_t = false)]
+    pub dry_run: bool,
 }
 
 /// `keel auth` subcommands.
@@ -202,15 +284,39 @@ pub struct AuthArgs {
 /// Subcommands under `keel auth`.
 #[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
 pub enum AuthCommands {
-    /// Authenticate the CLI against keel-server via OIDC Authorization Code + PKCE
+    /// Log in via the browser (OIDC + PKCE, RFC 8252 loopback redirect) and store a session token
     Login(AuthLoginArgs),
+    /// Show the stored session and the identity reported by the server
+    Status(AuthServerArgs),
+    /// Remove the stored session token for the server
+    Logout(AuthServerArgs),
 }
 
 /// Arguments for `keel auth login` (`SDD.md` §6.1, §7.2, `NFR-SEC-01`).
 #[derive(Args, Debug, Clone, PartialEq, Eq)]
 pub struct AuthLoginArgs {
-    /// Keel server base URL
-    #[arg(long, default_value = DEFAULT_SERVER_URL)]
+    /// Keel server base URL (set via global `--server` / `KEEL_SERVER`)
+    #[arg(skip = DEFAULT_SERVER_URL.to_string())]
+    pub server: String,
+
+    /// Do not try to open a browser; only print the login URL
+    #[arg(long, default_value_t = false)]
+    pub no_browser: bool,
+
+    /// Force the IdP to re-prompt for credentials
+    #[arg(long, default_value_t = false)]
+    pub force_prompt: bool,
+
+    /// Seconds to wait for the browser callback
+    #[arg(long, default_value_t = 300)]
+    pub timeout_secs: u64,
+}
+
+/// Arguments for `keel auth status|logout`.
+#[derive(Args, Debug, Clone, PartialEq, Eq)]
+pub struct AuthServerArgs {
+    /// Keel server base URL (set via global `--server` / `KEEL_SERVER`)
+    #[arg(skip = DEFAULT_SERVER_URL.to_string())]
     pub server: String,
 }
 
@@ -234,8 +340,17 @@ pub struct ServeArgs {
     pub config: Option<PathBuf>,
 
     /// Personal access token for remote Forge API access (GitHub/GitLab/Forgejo/Gitea; or set `KEEL_GIT_TOKEN`)
-    #[arg(long, env = "KEEL_GIT_TOKEN")]
+    #[arg(long, env = "KEEL_GIT_TOKEN", hide_env_values = true)]
     pub git_token: Option<String>,
+
+    /// Remote GitOps repository to bootstrap `--repo-dir` from (cloned when the directory is
+    /// missing/empty, otherwise fetched). Credentials come from `KEEL_GIT_TOKEN`, never the URL.
+    #[arg(long, env = "KEEL_GIT_URL")]
+    pub git_url: Option<String>,
+
+    /// HTTPS username paired with `KEEL_GIT_TOKEN` for `--git-url` (default: `keel`)
+    #[arg(long, env = "KEEL_GIT_USERNAME")]
+    pub git_username: Option<String>,
 }
 
 /// Supported CLI `--forge-type` values.
@@ -314,8 +429,8 @@ pub enum InfraCommands {
 /// Arguments for `keel infra list` (`SDD.md` §7.2).
 #[derive(Args, Debug, Clone, PartialEq, Eq)]
 pub struct InfraListArgs {
-    /// Filter stacks by tenant ID
-    #[arg(long)]
+    /// Filter stacks by tenant (bare id, e.g. `default`; a `tenant-` prefix is stripped)
+    #[arg(long, help = TENANT_HELP)]
     pub tenant: Option<String>,
 
     /// Filter stacks by provider ID (e.g. `proxmox`, `aws`, `gcp`, `azure`, `hetzner`)
@@ -326,8 +441,8 @@ pub struct InfraListArgs {
     #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
     pub output: OutputFormat,
 
-    /// Keel server base URL
-    #[arg(long, default_value = DEFAULT_SERVER_URL)]
+    /// Keel server base URL (set via global `--server` / `KEEL_SERVER`)
+    #[arg(skip = DEFAULT_SERVER_URL.to_string())]
     pub server: String,
 }
 
@@ -338,16 +453,16 @@ pub struct InfraProvisionArgs {
     #[arg(long)]
     pub blueprint: String,
 
-    /// Target tenant ID (`tenant-<id>`)
-    #[arg(long)]
+    /// Target tenant (bare id, e.g. `default`; a `tenant-` prefix is stripped)
+    #[arg(long, help = TENANT_HELP)]
     pub tenant: String,
 
     /// Path to YAML or JSON input values file
     #[arg(long)]
     pub values_file: PathBuf,
 
-    /// Keel server base URL
-    #[arg(long, default_value = DEFAULT_SERVER_URL)]
+    /// Keel server base URL (set via global `--server` / `KEEL_SERVER`)
+    #[arg(skip = DEFAULT_SERVER_URL.to_string())]
     pub server: String,
 }
 
@@ -357,8 +472,8 @@ pub struct InfraSshArgs {
     /// Infrastructure stack name
     pub stack_name: String,
 
-    /// Target tenant identifier
-    #[arg(long, default_value = "default")]
+    /// Target tenant (bare id, e.g. `default`; a `tenant-` prefix is stripped)
+    #[arg(long, default_value = "default", help = TENANT_HELP)]
     pub tenant: String,
 
     /// Override SSH username
@@ -377,12 +492,12 @@ pub struct InfraSshArgs {
     #[arg(long)]
     pub exec: bool,
 
-    /// Output format when printing (table, json, command)
-    #[arg(long, default_value = "table")]
+    /// Output format when printing (`table|json|command`)
+    #[arg(long, default_value = "table", value_parser = ["table", "json", "command"])]
     pub output: String,
 
-    /// Keel server URL
-    #[arg(long, default_value = DEFAULT_SERVER_URL)]
+    /// Keel server base URL (set via global `--server` / `KEEL_SERVER`)
+    #[arg(skip = DEFAULT_SERVER_URL.to_string())]
     pub server: String,
 }
 
@@ -404,8 +519,8 @@ pub struct InfraForceDeleteArgs {
     #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
     pub output: OutputFormat,
 
-    /// Keel server base URL
-    #[arg(long, default_value = DEFAULT_SERVER_URL)]
+    /// Keel server base URL (set via global `--server` / `KEEL_SERVER`)
+    #[arg(skip = DEFAULT_SERVER_URL.to_string())]
     pub server: String,
 }
 
@@ -427,8 +542,8 @@ pub struct InfraUnlockArgs {
     #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
     pub output: OutputFormat,
 
-    /// Keel server base URL
-    #[arg(long, default_value = DEFAULT_SERVER_URL)]
+    /// Keel server base URL (set via global `--server` / `KEEL_SERVER`)
+    #[arg(skip = DEFAULT_SERVER_URL.to_string())]
     pub server: String,
 }
 
@@ -444,6 +559,181 @@ pub struct AppArgs {
 pub enum AppCommands {
     /// Validate Helm/Kustomize values against catalog JSONSchema and open a deployment PR
     Install(AppInstallArgs),
+    /// List deployed application releases (Flux HelmReleases / Kustomizations)
+    List(AppListArgs),
+}
+
+/// Arguments for `keel app list`.
+#[derive(Args, Debug, Clone, PartialEq, Eq)]
+pub struct AppListArgs {
+    /// Filter by tenant (bare id, e.g. `default`; a `tenant-` prefix is stripped)
+    #[arg(long, help = TENANT_HELP)]
+    pub tenant: Option<String>,
+
+    /// Output format (`table|json`)
+    #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+    pub output: OutputFormat,
+
+    /// Keel server base URL (set via global `--server` / `KEEL_SERVER`)
+    #[arg(skip = DEFAULT_SERVER_URL.to_string())]
+    pub server: String,
+}
+
+/// `keel proposal` subcommands.
+#[derive(Args, Debug, Clone, PartialEq, Eq)]
+pub struct ProposalArgs {
+    #[command(subcommand)]
+    pub command: ProposalCommands,
+}
+
+/// Subcommands under `keel proposal`.
+#[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
+pub enum ProposalCommands {
+    /// List proposals (pull requests)
+    List(ProposalListArgs),
+    /// Show one proposal
+    Show(ProposalRefArgs),
+    /// Close (reject) an open proposal; ephemeral previews are garbage-collected
+    Close(ProposalRefArgs),
+    /// Merge an open proposal (pinned to the reviewed head SHA by the server)
+    Merge(ProposalRefArgs),
+}
+
+/// Proposal status filter for `keel proposal list`.
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ProposalStatusArg {
+    #[default]
+    Open,
+    Merged,
+    Closed,
+    All,
+}
+
+impl ProposalStatusArg {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Merged => "merged",
+            Self::Closed => "closed",
+            Self::All => "all",
+        }
+    }
+}
+
+/// Arguments for `keel proposal list`.
+#[derive(Args, Debug, Clone, PartialEq, Eq)]
+pub struct ProposalListArgs {
+    /// Filter by tenant (bare id, e.g. `default`; a `tenant-` prefix is stripped)
+    #[arg(long, help = TENANT_HELP)]
+    pub tenant: Option<String>,
+
+    /// Status filter
+    #[arg(long, value_enum, default_value_t = ProposalStatusArg::Open)]
+    pub status: ProposalStatusArg,
+
+    /// Output format (`table|json`)
+    #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+    pub output: OutputFormat,
+
+    /// Keel server base URL (set via global `--server` / `KEEL_SERVER`)
+    #[arg(skip = DEFAULT_SERVER_URL.to_string())]
+    pub server: String,
+}
+
+/// Arguments for `keel proposal show|close|merge`.
+#[derive(Args, Debug, Clone, PartialEq, Eq)]
+pub struct ProposalRefArgs {
+    /// Pull request / proposal id
+    pub pr: String,
+
+    /// Output format (`table|json`)
+    #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+    pub output: OutputFormat,
+
+    /// Keel server base URL (set via global `--server` / `KEEL_SERVER`)
+    #[arg(skip = DEFAULT_SERVER_URL.to_string())]
+    pub server: String,
+}
+
+/// `keel catalog` subcommands.
+#[derive(Args, Debug, Clone, PartialEq, Eq)]
+pub struct CatalogArgs {
+    #[command(subcommand)]
+    pub command: CatalogCommands,
+}
+
+/// Subcommands under `keel catalog`.
+#[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
+pub enum CatalogCommands {
+    /// List catalog applications, infrastructure blueprints, and bundles
+    List(CatalogListArgs),
+    /// Show one catalog entry (including its values JSONSchema)
+    Show(CatalogShowArgs),
+}
+
+/// Arguments for `keel catalog list`.
+#[derive(Args, Debug, Clone, PartialEq, Eq)]
+pub struct CatalogListArgs {
+    /// Tenant whose view of the catalog to show (bare id; a `tenant-` prefix is stripped)
+    #[arg(long, help = TENANT_HELP)]
+    pub tenant: Option<String>,
+
+    /// Output format (`table|json`)
+    #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+    pub output: OutputFormat,
+
+    /// Keel server base URL (set via global `--server` / `KEEL_SERVER`)
+    #[arg(skip = DEFAULT_SERVER_URL.to_string())]
+    pub server: String,
+}
+
+/// Arguments for `keel catalog show`.
+#[derive(Args, Debug, Clone, PartialEq, Eq)]
+pub struct CatalogShowArgs {
+    /// Catalog entry id (application, blueprint, or bundle)
+    pub id: String,
+
+    /// Output format (`table|json`)
+    #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+    pub output: OutputFormat,
+
+    /// Keel server base URL (set via global `--server` / `KEEL_SERVER`)
+    #[arg(skip = DEFAULT_SERVER_URL.to_string())]
+    pub server: String,
+}
+
+/// `keel tenant` subcommands.
+#[derive(Args, Debug, Clone, PartialEq, Eq)]
+pub struct TenantArgs {
+    #[command(subcommand)]
+    pub command: TenantCommands,
+}
+
+/// Subcommands under `keel tenant`.
+#[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
+pub enum TenantCommands {
+    /// Move a tenant's Pulumi stack state from the bucket root to `tenants/<id>/` (idempotent)
+    MigrateState(TenantMigrateStateArgs),
+}
+
+/// Arguments for `keel tenant migrate-state` (talks to the cluster via kubectl, not keel-server).
+#[derive(Args, Debug, Clone, PartialEq, Eq)]
+pub struct TenantMigrateStateArgs {
+    /// Tenant (bare id, e.g. `default`; a `tenant-` prefix is stripped)
+    #[arg(long, help = TENANT_HELP)]
+    pub tenant: String,
+
+    /// Show what would be migrated without changing anything
+    #[arg(long, default_value_t = false)]
+    pub dry_run: bool,
+
+    /// Kubeconfig file for the management cluster
+    #[arg(long)]
+    pub kubeconfig: Option<PathBuf>,
+
+    /// Kubeconfig context for the management cluster
+    #[arg(long)]
+    pub context: Option<String>,
 }
 
 /// Arguments for `keel app install` (`SDD.md` §7.2).
@@ -453,8 +743,8 @@ pub struct AppInstallArgs {
     #[arg(long)]
     pub app: String,
 
-    /// Target tenant ID (`tenant-<id>`)
-    #[arg(long)]
+    /// Target tenant (bare id, e.g. `default`; a `tenant-` prefix is stripped)
+    #[arg(long, help = TENANT_HELP)]
     pub tenant: String,
 
     /// Path to YAML or JSON Helm/Kustomize values override file
@@ -469,8 +759,8 @@ pub struct AppInstallArgs {
     #[arg(long)]
     pub engine: Option<String>,
 
-    /// Keel server base URL
-    #[arg(long, default_value = DEFAULT_SERVER_URL)]
+    /// Keel server base URL (set via global `--server` / `KEEL_SERVER`)
+    #[arg(skip = DEFAULT_SERVER_URL.to_string())]
     pub server: String,
 }
 
@@ -499,8 +789,8 @@ pub struct PreviewStatusArgs {
     #[arg(long, default_value_t = false)]
     pub watch: bool,
 
-    /// Keel server base URL
-    #[arg(long, default_value = DEFAULT_SERVER_URL)]
+    /// Keel server base URL (set via global `--server` / `KEEL_SERVER`)
+    #[arg(skip = DEFAULT_SERVER_URL.to_string())]
     pub server: String,
 }
 
@@ -651,7 +941,10 @@ mod tests {
         };
         assert_eq!(def_args.s3_endpoint, "https://s3.example.internal:9000");
         assert_eq!(def_args.bucket, "pulumi-state");
-        assert_eq!(def_args.stack, "management-cluster-core");
+        assert!(def_args.stacks.is_empty());
+        assert_eq!(def_args.cluster_name, "keel-mgmt");
+        assert_eq!(def_args.region, "us-east-1");
+        assert!(!def_args.dry_run);
 
         let explicit_cli = Cli::try_parse_from([
             "keel",
@@ -662,7 +955,12 @@ mod tests {
             "--bucket",
             "custom-state",
             "--stack",
-            "keel/management-cluster-core/prod",
+            "stage0-control-plane-keel-mgmt",
+            "--stack",
+            "stage0-control-plane-rauthy-keel-mgmt",
+            "--dry-run",
+            "--snapshot",
+            "20261120T000000Z",
         ])
         .unwrap();
         let Commands::Bootstrap(BootstrapArgs {
@@ -672,7 +970,9 @@ mod tests {
             panic!("expected bootstrap recover");
         };
         assert_eq!(exp_args.bucket, "custom-state");
-        assert_eq!(exp_args.stack, "keel/management-cluster-core/prod");
+        assert_eq!(exp_args.stacks.len(), 2);
+        assert!(exp_args.dry_run);
+        assert_eq!(exp_args.snapshot.as_deref(), Some("20261120T000000Z"));
 
         assert!(Cli::try_parse_from(["keel", "bootstrap", "recover"]).is_err());
     }
@@ -691,13 +991,15 @@ mod tests {
         let custom_cli =
             Cli::try_parse_from(["keel", "auth", "login", "--server", "https://keel.internal"])
                 .unwrap();
+        assert_eq!(custom_cli.server_url(), "https://keel.internal");
         let Commands::Auth(AuthArgs {
             command: AuthCommands::Login(custom_args),
         }) = custom_cli.command
         else {
             panic!("expected auth login");
         };
-        assert_eq!(custom_args.server, "https://keel.internal");
+        assert_eq!(custom_cli.server.as_deref(), Some("https://keel.internal"));
+        assert!(!custom_args.no_browser);
     }
 
     #[test]
@@ -710,6 +1012,7 @@ mod tests {
         assert!(def_args.repo_dir.is_none());
         assert!(def_args.bare_repo.is_none());
         assert!(def_args.config.is_none());
+        assert!(def_args.git_url.is_none());
 
         let custom_cli = Cli::try_parse_from([
             "keel",
@@ -722,6 +1025,10 @@ mod tests {
             "/var/lib/keel/origin.git",
             "--config",
             "/etc/keel/config.yaml",
+            "--git-url",
+            "http://forgejo-http.keel-system.svc.cluster.local:3000/keel/infra-gitops.git",
+            "--git-username",
+            "keel",
         ])
         .unwrap();
         let Commands::Serve(custom_args) = custom_cli.command else {
@@ -740,6 +1047,11 @@ mod tests {
             custom_args.config,
             Some(PathBuf::from("/etc/keel/config.yaml"))
         );
+        assert_eq!(
+            custom_args.git_url.as_deref(),
+            Some("http://forgejo-http.keel-system.svc.cluster.local:3000/keel/infra-gitops.git")
+        );
+        assert_eq!(custom_args.git_username.as_deref(), Some("keel"));
     }
 
     #[test]
@@ -793,7 +1105,7 @@ mod tests {
         assert_eq!(prov_args.blueprint, "postgres-managed");
         assert_eq!(prov_args.tenant, "acme");
         assert_eq!(prov_args.values_file, PathBuf::from("db-values.yaml"));
-        assert_eq!(prov_args.server, "http://127.0.0.1:8081");
+        assert_eq!(prov_cli.server.as_deref(), Some("http://127.0.0.1:8081"));
     }
 
     #[test]
@@ -901,6 +1213,6 @@ mod tests {
         };
         assert_eq!(prev_args.pr, "42");
         assert!(prev_args.watch);
-        assert_eq!(prev_args.server, "http://127.0.0.1:8080");
+        assert_eq!(prev_cli.server.as_deref(), Some("http://127.0.0.1:8080"));
     }
 }

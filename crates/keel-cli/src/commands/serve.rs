@@ -114,6 +114,29 @@ fn build_forge_provider(
     Ok(forge)
 }
 
+/// Default HTTPS username paired with `KEEL_GIT_TOKEN` for `--git-url` (the Stage 0 Forgejo admin).
+const DEFAULT_REMOTE_GIT_USERNAME: &str = "keel";
+
+/// Builds the [`GitRunner`] used to clone/fetch `--git-url`. HTTP(S) remotes with a token get
+/// ephemeral Basic credentials; everything else (local paths, SSH, anonymous) runs without.
+fn remote_bootstrap_runner(url: &str, token: Option<&str>, username: Option<&str>) -> GitRunner {
+    let is_http = {
+        let lower = url.trim().to_ascii_lowercase();
+        lower.starts_with("http://") || lower.starts_with("https://")
+    };
+    match token.map(str::trim).filter(|t| !t.is_empty()) {
+        Some(tok) if is_http => GitRunner::new().with_credentials(GitCredentials::HttpsBasic {
+            username: username
+                .map(str::trim)
+                .filter(|u| !u.is_empty())
+                .unwrap_or(DEFAULT_REMOTE_GIT_USERNAME)
+                .to_string(),
+            password_or_token: tok.to_string(),
+        }),
+        _ => GitRunner::new(),
+    }
+}
+
 /// Builds a configured stateless [`AppState`] from [`ServeArgs`] (`SDD.md` §6.3, §7.2).
 pub async fn build_serve_state(args: &ServeArgs) -> Result<(AppState, Option<String>), CliError> {
     let (state, token, _pf) = build_serve_state_with_forward(args, false).await?;
@@ -141,30 +164,59 @@ async fn build_serve_state_with_forward(
         None => default_bare_repo_for_workdir(&repo_workdir),
     };
 
-    let git_runner = GitRunner::new();
-    if !bare_repo.join("HEAD").exists() {
-        git_runner.init_bare(&bare_repo).await?;
-    }
-    let bare_str = bare_repo
-        .to_str()
-        .ok_or_else(|| CliError::Validation("bare_repo path must be valid UTF-8".to_string()))?
-        .to_string();
+    let remote_git_url = args
+        .git_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+        .map(str::to_string);
+    let cli_token = args
+        .git_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_string);
 
-    if !repo_workdir.join(".git").exists() {
-        if let Some(parent) = repo_workdir.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            tokio::fs::create_dir_all(parent).await?;
+    let (git_runner, bare_str) = if let Some(ref url) = remote_git_url {
+        // OPEN-30: stateless/in-cluster mode. The workdir is (re)hydrated from the remote GitOps
+        // repository; no local bare repo is created. The token is injected ephemerally by
+        // `GitRunner` (never argv, `.git/config`, or logs).
+        let runner =
+            remote_bootstrap_runner(url, cli_token.as_deref(), args.git_username.as_deref());
+        let outcome = keel_git::ensure_workdir_from_remote(&runner, url, &repo_workdir).await?;
+        tracing::info!(
+            ?outcome,
+            repo_dir = %repo_workdir.display(),
+            "Bootstrapped keel serve workdir from remote GitOps repository"
+        );
+        (runner, url.clone())
+    } else {
+        let git_runner = GitRunner::new();
+        if !bare_repo.join("HEAD").exists() {
+            git_runner.init_bare(&bare_repo).await?;
         }
-        git_runner.clone(&bare_str, &repo_workdir).await?;
-    } else if bare_repo.join("HEAD").exists()
-        && let Ok(existing_origin) = git_runner.get_remote_url(&repo_workdir, "origin").await
-        && is_relative_local_remote(&existing_origin)
-    {
-        git_runner
-            .set_remote_url(&repo_workdir, "origin", &bare_str)
-            .await?;
-    }
+        let bare_str = bare_repo
+            .to_str()
+            .ok_or_else(|| CliError::Validation("bare_repo path must be valid UTF-8".to_string()))?
+            .to_string();
+
+        if !repo_workdir.join(".git").exists() {
+            if let Some(parent) = repo_workdir.parent()
+                && !parent.as_os_str().is_empty()
+            {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+            git_runner.clone(&bare_str, &repo_workdir).await?;
+        } else if bare_repo.join("HEAD").exists()
+            && let Ok(existing_origin) = git_runner.get_remote_url(&repo_workdir, "origin").await
+            && is_relative_local_remote(&existing_origin)
+        {
+            git_runner
+                .set_remote_url(&repo_workdir, "origin", &bare_str)
+                .await?;
+        }
+        (git_runner, bare_str)
+    };
 
     // Ensure `main` branch exists so proposal branches can cleanly branch off `main`.
     if !git_runner
@@ -262,19 +314,13 @@ async fn build_serve_state_with_forward(
     }
 
     let env_token = std::env::var("KEEL_GIT_TOKEN").ok();
-    let mut resolved_token: Option<String> = args
-        .git_token
-        .as_deref()
-        .map(str::trim)
-        .filter(|t| !t.is_empty())
-        .map(str::to_string)
-        .or_else(|| {
-            env_token
-                .as_deref()
-                .map(str::trim)
-                .filter(|t| !t.is_empty())
-                .map(str::to_string)
-        });
+    let mut resolved_token: Option<String> = cli_token.clone().or_else(|| {
+        env_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(str::to_string)
+    });
 
     if resolved_token.is_none()
         && parsed_keel_cfg
@@ -289,7 +335,11 @@ async fn build_serve_state_with_forward(
 
     let mut port_forwards: Vec<TempPortForward> = Vec::new();
     let mut api_url_override: Option<String> = None;
+    // Inside a Pod the in-cluster Service DNS resolves directly; port-forwards are a laptop aid.
+    let running_in_pod = std::env::var_os("KUBERNETES_SERVICE_HOST").is_some();
     if enable_in_cluster_port_forward
+        && !running_in_pod
+        && remote_git_url.is_none()
         && kube_reader.is_some()
         && let Some(ref cfg) = parsed_keel_cfg
         && cfg
@@ -317,6 +367,7 @@ async fn build_serve_state_with_forward(
     }
 
     if enable_in_cluster_port_forward
+        && !running_in_pod
         && kube_reader.is_some()
         && let Some(ref oidc) = oidc_cfg
         && oidc.issuer_url.contains("idp.keel.local")
@@ -335,40 +386,51 @@ async fn build_serve_state_with_forward(
         }
     }
 
+    // `LocalGitProvider` fallback operates on the bare repo; in `--git-url` mode that is the remote
+    // itself when it is a local path (otherwise the forge must be a remote provider).
+    let local_forge_repo = match remote_git_url.as_deref() {
+        Some(url) if !url.contains("://") && !url.contains('@') => std::path::PathBuf::from(url),
+        _ => bare_repo.clone(),
+    };
     let forge = build_forge_provider(
         parsed_keel_cfg.as_ref(),
         resolved_token.as_deref(),
         api_url_override.as_deref(),
-        &bare_repo,
+        &local_forge_repo,
     )?;
 
-    let git_runner = if let Some(ref tok) = resolved_token
-        && parsed_keel_cfg
-            .as_ref()
-            .is_some_and(|c| c.forge.provider != ForgeKind::Local)
-    {
-        let username = match parsed_keel_cfg.as_ref().map(|c| c.forge.provider) {
-            Some(ForgeKind::Forgejo | ForgeKind::Gitea) => "keel",
-            _ => "git",
-        };
-        git_runner.with_credentials(GitCredentials::HttpsBasic {
-            username: username.to_string(),
-            password_or_token: tok.clone(),
-        })
-    } else {
-        git_runner
-    };
-
-    let secret_store: Arc<dyn SecretStateStore> = if let Some(ref reader) = kube_reader {
-        let k8s_store = K8sSecretStore::new(reader.client().clone());
-        if k8s_store.get_or_create_session_key().await.is_ok() {
-            Arc::new(k8s_store) as Arc<dyn SecretStateStore>
+    let git_runner =
+        if remote_git_url.is_some() && !matches!(git_runner.credentials(), GitCredentials::None) {
+            // `--git-url` mode already carries the explicit clone credentials.
+            git_runner
+        } else if let Some(ref tok) = resolved_token
+            && parsed_keel_cfg
+                .as_ref()
+                .is_some_and(|c| c.forge.provider != ForgeKind::Local)
+        {
+            let username = match parsed_keel_cfg.as_ref().map(|c| c.forge.provider) {
+                Some(ForgeKind::Forgejo | ForgeKind::Gitea) => "keel",
+                _ => "git",
+            };
+            git_runner.with_credentials(GitCredentials::HttpsBasic {
+                username: username.to_string(),
+                password_or_token: tok.clone(),
+            })
         } else {
-            Arc::new(InMemorySecretStore::new())
-        }
-    } else {
-        Arc::new(InMemorySecretStore::new())
-    };
+            git_runner
+        };
+
+    let (secret_store, cluster_secret_store): (Arc<dyn SecretStateStore>, bool) =
+        if let Some(ref reader) = kube_reader {
+            let k8s_store = K8sSecretStore::new(reader.client().clone());
+            if k8s_store.get_or_create_session_key().await.is_ok() {
+                (Arc::new(k8s_store) as Arc<dyn SecretStateStore>, true)
+            } else {
+                (Arc::new(InMemorySecretStore::new()), false)
+            }
+        } else {
+            (Arc::new(InMemorySecretStore::new()), false)
+        };
 
     let live_mgmt_backend = if let Some(ref reader) = kube_reader {
         reader
@@ -398,7 +460,10 @@ async fn build_serve_state_with_forward(
         bare_str,
         auth_phase,
     )
-    .with_oidc_config(oidc_cfg);
+    .with_oidc_config(oidc_cfg)
+    // Tenant Stack proposals require the tenant state passphrase Secret whenever Secrets live in
+    // the cluster; cluster-less local dev (in-memory store, nothing applied) skips the gate.
+    .with_require_pulumi_passphrase(cluster_secret_store);
     if let Some(backend) = mgmt_stack_backend {
         state.backend_url = backend;
     }
@@ -412,6 +477,20 @@ async fn build_serve_state_with_forward(
             .unwrap_or(false)
     {
         state = state.with_s3_credentials_secret(Some(S3_CREDENTIALS_SECRET_NAME.to_string()));
+    }
+    // Tenant stacks use per-tenant scoped SeaweedFS identities (`tenants/<id>/*`), provisioned
+    // through kube-rs exec into the in-cluster SeaweedFS filer.
+    if let Some(ref reader) = kube_reader
+        && state.s3_credentials_secret.is_some()
+        && state
+            .backend_url
+            .contains("s3-state-backend-seaweedfs-s3.keel-system.svc.cluster.local")
+    {
+        let provisioner = keel_kube::SeaweedFsTenantS3Provisioner::new(
+            reader.client().clone(),
+            state.backend_url.clone(),
+        );
+        state = state.with_tenant_s3_provisioner(Some(Arc::new(provisioner)));
     }
 
     if let Some(reader) = kube_reader {
@@ -430,6 +509,11 @@ async fn build_serve_state_with_forward(
         {
             state = state.with_oidc_ca_pem(Some(ca_pem.into_bytes()));
         }
+        // Real ephemeral PKO previews: preview Stacks are applied into `keel-previews` and their
+        // state persisted in-cluster (labels/annotations + report ConfigMap).
+        state = state.with_preview_cluster(Some(Arc::new(keel_kube::KubePreviewCluster::new(
+            reader.client().clone(),
+        ))));
         state = state.with_state_provider(Arc::new(KubeClusterStateProvider::new(
             repo_state_provider,
             Arc::new(reader),
@@ -444,7 +528,8 @@ async fn build_serve_state_with_forward(
                 .filter(|p| p.enabled)
                 .map(|p| p.id)
                 .collect();
-            if let Ok(policy_val) = keel_kube::build_restrict_pulumi_providers_policy(&enabled_ids)
+            if let Ok(policy_val) =
+                keel_kube::build_restrict_pulumi_providers_policy_for_registry(&enabled_ids)
             {
                 let _ = state
                     .state_provider
@@ -466,6 +551,12 @@ where
     F: Future<Output = ()> + Send + 'static,
 {
     let (state, _unused, _forge_pf) = build_serve_state_with_forward(args, true).await?;
+    // Restart-/replica-safe preview GC + result publication driven by cluster state and forge
+    // PR states (OPEN-10). No-op without a live cluster.
+    let preview_reconciler = keel_server::preview_lifecycle::spawn_preview_reconciler(
+        state.clone(),
+        keel_server::preview_lifecycle::PREVIEW_RECONCILE_INTERVAL,
+    );
     let router = build_router(state);
     let listener = tokio::net::TcpListener::bind(&args.bind).await?;
     let local_addr = listener.local_addr()?;
@@ -496,6 +587,9 @@ where
                 res?;
             }
         }
+    }
+    if let Some(handle) = preview_reconciler {
+        handle.abort();
     }
     Ok(local_addr)
 }

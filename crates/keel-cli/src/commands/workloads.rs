@@ -11,7 +11,7 @@ use keel_core::{
 };
 use keel_git::{PullRequestInfo, PullRequestState};
 use keel_kube::{CrdReconcileStatus, CrdWatchEvent};
-use keel_pko::{PkoStack, PreviewReport};
+use keel_pko::{PkoStack, PreviewPhase, PreviewReport, PreviewSource};
 use keel_server::StackSummary;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -23,7 +23,7 @@ use crate::cli::{
 
 use super::{
     CliContext, CliError, attach_auth, extract_api_error, normalize_server_url,
-    validate_non_flag_input,
+    normalize_tenant_arg, validate_non_flag_input,
 };
 
 // ============================================================================
@@ -131,7 +131,8 @@ pub async fn execute_infra_list(
     args: &InfraListArgs,
     ctx: &CliContext,
 ) -> Result<String, CliError> {
-    if let Some(tenant) = &args.tenant {
+    let tenant = args.tenant.as_deref().map(normalize_tenant_arg);
+    if let Some(tenant) = &tenant {
         validate_dns_label(tenant, "tenant")?;
     }
     if let Some(provider) = &args.provider {
@@ -142,7 +143,7 @@ pub async fn execute_infra_list(
     let endpoint = format!("{base_url}/api/v1/stacks");
 
     let mut query: Vec<(&str, &str)> = Vec::new();
-    if let Some(t) = args.tenant.as_deref() {
+    if let Some(t) = tenant.as_deref() {
         query.push(("tenant", t));
     }
     if let Some(p) = args.provider.as_deref() {
@@ -200,7 +201,12 @@ pub async fn load_values_file(path: &Path) -> Result<Value, CliError> {
     if raw.trim().is_empty() {
         return Ok(json!({}));
     }
-    let val: Value = serde_yml::from_str(&raw)?;
+    let val: Value = serde_yml::from_str(&raw).map_err(|e| {
+        CliError::Validation(format!(
+            "invalid YAML/JSON in values file '{}': {e}",
+            path.display()
+        ))
+    })?;
     if !val.is_object() {
         return Err(CliError::Validation(format!(
             "Values file '{}' must deserialize to a YAML/JSON mapping object",
@@ -242,7 +248,8 @@ pub async fn execute_infra_provision(
     ctx: &CliContext,
 ) -> Result<ProposalCommandOutcome, CliError> {
     validate_dns_label(&args.blueprint, "blueprint")?;
-    validate_dns_label(&args.tenant, "tenant")?;
+    let tenant = normalize_tenant_arg(&args.tenant);
+    validate_dns_label(&tenant, "tenant")?;
     let values = load_values_file(&args.values_file).await?;
     let base_url = normalize_server_url(&args.server)?;
 
@@ -263,7 +270,7 @@ pub async fn execute_infra_provision(
     submit_proposal_request(
         &base_url,
         ctx,
-        &args.tenant,
+        &tenant,
         &args.blueprint,
         "infra",
         &values,
@@ -279,7 +286,8 @@ pub async fn execute_app_install(
     ctx: &CliContext,
 ) -> Result<ProposalCommandOutcome, CliError> {
     validate_dns_label(&args.app, "app")?;
-    validate_dns_label(&args.tenant, "tenant")?;
+    let tenant = normalize_tenant_arg(&args.tenant);
+    validate_dns_label(&tenant, "tenant")?;
     if let Some(ref eng) = args.engine {
         eng.parse::<keel_core::ManifestEngine>()?;
     }
@@ -303,7 +311,7 @@ pub async fn execute_app_install(
     submit_proposal_request(
         &base_url,
         ctx,
-        &args.tenant,
+        &tenant,
         &args.app,
         "application",
         &values,
@@ -370,12 +378,7 @@ async fn submit_proposal_request(
         created.branch, created.proposal.target_branch
     ));
     output.push_str(&format!("PR URL:        {}\n", created.proposal.url));
-    output.push_str(&format!(
-        "Preview Stack: {}/{} (preview={})\n\n",
-        created.preview_stack.metadata.namespace,
-        created.preview_stack.metadata.name,
-        created.preview_stack.is_preview()
-    ));
+    output.push('\n');
     output.push_str(&format_preview_table(&created.report));
 
     Ok(ProposalCommandOutcome {
@@ -497,12 +500,13 @@ pub(crate) async fn resolve_local_fallback_ssh_info(
 /// (with local GitOps fallback) and either printing the connection details or spawning `ssh`.
 pub async fn execute_infra_ssh(args: &InfraSshArgs, ctx: &CliContext) -> Result<String, CliError> {
     validate_dns_label(&args.stack_name, "stack_name")?;
-    validate_dns_label(&args.tenant, "tenant")?;
+    let tenant = normalize_tenant_arg(&args.tenant);
+    validate_dns_label(&tenant, "tenant")?;
 
     let base_url = normalize_server_url(&args.server)?;
     let endpoint = format!(
         "{base_url}/api/v1/stacks/tenant-{}/{}/ssh-info",
-        args.tenant, args.stack_name
+        tenant, args.stack_name
     );
 
     let mut info: keel_core::StackSshInfoResponse =
@@ -519,7 +523,7 @@ pub async fn execute_infra_ssh(args: &InfraSshArgs, ctx: &CliContext) -> Result<
             Err(http_err) => {
                 let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
                 if let Some(fallback) =
-                    resolve_local_fallback_ssh_info(&cwd, &args.tenant, &args.stack_name).await
+                    resolve_local_fallback_ssh_info(&cwd, &tenant, &args.stack_name).await
                 {
                     fallback
                 } else {
@@ -576,7 +580,8 @@ pub async fn execute_infra_force_delete(
             ns.clone()
         }
         None => {
-            validate_dns_label(&args.tenant, "tenant")?;
+            let tenant = normalize_tenant_arg(&args.tenant);
+            validate_dns_label(&tenant, "tenant")?;
             format!("tenant-{}", args.tenant)
         }
     };
@@ -621,7 +626,8 @@ pub async fn execute_infra_unlock(
             ns.clone()
         }
         None => {
-            validate_dns_label(&args.tenant, "tenant")?;
+            let tenant = normalize_tenant_arg(&args.tenant);
+            validate_dns_label(&tenant, "tenant")?;
             format!("tenant-{}", args.tenant)
         }
     };
@@ -681,9 +687,45 @@ pub struct PreviewStatusOutcome {
 }
 
 /// Renders a PKO v2 [`PreviewReport`] as an aligned terminal diff table (`+ Create`, `~ Update`, `- Delete`, `! Replace`, `! Drift`).
+/// Describes where a preview report came from and the state of its PKO run (CLI-4): a real
+/// PKO `pulumi preview` vs. a control-plane simulation, and the preview `Stack` only when it was
+/// actually applied to the cluster.
+pub fn format_preview_provenance(report: &PreviewReport) -> String {
+    let mut out = String::new();
+    let source = match report.source {
+        PreviewSource::Pko => "PKO (pulumi preview executed in keel-previews)",
+        PreviewSource::Synthesized => {
+            "Simulated (synthesized by the control plane; not a pulumi preview)"
+        }
+    };
+    out.push_str(&format!("Preview Source: {source}\n"));
+    match &report.run {
+        Some(run) => {
+            let mut status = run.phase.label().to_string();
+            if let Some(msg) = run.message.as_deref().filter(|m| !m.is_empty()) {
+                status.push_str(&format!(" - {msg}"));
+            }
+            out.push_str(&format!("PKO Preview:    {status}\n"));
+            if let Some(stack) = &run.stack {
+                out.push_str(&format!("Preview Stack:  {stack}\n"));
+            }
+            if let Some(commit) = &run.commit {
+                out.push_str(&format!("Commit:         {commit}\n"));
+            }
+            if matches!(run.phase, PreviewPhase::Pending | PreviewPhase::Running) {
+                out.push_str(
+                    "                (run `keel preview status --pr <id> --watch` for real PKO results)\n",
+                );
+            }
+        }
+        None => out.push_str("PKO Preview:    Unknown\n"),
+    }
+    out
+}
+
 pub fn format_preview_table(report: &PreviewReport) -> String {
     let s = &report.summary;
-    let mut out = String::new();
+    let mut out = format_preview_provenance(report);
     out.push_str(&format!(
         "Summary: +{} create, ~{} update, -{} delete, !{} replace, !{} drift, ={} unchanged (total: {})\n",
         s.create,
@@ -777,12 +819,21 @@ pub async fn execute_preview_status(
     let mut watched_events = Vec::new();
 
     if args.watch && preview.state == PullRequestState::Open {
-        let watch_timeout = if !preview.report.resources.is_empty() {
+        // Wait for the real PKO run while it is pending/running; otherwise only briefly.
+        let pko_in_flight = preview
+            .report
+            .run
+            .as_ref()
+            .is_some_and(|r| matches!(r.phase, PreviewPhase::Pending | PreviewPhase::Running));
+        let watch_timeout = if pko_in_flight {
+            Duration::from_secs(15 * 60)
+        } else if !preview.report.resources.is_empty() {
             Duration::from_secs(2)
         } else {
             Duration::from_secs(60)
         };
-        watched_events = watch_preview_sse(&base_url, &args.pr, ctx, watch_timeout).await?;
+        watched_events =
+            watch_preview_sse(&base_url, &args.pr, ctx, watch_timeout, pko_in_flight).await?;
 
         let refresh_resp = attach_auth(ctx.http.get(&preview_endpoint), ctx, &base_url)
             .send()
@@ -826,6 +877,7 @@ async fn watch_preview_sse(
     pr_id: &str,
     ctx: &CliContext,
     watch_timeout: Duration,
+    require_pko_result: bool,
 ) -> Result<Vec<CrdWatchEvent>, CliError> {
     let sse_url = format!("{base_url}/api/v1/events/stream");
     let mut resp = attach_auth(
@@ -875,12 +927,17 @@ async fn watch_preview_sse(
             if let Ok(ev) = serde_json::from_str::<CrdWatchEvent>(json_trimmed) {
                 let matches_pr =
                     ev.name.contains(&pr_marker) || ev.message.contains(&format!("#{pr_id}"));
+                // While a PKO preview is in flight, only the control plane's own "PKO preview ..."
+                // result event (published after the report is persisted) ends the watch; generic
+                // Stack watcher events can arrive before the results are collected.
                 let is_terminal = matches!(
                     ev.status,
                     CrdReconcileStatus::Ready
                         | CrdReconcileStatus::Failed
                         | CrdReconcileStatus::Deleted
-                );
+                ) && (!require_pko_result
+                    || ev.status == CrdReconcileStatus::Deleted
+                    || ev.message.starts_with("PKO preview"));
                 collected.push(ev);
                 if matches_pr && is_terminal {
                     return Ok(collected);
@@ -890,4 +947,58 @@ async fn watch_preview_sse(
     }
 
     Ok(collected)
+}
+
+#[cfg(test)]
+mod preview_output_tests {
+    use keel_pko::PreviewRunStatus;
+
+    use super::*;
+
+    #[test]
+    fn preview_table_labels_simulated_vs_pko_and_only_shows_applied_stacks() {
+        let simulated = PreviewReport {
+            run: Some(PreviewRunStatus::not_executed(
+                "No live cluster connected: PKO preview not executed",
+            )),
+            ..PreviewReport::default()
+        };
+        let out = format_preview_table(&simulated);
+        assert!(out.contains("Preview Source: Simulated"));
+        assert!(out.contains("PKO Preview:    Not executed - No live cluster connected"));
+        assert!(!out.contains("Preview Stack:"));
+
+        let running = PreviewReport {
+            run: Some(PreviewRunStatus {
+                phase: PreviewPhase::Running,
+                stack: Some("keel-previews/preview-stack-pr-4".to_string()),
+                commit: Some("abc123".to_string()),
+                ..PreviewRunStatus::default()
+            }),
+            ..PreviewReport::default()
+        };
+        let out = format_preview_table(&running);
+        assert!(out.contains("Preview Source: Simulated"));
+        assert!(out.contains("PKO Preview:    Running"));
+        assert!(out.contains("Preview Stack:  keel-previews/preview-stack-pr-4"));
+        assert!(out.contains("Commit:         abc123"));
+        assert!(out.contains("--watch"));
+
+        let pko = PreviewReport {
+            source: PreviewSource::Pko,
+            run: Some(PreviewRunStatus {
+                phase: PreviewPhase::Succeeded,
+                ..PreviewRunStatus::default()
+            }),
+            ..PreviewReport::default()
+        };
+        let out = format_preview_table(&pko);
+        assert!(out.contains("Preview Source: PKO"));
+        assert!(out.contains("PKO Preview:    Succeeded"));
+        assert!(!out.contains("--watch"));
+
+        let legacy = format_preview_table(&PreviewReport::default());
+        assert!(legacy.contains("PKO Preview:    Unknown"));
+        assert!(legacy.contains("No resource changes planned."));
+    }
 }

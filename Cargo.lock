@@ -145,12 +145,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "anyhow"
-version = "1.0.104"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
-
-[[package]]
 name = "ar_archive_writer"
 version = "0.5.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2029,17 +2023,19 @@ dependencies = [
 name = "keel-cli"
 version = "0.7.0"
 dependencies = [
- "anyhow",
  "async-trait",
  "axum",
  "base64 0.23.1",
  "chrono",
  "clap",
+ "hex",
+ "hmac",
  "keel-core",
  "keel-git",
  "keel-kube",
  "keel-pko",
  "keel-server",
+ "rand 0.10.4",
  "reqwest",
  "serde",
  "serde_json",
@@ -2049,7 +2045,9 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "url",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -2070,6 +2068,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -2102,6 +2101,7 @@ dependencies = [
  "http",
  "k8s-openapi",
  "keel-core",
+ "keel-pko",
  "kube",
  "rand 0.10.4",
  "serde",
@@ -2133,10 +2133,12 @@ dependencies = [
  "axum",
  "base64 0.23.1",
  "chrono",
+ "flate2",
  "futures",
  "hex",
  "http-body-util",
  "jsonwebtoken",
+ "k8s-openapi",
  "keel-core",
  "keel-git",
  "keel-kube",

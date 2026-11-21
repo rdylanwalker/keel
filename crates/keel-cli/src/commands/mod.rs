@@ -1,5 +1,6 @@
 //! Command execution handlers for `keel` (`SDD.md` §2.1, §2.2, §4.2, §6.1, §7.2).
 
+pub mod api;
 pub mod auth;
 pub mod bootstrap;
 pub mod recover;
@@ -21,15 +22,24 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::cli::{
-    AppCommands, AuthCommands, BootstrapCommands, Cli, Commands, InfraCommands, PreviewCommands,
+    AppCommands, AuthCommands, BootstrapCommands, CatalogCommands, Cli, Commands, InfraCommands,
+    PreviewCommands, ProposalCommands, TenantCommands,
 };
 
-pub use auth::{AuthLoginOutcome, PkceChallenge, execute_auth_login, generate_pkce_pair};
+pub use api::{
+    execute_app_list, execute_catalog_list, execute_catalog_show, execute_proposal_close,
+    execute_proposal_list, execute_proposal_merge, execute_proposal_show,
+};
+pub use auth::{
+    AuthLoginOutcome, PkceChallenge, execute_auth_login, execute_auth_logout, execute_auth_status,
+    generate_pkce_pair,
+};
 pub use bootstrap::{
     BootstrapInitOutcome, KyvernoPolicyGenerator, RauthySeedConfig, SeedControlPlaneArtifacts,
     SeedRepoInitResult, default_bare_repo_for_workdir, execute_bootstrap_init,
     execute_bootstrap_init_with_target, initialize_seed_git_repo, synthesize_seed_control_plane,
 };
+pub use bootstrap::{TenantMigrationReport, TenantStackMigration};
 pub use recover::{BootstrapRecoverOutcome, build_pulumi_recover_argv, execute_bootstrap_recover};
 pub use serve::{build_serve_state, execute_serve, execute_serve_until};
 pub use workloads::{
@@ -57,7 +67,7 @@ pub enum CliError {
     #[error(transparent)]
     Kube(#[from] KubeError),
 
-    #[error("HTTP transport error: {0}")]
+    #[error("{}", describe_http_error(.0))]
     Http(#[from] reqwest::Error),
 
     #[error("I/O error: {0}")]
@@ -67,7 +77,7 @@ pub enum CliError {
     Json(#[from] serde_json::Error),
 
     #[error("YAML error: {0}")]
-    Yaml(#[from] serde_yml::Error),
+    Yaml(#[source] serde_yml::Error),
 
     #[error("Validation error: {0}")]
     Validation(String),
@@ -75,9 +85,64 @@ pub enum CliError {
     #[error("Server API error (HTTP {status}): {message}")]
     Api { status: u16, message: String },
 
-    #[error("CLI execution error: {0}")]
+    #[error("{0}")]
     Execution(String),
 }
+
+impl From<serde_yml::Error> for CliError {
+    fn from(err: serde_yml::Error) -> Self {
+        Self::Yaml(err)
+    }
+}
+
+/// One-line, user-facing description of a transport error (full chain only with `-v`).
+fn describe_http_error(err: &reqwest::Error) -> String {
+    let target = err
+        .url()
+        .map(|u| {
+            let mut base = u.clone();
+            base.set_path("");
+            base.set_query(None);
+            base.as_str().trim_end_matches('/').to_string()
+        })
+        .unwrap_or_else(|| "the server".to_string());
+    if err.is_connect() {
+        format!(
+            "cannot reach server at {target} (connection failed; is `keel serve` running? use -v for details)"
+        )
+    } else if err.is_timeout() {
+        format!("request to {target} timed out")
+    } else if err.is_decode() {
+        format!("unexpected response from {target}: could not decode body")
+    } else if err.is_redirect() {
+        format!("too many redirects from {target}")
+    } else {
+        format!("HTTP request to {target} failed (use -v for details)")
+    }
+}
+
+impl CliError {
+    /// Renders the error for the terminal: one line by default, full cause chain when `verbose`.
+    pub fn render(&self, verbose: bool) -> String {
+        let mut out = self.to_string();
+        if verbose {
+            let mut src = std::error::Error::source(self);
+            let mut last = out.clone();
+            while let Some(cause) = src {
+                let msg = cause.to_string();
+                if !last.contains(&msg) {
+                    out.push_str(&format!("\n  caused by: {msg}"));
+                }
+                last = msg;
+                src = cause.source();
+            }
+        }
+        out
+    }
+}
+
+/// `User-Agent` sent by every CLI HTTP request.
+pub(crate) const USER_AGENT: &str = concat!("keel-cli/", env!("CARGO_PKG_VERSION"));
 
 /// Stored CLI session map keyed by normalized server URL (never logged).
 #[derive(Default, Serialize, Deserialize)]
@@ -90,7 +155,6 @@ struct StoredCredentialsFile {
 #[derive(Clone)]
 pub struct CliContext {
     pub(crate) http: Client,
-    pub(crate) no_redirect_http: Client,
     pub(crate) stream_http: Client,
     credentials_path: PathBuf,
     session_override: Option<String>,
@@ -123,25 +187,18 @@ impl CliContext {
     /// Creates a [`CliContext`] using a custom session credentials file path.
     pub fn with_credentials_path(credentials_path: impl Into<PathBuf>) -> Self {
         let http = Client::builder()
-            .user_agent("keel-cli/0.1.0")
-            .timeout(Duration::from_secs(30))
-            .build()
-            .unwrap_or_else(|_| Client::new());
-        let no_redirect_http = Client::builder()
-            .user_agent("keel-cli/0.1.0")
-            .redirect(reqwest::redirect::Policy::none())
+            .user_agent(USER_AGENT)
             .timeout(Duration::from_secs(30))
             .build()
             .unwrap_or_else(|_| Client::new());
         let stream_http = Client::builder()
-            .user_agent("keel-cli/0.1.0")
+            .user_agent(USER_AGENT)
             .connect_timeout(Duration::from_secs(10))
             .build()
             .unwrap_or_else(|_| Client::new());
 
         Self {
             http,
-            no_redirect_http,
             stream_http,
             credentials_path: credentials_path.into(),
             session_override: None,
@@ -156,44 +213,133 @@ impl CliContext {
 
     /// Persists an opaque session token for `server_url` with `0600` file permissions (`NFR-SEC-05`).
     pub fn save_session_token(&self, server_url: &str, token: &str) -> Result<(), CliError> {
-        let normalized = normalize_server_url(server_url)?;
+        let key = session_key(server_url)?;
         let mut store = self.read_store();
-        store.sessions.insert(normalized, token.trim().to_string());
+        store
+            .sessions
+            .retain(|k, _| session_key(k).map_or(true, |nk| nk != key));
+        store.sessions.insert(key, token.trim().to_string());
+        self.write_store(&store)
+    }
 
+    /// Removes the stored session for `server_url`; returns `true` if one existed.
+    pub fn remove_session_token(&self, server_url: &str) -> Result<bool, CliError> {
+        let key = session_key(server_url)?;
+        let mut store = self.read_store();
+        let before = store.sessions.len();
+        store
+            .sessions
+            .retain(|k, _| session_key(k).map_or(true, |nk| nk != key));
+        if store.sessions.len() == before {
+            return Ok(false);
+        }
+        self.write_store(&store)?;
+        Ok(true)
+    }
+
+    fn write_store(&self, store: &StoredCredentialsFile) -> Result<(), CliError> {
         if let Some(parent) = self.credentials_path.parent()
             && !parent.as_os_str().is_empty()
         {
             std::fs::create_dir_all(parent)?;
         }
-
-        let payload = serde_json::to_vec_pretty(&store)?;
+        let payload = serde_json::to_vec_pretty(store)?;
         write_restricted_file(&self.credentials_path, &payload)?;
         Ok(())
     }
 
-    /// Loads the active session token for `server_url` if available.
+    /// Loads the active session token for `server_url` if available. Keys are compared after
+    /// normalization (`localhost` == `127.0.0.1`, default ports, case, trailing slash).
     pub fn load_session_token(&self, server_url: &str) -> Option<String> {
         if let Some(tok) = &self.session_override {
             return Some(tok.clone());
         }
-        let normalized = normalize_server_url(server_url).ok()?;
+        let key = session_key(server_url).ok()?;
         let store = self.read_store();
-        store.sessions.get(&normalized).cloned()
+        if let Some(tok) = store.sessions.get(&key) {
+            return Some(tok.clone());
+        }
+        store
+            .sessions
+            .iter()
+            .find(|(k, _)| session_key(k).is_ok_and(|nk| nk == key))
+            .map(|(_, v)| v.clone())
+    }
+
+    /// Server URLs that currently have a stored session (for "did you mean" hints).
+    pub fn stored_session_servers(&self) -> Vec<String> {
+        self.read_store().sessions.keys().cloned().collect()
+    }
+
+    /// Path of the credentials file.
+    pub fn credentials_path(&self) -> &Path {
+        &self.credentials_path
     }
 
     fn read_store(&self) -> StoredCredentialsFile {
-        std::fs::read_to_string(&self.credentials_path)
-            .ok()
-            .and_then(|raw| serde_json::from_str::<StoredCredentialsFile>(&raw).ok())
-            .unwrap_or_default()
+        let raw = match std::fs::read_to_string(&self.credentials_path) {
+            Ok(raw) => raw,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return StoredCredentialsFile::default();
+            }
+            Err(err) => {
+                eprintln!(
+                    "warning: cannot read {}: {err}; continuing without stored sessions",
+                    self.credentials_path.display()
+                );
+                return StoredCredentialsFile::default();
+            }
+        };
+        match serde_json::from_str::<StoredCredentialsFile>(&raw) {
+            Ok(store) => store,
+            Err(err) => {
+                eprintln!(
+                    "warning: {} is corrupt ({err}); ignoring stored sessions. Fix or delete the file, then run `keel auth login`",
+                    self.credentials_path.display()
+                );
+                StoredCredentialsFile::default()
+            }
+        }
     }
 }
 
+/// Canonical credentials-store key for a server URL: lower-cased scheme/host, `localhost` and
+/// `[::1]` folded to `127.0.0.1`, default ports dropped, no trailing slash.
+pub fn session_key(server_url: &str) -> Result<String, CliError> {
+    let normalized = normalize_server_url(server_url)?;
+    let Ok(mut parsed) = url::Url::parse(&normalized) else {
+        return Ok(normalized);
+    };
+    let host = parsed.host_str().unwrap_or_default().to_ascii_lowercase();
+    if matches!(host.as_str(), "localhost" | "[::1]" | "::1") {
+        let _ = parsed.set_host(Some("127.0.0.1"));
+    }
+    let mut key = format!(
+        "{}://{}",
+        parsed.scheme(),
+        parsed.host_str().unwrap_or_default()
+    );
+    if let Some(port) = parsed.port() {
+        key.push_str(&format!(":{port}"));
+    }
+    let path = parsed.path().trim_end_matches('/');
+    key.push_str(path);
+    Ok(key)
+}
+
 fn default_credentials_path() -> PathBuf {
-    if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
-        PathBuf::from(home).join(".config/keel/credentials.json")
-    } else {
-        std::env::temp_dir().join("keel-cli-credentials.json")
+    keel_core::keel_config_dir().join("credentials.json")
+}
+
+/// Strips an accidental `tenant-` prefix from a `--tenant` value (CLI-9), printing a note.
+pub(crate) fn normalize_tenant_arg(raw: &str) -> String {
+    let trimmed = raw.trim();
+    match trimmed.strip_prefix("tenant-") {
+        Some(bare) if !bare.is_empty() => {
+            eprintln!("note: --tenant expects a bare id; using '{bare}' (namespace {trimmed})");
+            bare.to_string()
+        }
+        _ => trimmed.to_string(),
     }
 }
 
@@ -275,6 +421,26 @@ pub(crate) fn validate_non_flag_input(value: &str, field: &str) -> Result<(), Cl
 
 pub(crate) async fn extract_api_error(resp: reqwest::Response) -> CliError {
     let status = resp.status().as_u16();
+    if status == 401 {
+        let mut server = resp.url().clone();
+        server.set_path("");
+        server.set_query(None);
+        let server = server.as_str().trim_end_matches('/').to_string();
+        let body = resp.text().await.unwrap_or_default();
+        let detail = serde_json::from_str::<Value>(&body)
+            .ok()
+            .and_then(|v| {
+                v.get("message")
+                    .or_else(|| v.get("error"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| "authentication required".to_string());
+        return CliError::Api {
+            status,
+            message: format!("{detail}; run `keel auth login --server {server}`"),
+        };
+    }
     let body = resp.text().await.unwrap_or_default();
     if let Ok(parsed) = serde_json::from_str::<Value>(&body)
         && let Some(msg) = parsed
@@ -315,30 +481,77 @@ pub(crate) fn attach_auth(
 // ============================================================================
 
 /// Dispatches any parsed [`Cli`] command and returns formatted stdout text.
+///
+/// The global `--server` / `KEEL_SERVER` value is applied to every API subcommand.
 pub async fn dispatch(cli: &Cli, ctx: &CliContext) -> Result<String, CliError> {
+    let server = cli.server_url();
+    macro_rules! with_server {
+        ($args:expr) => {{
+            let mut a = $args.clone();
+            a.server = server.clone();
+            a
+        }};
+    }
     match &cli.command {
         Commands::Bootstrap(b) => match &b.command {
             BootstrapCommands::Init(args) => Ok(execute_bootstrap_init(args).await?.output),
             BootstrapCommands::Recover(args) => Ok(execute_bootstrap_recover(args).await?.output),
         },
         Commands::Auth(a) => match &a.command {
-            AuthCommands::Login(args) => {
-                Ok(execute_auth_login(args, ctx).await?.output().to_string())
-            }
+            AuthCommands::Login(args) => Ok(execute_auth_login(&with_server!(args), ctx)
+                .await?
+                .output()
+                .to_string()),
+            AuthCommands::Status(args) => execute_auth_status(&with_server!(args), ctx).await,
+            AuthCommands::Logout(args) => execute_auth_logout(&with_server!(args), ctx).await,
         },
         Commands::Serve(args) => execute_serve(args).await,
         Commands::Infra(i) => match &i.command {
-            InfraCommands::List(args) => execute_infra_list(args, ctx).await,
-            InfraCommands::Provision(args) => Ok(execute_infra_provision(args, ctx).await?.output),
-            InfraCommands::Ssh(args) => execute_infra_ssh(args, ctx).await,
-            InfraCommands::ForceDelete(args) => execute_infra_force_delete(args, ctx).await,
-            InfraCommands::Unlock(args) => execute_infra_unlock(args, ctx).await,
+            InfraCommands::List(args) => execute_infra_list(&with_server!(args), ctx).await,
+            InfraCommands::Provision(args) => Ok(execute_infra_provision(&with_server!(args), ctx)
+                .await?
+                .output),
+            InfraCommands::Ssh(args) => execute_infra_ssh(&with_server!(args), ctx).await,
+            InfraCommands::ForceDelete(args) => {
+                execute_infra_force_delete(&with_server!(args), ctx).await
+            }
+            InfraCommands::Unlock(args) => execute_infra_unlock(&with_server!(args), ctx).await,
         },
         Commands::App(a) => match &a.command {
-            AppCommands::Install(args) => Ok(execute_app_install(args, ctx).await?.output),
+            AppCommands::Install(args) => {
+                Ok(execute_app_install(&with_server!(args), ctx).await?.output)
+            }
+            AppCommands::List(args) => execute_app_list(&with_server!(args), ctx).await,
         },
         Commands::Preview(p) => match &p.command {
-            PreviewCommands::Status(args) => Ok(execute_preview_status(args, ctx).await?.output),
+            PreviewCommands::Status(args) => Ok(execute_preview_status(&with_server!(args), ctx)
+                .await?
+                .output),
+        },
+        Commands::Proposal(p) => match &p.command {
+            ProposalCommands::List(args) => execute_proposal_list(&with_server!(args), ctx).await,
+            ProposalCommands::Show(args) => execute_proposal_show(&with_server!(args), ctx).await,
+            ProposalCommands::Close(args) => execute_proposal_close(&with_server!(args), ctx).await,
+            ProposalCommands::Merge(args) => execute_proposal_merge(&with_server!(args), ctx).await,
+        },
+        Commands::Catalog(c) => match &c.command {
+            CatalogCommands::List(args) => execute_catalog_list(&with_server!(args), ctx).await,
+            CatalogCommands::Show(args) => execute_catalog_show(&with_server!(args), ctx).await,
+        },
+        Commands::Tenant(t) => match &t.command {
+            TenantCommands::MigrateState(args) => {
+                let tenant = normalize_tenant_arg(&args.tenant);
+                keel_core::validate_dns_label(&tenant, "tenant")?;
+                let target = bootstrap::kube::KubeTarget::new(
+                    args.context.as_deref(),
+                    args.kubeconfig.as_deref(),
+                );
+                Ok(
+                    bootstrap::state::migrate_tenant_state(target, &tenant, args.dry_run)
+                        .await?
+                        .render(),
+                )
+            }
         },
     }
 }
@@ -349,8 +562,8 @@ mod tests {
     use super::workloads::resolve_local_fallback_ssh_info;
     use super::*;
     use crate::cli::{
-        AuthLoginArgs, BootstrapInitArgs, BootstrapRecoverArgs, InfraSshArgs, OutputFormat,
-        PreviewStatusArgs, ServeArgs,
+        BootstrapInitArgs, BootstrapRecoverArgs, InfraSshArgs, OutputFormat, PreviewStatusArgs,
+        ServeArgs,
     };
     use clap::Parser;
     use keel_core::{
@@ -371,6 +584,34 @@ mod tests {
     use keel_server::{StackSummary, build_router};
     use serde_json::json;
     use tokio::sync::oneshot;
+
+    /// Points kube-rs (and any spawned `kubectl`) at a nonexistent kubeconfig and clears in-cluster
+    /// service env vars so tests that build server state never touch the developer's ambient
+    /// cluster (`OPEN-23`). `KubeClusterStatusReader::try_default()` then fails and the server runs
+    /// in no-cluster (Git-only) mode.
+    fn isolate_from_ambient_kubeconfig() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let path = std::env::temp_dir()
+                .join(format!("keel-test-no-kubeconfig-{}", std::process::id()))
+                .join("config");
+            // SAFETY: runs exactly once (guarded by `Once`) before any kube client is constructed in
+            // this test binary; these variables are only read by kube config inference.
+            unsafe {
+                std::env::set_var("KUBECONFIG", &path);
+                std::env::remove_var("KUBERNETES_SERVICE_HOST");
+                std::env::remove_var("KUBERNETES_SERVICE_PORT");
+            }
+        });
+    }
+
+    #[test]
+    fn isolate_from_ambient_kubeconfig_points_at_missing_file() {
+        isolate_from_ambient_kubeconfig();
+        let kc = std::env::var_os("KUBECONFIG").expect("KUBECONFIG set");
+        assert!(!std::path::Path::new(&kc).exists());
+        assert!(std::env::var_os("KUBERNETES_SERVICE_HOST").is_none());
+    }
 
     struct TempTestDir {
         path: PathBuf,
@@ -634,6 +875,7 @@ spec:
             oidc_issuer: None,
             oidc_provider: crate::cli::OidcProviderArg::Rauthy,
             oidc_client_id: None,
+            oidc_public_url: None,
             admin_username: None,
             admin_password: None,
             local_dev_docker_socket_exception: false,
@@ -687,6 +929,7 @@ spec:
             oidc_issuer: None,
             oidc_provider: crate::cli::OidcProviderArg::Rauthy,
             oidc_client_id: None,
+            oidc_public_url: None,
             admin_username: None,
             admin_password: None,
             local_dev_docker_socket_exception: true,
@@ -724,6 +967,7 @@ spec:
             oidc_issuer: None,
             oidc_provider: crate::cli::OidcProviderArg::Rauthy,
             oidc_client_id: None,
+            oidc_public_url: None,
             admin_username: None,
             admin_password: None,
             local_dev_docker_socket_exception: true,
@@ -798,32 +1042,50 @@ spec:
             "--bucket",
             "pulumi-state",
             "--stack",
-            "keel/management-cluster-core/prod",
+            "stage0-control-plane-keel-mgmt",
+            "--dry-run",
         ])
         .unwrap();
 
+        // `--dry-run` prints the plan; without it recovery executes (needs S3 creds + passphrase).
         let out = dispatch(&cli, &ctx).await.unwrap();
-        assert!(out.contains("Break-Glass Control-Plane Recovery Plan"));
+        assert!(out.contains("Break-Glass Stage 0 Recovery"));
         assert!(out.contains(
-            "s3://pulumi-state?endpoint=https://s3.garage.internal:3900&s3ForcePathStyle=true"
+            "s3://pulumi-state/stage0/keel-mgmt?endpoint=s3.garage.internal:3900&region=us-east-1&s3ForcePathStyle=true"
         ));
-        assert!(out.contains("protect=true"));
-        assert!(out.contains("pulumi refresh --yes --stack keel/management-cluster-core/prod"));
+        assert!(out.contains(
+            "pulumi refresh --yes --non-interactive --stack stage0-control-plane-keel-mgmt"
+        ));
 
         // Reject flag injection in stack or invalid URL
+        let base = match Cli::try_parse_from([
+            "keel",
+            "bootstrap",
+            "recover",
+            "--s3-endpoint",
+            "https://s3.local",
+            "--dry-run",
+        ])
+        .unwrap()
+        .command
+        {
+            Commands::Bootstrap(crate::cli::BootstrapArgs {
+                command: BootstrapCommands::Recover(a),
+            }) => a,
+            _ => unreachable!(),
+        };
         let bad_stack = BootstrapRecoverArgs {
-            s3_endpoint: "https://s3.local".to_string(),
-            bucket: "pulumi-state".to_string(),
-            stack: "--malicious-flag".to_string(),
+            stacks: vec!["--malicious-flag".to_string()],
+            ..base.clone()
         };
         assert!(execute_bootstrap_recover(&bad_stack).await.is_err());
 
         let bad_url = BootstrapRecoverArgs {
             s3_endpoint: "ftp://s3.local".to_string(),
-            bucket: "pulumi-state".to_string(),
-            stack: "management-cluster-core".to_string(),
+            ..base
         };
-        assert!(execute_bootstrap_recover(&bad_url).await.is_err());
+        let err = execute_bootstrap_recover(&bad_url).await.unwrap_err();
+        assert!(err.to_string().contains("--s3-endpoint"));
     }
 
     #[test]
@@ -867,6 +1129,7 @@ spec:
                 same: 2,
                 drift: 1,
             },
+            ..PreviewReport::default()
         };
 
         let table = format_preview_table(&populated);
@@ -949,6 +1212,7 @@ spec:
 
     #[tokio::test]
     async fn full_cli_server_integration_auth_infra_app_preview_watch_and_serve() {
+        isolate_from_ambient_kubeconfig();
         let tmp = TempTestDir::new("e2e-cli");
         let work_dir = tmp.path().join("work");
         let bare_dir = tmp.path().join("work.git");
@@ -960,8 +1224,15 @@ spec:
             bare_repo: Some(bare_dir.clone()),
             config: None,
             git_token: None,
+            git_url: None,
+            git_username: None,
         };
         let (state, _) = build_serve_state(&serve_args).await.unwrap();
+        // Keep this test hermetic even when a developer kubeconfig points at a live Keel cluster:
+        // never mirror/provision tenant S3 identities against it.
+        let state = state
+            .with_s3_credentials_secret(None)
+            .with_tenant_s3_provisioner(None);
 
         // Commit enabled provider registry + catalog items onto `main`
         let mut reg = ProviderRegistry::default_day1();
@@ -1193,16 +1464,66 @@ spec:
         assert!(list_json_out.contains("\"postgres-managed\""));
 
         // 7b. `keel infra ssh` against live server (table, json, command, overrides, and flag-injection rejection)
+        // Non-VM stacks (postgres-managed is a Service) and unknown stacks are rejected instead of
+        // fabricating a `<stack>.<tenant>.local` target (`OPEN-17`).
+        for (stack, expected_err) in [
+            ("postgres-managed", "SSH not supported"),
+            ("no-such-vm", "not found"),
+        ] {
+            let ssh_cli = Cli::try_parse_from([
+                "keel",
+                "infra",
+                "ssh",
+                stack,
+                "--tenant",
+                "acme",
+                "--output",
+                "json",
+                "--server",
+                &server_url,
+            ])
+            .unwrap();
+            let err = dispatch(&ssh_cli, &ctx).await.unwrap_err().to_string();
+            assert!(
+                err.contains(expected_err),
+                "{stack}: unexpected error: {err}"
+            );
+        }
+
+        // Commit a VM stack to `main` so SSH target resolution has a real VM to resolve.
+        let vm_dir = work_dir.join("tenants/acme/infra/dev-vm");
+        tokio::fs::create_dir_all(&vm_dir).await.unwrap();
+        tokio::fs::write(
+            vm_dir.join("stack.yaml"),
+            "apiVersion: pulumi.com/v1\nkind: Stack\nmetadata:\n  name: dev-vm\n  namespace: tenant-acme\n  labels:\n    keel.io/tenant: acme\n    keel.io/provider: proxmox\n    keel.io/resource-kind: vm\nspec:\n  stack: acme/dev-vm\n",
+        )
+        .await
+        .unwrap();
+        git.add(&work_dir, ["tenants/acme/infra/dev-vm/stack.yaml"])
+            .await
+            .unwrap();
+        git.commit(
+            &work_dir,
+            "feat(acme): add dev-vm stack",
+            &CommitAuthor::new("Test Admin", "admin@keel.io"),
+        )
+        .await
+        .unwrap();
+        git.push(&work_dir, "origin", "HEAD:refs/heads/main")
+            .await
+            .unwrap();
+        git.fetch(&work_dir, "origin").await.unwrap();
+
         for (output_fmt, expected_substr) in [
-            ("table", "Stack:       postgres-managed"),
-            ("json", "\"stackName\": \"postgres-managed\""),
+            ("table", "Stack:       dev-vm"),
+            ("json", "\"stackName\": \"dev-vm\""),
             ("command", "ssh -p 2222 -i /tmp/id_key debian@"),
         ] {
             let ssh_cli = Cli::try_parse_from([
                 "keel",
                 "infra",
                 "ssh",
-                "postgres-managed",
+                "dev-vm",
                 "--tenant",
                 "acme",
                 "--user",
@@ -1226,7 +1547,7 @@ spec:
 
         // Flag injection rejection on `execute_infra_ssh`
         let bad_user_ssh = InfraSshArgs {
-            stack_name: "postgres-managed".to_string(),
+            stack_name: "dev-vm".to_string(),
             tenant: "acme".to_string(),
             user: Some("-oProxyCommand=evil".to_string()),
             port: None,
@@ -1351,6 +1672,8 @@ spec:
                 bare_repo: None,
                 config: None,
                 git_token: None,
+                git_url: None,
+                git_username: None,
             },
             async move {
                 let _ = ephemeral_rx.await;
@@ -1363,6 +1686,7 @@ spec:
 
     #[tokio::test]
     async fn oidc_login_redirect_flow_returns_pkce_authorize_url() {
+        isolate_from_ambient_kubeconfig();
         let tmp = TempTestDir::new("oidc-redirect");
         let (mut state, _) = build_serve_state(&ServeArgs {
             bind: "127.0.0.1:0".to_string(),
@@ -1370,6 +1694,8 @@ spec:
             bare_repo: None,
             config: None,
             git_token: None,
+            git_url: None,
+            git_username: None,
         })
         .await
         .unwrap();
@@ -1393,26 +1719,33 @@ spec:
                 .unwrap();
         });
 
-        let ctx = CliContext::with_credentials_path(tmp.path().join("creds.json"));
-        let args = AuthLoginArgs {
-            server: format!("http://{addr}"),
-        };
-        let outcome = execute_auth_login(&args, &ctx).await.unwrap();
-        let AuthLoginOutcome::OidcRedirect {
-            authorize_url,
-            output,
-        } = outcome;
+        // The CLI loopback login URL is accepted by the real server, which redirects to the IdP
+        // with its own S256 PKCE challenge (the CLI leg is covered in `commands::auth` tests).
+        let _ = &tmp;
+        let pkce = generate_pkce_pair();
+        let login_url = super::auth::build_cli_login_url(
+            &format!("http://{addr}"),
+            "http://127.0.0.1:53682/callback",
+            &pkce,
+            false,
+        );
+        let resp = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap()
+            .get(&login_url)
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_redirection(), "status {}", resp.status());
+        let authorize_url = resp
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap()
+            .to_string();
         assert!(authorize_url.starts_with("https://idp.acme.io/auth"));
         assert!(authorize_url.contains("code_challenge_method=S256"));
-        assert!(output.contains("OIDC PKCE URL"));
-        let server_challenge = authorize_url
-            .split('&')
-            .find_map(|p| p.strip_prefix("code_challenge="))
-            .expect("code_challenge query parameter in authorize_url");
-        assert!(
-            output.contains(&format!("(challenge S256={server_challenge})")),
-            "expected challenge S256={server_challenge} in '{output}'"
-        );
 
         let _ = tx.send(());
         handle.await.unwrap();
@@ -1420,6 +1753,7 @@ spec:
 
     #[tokio::test]
     async fn validation_guards_and_secret_redaction_edge_cases() {
+        isolate_from_ambient_kubeconfig();
         let tmp = TempTestDir::new("edge-cases");
 
         // CliContext & PkceChallenge Debug secret redaction + session override
@@ -1463,6 +1797,8 @@ spec:
                 bare_repo: None,
                 config: None,
                 git_token: None,
+                git_url: None,
+                git_username: None,
             })
             .await
             .is_err()
@@ -1488,6 +1824,7 @@ spec:
 
     #[tokio::test]
     async fn relative_repo_dir_resolves_to_absolute_bare_origin_and_repairs_existing_remote() {
+        isolate_from_ambient_kubeconfig();
         let abs = absolutize_path(Path::new("./keel-gitops")).unwrap();
         assert!(abs.is_absolute());
         assert_eq!(
@@ -1524,12 +1861,81 @@ spec:
             bare_repo: None,
             config: None,
             git_token: None,
+            git_url: None,
+            git_username: None,
         })
         .await
         .unwrap();
 
         let repaired_origin = git.get_remote_url(&work_dir, "origin").await.unwrap();
         assert_eq!(repaired_origin, bare_dir.to_string_lossy());
+    }
+
+    /// OPEN-30: `keel serve --git-url` hydrates an empty `--repo-dir` from the remote (seeding
+    /// `main` when the remote is empty), never creates a sibling bare repo, and on restart reuses
+    /// the existing clone and fetches remote updates.
+    #[tokio::test]
+    async fn serve_git_url_clones_empty_workdir_then_reuses_and_fetches() {
+        isolate_from_ambient_kubeconfig();
+        let tmp = TempTestDir::new("serve-git-url");
+        let remote = tmp.path().join("infra-gitops.git");
+        let git = GitRunner::new();
+        git.init_bare(&remote).await.unwrap();
+        let remote_url = remote.to_str().unwrap().to_string();
+        let work_dir = tmp.path().join("work");
+        let args = ServeArgs {
+            bind: "127.0.0.1:0".to_string(),
+            repo_dir: Some(work_dir.clone()),
+            bare_repo: None,
+            config: None,
+            git_token: None,
+            git_url: Some(remote_url.clone()),
+            git_username: None,
+        };
+
+        let (state, _) = build_serve_state(&args).await.unwrap();
+        assert_eq!(state.remote_url, remote_url);
+        assert!(!tmp.path().join("work.git").exists(), "no local bare repo");
+        assert_eq!(
+            git.get_remote_url(&work_dir, "origin").await.unwrap(),
+            remote_url
+        );
+        // Empty remote was seeded with `main`.
+        assert!(
+            git.ref_exists(&remote, "refs/heads/main").await.unwrap(),
+            "seed commit pushed to remote main"
+        );
+
+        // Another writer advances remote `main`; a restart must fetch it, not re-init.
+        let other = tmp.path().join("other");
+        git.clone(&remote_url, &other).await.unwrap();
+        tokio::fs::write(other.join("MARKER"), "remote-update\n")
+            .await
+            .unwrap();
+        git.add(&other, ["MARKER"]).await.unwrap();
+        let sha = git
+            .commit(
+                &other,
+                "chore: marker",
+                &CommitAuthor::new("Ops", "ops@keel.io"),
+            )
+            .await
+            .unwrap();
+        git.push(&other, "origin", "HEAD:refs/heads/main")
+            .await
+            .unwrap();
+
+        let _ = build_serve_state(&args).await.unwrap();
+        assert_eq!(git.current_head_sha(&work_dir).await.unwrap(), sha);
+        assert!(work_dir.join("MARKER").exists());
+
+        // Inline credentials in the URL are rejected (tokens only via KEEL_GIT_TOKEN).
+        let bad = ServeArgs {
+            repo_dir: Some(tmp.path().join("bad")),
+            git_url: Some("https://keel:tok@forge.invalid/keel/infra.git".to_string()),
+            ..args.clone()
+        };
+        assert!(build_serve_state(&bad).await.is_err());
     }
 
     #[tokio::test]
@@ -1558,6 +1964,7 @@ spec:
             oidc_issuer: None,
             oidc_provider: crate::cli::OidcProviderArg::Rauthy,
             oidc_client_id: None,
+            oidc_public_url: None,
             admin_username: None,
             admin_password: None,
             local_dev_docker_socket_exception: true,
