@@ -12,12 +12,6 @@ pub mod secret_store;
 pub mod telemetry;
 pub mod tenant;
 
-use futures::Stream;
-use k8s_openapi::api::core::v1::Secret;
-use keel_core::EntityMeta;
-use kube::Client;
-use tokio_stream::wrappers::ReceiverStream;
-
 pub use kyverno::{
     DockerSocketExceptionConfig, KyvernoManifestBundle, KyvernoPolicyConfig,
     build_disallow_privileged_containers_policy, build_local_kind_docker_socket_exception,
@@ -29,10 +23,9 @@ pub use live::{
     extract_conditions, extract_last_synced, extract_ready_status, extract_resource_count,
 };
 pub use secret_store::{
-    DEX_CONFIG_SECRET_NAME, GITHUB_TOKEN_SECRET_NAME, InMemorySecretStore, K8sSecretStore,
-    S3_CREDENTIALS_SECRET_NAME, SESSION_KEY_LEN, SESSION_KEY_SECRET_NAME, SecretStateStore,
-    TENANT_SOPS_AGE_SECRET_NAME, TenantAgeKey, USER_GIT_CREDS_SECRET_PREFIX, UserGitCredentials,
-    user_git_creds_secret_name,
+    GITHUB_TOKEN_SECRET_NAME, InMemorySecretStore, K8sSecretStore, S3_CREDENTIALS_SECRET_NAME,
+    SESSION_KEY_LEN, SESSION_KEY_SECRET_NAME, SecretStateStore, TENANT_SOPS_AGE_SECRET_NAME,
+    TenantAgeKey, USER_GIT_CREDS_SECRET_PREFIX, UserGitCredentials, user_git_creds_secret_name,
 };
 pub use telemetry::{
     CrdReconcileStatus, CrdWatchEvent, DEFAULT_TELEMETRY_BUFFER_CAPACITY, TelemetryMux,
@@ -74,64 +67,4 @@ pub enum KubeError {
         name: String,
         reason: String,
     },
-}
-
-/// High-level Kubernetes integration handle wrapping a `kube::Client`,
-/// stateless `K8sSecretStore`, and `TelemetryMux`.
-#[derive(Clone)]
-pub struct KubeManager {
-    pub client: Client,
-    pub telemetry: TelemetryMux,
-}
-
-impl KubeManager {
-    pub fn new(client: Client) -> Self {
-        Self {
-            client,
-            telemetry: TelemetryMux::default(),
-        }
-    }
-
-    pub fn with_telemetry(client: Client, telemetry: TelemetryMux) -> Self {
-        Self { client, telemetry }
-    }
-
-    pub fn secret_store(&self) -> K8sSecretStore {
-        K8sSecretStore::new(self.client.clone())
-    }
-}
-
-pub fn create_secret_manifest(meta: &EntityMeta) -> Secret {
-    let mut secret = Secret::default();
-    secret.metadata.name = Some(meta.name.clone());
-    secret.metadata.namespace = Some(meta.namespace.clone());
-    secret
-}
-
-pub fn create_event_stream(rx: tokio::sync::mpsc::Receiver<String>) -> impl Stream<Item = String> {
-    ReceiverStream::new(rx)
-}
-
-#[cfg(test)]
-mod tests {
-    use futures::StreamExt;
-
-    use super::*;
-
-    #[test]
-    fn test_create_secret_manifest() {
-        let meta = EntityMeta::new("db-secret", "tenant-1");
-        let secret = create_secret_manifest(&meta);
-        assert_eq!(secret.metadata.name.as_deref(), Some("db-secret"));
-        assert_eq!(secret.metadata.namespace.as_deref(), Some("tenant-1"));
-    }
-
-    #[tokio::test]
-    async fn test_create_event_stream() {
-        let (tx, rx) = tokio::sync::mpsc::channel(4);
-        tx.send("ready".to_string()).await.unwrap();
-        drop(tx);
-        let events: Vec<String> = create_event_stream(rx).collect().await;
-        assert_eq!(events, vec!["ready".to_string()]);
-    }
 }

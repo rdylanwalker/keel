@@ -216,6 +216,25 @@ pub trait LiveStatusSource: Send + Sync {
     async fn stack_outputs(&self, _namespace: &str, _name: &str) -> HashMap<String, String> {
         HashMap::new()
     }
+
+    /// Deletes a namespaced dynamic Kubernetes resource (e.g., ephemeral PKO `Stack` or Flux `GitRepository`).
+    /// Returns `Ok(true)` if deleted, `Ok(false)` if not found (or in offline mode).
+    async fn delete_dynamic_resource(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: &str,
+        name: &str,
+    ) -> Result<bool, KubeError> {
+        let _ = (api_version, kind, namespace, name);
+        Ok(false)
+    }
+
+    /// Server-side applies a cluster-scoped Kyverno `ClusterPolicy` document.
+    async fn apply_cluster_policy(&self, name: &str, policy_doc: &Value) -> Result<(), KubeError> {
+        let _ = (name, policy_doc);
+        Ok(())
+    }
 }
 
 /// Live `kube-rs` implementation querying PKO v2 `Stack`, Flux `HelmRelease`, and Flux `Kustomization` CRDs.
@@ -1246,7 +1265,119 @@ impl LiveStatusSource for KubeClusterStatusReader {
 
     async fn stack_outputs(&self, namespace: &str, name: &str) -> HashMap<String, String> {
         let secret_name = format!("{name}-outputs");
-        self.read_secret_map(namespace, &secret_name).await
+        let direct = self.read_secret_map(namespace, &secret_name).await;
+        if !direct.is_empty() {
+            return direct;
+        }
+        use k8s_openapi::api::core::v1::Secret;
+        let secrets: Api<Secret> = Api::namespaced(self.client.clone(), namespace);
+        let lp = ListParams::default().labels("auto.pulumi.com/component=update");
+        let Ok(list) = secrets.list(&lp).await else {
+            return HashMap::new();
+        };
+        let prefix = format!("{name}-");
+        let suffix = "-stack-outputs";
+        let latest = list
+            .items
+            .into_iter()
+            .filter(|s| {
+                s.metadata
+                    .name
+                    .as_deref()
+                    .is_some_and(|n| n.starts_with(&prefix) && n.ends_with(suffix))
+            })
+            .max_by_key(|s| {
+                s.metadata
+                    .resource_version
+                    .as_deref()
+                    .and_then(|rv| rv.parse::<u64>().ok())
+                    .unwrap_or(0)
+            });
+        let mut out = HashMap::new();
+        if let Some(secret) = latest
+            && let Some(data) = secret.data
+        {
+            for (k, bytes) in data {
+                if let Ok(raw) = String::from_utf8(bytes.0) {
+                    let parsed = serde_json::from_str::<String>(&raw)
+                        .unwrap_or_else(|_| raw.trim().trim_matches('"').to_string());
+                    out.insert(k, parsed);
+                }
+            }
+        }
+        out
+    }
+
+    async fn delete_dynamic_resource(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: &str,
+        name: &str,
+    ) -> Result<bool, KubeError> {
+        let ar = match (api_version, kind) {
+            ("pulumi.com/v1", "Stack") => ApiResource {
+                group: "pulumi.com".to_string(),
+                version: "v1".to_string(),
+                api_version: "pulumi.com/v1".to_string(),
+                kind: "Stack".to_string(),
+                plural: "stacks".to_string(),
+            },
+            ("source.toolkit.fluxcd.io/v1", "GitRepository") => ApiResource {
+                group: "source.toolkit.fluxcd.io".to_string(),
+                version: "v1".to_string(),
+                api_version: "source.toolkit.fluxcd.io/v1".to_string(),
+                kind: "GitRepository".to_string(),
+                plural: "gitrepositories".to_string(),
+            },
+            _ => {
+                return Err(KubeError::InvalidInput(format!(
+                    "Unsupported dynamic resource for deletion: {api_version} {kind}"
+                )));
+            }
+        };
+
+        let api: Api<DynamicObject> = Api::namespaced_with(self.client.clone(), namespace, &ar);
+        match api.delete(name, &DeleteParams::default()).await {
+            Ok(_) => Ok(true),
+            Err(kube::Error::Api(err)) if err.code == 404 => Ok(false),
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    async fn apply_cluster_policy(&self, name: &str, policy_doc: &Value) -> Result<(), KubeError> {
+        let api_version = policy_doc
+            .get("apiVersion")
+            .and_then(|v| v.as_str())
+            .unwrap_or("policies.kyverno.io/v1");
+        let kind = policy_doc
+            .get("kind")
+            .and_then(|v| v.as_str())
+            .unwrap_or("ValidatingPolicy");
+        let (group, version) = match api_version.split_once('/') {
+            Some((g, v)) => (g.to_string(), v.to_string()),
+            None => (String::new(), api_version.to_string()),
+        };
+        let plural = match kind {
+            "ValidatingPolicy" => "validatingpolicies".to_string(),
+            "ClusterPolicy" => "clusterpolicies".to_string(),
+            other => format!("{}s", other.to_ascii_lowercase()),
+        };
+        let ar = ApiResource {
+            group,
+            version,
+            api_version: api_version.to_string(),
+            kind: kind.to_string(),
+            plural,
+        };
+        let api: Api<DynamicObject> = Api::all_with(self.client.clone(), &ar);
+        api.patch(
+            name,
+            &PatchParams::apply("keel-server").force(),
+            &Patch::Apply(policy_doc),
+        )
+        .await?;
+        Ok(())
     }
 }
 
@@ -1928,6 +2059,17 @@ mod tests {
         assert!(stub.unlock_stack("tenant-a", "s1").await.is_err());
         assert!(stub.reconcile_release("tenant-a", "r1").await.is_err());
         assert!(stub.stack_outputs("tenant-a", "s1").await.is_empty());
+        assert!(
+            !stub
+                .delete_dynamic_resource("pulumi.com/v1", "Stack", "keel-previews", "s1")
+                .await
+                .unwrap()
+        );
+        assert!(
+            stub.apply_cluster_policy("restrict-pulumi-providers", &json!({}))
+                .await
+                .is_ok()
+        );
     }
 
     async fn spawn_mock_k8s_server<F>(handler: F) -> String
@@ -2299,6 +2441,20 @@ mod tests {
                     404,
                     json!({ "kind": "Status", "status": "Failure", "code": 404, "message": "not found", "reason": "NotFound" }).to_string(),
                 ),
+                ("DELETE", "/apis/pulumi.com/v1/namespaces/keel-previews/stacks/pr-1-stack")
+                | ("DELETE", "/apis/source.toolkit.fluxcd.io/v1/namespaces/keel-previews/gitrepositories/pr-1-repo") => (
+                    200,
+                    json!({ "apiVersion": "v1", "kind": "Status", "status": "Success" }).to_string(),
+                ),
+                ("PATCH", "/apis/kyverno.io/v1/clusterpolicies/restrict-pulumi-providers") => (
+                    200,
+                    json!({
+                        "apiVersion": "kyverno.io/v1",
+                        "kind": "ClusterPolicy",
+                        "metadata": { "name": "restrict-pulumi-providers" }
+                    })
+                    .to_string(),
+                ),
                 _ => (
                     404,
                     json!({ "kind": "Status", "status": "Failure", "code": 404, "message": "not found", "reason": "NotFound" }).to_string(),
@@ -2417,5 +2573,47 @@ mod tests {
             .await
             .unwrap();
         assert!(force_msg.contains("Cleared finalizers and force-deleted Stack tenant-a/my-stack"));
+
+        assert!(
+            reader
+                .delete_dynamic_resource("pulumi.com/v1", "Stack", "keel-previews", "pr-1-stack")
+                .await
+                .unwrap()
+        );
+        assert!(
+            reader
+                .delete_dynamic_resource(
+                    "source.toolkit.fluxcd.io/v1",
+                    "GitRepository",
+                    "keel-previews",
+                    "pr-1-repo"
+                )
+                .await
+                .unwrap()
+        );
+        assert!(
+            !reader
+                .delete_dynamic_resource("pulumi.com/v1", "Stack", "keel-previews", "missing-stack")
+                .await
+                .unwrap()
+        );
+        assert!(
+            reader
+                .delete_dynamic_resource("v1", "ConfigMap", "keel-previews", "cm")
+                .await
+                .is_err()
+        );
+
+        let policy_doc = json!({
+            "apiVersion": "kyverno.io/v1",
+            "kind": "ClusterPolicy",
+            "metadata": { "name": "restrict-pulumi-providers" }
+        });
+        assert!(
+            reader
+                .apply_cluster_policy("restrict-pulumi-providers", &policy_doc)
+                .await
+                .is_ok()
+        );
     }
 }

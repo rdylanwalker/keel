@@ -26,9 +26,6 @@ use tokio::sync::RwLock;
 use crate::KubeError;
 use crate::tenant::tenant_namespace;
 
-/// Secret name holding the Stage 0 Dex OIDC configuration & bcrypt admin password in `keel-system`.
-pub const DEX_CONFIG_SECRET_NAME: &str = "dex-config";
-
 /// Secret name holding the cluster-managed 256-bit session key in `keel-system`.
 pub const SESSION_KEY_SECRET_NAME: &str = "session-key";
 
@@ -201,9 +198,9 @@ pub trait SecretStateStore: Send + Sync {
     ) -> Result<bool, KubeError>;
 }
 
-/// Internal low-level `Secret` CRUD abstraction shared between `K8sSecretStore` and `InMemorySecretStore`.
+/// Low-level `Secret` CRUD abstraction shared between `K8sSecretStore` and `InMemorySecretStore`.
 #[async_trait]
-trait SecretBackend: Send + Sync {
+pub trait SecretBackend: Send + Sync {
     async fn get_secret(&self, namespace: &str, name: &str) -> Result<Option<Secret>, KubeError>;
     async fn upsert_secret(&self, namespace: &str, secret: Secret) -> Result<Secret, KubeError>;
     async fn create_secret_if_absent(
@@ -377,67 +374,7 @@ impl SecretBackend for InMemorySecretStore {
 }
 
 #[async_trait]
-impl SecretStateStore for K8sSecretStore {
-    async fn get_or_create_session_key(&self) -> Result<[u8; SESSION_KEY_LEN], KubeError> {
-        get_or_create_session_key_impl(self).await
-    }
-
-    async fn put_user_git_creds(
-        &self,
-        oidc_sub: &str,
-        creds: &UserGitCredentials,
-        encryption_key: &[u8; SESSION_KEY_LEN],
-    ) -> Result<(), KubeError> {
-        put_user_git_creds_impl(self, oidc_sub, creds, encryption_key).await
-    }
-
-    async fn get_user_git_creds(
-        &self,
-        oidc_sub: &str,
-        encryption_key: &[u8; SESSION_KEY_LEN],
-    ) -> Result<Option<UserGitCredentials>, KubeError> {
-        get_user_git_creds_impl(self, oidc_sub, encryption_key).await
-    }
-
-    async fn store_tenant_age_key(
-        &self,
-        tenant_id: &str,
-        age_key: &TenantAgeKey,
-    ) -> Result<(), KubeError> {
-        store_tenant_age_key_impl(self, tenant_id, age_key).await
-    }
-
-    async fn get_tenant_age_key(&self, tenant_id: &str) -> Result<Option<TenantAgeKey>, KubeError> {
-        get_tenant_age_key_impl(self, tenant_id).await
-    }
-
-    async fn has_s3_credentials(&self) -> Result<bool, KubeError> {
-        has_s3_credentials_impl(self).await
-    }
-
-    async fn ensure_s3_credentials_in_namespace(
-        &self,
-        target_namespace: &str,
-    ) -> Result<bool, KubeError> {
-        ensure_s3_credentials_in_namespace_impl(self, target_namespace).await
-    }
-
-    async fn ensure_github_token_in_namespace(
-        &self,
-        target_namespace: &str,
-    ) -> Result<bool, KubeError> {
-        ensure_secret_in_namespace_impl(
-            self,
-            target_namespace,
-            GITHUB_TOKEN_SECRET_NAME,
-            "github-token",
-        )
-        .await
-    }
-}
-
-#[async_trait]
-impl SecretStateStore for InMemorySecretStore {
+impl<B: SecretBackend> SecretStateStore for B {
     async fn get_or_create_session_key(&self) -> Result<[u8; SESSION_KEY_LEN], KubeError> {
         get_or_create_session_key_impl(self).await
     }

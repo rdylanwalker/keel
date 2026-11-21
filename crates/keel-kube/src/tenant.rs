@@ -33,49 +33,19 @@ pub fn validate_tenant_id(tenant_id: &str) -> Result<(), KubeError> {
             "tenant ID `{tenant_id}` must be 1..={MAX_TENANT_ID_LEN} characters"
         )));
     }
-    let bytes = tenant_id.as_bytes();
-    let starts_ends_alnum = bytes[0].is_ascii_lowercase() || bytes[0].is_ascii_digit();
-    let ends_alnum =
-        bytes[bytes.len() - 1].is_ascii_lowercase() || bytes[bytes.len() - 1].is_ascii_digit();
-    let all_valid = bytes
-        .iter()
-        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-');
-
-    if !starts_ends_alnum || !ends_alnum || !all_valid {
-        return Err(KubeError::InvalidInput(format!(
-            "tenant ID `{tenant_id}` must contain only lowercase alphanumeric characters or `-`, and start/end with an alphanumeric character"
-        )));
-    }
-    Ok(())
+    keel_core::validate_dns_label(tenant_id, "tenant_id")
+        .map_err(|e| KubeError::InvalidInput(e.to_string()))
 }
 
 /// Validates a Kubernetes resource name (RFC 1123 DNS subdomain segment).
 pub fn validate_resource_name(field: &str, name: &str) -> Result<(), KubeError> {
-    if name.is_empty() || name.len() > 63 {
-        return Err(KubeError::InvalidInput(format!(
-            "{field} `{name}` must be 1..=63 characters"
-        )));
-    }
-    let bytes = name.as_bytes();
-    let valid_start = bytes[0].is_ascii_lowercase() || bytes[0].is_ascii_digit();
-    let valid_end =
-        bytes[bytes.len() - 1].is_ascii_lowercase() || bytes[bytes.len() - 1].is_ascii_digit();
-    let all_valid = bytes
-        .iter()
-        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-');
-
-    if !valid_start || !valid_end || !all_valid {
-        return Err(KubeError::InvalidInput(format!(
-            "{field} `{name}` must be a valid RFC 1123 DNS label"
-        )));
-    }
-    Ok(())
+    keel_core::validate_dns_label(name, field).map_err(|e| KubeError::InvalidInput(e.to_string()))
 }
 
 /// Maps a validated `<tenant-id>` to its isolated Kubernetes namespace `tenant-<tenant-id>`.
 pub fn tenant_namespace(tenant_id: &str) -> Result<String, KubeError> {
     validate_tenant_id(tenant_id)?;
-    Ok(format!("{TENANT_NAMESPACE_PREFIX}{tenant_id}"))
+    keel_core::tenant_namespace(tenant_id).map_err(|e| KubeError::InvalidInput(e.to_string()))
 }
 
 /// Returns the default Flux/PKO reconciliation `ServiceAccount` name for a tenant.
