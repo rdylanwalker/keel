@@ -30,6 +30,14 @@ config:
     default: tenant-default
 
 variables:
+  # Kubeconfig with the API server rewritten to the in-network `kind` control-plane address.
+  inClusterKubeconfig:
+    fn::secret:
+      fn::join:
+        - https://${clusterName}-control-plane:6443
+        - fn::split:
+            - ${workloadCluster.endpoint}
+            - ${workloadCluster.kubeconfig}
   nodeTopologies:
     - - role: control-plane
     - - role: control-plane
@@ -65,13 +73,34 @@ resources:
         name: ${kubeconfigSecretName}
         namespace: ${kubeconfigSecretNamespace}
       stringData:
-        kubeconfig:
-          fn::secret:
-            fn::join:
-              - https://${clusterName}-control-plane:6443
-              - fn::split:
-                  - ${workloadCluster.endpoint}
-                  - ${workloadCluster.kubeconfig}
+        kubeconfig: ${inClusterKubeconfig}
+
+  # Kubernetes provider for the new workload cluster (reachable from the PKO workspace pod via
+  # the shared `kind` Docker network).
+  workloadProvider:
+    type: pulumi:providers:kubernetes
+    properties:
+      kubeconfig: ${inClusterKubeconfig}
+
+  # Flux reconciles tenant HelmReleases/Kustomizations on this cluster through the kubeconfig
+  # Secret while impersonating the owning tenant's ServiceAccount
+  # (`system:serviceaccount:tenant-<id>:tenant-<id>-sa`, Flux multi-tenancy lockdown). The tenant
+  # owns this cluster outright (it holds its admin kubeconfig), so that identity is cluster-admin.
+  tenantFluxAccess:
+    type: kubernetes:rbac.authorization.k8s.io/v1:ClusterRoleBinding
+    options:
+      provider: ${workloadProvider}
+    properties:
+      metadata:
+        name: keel-tenant-flux
+      roleRef:
+        apiGroup: rbac.authorization.k8s.io
+        kind: ClusterRole
+        name: cluster-admin
+      subjects:
+        - kind: ServiceAccount
+          name: ${kubeconfigSecretNamespace}-sa
+          namespace: ${kubeconfigSecretNamespace}
 
 outputs:
   clusterName: ${workloadCluster.name}

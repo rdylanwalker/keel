@@ -9,6 +9,9 @@ metadata:
     keel.io/protect: "true"
 spec:
   interval: 10m
+  # Same release name/namespace as the Stage 0 Pulumi install so Flux adopts it in place.
+  storageNamespace: keel-system
+  releaseName: cert-manager
   chart:
     spec:
       chart: cert-manager

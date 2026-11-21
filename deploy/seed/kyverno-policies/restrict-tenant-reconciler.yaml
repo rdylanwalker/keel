@@ -1,0 +1,37 @@
+# Kyverno ValidatingPolicy: restrict-tenant-reconciler (NFR-SEC-02, NFR-SEC-04)
+# Mirrors `keel_kube::kyverno::build_restrict_tenant_reconciler_policy()`.
+# Confines `flux-system/keel-tenant-reconciler` (impersonated by the root tenants Flux
+# Kustomization) to `tenant-*` namespaces. Fails closed.
+apiVersion: policies.kyverno.io/v1
+kind: ValidatingPolicy
+metadata:
+  name: restrict-tenant-reconciler
+  labels:
+    app.kubernetes.io/managed-by: keel
+    keel.io/policy-tier: tenant-isolation
+spec:
+  validationActions:
+    - Deny
+  failurePolicy: Fail
+  evaluation:
+    background:
+      enabled: false
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["*"]
+        apiVersions: ["*"]
+        operations: ["CREATE", "UPDATE", "DELETE"]
+        resources: ["*"]
+  matchConditions:
+    - name: tenant-reconciler-only
+      expression: "request.userInfo.username == 'system:serviceaccount:flux-system:keel-tenant-reconciler'"
+  validations:
+    - expression: >-
+        (has(request.namespace) ? request.namespace : '') != '' ? (has(request.namespace) ? request.namespace : '').startsWith('tenant-') : (request.kind.kind == 'Namespace' ? request.name.startsWith('tenant-') : request.kind.kind == 'ClusterRoleBinding')
+      message: "keel-tenant-reconciler may only manage objects in tenant-* namespaces."
+    - expression: >-
+        request.kind.kind != 'ClusterRoleBinding' || request.operation == 'DELETE' || (object.roleRef.name == 'system:auth-delegator' && has(object.subjects) && object.subjects.all(s, s.kind == 'ServiceAccount' && has(s.namespace) && s.namespace.startsWith('tenant-')))
+      message: "keel-tenant-reconciler may only bind ClusterRole/system:auth-delegator to tenant ServiceAccounts."
+    - expression: >-
+        request.kind.kind != 'RoleBinding' || request.operation == 'DELETE' || (object.subjects.all(s, s.kind != 'ServiceAccount' || (has(s.namespace) && s.namespace == (has(request.namespace) ? request.namespace : '')))) || (object.roleRef.kind == 'ClusterRole' && object.roleRef.name == 'keel-server-tenant' && has(object.subjects) && object.subjects.all(s, s.kind == 'ServiceAccount' && s.name == 'keel-server' && has(s.namespace) && s.namespace == 'keel-system'))
+      message: "Tenant RoleBindings may only reference ServiceAccounts from the same tenant namespace (or bind ClusterRole/keel-server-tenant to keel-system/keel-server)."

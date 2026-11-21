@@ -11,7 +11,7 @@ spec:
   upstream:
     chart: kyverno
     repoURL: https://kyverno.github.io/kyverno/
-    version: "3.3.7"
+    version: "3.10.0"
   progressiveDelivery:
     flaggerSupported: false
     defaultCanary: false

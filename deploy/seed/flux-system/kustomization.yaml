@@ -1,15 +1,11 @@
-# Flux CD Control-Plane Kustomization enforcing strict multi-tenancy (`--no-cross-namespace-refs=true`, `NFR-SEC-02`)
+# Flux CD control-plane Kustomization.
+# Multi-tenancy lockdown (`--no-cross-namespace-refs=true`, `--default-service-account=default`,
+# `NFR-SEC-02`) is configured on the Flux controllers themselves through the flux2 Helm chart
+# `multitenancy` values in `deploy/bootstrap/control-plane/Pulumi.yaml`; the controller
+# Deployments are not part of this kustomization, so no patches are applied here.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
   - git-repository.yaml
+  - tenant-reconciler-rbac.yaml
   - gotk-sync.yaml
-patches:
-  - target:
-      kind: Deployment
-      name: "(kustomize-controller|helm-controller)"
-      namespace: flux-system
-    patch: |
-      - op: add
-        path: /spec/template/spec/containers/0/args/-
-        value: --no-cross-namespace-refs=true

@@ -1,4 +1,9 @@
-# Kyverno Admission Controller with `PolicyException` restricted to `keel-system` (`SDD.md` §6.2, `NFR-SEC-04`)
+# Kyverno admission controller (`SDD.md` §6.2, `NFR-SEC-04`).
+# Adopts the Stage 0 release installed by `deploy/bootstrap/control-plane/Pulumi.yaml` in place:
+# same release name (`kyverno`), namespace (`keel-system`), chart version and values. Chart 3.10.0
+# ships CRDs serving `policies.kyverno.io/v1` (ValidatingPolicy, GeneratingPolicy, PolicyException)
+# used by `deploy/seed/kyverno-policies`. The `# keel:policy-exceptions` marker is rendered by
+# `keel bootstrap init` to mirror `--local-dev-docker-socket-exception`.
 apiVersion: helm.toolkit.fluxcd.io/v2
 kind: HelmRelease
 metadata:
@@ -9,10 +14,12 @@ metadata:
     keel.io/protect: "true"
 spec:
   interval: 10m
+  releaseName: kyverno
+  storageNamespace: keel-system
   chart:
     spec:
       chart: kyverno
-      version: "3.3.7"
+      version: "3.10.0"
       sourceRef:
         kind: HelmRepository
         name: kyverno
@@ -26,15 +33,20 @@ spec:
       retries: 1
       strategy: rollback
   values:
+    # Keel only uses the CEL `policies.kyverno.io/v1` policy types. Kyverno 1.20 no longer
+    # executes the deprecated `kyverno.io` policy kinds, and installing their CRDs only makes
+    # the controllers emit deprecation warnings, so they are not installed.
+    crds:
+      groups:
+        kyverno:
+          clusterpolicies: false
+          policies: false
+          policyexceptions: false
+          cleanuppolicies: false
+          clustercleanuppolicies: false
     admissionController:
-      replicas: 2
-      container:
-        extraArgs:
-          enablePolicyException: "true"
-          exceptionNamespace: keel-system
-    backgroundController:
-      enabled: true
-    cleanupController:
-      enabled: true
-    reportsController:
-      enabled: true
+      replicas: 1
+    features:
+      policyExceptions:
+        enabled: true # keel:policy-exceptions
+        namespace: keel-system

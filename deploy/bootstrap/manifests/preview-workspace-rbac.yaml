@@ -1,0 +1,42 @@
+# ServiceAccount used by ephemeral PKO v2 preview Stack workspaces in `keel-previews`
+# (`SDD.md` §4.2). PKO v2 workspaces authenticate to the operator via TokenReview, which requires
+# `system:auth-delegator`. Read access uses the built-in aggregated `view` ClusterRole, which
+# deliberately excludes Secrets; previews never get write access to the cluster.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: keel-preview-readonly
+  namespace: keel-previews
+  labels:
+    app.kubernetes.io/managed-by: keel
+    keel.io/role: preview-readonly
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: keel-preview-readonly:auth-delegator
+  labels:
+    app.kubernetes.io/managed-by: keel
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:auth-delegator
+subjects:
+  - kind: ServiceAccount
+    name: keel-preview-readonly
+    namespace: keel-previews
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: keel-preview-readonly:view
+  labels:
+    app.kubernetes.io/managed-by: keel
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: view
+subjects:
+  - kind: ServiceAccount
+    name: keel-preview-readonly
+    namespace: keel-previews

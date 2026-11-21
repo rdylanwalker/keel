@@ -11,7 +11,7 @@ spec:
   upstream:
     chart: seaweedfs
     repoURL: https://seaweedfs.github.io/seaweedfs/helm
-    version: "4.53.0"
+    version: "4.54.0"
   progressiveDelivery:
     flaggerSupported: false
     defaultCanary: false

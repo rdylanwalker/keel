@@ -17,7 +17,7 @@ spec:
         resources: ["stacks"]
   matchConditions:
     - name: tenant-or-preview-namespace
-      expression: "request.namespace == 'keel-previews' || request.namespace.startsWith('tenant-')"
+      expression: "(has(request.namespace) ? request.namespace : '') == 'keel-previews' || (has(request.namespace) ? request.namespace : '').startsWith('tenant-')"
   validations:
     - expression: >-
         has(object.metadata.labels) && ('keel.io/provider' in object.metadata.labels) && object.metadata.labels['keel.io/provider'] in ["kind","proxmox","aws","gcp","azure","hetzner"]

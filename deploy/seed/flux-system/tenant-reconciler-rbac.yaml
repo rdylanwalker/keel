@@ -1,0 +1,87 @@
+# Confined identity impersonated by the root tenants Flux Kustomization (`tenants-root` /
+# `keel-tenants`) under multi-tenancy lockdown (`NFR-SEC-02`, `NFR-SEC-04`).
+# Mirrors `keel_kube::tenant::build_tenant_reconciler_rbac()`.
+#
+# - Covers only the kinds Keel writes under `tenants/` (tenant onboarding + tenant workloads).
+# - May bind only ClusterRole/admin and ClusterRole/keel-server-tenant (namespaced RoleBindings)
+#   and ClusterRole/system:auth-delegator;
+#   it cannot create Roles/ClusterRoles, escalate, or impersonate, so it cannot mint cluster-admin.
+# - The Kyverno ValidatingPolicy `restrict-tenant-reconciler` confines all of its writes to
+#   `tenant-*` namespaces (and auth-delegator bindings for tenant ServiceAccounts).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: keel-tenant-reconciler
+  namespace: flux-system
+  labels:
+    app.kubernetes.io/managed-by: keel
+    app.kubernetes.io/part-of: keel-control-plane
+automountServiceAccountToken: false
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: keel-tenant-reconciler
+  labels:
+    app.kubernetes.io/managed-by: keel
+    app.kubernetes.io/part-of: keel-control-plane
+rules:
+  - apiGroups: [""]
+    resources: ["namespaces", "serviceaccounts", "secrets", "configmaps", "services", "resourcequotas", "limitranges", "persistentvolumeclaims"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["rolebindings", "clusterrolebindings"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["clusterroles"]
+    resourceNames: ["admin", "keel-server-tenant", "system:auth-delegator"]
+    verbs: ["bind"]
+  - apiGroups: ["source.toolkit.fluxcd.io"]
+    resources: ["gitrepositories", "helmrepositories", "ocirepositories", "helmcharts", "buckets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["kustomize.toolkit.fluxcd.io"]
+    resources: ["kustomizations"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["helm.toolkit.fluxcd.io"]
+    resources: ["helmreleases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["pulumi.com"]
+    resources: ["stacks", "programs"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["flagger.app"]
+    resources: ["canaries", "metrictemplates", "alertproviders"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources: ["httproutes", "grpcroutes", "referencegrants"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "statefulsets", "daemonsets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["batch"]
+    resources: ["jobs", "cronjobs"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["policy"]
+    resources: ["poddisruptionbudgets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["autoscaling"]
+    resources: ["horizontalpodautoscalers"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: keel-tenant-reconciler
+  labels:
+    app.kubernetes.io/managed-by: keel
+    app.kubernetes.io/part-of: keel-control-plane
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: keel-tenant-reconciler
+subjects:
+  - kind: ServiceAccount
+    name: keel-tenant-reconciler
+    namespace: flux-system

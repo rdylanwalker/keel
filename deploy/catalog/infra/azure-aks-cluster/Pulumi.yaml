@@ -24,6 +24,34 @@ config:
     type: string
     default: tenant-default
 
+variables:
+  # AKS local admin kubeconfig (client certificate, base64-encoded by the ARM API). Used only by
+  # `workloadProvider`.
+  aksAdminKubeconfigs:
+    fn::invoke:
+      function: azure-native:containerservice:listManagedClusterAdminCredentials
+      arguments:
+        resourceGroupName: ${resourceGroup.name}
+        resourceName: ${aksCluster.name}
+      return: kubeconfigs
+  keelFluxBearerToken:
+    fn::fromBase64: ${keelFluxToken.data.token}
+  aksAdminKubeconfig:
+    fn::secret:
+      fn::fromBase64: ${aksAdminKubeconfigs[0].value}
+  # AKS exposes no cluster CA output; take the (base64) `certificate-authority-data` line from
+  # the admin kubeconfig.
+  aksClusterCaData:
+    fn::select:
+      - 0
+      - fn::split:
+          - "\n"
+          - fn::select:
+              - 1
+              - fn::split:
+                  - "certificate-authority-data: "
+                  - ${aksAdminKubeconfig}
+
 resources:
   resourceGroup:
     type: azure-native:resources:ResourceGroup
@@ -48,6 +76,72 @@ resources:
       identity:
         type: SystemAssigned
 
+  # Kubernetes provider for the new workload cluster, authenticated with the AKS admin credential.
+  workloadProvider:
+    type: pulumi:providers:kubernetes
+    properties:
+      kubeconfig: ${aksAdminKubeconfig}
+
+  # Long-lived static credential for Flux. Flux controllers cannot run exec credential plugins
+  # (no cloud CLIs in their images), so the kubeconfig Secret carries a ServiceAccount token
+  # minted on the workload cluster instead of the deployer's short-lived cloud token.
+  keelFluxServiceAccount:
+    type: kubernetes:core/v1:ServiceAccount
+    options:
+      provider: ${workloadProvider}
+    properties:
+      metadata:
+        name: keel-flux
+        namespace: kube-system
+
+  keelFluxToken:
+    type: kubernetes:core/v1:Secret
+    options:
+      provider: ${workloadProvider}
+    properties:
+      metadata:
+        name: keel-flux-token
+        namespace: kube-system
+        annotations:
+          kubernetes.io/service-account.name: ${keelFluxServiceAccount.metadata.name}
+      type: kubernetes.io/service-account-token
+
+  keelFluxClusterAdmin:
+    type: kubernetes:rbac.authorization.k8s.io/v1:ClusterRoleBinding
+    options:
+      provider: ${workloadProvider}
+    properties:
+      metadata:
+        name: keel-flux
+      roleRef:
+        apiGroup: rbac.authorization.k8s.io
+        kind: ClusterRole
+        name: cluster-admin
+      subjects:
+        - kind: ServiceAccount
+          name: ${keelFluxServiceAccount.metadata.name}
+          namespace: kube-system
+
+  # Flux reconciles tenant HelmReleases/Kustomizations on this cluster through the kubeconfig
+  # Secret while impersonating the owning tenant's ServiceAccount
+  # (`system:serviceaccount:tenant-<id>:tenant-<id>-sa`, Flux multi-tenancy lockdown). The tenant
+  # owns this cluster outright (it holds its admin kubeconfig), so that identity is cluster-admin.
+  tenantFluxAccess:
+    type: kubernetes:rbac.authorization.k8s.io/v1:ClusterRoleBinding
+    options:
+      provider: ${workloadProvider}
+    properties:
+      metadata:
+        name: keel-tenant-flux
+      roleRef:
+        apiGroup: rbac.authorization.k8s.io
+        kind: ClusterRole
+        name: cluster-admin
+      subjects:
+        - kind: ServiceAccount
+          name: ${kubeconfigSecretNamespace}-sa
+          namespace: ${kubeconfigSecretNamespace}
+
   kubeconfigSecret:
     type: kubernetes:core/v1:Secret
     properties:
@@ -58,32 +152,22 @@ resources:
         kubeconfig:
           fn::secret: |
             apiVersion: v1
-            clusters:
-            - cluster:
-                server: https://${aksCluster.fqdn}
-              name: aks
-            contexts:
-            - context:
-                cluster: aks
-                user: aksUser
-              name: aksContext
-            current-context: aksContext
             kind: Config
-            preferences: {}
+            clusters:
+            - name: workload
+              cluster:
+                server: https://${aksCluster.fqdn}
+                certificate-authority-data: ${aksClusterCaData}
+            contexts:
+            - name: keel-flux
+              context:
+                cluster: workload
+                user: keel-flux
+            current-context: keel-flux
             users:
-            - name: aksUser
+            - name: keel-flux
               user:
-                exec:
-                  apiVersion: client.authentication.k8s.io/v1beta1
-                  command: kubelogin
-                  args:
-                    - "get-token"
-                    - "--login"
-                    - "spn"
-                    - "--environment"
-                    - "AzurePublicCloud"
-                    - "--server-id"
-                    - "6dae42f8-4368-4678-94ff-3960e28e3630" # Default AKS server ID
+                token: ${keelFluxBearerToken}
 
 outputs:
   clusterName: ${aksCluster.name}

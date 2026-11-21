@@ -11,7 +11,7 @@ spec:
   upstream:
     chart: prometheus
     repoURL: https://prometheus-community.github.io/helm-charts
-    version: "27.5.0"
+    version: "29.48.0"
   progressiveDelivery:
     flaggerSupported: false
     defaultCanary: false

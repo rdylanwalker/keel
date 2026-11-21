@@ -27,6 +27,16 @@ config:
     type: string
     default: tenant-default
 
+variables:
+  # Short-lived OAuth access token of the identity running this deployment (GKE maps it to
+  # cluster-admin through IAM `container.admin`). Used only by `workloadProvider`.
+  gkeDeployerToken:
+    fn::invoke:
+      function: gcp:organizations:getClientConfig
+      return: accessToken
+  keelFluxBearerToken:
+    fn::fromBase64: ${keelFluxToken.data.token}
+
 resources:
   gkeCluster:
     type: gcp:container:Cluster
@@ -44,6 +54,90 @@ resources:
           - "https://www.googleapis.com/auth/logging.write"
           - "https://www.googleapis.com/auth/monitoring"
 
+  # Kubernetes provider for the new workload cluster, authenticated with the deployer's OAuth token.
+  workloadProvider:
+    type: pulumi:providers:kubernetes
+    properties:
+      kubeconfig:
+        fn::secret: |
+          apiVersion: v1
+          kind: Config
+          clusters:
+          - name: workload
+            cluster:
+              server: https://${gkeCluster.endpoint}
+              certificate-authority-data: ${gkeCluster.masterAuth.clusterCaCertificate}
+          contexts:
+          - name: deployer
+            context:
+              cluster: workload
+              user: deployer
+          current-context: deployer
+          users:
+          - name: deployer
+            user:
+              token: ${gkeDeployerToken}
+
+  # Long-lived static credential for Flux. Flux controllers cannot run exec credential plugins
+  # (no cloud CLIs in their images), so the kubeconfig Secret carries a ServiceAccount token
+  # minted on the workload cluster instead of the deployer's short-lived cloud token.
+  keelFluxServiceAccount:
+    type: kubernetes:core/v1:ServiceAccount
+    options:
+      provider: ${workloadProvider}
+    properties:
+      metadata:
+        name: keel-flux
+        namespace: kube-system
+
+  keelFluxToken:
+    type: kubernetes:core/v1:Secret
+    options:
+      provider: ${workloadProvider}
+    properties:
+      metadata:
+        name: keel-flux-token
+        namespace: kube-system
+        annotations:
+          kubernetes.io/service-account.name: ${keelFluxServiceAccount.metadata.name}
+      type: kubernetes.io/service-account-token
+
+  keelFluxClusterAdmin:
+    type: kubernetes:rbac.authorization.k8s.io/v1:ClusterRoleBinding
+    options:
+      provider: ${workloadProvider}
+    properties:
+      metadata:
+        name: keel-flux
+      roleRef:
+        apiGroup: rbac.authorization.k8s.io
+        kind: ClusterRole
+        name: cluster-admin
+      subjects:
+        - kind: ServiceAccount
+          name: ${keelFluxServiceAccount.metadata.name}
+          namespace: kube-system
+
+  # Flux reconciles tenant HelmReleases/Kustomizations on this cluster through the kubeconfig
+  # Secret while impersonating the owning tenant's ServiceAccount
+  # (`system:serviceaccount:tenant-<id>:tenant-<id>-sa`, Flux multi-tenancy lockdown). The tenant
+  # owns this cluster outright (it holds its admin kubeconfig), so that identity is cluster-admin.
+  tenantFluxAccess:
+    type: kubernetes:rbac.authorization.k8s.io/v1:ClusterRoleBinding
+    options:
+      provider: ${workloadProvider}
+    properties:
+      metadata:
+        name: keel-tenant-flux
+      roleRef:
+        apiGroup: rbac.authorization.k8s.io
+        kind: ClusterRole
+        name: cluster-admin
+      subjects:
+        - kind: ServiceAccount
+          name: ${kubeconfigSecretNamespace}-sa
+          namespace: ${kubeconfigSecretNamespace}
+
   kubeconfigSecret:
     type: kubernetes:core/v1:Secret
     properties:
@@ -54,25 +148,22 @@ resources:
         kubeconfig:
           fn::secret: |
             apiVersion: v1
-            clusters:
-            - cluster:
-                certificate-authority-data: ${gkeCluster.masterAuth.clusterCaCertificate}
-                server: https://${gkeCluster.endpoint}
-              name: gke-cluster
-            contexts:
-            - context:
-                cluster: gke-cluster
-                user: gke-user
-              name: gke-context
-            current-context: gke-context
             kind: Config
-            preferences: {}
+            clusters:
+            - name: workload
+              cluster:
+                server: https://${gkeCluster.endpoint}
+                certificate-authority-data: ${gkeCluster.masterAuth.clusterCaCertificate}
+            contexts:
+            - name: keel-flux
+              context:
+                cluster: workload
+                user: keel-flux
+            current-context: keel-flux
             users:
-            - name: gke-user
+            - name: keel-flux
               user:
-                exec:
-                  apiVersion: client.authentication.k8s.io/v1beta1
-                  command: gke-gcloud-auth-plugin
+                token: ${keelFluxBearerToken}
 
 outputs:
   clusterName: ${gkeCluster.name}

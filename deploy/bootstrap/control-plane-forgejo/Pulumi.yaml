@@ -26,6 +26,8 @@ resources:
     properties:
       name: forgejo
       chart: oci://code.forgejo.org/forgejo-helm/forgejo
+      # Pinned (latest stable at time of pinning via `helm show chart`); Renovate bumps it.
+      version: "17.3.3"
       namespace: keel-system
       createNamespace: true
       waitForJobs: true
@@ -33,8 +35,10 @@ resources:
       values:
         gitea:
           admin:
-            username: keel
-            password: keel-admin-dev
+            # Credentials are generated per cluster by `keel bootstrap init` (or taken from
+            # KEEL_FORGEJO_ADMIN_PASSWORD) and stored in this Secret before the chart installs;
+            # no password ever appears in Helm or Pulumi values.
+            existingSecret: keel-forgejo-admin
             email: admin@keel.local
           config:
             server:

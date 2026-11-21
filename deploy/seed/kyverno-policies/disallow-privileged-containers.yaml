@@ -1,4 +1,7 @@
 # Kyverno ValidatingPolicy: disallow-privileged-containers (NFR-SEC-03, NFR-SEC-04)
+# Mirrors `keel_kube::kyverno::build_disallow_privileged_containers_policy()`.
+# Applies to containers, initContainers, and ephemeralContainers, and forbids host namespaces
+# (hostNetwork/hostPID/hostIPC), hostPort bindings, hostPath volumes, and DOCKER_HOST injection.
 apiVersion: policies.kyverno.io/v1
 kind: ValidatingPolicy
 metadata:
@@ -17,11 +20,21 @@ spec:
         resources: ["pods"]
   matchConditions:
     - name: tenant-or-preview-namespace
-      expression: "request.namespace == 'keel-previews' || request.namespace.startsWith('tenant-')"
+      expression: "(has(request.namespace) ? request.namespace : '') == 'keel-previews' || (has(request.namespace) ? request.namespace : '').startsWith('tenant-')"
+  variables:
+    - name: allContainers
+      expression: >-
+        object.spec.containers + (has(object.spec.initContainers) ? object.spec.initContainers : []) + (has(object.spec.ephemeralContainers) ? object.spec.ephemeralContainers : [])
   validations:
     - expression: >-
-        object.spec.containers.all(c, has(c.securityContext) && (!has(c.securityContext.privileged) || !c.securityContext.privileged) && has(c.securityContext.allowPrivilegeEscalation) && !c.securityContext.allowPrivilegeEscalation && ((has(object.spec.securityContext) && has(object.spec.securityContext.runAsNonRoot) && object.spec.securityContext.runAsNonRoot) || (has(c.securityContext.runAsNonRoot) && c.securityContext.runAsNonRoot)) && has(c.securityContext.capabilities) && has(c.securityContext.capabilities.drop) && 'ALL' in c.securityContext.capabilities.drop)
-      message: "Privileged containers and privilege escalation are prohibited; pods must adhere to restricted PSS."
+        variables.allContainers.all(c, has(c.securityContext) && (!has(c.securityContext.privileged) || !c.securityContext.privileged) && has(c.securityContext.allowPrivilegeEscalation) && !c.securityContext.allowPrivilegeEscalation && ((has(object.spec.securityContext) && has(object.spec.securityContext.runAsNonRoot) && object.spec.securityContext.runAsNonRoot) || (has(c.securityContext.runAsNonRoot) && c.securityContext.runAsNonRoot)) && has(c.securityContext.capabilities) && has(c.securityContext.capabilities.drop) && 'ALL' in c.securityContext.capabilities.drop)
+      message: "Privileged containers and privilege escalation are prohibited in containers, initContainers, and ephemeralContainers; pods must adhere to restricted PSS."
     - expression: >-
-        (!has(object.spec.volumes) || object.spec.volumes.all(v, !has(v.hostPath))) && object.spec.containers.all(c, !has(c.env) || c.env.all(e, e.name != 'DOCKER_HOST'))
+        (!has(object.spec.hostNetwork) || !object.spec.hostNetwork) && (!has(object.spec.hostPID) || !object.spec.hostPID) && (!has(object.spec.hostIPC) || !object.spec.hostIPC)
+      message: "Sharing host namespaces (hostNetwork, hostPID, hostIPC) is forbidden."
+    - expression: >-
+        variables.allContainers.all(c, !has(c.ports) || c.ports.all(p, !has(p.hostPort) || p.hostPort == 0))
+      message: "Binding container ports to host ports (hostPort) is forbidden."
+    - expression: >-
+        (!has(object.spec.volumes) || object.spec.volumes.all(v, !has(v.hostPath))) && variables.allContainers.all(c, !has(c.env) || c.env.all(e, e.name != 'DOCKER_HOST'))
       message: "Mounting hostPath volumes (such as /var/run/docker.sock) or injecting DOCKER_HOST is forbidden in production."

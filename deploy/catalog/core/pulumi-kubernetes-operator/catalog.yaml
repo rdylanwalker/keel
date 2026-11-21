@@ -11,7 +11,7 @@ spec:
   upstream:
     chart: oci://ghcr.io/pulumi/helm-charts/pulumi-kubernetes-operator
     repoURL: oci://ghcr.io/pulumi/helm-charts/pulumi-kubernetes-operator
-    version: "2.1.0"
+    version: "2.10.1"
   progressiveDelivery:
     flaggerSupported: false
     defaultCanary: false

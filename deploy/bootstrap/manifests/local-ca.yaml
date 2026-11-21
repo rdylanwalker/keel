@@ -1,0 +1,57 @@
+# Self-signed control-plane CA and wildcard certificate for the Stage 0 ingress hosts.
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: keel-selfsigned
+  labels:
+    app.kubernetes.io/managed-by: keel
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: keel-ca
+  namespace: keel-system
+  labels:
+    app.kubernetes.io/managed-by: keel
+spec:
+  isCA: true
+  commonName: keel-local-ca
+  secretName: keel-ca-secret
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+  issuerRef:
+    name: keel-selfsigned
+    kind: ClusterIssuer
+    group: cert-manager.io
+---
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: keel-ca-issuer
+  labels:
+    app.kubernetes.io/managed-by: keel
+spec:
+  ca:
+    secretName: keel-ca-secret
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: keel-wildcard-tls
+  namespace: keel-system
+  labels:
+    app.kubernetes.io/managed-by: keel
+spec:
+  secretName: keel-wildcard-tls
+  dnsNames:
+    - "*.${BASE_DOMAIN}"
+    - ${IDP_HOST}
+    - ${FORGEJO_HOST}
+    - ${KEEL_HOST}
+  issuerRef:
+    name: keel-ca-issuer
+    kind: ClusterIssuer
+    group: cert-manager.io

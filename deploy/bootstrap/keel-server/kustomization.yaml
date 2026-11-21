@@ -1,0 +1,26 @@
+# In-cluster `keel serve` (OPEN-26, `SDD.md` §6.3): least-privilege RBAC + restricted Deployment.
+# Apply with `kubectl apply -k deploy/bootstrap/keel-server` after Stage 0. Uses the released
+# `ghcr.io/rdylanwalker/keel` image; pin a version or mirror with
+# `kustomize edit set image ghcr.io/rdylanwalker/keel=<registry>/keel:<tag>`.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - rbac.yaml
+  - deployment.yaml
+# Server configuration consumed via `envFrom` (hash-suffixed, so edits roll the Deployment).
+# Point `KEEL_GIT_URL` at an external forge with a kustomize overlay, e.g.
+#   configMapGenerator: [{name: keel-server-config, behavior: merge,
+#                         literals: [KEEL_GIT_URL=https://github.com/acme/infra.git]}]
+configMapGenerator:
+  - name: keel-server-config
+    namespace: keel-system
+    options:
+      labels:
+        app.kubernetes.io/name: keel-server
+        app.kubernetes.io/managed-by: keel
+    literals:
+      - KEEL_GIT_URL=http://forgejo-http.keel-system.svc.cluster.local:3000/keel/infra-gitops.git
+      - KEEL_GIT_USERNAME=keel
+images:
+  - name: ghcr.io/rdylanwalker/keel
+    newTag: latest

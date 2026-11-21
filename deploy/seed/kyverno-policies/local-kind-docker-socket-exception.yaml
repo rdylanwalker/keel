@@ -1,17 +1,17 @@
 # OPT-IN LOCAL DEVELOPMENT ONLY — NOT APPLIED IN PRODUCTION (`NFR-SEC-03`, `NFR-SEC-04`)
 #
-# This `kyverno.io/v2` `PolicyException` is deliberately excluded from the default
-# `kyverno-policies/kustomization.yaml`. It is synthesized and applied ONLY when an operator
-# explicitly passes `--local-dev-docker-socket-exception` on a local `kind` management cluster:
+# Deliberately excluded from the default `kyverno-policies/kustomization.yaml`. Synthesized and
+# applied ONLY when an operator explicitly opts in on a local `kind` management cluster:
 #
 #   keel bootstrap init --target kind --local-dev-docker-socket-exception
 #
-# Purpose:
-# Allows Pulumi Kubernetes Operator (`app.kubernetes.io/managed-by: pulumi-kubernetes-operator`)
-# workspace pods in `keel-previews` and `tenant-*` to access `/var/run/docker.sock` or `DOCKER_HOST`
-# strictly for nested local `kind` workload cluster provisioning (`catalog/infra/kind-cluster`).
-# Stored in `keel-system` so tenant namespaces cannot self-create or modify `PolicyException` CRs.
-apiVersion: kyverno.io/v2
+# Mirrors `keel_kube::kyverno::build_local_kind_docker_socket_exception()` with default config.
+# `disallow-privileged-containers` is a CEL `ValidatingPolicy` (no named rules), so this uses the
+# `policies.kyverno.io/v1` PolicyException with `policyRefs` + CEL `matchConditions`. It exempts
+# only PKO workspace pods (`auto.pulumi.com/component: workspace`) in `keel-previews` / `tenant-*`
+# that mount `/var/run/docker.sock` or set `DOCKER_HOST`, for nested `kind` provisioning.
+# Stored in `keel-system` (Kyverno's configured exception namespace) so tenants cannot self-exempt.
+apiVersion: policies.kyverno.io/v1
 kind: PolicyException
 metadata:
   name: local-kind-docker-socket-exception
@@ -22,29 +22,15 @@ metadata:
   annotations:
     keel.io/description: "Explicit local-dev exception allowing PKO workspace pods to access Docker socket / DOCKER_HOST for nested kind provisioning."
 spec:
-  exceptions:
-    - policyName: disallow-privileged-containers
-      ruleNames:
-        - disallow-privileged
-        - disallow-host-path-and-docker-socket
-  match:
-    any:
-      - resources:
-          kinds:
-            - Pod
-          namespaces:
-            - keel-previews
-            - tenant-*
-          selector:
-            matchLabels:
-              app.kubernetes.io/managed-by: pulumi-kubernetes-operator
-  conditions:
-    any:
-      - key: "{{ request.object.spec.volumes[].hostPath.path || `[]` }}"
-        operator: AllIn
-        value:
-          - /var/run/docker.sock
-      - key: "{{ request.object.spec.containers[].env[].name || `[]` }}"
-        operator: AnyIn
-        value:
-          - DOCKER_HOST
+  policyRefs:
+    - kind: ValidatingPolicy
+      name: disallow-privileged-containers
+  matchConditions:
+    - name: allowed-namespaces
+      expression: "(has(request.namespace) ? request.namespace : '') == 'keel-previews' || (has(request.namespace) ? request.namespace : '').startsWith('tenant-')"
+    - name: pko-workspace-pod-labels
+      expression: >-
+        ((has(object.metadata.labels) && ('auto.pulumi.com/component' in object.metadata.labels) && object.metadata.labels['auto.pulumi.com/component'] == 'workspace') || (has(object.spec.template) && has(object.spec.template.metadata) && has(object.spec.template.metadata.labels) && ('auto.pulumi.com/component' in object.spec.template.metadata.labels) && object.spec.template.metadata.labels['auto.pulumi.com/component'] == 'workspace'))
+    - name: docker-socket-or-host
+      expression: >-
+        (((has(object.spec.volumes) && object.spec.volumes.exists(v, has(v.hostPath) && v.hostPath.path == '/var/run/docker.sock')) || (has(object.spec.containers) && object.spec.containers.exists(c, has(c.env) && c.env.exists(e, e.name == 'DOCKER_HOST'))))) || (has(object.spec.template) && has(object.spec.template.spec) && ((has(object.spec.template.spec.volumes) && object.spec.template.spec.volumes.exists(v, has(v.hostPath) && v.hostPath.path == '/var/run/docker.sock')) || (has(object.spec.template.spec.containers) && object.spec.template.spec.containers.exists(c, has(c.env) && c.env.exists(e, e.name == 'DOCKER_HOST')))))

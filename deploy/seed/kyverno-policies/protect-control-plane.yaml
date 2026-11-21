@@ -27,5 +27,5 @@ spec:
         !(request.operation == 'DELETE' && request.kind.group == 'pulumi.com' && request.kind.kind == 'Stack' && (oldObject.metadata.name == 'management-cluster-core' || (has(oldObject.metadata.labels) && 'keel.io/protect' in oldObject.metadata.labels && oldObject.metadata.labels['keel.io/protect'] == 'true')))
       message: "Protected control-plane Stack `management-cluster-core` cannot be deleted via standard admission; use `keel bootstrap recover` for break-glass maintenance."
     - expression: >-
-        !((request.namespace == 'flux-system' || request.namespace == 'keel-system') && has(request.userInfo) && has(request.userInfo.username) && (request.userInfo.username.startsWith('system:serviceaccount:keel-previews:') || request.userInfo.username.startsWith('system:serviceaccount:tenant-')))
+        !(((has(request.namespace) ? request.namespace : '') == 'flux-system' || (has(request.namespace) ? request.namespace : '') == 'keel-system') && has(request.userInfo) && has(request.userInfo.username) && (request.userInfo.username.startsWith('system:serviceaccount:keel-previews:') || request.userInfo.username.startsWith('system:serviceaccount:tenant-')))
       message: "Tenant and preview ServiceAccounts are strictly prohibited from mutating control-plane namespaces."

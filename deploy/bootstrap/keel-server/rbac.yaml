@@ -1,0 +1,239 @@
+# Least-privilege identity for keel-server running in `keel-system`.
+#
+# Cluster-wide: READ-ONLY on the CRDs it watches (no Secrets), plus the Kyverno policy objects it
+# re-applies (`restrict-pulumi-providers`). Namespaced write access is granted only in
+# `keel-system`, `keel-previews` and `flux-system`. Tenant namespaces are dynamic, so per-tenant
+# access is a RoleBinding (`keel-server`) to the `keel-server-tenant` ClusterRole created in each
+# `tenant-<id>` namespace (tenant-default included below; the tenant RBAC bundle must add the same
+# binding for new tenants).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: keel-server
+  namespace: keel-system
+  labels:
+    app.kubernetes.io/name: keel-server
+    app.kubernetes.io/managed-by: keel
+automountServiceAccountToken: true
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: keel-server-read
+  labels:
+    app.kubernetes.io/managed-by: keel
+rules:
+  - apiGroups: ["pulumi.com"]
+    resources: ["stacks", "programs"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["auto.pulumi.com"]
+    resources: ["workspaces", "updates"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["helm.toolkit.fluxcd.io"]
+    resources: ["helmreleases"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["kustomize.toolkit.fluxcd.io"]
+    resources: ["kustomizations"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["source.toolkit.fluxcd.io"]
+    resources: ["gitrepositories", "helmrepositories", "ocirepositories"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["flagger.app"]
+    resources: ["canaries"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["namespaces", "events"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["events.k8s.io"]
+    resources: ["events"]
+    verbs: ["get", "list", "watch"]
+  # Kyverno policy objects re-applied by keel-server (shared provider allowlist helper).
+  - apiGroups: ["policies.kyverno.io"]
+    resources: ["validatingpolicies", "generatingpolicies", "policyexceptions"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  - apiGroups: ["wgpolicyk8s.io"]
+    resources: ["policyreports", "clusterpolicyreports"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: keel-server-read
+  labels:
+    app.kubernetes.io/managed-by: keel
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: keel-server-read
+subjects:
+  - kind: ServiceAccount
+    name: keel-server
+    namespace: keel-system
+---
+# Bound per tenant namespace via RoleBinding (never via ClusterRoleBinding).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: keel-server-tenant
+  labels:
+    app.kubernetes.io/managed-by: keel
+rules:
+  # Scoped tenant credentials (S3 / git / kubeconfig secrets) read and rotated by the server.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  # Out-of-band operations: reconcile / unlock / force-delete (finalizer removal).
+  - apiGroups: ["pulumi.com"]
+    resources: ["stacks"]
+    verbs: ["get", "list", "watch", "patch", "update", "delete"]
+  - apiGroups: ["helm.toolkit.fluxcd.io"]
+    resources: ["helmreleases"]
+    verbs: ["get", "list", "watch", "patch"]
+  - apiGroups: ["kustomize.toolkit.fluxcd.io"]
+    resources: ["kustomizations"]
+    verbs: ["get", "list", "watch", "patch"]
+  - apiGroups: [""]
+    resources: ["pods", "pods/log", "configmaps"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: keel-server
+  namespace: tenant-default
+  labels:
+    app.kubernetes.io/managed-by: keel
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: keel-server-tenant
+subjects:
+  - kind: ServiceAccount
+    name: keel-server
+    namespace: keel-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: keel-server
+  namespace: keel-system
+  labels:
+    app.kubernetes.io/managed-by: keel
+rules:
+  # Session/OIDC keys, forge token, user git credentials, Stage 0 credentials.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  # SeaweedFS tenant identity provisioning (`weed shell` in the filer pod via exec).
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create", "get"]
+  - apiGroups: ["apps"]
+    resources: ["statefulsets"]
+    verbs: ["get", "list"]
+  # Management add-on upgrade / rollback.
+  - apiGroups: ["helm.toolkit.fluxcd.io"]
+    resources: ["helmreleases"]
+    verbs: ["get", "list", "watch", "patch", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: keel-server
+  namespace: keel-system
+  labels:
+    app.kubernetes.io/managed-by: keel
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: keel-server
+subjects:
+  - kind: ServiceAccount
+    name: keel-server
+    namespace: keel-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: keel-server
+  namespace: keel-previews
+  labels:
+    app.kubernetes.io/managed-by: keel
+rules:
+  # Ephemeral preview Stacks + their copied tenant-scoped creds (keel-preview-s3-<tenant>,
+  # keel-preview-git-<tenant>) and result ConfigMaps; garbage-collected on PR merge/close.
+  - apiGroups: ["pulumi.com"]
+    resources: ["stacks"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["auto.pulumi.com"]
+    resources: ["workspaces", "updates"]
+    verbs: ["get", "list", "watch", "delete"]
+  - apiGroups: ["source.toolkit.fluxcd.io"]
+    resources: ["gitrepositories"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["secrets", "configmaps"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods", "pods/log"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: keel-server
+  namespace: keel-previews
+  labels:
+    app.kubernetes.io/managed-by: keel
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: keel-server
+subjects:
+  - kind: ServiceAccount
+    name: keel-server
+    namespace: keel-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: keel-server
+  namespace: flux-system
+  labels:
+    app.kubernetes.io/managed-by: keel
+rules:
+  # Reconcile requests on platform Kustomizations / sources and management-core Stack.
+  - apiGroups: ["kustomize.toolkit.fluxcd.io"]
+    resources: ["kustomizations"]
+    verbs: ["get", "list", "watch", "patch"]
+  - apiGroups: ["source.toolkit.fluxcd.io"]
+    resources: ["gitrepositories"]
+    verbs: ["get", "list", "watch", "patch"]
+  - apiGroups: ["pulumi.com"]
+    resources: ["stacks"]
+    verbs: ["get", "list", "watch", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: keel-server
+  namespace: flux-system
+  labels:
+    app.kubernetes.io/managed-by: keel
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: keel-server
+subjects:
+  - kind: ServiceAccount
+    name: keel-server
+    namespace: keel-system

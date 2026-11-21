@@ -1,0 +1,25 @@
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: forgejo-ingress
+  namespace: keel-system
+  labels:
+    app.kubernetes.io/managed-by: keel
+spec:
+  parentRefs:
+    - name: keel-ingress
+      namespace: keel-system
+      sectionName: https-local
+    - name: keel-ingress
+      namespace: keel-system
+      sectionName: https
+  hostnames:
+    - ${FORGEJO_HOST}
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        - name: forgejo-http
+          port: 3000

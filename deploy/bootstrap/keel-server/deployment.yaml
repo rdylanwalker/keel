@@ -1,0 +1,104 @@
+# keel-server Deployment (stateless; `restricted` Pod Security Standard).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: keel-server
+  namespace: keel-system
+  labels:
+    app.kubernetes.io/name: keel-server
+    app.kubernetes.io/managed-by: keel
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: keel-server
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: keel-server
+    spec:
+      serviceAccountName: keel-server
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: keel-server
+          # Release image (ENTRYPOINT `keel`, nonroot UID 65532, ships git/openssh/sops/age).
+          # Override the tag/registry via `images:` in kustomization.yaml.
+          image: ghcr.io/rdylanwalker/keel:latest
+          args:
+            - serve
+            - --bind
+            - 0.0.0.0:8080
+            - --repo-dir
+            - /var/lib/keel/work
+          ports:
+            - name: http
+              containerPort: 8080
+          # OPEN-30: the workdir is hydrated from the GitOps remote (clone when the emptyDir is
+          # fresh, fetch on restart). Override `KEEL_GIT_URL` / `KEEL_GIT_USERNAME` through the
+          # `keel-server-config` configMapGenerator in kustomization.yaml.
+          envFrom:
+            - configMapRef:
+                name: keel-server-config
+          env:
+            - name: HOME
+              value: /var/lib/keel
+            # Forge API + HTTPS git token (Stage 0 `keel-system/forge-token`). Injected as env only;
+            # keel passes it to git via ephemeral config env, never argv or logs.
+            - name: KEEL_GIT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: forge-token
+                  key: token
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: work
+              mountPath: /var/lib/keel
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: work
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: keel-server
+  namespace: keel-system
+  labels:
+    app.kubernetes.io/name: keel-server
+    app.kubernetes.io/managed-by: keel
+spec:
+  selector:
+    app.kubernetes.io/name: keel-server
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http

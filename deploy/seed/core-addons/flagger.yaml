@@ -9,13 +9,16 @@ metadata:
     keel.io/protect: "true"
 spec:
   interval: 10m
+  # Same release name/namespace as the Stage 0 Pulumi install so Flux adopts it in place.
+  storageNamespace: keel-system
+  releaseName: flagger
   dependsOn:
     - name: envoy-gateway
     - name: prometheus
   chart:
     spec:
       chart: flagger
-      version: "1.40.0"
+      version: "1.45.0"
       sourceRef:
         kind: HelmRepository
         name: flagger

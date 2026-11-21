@@ -26,10 +26,13 @@ metadata:
     keel.io/protect: "true"
 spec:
   interval: 10m
+  # Adopts the Stage 0 Pulumi-installed release in place (same name/namespace/version/values).
+  releaseName: pulumi-kubernetes-operator
+  storageNamespace: keel-system
   chart:
     spec:
       chart: pulumi-kubernetes-operator
-      version: "2.1.0"
+      version: "2.10.1"
       sourceRef:
         kind: HelmRepository
         name: pulumi
@@ -43,14 +46,11 @@ spec:
       retries: 1
       strategy: rollback
   values:
-    controller:
-      replicas: 2
-      securityContext:
-        runAsNonRoot: true
-        allowPrivilegeEscalation: false
-        readOnlyRootFilesystem: true
-        seccompProfile:
-          type: RuntimeDefault
-        capabilities:
-          drop:
-            - ALL
+    replicaCount: 1
+    securityContext:
+      allowPrivilegeEscalation: false
+      seccompProfile:
+        type: RuntimeDefault
+      capabilities:
+        drop:
+          - ALL

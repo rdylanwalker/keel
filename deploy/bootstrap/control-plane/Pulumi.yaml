@@ -1,6 +1,11 @@
 # Stage 0 Seed Control-Plane Addons (`SDD.md` §2.1, §6.2, `NFR-SEC-03`)
 # Provisions seed namespaces, SOPS age secret, Flux CD, Kyverno, PKO v2, SeaweedFS S3,
 # Envoy Gateway, Prometheus, and Flagger via pulumi-kubernetes.
+#
+# Anti-lockout (AGENTS.md guardrail 7, NFR-REL-01): core control-plane resources (namespaces,
+# SOPS age key, Flux, Kyverno, PKO, S3 state backend) carry `protect: true`. Keel never runs
+# `pulumi destroy` on this stack; tearing it down requires an explicit
+# `pulumi state unprotect --all` first (or deleting the whole cluster).
 name: keel-stage0-control-plane
 runtime: yaml
 description: Stage 0 seed control-plane addons (Flux CD, Kyverno, PKO v2, SeaweedFS, Envoy Gateway, Prometheus, Flagger)
@@ -29,6 +34,7 @@ resources:
   fluxSystemNamespace:
     type: kubernetes:core/v1:Namespace
     options:
+      protect: true
       provider: ${k8sProvider}
     properties:
       metadata:
@@ -40,6 +46,7 @@ resources:
   keelSystemNamespace:
     type: kubernetes:core/v1:Namespace
     options:
+      protect: true
       provider: ${k8sProvider}
     properties:
       metadata:
@@ -68,6 +75,7 @@ resources:
   sopsAgeSecret:
     type: kubernetes:core/v1:Secret
     options:
+      protect: true
       provider: ${k8sProvider}
       dependsOn:
         - ${fluxSystemNamespace}
@@ -85,33 +93,68 @@ resources:
   flux2:
     type: kubernetes:helm.sh/v3:Release
     options:
+      protect: true
       provider: ${k8sProvider}
       dependsOn:
         - ${fluxSystemNamespace}
     properties:
       name: flux2
       chart: oci://ghcr.io/fluxcd-community/charts/flux2
+      # Pinned: latest stable flux2 community chart (Flux v2.x controllers) at time of pinning,
+      # confirmed via `helm show chart oci://ghcr.io/fluxcd-community/charts/flux2`. Renovate bumps it.
+      version: "2.20.0"
       namespace: flux-system
       createNamespace: true
       waitForJobs: true
       timeout: 300
+      values:
+        # Multi-tenancy lockdown (NFR-SEC-02): adds `--no-cross-namespace-refs=true` and
+        # `--default-service-account=default` to kustomize/helm controllers, so any Flux
+        # Kustomization/HelmRelease without `spec.serviceAccountName` impersonates the
+        # permissionless `default` SA of its own namespace. Platform Kustomizations in
+        # `flux-system` explicitly impersonate `kustomize-controller`; tenant Kustomizations
+        # impersonate `tenant-<id>-sa`; the root tenants Kustomization impersonates
+        # `keel-tenant-reconciler` (confined by Kyverno `restrict-tenant-reconciler`).
+        multitenancy:
+          enabled: true
+          defaultServiceAccount: default
+          # Controllers keep cluster-admin so they can impersonate the SAs above.
+          privileged: true
 
+  # Single Kyverno install in `keel-system`, release `kyverno`, pinned to a chart whose bundled
+  # CRDs serve `policies.kyverno.io/v1` (ValidatingPolicy / GeneratingPolicy / PolicyException,
+  # verified with `helm pull kyverno/kyverno --version 3.10.0`). The Flux HelmRelease in
+  # `deploy/seed/core-addons/kyverno.yaml` uses the same release name, namespace, version and
+  # values so Flux adopts this release in place (no second install). Keep them in lockstep.
   kyverno:
     type: kubernetes:helm.sh/v3:Release
     options:
+      protect: true
       provider: ${k8sProvider}
       dependsOn:
         - ${keelSystemNamespace}
     properties:
       name: kyverno
       chart: kyverno
+      version: "3.10.0"
       repositoryOpts:
         repo: https://kyverno.github.io/kyverno/
-      namespace: kyverno
-      createNamespace: true
+      namespace: keel-system
+      createNamespace: false
       waitForJobs: true
       timeout: 300
       values:
+        # Keel only uses the CEL `policies.kyverno.io/v1` policy types. Kyverno 1.20 no longer
+        # executes the deprecated `kyverno.io` policy kinds, and installing their CRDs only makes
+        # the controllers emit deprecation warnings, so they are not installed.
+        crds:
+          groups:
+            kyverno:
+              clusterpolicies: false
+              policies: false
+              policyexceptions: false
+              cleanuppolicies: false
+              clustercleanuppolicies: false
         admissionController:
           replicas: 1
         features:
@@ -122,27 +165,40 @@ resources:
   pulumiKubernetesOperator:
     type: kubernetes:helm.sh/v3:Release
     options:
+      protect: true
       provider: ${k8sProvider}
       dependsOn:
         - ${keelSystemNamespace}
     properties:
       name: pulumi-kubernetes-operator
       chart: oci://ghcr.io/pulumi/helm-charts/pulumi-kubernetes-operator
+      # Pinned; must match deploy/seed/core-addons/pko.yaml (Flux adopts this release).
+      version: "2.10.1"
       namespace: keel-system
       createNamespace: true
       waitForJobs: true
       timeout: 300
+      values:
+        replicaCount: 1
+        securityContext:
+          allowPrivilegeEscalation: false
+          seccompProfile:
+            type: RuntimeDefault
+          capabilities:
+            drop:
+              - ALL
 
   s3StateBackend:
     type: kubernetes:helm.sh/v3:Release
     options:
+      protect: true
       provider: ${k8sProvider}
       dependsOn:
         - ${keelSystemNamespace}
     properties:
       name: s3-state-backend
       chart: seaweedfs
-      version: "4.53.0"
+      version: "4.54.0"
       repositoryOpts:
         repo: https://seaweedfs.github.io/seaweedfs/helm
       namespace: keel-system
@@ -188,7 +244,7 @@ resources:
     properties:
       name: envoy-gateway
       chart: oci://docker.io/envoyproxy/gateway-helm
-      version: v1.3.0
+      version: v1.10.0
       namespace: keel-system
       createNamespace: true
       waitForJobs: true
@@ -203,7 +259,7 @@ resources:
     properties:
       name: prometheus
       chart: prometheus
-      version: "27.5.0"
+      version: "29.48.0"
       repositoryOpts:
         repo: https://prometheus-community.github.io/helm-charts
       namespace: keel-system
@@ -235,7 +291,7 @@ resources:
     properties:
       name: flagger
       chart: flagger
-      version: "1.40.0"
+      version: "1.45.0"
       repositoryOpts:
         repo: https://flagger.app
       namespace: keel-system

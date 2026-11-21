@@ -1,4 +1,10 @@
 # Flux CD Seed Kustomizations with SOPS + `age` Decryption (`SDD.md` §3.1, §6.2, §6.3)
+#
+# Flux runs in multi-tenancy lockdown (`--no-cross-namespace-refs=true`,
+# `--default-service-account=default`, set via the flux2 chart `multitenancy` values in
+# `deploy/bootstrap/control-plane/Pulumi.yaml`). Every Kustomization therefore names the
+# ServiceAccount it impersonates: platform Kustomizations use the privileged
+# `kustomize-controller`; `tenants-root` uses the confined `keel-tenant-reconciler`.
 apiVersion: kustomize.toolkit.fluxcd.io/v1
 kind: Kustomization
 metadata:
@@ -11,6 +17,7 @@ spec:
   path: ./clusters/management/flux-system
   prune: true
   wait: true
+  serviceAccountName: kustomize-controller
   sourceRef:
     kind: GitRepository
     name: flux-system
@@ -31,6 +38,7 @@ spec:
   path: ./clusters/management/core-addons
   prune: false
   wait: true
+  serviceAccountName: kustomize-controller
   sourceRef:
     kind: GitRepository
     name: flux-system
@@ -50,8 +58,16 @@ spec:
   interval: 1m
   path: ./tenants
   prune: true
+  # Never cluster-admin: may only manage tenant-* namespaces and bind ClusterRole/admin
+  # (namespaced) or system:auth-delegator (see tenant-reconciler-rbac.yaml and the Kyverno
+  # `restrict-tenant-reconciler` ValidatingPolicy).
+  serviceAccountName: keel-tenant-reconciler
   dependsOn:
     - name: core-addons
   sourceRef:
     kind: GitRepository
     name: flux-system
+  decryption:
+    provider: sops
+    secretRef:
+      name: sops-age
