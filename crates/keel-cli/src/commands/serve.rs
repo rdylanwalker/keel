@@ -467,14 +467,18 @@ async fn build_serve_state_with_forward(
     if let Some(backend) = mgmt_stack_backend {
         state.backend_url = backend;
     }
-    if state
-        .backend_url
-        .contains("s3-state-backend-seaweedfs-s3.keel-system.svc.cluster.local")
-        || state
-            .secret_store
-            .has_s3_credentials()
-            .await
-            .unwrap_or(false)
+    // Scoped state credentials can only be provisioned/verified against a live cluster; a
+    // cluster-less server (in-memory secrets, nothing applied) must not enforce them — otherwise
+    // the in-cluster default backend URL alone would reject every Pulumi proposal with 409.
+    if cluster_secret_store
+        && (state
+            .backend_url
+            .contains("s3-state-backend-seaweedfs-s3.keel-system.svc.cluster.local")
+            || state
+                .secret_store
+                .has_s3_credentials()
+                .await
+                .unwrap_or(false))
     {
         state = state.with_s3_credentials_secret(Some(S3_CREDENTIALS_SECRET_NAME.to_string()));
     }
