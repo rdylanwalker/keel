@@ -690,7 +690,20 @@ test.describe('08.1 - Multi-Cloud Free-Tier Stage 1 Live E2E (kind Management Cl
       logStep('Seeding full deploy/catalog/{apps,infra,bundles} into GitOps repo...');
       fs.cpSync(deployCatalog, path.join(repoDir, 'catalog'), { recursive: true });
     }
-    runCmd('git', ['-C', repoDir, 'add', 'catalog']);
+    const defaultRbacPath = path.join(repoDir, 'tenants/default/rbac.yaml');
+    if (fs.existsSync(defaultRbacPath)) {
+      const rbacRaw = fs.readFileSync(defaultRbacPath, 'utf-8');
+      const expandedRbac = rbacRaw
+        .replace(/limits\.cpu:\s*"?8"?/g, 'limits.cpu: "16"')
+        .replace(/limits\.memory:\s*"?16Gi"?/g, 'limits.memory: "32Gi"')
+        .replace(/requests\.cpu:\s*"?4"?/g, 'requests.cpu: "8"')
+        .replace(/requests\.memory:\s*"?8Gi"?/g, 'requests.memory: "16Gi"');
+      if (expandedRbac !== rbacRaw) {
+        fs.writeFileSync(defaultRbacPath, expandedRbac, 'utf-8');
+        tryCmd('kubectl', ['apply', '-f', defaultRbacPath]);
+      }
+    }
+    runCmd('git', ['-C', repoDir, 'add', 'catalog', 'tenants']);
     const diff = tryCmd('git', ['-C', repoDir, 'diff', '--cached', '--quiet']);
     if (!diff.ok) {
       logStep('Committing updated free-tier catalog blueprints to GitOps repo...');
@@ -924,62 +937,41 @@ test.describe('08.1 - Multi-Cloud Free-Tier Stage 1 Live E2E (kind Management Cl
     }
   }
 
-  async function reconcileVerifyAndDeleteCloudStack(run: ProvisionedCloudRun): Promise<void> {
-    const { spec, stackName, tenant, context, page } = run;
+  async function reconcileAndVerifyCloudStack(run: ProvisionedCloudRun): Promise<void> {
+    const { spec, stackName, tenant, page } = run;
     const { provider, sshUser } = spec;
     const request = page.request;
-    let primaryError: unknown;
-    let cleanupError: unknown;
 
+    logStep(`Waiting for PKO v2 Stack tenant-${tenant}/${stackName} to provision VM...`, provider);
+    await waitForStackReady(stackName, `tenant-${tenant}`, provider, PROVISION_TIMEOUT_MS);
+
+    logStep(`Verifying stack SSH info for ${stackName}...`, provider);
+    const sshRes = await request.get(
+      `${BASE_URL}/api/v1/stacks/tenant-${tenant}/${stackName}/ssh-info`,
+    );
+    expect(sshRes.ok(), `[${provider}] Expected ssh-info 200 OK, got ${sshRes.status()}`).toBe(
+      true,
+    );
+    const sshJson = (await sshRes.json()) as {
+      sshHost?: string;
+      sshPort?: number;
+      sshUser?: string;
+    };
+    expect(sshJson.sshHost, `[${provider}] Expected non-empty sshHost`).toBeTruthy();
+    expect(sshJson.sshPort).toBe(22);
+    expect(sshJson.sshUser).toBe(sshUser);
+    logStep(
+      `Verified SSH info: ${sshJson.sshUser}@${sshJson.sshHost}:${sshJson.sshPort}`,
+      provider,
+    );
+  }
+
+  async function teardownCloudStack(run: ProvisionedCloudRun): Promise<void> {
+    const { spec, stackName, tenant, context, page } = run;
     try {
-      logStep(
-        `Waiting for PKO v2 Stack tenant-${tenant}/${stackName} to provision VM...`,
-        provider,
-      );
-      await waitForStackReady(stackName, `tenant-${tenant}`, provider, PROVISION_TIMEOUT_MS);
-
-      logStep(`Verifying stack SSH info for ${stackName}...`, provider);
-      const sshRes = await request.get(
-        `${BASE_URL}/api/v1/stacks/tenant-${tenant}/${stackName}/ssh-info`,
-      );
-      expect(sshRes.ok(), `[${provider}] Expected ssh-info 200 OK, got ${sshRes.status()}`).toBe(
-        true,
-      );
-      const sshJson = (await sshRes.json()) as {
-        sshHost?: string;
-        sshPort?: number;
-        sshUser?: string;
-      };
-      expect(sshJson.sshHost, `[${provider}] Expected non-empty sshHost`).toBeTruthy();
-      expect(sshJson.sshPort).toBe(22);
-      expect(sshJson.sshUser).toBe(sshUser);
-      logStep(
-        `Verified SSH info: ${sshJson.sshUser}@${sshJson.sshHost}:${sshJson.sshPort}`,
-        provider,
-      );
-    } catch (err) {
-      primaryError = err;
-      throw err;
+      await deleteAndConfirmStage1StackRemoved(page.request, tenant, stackName, spec.provider);
     } finally {
-      try {
-        try {
-          await deleteAndConfirmStage1StackRemoved(request, tenant, stackName, provider);
-        } catch (err) {
-          if (primaryError) {
-            logStep(
-              `Cleanup warning after primary error: ${err instanceof Error ? err.message : String(err)}`,
-              provider,
-            );
-          } else {
-            cleanupError = err;
-          }
-        }
-      } finally {
-        await context.close();
-      }
-    }
-    if (!primaryError && cleanupError) {
-      throw cleanupError;
+      await context.close();
     }
   }
 
@@ -1123,9 +1115,18 @@ test.describe('08.1 - Multi-Cloud Free-Tier Stage 1 Live E2E (kind Management Cl
       }
     }
 
-    // Phase 2: Reconcile, verify SSH info, and tear down all merged cloud stacks in parallel.
-    const results = await Promise.allSettled(
-      mergedRuns.map((run) => reconcileVerifyAndDeleteCloudStack(run)),
+    // Phase 2: Reconcile and verify SSH info for all merged cloud stacks in parallel.
+    const verifyResults = await Promise.allSettled(
+      mergedRuns.map((run) => reconcileAndVerifyCloudStack(run)),
+    );
+
+    // Phase 3: Tear down all merged cloud stacks in parallel after all provisioning settles.
+    const teardownResults = await Promise.allSettled(
+      mergedRuns.map((run) => teardownCloudStack(run)),
+    );
+
+    const results: PromiseSettledResult<void>[] = verifyResults.map((v, i) =>
+      v.status === 'rejected' ? v : teardownResults[i],
     );
 
     const failures = results
