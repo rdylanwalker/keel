@@ -1,6 +1,8 @@
 //! Live Kubernetes CRD status reader via `kube-rs` (`SDD.md` §5.3, §7.1).
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -33,6 +35,86 @@ pub struct LiveResourceInfo {
     pub status: LiveResourceStatus,
     pub last_synced: Option<String>,
     pub resource_count: Option<u32>,
+    /// `true` only when `metadata.deletionTimestamp` is set on the live object.
+    pub terminating: bool,
+    /// Anti-lockout protection (`keel.io/protect` label or `spec.config.protect`), see [`is_stack_object_protected`].
+    pub protected: bool,
+    /// Tenant from the `keel.io/tenant` label, if present.
+    pub tenant: Option<String>,
+    /// Provider from the `keel.io/provider` label or `spec.config["keel:provider"]`, if present.
+    pub provider: Option<String>,
+}
+
+impl LiveResourceInfo {
+    /// Creates a minimal [`LiveResourceInfo`] carrying only a reconciliation status.
+    pub fn from_status(status: LiveResourceStatus) -> Self {
+        Self {
+            terminating: status == LiveResourceStatus::Deleting,
+            status,
+            last_synced: None,
+            resource_count: None,
+            protected: false,
+            tenant: None,
+            provider: None,
+        }
+    }
+}
+
+fn truthy(v: Option<&Value>) -> bool {
+    match v {
+        Some(Value::Bool(b)) => *b,
+        Some(Value::String(s)) => s.trim().eq_ignore_ascii_case("true"),
+        _ => false,
+    }
+}
+
+/// Returns `true` if a PKO `Stack` is protected against deletion, mirroring
+/// [`keel_pko::PkoStack::is_protected`]: the canonical `keel.io/protect: "true"` label, or
+/// `spec.config.protect` / `spec.config["keel:protect"]` set to `true`. PKO `Stack`s have no
+/// top-level `spec.protect` field, so it is deliberately ignored.
+pub fn is_stack_object_protected(
+    labels: Option<&std::collections::BTreeMap<String, String>>,
+    data: &Value,
+) -> bool {
+    let label = labels
+        .and_then(|l| l.get(keel_pko::stack::LABEL_PROTECT))
+        .is_some_and(|v| v.trim().eq_ignore_ascii_case("true"));
+    label
+        || truthy(data.pointer("/spec/config/protect"))
+        || truthy(data.pointer("/spec/config/keel:protect"))
+}
+
+/// Same as [`is_stack_object_protected`] for a full manifest document (`metadata` + `spec`).
+pub fn is_stack_manifest_protected(doc: &Value) -> bool {
+    let label = doc
+        .pointer("/metadata/labels")
+        .and_then(Value::as_object)
+        .and_then(|l| l.get(keel_pko::stack::LABEL_PROTECT));
+    truthy(label) || is_stack_object_protected(None, doc)
+}
+
+/// Maps a Kubernetes API `404` into [`KubeError::NotFound`], passing other errors through.
+fn not_found_or(err: kube::Error, msg: String) -> KubeError {
+    match err {
+        kube::Error::Api(status) if status.code == 404 => KubeError::NotFound(msg),
+        other => KubeError::Kube(other),
+    }
+}
+
+/// Extracts the provider for a Stack from the `keel.io/provider` label or `spec.config["keel:provider"]`.
+fn extract_stack_provider(
+    labels: Option<&std::collections::BTreeMap<String, String>>,
+    data: &Value,
+) -> Option<String> {
+    labels
+        .and_then(|l| l.get("keel.io/provider"))
+        .cloned()
+        .or_else(|| {
+            data.pointer("/spec/config/keel:provider")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .filter(|p| !p.trim().is_empty())
 }
 
 /// Live status and traffic weight for a Flagger `Canary` resource.
@@ -126,16 +208,7 @@ pub trait LiveStatusSource: Send + Sync {
         self.stack_statuses()
             .await
             .into_iter()
-            .map(|(k, status)| {
-                (
-                    k,
-                    LiveResourceInfo {
-                        status,
-                        last_synced: None,
-                        resource_count: None,
-                    },
-                )
-            })
+            .map(|(k, status)| (k, LiveResourceInfo::from_status(status)))
             .collect()
     }
 
@@ -144,16 +217,7 @@ pub trait LiveStatusSource: Send + Sync {
         self.release_statuses()
             .await
             .into_iter()
-            .map(|(k, status)| {
-                (
-                    k,
-                    LiveResourceInfo {
-                        status,
-                        last_synced: None,
-                        resource_count: None,
-                    },
-                )
-            })
+            .map(|(k, status)| (k, LiveResourceInfo::from_status(status)))
             .collect()
     }
 
@@ -178,21 +242,21 @@ pub trait LiveStatusSource: Send + Sync {
         _namespace: &str,
         _name: &str,
     ) -> Result<String, KubeError> {
-        Err(KubeError::InvalidInput(
+        Err(KubeError::Unavailable(
             "Live Kubernetes cluster connection required to restart stack workspace".to_string(),
         ))
     }
 
     /// Annotates a PKO v2 `Stack` with `pulumi.com/reconcile-request`.
     async fn reconcile_stack(&self, _namespace: &str, _name: &str) -> Result<String, KubeError> {
-        Err(KubeError::InvalidInput(
+        Err(KubeError::Unavailable(
             "Live Kubernetes cluster connection required to reconcile stack".to_string(),
         ))
     }
 
     /// Clears finalizers on a stuck/terminating PKO v2 `Stack` and deletes it if not already terminating.
     async fn force_delete_stack(&self, _namespace: &str, _name: &str) -> Result<String, KubeError> {
-        Err(KubeError::InvalidInput(
+        Err(KubeError::Unavailable(
             "Live Kubernetes cluster connection required to force-delete stack".to_string(),
         ))
     }
@@ -200,14 +264,14 @@ pub trait LiveStatusSource: Send + Sync {
     /// Cancels a stale Pulumi state lock for a PKO v2 `Stack` via `pulumi cancel` in its workspace pod
     /// and requests immediate reconciliation.
     async fn unlock_stack(&self, _namespace: &str, _name: &str) -> Result<String, KubeError> {
-        Err(KubeError::InvalidInput(
+        Err(KubeError::Unavailable(
             "Live Kubernetes cluster connection required to unlock stack".to_string(),
         ))
     }
 
     /// Annotates a Flux `HelmRelease` (or `Kustomization`) with `reconcile.fluxcd.io/requestedAt`.
     async fn reconcile_release(&self, _namespace: &str, _name: &str) -> Result<String, KubeError> {
-        Err(KubeError::InvalidInput(
+        Err(KubeError::Unavailable(
             "Live Kubernetes cluster connection required to reconcile release".to_string(),
         ))
     }
@@ -230,7 +294,7 @@ pub trait LiveStatusSource: Send + Sync {
         Ok(false)
     }
 
-    /// Server-side applies a cluster-scoped Kyverno `ClusterPolicy` document.
+    /// Server-side applies a cluster-scoped Kyverno CEL policy document (`policies.kyverno.io/v1`).
     async fn apply_cluster_policy(&self, name: &str, policy_doc: &Value) -> Result<(), KubeError> {
         let _ = (name, policy_doc);
         Ok(())
@@ -238,21 +302,68 @@ pub trait LiveStatusSource: Send + Sync {
 }
 
 /// Live `kube-rs` implementation querying PKO v2 `Stack`, Flux `HelmRelease`, and Flux `Kustomization` CRDs.
+///
+/// CRD list results are memoized for [`DEFAULT_STATUS_CACHE_TTL`] so concurrent UI/CLI polling of
+/// `GET /api/v1/stacks` / `GET /api/v1/releases` does not fan out into repeated cluster-wide LISTs
+/// (`NFR-PERF`). Mutating operations invalidate the cache immediately.
 #[derive(Clone)]
 pub struct KubeClusterStatusReader {
     client: Client,
+    status_cache: Arc<StdMutex<StatusCache>>,
+    cache_ttl: Duration,
 }
+
+/// Default time-to-live for memoized CRD status LIST results.
+pub const DEFAULT_STATUS_CACHE_TTL: Duration = Duration::from_secs(2);
+
+type StatusMap = HashMap<(String, String), LiveResourceInfo>;
+type StatusCache = HashMap<String, (Instant, StatusMap)>;
 
 impl KubeClusterStatusReader {
     /// Connects to the Kubernetes cluster using default `KUBECONFIG` or in-cluster configuration.
     pub async fn try_default() -> Result<Self, KubeError> {
         let client = Client::try_default().await?;
-        Ok(Self { client })
+        Ok(Self::from_client(client))
     }
 
     /// Wraps an existing `kube::Client`.
     pub fn from_client(client: Client) -> Self {
-        Self { client }
+        Self {
+            client,
+            status_cache: Arc::new(StdMutex::new(HashMap::new())),
+            cache_ttl: DEFAULT_STATUS_CACHE_TTL,
+        }
+    }
+
+    /// Overrides the CRD status LIST cache TTL (`Duration::ZERO` disables caching).
+    pub fn with_status_cache_ttl(mut self, ttl: Duration) -> Self {
+        self.cache_ttl = ttl;
+        self
+    }
+
+    fn cached_statuses(&self, key: &str) -> Option<StatusMap> {
+        if self.cache_ttl.is_zero() {
+            return None;
+        }
+        let cache = self.status_cache.lock().ok()?;
+        let (at, map) = cache.get(key)?;
+        (at.elapsed() < self.cache_ttl).then(|| map.clone())
+    }
+
+    fn store_statuses(&self, key: String, map: &StatusMap) {
+        if self.cache_ttl.is_zero() {
+            return;
+        }
+        if let Ok(mut cache) = self.status_cache.lock() {
+            cache.insert(key, (Instant::now(), map.clone()));
+        }
+    }
+
+    /// Drops memoized CRD status LIST results (called after every mutating operation).
+    pub fn invalidate_status_cache(&self) {
+        if let Ok(mut cache) = self.status_cache.lock() {
+            cache.clear();
+        }
     }
 
     /// Returns a reference to the underlying `kube::Client`.
@@ -484,8 +595,75 @@ impl KubeClusterStatusReader {
         parse_prometheus_vector_response(&body)
     }
 
-    async fn build_client_from_kubeconfig_yaml(yaml: &str) -> Option<Client> {
-        let kc = kube::config::Kubeconfig::from_yaml(yaml).ok()?;
+    /// Lists Secrets only inside tenant namespaces (`tenant-*` namespaces labeled
+    /// `keel.io/tenant`). Falls back to a cluster-wide list only if namespace listing is
+    /// forbidden, preserving existing behaviour on restricted RBAC setups; callers still filter
+    /// on `tenant-*` namespaces.
+    async fn list_tenant_namespace_secrets(&self) -> Vec<k8s_openapi::api::core::v1::Secret> {
+        let ns_api: Api<k8s_openapi::api::core::v1::Namespace> = Api::all(self.client.clone());
+        match ns_api
+            .list(&ListParams::default().labels("keel.io/tenant"))
+            .await
+        {
+            Ok(namespaces) => {
+                let futures = namespaces
+                    .items
+                    .into_iter()
+                    .filter_map(|n| n.metadata.name)
+                    .filter(|n| n.starts_with("tenant-"))
+                    .map(|ns| {
+                        let api: Api<k8s_openapi::api::core::v1::Secret> =
+                            Api::namespaced(self.client.clone(), &ns);
+                        async move { api.list(&ListParams::default()).await.ok() }
+                    });
+                futures::future::join_all(futures)
+                    .await
+                    .into_iter()
+                    .flatten()
+                    .flat_map(|l| l.items)
+                    .collect()
+            }
+            Err(err) => {
+                tracing::debug!(
+                    error = %err,
+                    "Namespace list failed; falling back to cluster-wide Secret list for tenant kubeconfigs"
+                );
+                let api: Api<k8s_openapi::api::core::v1::Secret> = Api::all(self.client.clone());
+                api.list(&ListParams::default())
+                    .await
+                    .map(|l| l.items)
+                    .unwrap_or_default()
+            }
+        }
+    }
+
+    /// Builds a `kube::Client` from an **untrusted**, tenant-authored kubeconfig.
+    ///
+    /// The kubeconfig is rejected (returning `None`) unless it passes
+    /// [`validate_untrusted_kubeconfig`]: `exec`/`auth-provider` plugins would execute
+    /// arbitrary binaries inside `keel-server`, and file-path credentials (`tokenFile`,
+    /// `client-certificate`, `client-key`, `certificate-authority`) would read server-local
+    /// files such as the in-cluster ServiceAccount token. `secret_ref` is a
+    /// `namespace/name` identifier used only for logging; secret content is never logged.
+    async fn build_client_from_kubeconfig_yaml(yaml: &str, secret_ref: &str) -> Option<Client> {
+        let kc = match kube::config::Kubeconfig::from_yaml(yaml) {
+            Ok(kc) => kc,
+            Err(_) => {
+                tracing::warn!(
+                    secret = %secret_ref,
+                    "Skipping tenant kubeconfig Secret: failed to parse kubeconfig"
+                );
+                return None;
+            }
+        };
+        if let Err(reason) = validate_untrusted_kubeconfig(&kc) {
+            tracing::warn!(
+                secret = %secret_ref,
+                reason = %reason,
+                "Skipping tenant kubeconfig Secret: unsafe kubeconfig rejected"
+            );
+            return None;
+        }
         let mut cfg =
             kube::Config::from_custom_kubeconfig(kc, &kube::config::KubeConfigOptions::default())
                 .await
@@ -541,6 +719,10 @@ impl KubeClusterStatusReader {
             kind: kind.to_string(),
             plural: plural.to_string(),
         };
+        let cache_key = format!("{group}/{version}/{plural}/{is_stack}");
+        if let Some(hit) = self.cached_statuses(&cache_key) {
+            return hit;
+        }
         let api: Api<DynamicObject> = Api::all_with(self.client.clone(), &ar);
         let Ok(list) = api.list(&ListParams::default()).await else {
             return HashMap::new();
@@ -578,26 +760,29 @@ impl KubeClusterStatusReader {
             let last_synced = extract_last_synced(&item.data, creation_ts.as_deref());
             let resource_count = extract_resource_count(&item.data);
 
-            if item.metadata.deletion_timestamp.is_some() {
-                out.insert(
-                    (ns, name),
-                    LiveResourceInfo {
-                        status: LiveResourceStatus::Deleting,
-                        last_synced,
-                        resource_count,
-                    },
-                );
-            } else if let Some(status) = extract_ready_status(&item.data, is_stack) {
+            let terminating = item.metadata.deletion_timestamp.is_some();
+            let labels = item.metadata.labels.as_ref();
+            let status = if terminating {
+                Some(LiveResourceStatus::Deleting)
+            } else {
+                extract_ready_status(&item.data, is_stack)
+            };
+            if let Some(status) = status {
                 out.insert(
                     (ns, name),
                     LiveResourceInfo {
                         status,
                         last_synced,
                         resource_count,
+                        terminating,
+                        protected: is_stack && is_stack_object_protected(labels, &item.data),
+                        tenant: labels.and_then(|l| l.get("keel.io/tenant")).cloned(),
+                        provider: extract_stack_provider(labels, &item.data),
                     },
                 );
             }
         }
+        self.store_statuses(cache_key, &out);
         out
     }
 
@@ -724,11 +909,15 @@ impl LiveStatusSource for KubeClusterStatusReader {
     async fn canary_statuses(&self) -> HashMap<(String, String), CanaryStatusInfo> {
         let mut out = Self::collect_canary_statuses_for_client(&self.client).await;
 
-        // Also poll workload clusters referenced by `*-kubeconfig` Secrets in `tenant-*` namespaces
-        let secret_api: Api<k8s_openapi::api::core::v1::Secret> = Api::all(self.client.clone());
-        if let Ok(secrets) = secret_api.list(&ListParams::default()).await {
+        // Also poll workload clusters referenced by `*-kubeconfig` Secrets in `tenant-*` namespaces.
+        // Secrets are listed per tenant namespace (namespaces labeled `keel.io/tenant`) so the
+        // control plane never pulls `keel-system`/`flux-system` Secrets into memory here. These
+        // Secrets are written by tenant Pulumi programs and carry no Keel label, so the
+        // `-kubeconfig` suffix filter below is still required.
+        let secrets = self.list_tenant_namespace_secrets().await;
+        {
             let mut kubeconfig_yamls = Vec::new();
-            for sec in secrets.items {
+            for sec in secrets {
                 let Some(ns) = sec.metadata.namespace.as_deref() else {
                     continue;
                 };
@@ -746,19 +935,23 @@ impl LiveStatusSource for KubeClusterStatusReader {
                     && let Ok(yaml) = String::from_utf8(bytes.0.clone())
                     && !yaml.trim().is_empty()
                 {
-                    kubeconfig_yamls.push(yaml);
+                    kubeconfig_yamls.push((format!("{ns}/{name}"), yaml));
                 }
             }
 
-            let remote_futures = kubeconfig_yamls.into_iter().map(|yaml| async move {
-                let client = Self::build_client_from_kubeconfig_yaml(&yaml).await?;
-                tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
-                    Self::collect_canary_statuses_for_client(&client),
-                )
-                .await
-                .ok()
-            });
+            let remote_futures =
+                kubeconfig_yamls
+                    .into_iter()
+                    .map(|(secret_ref, yaml)| async move {
+                        let client =
+                            Self::build_client_from_kubeconfig_yaml(&yaml, &secret_ref).await?;
+                        tokio::time::timeout(
+                            std::time::Duration::from_secs(5),
+                            Self::collect_canary_statuses_for_client(&client),
+                        )
+                        .await
+                        .ok()
+                    });
             for remote_map in futures::future::join_all(remote_futures)
                 .await
                 .into_iter()
@@ -1033,6 +1226,7 @@ impl LiveStatusSource for KubeClusterStatusReader {
         namespace: &str,
         name: &str,
     ) -> Result<String, KubeError> {
+        self.invalidate_status_cache();
         let sts_name = format!("{name}-workspace");
         let sts_api: Api<StatefulSet> = Api::namespaced(self.client.clone(), namespace);
         let restarted_at = Utc::now().to_rfc3339();
@@ -1053,13 +1247,20 @@ impl LiveStatusSource for KubeClusterStatusReader {
                 &PatchParams::default(),
                 &Patch::Strategic(&patch),
             )
-            .await?;
+            .await
+            .map_err(|e| {
+                not_found_or(
+                    e,
+                    format!("Workspace StatefulSet {namespace}/{sts_name} not found"),
+                )
+            })?;
         Ok(format!(
             "Triggered rollout restart for StatefulSet {namespace}/{sts_name}"
         ))
     }
 
     async fn reconcile_stack(&self, namespace: &str, name: &str) -> Result<String, KubeError> {
+        self.invalidate_status_cache();
         let ar = ApiResource {
             group: "pulumi.com".to_string(),
             version: "v1".to_string(),
@@ -1077,15 +1278,17 @@ impl LiveStatusSource for KubeClusterStatusReader {
             }
         });
         api.patch(name, &PatchParams::default(), &Patch::Merge(&patch))
-            .await?;
+            .await
+            .map_err(|e| not_found_or(e, format!("Stack {namespace}/{name} not found")))?;
         Ok(format!(
             "Requested reconciliation for Stack {namespace}/{name}"
         ))
     }
 
     async fn force_delete_stack(&self, namespace: &str, name: &str) -> Result<String, KubeError> {
-        if namespace == "flux-system" && name == "management-cluster-core" {
-            return Err(KubeError::InvalidInput(
+        self.invalidate_status_cache();
+        if namespace == "flux-system" && name == keel_pko::MANAGEMENT_CORE_STACK_NAME {
+            return Err(KubeError::Conflict(
                 "Cannot force-delete protected management-cluster-core stack".to_string(),
             ));
         }
@@ -1098,20 +1301,15 @@ impl LiveStatusSource for KubeClusterStatusReader {
             plural: "stacks".to_string(),
         };
         let api: Api<DynamicObject> = Api::namespaced_with(self.client.clone(), namespace, &ar);
-        let existing = api.get_opt(name).await?.ok_or_else(|| {
-            KubeError::InvalidInput(format!("Stack {namespace}/{name} not found"))
-        })?;
+        let existing = api
+            .get_opt(name)
+            .await?
+            .ok_or_else(|| KubeError::NotFound(format!("Stack {namespace}/{name} not found")))?;
 
-        let is_protected = existing
-            .metadata
-            .labels
-            .as_ref()
-            .and_then(|labels| labels.get("keel.io/protected"))
-            .map(String::as_str)
-            == Some("true");
-        if is_protected {
-            return Err(KubeError::InvalidInput(format!(
-                "Cannot force-delete protected Stack {namespace}/{name}"
+        if is_stack_object_protected(existing.metadata.labels.as_ref(), &existing.data) {
+            return Err(KubeError::Conflict(format!(
+                "Cannot force-delete protected Stack {namespace}/{name} (labeled `{}: \"true\"` or `spec.config.protect: true`); remove protection via a GitOps PR first",
+                keel_pko::stack::LABEL_PROTECT
             )));
         }
 
@@ -1145,6 +1343,7 @@ impl LiveStatusSource for KubeClusterStatusReader {
     }
 
     async fn unlock_stack(&self, namespace: &str, name: &str) -> Result<String, KubeError> {
+        self.invalidate_status_cache();
         let ar = ApiResource {
             group: "pulumi.com".to_string(),
             version: "v1".to_string(),
@@ -1153,9 +1352,10 @@ impl LiveStatusSource for KubeClusterStatusReader {
             plural: "stacks".to_string(),
         };
         let api: Api<DynamicObject> = Api::namespaced_with(self.client.clone(), namespace, &ar);
-        let existing = api.get_opt(name).await?.ok_or_else(|| {
-            KubeError::InvalidInput(format!("Stack {namespace}/{name} not found"))
-        })?;
+        let existing = api
+            .get_opt(name)
+            .await?
+            .ok_or_else(|| KubeError::NotFound(format!("Stack {namespace}/{name} not found")))?;
 
         let (backend, stack_name, flux_dir) = extract_stack_unlock_params(&existing)?;
 
@@ -1217,6 +1417,7 @@ impl LiveStatusSource for KubeClusterStatusReader {
     }
 
     async fn reconcile_release(&self, namespace: &str, name: &str) -> Result<String, KubeError> {
+        self.invalidate_status_cache();
         let requested_at = Utc::now().to_rfc3339();
         let patch = json!({
             "metadata": {
@@ -1315,6 +1516,7 @@ impl LiveStatusSource for KubeClusterStatusReader {
         namespace: &str,
         name: &str,
     ) -> Result<bool, KubeError> {
+        self.invalidate_status_cache();
         let ar = match (api_version, kind) {
             ("pulumi.com/v1", "Stack") => ApiResource {
                 group: "pulumi.com".to_string(),
@@ -1346,6 +1548,7 @@ impl LiveStatusSource for KubeClusterStatusReader {
     }
 
     async fn apply_cluster_policy(&self, name: &str, policy_doc: &Value) -> Result<(), KubeError> {
+        self.invalidate_status_cache();
         let api_version = policy_doc
             .get("apiVersion")
             .and_then(|v| v.as_str())
@@ -1360,7 +1563,6 @@ impl LiveStatusSource for KubeClusterStatusReader {
         };
         let plural = match kind {
             "ValidatingPolicy" => "validatingpolicies".to_string(),
-            "ClusterPolicy" => "clusterpolicies".to_string(),
             other => format!("{}s", other.to_ascii_lowercase()),
         };
         let ar = ApiResource {
@@ -1379,6 +1581,60 @@ impl LiveStatusSource for KubeClusterStatusReader {
         .await?;
         Ok(())
     }
+}
+
+/// Validates an **untrusted** (tenant-authored) kubeconfig before it is handed to
+/// `kube::Config::from_custom_kubeconfig`.
+///
+/// Only inline credential material is permitted: `token`, `username`/`password`,
+/// `client-certificate-data`, `client-key-data`, and `certificate-authority-data`.
+/// The following are rejected because they lead to code execution or server-local file reads
+/// inside `keel-server`:
+/// * `users[].user.exec` (credential plugin binaries) and `users[].user.auth-provider`,
+/// * `users[].user.tokenFile`, `client-certificate`, `client-key` (file paths),
+/// * `clusters[].cluster.certificate-authority` (file path).
+///
+/// All users and clusters are checked (not only the current context) so a later context switch
+/// cannot smuggle an unsafe entry. Returned error strings never include credential values.
+pub fn validate_untrusted_kubeconfig(kc: &kube::config::Kubeconfig) -> Result<(), String> {
+    fn non_empty(v: &Option<String>) -> bool {
+        v.as_deref().is_some_and(|s| !s.trim().is_empty())
+    }
+    for named in &kc.auth_infos {
+        let Some(user) = named.auth_info.as_ref() else {
+            continue;
+        };
+        let who = &named.name;
+        if user.exec.is_some() {
+            return Err(format!("user '{who}' uses an exec credential plugin"));
+        }
+        if user.auth_provider.is_some() {
+            return Err(format!("user '{who}' uses an auth-provider plugin"));
+        }
+        if non_empty(&user.token_file) {
+            return Err(format!("user '{who}' references a tokenFile path"));
+        }
+        if non_empty(&user.client_certificate) {
+            return Err(format!(
+                "user '{who}' references a client-certificate file path"
+            ));
+        }
+        if non_empty(&user.client_key) {
+            return Err(format!("user '{who}' references a client-key file path"));
+        }
+    }
+    for named in &kc.clusters {
+        let Some(cluster) = named.cluster.as_ref() else {
+            continue;
+        };
+        if non_empty(&cluster.certificate_authority) {
+            return Err(format!(
+                "cluster '{}' references a certificate-authority file path",
+                named.name
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Extracts all `status.conditions` entries from a Kubernetes resource's JSON payload.
@@ -1767,6 +2023,104 @@ pub fn force_delete_warning_suffix(data: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn parse_kc(yaml: &str) -> kube::config::Kubeconfig {
+        kube::config::Kubeconfig::from_yaml(yaml).expect("valid kubeconfig yaml")
+    }
+
+    const SAFE_KUBECONFIG: &str = r#"
+apiVersion: v1
+kind: Config
+clusters:
+- name: workload
+  cluster:
+    server: https://203.0.113.10:6443
+    certificate-authority-data: Y2E=
+users:
+- name: admin
+  user:
+    client-certificate-data: Y2VydA==
+    client-key-data: a2V5
+- name: tok
+  user:
+    token: abc
+- name: basic
+  user:
+    username: u
+    password: p
+contexts:
+- name: workload
+  context:
+    cluster: workload
+    user: admin
+current-context: workload
+"#;
+
+    #[test]
+    fn validate_untrusted_kubeconfig_accepts_inline_credentials() {
+        assert!(validate_untrusted_kubeconfig(&parse_kc(SAFE_KUBECONFIG)).is_ok());
+    }
+
+    #[test]
+    fn validate_untrusted_kubeconfig_rejects_exec_and_auth_provider() {
+        let exec = SAFE_KUBECONFIG.replace(
+            "    token: abc\n",
+            "    exec:\n      apiVersion: client.authentication.k8s.io/v1\n      command: /bin/sh\n      args: [\"-c\", \"id\"]\n",
+        );
+        let err = validate_untrusted_kubeconfig(&parse_kc(&exec)).unwrap_err();
+        assert!(err.contains("exec"), "{err}");
+        assert!(!err.contains("/bin/sh"));
+
+        let ap = SAFE_KUBECONFIG.replace(
+            "    token: abc\n",
+            "    auth-provider:\n      name: gcp\n      config:\n        cmd-path: /bin/sh\n",
+        );
+        let err = validate_untrusted_kubeconfig(&parse_kc(&ap)).unwrap_err();
+        assert!(err.contains("auth-provider"), "{err}");
+    }
+
+    #[test]
+    fn validate_untrusted_kubeconfig_rejects_file_path_credentials() {
+        for (needle, replacement, expect) in [
+            (
+                "    token: abc\n",
+                "    tokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token\n",
+                "tokenFile",
+            ),
+            (
+                "    client-certificate-data: Y2VydA==\n",
+                "    client-certificate: /etc/keel/tls.crt\n",
+                "client-certificate",
+            ),
+            (
+                "    client-key-data: a2V5\n",
+                "    client-key: /etc/keel/tls.key\n",
+                "client-key",
+            ),
+            (
+                "    certificate-authority-data: Y2E=\n",
+                "    certificate-authority: /etc/ssl/ca.crt\n",
+                "certificate-authority",
+            ),
+        ] {
+            let yaml = SAFE_KUBECONFIG.replace(needle, replacement);
+            assert_ne!(yaml, SAFE_KUBECONFIG, "replacement for {expect} must apply");
+            let err = validate_untrusted_kubeconfig(&parse_kc(&yaml)).unwrap_err();
+            assert!(err.contains(expect), "{err}");
+            assert!(!err.contains("/etc/") && !err.contains("/var/"));
+        }
+    }
+
+    #[test]
+    fn validate_untrusted_kubeconfig_checks_non_current_users() {
+        // Unsafe user is not referenced by current-context but must still be rejected.
+        let yaml = SAFE_KUBECONFIG.replace(
+            "- name: basic\n  user:\n    username: u\n    password: p\n",
+            "- name: basic\n  user:\n    tokenFile: /etc/passwd\n",
+        );
+        assert_ne!(yaml, SAFE_KUBECONFIG);
+        assert!(validate_untrusted_kubeconfig(&parse_kc(&yaml)).is_err());
+    }
     use serde_json::json;
 
     #[test]
@@ -2446,11 +2800,11 @@ mod tests {
                     200,
                     json!({ "apiVersion": "v1", "kind": "Status", "status": "Success" }).to_string(),
                 ),
-                ("PATCH", "/apis/kyverno.io/v1/clusterpolicies/restrict-pulumi-providers") => (
+                ("PATCH", "/apis/policies.kyverno.io/v1/validatingpolicies/restrict-pulumi-providers") => (
                     200,
                     json!({
-                        "apiVersion": "kyverno.io/v1",
-                        "kind": "ClusterPolicy",
+                        "apiVersion": "policies.kyverno.io/v1",
+                        "kind": "ValidatingPolicy",
                         "metadata": { "name": "restrict-pulumi-providers" }
                     })
                     .to_string(),
@@ -2605,8 +2959,8 @@ mod tests {
         );
 
         let policy_doc = json!({
-            "apiVersion": "kyverno.io/v1",
-            "kind": "ClusterPolicy",
+            "apiVersion": "policies.kyverno.io/v1",
+            "kind": "ValidatingPolicy",
             "metadata": { "name": "restrict-pulumi-providers" }
         });
         assert!(
@@ -2615,5 +2969,199 @@ mod tests {
                 .await
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn stack_protection_matches_pko_is_protected_semantics() {
+        let mut labels = std::collections::BTreeMap::new();
+        labels.insert(
+            keel_pko::stack::LABEL_PROTECT.to_string(),
+            "true".to_string(),
+        );
+        assert!(is_stack_object_protected(Some(&labels), &json!({})));
+
+        // The legacy/incorrect `keel.io/protected` label must NOT count.
+        let mut wrong = std::collections::BTreeMap::new();
+        wrong.insert("keel.io/protected".to_string(), "true".to_string());
+        assert!(!is_stack_object_protected(Some(&wrong), &json!({})));
+
+        assert!(is_stack_object_protected(
+            None,
+            &json!({ "spec": { "config": { "protect": "true" } } })
+        ));
+        assert!(is_stack_object_protected(
+            None,
+            &json!({ "spec": { "config": { "keel:protect": "true" } } })
+        ));
+        // Nonexistent top-level `spec.protect` must not count (PKO has no such field).
+        assert!(!is_stack_object_protected(
+            None,
+            &json!({ "spec": { "protect": true } })
+        ));
+        assert!(!is_stack_object_protected(
+            None,
+            &json!({ "spec": { "config": { "protect": "false" } } })
+        ));
+
+        assert!(is_stack_manifest_protected(&json!({
+            "metadata": { "labels": { "keel.io/protect": "true" } }
+        })));
+        assert!(!is_stack_manifest_protected(&json!({
+            "metadata": { "labels": { "keel.io/protected": "true" } }
+        })));
+
+        // Agrees with keel_pko::PkoStack::is_protected for a synthesized management stack.
+        let stack =
+            keel_pko::synthesize_management_core_stack(&keel_pko::ManagementCoreStackParams::new(
+                "s3://state",
+                "flux-system",
+                "clusters/management",
+            ))
+            .unwrap();
+        let doc = serde_json::to_value(&stack).unwrap();
+        assert!(stack.is_protected());
+        assert_eq!(is_stack_manifest_protected(&doc), stack.is_protected());
+    }
+
+    #[tokio::test]
+    async fn force_delete_refuses_protected_and_reports_not_found() {
+        let url = spawn_mock_k8s_server(|method, path| {
+            let path_only = path.split('?').next().unwrap_or(path);
+            match (method, path_only) {
+                ("GET", "/apis/pulumi.com/v1/namespaces/tenant-a/stacks/locked") => (
+                    200,
+                    json!({
+                        "apiVersion": "pulumi.com/v1",
+                        "kind": "Stack",
+                        "metadata": {
+                            "name": "locked",
+                            "namespace": "tenant-a",
+                            "labels": { "keel.io/protect": "true" }
+                        },
+                        "spec": {}
+                    })
+                    .to_string(),
+                ),
+                ("GET", "/apis/pulumi.com/v1/namespaces/tenant-a/stacks/cfg-locked") => (
+                    200,
+                    json!({
+                        "apiVersion": "pulumi.com/v1",
+                        "kind": "Stack",
+                        "metadata": { "name": "cfg-locked", "namespace": "tenant-a" },
+                        "spec": { "config": { "protect": "true" } }
+                    })
+                    .to_string(),
+                ),
+                _ => (
+                    404,
+                    json!({ "kind": "Status", "status": "Failure", "code": 404, "message": "not found", "reason": "NotFound" }).to_string(),
+                ),
+            }
+        })
+        .await;
+        let reader = KubeClusterStatusReader::from_client(mock_k8s_client(&url));
+
+        for name in ["locked", "cfg-locked"] {
+            let err = reader
+                .force_delete_stack("tenant-a", name)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, KubeError::Conflict(_)), "{name}: {err:?}");
+        }
+        let err = reader
+            .force_delete_stack("flux-system", "management-cluster-core")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, KubeError::Conflict(_)));
+
+        let err = reader
+            .force_delete_stack("tenant-a", "missing")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, KubeError::NotFound(_)), "{err:?}");
+        let err = reader
+            .unlock_stack("tenant-a", "missing")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, KubeError::NotFound(_)), "{err:?}");
+        let err = reader
+            .restart_stack_workspace("tenant-a", "missing")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, KubeError::NotFound(_)), "{err:?}");
+        let err = reader
+            .reconcile_stack("tenant-a", "missing")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, KubeError::NotFound(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn status_details_carry_protection_provider_and_terminating_flags_and_cache() {
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hits_c = std::sync::Arc::clone(&hits);
+        let url = spawn_mock_k8s_server(move |method, path| {
+            let path_only = path.split('?').next().unwrap_or(path);
+            match (method, path_only) {
+                ("GET", "/apis/pulumi.com/v1/stacks") => {
+                    hits_c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    (
+                        200,
+                        json!({
+                            "apiVersion": "pulumi.com/v1",
+                            "kind": "StackList",
+                            "metadata": {},
+                            "items": [
+                                {
+                                    "apiVersion": "pulumi.com/v1", "kind": "Stack",
+                                    "metadata": {
+                                        "name": "vm1", "namespace": "tenant-a",
+                                        "labels": { "keel.io/provider": "aws", "keel.io/tenant": "a", "keel.io/protect": "true" }
+                                    },
+                                    "spec": {},
+                                    "status": { "conditions": [ { "type": "Ready", "status": "True", "reason": "ProcessingCompleted" } ] }
+                                },
+                                {
+                                    "apiVersion": "pulumi.com/v1", "kind": "Stack",
+                                    "metadata": {
+                                        "name": "gone", "namespace": "tenant-a",
+                                        "deletionTimestamp": "2026-01-01T00:00:00Z",
+                                        "finalizers": ["finalizer.stack.pulumi.com"]
+                                    },
+                                    "spec": { "config": { "keel:provider": "proxmox" } }
+                                }
+                            ]
+                        })
+                        .to_string(),
+                    )
+                }
+                _ => (
+                    404,
+                    json!({ "kind": "Status", "status": "Failure", "code": 404, "message": "not found", "reason": "NotFound" }).to_string(),
+                ),
+            }
+        })
+        .await;
+        let reader = KubeClusterStatusReader::from_client(mock_k8s_client(&url))
+            .with_status_cache_ttl(Duration::from_secs(60));
+        let details = reader.stack_status_details().await;
+        let vm1 = details
+            .get(&("tenant-a".to_string(), "vm1".to_string()))
+            .unwrap();
+        assert!(vm1.protected && !vm1.terminating);
+        assert_eq!(vm1.provider.as_deref(), Some("aws"));
+        assert_eq!(vm1.tenant.as_deref(), Some("a"));
+        let gone = details
+            .get(&("tenant-a".to_string(), "gone".to_string()))
+            .unwrap();
+        assert!(gone.terminating);
+        assert_eq!(gone.status, LiveResourceStatus::Deleting);
+        assert_eq!(gone.provider.as_deref(), Some("proxmox"));
+
+        let _ = reader.stack_status_details().await;
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1, "cached");
+        reader.invalidate_status_cache();
+        let _ = reader.stack_status_details().await;
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 }

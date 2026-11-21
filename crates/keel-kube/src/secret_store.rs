@@ -24,7 +24,10 @@ use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
 
 use crate::KubeError;
-use crate::tenant::tenant_namespace;
+use crate::tenant::{
+    TENANT_NAMESPACE_PREFIX, TENANT_S3_CREDENTIALS_SECRET_KIND, TENANT_S3_CREDENTIALS_SECRET_NAME,
+    tenant_namespace,
+};
 
 /// Secret name holding the cluster-managed 256-bit session key in `keel-system`.
 pub const SESSION_KEY_SECRET_NAME: &str = "session-key";
@@ -36,10 +39,26 @@ pub const USER_GIT_CREDS_SECRET_PREFIX: &str = "user-git-creds-";
 pub const TENANT_SOPS_AGE_SECRET_NAME: &str = "sops-age";
 
 /// Secret name holding the in-cluster S3 state backend credentials (`accessKey`, `secretKey`).
+///
+/// In `keel-system`/`flux-system`/`keel-previews` this holds the SeaweedFS admin identity. In
+/// `tenant-*` namespaces it is only ever a mirror of the tenant-scoped
+/// `keel-tenant-s3-credentials` identity (never the admin keys).
 pub const S3_CREDENTIALS_SECRET_NAME: &str = "keel-s3-credentials";
+
+/// Annotation set on `keel-tenant-s3-credentials` while its keys are stored but not yet applied
+/// to SeaweedFS; such identities are never mirrored for PKO `Stack`s.
+pub const TENANT_S3_IDENTITY_PENDING_ANNOTATION: &str = "keel.io/s3-identity-pending";
 
 /// Optional secret name holding a GitHub token (`token`) for PKO workspace plugin downloads.
 pub const GITHUB_TOKEN_SECRET_NAME: &str = "keel-github-token";
+
+pub use keel_pko::{PULUMI_PASSPHRASE_SECRET_KEY, PULUMI_PASSPHRASE_SECRET_NAME};
+
+/// `keel.io/secret-kind` label value for Pulumi state passphrase Secrets.
+pub const PULUMI_PASSPHRASE_SECRET_KIND: &str = "pulumi-passphrase";
+
+/// Random bytes behind a generated Pulumi state passphrase (256-bit).
+pub const PULUMI_PASSPHRASE_BYTES: usize = 32;
 
 /// Length in bytes of the cluster session / symmetric encryption key (256-bit).
 pub const SESSION_KEY_LEN: usize = 32;
@@ -181,13 +200,28 @@ pub trait SecretStateStore: Send + Sync {
     /// Returns `true` when `keel-system/keel-s3-credentials` exists in the cluster.
     async fn has_s3_credentials(&self) -> Result<bool, KubeError>;
 
-    /// Ensures `keel-s3-credentials` exists in `target_namespace` by copying it from
-    /// `keel-system/keel-s3-credentials` if present. Returns `Ok(true)` if propagated or already
-    /// present, or `Ok(false)` if the source secret does not exist in `keel-system`.
+    /// Ensures `keel-s3-credentials` exists in `target_namespace`.
+    ///
+    /// Control-plane namespaces receive a copy of `keel-system/keel-s3-credentials`. `tenant-*`
+    /// namespaces only ever receive a mirror of their own scoped `keel-tenant-s3-credentials`
+    /// (never the admin keys). Returns `Ok(false)` when no suitable source exists.
     async fn ensure_s3_credentials_in_namespace(
         &self,
         target_namespace: &str,
     ) -> Result<bool, KubeError>;
+
+    /// Ensures the Pulumi state passphrase Secret (`keel-pulumi-passphrase`, key `passphrase`)
+    /// exists in `namespace`: an existing usable passphrase is always reused (never rotated);
+    /// otherwise a fresh 256-bit URL-safe passphrase is generated and created-if-absent (so
+    /// concurrent callers converge on one value). A present but empty/unreadable passphrase is
+    /// reported as corrupted and never silently replaced (it may guard existing state).
+    async fn ensure_pulumi_passphrase(
+        &self,
+        namespace: &str,
+    ) -> Result<PulumiPassphraseOutcome, KubeError>;
+
+    /// Returns `true` when `namespace` holds a usable (non-empty) Pulumi state passphrase.
+    async fn has_pulumi_passphrase(&self, namespace: &str) -> Result<bool, KubeError>;
 
     /// Ensures `keel-github-token` exists in `target_namespace` by copying it from
     /// `keel-system/keel-github-token` if present. Returns `Ok(true)` if propagated or already
@@ -196,6 +230,89 @@ pub trait SecretStateStore: Send + Sync {
         &self,
         target_namespace: &str,
     ) -> Result<bool, KubeError>;
+}
+
+/// Result of [`SecretStateStore::ensure_pulumi_passphrase`]. Never carries the passphrase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PulumiPassphraseOutcome {
+    /// A new passphrase was generated and stored.
+    Created,
+    /// An existing passphrase was kept.
+    Reused,
+}
+
+/// Generates a Pulumi state passphrase: 256 bits from the OS-seeded CSPRNG, base64url (no
+/// padding, 43 chars) so it is safe in env vars, YAML and URLs.
+pub fn generate_pulumi_passphrase() -> String {
+    use base64::Engine as _;
+    let mut bytes = [0u8; PULUMI_PASSPHRASE_BYTES];
+    rand::rng().fill_bytes(&mut bytes);
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// Builds the `keel-pulumi-passphrase` Secret for `namespace` holding `passphrase`.
+pub fn build_pulumi_passphrase_secret(namespace: &str, passphrase: &str) -> Secret {
+    Secret {
+        metadata: ObjectMeta {
+            name: Some(PULUMI_PASSPHRASE_SECRET_NAME.to_string()),
+            namespace: Some(namespace.to_string()),
+            labels: Some(managed_labels(PULUMI_PASSPHRASE_SECRET_KIND)),
+            ..ObjectMeta::default()
+        },
+        type_: Some("Opaque".to_string()),
+        data: Some(BTreeMap::from([(
+            PULUMI_PASSPHRASE_SECRET_KEY.to_string(),
+            ByteString(passphrase.as_bytes().to_vec()),
+        )])),
+        ..Secret::default()
+    }
+}
+
+fn usable_passphrase(secret: &Secret) -> bool {
+    secret
+        .data
+        .as_ref()
+        .and_then(|d| d.get(PULUMI_PASSPHRASE_SECRET_KEY))
+        .and_then(|v| std::str::from_utf8(&v.0).ok())
+        .is_some_and(|p| !p.trim().is_empty())
+}
+
+async fn has_pulumi_passphrase_impl(
+    backend: &impl SecretBackend,
+    namespace: &str,
+) -> Result<bool, KubeError> {
+    Ok(backend
+        .get_secret(namespace, PULUMI_PASSPHRASE_SECRET_NAME)
+        .await?
+        .as_ref()
+        .is_some_and(usable_passphrase))
+}
+
+pub(crate) async fn ensure_pulumi_passphrase_impl(
+    backend: &impl SecretBackend,
+    namespace: &str,
+) -> Result<PulumiPassphraseOutcome, KubeError> {
+    let corrupted = || KubeError::CorruptedSecret {
+        namespace: namespace.to_string(),
+        name: PULUMI_PASSPHRASE_SECRET_NAME.to_string(),
+        reason: format!("missing or empty `{PULUMI_PASSPHRASE_SECRET_KEY}`"),
+    };
+    if let Some(existing) = backend
+        .get_secret(namespace, PULUMI_PASSPHRASE_SECRET_NAME)
+        .await?
+    {
+        return if usable_passphrase(&existing) {
+            Ok(PulumiPassphraseOutcome::Reused)
+        } else {
+            Err(corrupted())
+        };
+    }
+    let desired = build_pulumi_passphrase_secret(namespace, &generate_pulumi_passphrase());
+    let stored = backend.create_secret_if_absent(namespace, desired).await?;
+    if !usable_passphrase(&stored) {
+        return Err(corrupted());
+    }
+    Ok(PulumiPassphraseOutcome::Created)
 }
 
 /// Low-level `Secret` CRUD abstraction shared between `K8sSecretStore` and `InMemorySecretStore`.
@@ -402,6 +519,17 @@ impl<B: SecretBackend> SecretStateStore for B {
         age_key: &TenantAgeKey,
     ) -> Result<(), KubeError> {
         store_tenant_age_key_impl(self, tenant_id, age_key).await
+    }
+
+    async fn ensure_pulumi_passphrase(
+        &self,
+        namespace: &str,
+    ) -> Result<PulumiPassphraseOutcome, KubeError> {
+        ensure_pulumi_passphrase_impl(self, namespace).await
+    }
+
+    async fn has_pulumi_passphrase(&self, namespace: &str) -> Result<bool, KubeError> {
+        has_pulumi_passphrase_impl(self, namespace).await
     }
 
     async fn get_tenant_age_key(&self, tenant_id: &str) -> Result<Option<TenantAgeKey>, KubeError> {
@@ -780,6 +908,9 @@ async fn ensure_s3_credentials_in_namespace_impl(
     backend: &impl SecretBackend,
     target_namespace: &str,
 ) -> Result<bool, KubeError> {
+    if target_namespace.starts_with(TENANT_NAMESPACE_PREFIX) {
+        return ensure_tenant_scoped_s3_credentials_impl(backend, target_namespace).await;
+    }
     ensure_secret_in_namespace_impl(
         backend,
         target_namespace,
@@ -787,6 +918,72 @@ async fn ensure_s3_credentials_in_namespace_impl(
         "s3-credentials",
     )
     .await
+}
+
+/// Tenant namespaces NEVER receive the control-plane (SeaweedFS admin) `keel-s3-credentials`.
+///
+/// Instead, the tenant-local scoped identity `keel-tenant-s3-credentials` (provisioned per tenant,
+/// see `keel_kube::tenant::seaweedfs_configure_tenant_identity_script`) is mirrored under the
+/// `keel-s3-credentials` name PKO `Stack.spec.envRefs` reference. Any legacy admin copy (e.g.
+/// previously cloned by Kyverno) is overwritten. Returns `Ok(false)` when the tenant has no
+/// scoped identity yet (fail closed).
+pub(crate) async fn ensure_tenant_scoped_s3_credentials_impl(
+    backend: &impl SecretBackend,
+    tenant_ns: &str,
+) -> Result<bool, KubeError> {
+    let Some(scoped) = backend
+        .get_secret(tenant_ns, TENANT_S3_CREDENTIALS_SECRET_NAME)
+        .await?
+    else {
+        return Ok(false);
+    };
+    if scoped
+        .metadata
+        .annotations
+        .as_ref()
+        .is_some_and(|a| a.contains_key(TENANT_S3_IDENTITY_PENDING_ANNOTATION))
+    {
+        // Keys stored but not yet applied to SeaweedFS (provisioning interrupted): fail closed.
+        return Ok(false);
+    }
+    let scoped_data = scoped.data.unwrap_or_default();
+    let mut data = BTreeMap::new();
+    for key in ["accessKey", "secretKey"] {
+        match scoped_data.get(key) {
+            Some(v) if !v.0.is_empty() => {
+                data.insert(key.to_string(), v.clone());
+            }
+            _ => {
+                return Err(KubeError::CorruptedSecret {
+                    namespace: tenant_ns.to_string(),
+                    name: TENANT_S3_CREDENTIALS_SECRET_NAME.to_string(),
+                    reason: format!("missing `{key}`"),
+                });
+            }
+        }
+    }
+
+    if let Some(existing) = backend
+        .get_secret(tenant_ns, S3_CREDENTIALS_SECRET_NAME)
+        .await?
+        && existing.data.as_ref() == Some(&data)
+    {
+        return Ok(true);
+    }
+
+    let mirror = Secret {
+        metadata: ObjectMeta {
+            name: Some(S3_CREDENTIALS_SECRET_NAME.to_string()),
+            namespace: Some(tenant_ns.to_string()),
+            labels: Some(managed_labels(TENANT_S3_CREDENTIALS_SECRET_KIND)),
+            ..ObjectMeta::default()
+        },
+        type_: Some("Opaque".to_string()),
+        data: Some(data),
+        ..Secret::default()
+    };
+    backend.upsert_secret(tenant_ns, mirror).await?;
+    Ok(true)
 }
 
 async fn ensure_secret_in_namespace_impl(
@@ -1131,13 +1328,27 @@ mod tests {
         ));
     }
 
+    fn s3_secret(name: &str, access: &[u8], secret: &[u8]) -> Secret {
+        Secret {
+            metadata: ObjectMeta {
+                name: Some(name.to_string()),
+                ..ObjectMeta::default()
+            },
+            data: Some(BTreeMap::from([
+                ("accessKey".to_string(), ByteString(access.to_vec())),
+                ("secretKey".to_string(), ByteString(secret.to_vec())),
+            ])),
+            ..Secret::default()
+        }
+    }
+
     #[tokio::test]
-    async fn s3_credentials_propagation_copies_from_keel_system() {
+    async fn s3_credentials_propagation_copies_admin_only_to_control_plane_namespaces() {
         let store = InMemorySecretStore::new();
         assert!(!store.has_s3_credentials().await.unwrap());
         assert!(
             !store
-                .ensure_s3_credentials_in_namespace("tenant-acme")
+                .ensure_s3_credentials_in_namespace(KEEL_PREVIEWS_NAMESPACE_FOR_TEST)
                 .await
                 .unwrap()
         );
@@ -1145,20 +1356,7 @@ mod tests {
         store
             .upsert_secret(
                 KEEL_SYSTEM_NAMESPACE,
-                Secret {
-                    metadata: ObjectMeta {
-                        name: Some(S3_CREDENTIALS_SECRET_NAME.to_string()),
-                        ..ObjectMeta::default()
-                    },
-                    data: Some(BTreeMap::from([
-                        ("accessKey".to_string(), ByteString(b"keel-pulumi".to_vec())),
-                        (
-                            "secretKey".to_string(),
-                            ByteString(b"super-secret".to_vec()),
-                        ),
-                    ])),
-                    ..Secret::default()
-                },
+                s3_secret(S3_CREDENTIALS_SECRET_NAME, b"admin-key", b"admin-secret"),
             )
             .await
             .unwrap();
@@ -1166,20 +1364,110 @@ mod tests {
         assert!(store.has_s3_credentials().await.unwrap());
         assert!(
             store
+                .ensure_s3_credentials_in_namespace(KEEL_PREVIEWS_NAMESPACE_FOR_TEST)
+                .await
+                .unwrap()
+        );
+        let copied = store
+            .get_secret(KEEL_PREVIEWS_NAMESPACE_FOR_TEST, S3_CREDENTIALS_SECRET_NAME)
+            .await
+            .unwrap()
+            .expect("copied secret");
+        assert_eq!(
+            copied.data.unwrap().get("accessKey").unwrap().0,
+            b"admin-key"
+        );
+    }
+
+    #[tokio::test]
+    async fn tenant_namespaces_never_receive_admin_s3_credentials() {
+        let store = InMemorySecretStore::new();
+        store
+            .upsert_secret(
+                KEEL_SYSTEM_NAMESPACE,
+                s3_secret(S3_CREDENTIALS_SECRET_NAME, b"admin-key", b"admin-secret"),
+            )
+            .await
+            .unwrap();
+
+        // No scoped identity yet: fail closed, nothing copied.
+        assert!(
+            !store
                 .ensure_s3_credentials_in_namespace("tenant-acme")
                 .await
                 .unwrap()
         );
+        assert!(
+            store
+                .get_secret("tenant-acme", S3_CREDENTIALS_SECRET_NAME)
+                .await
+                .unwrap()
+                .is_none()
+        );
 
-        let copied = store
+        // A legacy admin copy (e.g. from the removed Kyverno clone) is replaced by the scoped one.
+        store
+            .upsert_secret(
+                "tenant-acme",
+                s3_secret(S3_CREDENTIALS_SECRET_NAME, b"admin-key", b"admin-secret"),
+            )
+            .await
+            .unwrap();
+        store
+            .upsert_secret(
+                "tenant-acme",
+                s3_secret(
+                    TENANT_S3_CREDENTIALS_SECRET_NAME,
+                    b"tenant-key",
+                    b"tenant-secret",
+                ),
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .ensure_s3_credentials_in_namespace("tenant-acme")
+                .await
+                .unwrap()
+        );
+        let mirrored = store
             .get_secret("tenant-acme", S3_CREDENTIALS_SECRET_NAME)
             .await
             .unwrap()
-            .expect("copied secret");
-        let data = copied.data.unwrap();
-        assert_eq!(data.get("accessKey").unwrap().0, b"keel-pulumi");
-        assert_eq!(data.get("secretKey").unwrap().0, b"super-secret");
+            .expect("mirrored secret");
+        let labels = mirrored.metadata.labels.clone().unwrap();
+        assert_eq!(
+            labels.get("keel.io/secret-kind").map(String::as_str),
+            Some(TENANT_S3_CREDENTIALS_SECRET_KIND)
+        );
+        let data = mirrored.data.unwrap();
+        assert_eq!(data.get("accessKey").unwrap().0, b"tenant-key");
+        assert_eq!(data.get("secretKey").unwrap().0, b"tenant-secret");
+
+        // Idempotent.
+        assert!(
+            store
+                .ensure_s3_credentials_in_namespace("tenant-acme")
+                .await
+                .unwrap()
+        );
     }
+
+    #[tokio::test]
+    async fn tenant_scoped_s3_credentials_missing_keys_are_rejected() {
+        let store = InMemorySecretStore::new();
+        let mut broken = s3_secret(TENANT_S3_CREDENTIALS_SECRET_NAME, b"k", b"");
+        broken.data.as_mut().unwrap().remove("secretKey");
+        store.upsert_secret("tenant-acme", broken).await.unwrap();
+        assert!(matches!(
+            store
+                .ensure_s3_credentials_in_namespace("tenant-acme")
+                .await,
+            Err(KubeError::CorruptedSecret { .. })
+        ));
+    }
+
+    const KEEL_PREVIEWS_NAMESPACE_FOR_TEST: &str = "keel-previews";
 
     #[tokio::test]
     async fn github_token_propagation_copies_from_keel_system() {
@@ -1225,5 +1513,106 @@ mod tests {
             copied.data.unwrap().get("token").unwrap().0,
             b"ghp_test_token"
         );
+    }
+
+    fn passphrase_of(secret: &Secret) -> String {
+        String::from_utf8(
+            secret.data.as_ref().unwrap()[PULUMI_PASSPHRASE_SECRET_KEY]
+                .0
+                .clone(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn generated_pulumi_passphrases_are_256_bit_url_safe_and_unique() {
+        let a = generate_pulumi_passphrase();
+        let b = generate_pulumi_passphrase();
+        assert_ne!(a, b);
+        // 32 bytes base64url without padding = 43 chars (>= 256 bits of entropy).
+        assert_eq!(a.len(), 43);
+        assert!(
+            a.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+            "not URL-safe"
+        );
+    }
+
+    #[tokio::test]
+    async fn pulumi_passphrase_is_created_once_and_never_rotated() {
+        let store = InMemorySecretStore::new();
+        assert!(!store.has_pulumi_passphrase("tenant-acme").await.unwrap());
+        assert_eq!(
+            store.ensure_pulumi_passphrase("tenant-acme").await.unwrap(),
+            PulumiPassphraseOutcome::Created
+        );
+        assert!(store.has_pulumi_passphrase("tenant-acme").await.unwrap());
+        let first = store
+            .inspect_raw_secret("tenant-acme", PULUMI_PASSPHRASE_SECRET_NAME)
+            .await
+            .unwrap();
+        let pass = passphrase_of(&first);
+        assert_eq!(pass.len(), 43);
+        assert_eq!(
+            first.metadata.labels.as_ref().unwrap()["keel.io/secret-kind"],
+            PULUMI_PASSPHRASE_SECRET_KIND
+        );
+        // Never surfaced through Debug of the outcome.
+        let outcome = store.ensure_pulumi_passphrase("tenant-acme").await.unwrap();
+        assert_eq!(outcome, PulumiPassphraseOutcome::Reused);
+        assert!(!format!("{outcome:?}").contains(&pass));
+        let second = store
+            .inspect_raw_secret("tenant-acme", PULUMI_PASSPHRASE_SECRET_NAME)
+            .await
+            .unwrap();
+        assert_eq!(passphrase_of(&second), pass, "passphrase must never rotate");
+
+        // Namespaces are independent (tenant vs management).
+        store.ensure_pulumi_passphrase("flux-system").await.unwrap();
+        let mgmt = store
+            .inspect_raw_secret("flux-system", PULUMI_PASSPHRASE_SECRET_NAME)
+            .await
+            .unwrap();
+        assert_ne!(passphrase_of(&mgmt), pass);
+    }
+
+    #[tokio::test]
+    async fn pre_existing_passphrase_is_reused_and_empty_one_fails_closed() {
+        let store = InMemorySecretStore::new();
+        store
+            .upsert_secret(
+                "tenant-acme",
+                build_pulumi_passphrase_secret("tenant-acme", "operator-provided"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store.ensure_pulumi_passphrase("tenant-acme").await.unwrap(),
+            PulumiPassphraseOutcome::Reused
+        );
+        let kept = store
+            .inspect_raw_secret("tenant-acme", PULUMI_PASSPHRASE_SECRET_NAME)
+            .await
+            .unwrap();
+        assert_eq!(passphrase_of(&kept), "operator-provided");
+
+        store
+            .upsert_secret(
+                "tenant-bad",
+                build_pulumi_passphrase_secret("tenant-bad", ""),
+            )
+            .await
+            .unwrap();
+        assert!(!store.has_pulumi_passphrase("tenant-bad").await.unwrap());
+        assert!(matches!(
+            store.ensure_pulumi_passphrase("tenant-bad").await,
+            Err(KubeError::CorruptedSecret { .. })
+        ));
+        // The empty value is left untouched (no silent regeneration).
+        let bad = store
+            .inspect_raw_secret("tenant-bad", PULUMI_PASSPHRASE_SECRET_NAME)
+            .await
+            .unwrap();
+        assert_eq!(passphrase_of(&bad), "");
     }
 }

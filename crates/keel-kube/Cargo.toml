@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 keel-core.workspace = true
+keel-pko.workspace = true
 
 aes-gcm.workspace = true
 async-trait.workspace = true

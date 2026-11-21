@@ -1,9 +1,9 @@
-//! Kyverno `ClusterPolicy` & explicit local-dev `PolicyException` synthesis (`SDD.md` §6.2, `NFR-SEC-03`, `NFR-SEC-04`).
+//! Kyverno CEL `ValidatingPolicy` (`policies.kyverno.io/v1`) & explicit local-dev `PolicyException` synthesis (`SDD.md` §6.2, `NFR-SEC-03`, `NFR-SEC-04`).
 //!
 //! Generates the three baseline admission policies (`disallow-privileged-containers`,
 //! `protect-control-plane`, `restrict-pulumi-providers`) in `Enforce` mode while keeping
 //! production defaults strictly `restricted`. When `local_dev_docker_socket_exception` is
-//! explicitly enabled via CLI/init config, generates a scoped `kyverno.io/v2` `PolicyException`
+//! explicitly enabled via CLI/init config, generates a scoped `policies.kyverno.io/v1` `PolicyException`
 //! (`local-kind-docker-socket-exception`) allowing PKO workspace pods in `keel-previews` / `tenant-*`
 //! to access `/var/run/docker.sock` or `DOCKER_HOST` for `kind`-in-`kind` provisioning.
 
@@ -14,12 +14,17 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::KubeError;
-use crate::tenant::validate_resource_name;
+use crate::tenant::{TENANT_RECONCILER_SERVICE_ACCOUNT, validate_resource_name};
 
 pub const POLICY_DISALLOW_PRIVILEGED: &str = "disallow-privileged-containers";
 pub const POLICY_PROTECT_CONTROL_PLANE: &str = "protect-control-plane";
 pub const POLICY_RESTRICT_PULUMI_PROVIDERS: &str = "restrict-pulumi-providers";
+/// Retired `GeneratingPolicy` that cloned control-plane admin credentials into every tenant.
+/// Kept only so bootstrap can delete it (and its RBAC) from existing clusters.
 pub const POLICY_SYNC_TENANT_SECRETS: &str = "sync-tenant-secrets";
+/// Retired RBAC (`ClusterRole` + `ClusterRoleBinding`) used by [`POLICY_SYNC_TENANT_SECRETS`].
+pub const RETIRED_SYNC_TENANT_SECRETS_RBAC: &str = "keel-kyverno-tenant-secret-sync";
+pub const POLICY_RESTRICT_TENANT_RECONCILER: &str = "restrict-tenant-reconciler";
 pub const EXCEPTION_LOCAL_KIND_DOCKER_SOCKET: &str = "local-kind-docker-socket-exception";
 
 pub const RULE_DISALLOW_PRIVILEGED: &str = "disallow-privileged";
@@ -38,7 +43,7 @@ pub fn default_allowed_pulumi_providers() -> Vec<String> {
     ]
 }
 
-/// Customizable configuration for the opt-in `kyverno.io/v2` `PolicyException`
+/// Customizable configuration for the opt-in `policies.kyverno.io/v1` `PolicyException`
 /// (`local-kind-docker-socket-exception`) used in local `kind` development environments.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DockerSocketExceptionConfig {
@@ -101,8 +106,9 @@ impl Default for KyvernoPolicyConfig {
 
 /// Generates `ValidatingPolicy/disallow-privileged-containers` (`policies.kyverno.io/v1`).
 ///
-/// Enforces non-privileged, non-root, `allowPrivilegeEscalation: false`, `drop: ["ALL"]`,
-/// and blocks `hostPath` volumes (including `/var/run/docker.sock`) and `DOCKER_HOST` injection
+/// Enforces non-privileged, non-root, `allowPrivilegeEscalation: false`, `drop: ["ALL"]` on every
+/// container, init container, and ephemeral container; forbids `hostNetwork`/`hostPID`/`hostIPC`
+/// and `hostPort`; and blocks `hostPath` volumes (including `/var/run/docker.sock`) and `DOCKER_HOST` injection
 /// across `keel-previews` and `tenant-*` unless explicitly exempted via a `PolicyException`.
 pub fn build_disallow_privileged_containers_policy() -> Value {
     json!({
@@ -131,17 +137,31 @@ pub fn build_disallow_privileged_containers_policy() -> Value {
                 {
                     "name": "tenant-or-preview-namespace",
                     "expression": format!(
-                        "request.namespace == '{KEEL_PREVIEWS_NAMESPACE}' || request.namespace.startsWith('tenant-')"
+                        "(has(request.namespace) ? request.namespace : '') == '{KEEL_PREVIEWS_NAMESPACE}' || (has(request.namespace) ? request.namespace : '').startsWith('tenant-')"
                     )
+                }
+            ],
+            "variables": [
+                {
+                    "name": "allContainers",
+                    "expression": "object.spec.containers + (has(object.spec.initContainers) ? object.spec.initContainers : []) + (has(object.spec.ephemeralContainers) ? object.spec.ephemeralContainers : [])"
                 }
             ],
             "validations": [
                 {
-                    "expression": "object.spec.containers.all(c, has(c.securityContext) && (!has(c.securityContext.privileged) || !c.securityContext.privileged) && has(c.securityContext.allowPrivilegeEscalation) && !c.securityContext.allowPrivilegeEscalation && ((has(object.spec.securityContext) && has(object.spec.securityContext.runAsNonRoot) && object.spec.securityContext.runAsNonRoot) || (has(c.securityContext.runAsNonRoot) && c.securityContext.runAsNonRoot)) && has(c.securityContext.capabilities) && has(c.securityContext.capabilities.drop) && 'ALL' in c.securityContext.capabilities.drop)",
-                    "message": "Privileged containers and privilege escalation are prohibited; pods must adhere to restricted PSS."
+                    "expression": "variables.allContainers.all(c, has(c.securityContext) && (!has(c.securityContext.privileged) || !c.securityContext.privileged) && has(c.securityContext.allowPrivilegeEscalation) && !c.securityContext.allowPrivilegeEscalation && ((has(object.spec.securityContext) && has(object.spec.securityContext.runAsNonRoot) && object.spec.securityContext.runAsNonRoot) || (has(c.securityContext.runAsNonRoot) && c.securityContext.runAsNonRoot)) && has(c.securityContext.capabilities) && has(c.securityContext.capabilities.drop) && 'ALL' in c.securityContext.capabilities.drop)",
+                    "message": "Privileged containers and privilege escalation are prohibited in containers, initContainers, and ephemeralContainers; pods must adhere to restricted PSS."
                 },
                 {
-                    "expression": "(!has(object.spec.volumes) || object.spec.volumes.all(v, !has(v.hostPath))) && object.spec.containers.all(c, !has(c.env) || c.env.all(e, e.name != 'DOCKER_HOST'))",
+                    "expression": "(!has(object.spec.hostNetwork) || !object.spec.hostNetwork) && (!has(object.spec.hostPID) || !object.spec.hostPID) && (!has(object.spec.hostIPC) || !object.spec.hostIPC)",
+                    "message": "Sharing host namespaces (hostNetwork, hostPID, hostIPC) is forbidden."
+                },
+                {
+                    "expression": "variables.allContainers.all(c, !has(c.ports) || c.ports.all(p, !has(p.hostPort) || p.hostPort == 0))",
+                    "message": "Binding container ports to host ports (hostPort) is forbidden."
+                },
+                {
+                    "expression": "(!has(object.spec.volumes) || object.spec.volumes.all(v, !has(v.hostPath))) && variables.allContainers.all(c, !has(c.env) || c.env.all(e, e.name != 'DOCKER_HOST'))",
                     "message": "Mounting hostPath volumes (such as /var/run/docker.sock) or injecting DOCKER_HOST is forbidden in production."
                 }
             ]
@@ -195,7 +215,7 @@ pub fn build_protect_control_plane_policy() -> Value {
                 },
                 {
                     "expression": format!(
-                        "!((request.namespace == '{FLUX_SYSTEM_NAMESPACE}' || request.namespace == '{KEEL_SYSTEM_NAMESPACE}') && has(request.userInfo) && has(request.userInfo.username) && (request.userInfo.username.startsWith('system:serviceaccount:{KEEL_PREVIEWS_NAMESPACE}:') || request.userInfo.username.startsWith('system:serviceaccount:tenant-')))"
+                        "!(((has(request.namespace) ? request.namespace : '') == '{FLUX_SYSTEM_NAMESPACE}' || (has(request.namespace) ? request.namespace : '') == '{KEEL_SYSTEM_NAMESPACE}') && has(request.userInfo) && has(request.userInfo.username) && (request.userInfo.username.startsWith('system:serviceaccount:{KEEL_PREVIEWS_NAMESPACE}:') || request.userInfo.username.startsWith('system:serviceaccount:tenant-')))"
                     ),
                     "message": "Tenant and preview ServiceAccounts are strictly prohibited from mutating control-plane namespaces."
                 }
@@ -246,7 +266,7 @@ pub fn build_restrict_pulumi_providers_policy(
                 {
                     "name": "tenant-or-preview-namespace",
                     "expression": format!(
-                        "request.namespace == '{KEEL_PREVIEWS_NAMESPACE}' || request.namespace.startsWith('tenant-')"
+                        "(has(request.namespace) ? request.namespace : '') == '{KEEL_PREVIEWS_NAMESPACE}' || (has(request.namespace) ? request.namespace : '').startsWith('tenant-')"
                     )
                 }
             ],
@@ -260,6 +280,35 @@ pub fn build_restrict_pulumi_providers_policy(
             ]
         }
     }))
+}
+
+/// Built-in Pulumi providers every Keel control plane relies on regardless of
+/// `providers/registry.yaml` (manifest apps and blueprints synthesize `kubernetes` Stacks).
+pub const BUILTIN_PULUMI_PROVIDERS: &[&str] = &["kubernetes"];
+
+/// Returns the deduplicated `restrict-pulumi-providers` allowlist: registry-enabled providers
+/// followed by [`BUILTIN_PULUMI_PROVIDERS`]. Blank ids are dropped.
+pub fn pulumi_provider_allowlist<S: AsRef<str>>(enabled_provider_ids: &[S]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let ids = enabled_provider_ids
+        .iter()
+        .map(|p| p.as_ref().trim())
+        .chain(BUILTIN_PULUMI_PROVIDERS.iter().copied());
+    for id in ids {
+        if !id.is_empty() && !out.iter().any(|p| p == id) {
+            out.push(id.to_string());
+        }
+    }
+    out
+}
+
+/// Single entry point for (re-)generating `restrict-pulumi-providers` from the provider registry
+/// (Stage 0 bootstrap, `keel serve` startup, provider-registry PR merges). Always includes the
+/// built-in providers so a re-apply can never deny Keel's own `kubernetes` Stacks (OPEN-3).
+pub fn build_restrict_pulumi_providers_policy_for_registry<S: AsRef<str>>(
+    enabled_provider_ids: &[S],
+) -> Result<Value, KubeError> {
+    build_restrict_pulumi_providers_policy(&pulumi_provider_allowlist(enabled_provider_ids))
 }
 
 fn pod_spec_docker_expr(pod_spec_path: &str, socket_path: &str, allow_docker_host: bool) -> String {
@@ -307,9 +356,9 @@ pub fn build_local_kind_docker_socket_exception(
         .iter()
         .map(|ns| {
             if let Some(prefix) = ns.strip_suffix('*') {
-                format!("request.namespace.startsWith('{prefix}')")
+                format!("(has(request.namespace) ? request.namespace : '').startsWith('{prefix}')")
             } else {
-                format!("request.namespace == '{ns}'")
+                format!("(has(request.namespace) ? request.namespace : '') == '{ns}'")
             }
         })
         .collect::<Vec<_>>()
@@ -381,153 +430,69 @@ pub fn build_local_kind_docker_socket_exception(
     }))
 }
 
-/// Generates `GeneratingPolicy/sync-tenant-secrets` (`policies.kyverno.io/v1`) to clone and
-/// synchronize `keel-s3-credentials` and `git-credentials` from `flux-system` into every
-/// `tenant-*` namespace.
-pub fn build_sync_tenant_secrets_policy() -> Value {
-    let generate_expr = "generator.Apply(object.metadata.name, [\n\
-         \x20 {\n\
-         \x20   \"apiVersion\": dyn(\"v1\"),\n\
-         \x20   \"kind\": dyn(\"Secret\"),\n\
-         \x20   \"metadata\": dyn({\n\
-         \x20     \"name\": \"keel-s3-credentials\",\n\
-         \x20     \"labels\": {\n\
-         \x20       \"app.kubernetes.io/managed-by\": \"keel\",\n\
-         \x20       \"keel.io/secret-kind\": \"s3-credentials\"\n\
-         \x20     }\n\
-         \x20   }),\n\
-         \x20   \"type\": dyn(variables.s3Secret.type),\n\
-         \x20   \"data\": dyn(variables.s3Secret.data)\n\
-         \x20 },\n\
-         \x20 {\n\
-         \x20   \"apiVersion\": dyn(\"v1\"),\n\
-         \x20   \"kind\": dyn(\"Secret\"),\n\
-         \x20   \"metadata\": dyn({\n\
-         \x20     \"name\": \"git-credentials\",\n\
-         \x20     \"labels\": {\n\
-         \x20       \"app.kubernetes.io/managed-by\": \"keel\",\n\
-         \x20       \"keel.io/secret-kind\": \"git-credentials\"\n\
-         \x20     }\n\
-         \x20   }),\n\
-         \x20   \"type\": dyn(variables.gitSecret.type),\n\
-         \x20   \"data\": dyn(variables.gitSecret.data)\n\
-         \x20 }\n\
-         ])";
-
+/// Generates `ValidatingPolicy/restrict-tenant-reconciler` (`policies.kyverno.io/v1`).
+///
+/// Confines the `flux-system/keel-tenant-reconciler` `ServiceAccount` (impersonated by the root
+/// tenants Flux `Kustomization` under multi-tenancy lockdown) to `tenant-*` namespaces: namespaced
+/// writes must target `tenant-*`, `Namespace` objects must be named `tenant-*`, and the only
+/// permitted cluster-scoped object is a `ClusterRoleBinding` to `system:auth-delegator` for
+/// `tenant-*` `ServiceAccount`s. Fails closed (`failurePolicy: Fail`).
+pub fn build_restrict_tenant_reconciler_policy() -> Value {
     json!({
         "apiVersion": "policies.kyverno.io/v1",
-        "kind": "GeneratingPolicy",
+        "kind": "ValidatingPolicy",
         "metadata": {
-            "name": POLICY_SYNC_TENANT_SECRETS,
+            "name": POLICY_RESTRICT_TENANT_RECONCILER,
             "labels": {
                 "app.kubernetes.io/managed-by": "keel",
-                "keel.io/policy-tier": "tenant-secret-sync"
+                "keel.io/policy-tier": "tenant-isolation"
             }
         },
         "spec": {
+            "validationActions": ["Deny"],
+            "failurePolicy": "Fail",
             "evaluation": {
-                "generateExisting": {
-                    "enabled": true
-                },
-                "synchronize": {
-                    "enabled": true
+                "background": {
+                    "enabled": false
                 }
             },
             "matchConstraints": {
                 "resourceRules": [
                     {
-                        "apiGroups": [""],
-                        "apiVersions": ["v1"],
-                        "operations": ["CREATE", "UPDATE"],
-                        "resources": ["namespaces"]
+                        "apiGroups": ["*"],
+                        "apiVersions": ["*"],
+                        "operations": ["CREATE", "UPDATE", "DELETE"],
+                        "resources": ["*"]
                     }
                 ]
             },
             "matchConditions": [
                 {
-                    "name": "tenant-namespace",
-                    "expression": "object.metadata.name.startsWith('tenant-')"
+                    "name": "tenant-reconciler-only",
+                    "expression": format!(
+                        "request.userInfo.username == 'system:serviceaccount:{FLUX_SYSTEM_NAMESPACE}:{TENANT_RECONCILER_SERVICE_ACCOUNT}'"
+                    )
                 }
             ],
-            "variables": [
+            "validations": [
                 {
-                    "name": "s3Secret",
-                    "expression": format!("resource.Get('v1', 'secrets', '{FLUX_SYSTEM_NAMESPACE}', 'keel-s3-credentials')")
+                    "expression": "(has(request.namespace) ? request.namespace : '') != '' ? (has(request.namespace) ? request.namespace : '').startsWith('tenant-') : (request.kind.kind == 'Namespace' ? request.name.startsWith('tenant-') : request.kind.kind == 'ClusterRoleBinding')",
+                    "message": "keel-tenant-reconciler may only manage objects in tenant-* namespaces."
                 },
                 {
-                    "name": "gitSecret",
-                    "expression": format!("resource.Get('v1', 'secrets', '{FLUX_SYSTEM_NAMESPACE}', 'git-credentials')")
-                }
-            ],
-            "generate": [
+                    "expression": "request.kind.kind != 'ClusterRoleBinding' || request.operation == 'DELETE' || (object.roleRef.name == 'system:auth-delegator' && has(object.subjects) && object.subjects.all(s, s.kind == 'ServiceAccount' && has(s.namespace) && s.namespace.startsWith('tenant-')))",
+                    "message": "keel-tenant-reconciler may only bind ClusterRole/system:auth-delegator to tenant ServiceAccounts."
+                },
                 {
-                    "expression": generate_expr
+                    "expression": "request.kind.kind != 'RoleBinding' || request.operation == 'DELETE' || (object.subjects.all(s, s.kind != 'ServiceAccount' || (has(s.namespace) && s.namespace == (has(request.namespace) ? request.namespace : '')))) || (object.roleRef.kind == 'ClusterRole' && object.roleRef.name == 'keel-server-tenant' && has(object.subjects) && object.subjects.all(s, s.kind == 'ServiceAccount' && s.name == 'keel-server' && has(s.namespace) && s.namespace == 'keel-system'))",
+                    "message": "Tenant RoleBindings may only reference ServiceAccounts from the same tenant namespace (or bind ClusterRole/keel-server-tenant to keel-system/keel-server)."
                 }
             ]
         }
     })
 }
 
-/// Generates scoped RBAC (`ClusterRole` + `ClusterRoleBinding`) granting Kyverno's
-/// `background-controller` permission to clone and synchronize `keel-s3-credentials` and
-/// `git-credentials` into `tenant-*` namespaces.
-pub fn build_sync_tenant_secrets_rbac() -> [Value; 2] {
-    let cluster_role = json!({
-        "apiVersion": "rbac.authorization.k8s.io/v1",
-        "kind": "ClusterRole",
-        "metadata": {
-            "name": "keel-kyverno-tenant-secret-sync",
-            "labels": {
-                "app.kubernetes.io/managed-by": "keel"
-            }
-        },
-        "rules": [
-            {
-                "apiGroups": [""],
-                "resources": ["secrets"],
-                "verbs": ["list", "watch", "create"]
-            },
-            {
-                "apiGroups": [""],
-                "resources": ["secrets"],
-                "resourceNames": ["keel-s3-credentials", "git-credentials"],
-                "verbs": ["get", "update", "patch", "delete"]
-            }
-        ]
-    });
-
-    let cluster_role_binding = json!({
-        "apiVersion": "rbac.authorization.k8s.io/v1",
-        "kind": "ClusterRoleBinding",
-        "metadata": {
-            "name": "keel-kyverno-tenant-secret-sync",
-            "labels": {
-                "app.kubernetes.io/managed-by": "keel"
-            }
-        },
-        "roleRef": {
-            "apiGroup": "rbac.authorization.k8s.io",
-            "kind": "ClusterRole",
-            "name": "keel-kyverno-tenant-secret-sync"
-        },
-        "subjects": [
-            {
-                "kind": "ServiceAccount",
-                "name": "kyverno-background-controller",
-                "namespace": "kyverno"
-            },
-            {
-                "kind": "ServiceAccount",
-                "name": "kyverno-admission-controller",
-                "namespace": "kyverno"
-            }
-        ]
-    });
-
-    [cluster_role, cluster_role_binding]
-}
-
-/// Generated bundle of baseline Kyverno `ClusterPolicy` manifests and optional local-dev `PolicyException`.
+/// Generated bundle of baseline Kyverno `ValidatingPolicy` manifests and optional local-dev `PolicyException`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct KyvernoManifestBundle {
     pub cluster_policies: Vec<Value>,
@@ -536,7 +501,7 @@ pub struct KyvernoManifestBundle {
 }
 
 impl KyvernoManifestBundle {
-    /// Generates baseline Kyverno `ClusterPolicy` manifests and includes `PolicyException`
+    /// Generates baseline Kyverno `ValidatingPolicy` manifests and includes `PolicyException`
     /// only when `config.local_dev_docker_socket_exception` is explicitly `true`.
     pub fn generate(config: &KyvernoPolicyConfig) -> Result<Self, KubeError> {
         let cluster_policies = vec![
@@ -545,9 +510,7 @@ impl KyvernoManifestBundle {
             build_restrict_pulumi_providers_policy(&config.allowed_providers)?,
         ];
 
-        let [sync_role, sync_binding] = build_sync_tenant_secrets_rbac();
-        let supporting_manifests =
-            vec![sync_role, sync_binding, build_sync_tenant_secrets_policy()];
+        let supporting_manifests = vec![build_restrict_tenant_reconciler_policy()];
 
         let policy_exception = if config.local_dev_docker_socket_exception {
             Some(build_local_kind_docker_socket_exception(
@@ -600,9 +563,15 @@ mod tests {
 
         let bundle = KyvernoManifestBundle::generate(&cfg).unwrap();
         assert_eq!(bundle.cluster_policies.len(), 3);
-        assert_eq!(bundle.supporting_manifests.len(), 3);
+        assert_eq!(bundle.supporting_manifests.len(), 1);
         assert!(bundle.policy_exception.is_none());
-        assert_eq!(bundle.all_manifests().len(), 6);
+        assert_eq!(bundle.all_manifests().len(), 4);
+        assert!(
+            !bundle
+                .to_multi_doc_yaml()
+                .unwrap()
+                .contains("GeneratingPolicy")
+        );
 
         let names: Vec<&str> = bundle
             .cluster_policies
@@ -639,7 +608,7 @@ mod tests {
         };
 
         let bundle = KyvernoManifestBundle::generate(&cfg).unwrap();
-        assert_eq!(bundle.all_manifests().len(), 7);
+        assert_eq!(bundle.all_manifests().len(), 5);
 
         let exc = bundle
             .policy_exception
@@ -708,58 +677,132 @@ mod tests {
     }
 
     #[test]
-    fn sync_tenant_secrets_policy_and_rbac_are_generated() {
-        let policy = build_sync_tenant_secrets_policy();
-        assert_eq!(policy["apiVersion"], "policies.kyverno.io/v1");
-        assert_eq!(policy["kind"], "GeneratingPolicy");
-        assert_eq!(policy["metadata"]["name"], POLICY_SYNC_TENANT_SECRETS);
-        assert_eq!(
-            policy["spec"]["evaluation"]["generateExisting"]["enabled"],
-            true
-        );
-        assert_eq!(policy["spec"]["evaluation"]["synchronize"]["enabled"], true);
+    fn admin_credentials_are_never_cloned_into_tenants() {
+        let bundle = KyvernoManifestBundle::generate(&KyvernoPolicyConfig::default()).unwrap();
+        let yaml = bundle.to_multi_doc_yaml().unwrap();
+        assert!(!yaml.contains("keel-s3-credentials"));
+        assert!(!yaml.contains("git-credentials"));
+        assert!(!yaml.contains(POLICY_SYNC_TENANT_SECRETS));
+        assert!(!yaml.contains(RETIRED_SYNC_TENANT_SECRETS_RBAC));
+    }
 
-        let vars = policy["spec"]["variables"].as_array().unwrap();
-        assert_eq!(vars.len(), 2);
-        assert_eq!(vars[0]["name"], "s3Secret");
+    #[test]
+    fn restrict_tenant_reconciler_policy_confines_to_tenant_namespaces() {
+        let policy = build_restrict_tenant_reconciler_policy();
+        assert_eq!(policy["kind"], "ValidatingPolicy");
+        assert_eq!(
+            policy["metadata"]["name"],
+            POLICY_RESTRICT_TENANT_RECONCILER
+        );
+        assert_eq!(policy["spec"]["failurePolicy"], "Fail");
+        assert_eq!(
+            policy["spec"]["matchConditions"][0]["expression"],
+            "request.userInfo.username == 'system:serviceaccount:flux-system:keel-tenant-reconciler'"
+        );
+        let exprs: Vec<&str> = policy["spec"]["validations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["expression"].as_str().unwrap())
+            .collect();
         assert!(
-            vars[0]["expression"]
-                .as_str()
-                .unwrap()
-                .contains("keel-s3-credentials")
+            exprs[0].contains(
+                "(has(request.namespace) ? request.namespace : '').startsWith('tenant-')"
+            )
         );
-        assert_eq!(vars[1]["name"], "gitSecret");
+        assert!(exprs[0].contains("request.name.startsWith('tenant-')"));
+        assert!(exprs[1].contains("system:auth-delegator"));
+        assert!(exprs[2].contains("RoleBinding"));
+        // New tenants carry the keel-server RoleBinding (cross-namespace SA subject), which the
+        // policy must explicitly allow while still pinning the role and subject.
+        assert!(exprs[2].contains("object.roleRef.name == 'keel-server-tenant'"));
+        assert!(exprs[2].contains("s.name == 'keel-server'"));
+        assert!(exprs[2].contains("s.namespace == 'keel-system'"));
+    }
+
+    /// Kyverno's CEL `request` omits `namespace` for cluster-scoped objects, so a bare
+    /// `request.namespace` errors ("no such key") and the fail-closed policy denies the request
+    /// (this blocked tenant ClusterRoleBindings on fresh clusters). Every reference must be
+    /// guarded with `has(request.namespace)`.
+    #[test]
+    fn policies_never_dereference_request_namespace_unguarded() {
+        let guarded = "(has(request.namespace) ? request.namespace : '')";
+        let mut docs = vec![
+            build_disallow_privileged_containers_policy(),
+            build_protect_control_plane_policy(),
+            build_restrict_pulumi_providers_policy(&["kubernetes".to_string()]).unwrap(),
+            build_restrict_tenant_reconciler_policy(),
+        ];
+        for seed in [
+            include_str!("../../../deploy/seed/kyverno-policies/restrict-pulumi-providers.yaml"),
+            include_str!(
+                "../../../deploy/seed/kyverno-policies/disallow-privileged-containers.yaml"
+            ),
+            include_str!(
+                "../../../deploy/seed/kyverno-policies/local-kind-docker-socket-exception.yaml"
+            ),
+            include_str!("../../../deploy/seed/kyverno-policies/protect-control-plane.yaml"),
+            include_str!("../../../deploy/seed/kyverno-policies/restrict-tenant-reconciler.yaml"),
+        ] {
+            docs.push(serde_yml::from_str(seed).unwrap());
+        }
+        for doc in docs {
+            let text = doc.to_string();
+            let stripped = text
+                .replace(guarded, "")
+                .replace("has(request.namespace)", "");
+            assert!(
+                !stripped.contains("request.namespace"),
+                "unguarded request.namespace in policy {}",
+                doc["metadata"]["name"]
+            );
+        }
+    }
+
+    #[test]
+    fn restrict_tenant_reconciler_policy_matches_seed_manifest() {
+        let seed: Value = serde_yml::from_str(include_str!(
+            "../../../deploy/seed/kyverno-policies/restrict-tenant-reconciler.yaml"
+        ))
+        .unwrap();
+        let generated = build_restrict_tenant_reconciler_policy();
+        assert_eq!(
+            seed["spec"]["validations"],
+            generated["spec"]["validations"]
+        );
+        assert_eq!(
+            seed["spec"]["matchConditions"],
+            generated["spec"]["matchConditions"]
+        );
+    }
+
+    #[test]
+    fn disallow_privileged_covers_all_container_types_and_host_namespaces() {
+        let policy = build_disallow_privileged_containers_policy();
+        let all = policy["spec"]["variables"][0]["expression"]
+            .as_str()
+            .unwrap();
+        assert!(all.contains("object.spec.initContainers"));
+        assert!(all.contains("object.spec.ephemeralContainers"));
+        let exprs: Vec<&str> = policy["spec"]["validations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["expression"].as_str().unwrap())
+            .collect();
+        assert_eq!(exprs.len(), 4);
+        assert!(exprs[0].starts_with("variables.allContainers.all("));
+        assert!(exprs[1].contains("hostNetwork"));
+        assert!(exprs[1].contains("hostPID"));
+        assert!(exprs[1].contains("hostIPC"));
+        assert!(exprs[2].contains("hostPort"));
+        assert!(exprs[3].contains("hostPath"));
+        assert!(exprs[3].contains("variables.allContainers"));
         assert!(
-            vars[1]["expression"]
-                .as_str()
-                .unwrap()
-                .contains("git-credentials")
+            !exprs
+                .iter()
+                .any(|e| e.contains("object.spec.containers.all"))
         );
-
-        let generate = policy["spec"]["generate"].as_array().unwrap();
-        assert_eq!(generate.len(), 1);
-        let expr = generate[0]["expression"].as_str().unwrap();
-        assert!(expr.contains("generator.Apply"));
-        assert!(expr.contains("keel-s3-credentials"));
-        assert!(expr.contains("git-credentials"));
-
-        let [role, binding] = build_sync_tenant_secrets_rbac();
-        assert_eq!(role["kind"], "ClusterRole");
-        assert_eq!(role["metadata"]["name"], "keel-kyverno-tenant-secret-sync");
-        assert_eq!(
-            role["rules"][1]["resourceNames"],
-            json!(["keel-s3-credentials", "git-credentials"])
-        );
-        assert_eq!(binding["kind"], "ClusterRoleBinding");
-        assert_eq!(
-            binding["subjects"][0]["name"],
-            "kyverno-background-controller"
-        );
-        assert_eq!(
-            binding["subjects"][1]["name"],
-            "kyverno-admission-controller"
-        );
-        assert_eq!(binding["subjects"][0]["namespace"], "kyverno");
     }
 
     #[test]
@@ -778,11 +821,31 @@ mod tests {
             }
         }
         let docs: Vec<&str> = yaml.split("\n---\n").collect();
-        assert_eq!(docs.len(), 7);
+        assert_eq!(docs.len(), 5);
         for doc in docs {
             let parsed: serde_json::Value =
                 serde_yml::from_str(doc).expect("each Kyverno multi-doc YAML part must parse");
             assert!(parsed.get("kind").is_some());
         }
+    }
+
+    #[test]
+    fn registry_policy_always_allows_builtin_kubernetes_provider() {
+        let allow = pulumi_provider_allowlist(&["aws", " ", "kubernetes", "aws"]);
+        assert_eq!(allow, vec!["aws".to_string(), "kubernetes".to_string()]);
+        let empty: [&str; 0] = [];
+        assert_eq!(
+            pulumi_provider_allowlist(&empty),
+            vec!["kubernetes".to_string()]
+        );
+
+        let policy = build_restrict_pulumi_providers_policy_for_registry(&["proxmox"]).unwrap();
+        let expr = policy["spec"]["validations"][0]["expression"]
+            .as_str()
+            .unwrap();
+        assert!(expr.contains("\"kubernetes\""));
+        assert!(expr.contains("\"proxmox\""));
+        // Even with nothing enabled, the policy is valid and keeps `kubernetes`.
+        assert!(build_restrict_pulumi_providers_policy_for_registry(&empty).is_ok());
     }
 }

@@ -8,6 +8,7 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use futures::{Stream, StreamExt, stream};
@@ -395,14 +396,20 @@ impl TelemetryMux {
     /// Publishes a [`CrdWatchEvent`] to all active subscribers and records it in the replay buffer.
     ///
     /// Returns the number of active subscribers that received the event (`0` if nobody is currently subscribed).
+    ///
+    /// The replay buffer lock is held across the broadcast `send` so that [`Self::subscribe_stream`]
+    /// observes every event exactly once: either in its replay snapshot or on its live receiver.
     pub fn publish(&self, event: CrdWatchEvent) -> usize {
-        if let Ok(mut buf) = self.recent.lock() {
+        let mut guard = self.recent.lock().ok();
+        if let Some(buf) = guard.as_mut() {
             if buf.len() >= MAX_RECENT_TELEMETRY_EVENTS {
                 buf.pop_front();
             }
             buf.push_back(event.clone());
         }
-        self.sender.send(event).unwrap_or(0)
+        let delivered = self.sender.send(event).unwrap_or(0);
+        drop(guard);
+        delivered
     }
 
     /// Subscribes a new `broadcast::Receiver<CrdWatchEvent>`.
@@ -413,12 +420,12 @@ impl TelemetryMux {
     /// Returns an async `futures::Stream` over a new subscription for Axum SSE endpoints,
     /// replaying recent events first and gracefully continuing past lagged ring-buffer slots until the broadcaster closes.
     pub fn subscribe_stream(&self) -> impl Stream<Item = CrdWatchEvent> + Send + 'static {
-        let rx = self.subscribe();
-        let snapshot: Vec<CrdWatchEvent> = self
-            .recent
-            .lock()
-            .map(|buf| buf.iter().cloned().collect())
-            .unwrap_or_default();
+        // Snapshot the replay buffer and subscribe atomically under the same lock `publish` holds
+        // while sending, so no event is both replayed and received live (duplicate) or lost.
+        let (rx, snapshot): (_, Vec<CrdWatchEvent>) = match self.recent.lock() {
+            Ok(buf) => (self.subscribe(), buf.iter().cloned().collect()),
+            Err(_) => (self.subscribe(), Vec::new()),
+        };
 
         stream::iter(snapshot).chain(stream::unfold(rx, |mut rx| async move {
             loop {
@@ -468,12 +475,16 @@ impl TelemetryMux {
         tokio::spawn(async move {
             let stream = watcher::watcher(api, watcher::Config::default());
             futures::pin_mut!(stream);
+            let mut consecutive_errors: u32 = 0;
             let mut last_published: std::collections::HashMap<
                 (String, String),
                 (CrdReconcileStatus, String, Option<String>),
             > = std::collections::HashMap::new();
 
             while let Some(item) = stream.next().await {
+                if item.is_ok() {
+                    consecutive_errors = 0;
+                }
                 match item {
                     Ok(WatcherEvent::Apply(obj) | WatcherEvent::InitApply(obj)) => {
                         if let Some(ev) = CrdWatchEvent::from_dynamic_object(kind, &obj) {
@@ -493,18 +504,62 @@ impl TelemetryMux {
                     }
                     Ok(WatcherEvent::Init | WatcherEvent::InitDone) => {}
                     Err(err) => {
-                        let msg = err.to_string();
-                        if msg.contains("404") || msg.contains("NotFound") {
-                            tracing::debug!(%kind, "CRD not installed in cluster yet; backing off");
+                        let not_installed = is_crd_not_installed(&err);
+                        let delay = watcher_backoff_delay(
+                            consecutive_errors,
+                            not_installed,
+                            rand::random::<f64>(),
+                        );
+                        consecutive_errors = consecutive_errors.saturating_add(1);
+                        if not_installed {
+                            tracing::debug!(%kind, delay_ms = delay.as_millis() as u64, "CRD not installed in cluster yet; backing off");
                         } else {
-                            tracing::warn!(%kind, error = %err, "CRD watcher stream error; backing off");
+                            tracing::warn!(%kind, error = %err, delay_ms = delay.as_millis() as u64, "CRD watcher stream error; backing off");
                         }
-                        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                        tokio::time::sleep(delay).await;
                     }
                 }
             }
         })
     }
+}
+
+/// Initial CRD watcher retry delay.
+const WATCHER_BACKOFF_BASE: Duration = Duration::from_millis(500);
+/// Maximum CRD watcher retry delay for transient errors.
+const WATCHER_BACKOFF_MAX: Duration = Duration::from_secs(60);
+/// Maximum CRD watcher retry delay while a CRD is not installed (`404`).
+const WATCHER_BACKOFF_MAX_NOT_INSTALLED: Duration = Duration::from_secs(300);
+
+/// Returns `true` if a watcher error is a typed Kubernetes `404 NotFound` (CRD not installed yet).
+pub fn is_crd_not_installed(err: &watcher::Error) -> bool {
+    match err {
+        watcher::Error::InitialListFailed(e)
+        | watcher::Error::WatchStartFailed(e)
+        | watcher::Error::WatchFailed(e) => {
+            matches!(e, kube::Error::Api(status) if status.code == 404)
+        }
+        watcher::Error::WatchError(status) => status.code == 404,
+        watcher::Error::NoResourceVersion => false,
+    }
+}
+
+/// Computes exponential backoff with "equal jitter" for the `attempt`-th consecutive watcher error.
+///
+/// `jitter` is a uniform sample in `[0, 1)`; the result lies in `[cap/2, cap)` where
+/// `cap = min(base * 2^attempt, max)`. CRDs that are not installed back off to a longer ceiling.
+pub fn watcher_backoff_delay(attempt: u32, not_installed: bool, jitter: f64) -> Duration {
+    let max = if not_installed {
+        WATCHER_BACKOFF_MAX_NOT_INSTALLED
+    } else {
+        WATCHER_BACKOFF_MAX
+    };
+    let exp = WATCHER_BACKOFF_BASE
+        .checked_mul(1u32.checked_shl(attempt.min(20)).unwrap_or(u32::MAX))
+        .unwrap_or(max);
+    let cap = exp.min(max);
+    let half = cap / 2;
+    half + half.mul_f64(jitter.clamp(0.0, 1.0))
 }
 
 #[cfg(test)]
@@ -760,6 +815,71 @@ mod tests {
                 .status,
             CrdReconcileStatus::Previewing
         );
+    }
+
+    #[test]
+    fn watcher_backoff_grows_exponentially_with_jitter_and_caps() {
+        let d0 = watcher_backoff_delay(0, false, 0.0);
+        assert_eq!(d0, WATCHER_BACKOFF_BASE / 2);
+        let d0_hi = watcher_backoff_delay(0, false, 0.999);
+        assert!(d0_hi < WATCHER_BACKOFF_BASE && d0_hi > d0);
+        let d3 = watcher_backoff_delay(3, false, 0.0);
+        assert_eq!(d3, WATCHER_BACKOFF_BASE * 8 / 2);
+        // Capped for large attempts (no overflow).
+        let big = watcher_backoff_delay(u32::MAX, false, 0.5);
+        assert!(big <= WATCHER_BACKOFF_MAX && big >= WATCHER_BACKOFF_MAX / 2);
+        let big_ni = watcher_backoff_delay(40, true, 0.0);
+        assert_eq!(big_ni, WATCHER_BACKOFF_MAX_NOT_INSTALLED / 2);
+        // Out-of-range jitter is clamped.
+        assert!(watcher_backoff_delay(1, false, 7.0) <= WATCHER_BACKOFF_BASE * 2);
+    }
+
+    #[test]
+    fn crd_not_installed_detection_is_typed() {
+        let status_404 = kube::core::Status {
+            code: 404,
+            reason: "NotFound".to_string(),
+            ..Default::default()
+        };
+        let status_500 = kube::core::Status {
+            code: 500,
+            message: "contains 404 in text".to_string(),
+            ..Default::default()
+        };
+        assert!(is_crd_not_installed(&watcher::Error::InitialListFailed(
+            kube::Error::Api(Box::new(status_404.clone()))
+        )));
+        assert!(is_crd_not_installed(&watcher::Error::WatchError(Box::new(
+            status_404
+        ))));
+        assert!(!is_crd_not_installed(&watcher::Error::WatchFailed(
+            kube::Error::Api(Box::new(status_500.clone()))
+        )));
+        assert!(!is_crd_not_installed(&watcher::Error::WatchError(
+            Box::new(status_500)
+        )));
+        assert!(!is_crd_not_installed(&watcher::Error::NoResourceVersion));
+    }
+
+    #[tokio::test]
+    async fn subscribe_stream_replays_then_streams_without_duplicates() {
+        let mux = TelemetryMux::new(16);
+        let mk = |n: &str| {
+            CrdWatchEvent::new(
+                WatchedCrdKind::Stack,
+                "tenant-a",
+                n,
+                CrdReconcileStatus::Ready,
+                "ok",
+                None,
+            )
+        };
+        mux.publish(mk("before"));
+        let stream = Box::pin(mux.subscribe_stream());
+        mux.publish(mk("after"));
+        drop(mux);
+        let names: Vec<String> = stream.map(|e| e.name).collect().await;
+        assert_eq!(names, vec!["before".to_string(), "after".to_string()]);
     }
 
     #[tokio::test]

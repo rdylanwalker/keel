@@ -306,6 +306,40 @@ pub fn build_tenant_admin_role_binding(
     })
 }
 
+/// `ClusterRole` (shipped in `deploy/bootstrap/keel-server/rbac.yaml`) granting `keel-server` its
+/// per-tenant operational access (scoped secrets, Stack/HelmRelease out-of-band operations).
+pub const KEEL_SERVER_TENANT_CLUSTER_ROLE: &str = "keel-server-tenant";
+/// `ServiceAccount` / `RoleBinding` name of the control-plane API server.
+pub const KEEL_SERVER_SERVICE_ACCOUNT: &str = "keel-server";
+/// Namespace hosting the `keel-server` `ServiceAccount`.
+pub const KEEL_SERVER_NAMESPACE: &str = "keel-system";
+
+/// Generates the `RoleBinding` (`keel-server`) inside `tenant-<tenant-id>` that binds the
+/// `keel-server-tenant` `ClusterRole` to `keel-system/keel-server`. Tenant namespaces are dynamic,
+/// so every tenant bundle must carry this binding or the server loses access to the tenant.
+pub fn build_keel_server_tenant_role_binding(tenant_id: &str) -> Result<RoleBinding, KubeError> {
+    let ns_name = tenant_namespace(tenant_id)?;
+    Ok(RoleBinding {
+        metadata: ObjectMeta {
+            name: Some(KEEL_SERVER_SERVICE_ACCOUNT.to_string()),
+            namespace: Some(ns_name),
+            labels: Some(tenant_common_labels(tenant_id)),
+            ..ObjectMeta::default()
+        },
+        role_ref: RoleRef {
+            api_group: "rbac.authorization.k8s.io".to_string(),
+            kind: "ClusterRole".to_string(),
+            name: KEEL_SERVER_TENANT_CLUSTER_ROLE.to_string(),
+        },
+        subjects: Some(vec![Subject {
+            kind: "ServiceAccount".to_string(),
+            name: KEEL_SERVER_SERVICE_ACCOUNT.to_string(),
+            namespace: Some(KEEL_SERVER_NAMESPACE.to_string()),
+            api_group: None,
+        }]),
+    })
+}
+
 /// Generates the `ClusterRoleBinding` granting `system:auth-delegator` to the tenant's
 /// `ServiceAccount` so PKO v2 workspace pods can authenticate Kubernetes gRPC calls.
 pub fn build_tenant_auth_delegator_binding(
@@ -344,6 +378,7 @@ pub struct TenantManifestBundle {
     pub limit_range: LimitRange,
     pub network_policy: NetworkPolicy,
     pub role_binding: RoleBinding,
+    pub keel_server_role_binding: RoleBinding,
     pub auth_delegator_binding: ClusterRoleBinding,
 }
 
@@ -357,6 +392,7 @@ impl TenantManifestBundle {
             limit_range: build_tenant_limit_range(&config.tenant_id)?,
             network_policy: build_tenant_default_deny_network_policy(&config.tenant_id)?,
             role_binding: build_tenant_admin_role_binding(config)?,
+            keel_server_role_binding: build_keel_server_tenant_role_binding(&config.tenant_id)?,
             auth_delegator_binding: build_tenant_auth_delegator_binding(config)?,
         })
     }
@@ -370,6 +406,7 @@ impl TenantManifestBundle {
             serde_json::to_value(&self.limit_range)?,
             serde_json::to_value(&self.network_policy)?,
             serde_json::to_value(&self.role_binding)?,
+            serde_json::to_value(&self.keel_server_role_binding)?,
             serde_json::to_value(&self.auth_delegator_binding)?,
         ])
     }
@@ -568,9 +605,11 @@ pub fn synthesize_helm_release(input: &HelmReleaseSpecInput) -> Result<Value, Ku
         "interval".to_string(),
         Value::String(input.interval.clone()),
     );
-    if input.kube_config.is_none() {
-        spec.insert("serviceAccountName".to_string(), Value::String(sa_name));
-    }
+    // Always explicit: under Flux multi-tenancy lockdown (`--default-service-account`) an empty
+    // value makes the controller impersonate `default`, and for remote targets (`kubeConfig`)
+    // that impersonation happens on the workload cluster, whose blueprint binds exactly this
+    // tenant ServiceAccount identity.
+    spec.insert("serviceAccountName".to_string(), Value::String(sa_name));
     spec.insert("chart".to_string(), json!({ "spec": chart_spec }));
 
     if !input.depends_on.is_empty() {
@@ -956,9 +995,11 @@ pub fn synthesize_flux_kustomization(
     spec.insert("path".to_string(), Value::String(input.path.clone()));
     spec.insert("prune".to_string(), Value::Bool(input.prune));
     spec.insert("wait".to_string(), Value::Bool(input.wait));
-    if input.kube_config.is_none() {
-        spec.insert("serviceAccountName".to_string(), Value::String(sa_name));
-    }
+    // Always explicit: under Flux multi-tenancy lockdown (`--default-service-account`) an empty
+    // value makes the controller impersonate `default`, and for remote targets (`kubeConfig`)
+    // that impersonation happens on the workload cluster, whose blueprint binds exactly this
+    // tenant ServiceAccount identity.
+    spec.insert("serviceAccountName".to_string(), Value::String(sa_name));
     if let Some(kc) = &input.kube_config {
         validate_resource_name("kube_config.secret_name", &kc.secret_name)?;
         let mut secret_ref = serde_json::Map::new();
@@ -978,6 +1019,13 @@ pub fn synthesize_flux_kustomization(
         spec.insert(
             "targetNamespace".to_string(),
             Value::String(target_ns.clone()),
+        );
+    } else if input.kube_config.is_none() {
+        // Flux multi-tenancy lockdown: local tenant Kustomizations impersonate the tenant SA and
+        // force every namespaced object into `tenant-<id>`.
+        spec.insert(
+            "targetNamespace".to_string(),
+            Value::String(namespace.clone()),
         );
     }
     spec.insert(
@@ -1079,9 +1127,540 @@ pub fn generate_flux_kustomization_manifest(
     synthesize_flux_kustomization_yaml(input)
 }
 
+// ---------------------------------------------------------------------------------------------
+// Least-privilege tenant credentials (`NFR-SEC-02`, `NFR-SEC-05`)
+// ---------------------------------------------------------------------------------------------
+
+/// Secret name (inside `tenant-<id>`) holding the tenant-scoped S3 state backend identity
+/// (`accessKey`, `secretKey`, `stateBackendUrl`). Unlike the control-plane
+/// `keel-s3-credentials` (SeaweedFS admin keys, confined to `keel-system`/`flux-system`/
+/// `keel-previews`), this identity can only read/write `<bucket>/tenants/<id>/*`.
+pub const TENANT_S3_CREDENTIALS_SECRET_NAME: &str = "keel-tenant-s3-credentials";
+
+/// Secret name (inside `tenant-<id>`) holding a read-only Git credential (`username`, `password`)
+/// for the tenant's Flux `GitRepository`. Never a copy of the control-plane/forge admin token.
+pub const TENANT_GIT_CREDENTIALS_SECRET_NAME: &str = "git-credentials";
+
+/// `keel.io/secret-kind` label value for tenant-scoped S3 credentials.
+pub const TENANT_S3_CREDENTIALS_SECRET_KIND: &str = "tenant-s3-credentials";
+
+/// `keel.io/secret-kind` label value for tenant read-only Git credentials.
+pub const TENANT_GIT_CREDENTIALS_SECRET_KIND: &str = "tenant-git-credentials-readonly";
+
+/// Name of the Flux reconciler `ServiceAccount` (in `flux-system`) impersonated by the
+/// `tenants-root` / `keel-tenants` Kustomization instead of cluster-admin `kustomize-controller`.
+pub const TENANT_RECONCILER_SERVICE_ACCOUNT: &str = "keel-tenant-reconciler";
+
+/// Returns the S3 object-key prefix (`tenants/<id>`) owning a tenant's Pulumi DIY state.
+pub fn tenant_s3_state_prefix(tenant_id: &str) -> Result<String, KubeError> {
+    validate_tenant_id(tenant_id)?;
+    Ok(format!("tenants/{tenant_id}"))
+}
+
+/// Returns the SeaweedFS IAM identity name (`keel-tenant-<id>`) for a tenant.
+pub fn tenant_s3_identity_name(tenant_id: &str) -> Result<String, KubeError> {
+    validate_tenant_id(tenant_id)?;
+    Ok(format!("keel-tenant-{tenant_id}"))
+}
+
+/// Rewrites a Pulumi DIY S3 backend URL (`s3://<bucket>[/<path>][?query]`) so the tenant's state
+/// lives under `s3://<bucket>/tenants/<id>?query`, matching the scoped SeaweedFS identity.
+pub fn tenant_s3_backend_url(base_backend_url: &str, tenant_id: &str) -> Result<String, KubeError> {
+    let prefix = tenant_s3_state_prefix(tenant_id)?;
+    let (bucket, query) = split_s3_backend_url(base_backend_url)?;
+    let mut url = format!("s3://{bucket}/{prefix}");
+    if let Some(q) = query.filter(|q| !q.is_empty()) {
+        url.push('?');
+        url.push_str(q);
+    }
+    Ok(url)
+}
+
+/// Extracts the bucket name from a Pulumi DIY S3 backend URL (`s3://<bucket>[/<path>][?query]`).
+pub fn s3_bucket_from_backend_url(base_backend_url: &str) -> Result<String, KubeError> {
+    let (bucket, _) = split_s3_backend_url(base_backend_url)?;
+    validate_s3_bucket_name(bucket)?;
+    Ok(bucket.to_string())
+}
+
+fn split_s3_backend_url(base_backend_url: &str) -> Result<(&str, Option<&str>), KubeError> {
+    let rest = base_backend_url.strip_prefix("s3://").ok_or_else(|| {
+        KubeError::InvalidInput(format!(
+            "backend URL `{base_backend_url}` must use the `s3://` scheme"
+        ))
+    })?;
+    let (location, query) = match rest.split_once('?') {
+        Some((loc, q)) => (loc, Some(q)),
+        None => (rest, None),
+    };
+    let bucket = location.split('/').next().unwrap_or_default();
+    if bucket.is_empty() {
+        return Err(KubeError::InvalidInput(format!(
+            "backend URL `{base_backend_url}` is missing a bucket name"
+        )));
+    }
+    Ok((bucket, query))
+}
+
+/// Returns the SeaweedFS identity actions granting a tenant access to its own state prefix only.
+///
+/// SeaweedFS matches `<Action>:<bucket>/<objectKey>` against wildcard actions; bucket listings
+/// with a `prefix` query are authorized against that prefix, so Pulumi's prefixed `ListObjects`
+/// calls are covered without granting bucket-wide `List`.
+pub fn seaweedfs_tenant_identity_actions(
+    bucket: &str,
+    tenant_id: &str,
+) -> Result<Vec<String>, KubeError> {
+    validate_s3_bucket_name(bucket)?;
+    let prefix = tenant_s3_state_prefix(tenant_id)?;
+    Ok(["Read", "Write", "List"]
+        .iter()
+        .map(|action| format!("{action}:{bucket}/{prefix}/*"))
+        .collect())
+}
+
+/// Builds the `weed shell` script (fed via **stdin**, never argv, so keys are not exposed in the
+/// process table) that creates or updates a tenant's scoped SeaweedFS S3 identity.
+pub fn seaweedfs_configure_tenant_identity_script(
+    bucket: &str,
+    tenant_id: &str,
+    access_key: &str,
+    secret_key: &str,
+) -> Result<String, KubeError> {
+    for (field, value) in [("access_key", access_key), ("secret_key", secret_key)] {
+        if value.len() < 16 || !value.chars().all(|c| c.is_ascii_alphanumeric()) {
+            return Err(KubeError::InvalidInput(format!(
+                "{field} must be at least 16 ASCII alphanumeric characters"
+            )));
+        }
+    }
+    let user = tenant_s3_identity_name(tenant_id)?;
+    let actions = seaweedfs_tenant_identity_actions(bucket, tenant_id)?.join(",");
+    Ok(format!(
+        "s3.configure -user={user} -access_key={access_key} -secret_key={secret_key} -actions={actions} -apply\n"
+    ))
+}
+
+/// Synthesizes the `tenant-<id>/keel-tenant-s3-credentials` `Secret` for a scoped identity.
+pub fn build_tenant_s3_credentials_secret(
+    tenant_id: &str,
+    access_key: &str,
+    secret_key: &str,
+    base_backend_url: &str,
+) -> Result<Value, KubeError> {
+    let ns = tenant_namespace(tenant_id)?;
+    let backend_url = tenant_s3_backend_url(base_backend_url, tenant_id)?;
+    let mut labels = tenant_common_labels(tenant_id);
+    labels.insert(
+        "keel.io/secret-kind".to_string(),
+        TENANT_S3_CREDENTIALS_SECRET_KIND.to_string(),
+    );
+    Ok(json!({
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": {
+            "name": TENANT_S3_CREDENTIALS_SECRET_NAME,
+            "namespace": ns,
+            "labels": labels,
+            "annotations": {
+                "keel.io/s3-identity": tenant_s3_identity_name(tenant_id)?,
+                "keel.io/s3-state-prefix": tenant_s3_state_prefix(tenant_id)?,
+            },
+        },
+        "type": "Opaque",
+        "stringData": {
+            "accessKey": access_key,
+            "secretKey": secret_key,
+            "stateBackendUrl": backend_url,
+        },
+    }))
+}
+
+/// Synthesizes the tenant's read-only Git credential `Secret` (`tenant-<id>/git-credentials`).
+pub fn build_tenant_git_credentials_secret(
+    tenant_id: &str,
+    username: &str,
+    read_only_token: &str,
+) -> Result<Value, KubeError> {
+    let ns = tenant_namespace(tenant_id)?;
+    if username.trim().is_empty() || read_only_token.trim().is_empty() {
+        return Err(KubeError::InvalidInput(
+            "tenant git credentials require a non-empty username and token".to_string(),
+        ));
+    }
+    let mut labels = tenant_common_labels(tenant_id);
+    labels.insert(
+        "keel.io/secret-kind".to_string(),
+        TENANT_GIT_CREDENTIALS_SECRET_KIND.to_string(),
+    );
+    Ok(json!({
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": {
+            "name": TENANT_GIT_CREDENTIALS_SECRET_NAME,
+            "namespace": ns,
+            "labels": labels,
+        },
+        "type": "Opaque",
+        "stringData": {
+            "username": username,
+            "password": read_only_token,
+        },
+    }))
+}
+
+fn validate_s3_bucket_name(bucket: &str) -> Result<(), KubeError> {
+    let valid = (3..=63).contains(&bucket.len())
+        && bucket
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '.')
+        && !bucket.starts_with(['-', '.'])
+        && !bucket.ends_with(['-', '.']);
+    if valid {
+        Ok(())
+    } else {
+        Err(KubeError::InvalidInput(format!(
+            "invalid S3 bucket name `{bucket}`"
+        )))
+    }
+}
+
+/// Synthesizes the `flux-system/keel-tenant-reconciler` `ServiceAccount`, `ClusterRole`, and
+/// `ClusterRoleBinding` impersonated by the root tenants `Kustomization`.
+///
+/// The role only covers the kinds Keel writes under `tenants/` (tenant onboarding + tenant
+/// workloads). It may bind only `ClusterRole/admin` and `ClusterRole/keel-server-tenant`
+/// (namespaced `RoleBinding`s) and
+/// `ClusterRole/system:auth-delegator`, so it cannot mint cluster-admin. The companion Kyverno
+/// `ValidatingPolicy/restrict-tenant-reconciler` confines its writes to `tenant-*` namespaces.
+pub fn build_tenant_reconciler_rbac() -> [Value; 3] {
+    let labels = json!({
+        "app.kubernetes.io/managed-by": "keel",
+        "app.kubernetes.io/part-of": "keel-control-plane"
+    });
+    let all = json!([
+        "get", "list", "watch", "create", "update", "patch", "delete"
+    ]);
+    let service_account = json!({
+        "apiVersion": "v1",
+        "kind": "ServiceAccount",
+        "metadata": {
+            "name": TENANT_RECONCILER_SERVICE_ACCOUNT,
+            "namespace": "flux-system",
+            "labels": labels,
+        },
+        "automountServiceAccountToken": false
+    });
+    let cluster_role = json!({
+        "apiVersion": "rbac.authorization.k8s.io/v1",
+        "kind": "ClusterRole",
+        "metadata": {
+            "name": TENANT_RECONCILER_SERVICE_ACCOUNT,
+            "labels": labels,
+        },
+        "rules": [
+            {
+                "apiGroups": [""],
+                "resources": [
+                    "namespaces", "serviceaccounts", "secrets", "configmaps", "services",
+                    "resourcequotas", "limitranges", "persistentvolumeclaims"
+                ],
+                "verbs": all
+            },
+            { "apiGroups": ["networking.k8s.io"], "resources": ["networkpolicies"], "verbs": all },
+            {
+                "apiGroups": ["rbac.authorization.k8s.io"],
+                "resources": ["rolebindings", "clusterrolebindings"],
+                "verbs": all
+            },
+            {
+                "apiGroups": ["rbac.authorization.k8s.io"],
+                "resources": ["clusterroles"],
+                "resourceNames": ["admin", KEEL_SERVER_TENANT_CLUSTER_ROLE, "system:auth-delegator"],
+                "verbs": ["bind"]
+            },
+            {
+                "apiGroups": ["source.toolkit.fluxcd.io"],
+                "resources": ["gitrepositories", "helmrepositories", "ocirepositories", "helmcharts", "buckets"],
+                "verbs": all
+            },
+            { "apiGroups": ["kustomize.toolkit.fluxcd.io"], "resources": ["kustomizations"], "verbs": all },
+            { "apiGroups": ["helm.toolkit.fluxcd.io"], "resources": ["helmreleases"], "verbs": all },
+            { "apiGroups": ["pulumi.com"], "resources": ["stacks", "programs"], "verbs": all },
+            { "apiGroups": ["flagger.app"], "resources": ["canaries", "metrictemplates", "alertproviders"], "verbs": all },
+            {
+                "apiGroups": ["gateway.networking.k8s.io"],
+                "resources": ["httproutes", "grpcroutes", "referencegrants"],
+                "verbs": all
+            },
+            {
+                "apiGroups": ["apps"],
+                "resources": ["deployments", "statefulsets", "daemonsets"],
+                "verbs": all
+            },
+            { "apiGroups": ["batch"], "resources": ["jobs", "cronjobs"], "verbs": all },
+            { "apiGroups": ["policy"], "resources": ["poddisruptionbudgets"], "verbs": all },
+            { "apiGroups": ["autoscaling"], "resources": ["horizontalpodautoscalers"], "verbs": all }
+        ]
+    });
+    let binding = json!({
+        "apiVersion": "rbac.authorization.k8s.io/v1",
+        "kind": "ClusterRoleBinding",
+        "metadata": {
+            "name": TENANT_RECONCILER_SERVICE_ACCOUNT,
+            "labels": labels,
+        },
+        "roleRef": {
+            "apiGroup": "rbac.authorization.k8s.io",
+            "kind": "ClusterRole",
+            "name": TENANT_RECONCILER_SERVICE_ACCOUNT
+        },
+        "subjects": [{
+            "kind": "ServiceAccount",
+            "name": TENANT_RECONCILER_SERVICE_ACCOUNT,
+            "namespace": "flux-system"
+        }]
+    });
+    [service_account, cluster_role, binding]
+}
+
+/// Serializes [`build_tenant_reconciler_rbac`] into multi-document YAML.
+pub fn build_tenant_reconciler_rbac_yaml() -> Result<String, KubeError> {
+    let mut docs = Vec::new();
+    for doc in build_tenant_reconciler_rbac() {
+        let mut s = serde_yml::to_string(&doc)?;
+        if !s.ends_with('\n') {
+            s.push('\n');
+        }
+        docs.push(s);
+    }
+    Ok(docs.join("---\n"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tenant_s3_backend_url_scopes_state_under_tenant_prefix() {
+        let base = "s3://pulumi-state?endpoint=s3.local:8333&s3ForcePathStyle=true";
+        assert_eq!(
+            tenant_s3_backend_url(base, "acme").unwrap(),
+            "s3://pulumi-state/tenants/acme?endpoint=s3.local:8333&s3ForcePathStyle=true"
+        );
+        assert_eq!(
+            tenant_s3_backend_url("s3://pulumi-state", "default").unwrap(),
+            "s3://pulumi-state/tenants/default"
+        );
+        // An existing path is replaced (never nested) so tenants cannot escape their prefix.
+        assert_eq!(
+            tenant_s3_backend_url("s3://b-1/other/path?x=1", "acme").unwrap(),
+            "s3://b-1/tenants/acme?x=1"
+        );
+        assert!(tenant_s3_backend_url("file:///tmp/state", "acme").is_err());
+        assert!(tenant_s3_backend_url("s3://", "acme").is_err());
+        assert!(tenant_s3_backend_url("s3://bucket", "../etc").is_err());
+    }
+
+    #[test]
+    fn s3_bucket_from_backend_url_extracts_and_validates_bucket() {
+        assert_eq!(
+            s3_bucket_from_backend_url("s3://pulumi-state?endpoint=x:8333").unwrap(),
+            "pulumi-state"
+        );
+        assert_eq!(
+            s3_bucket_from_backend_url("s3://b-1/some/path").unwrap(),
+            "b-1"
+        );
+        assert!(s3_bucket_from_backend_url("file:///tmp").is_err());
+        assert!(s3_bucket_from_backend_url("s3://Bad_Bucket").is_err());
+    }
+
+    #[test]
+    fn seaweedfs_identity_is_scoped_to_tenant_prefix_without_admin() {
+        let actions = seaweedfs_tenant_identity_actions("pulumi-state", "acme").unwrap();
+        assert_eq!(
+            actions,
+            vec![
+                "Read:pulumi-state/tenants/acme/*",
+                "Write:pulumi-state/tenants/acme/*",
+                "List:pulumi-state/tenants/acme/*",
+            ]
+        );
+        assert!(actions.iter().all(|a| !a.starts_with("Admin")));
+        assert!(seaweedfs_tenant_identity_actions("Bad_Bucket", "acme").is_err());
+        assert!(seaweedfs_tenant_identity_actions("pulumi-state", "ACME").is_err());
+
+        let access = "AKIAABCDEFGHIJKLMNOP";
+        let secret = "s3cretS3cretS3cretS3cretS3cret";
+        let script =
+            seaweedfs_configure_tenant_identity_script("pulumi-state", "acme", access, secret)
+                .unwrap();
+        assert!(script.starts_with("s3.configure -user=keel-tenant-acme "));
+        assert!(script.contains(&format!("-access_key={access}")));
+        assert!(script.contains("-actions=Read:pulumi-state/tenants/acme/*,"));
+        assert!(script.trim_end().ends_with("-apply"));
+        assert_eq!(script.lines().count(), 1);
+
+        // Injection attempts into the weed shell script are rejected.
+        assert!(
+            seaweedfs_configure_tenant_identity_script(
+                "pulumi-state",
+                "acme",
+                "AKIAABCDEFGHIJKL -apply\ns3.bucket.delete",
+                secret
+            )
+            .is_err()
+        );
+        assert!(
+            seaweedfs_configure_tenant_identity_script("pulumi-state", "acme", "short", secret)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn tenant_credential_secrets_live_in_tenant_namespace() {
+        let s3 = build_tenant_s3_credentials_secret(
+            "acme",
+            "AKIAABCDEFGHIJKLMNOP",
+            "s3cretS3cretS3cretS3cret",
+            "s3://pulumi-state?region=us-east-1",
+        )
+        .unwrap();
+        assert_eq!(s3["metadata"]["name"], TENANT_S3_CREDENTIALS_SECRET_NAME);
+        assert_eq!(s3["metadata"]["namespace"], "tenant-acme");
+        assert_eq!(
+            s3["metadata"]["labels"]["keel.io/secret-kind"],
+            TENANT_S3_CREDENTIALS_SECRET_KIND
+        );
+        assert_eq!(s3["metadata"]["labels"]["keel.io/tenant"], "acme");
+        assert_eq!(
+            s3["stringData"]["stateBackendUrl"],
+            "s3://pulumi-state/tenants/acme?region=us-east-1"
+        );
+        assert_eq!(
+            s3["metadata"]["annotations"]["keel.io/s3-identity"],
+            "keel-tenant-acme"
+        );
+
+        let git = build_tenant_git_credentials_secret("default", "keel", "ro-token").unwrap();
+        assert_eq!(git["metadata"]["namespace"], "tenant-default");
+        assert_eq!(git["metadata"]["name"], "git-credentials");
+        assert_eq!(
+            git["metadata"]["labels"]["keel.io/secret-kind"],
+            TENANT_GIT_CREDENTIALS_SECRET_KIND
+        );
+        assert!(build_tenant_git_credentials_secret("default", "keel", " ").is_err());
+    }
+
+    #[test]
+    fn tenant_reconciler_rbac_matches_seed_manifest() {
+        let seed = include_str!("../../../deploy/seed/flux-system/tenant-reconciler-rbac.yaml");
+        let docs: Vec<Value> = seed
+            .split("\n---\n")
+            .map(|d| serde_yml::from_str(d).unwrap())
+            .collect();
+        let [_, role, _] = build_tenant_reconciler_rbac();
+        let seed_role = docs
+            .iter()
+            .find(|d| d["kind"] == "ClusterRole")
+            .expect("seed ClusterRole");
+        assert_eq!(seed_role["rules"], role["rules"]);
+    }
+
+    #[test]
+    fn keel_server_tenant_role_binding_targets_server_service_account() {
+        let rb = build_keel_server_tenant_role_binding("acme").unwrap();
+        assert_eq!(rb.metadata.name.as_deref(), Some("keel-server"));
+        assert_eq!(rb.metadata.namespace.as_deref(), Some("tenant-acme"));
+        assert_eq!(rb.role_ref.kind, "ClusterRole");
+        assert_eq!(rb.role_ref.name, KEEL_SERVER_TENANT_CLUSTER_ROLE);
+        let subjects = rb.subjects.unwrap();
+        assert_eq!(subjects.len(), 1);
+        assert_eq!(subjects[0].kind, "ServiceAccount");
+        assert_eq!(subjects[0].name, "keel-server");
+        assert_eq!(subjects[0].namespace.as_deref(), Some("keel-system"));
+        assert!(build_keel_server_tenant_role_binding("Bad_ID").is_err());
+
+        // Must match the static tenant-default binding shipped with keel-server.
+        let shipped = include_str!("../../../deploy/bootstrap/keel-server/rbac.yaml");
+        let shipped_rb: Value = shipped
+            .split("\n---\n")
+            .map(|d| serde_yml::from_str::<Value>(d).unwrap())
+            .find(|d| d["kind"] == "RoleBinding" && d["metadata"]["namespace"] == "tenant-default")
+            .expect("tenant-default keel-server RoleBinding");
+        let generated =
+            serde_json::to_value(build_keel_server_tenant_role_binding("default").unwrap())
+                .unwrap();
+        assert_eq!(
+            shipped_rb["metadata"]["name"],
+            generated["metadata"]["name"]
+        );
+        assert_eq!(shipped_rb["roleRef"], generated["roleRef"]);
+        assert_eq!(shipped_rb["subjects"], generated["subjects"]);
+        assert!(shipped.contains(&format!("name: {KEEL_SERVER_TENANT_CLUSTER_ROLE}")));
+    }
+
+    #[test]
+    fn tenant_reconciler_rbac_cannot_bind_cluster_admin() {
+        let [sa, role, binding] = build_tenant_reconciler_rbac();
+        assert_eq!(sa["metadata"]["namespace"], "flux-system");
+        assert_eq!(sa["metadata"]["name"], TENANT_RECONCILER_SERVICE_ACCOUNT);
+        let rules = role["rules"].as_array().unwrap();
+        for rule in rules {
+            assert_ne!(rule["apiGroups"], json!(["*"]));
+            assert_ne!(rule["resources"], json!(["*"]));
+            assert_ne!(rule["verbs"], json!(["*"]));
+            if rule["verbs"] == json!(["bind"]) {
+                assert_eq!(
+                    rule["resourceNames"],
+                    json!(["admin", "keel-server-tenant", "system:auth-delegator"])
+                );
+            }
+            // No escalate verb and no ability to author ClusterRoles/Roles.
+            let resources = rule["resources"].as_array().unwrap();
+            if rule["verbs"] != json!(["bind"]) {
+                assert!(!resources.contains(&json!("clusterroles")));
+                assert!(!resources.contains(&json!("roles")));
+            }
+            assert!(
+                !rule["verbs"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!("escalate"))
+            );
+            assert!(
+                !rule["verbs"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!("impersonate"))
+            );
+        }
+        assert_eq!(
+            binding["roleRef"]["name"],
+            TENANT_RECONCILER_SERVICE_ACCOUNT
+        );
+        assert_eq!(binding["subjects"][0]["namespace"], "flux-system");
+
+        let yaml = build_tenant_reconciler_rbac_yaml().unwrap();
+        assert_eq!(yaml.matches("\n---\n").count(), 2);
+    }
+
+    #[test]
+    fn local_flux_kustomization_defaults_target_namespace_to_tenant() {
+        let input = FluxKustomizationSpecInput::new("acme", "web", "keel-gitops", "./tenants/acme");
+        let doc = synthesize_flux_kustomization(&input).unwrap();
+        assert_eq!(doc["spec"]["serviceAccountName"], "tenant-acme-sa");
+        assert_eq!(doc["spec"]["targetNamespace"], "tenant-acme");
+        assert_eq!(doc["metadata"]["namespace"], "tenant-acme");
+
+        let mut remote = input.clone();
+        remote.kube_config = Some(RemoteKubeConfigRef::new("remote-kubeconfig"));
+        let doc = synthesize_flux_kustomization(&remote).unwrap();
+        // Remote targets still impersonate the tenant SA (bound on the workload cluster).
+        assert_eq!(doc["spec"]["serviceAccountName"], "tenant-acme-sa");
+        assert!(doc["spec"].get("targetNamespace").is_none());
+    }
 
     #[test]
     fn tenant_isolation_bundle_enforces_restricted_pss_quota_and_default_deny() {
@@ -1151,7 +1730,7 @@ mod tests {
 
         // JSON & multi-doc YAML serialization
         let json_docs = bundle.to_json_values().unwrap();
-        assert_eq!(json_docs.len(), 7);
+        assert_eq!(json_docs.len(), 8);
         assert_eq!(json_docs[0]["kind"], "Namespace");
         assert_eq!(json_docs[1]["kind"], "ServiceAccount");
         assert_eq!(json_docs[2]["kind"], "ResourceQuota");
@@ -1159,8 +1738,15 @@ mod tests {
         assert_eq!(json_docs[4]["kind"], "NetworkPolicy");
         assert_eq!(json_docs[5]["kind"], "RoleBinding");
         assert_eq!(json_docs[5]["metadata"]["name"], "tenant-acme-prod-admin");
-        assert_eq!(json_docs[6]["kind"], "ClusterRoleBinding");
-        assert_eq!(json_docs[6]["roleRef"]["name"], "system:auth-delegator");
+        assert_eq!(json_docs[6]["kind"], "RoleBinding");
+        assert_eq!(json_docs[6]["metadata"]["name"], "keel-server");
+        assert_eq!(json_docs[6]["metadata"]["namespace"], "tenant-acme-prod");
+        assert_eq!(json_docs[6]["roleRef"]["kind"], "ClusterRole");
+        assert_eq!(json_docs[6]["roleRef"]["name"], "keel-server-tenant");
+        assert_eq!(json_docs[6]["subjects"][0]["name"], "keel-server");
+        assert_eq!(json_docs[6]["subjects"][0]["namespace"], "keel-system");
+        assert_eq!(json_docs[7]["kind"], "ClusterRoleBinding");
+        assert_eq!(json_docs[7]["roleRef"]["name"], "system:auth-delegator");
 
         let yaml = bundle.to_multi_doc_yaml().unwrap();
         assert!(yaml.contains("\n---\n"));
@@ -1226,7 +1812,7 @@ mod tests {
         assert_eq!(manifest["apiVersion"], "helm.toolkit.fluxcd.io/v2");
         assert_eq!(manifest["kind"], "HelmRelease");
         assert_eq!(manifest["metadata"]["namespace"], "tenant-fintech");
-        assert!(manifest["spec"].get("serviceAccountName").is_none());
+        assert_eq!(manifest["spec"]["serviceAccountName"], "tenant-fintech-sa");
         assert_eq!(
             manifest["spec"]["chart"]["spec"]["sourceRef"]["namespace"],
             "tenant-fintech"
@@ -1295,7 +1881,8 @@ mod tests {
         );
         minimal.kube_config = Some(RemoteKubeConfigRef::new("remote-k3s"));
         let hr = synthesize_helm_release(&minimal).unwrap();
-        assert!(hr["spec"].get("serviceAccountName").is_none());
+        // The explicit SA is kept for remote targets too (impersonated on the workload cluster).
+        assert_eq!(hr["spec"]["serviceAccountName"], "custom-ops-reconciler");
         assert_eq!(
             hr["spec"]["valuesFrom"][0]["name"],
             "grafana-companion-secret"
