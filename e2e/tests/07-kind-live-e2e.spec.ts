@@ -752,16 +752,18 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
         pods.filter((p) => p.includes('kyverno')).map((p) => p.split('/')[0]),
       );
       expect([...kyvernoNamespaces]).toEqual(['keel-system']);
+      // Core add-on HelmReleases live in flux-system (impersonating helm-controller) but must
+      // install into, and store Helm release state in, keel-system.
       const releases = tryCmd('kubectl', [
         'get',
         'helmrelease',
         '-A',
         '-o',
-        'jsonpath={range .items[*]}{.metadata.namespace}/{.metadata.name}{"\\n"}{end}',
+        'jsonpath={range .items[*]}{.metadata.namespace}/{.metadata.name}/{.spec.targetNamespace}/{.spec.storageNamespace}{"\\n"}{end}',
       ]).stdout.split('\n');
-      for (const r of releases.filter((x) => /kyverno/.test(x))) {
-        expect(r.startsWith('keel-system/'), r).toBe(true);
-      }
+      const kyvernoReleases = releases.filter((x) => /kyverno/.test(x));
+      expect(kyvernoReleases, 'exactly one Kyverno HelmRelease').toHaveLength(1);
+      expect(kyvernoReleases[0]).toBe('flux-system/kyverno/keel-system/keel-system');
     });
 
     await test.step('3. `keel bootstrap recover --dry-run` prints the break-glass plan', async () => {
