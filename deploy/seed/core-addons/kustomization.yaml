@@ -4,6 +4,8 @@
 # - `kyverno-policies.yaml` is rendered at bootstrap from `deploy/seed/kyverno-policies/`
 #   (`KyvernoManifestBundle`, provider allowlist + optional local-dev exception).
 # - `rauthy.yaml` is only written (and listed) when the built-in Rauthy IdP is enabled.
+# - `forgejo.yaml` is only written (and listed) with `--with-forge`; its `ROOT_URL` is rendered
+#   from `--oidc-public-url`.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
@@ -18,3 +20,4 @@ resources:
   - flagger.yaml
   - cert-manager.yaml
   - rauthy.yaml
+  - forgejo.yaml

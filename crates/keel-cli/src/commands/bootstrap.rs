@@ -251,6 +251,8 @@ pub struct SeedControlPlaneArtifacts {
     pub sops_age_keyfile: Option<String>,
     /// Public ingress hosts for the IdP / Forgejo / portal (`--oidc-public-url`).
     pub ingress: Stage0Ingress,
+    /// `--with-forge`: the in-cluster Forgejo is installed and managed as a Flux add-on.
+    pub with_forge: bool,
 }
 
 impl std::fmt::Debug for SeedControlPlaneArtifacts {
@@ -261,6 +263,7 @@ impl std::fmt::Debug for SeedControlPlaneArtifacts {
             .field("admin_password", &"[REDACTED]")
             .field("admin_password_generated", &self.admin_password_generated)
             .field("ingress", &self.ingress)
+            .field("with_forge", &self.with_forge)
             .field(
                 "rauthy_secret",
                 &self
@@ -606,6 +609,7 @@ pub async fn synthesize_seed_control_plane_with_ingress(
         rauthy_config,
         sops_age_keyfile,
         ingress,
+        with_forge: cfg.with_forge,
     })
 }
 
@@ -672,6 +676,11 @@ const SEED_CORE_ADDON_CERT_MANAGER_YAML: &str =
     include_str!("../../../../deploy/seed/core-addons/cert-manager.yaml");
 const SEED_CORE_ADDON_RAUTHY_YAML: &str =
     include_str!("../../../../deploy/seed/core-addons/rauthy.yaml");
+/// Optional Forgejo `HelmRepository` + `HelmRelease` + `forgejo-ingress` HTTPRoute
+/// (`--with-forge`); `${FORGEJO_ROOT_URL}` / `${FORGEJO_HOST}` are rendered by
+/// [`render_seed_forgejo_helmrelease`].
+const SEED_CORE_ADDON_FORGEJO_YAML: &str =
+    include_str!("../../../../deploy/seed/core-addons/forgejo.yaml");
 /// Plain manifests of the Rauthy add-on (`clusters/management/addons/rauthy/`), reconciled by the
 /// Flux Kustomization in [`SEED_CORE_ADDON_RAUTHY_YAML`].
 const SEED_ADDON_RAUTHY_KUSTOMIZATION_YAML: &str =
@@ -704,6 +713,8 @@ const CORE_CATALOG_CERT_MANAGER_YAML: &str =
     include_str!("../../../../deploy/catalog/core/cert-manager/catalog.yaml");
 const CORE_CATALOG_RAUTHY_YAML: &str =
     include_str!("../../../../deploy/catalog/core/rauthy/catalog.yaml");
+const CORE_CATALOG_FORGEJO_YAML: &str =
+    include_str!("../../../../deploy/catalog/core/forgejo/catalog.yaml");
 /// Self-service starter app (end users may install Dex even though Keel itself uses Rauthy).
 const STARTER_DEX_APP_YAML: &str = include_str!("../../../../deploy/catalog/apps/dex/catalog.yaml");
 const STARTER_CERT_MANAGER_APP_YAML: &str =
@@ -796,14 +807,43 @@ pub(crate) fn render_rauthy_httproute(ingress: &Stage0Ingress) -> Result<String,
     )
 }
 
+/// Public Forgejo `ROOT_URL` (`https://forgejo.<domain>[:port]/`), identical for the Stage 0
+/// Pulumi release (`forgejoRootUrl`) and the seed Flux HelmRelease.
+pub(crate) fn forgejo_root_url(ingress: &Stage0Ingress) -> String {
+    format!("{}/", ingress.forgejo_origin())
+}
+
+/// Non-secret Pulumi config of the `control-plane-forgejo` Stage 0 stack (besides the kubeconfig
+/// connection). `forgejoRootUrl` must match a `config:` key of
+/// `deploy/bootstrap/control-plane-forgejo/Pulumi.yaml`, otherwise Stage 0 silently falls back to
+/// the default `ROOT_URL` and Flux's in-place adoption replaces the (ephemeral) Forgejo pod.
+pub(crate) fn forgejo_stack_config(ingress: &Stage0Ingress) -> Vec<(&'static str, String)> {
+    vec![("forgejoRootUrl", forgejo_root_url(ingress))]
+}
+
+/// Renders `core-addons/forgejo.yaml`: the Flux `HelmRelease` that adopts the Stage 0 Forgejo
+/// release in place, with `ROOT_URL` from `--oidc-public-url` (host and port are validated by
+/// [`Stage0Ingress`]), plus its `HelmRepository` and `forgejo-ingress` HTTPRoute.
+pub(crate) fn render_seed_forgejo_helmrelease(ingress: &Stage0Ingress) -> Result<String, CliError> {
+    // `ROOT_URL` is not DNS-safe (scheme, port, path), so it is substituted before the
+    // DNS-validated host placeholders.
+    let out =
+        SEED_CORE_ADDON_FORGEJO_YAML.replace("${FORGEJO_ROOT_URL}", &forgejo_root_url(ingress));
+    render_manifest(&out, &ingress.template_vars())
+}
+
 /// Renders `clusters/management/core-addons/kustomization.yaml`, listing `rauthy.yaml` only when
-/// the built-in Rauthy IdP is enabled (exactly the files [`seed_core_addon_files`] writes).
-fn render_seed_core_addons_kustomization(with_rauthy: bool) -> String {
-    if with_rauthy {
-        SEED_CORE_ADDON_KUSTOMIZATION_YAML.to_string()
-    } else {
-        SEED_CORE_ADDON_KUSTOMIZATION_YAML.replace("  - rauthy.yaml\n", "")
+/// the built-in Rauthy IdP is enabled and `forgejo.yaml` only with `--with-forge` (exactly the
+/// files [`seed_core_addon_files`] writes).
+fn render_seed_core_addons_kustomization(with_rauthy: bool, with_forge: bool) -> String {
+    let mut out = SEED_CORE_ADDON_KUSTOMIZATION_YAML.to_string();
+    if !with_rauthy {
+        out = out.replace("  - rauthy.yaml\n", "");
     }
+    if !with_forge {
+        out = out.replace("  - forgejo.yaml\n", "");
+    }
+    out
 }
 
 /// Management-plane files written to `clusters/management/{flux-system,core-addons,addons}/`.
@@ -838,7 +878,7 @@ fn seed_management_files(
         ),
         (
             format!("{core}/kustomization.yaml"),
-            render_seed_core_addons_kustomization(with_rauthy),
+            render_seed_core_addons_kustomization(with_rauthy, artifacts.with_forge),
         ),
     ];
     files.extend(seed_core_addon_files(artifacts)?);
@@ -902,6 +942,12 @@ fn seed_core_addon_files(
     if artifacts.rauthy_config.is_some() {
         files.push(("rauthy.yaml", SEED_CORE_ADDON_RAUTHY_YAML.to_string()));
     }
+    if artifacts.with_forge {
+        files.push((
+            "forgejo.yaml",
+            render_seed_forgejo_helmrelease(&artifacts.ingress)?,
+        ));
+    }
     Ok(files
         .into_iter()
         .map(|(name, contents)| {
@@ -913,7 +959,8 @@ fn seed_core_addon_files(
         .collect())
 }
 
-/// `catalog/core/<id>/catalog.yaml` files; Rauthy only when the built-in Rauthy IdP is enabled.
+/// `catalog/core/<id>/catalog.yaml` files; Rauthy only when the built-in Rauthy IdP is enabled,
+/// Forgejo only with `--with-forge`.
 fn seed_core_catalog_files(artifacts: &SeedControlPlaneArtifacts) -> Vec<(String, String)> {
     let mut files = vec![
         (
@@ -937,6 +984,16 @@ fn seed_core_catalog_files(artifacts: &SeedControlPlaneArtifacts) -> Vec<(String
             "rauthy",
             CORE_CATALOG_RAUTHY_YAML
                 .replace(DEFAULT_OIDC_PUBLIC_URL, &artifacts.ingress.idp_origin),
+        ));
+    }
+    if artifacts.with_forge {
+        // The service link follows `--oidc-public-url` (`https://forgejo.<domain>[:port]`).
+        files.push((
+            "forgejo",
+            CORE_CATALOG_FORGEJO_YAML.replace(
+                &Stage0Ingress::default().forgejo_origin(),
+                &artifacts.ingress.forgejo_origin(),
+            ),
         ));
     }
     files
@@ -1870,6 +1927,19 @@ mod security_hardening_tests {
                 "{id}: deploy/catalog/core version drifts from deploy/seed/core-addons"
             );
         }
+        // Optional Forgejo (`--with-forge`): catalog == seed HelmRelease == Stage 0 Pulumi release.
+        let forgejo = catalog_version(CORE_CATALOG_FORGEJO_YAML);
+        assert_eq!(
+            forgejo,
+            seed_version(SEED_CORE_ADDON_FORGEJO_YAML),
+            "forgejo"
+        );
+        let program: Value = serde_yml::from_str(CONTROL_PLANE_FORGEJO_PULUMI_YAML).unwrap();
+        assert_eq!(
+            program["resources"]["forgejo"]["properties"]["version"],
+            forgejo.as_str(),
+            "forgejo: Stage 0 Pulumi version drift"
+        );
         // Rauthy is an image-based Kustomize add-on: the catalog version is the image tag pinned
         // by the Flux Kustomization `spec.images[].newTag`, the plain StatefulSet manifest and the
         // Stage 0 Pulumi StatefulSet (which Flux adopts in place).
@@ -1949,9 +2019,13 @@ mod security_hardening_tests {
 
     #[tokio::test]
     async fn seed_management_files_reconcile_with_rauthy() {
-        let cfg = BootstrapConfig::new(keel_core::BootstrapTargetKind::Kubeconfig);
+        let cfg = BootstrapConfig {
+            with_forge: true,
+            ..BootstrapConfig::new(keel_core::BootstrapTargetKind::Kubeconfig)
+        };
         let a = artifacts_for(cfg, "https://idp.corp.example:9443").await;
         assert!(a.rauthy_config.is_some());
+        assert!(a.with_forge);
         let files = seed_management_files(&a).unwrap();
         let core = keel_core::MANAGEMENT_CORE_ADDONS_DIR;
 
@@ -1960,7 +2034,8 @@ mod security_hardening_tests {
         assert_eq!(listed, files_in(&files, core));
         assert!(listed.contains("kyverno-policies.yaml"));
         assert!(listed.contains("rauthy.yaml"));
-        // ... and the static seed kustomization (rauthy enabled) is that very list.
+        assert!(listed.contains("forgejo.yaml"));
+        // ... and the static seed kustomization (rauthy + forge enabled) is that very list.
         assert_eq!(
             kustomize_resources(SEED_CORE_ADDON_KUSTOMIZATION_YAML),
             listed
@@ -2101,36 +2176,281 @@ mod security_hardening_tests {
     async fn core_addon_flux_objects_impersonate_privileged_reconcilers() {
         // Flux runs with `--default-service-account=default`: a core add-on Flux object without
         // `serviceAccountName` would impersonate a permissionless SA and never become Ready.
-        let cfg = BootstrapConfig::new(keel_core::BootstrapTargetKind::Kubeconfig);
-        let a = artifacts_for(cfg, DEFAULT_OIDC_PUBLIC_URL).await;
-        let files = seed_management_files(&a).unwrap();
-        let core = keel_core::MANAGEMENT_CORE_ADDONS_DIR;
-        let mut seen = 0;
-        for (path, contents) in files
-            .iter()
-            .filter(|(p, _)| p.starts_with(&format!("{core}/")))
-        {
-            for doc in yaml_docs(contents) {
-                let kind = doc["kind"].as_str().unwrap_or_default();
-                let flux_group = doc["apiVersion"]
-                    .as_str()
-                    .is_some_and(|v| v.contains("toolkit.fluxcd.io"));
-                if !flux_group {
-                    continue;
+        for with_forge in [false, true] {
+            let cfg = BootstrapConfig {
+                with_forge,
+                ..BootstrapConfig::new(keel_core::BootstrapTargetKind::Kubeconfig)
+            };
+            let a = artifacts_for(cfg, DEFAULT_OIDC_PUBLIC_URL).await;
+            let files = seed_management_files(&a).unwrap();
+            let core = keel_core::MANAGEMENT_CORE_ADDONS_DIR;
+            let mut seen = 0;
+            for (path, contents) in files
+                .iter()
+                .filter(|(p, _)| p.starts_with(&format!("{core}/")))
+            {
+                for doc in yaml_docs(contents) {
+                    let kind = doc["kind"].as_str().unwrap_or_default();
+                    let flux_group = doc["apiVersion"]
+                        .as_str()
+                        .is_some_and(|v| v.contains("toolkit.fluxcd.io"));
+                    if !flux_group {
+                        continue;
+                    }
+                    // Flux sources and objects live in `flux-system` (no cross-namespace refs).
+                    assert_eq!(doc["metadata"]["namespace"], "flux-system", "{path} {kind}");
+                    let expected = match kind {
+                        "HelmRelease" => "helm-controller",
+                        "Kustomization" => "kustomize-controller",
+                        _ => continue,
+                    };
+                    seen += 1;
+                    assert_eq!(doc["spec"]["serviceAccountName"], expected, "{path} {kind}");
                 }
-                // Flux sources and objects live in `flux-system` (no cross-namespace refs).
-                assert_eq!(doc["metadata"]["namespace"], "flux-system", "{path} {kind}");
-                let expected = match kind {
-                    "HelmRelease" => "helm-controller",
-                    "Kustomization" => "kustomize-controller",
-                    _ => continue,
-                };
-                seen += 1;
-                assert_eq!(doc["spec"]["serviceAccountName"], expected, "{path} {kind}");
             }
+            // 8 HelmReleases (incl. Flux itself) + the Rauthy Kustomization (+ Forgejo).
+            assert_eq!(seen, if with_forge { 10 } else { 9 });
         }
-        // 8 HelmReleases (incl. Flux itself) + the Rauthy Kustomization.
-        assert_eq!(seen, 9);
+    }
+
+    #[test]
+    fn forgejo_helmrelease_adopts_stage0_release_in_place() {
+        let ingress = Stage0Ingress::from_public_url("https://idp.corp.example:9443").unwrap();
+        let root_url = forgejo_root_url(&ingress);
+        assert_eq!(root_url, "https://forgejo.corp.example:9443/");
+        let rendered = render_seed_forgejo_helmrelease(&ingress).unwrap();
+        let docs = yaml_docs(&rendered);
+        let repo = docs.iter().find(|d| d["kind"] == "HelmRepository").unwrap();
+        let hr = docs.iter().find(|d| d["kind"] == "HelmRelease").unwrap();
+        assert_eq!(docs.len(), 3);
+
+        let program: Value = serde_yml::from_str(CONTROL_PLANE_FORGEJO_PULUMI_YAML).unwrap();
+        let release = &program["resources"]["forgejo"];
+        let p = &release["properties"];
+        assert_eq!(hr["metadata"]["name"], "forgejo");
+        assert_eq!(hr["metadata"]["namespace"], "flux-system");
+        assert_eq!(hr["spec"]["releaseName"], p["name"]);
+        assert_eq!(hr["spec"]["targetNamespace"], p["namespace"]);
+        assert_eq!(hr["spec"]["storageNamespace"], p["namespace"]);
+        assert_eq!(hr["spec"]["serviceAccountName"], "helm-controller");
+        assert_eq!(hr["spec"]["chart"]["spec"]["version"], p["version"]);
+        // Same OCI chart as Stage 0, from a `flux-system` source.
+        let source = &hr["spec"]["chart"]["spec"]["sourceRef"];
+        assert_eq!(source["name"], repo["metadata"]["name"]);
+        assert_eq!(source["namespace"], "flux-system");
+        assert_eq!(repo["metadata"]["namespace"], "flux-system");
+        assert_eq!(repo["spec"]["type"], "oci");
+        assert_eq!(
+            p["chart"],
+            format!(
+                "{}/{}",
+                repo["spec"]["url"].as_str().unwrap(),
+                hr["spec"]["chart"]["spec"]["chart"].as_str().unwrap()
+            )
+            .as_str()
+        );
+        // Identical values once `forgejoRootUrl` is the rendered ROOT_URL Stage 0 receives.
+        let stage0_values: Value = serde_json::from_str(
+            &p["values"]
+                .to_string()
+                .replace("${forgejoRootUrl}", &root_url),
+        )
+        .unwrap();
+        assert_eq!(hr["spec"]["values"], stage0_values);
+        assert_eq!(
+            hr["spec"]["values"]["gitea"]["config"]["server"]["ROOT_URL"],
+            root_url.as_str()
+        );
+        assert_eq!(
+            hr["spec"]["values"]["gitea"]["admin"]["existingSecret"],
+            forge::FORGEJO_ADMIN_SECRET_NAME
+        );
+        assert!(
+            hr["spec"]["values"]["gitea"]["admin"]
+                .get("password")
+                .is_none()
+        );
+        // The Pulumi default only serves stacks created before `forgejoRootUrl` existed.
+        assert_eq!(
+            program["config"]["forgejoRootUrl"]["default"],
+            forgejo_root_url(&Stage0Ingress::default()).as_str()
+        );
+
+        // Hosts the GitOps repository: protected, never pruned, never uninstalled by remediation,
+        // and Stage 0 never reverts Flux-applied upgrades.
+        assert_eq!(hr["metadata"]["labels"]["keel.io/protect"], "true");
+        assert_eq!(
+            hr["metadata"]["annotations"]["kustomize.toolkit.fluxcd.io/prune"],
+            "disabled"
+        );
+        assert!(hr["spec"]["install"].get("remediation").is_none());
+        assert_eq!(hr["spec"]["upgrade"]["remediation"]["strategy"], "rollback");
+        assert_eq!(release["options"]["protect"], true);
+        let ignored: Vec<&str> = release["options"]["ignoreChanges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        for input in p.as_object().unwrap().keys() {
+            assert!(
+                input == "name" || input == "namespace" || ignored.contains(&input.as_str()),
+                "forgejo input `{input}` is not ignored after the Flux handoff"
+            );
+        }
+
+        // Upgrades through the management API cannot touch the admin Secret or OAuth2 settings.
+        let mutable = keel_core::management_addon_mutable_values("forgejo").unwrap();
+        assert!(mutable.iter().all(|p| !p.contains("gitea")));
+    }
+
+    #[tokio::test]
+    async fn seed_files_include_forgejo_only_with_forge() {
+        for with_forge in [false, true] {
+            let cfg = BootstrapConfig {
+                with_forge,
+                ..BootstrapConfig::new(keel_core::BootstrapTargetKind::Kubeconfig)
+            };
+            let a = artifacts_for(cfg, "https://idp.corp.example:9443").await;
+            assert_eq!(a.with_forge, with_forge);
+            let files = seed_management_files(&a).unwrap();
+            let core = keel_core::MANAGEMENT_CORE_ADDONS_DIR;
+            let listed = kustomize_resources(file(&files, &format!("{core}/kustomization.yaml")));
+            assert_eq!(listed, files_in(&files, core));
+            assert_eq!(listed.contains("forgejo.yaml"), with_forge);
+            let catalogs = seed_core_catalog_files(&a);
+            let catalog = catalogs
+                .iter()
+                .find(|(p, _)| p == "catalog/core/forgejo/catalog.yaml");
+            assert_eq!(catalog.is_some(), with_forge);
+
+            // Exactly one more Flux object (the `forgejo` HelmRelease) with `--with-forge`.
+            let helm_releases = files
+                .iter()
+                .filter(|(p, _)| p.starts_with(&format!("{core}/")))
+                .flat_map(|(_, c)| yaml_docs(c))
+                .filter(|d| d["kind"] == "HelmRelease")
+                .count();
+            assert_eq!(helm_releases, if with_forge { 9 } else { 8 });
+            if !with_forge {
+                assert!(files.iter().all(|(p, _)| !p.contains("forgejo")));
+                continue;
+            }
+
+            let forgejo = file(&files, &format!("{core}/forgejo.yaml"));
+            assert!(!forgejo.contains("${"));
+            assert!(forgejo.contains("ROOT_URL: \"https://forgejo.corp.example:9443/\""));
+            let (_, catalog) = catalog.unwrap();
+            let app = keel_core::parse_catalog_application(catalog).unwrap();
+            assert_eq!(app.metadata.id, "forgejo");
+            let doc: Value = serde_yml::from_str(catalog).unwrap();
+            assert_eq!(
+                doc["spec"]["serviceUrl"],
+                "https://forgejo.corp.example:9443"
+            );
+            assert_eq!(
+                doc["metadata"]["category"],
+                keel_core::MANAGEMENT_CORE_CATEGORY
+            );
+            // The catalog form never offers the locked security values.
+            let props = doc["spec"]["schema"]["properties"].as_object().unwrap();
+            assert!(!props.contains_key("gitea"));
+            // Toggling persistence replaces the pod and its volume: locked in the API and form.
+            assert!(
+                doc["spec"]["schema"]["properties"]["persistence"]["properties"]
+                    .get("enabled")
+                    .is_none()
+            );
+            assert!(
+                doc["metadata"]["description"]
+                    .as_str()
+                    .unwrap()
+                    .contains("ephemeral")
+            );
+        }
+    }
+
+    #[test]
+    fn forgejo_stack_config_reaches_the_stage0_program() {
+        // Every key Stage 0 passes must be declared by the program, or Pulumi falls back to the
+        // default `ROOT_URL` and Flux's in-place adoption replaces the Forgejo pod.
+        let program: Value = serde_yml::from_str(CONTROL_PLANE_FORGEJO_PULUMI_YAML).unwrap();
+        let ingress = Stage0Ingress::from_public_url("https://idp.corp.example:9443").unwrap();
+        let config = forgejo_stack_config(&ingress);
+        assert!(config.iter().any(|(k, _)| *k == "forgejoRootUrl"));
+        for (key, _) in &config {
+            assert!(
+                program["config"].get(*key).is_some(),
+                "`{key}` is not a config key of control-plane-forgejo"
+            );
+            assert!(
+                program.to_string().contains(&format!("${{{key}}}")),
+                "`{key}` is never referenced by control-plane-forgejo"
+            );
+        }
+        let root_url = &config
+            .iter()
+            .find(|(k, _)| *k == "forgejoRootUrl")
+            .unwrap()
+            .1;
+        assert_ne!(root_url, &forgejo_root_url(&Stage0Ingress::default()));
+        let rendered = render_seed_forgejo_helmrelease(&ingress).unwrap();
+        let hr = yaml_docs(&rendered)
+            .into_iter()
+            .find(|d| d["kind"] == "HelmRelease")
+            .unwrap();
+        assert_eq!(
+            hr["spec"]["values"]["gitea"]["config"]["server"]["ROOT_URL"],
+            root_url.as_str()
+        );
+    }
+
+    #[tokio::test]
+    async fn forgejo_without_rauthy_keeps_its_route_in_git() {
+        for cfg in [
+            BootstrapConfig {
+                with_forge: true,
+                oidc_issuer: Some("https://login.example.org".to_string()),
+                ..BootstrapConfig::new(keel_core::BootstrapTargetKind::Kubeconfig)
+            },
+            BootstrapConfig {
+                with_forge: true,
+                with_oidc: false,
+                ..BootstrapConfig::new(keel_core::BootstrapTargetKind::Kubeconfig)
+            },
+        ] {
+            let a = artifacts_for(cfg, "https://idp.corp.example:9443").await;
+            assert!(a.rauthy_config.is_none());
+            let files = seed_management_files(&a).unwrap();
+            let core = keel_core::MANAGEMENT_CORE_ADDONS_DIR;
+            let listed = kustomize_resources(file(&files, &format!("{core}/kustomization.yaml")));
+            assert_eq!(listed, files_in(&files, core));
+            assert!(listed.contains("forgejo.yaml"));
+            assert!(!listed.contains("rauthy.yaml"));
+
+            // The catalog `serviceUrl` resolves through the Git-owned `forgejo-ingress` route.
+            let docs = yaml_docs(file(&files, &format!("{core}/forgejo.yaml")));
+            let route = docs.iter().find(|d| d["kind"] == "HTTPRoute").unwrap();
+            assert_eq!(route["metadata"]["name"], "forgejo-ingress");
+            assert_eq!(route["spec"]["hostnames"][0], "forgejo.corp.example");
+            let listeners: Vec<&str> = route["spec"]["parentRefs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|p| p["sectionName"].as_str().unwrap())
+                .collect();
+            assert_eq!(listeners, ["https-local", "https"]);
+            let catalogs = seed_core_catalog_files(&a);
+            let (_, catalog) = catalogs
+                .iter()
+                .find(|(p, _)| p == "catalog/core/forgejo/catalog.yaml")
+                .unwrap();
+            let doc: Value = serde_yml::from_str(catalog).unwrap();
+            assert_eq!(
+                doc["spec"]["serviceUrl"],
+                "https://forgejo.corp.example:9443"
+            );
+        }
     }
 
     #[test]

@@ -1,5 +1,13 @@
 # Stage 0 In-Cluster Forgejo Git Forge (`SDD.md` §2.1)
 # Installed when `keel bootstrap init --with-forge` is enabled.
+#
+# Flux handoff: the seed `forgejo` HelmRelease (`deploy/seed/core-addons/forgejo.yaml`, written to
+# Git only with `--with-forge`) adopts this release in place: same release name, namespace, chart
+# version and values (`forgejo_helmrelease_adopts_stage0_release_in_place`). Keep them in
+# lockstep. After the handoff every chart-affecting input is ignored, so a later Pulumi run (e.g.
+# `keel bootstrap recover`) never runs a `helm upgrade` with stale Stage 0 inputs and reverts an
+# upgrade or rollback applied by Flux through a Git PR. Do not add or edit other inputs of the
+# release after handoff; change the seed HelmRelease in Git instead (`SDD.md` §2.1).
 name: keel-stage0-control-plane-forgejo
 runtime: yaml
 description: Stage 0 in-cluster Forgejo Git forge in keel-system
@@ -10,6 +18,12 @@ config:
   kubeContext:
     type: string
     default: ""
+  # Public Forgejo URL rendered by `keel bootstrap init` from `--oidc-public-url`
+  # (`https://forgejo.<domain>[:port]/`). The default only applies to stacks created before this
+  # setting existed (their release ignores `values` after the Flux handoff anyway).
+  forgejoRootUrl:
+    type: string
+    default: "https://forgejo.keel.local:8888/"
 
 resources:
   k8sProvider:
@@ -22,6 +36,17 @@ resources:
   forgejo:
     type: kubernetes:helm.sh/v3:Release
     options:
+      # Hosts the GitOps repository Flux reconciles from (anti-lockout, `NFR-REL-01`).
+      protect: true
+      # Flux owns the release after the in-place handoff (see the header note).
+      ignoreChanges:
+        - chart
+        - version
+        - values
+        - repositoryOpts
+        - timeout
+        - waitForJobs
+        - createNamespace
       provider: ${k8sProvider}
     properties:
       name: forgejo
@@ -42,7 +67,7 @@ resources:
             email: admin@keel.local
           config:
             server:
-              ROOT_URL: "https://forgejo.keel.local:8888/"
+              ROOT_URL: ${forgejoRootUrl}
             database:
               DB_TYPE: sqlite3
             oauth2_client:

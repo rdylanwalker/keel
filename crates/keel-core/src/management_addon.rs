@@ -150,8 +150,44 @@ pub fn management_addon_mutable_values(id: &str) -> Option<&'static [&'static st
         "s3-state-backend" => Some(&[
             "/master|volume|filer/resources|tolerations|nodeSelector|affinity|priorityClassName",
         ]),
+        // Optional in-cluster Forgejo (`--with-forge`) hosts the management GitOps repository:
+        // the admin `existingSecret`, OAuth2 client settings (`gitea.config.oauth2_client`,
+        // `gitea.oauth`), `ROOT_URL`, database and CA trust (`extraVolumes`, `deployment.env`)
+        // decide who can push to the repository Flux reconciles from, so only sizing and
+        // scheduling are mutable. `persistence.enabled` (toggling it replaces the pod and its
+        // volume), `persistence.annotations` (`helm.sh/resource-policy: keep` retains the
+        // repository PVC) and `persistence.existingClaim`/`claimName` are locked. The add-on is
+        // only upgradable at all once persistence is enabled
+        // ([`ensure_management_addon_upgradable`]).
+        "forgejo" => Some(&[
+            "/resources|tolerations|nodeSelector|affinity|topologySpreadConstraints",
+            "/persistence/size|storageClass|accessModes|labels",
+        ]),
         _ => None,
     }
+}
+
+/// Rejects management API upgrades and rollbacks of an add-on whose current desired state (`doc`,
+/// its Flux object as stored in Git) makes any pod replacement destructive (`NFR-REL-01`).
+///
+/// The optional in-cluster `forgejo` hosts the management GitOps repository Flux pulls from, its
+/// SQLite database and the Keel API token. With `spec.values.persistence.enabled` not `true` that
+/// data lives on an `emptyDir`, so a chart bump, values change or failed-upgrade rollback would
+/// wipe the repository the PR was merged into and lock the management plane out. Such a Forgejo
+/// must be backed up and switched to persistence by editing Git directly.
+pub fn ensure_management_addon_upgradable(id: &str, doc: &Value) -> Result<(), CoreError> {
+    if id == "forgejo"
+        && doc.pointer("/spec/values/persistence/enabled") != Some(&Value::Bool(true))
+    {
+        return Err(CoreError::Validation(
+            "Core add-on 'forgejo' runs without persistence (emptyDir): any upgrade or rollback \
+             replaces the pod and wipes the GitOps repository Flux reconciles from. Back up the \
+             repository first (`forgejo dump` or push a mirror), then enable \
+             `persistence.enabled` by editing the HelmRelease in Git directly"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn escape_pointer_segment(seg: &str) -> String {
@@ -375,6 +411,7 @@ fn object_entry<'a>(
 ///   already exist, and digest-pinned entries are rejected because kustomize prefers `digest`
 ///   over `newTag`); `values` are rejected.
 ///
+/// Rejects add-ons that cannot be replaced safely ([`ensure_management_addon_upgradable`]).
 /// Always (re)asserts the `keel.io/protect: "true"` label. Returns `CoreError::Validation` (HTTP
 /// 400) for invalid input, disallowed value changes, or no-op requests.
 pub fn apply_management_addon_upgrade(
@@ -386,6 +423,7 @@ pub fn apply_management_addon_upgrade(
     let addon = management_addon_ref(doc)
         .filter(|r| r.name == id)
         .ok_or_else(|| not_addon_document(id))?;
+    ensure_management_addon_upgradable(id, doc)?;
     let version = version.map(str::trim).filter(|v| !v.is_empty());
     let has_values = !values_patch_is_empty(values);
     if version.is_none() && !has_values {
@@ -1014,6 +1052,134 @@ mod tests {
             &json!({"s3": {"enableAuth": true}, "filer": {"resources": {"requests": {"cpu": "100m"}}}}),
         )
         .unwrap();
+    }
+
+    fn forgejo_release(persistence: Value) -> Value {
+        helm_release(
+            "forgejo",
+            json!({
+                "gitea": {
+                    "admin": {"existingSecret": "keel-forgejo-admin", "email": "admin@keel.local"},
+                    "config": {
+                        "server": {"ROOT_URL": "https://forgejo.keel.local:8888/"},
+                        "oauth2_client": {"ENABLE_AUTO_REGISTRATION": true, "ACCOUNT_LINKING": "auto"}
+                    }
+                },
+                "persistence": persistence
+            }),
+        )
+    }
+
+    #[test]
+    fn ephemeral_forgejo_cannot_be_upgraded() {
+        // Any pod replacement wipes the emptyDir GitOps repository (`NFR-REL-01`).
+        for persistence in [
+            json!({"enabled": false}),
+            json!({}),
+            json!({"enabled": "true"}),
+        ] {
+            let forgejo = forgejo_release(persistence);
+            assert!(ensure_management_addon_upgradable("forgejo", &forgejo).is_err());
+            for (version, values) in [
+                (Some("17.4.0"), json!({})),
+                (None, json!({"resources": {"limits": {"memory": "1Gi"}}})),
+                (None, json!({"persistence": {"enabled": true}})),
+            ] {
+                let mut doc = forgejo.clone();
+                let err = apply_management_addon_upgrade("forgejo", &mut doc, version, &values)
+                    .expect_err("ephemeral forgejo must not be upgradable");
+                assert!(err.to_string().contains("without persistence"), "{err}");
+                assert!(err.to_string().contains("forgejo dump"), "{err}");
+                assert_eq!(
+                    doc, forgejo,
+                    "rejected upgrade must not mutate the document"
+                );
+            }
+        }
+        // Only Forgejo is gated; other add-ons never carry `persistence`.
+        assert!(
+            ensure_management_addon_upgradable("flagger", &helm_release("flagger", json!({})))
+                .is_ok()
+        );
+        assert!(
+            ensure_management_addon_upgradable(
+                "forgejo",
+                &forgejo_release(json!({"enabled": true}))
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn forgejo_security_values_cannot_be_changed() {
+        let forgejo = forgejo_release(json!({
+            "enabled": true,
+            "annotations": {"helm.sh/resource-policy": "keep"}
+        }));
+        for (values, needle) in [
+            (
+                json!({"gitea": {"admin": {"existingSecret": "attacker"}}}),
+                "/gitea/admin/existingSecret",
+            ),
+            (
+                json!({"gitea": {"admin": {"password": "x"}}}),
+                "/gitea/admin/password",
+            ),
+            (
+                json!({"gitea": {"config": {"oauth2_client": {"ACCOUNT_LINKING": "login"}}}}),
+                "/gitea/config/oauth2_client/ACCOUNT_LINKING",
+            ),
+            (
+                json!({"gitea": {"oauth": [{"name": "evil", "provider": "openidConnect"}]}}),
+                "/gitea/oauth",
+            ),
+            (
+                json!({"gitea": {"config": {"server": {"ROOT_URL": "https://evil.example/"}}}}),
+                "/gitea/config/server/ROOT_URL",
+            ),
+            (
+                json!({"gitea": {"config": {"service": {"DISABLE_REGISTRATION": false}}}}),
+                "/gitea/config/service/DISABLE_REGISTRATION",
+            ),
+            (
+                json!({"persistence": {"existingClaim": "other"}}),
+                "/persistence/existingClaim",
+            ),
+            // Disabling persistence swaps the repository PVC for an emptyDir.
+            (
+                json!({"persistence": {"enabled": false}}),
+                "/persistence/enabled",
+            ),
+            // `helm.sh/resource-policy: keep` retains the repository PVC.
+            (
+                json!({"persistence": {"annotations": {"helm.sh/resource-policy": null}}}),
+                "/persistence/annotations/helm.sh~1resource-policy",
+            ),
+            (json!({"extraVolumes": []}), "/extraVolumes"),
+            (json!({"deployment": {"env": []}}), "/deployment/env"),
+        ] {
+            assert_rejected("forgejo", &forgejo, values, needle);
+        }
+        let mut forgejo = forgejo;
+        apply_management_addon_upgrade(
+            "forgejo",
+            &mut forgejo,
+            Some("17.4.0"),
+            &json!({
+                "gitea": {"admin": {"existingSecret": "keel-forgejo-admin"}},
+                "persistence": {"size": "20Gi"},
+                "resources": {"limits": {"memory": "1Gi"}}
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            forgejo.pointer("/spec/values/persistence/size").unwrap(),
+            "20Gi"
+        );
+        assert_eq!(
+            forgejo.pointer("/spec/chart/spec/version").unwrap(),
+            "17.4.0"
+        );
     }
 
     #[test]

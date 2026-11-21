@@ -1,0 +1,37 @@
+# Forgejo Git Forge Core Addon Catalog Application (`SDD.md` §2.1, §2.2)
+# Optional: only written to `catalog/core/` by `keel bootstrap init --with-forge`. Reconciled by the
+# protected `flux-system/forgejo` HelmRelease (`core-addons/forgejo.yaml`), which adopts the Stage 0
+# release in place. The schema only exposes knobs the management API allows to change
+# (`keel_core::management_addon_mutable_values("forgejo")`); the admin `existingSecret`, OAuth2
+# client settings, `ROOT_URL`, database, CA trust and `persistence.enabled`/`annotations` are locked
+# and never offered here.
+# `serviceUrl` follows `--oidc-public-url` (`https://forgejo.<domain>[:port]`).
+apiVersion: keel.io/v1alpha1
+kind: CatalogApplication
+metadata:
+  id: forgejo
+  name: Forgejo Git Forge
+  description: In-cluster Forgejo Git forge hosting the management GitOps repository and pull requests. Data is ephemeral by default (persistence disabled), so the management API refuses upgrades and rollbacks until persistence is enabled by editing the HelmRelease in Git directly, after backing up the repository (forgejo dump or a pushed mirror).
+  category: management-core
+  runtime: helm
+spec:
+  upstream:
+    chart: oci://code.forgejo.org/forgejo-helm/forgejo
+    repoURL: oci://code.forgejo.org/forgejo-helm/forgejo
+    version: "17.3.3"
+  progressiveDelivery:
+    flaggerSupported: false
+    defaultCanary: false
+  serviceUrl: https://forgejo.keel.local:8888
+  schema:
+    type: object
+    properties:
+      persistence:
+        type: object
+        title: Persistence
+        description: Only applies once persistence has been enabled in Git; enabling or disabling it is not offered here because it replaces the pod and its volume.
+        properties:
+          size:
+            type: string
+            title: Volume Size
+            default: 10Gi

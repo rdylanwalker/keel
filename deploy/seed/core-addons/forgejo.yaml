@@ -1,0 +1,138 @@
+# Optional in-cluster Forgejo Git forge (`keel bootstrap init --with-forge`, `SDD.md` §2.1, §2.2)
+# Only written to Git (and listed in `kustomization.yaml`) when `--with-forge` is set, together
+# with `catalog/core/forgejo/catalog.yaml`.
+#
+# Adopts the Stage 0 `forgejo` release installed by `deploy/bootstrap/control-plane-forgejo/Pulumi.yaml`
+# in place: same release name, release namespace (`keel-system`, target + storage), chart version and
+# values (`forgejo_helmrelease_adopts_stage0_release_in_place`). `ROOT_URL` is rendered at bootstrap
+# from `--oidc-public-url` (`https://forgejo.<domain>[:port]/`), identically for Stage 0 and Git.
+#
+# This Forgejo hosts the management GitOps repository Flux pulls from, so:
+# - `keel.io/protect: "true"` + `prune: disabled`: dropping the document from Git never uninstalls it.
+# - No install remediation (Flux install remediation is `helm uninstall`); upgrades roll back on failure.
+# - Locked values: the management API only lets PRs change sizing/scheduling and persistence
+#   (`keel_core::management_addon_mutable_values("forgejo")`); the admin `existingSecret`, OAuth2
+#   client settings, `ROOT_URL`, database and CA trust must be edited in Git directly.
+#
+# Data: `persistence.enabled: false` (emptyDir), so repositories and the SQLite database are lost
+# whenever the pod is replaced (including chart upgrades) unless persistence is enabled. The
+# management API therefore refuses every upgrade and rollback of an ephemeral Forgejo
+# (`keel_core::ensure_management_addon_upgradable`): back the repository up (`forgejo dump` or a
+# pushed mirror) and enable persistence by editing this file in Git directly.
+#
+# Supporting document: the `forgejo-ingress` HTTPRoute (`https://forgejo.<domain>[:port]`, both
+# `keel-ingress` HTTPS listeners), identical to `deploy/bootstrap/manifests/forgejo-route.yaml`
+# applied by Stage 0 (`forgejo_route_in_git_matches_stage0`).
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: HelmRepository
+metadata:
+  name: forgejo
+  namespace: flux-system
+  labels:
+    app.kubernetes.io/managed-by: keel
+spec:
+  type: oci
+  interval: 30m
+  url: oci://code.forgejo.org/forgejo-helm
+---
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: forgejo
+  namespace: flux-system
+  annotations:
+    # Never garbage-collected if the document is dropped from Git: the release hosts the
+    # GitOps repository Flux itself reconciles from (`NFR-REL-01`).
+    kustomize.toolkit.fluxcd.io/prune: disabled
+  labels:
+    app.kubernetes.io/managed-by: keel
+    keel.io/protect: "true"
+spec:
+  interval: 10m
+  releaseName: forgejo
+  targetNamespace: keel-system
+  storageNamespace: keel-system
+  # Multi-tenancy lockdown: platform releases live in `flux-system` and impersonate the
+  # privileged `helm-controller` SA (never the permissionless `default`).
+  serviceAccountName: helm-controller
+  chart:
+    spec:
+      chart: forgejo
+      version: "17.3.3"
+      sourceRef:
+        kind: HelmRepository
+        name: forgejo
+        namespace: flux-system
+  # No `install.remediation`: it would `helm uninstall` the forge holding the GitOps repository.
+  upgrade:
+    timeout: 5m
+    remediation:
+      retries: 1
+      strategy: rollback
+  values:
+    gitea:
+      admin:
+        # Keel-managed Secret (`keel bootstrap init`); no password ever appears in Git.
+        existingSecret: keel-forgejo-admin
+        email: admin@keel.local
+      config:
+        server:
+          ROOT_URL: "${FORGEJO_ROOT_URL}"
+        database:
+          DB_TYPE: sqlite3
+        oauth2_client:
+          ENABLE_AUTO_REGISTRATION: true
+          ACCOUNT_LINKING: auto
+          USERNAME: userid
+          OPENID_CONNECT_SCOPES: openid email profile groups
+    persistence:
+      enabled: false
+    valkey-cluster:
+      enabled: false
+    valkey:
+      enabled: false
+    postgresql:
+      enabled: false
+    postgresql-ha:
+      enabled: false
+    extraVolumes:
+      - name: keel-ca
+        secret:
+          secretName: keel-wildcard-tls
+          items:
+            - key: ca.crt
+              path: ca.crt
+    extraVolumeMounts:
+      - name: keel-ca
+        mountPath: /etc/ssl/keel-ca
+        readOnly: true
+    deployment:
+      env:
+        - name: SSL_CERT_DIR
+          value: /etc/ssl/certs:/etc/ssl/keel-ca
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: forgejo-ingress
+  namespace: keel-system
+  labels:
+    app.kubernetes.io/managed-by: keel
+spec:
+  parentRefs:
+    - name: keel-ingress
+      namespace: keel-system
+      sectionName: https-local
+    - name: keel-ingress
+      namespace: keel-system
+      sectionName: https
+  hostnames:
+    - ${FORGEJO_HOST}
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        - name: forgejo-http
+          port: 3000

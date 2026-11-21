@@ -143,7 +143,7 @@ keel bootstrap init \
 
 ### Optional Add-ons, OIDC & Git Remotes
 
-- `--with-forge` — Installs an in-cluster Forgejo instance in `keel-system` and points Flux + `.keel/config.yaml` at it.
+- `--with-forge` — Installs an in-cluster Forgejo instance in `keel-system` and points Flux + `.keel/config.yaml` at it. Forgejo then becomes a Flux-managed management add-on (`clusters/management/core-addons/forgejo.yaml`, `catalog/core/forgejo`), Its data is ephemeral by default (persistence disabled): repositories are lost whenever the Forgejo pod is replaced, so the management API refuses Forgejo upgrades and rollbacks until you back up the repository (`forgejo dump` or a pushed mirror) and set `persistence.enabled: true` in `core-addons/forgejo.yaml` directly in Git.
 - `--git-url <URL>` — Connects an external GitHub, GitLab, or Forgejo/Gitea repository (with `KEEL_GIT_TOKEN` / `--git-token` for private repos and PRs). See [Git Repositories & Forges](git-repositories.md).
 - `--admin-username` / `--admin-password` — Customizes the initial admin account seeded into in-cluster Rauthy (`keel-system/rauthy-config`) and added to `keel-admins`. When omitted, `keel bootstrap init` generates a random password and prints it in the bootstrap summary.
 - `--oidc-provider <rauthy|none>` — Selects the Stage 0 in-cluster OIDC provider (defaults to `rauthy`; pass `none` to skip in-cluster IdP installation).

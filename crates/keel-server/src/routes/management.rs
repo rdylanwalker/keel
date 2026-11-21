@@ -15,9 +15,9 @@ use futures::{Stream, StreamExt};
 use keel_core::{
     KEEL_SYSTEM_NAMESPACE, MANAGEMENT_CORE_ADDONS_DIR, ManagementAddonKind, ManagementAddonRef,
     apply_management_addon_upgrade, disallowed_value_changes, ensure_management_addon_protected,
-    management_addon_chart, management_addon_desired_version, management_addon_ref,
-    render_management_addon_document, replace_yaml_document, validate_dns_label,
-    validate_management_addon_document,
+    ensure_management_addon_upgradable, management_addon_chart, management_addon_desired_version,
+    management_addon_ref, render_management_addon_document, replace_yaml_document,
+    validate_dns_label, validate_management_addon_document,
 };
 use keel_git::PullRequestInfo;
 use keel_kube::{CrdWatchEvent, UserGitCredentials, user_git_creds_secret_name};
@@ -598,6 +598,9 @@ pub async fn rollback_management_addon(
             .await?;
 
         let manifest = find_core_addon_manifest(&state.repo_workdir, &id).await?;
+        // A rollback replaces the pod just like an upgrade does (e.g. an ephemeral Forgejo).
+        ensure_management_addon_upgradable(&id, &manifest.doc)
+            .map_err(|e| ServerError::BadRequest(e.to_string()))?;
 
         let commits = state
             .git_runner
@@ -1455,6 +1458,144 @@ spec:
                 .unwrap();
         let restored = read_on_branch(&state, &workdir, &resp.branch, "flux2.yaml").await;
         assert_eq!(restored, SEED_FLUX2);
+    }
+
+    /// The seed `forgejo.yaml` (`HelmRepository` + `HelmRelease`, both named `forgejo`, plus the
+    /// `forgejo-ingress` HTTPRoute) as bootstrap renders it.
+    fn seed_forgejo(persistent: bool) -> String {
+        let seed = include_str!("../../../../deploy/seed/core-addons/forgejo.yaml")
+            .replace("${FORGEJO_ROOT_URL}", "https://forgejo.keel.local:8888/")
+            .replace("${FORGEJO_HOST}", "forgejo.keel.local");
+        if persistent {
+            let ephemeral = "    persistence:\n      enabled: false\n";
+            assert!(seed.contains(ephemeral));
+            seed.replace(ephemeral, "    persistence:\n      enabled: true\n")
+        } else {
+            seed
+        }
+    }
+
+    fn yaml_chunks(raw: &str) -> Vec<&str> {
+        raw.split("\n---\n").collect()
+    }
+
+    #[tokio::test]
+    async fn ephemeral_forgejo_is_never_upgraded_or_rolled_back_through_the_api() {
+        let (_tmp, state, workdir) = git_state().await;
+        let path = workdir
+            .join(MANAGEMENT_CORE_ADDONS_DIR)
+            .join("forgejo.yaml");
+        let seed = seed_forgejo(false);
+        tokio::fs::write(&path, &seed).await.unwrap();
+        commit_and_push(&state.git_runner, &workdir, "chore: add forgejo").await;
+
+        // Version-only and resources-only upgrades both replace the emptyDir pod.
+        for (version, values) in [
+            (Some("17.4.0"), serde_json::json!({})),
+            (
+                None,
+                serde_json::json!({"resources": {"limits": {"memory": "1Gi"}}}),
+            ),
+            (None, serde_json::json!({"persistence": {"enabled": true}})),
+        ] {
+            let err = upgrade(&state, "forgejo", version, values.clone())
+                .await
+                .unwrap_err();
+            match err {
+                ServerError::Core(keel_core::CoreError::Validation(msg)) => {
+                    assert!(msg.contains("forgejo dump"), "{msg}")
+                }
+                other => panic!("{values}: {other:?}"),
+            }
+        }
+
+        // A Git-side bump does not make a rollback (another pod replacement) acceptable.
+        let bumped = seed.replace("version: \"17.3.3\"", "version: \"17.4.0\"");
+        assert_ne!(bumped, seed);
+        tokio::fs::write(&path, &bumped).await.unwrap();
+        commit_and_push(&state.git_runner, &workdir, "chore: bump forgejo").await;
+        let err = rollback_management_addon(
+            admin(),
+            State(state.clone()),
+            AxumPath("forgejo".to_string()),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&err, ServerError::BadRequest(msg) if msg.contains("without persistence")),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn persistent_forgejo_upgrade_and_rollback_round_trip_through_the_api() {
+        let (_tmp, state, workdir) = git_state().await;
+        let path = workdir
+            .join(MANAGEMENT_CORE_ADDONS_DIR)
+            .join("forgejo.yaml");
+        let seed = seed_forgejo(true);
+        tokio::fs::write(&path, &seed).await.unwrap();
+        commit_and_push(&state.git_runner, &workdir, "chore: add forgejo").await;
+
+        // Locked values: the admin Secret, OAuth2 settings, and persistence enablement.
+        for values in [
+            serde_json::json!({"gitea": {"admin": {"existingSecret": "attacker"}}}),
+            serde_json::json!({"gitea": {"config": {"oauth2_client": {"ACCOUNT_LINKING": "login"}}}}),
+            serde_json::json!({"persistence": {"enabled": false}}),
+        ] {
+            let err = upgrade(&state, "forgejo", Some("17.4.0"), values.clone())
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, ServerError::Core(keel_core::CoreError::Validation(_))),
+                "{values}: {err:?}"
+            );
+        }
+
+        // A version bump edits only the HelmRelease, never the same-named HelmRepository or
+        // the HTTPRoute.
+        let resp = upgrade(&state, "forgejo", Some("17.4.0"), serde_json::json!({}))
+            .await
+            .unwrap();
+        let upgraded = read_on_branch(&state, &workdir, &resp.branch, "forgejo.yaml").await;
+        let (before, after) = (yaml_chunks(&seed), yaml_chunks(&upgraded));
+        assert_eq!(before.len(), 3);
+        assert_eq!(after.len(), 3);
+        assert_eq!(
+            after[0], before[0],
+            "HelmRepository must be written back verbatim"
+        );
+        assert_eq!(
+            after[2], before[2],
+            "HTTPRoute must be written back verbatim"
+        );
+        let repo: Value = serde_yml::from_str(after[0]).unwrap();
+        assert_eq!(repo["kind"], "HelmRepository");
+        let hr: Value = serde_yml::from_str(after[1]).unwrap();
+        assert_eq!(hr["kind"], "HelmRelease");
+        assert_eq!(hr.pointer("/spec/chart/spec/version").unwrap(), "17.4.0");
+        assert_eq!(
+            upgraded,
+            seed.replace("version: \"17.3.3\"", "version: \"17.4.0\"")
+        );
+
+        // Merge, then roll back: the seed comes back verbatim, protect label included.
+        tokio::fs::write(&path, &upgraded).await.unwrap();
+        commit_and_push(&state.git_runner, &workdir, "chore: merge forgejo upgrade").await;
+        let (_, Json(resp)) = rollback_management_addon(
+            admin(),
+            State(state.clone()),
+            AxumPath("forgejo".to_string()),
+        )
+        .await
+        .unwrap();
+        let restored = read_on_branch(&state, &workdir, &resp.branch, "forgejo.yaml").await;
+        assert_eq!(restored, seed);
+        let hr: Value = serde_yml::from_str(yaml_chunks(&restored)[1]).unwrap();
+        assert_eq!(
+            hr.pointer("/metadata/labels/keel.io~1protect").unwrap(),
+            "true"
+        );
     }
 
     #[tokio::test]

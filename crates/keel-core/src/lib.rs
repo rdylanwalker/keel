@@ -36,9 +36,10 @@ pub use crypto::{
 pub use management_addon::{
     MANAGEMENT_ADDON_VERSION_MAX_LEN, MANAGEMENT_CORE_ADDONS_DIR, ManagementAddonKind,
     ManagementAddonRef, apply_management_addon_upgrade, changed_value_paths,
-    disallowed_value_changes, ensure_management_addon_protected, management_addon_chart,
-    management_addon_desired_version, management_addon_mutable_values, management_addon_ref,
-    merge_json_values, render_management_addon_document, validate_management_addon_document,
+    disallowed_value_changes, ensure_management_addon_protected,
+    ensure_management_addon_upgradable, management_addon_chart, management_addon_desired_version,
+    management_addon_mutable_values, management_addon_ref, merge_json_values,
+    render_management_addon_document, validate_management_addon_document,
     validate_management_addon_version,
 };
 pub use models::{

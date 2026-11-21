@@ -23,7 +23,7 @@ use super::state::{
 use super::{
     DEFAULT_TENANT_ID, SEED_FLUX_GOTK_SYNC_YAML, SeedControlPlaneArtifacts, Stage0Ingress,
     TENANT_GIT_TOKEN_ENV, apply_git_credentials_secret, apply_tenant_git_credentials_secret,
-    render_manifest, render_rauthy_httproute,
+    forgejo_stack_config, render_manifest, render_rauthy_httproute,
 };
 use crate::commands::CliError;
 
@@ -405,28 +405,41 @@ pub(crate) async fn install_stage0_core_addons(
         target
             .apply(&render_forgejo_admin_secret_yaml(&password)?)
             .await?;
+        // Same `ROOT_URL` as the seed `forgejo` HelmRelease (Flux adopts it in place).
+        let forgejo_config = forgejo_stack_config(ingress);
+        let mut config: Vec<(&str, &str, bool)> = vec![
+            ("kubeconfig", &connection.kubeconfig_yaml, true),
+            ("kubeContext", kube_context, false),
+        ];
+        config.extend(
+            forgejo_config
+                .iter()
+                .map(|(key, value)| (*key, value.as_str(), false)),
+        );
         run_pulumi_control_plane_stack(
             stage0,
             "control-plane-forgejo",
             CONTROL_PLANE_FORGEJO_PULUMI_YAML,
-            &[
-                ("kubeconfig", &connection.kubeconfig_yaml, true),
-                ("kubeContext", kube_context, false),
-            ],
+            &config,
         )
         .await
     };
 
     tokio::try_join!(infra_setup_fut, ingress_and_rauthy_fut, forgejo_fut)?;
 
-    if with_forge && artifacts.rauthy_config.is_some() {
+    if with_forge {
+        // Same document as the `forgejo-ingress` HTTPRoute in `core-addons/forgejo.yaml`, so the
+        // catalog `serviceUrl` resolves with or without the built-in Rauthy IdP.
         target
             .apply(&render_manifest(
                 FORGEJO_ROUTE_YAML,
                 &ingress.template_vars(),
             )?)
             .await?;
-        configure_coredns_local_rewrites(target, ingress).await;
+        if artifacts.rauthy_config.is_some() {
+            // In-cluster OIDC discovery between Forgejo and Rauthy via the public hostnames.
+            configure_coredns_local_rewrites(target, ingress).await;
+        }
     }
 
     let mgmt_sa_name = artifacts
@@ -513,6 +526,18 @@ mod tests {
             .filter(|d| !d.trim().is_empty())
             .map(|d| serde_yml::from_str::<Value>(d).unwrap())
             .collect()
+    }
+
+    #[test]
+    fn forgejo_route_in_git_matches_stage0() {
+        // Stage 0 applies the same `forgejo-ingress` route Flux reconciles from
+        // `core-addons/forgejo.yaml`, so the adoption never rewrites it.
+        let ingress = Stage0Ingress::from_public_url("https://idp.corp.example:9443").unwrap();
+        let stage0 = docs(&render_manifest(FORGEJO_ROUTE_YAML, &ingress.template_vars()).unwrap());
+        let git = docs(&super::super::render_seed_forgejo_helmrelease(&ingress).unwrap());
+        let route = git.iter().find(|d| d["kind"] == "HTTPRoute").unwrap();
+        assert_eq!(stage0.len(), 1);
+        assert_eq!(&stage0[0], route);
     }
 
     #[test]
