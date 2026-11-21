@@ -120,4 +120,6 @@ Applications whose `CatalogApplication` sets `spec.progressiveDelivery.flaggerSu
 - **`canary.yaml`**: a Flagger `Canary` (`provider: gatewayapi:v1`) targeting `keel-system/keel-ingress`. It gates on `envoy-gateway-request-success-rate` ≥ 99% and `envoy-gateway-request-duration` p99 ≤ 500 ms over `2m` windows.
 - **`networkpolicy-canary.yaml`**: allows ingress from Envoy proxy pods in `keel-system` through `default-deny-all`.
 
+For an app on a remote workload cluster, `canary.yaml` and `networkpolicy-canary.yaml` go into `<app>/canary/` and are applied there by a separate `<instance>-canary` Flux `Kustomization` (`canary-kustomization.yaml`). That directory also contains `namespace.yaml`, which creates the target namespace on the workload cluster so the canary objects don't wait for Helm to create it. The namespace is annotated `kustomize.toolkit.fluxcd.io/prune: disabled` and `kustomize.toolkit.fluxcd.io/ssa: IfNotPresent`, so Flux never deletes it or overwrites an existing one.
+
 Charts deployed into tenant namespaces must have a `restricted`-compliant `securityContext` (`allowPrivilegeEscalation: false`, `runAsNonRoot: true`, a numeric `runAsUser`, `capabilities.drop: ["ALL"]`).

@@ -21,7 +21,7 @@ use keel_kube::{
     HelmReleaseSpecInput, HelmValuesSecretRef, RemoteKubeConfigRef, TenantAgeKey,
     generate_flux_kustomization_manifest, synthesize_canary_gateway_network_policy_yaml,
     synthesize_flagger_canary_yaml, synthesize_flux_kustomization_yaml,
-    synthesize_helm_release_yaml,
+    synthesize_helm_release_yaml, synthesize_remote_target_namespace_yaml,
 };
 use keel_pko::{
     ChangeOp, EphemeralPreviewParams, GcPlan, PkoStack, PreviewReport, PreviewResourceCandidate,
@@ -1369,8 +1369,22 @@ pub async fn create_proposal(
                     canary_input.service_port,
                 )?;
                 if let Some(ref remote_kc) = remote_app_kube_config {
+                    let remote_target_ns = remote_app_target_ns
+                        .clone()
+                        .unwrap_or_else(|| tenant_ns.clone());
                     let canary_dir = target_dir.join("canary");
                     create_dir_all_contained(&state.repo_workdir, &canary_dir).await?;
+                    // On the workload cluster the target namespace is otherwise only created by
+                    // the sibling HelmRelease (`install.createNamespace`); ship it here so the
+                    // canary objects never race Helm (kustomize-controller applies Namespaces
+                    // first). `prune: disabled` + `ssa: IfNotPresent` keep it from deleting or
+                    // fighting the namespace Helm may also create.
+                    write_contained(
+                        &state.repo_workdir,
+                        &canary_dir.join("namespace.yaml"),
+                        synthesize_remote_target_namespace_yaml(&req.tenant, &remote_target_ns)?,
+                    )
+                    .await?;
                     write_contained(
                         &state.repo_workdir,
                         &canary_dir.join("canary.yaml"),
@@ -1386,7 +1400,7 @@ pub async fn create_proposal(
                     let canary_k_doc = serde_json::json!({
                         "apiVersion": "kustomize.config.k8s.io/v1beta1",
                         "kind": "Kustomization",
-                        "resources": ["canary.yaml", "networkpolicy-canary.yaml"],
+                        "resources": ["namespace.yaml", "canary.yaml", "networkpolicy-canary.yaml"],
                     });
                     let canary_k_yaml = serde_yml::to_string(&canary_k_doc).map_err(|e| {
                         ServerError::Internal(format!(
@@ -1399,6 +1413,7 @@ pub async fn create_proposal(
                         canary_k_yaml,
                     )
                     .await?;
+                    staged_paths.push(format!("{rel_dir}/canary/namespace.yaml"));
                     staged_paths.push(format!("{rel_dir}/canary/canary.yaml"));
                     staged_paths.push(format!("{rel_dir}/canary/networkpolicy-canary.yaml"));
                     staged_paths.push(format!("{rel_dir}/canary/kustomization.yaml"));
@@ -1410,11 +1425,7 @@ pub async fn create_proposal(
                         format!("./{rel_dir}/canary"),
                     );
                     fk_input.kube_config = Some(remote_kc.clone());
-                    fk_input.target_namespace = Some(
-                        remote_app_target_ns
-                            .clone()
-                            .unwrap_or_else(|| tenant_ns.clone()),
-                    );
+                    fk_input.target_namespace = Some(remote_target_ns);
                     let fk_yaml = synthesize_flux_kustomization_yaml(&fk_input)?;
                     write_contained(
                         &state.repo_workdir,

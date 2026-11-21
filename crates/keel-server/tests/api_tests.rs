@@ -3536,6 +3536,110 @@ spec:
 }
 
 #[tokio::test]
+async fn test_remote_canary_kustomization_creates_target_namespace_first() {
+    let fixture = setup_fixture().await;
+    let cookie = login_and_get_cookie(&fixture).await;
+    let app = build_router(fixture.state.clone());
+
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/proposals")
+                .header(COOKIE, &cookie)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "tenant": "acme",
+                        "catalogId": "grafana",
+                        "kind": "app",
+                        "name": "grafana-edge",
+                        "canary": true,
+                        "targetCluster": "workload-kubeconfig",
+                        "targetNamespace": "staging-obs",
+                        "values": { "replicas": 2 }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let body: Value =
+        serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let branch = body["branch"].as_str().unwrap();
+    fixture
+        .state
+        .git_runner
+        .checkout_branch(&fixture.state.repo_workdir, branch)
+        .await
+        .unwrap();
+
+    let app_dir = fixture
+        .state
+        .repo_workdir
+        .join("tenants/acme/apps/grafana-edge");
+    let ns: Value = serde_yml::from_str(
+        &tokio::fs::read_to_string(app_dir.join("canary/namespace.yaml"))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(ns["kind"], "Namespace");
+    assert_eq!(ns["metadata"]["name"], "staging-obs");
+    assert_eq!(
+        ns["metadata"]["annotations"]["kustomize.toolkit.fluxcd.io/prune"],
+        "disabled"
+    );
+    assert_eq!(
+        ns["metadata"]["annotations"]["kustomize.toolkit.fluxcd.io/ssa"],
+        "IfNotPresent"
+    );
+
+    let canary_k: Value = serde_yml::from_str(
+        &tokio::fs::read_to_string(app_dir.join("canary/kustomization.yaml"))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        canary_k["resources"],
+        json!(["namespace.yaml", "canary.yaml", "networkpolicy-canary.yaml"])
+    );
+
+    let fk: Value = serde_yml::from_str(
+        &tokio::fs::read_to_string(app_dir.join("canary-kustomization.yaml"))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(fk["spec"]["targetNamespace"], "staging-obs");
+    assert_eq!(
+        fk["spec"]["kubeConfig"]["secretRef"]["name"],
+        "workload-kubeconfig"
+    );
+    assert_eq!(
+        fk["spec"]["path"],
+        "./tenants/acme/apps/grafana-edge/canary"
+    );
+
+    // The Namespace lives only in the remote canary path, never in the local tenant tree.
+    let tenants_kustomization = tokio::fs::read_to_string(
+        fixture
+            .state
+            .repo_workdir
+            .join("tenants/kustomization.yaml"),
+    )
+    .await
+    .unwrap();
+    assert!(tenants_kustomization.contains("acme/apps/grafana-edge/canary-kustomization.yaml"));
+    assert!(!tenants_kustomization.contains("namespace.yaml"));
+    assert!(!tenants_kustomization.contains("acme/apps/grafana-edge/canary.yaml"));
+}
+
+#[tokio::test]
 async fn test_app_proposal_with_flagger_canary_stages_canary_yaml() {
     let fixture = setup_fixture().await;
     let cookie = login_and_get_cookie(&fixture).await;
@@ -3606,6 +3710,15 @@ async fn test_app_proposal_with_flagger_canary_stages_canary_yaml() {
     assert!(tenants_kustomization.contains("acme/apps/grafana/helmrelease-canary.yaml"));
     assert!(tenants_kustomization.contains("acme/apps/grafana/canary.yaml"));
     assert!(tenants_kustomization.contains("acme/apps/grafana/networkpolicy-canary.yaml"));
+    // Local (management-cluster) canaries never ship a Namespace object.
+    assert!(
+        !fixture
+            .state
+            .repo_workdir
+            .join("tenants/acme/apps/grafana/canary")
+            .exists()
+    );
+    assert!(!tenants_kustomization.contains("namespace.yaml"));
 
     fixture
         .state

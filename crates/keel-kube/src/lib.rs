@@ -58,7 +58,8 @@ pub use tenant::{
     synthesize_canary_gateway_network_policy_yaml, synthesize_flagger_canary,
     synthesize_flagger_canary_yaml, synthesize_flux_kustomization,
     synthesize_flux_kustomization_yaml, synthesize_helm_release, synthesize_helm_release_yaml,
-    tenant_namespace, validate_tenant_id,
+    synthesize_remote_target_namespace, synthesize_remote_target_namespace_yaml, tenant_namespace,
+    validate_tenant_id,
 };
 
 #[derive(Debug, thiserror::Error)]

@@ -412,6 +412,7 @@ spec:
   1. Keel generates a standard **Gateway API `HTTPRoute`** (managed by **Envoy Gateway**) alongside a **Flagger `Canary` CR**.
   2. On subsequent image tag or `values.yaml` PR merges, Flagger automatically shifts traffic (`5% -> 10% -> 25% -> 50% -> 100%`) while querying **Prometheus** for HTTP 5xx error rates and p99 latency.
   3. Any metric breach triggers an automatic rollback to the previous stable revision without human intervention.
+  4. When the app targets a remote workload cluster, the `Canary` and its `NetworkPolicy` are applied by a separate `<instance>-canary` Flux `Kustomization` (`spec.kubeConfig` + `spec.targetNamespace`) from `<app>/canary/`, which also ships a `Namespace` for the target namespace annotated `kustomize.toolkit.fluxcd.io/prune: disabled` and `kustomize.toolkit.fluxcd.io/ssa: IfNotPresent`, so it does not race the sibling `HelmRelease`'s `install.createNamespace`. Management-cluster canaries never ship `Namespace` objects.
 
 ---
 

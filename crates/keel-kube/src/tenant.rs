@@ -894,6 +894,43 @@ pub fn synthesize_canary_gateway_network_policy_yaml(
     Ok(serde_yml::to_string(&manifest)?)
 }
 
+/// Synthesizes a `Namespace` for a tenant workload's target namespace on a **remote** cluster.
+///
+/// Remote Flux `Kustomization`s (`spec.kubeConfig` + `spec.targetNamespace`) that apply namespaced
+/// objects next to a sibling `HelmRelease` would otherwise race Helm's `install.createNamespace`.
+/// kustomize-controller applies `Namespace` objects before namespaced ones, so including this
+/// manifest removes the race. It is annotated `prune: disabled` (never delete a namespace Helm
+/// may also own) and `ssa: IfNotPresent` (never fight an existing namespace). Must not be used on
+/// management-cluster tenant paths, where the tenant reconciler cannot create namespaces.
+pub fn synthesize_remote_target_namespace(
+    tenant_id: &str,
+    namespace: &str,
+) -> Result<Value, KubeError> {
+    validate_tenant_id(tenant_id)?;
+    validate_resource_name("namespace", namespace)?;
+    Ok(json!({
+        "apiVersion": "v1",
+        "kind": "Namespace",
+        "metadata": {
+            "name": namespace,
+            "labels": tenant_common_labels(tenant_id),
+            "annotations": {
+                "kustomize.toolkit.fluxcd.io/prune": "disabled",
+                "kustomize.toolkit.fluxcd.io/ssa": "IfNotPresent",
+            },
+        },
+    }))
+}
+
+/// Synthesizes a remote target `Namespace` (see [`synthesize_remote_target_namespace`]) as YAML.
+pub fn synthesize_remote_target_namespace_yaml(
+    tenant_id: &str,
+    namespace: &str,
+) -> Result<String, KubeError> {
+    let manifest = synthesize_remote_target_namespace(tenant_id, namespace)?;
+    Ok(serde_yml::to_string(&manifest)?)
+}
+
 /// Health-check target for `Kustomization.spec.healthChecks` (e.g., waiting on a PKO `Stack` CR).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FluxHealthCheckRef {
@@ -1440,6 +1477,29 @@ pub fn build_tenant_reconciler_rbac_yaml() -> Result<String, KubeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_target_namespace_never_prunes_or_overwrites() {
+        let ns = synthesize_remote_target_namespace("default", "staging-obs").unwrap();
+        assert_eq!(ns["apiVersion"], "v1");
+        assert_eq!(ns["kind"], "Namespace");
+        assert_eq!(ns["metadata"]["name"], "staging-obs");
+        assert!(ns["metadata"].get("namespace").is_none());
+        assert_eq!(ns["metadata"]["labels"]["keel.io/tenant"], "default");
+        assert_eq!(
+            ns["metadata"]["annotations"]["kustomize.toolkit.fluxcd.io/prune"],
+            "disabled"
+        );
+        assert_eq!(
+            ns["metadata"]["annotations"]["kustomize.toolkit.fluxcd.io/ssa"],
+            "IfNotPresent"
+        );
+        let yaml = synthesize_remote_target_namespace_yaml("default", "tenant-default").unwrap();
+        assert!(yaml.contains("kind: Namespace"));
+        assert!(yaml.contains("name: tenant-default"));
+        assert!(synthesize_remote_target_namespace("default", "Bad_NS").is_err());
+        assert!(synthesize_remote_target_namespace("Bad Tenant", "ns").is_err());
+    }
 
     #[test]
     fn tenant_s3_backend_url_scopes_state_under_tenant_prefix() {
