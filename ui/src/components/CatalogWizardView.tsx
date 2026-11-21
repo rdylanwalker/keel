@@ -1,58 +1,33 @@
 import React, { useEffect, useState } from "react"
-import type { RJSFSchema } from "@rjsf/utils"
+import { Filter, Layers, Plus, Search, Trash2, X } from "lucide-react"
+
+import { CatalogItem, Proposal } from "../types/api"
 import {
-  Search,
-  Layers,
-  CheckCircle2,
-  AlertCircle,
-  ArrowRight,
-  GitPullRequest,
-  Box,
-  Plus,
-  Trash2,
-  X,
-  Pencil,
-} from "lucide-react"
-import {
-  CatalogItem,
-  CreateCatalogItemPayload,
-  Proposal,
-  ReleaseSummary,
-  StackSummary,
-  TenantSummary,
-} from "../types/api"
-import {
-  createCatalogApp,
   createTenant,
-  deleteTenant,
-  getCatalog,
-  getReleaseConfig,
-  getReleases,
-  getStackConfig,
-  getStacks,
-  getTenants,
-  updateCatalogItem,
   deleteCatalogItem,
+  deleteTenant,
+  getReleaseConfig,
+  getStackConfig,
 } from "../lib/api"
-import { isDemoMode } from "../lib/utils"
-import {
-  DEFAULT_CATALOG,
-  DEFAULT_STARTER_MANIFEST,
-  DEMO_TENANTS,
-} from "../lib/demoFixtures"
-import {
-  SchemaFieldDraft,
-  extractManifestVariables,
-  fieldsToSchemaJson,
-  humanizeFieldName,
-  schemaJsonToFields,
-} from "../lib/schemaBuilder"
+import { useAuthz } from "../lib/authz-context"
+import { errorMessage } from "../lib/errors"
+import type { CatalogKindFilter } from "../lib/routes"
+import { Button } from "./ui/button"
+import { PageHeader } from "./ui/page-header"
+import { Input } from "./ui/input"
+import { NativeSelect } from "./ui/native-select"
 import {
   DeployInstanceInitialConfig,
   DeployInstanceModal,
 } from "./DeployInstanceModal"
 import { CreateTenantModal } from "./CreateTenantModal"
 import { CatalogItemModal } from "./CatalogItemModal"
+import { CatalogItemCard } from "./catalog/CatalogItemCard"
+import { InlineAlert } from "./catalog/InlineAlert"
+import { ProposalCreatedNotice } from "./catalog/ProposalCreatedNotice"
+import { KIND_FILTER_LABELS, matchesKindFilter } from "./catalog/kindFilter"
+import { useCatalogData } from "./catalog/useCatalogData"
+import { useCatalogItemEditor } from "./catalog/useCatalogItemEditor"
 
 export interface CatalogWizardViewProps {
   onNavigateToPreview?: () => void
@@ -63,6 +38,15 @@ export interface CatalogWizardViewProps {
   } | null
   onClearReleaseTarget?: () => void
   selectedTenant?: string
+  /** Pre-filter from `#catalog/<kind>` ("+ Deploy Cluster/VM/Service/App"). */
+  kindFilter?: CatalogKindFilter
+  onKindFilterChange?: (kind?: CatalogKindFilter) => void
+}
+
+interface DeployModalState {
+  item: CatalogItem | null
+  initialConfig: DeployInstanceInitialConfig | null
+  editMode: boolean
 }
 
 export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
@@ -70,42 +54,36 @@ export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
   initialReleaseTarget,
   onClearReleaseTarget,
   selectedTenant,
+  kindFilter,
+  onKindFilterChange,
 }) => {
-  const [catalog, setCatalog] = useState<CatalogItem[]>(() =>
-    isDemoMode() ? DEFAULT_CATALOG : []
-  )
+  const authz = useAuthz()
   const [searchQuery, setSearchQuery] = useState("")
   const [deletingCatalogId, setDeletingCatalogId] = useState<string | null>(
     null
   )
-  const [deployModalItem, setDeployModalItem] = useState<CatalogItem | null>(
-    null
-  )
-  const [deployInitialConfig, setDeployInitialConfig] =
-    useState<DeployInstanceInitialConfig | null>(null)
-  const [isDeployModalOpen, setIsDeployModalOpen] = useState(false)
-  const [isDeployEditMode, setIsDeployEditMode] = useState(false)
+  const [deployModal, setDeployModal] = useState<DeployModalState | null>(null)
+  const [activeKindFilter, setActiveKindFilter] = useState(kindFilter)
+  const [prevKindFilter, setPrevKindFilter] = useState(kindFilter)
+  if (kindFilter !== prevKindFilter) {
+    setPrevKindFilter(kindFilter)
+    setActiveKindFilter(kindFilter)
+  }
 
-  const [tenant, setTenant] = useState(selectedTenant || "default")
+  // `tenant` is the deploy target; `tenantFilter` narrows the visible catalog.
+  const [tenant, setTenantState] = useState(selectedTenant || "default")
   const [tenantFilter, setTenantFilter] = useState(selectedTenant || "all")
+  const setTenant = (next: string) => {
+    setTenantState(next)
+    setTenantFilter(next)
+  }
   const [prevSelectedTenant, setPrevSelectedTenant] = useState(selectedTenant)
   if (selectedTenant !== prevSelectedTenant) {
     setPrevSelectedTenant(selectedTenant)
-    if (selectedTenant && selectedTenant !== "all") {
-      setTenant(selectedTenant)
-      setTenantFilter(selectedTenant)
-    } else {
-      setTenant("all")
-      setTenantFilter("all")
-    }
+    setTenant(
+      selectedTenant && selectedTenant !== "all" ? selectedTenant : "all"
+    )
   }
-  const [stacks, setStacks] = useState<StackSummary[]>([])
-  const [releases, setReleases] = useState<ReleaseSummary[]>([])
-  const [tenants, setTenants] = useState<TenantSummary[]>(() =>
-    isDemoMode()
-      ? DEMO_TENANTS
-      : [{ id: "default", namespace: "tenant-default" }]
-  )
   const [error, setError] = useState<string | null>(null)
   const [createdProposal, setCreatedProposal] = useState<Proposal | null>(null)
 
@@ -114,167 +92,73 @@ export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
   const [tenantLoading, setTenantLoading] = useState(false)
   const [tenantError, setTenantError] = useState<string | null>(null)
 
-  const [isAddAppModalOpen, setIsAddAppModalOpen] = useState(false)
-  const [editingCatalogItem, setEditingCatalogItem] =
-    useState<CatalogItem | null>(null)
-  const [schemaJsonText, setSchemaJsonText] = useState("")
-  const [schemaFields, setSchemaFields] = useState<SchemaFieldDraft[]>([])
-  const [showSchemaEditor, setShowSchemaEditor] = useState(false)
-  const [appLoading, setAppLoading] = useState(false)
-  const [appError, setAppError] = useState<string | null>(null)
-  const [appForm, setAppForm] = useState<CreateCatalogItemPayload>({
-    kind: "app",
-    id: "",
-    name: "",
-    category: "Applications",
-    runtime: "helm",
-    repoUrl: "",
-    chart: "",
-    version: "",
-    flaggerSupported: false,
-    provider: "kind",
-    pulumiRuntime: "yaml",
-    entrypoint: "Pulumi.yaml",
-    protectByDefault: false,
-    terraformProvider: "",
-    pulumiYaml: "",
-    manifestsYaml: "",
-    defaultEngine: "flux",
-  })
-
-  useEffect(() => {
-    const fetchTenants = async () => {
-      try {
-        const items = await getTenants()
-        if (items && items.length > 0) {
-          setTenants(items)
-          setTenant((prev) =>
-            prev === "all" || items.some((t) => t.id === prev)
-              ? prev
-              : items[0].id
-          )
-        } else {
-          setTenants(
-            isDemoMode()
-              ? DEMO_TENANTS
-              : [{ id: "default", namespace: "tenant-default" }]
-          )
-        }
-      } catch {
-        setTenants(
-          isDemoMode()
-            ? DEMO_TENANTS
-            : [{ id: "default", namespace: "tenant-default" }]
-        )
-      }
-    }
-    fetchTenants()
-    if (typeof getStacks === "function") {
-      getStacks()
-        .then((stackList) =>
-          setStacks(
-            (stackList || []).filter(
-              (s) => s.name !== "management-cluster-core"
-            )
-          )
-        )
-        .catch(() => setStacks([]))
-    }
-    if (typeof getReleases === "function") {
-      getReleases()
-        .then((releaseList) => setReleases(releaseList || []))
-        .catch(() => setReleases([]))
-    }
-  }, [])
-
-  useEffect(() => {
-    const loadCatalog = async () => {
-      try {
-        const items = await getCatalog()
-        if (items && items.length > 0) {
-          setCatalog(items)
-        } else if (!isDemoMode()) {
-          setCatalog([])
-        }
-      } catch (err) {
-        const msg =
-          err instanceof Error ? err.message : "Failed to load catalog"
-        if (!(isDemoMode() && msg.includes("API error (401)"))) {
-          setError(msg)
-        }
-        if (!isDemoMode()) {
-          setCatalog([])
-        }
-      }
-    }
-    loadCatalog()
-  }, [])
+  const {
+    catalog,
+    setCatalog,
+    tenants,
+    setTenants,
+    stacks,
+    releases,
+    loadError,
+  } = useCatalogData((items) =>
+    setTenantState((prev) =>
+      prev === "all" || items.some((t) => t.id === prev) ? prev : items[0].id
+    )
+  )
+  const editor = useCatalogItemEditor(setCreatedProposal)
 
   useEffect(() => {
     if (!initialReleaseTarget || catalog.length === 0) return
-    if (typeof getReleaseConfig !== "function") {
-      onClearReleaseTarget?.()
-      return
-    }
     let cancelled = false
-    const loadReleaseConfig = async () => {
+    const target = initialReleaseTarget
+    const load = async () => {
       try {
-        const isInfra = initialReleaseTarget.kind === "infra"
-        const cfg = isInfra
-          ? await getStackConfig(
-              initialReleaseTarget.namespace,
-              initialReleaseTarget.name
-            )
-          : await getReleaseConfig(
-              initialReleaseTarget.namespace,
-              initialReleaseTarget.name
-            )
+        const cfg =
+          target.kind === "infra"
+            ? await getStackConfig(target.namespace, target.name)
+            : await getReleaseConfig(target.namespace, target.name)
         if (cancelled) return
         const matched =
           catalog.find((item) => item.id === cfg.catalogId) ?? null
         setTenant(cfg.tenant || "default")
-        setDeployModalItem(matched)
-        setDeployInitialConfig({
-          values: cfg.values,
-          name: cfg.name || initialReleaseTarget.name,
-          version: cfg.version || matched?.version || "",
-          tenant: cfg.tenant || "default",
-          targetCluster: cfg.targetCluster,
-          targetNamespace: cfg.targetNamespace,
-        })
-        setIsDeployEditMode(true)
-        setIsDeployModalOpen(Boolean(matched))
+        setDeployModal(
+          matched
+            ? {
+                item: matched,
+                editMode: true,
+                initialConfig: {
+                  values: cfg.values,
+                  name: cfg.name || target.name,
+                  version: cfg.version || matched.version || "",
+                  tenant: cfg.tenant || "default",
+                  targetCluster: cfg.targetCluster,
+                  targetNamespace: cfg.targetNamespace,
+                },
+              }
+            : null
+        )
         setCreatedProposal(null)
         setError(null)
       } catch (err) {
         if (!cancelled) {
-          setError(
-            err instanceof Error
-              ? err.message
-              : "Failed to load release configuration"
-          )
+          setError(errorMessage(err, "Failed to load release configuration"))
         }
       } finally {
-        if (!cancelled) {
-          onClearReleaseTarget?.()
-        }
+        if (!cancelled) onClearReleaseTarget?.()
       }
     }
-    loadReleaseConfig()
+    void load()
     return () => {
       cancelled = true
     }
   }, [initialReleaseTarget, catalog, onClearReleaseTarget])
 
-  const openDeployModal = (item: CatalogItem) => {
-    setDeployModalItem(item)
-    setDeployInitialConfig(null)
-    setIsDeployEditMode(false)
-    setIsDeployModalOpen(true)
-    setCreatedProposal(null)
-    setError(null)
-  }
+  const canManageItem = (item: CatalogItem) =>
+    item.tenant ? authz.canAdminTenant(item.tenant) : authz.isAdmin
+  const canAddCatalogItem =
+    authz.isAdmin || tenants.some((t) => authz.canAdminTenant(t.id))
 
+  const query = searchQuery.toLowerCase()
   const filteredCatalog = catalog.filter((item) => {
     if (
       tenantFilter &&
@@ -284,25 +168,29 @@ export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
     ) {
       return false
     }
+    if (!matchesKindFilter(item, activeKindFilter)) return false
     return (
-      item.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      item.description.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      item.category.toLowerCase().includes(searchQuery.toLowerCase())
+      item.name.toLowerCase().includes(query) ||
+      item.description.toLowerCase().includes(query) ||
+      item.category.toLowerCase().includes(query)
     )
   })
 
+  const clearKindFilter = () => {
+    setActiveKindFilter(undefined)
+    onKindFilterChange?.(undefined)
+  }
+
   const handleCreateTenant = async (e: React.FormEvent) => {
     e.preventDefault()
-    if (!newTenantId.trim()) return
-
+    const newId = newTenantId.trim()
+    if (!newId) return
     setTenantLoading(true)
     setTenantError(null)
     setCreatedProposal(null)
-
     try {
-      const proposal = await createTenant(newTenantId.trim())
+      const proposal = await createTenant(newId)
       setCreatedProposal(proposal)
-      const newId = newTenantId.trim()
       setTenants((prev) =>
         prev.some((t) => t.id === newId)
           ? prev
@@ -312,9 +200,7 @@ export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
       setNewTenantId("")
       setIsNewTenantModalOpen(false)
     } catch (err) {
-      setTenantError(
-        err instanceof Error ? err.message : "Failed to create tenant proposal"
-      )
+      setTenantError(errorMessage(err, "Failed to create tenant proposal"))
     } finally {
       setTenantLoading(false)
     }
@@ -322,791 +208,252 @@ export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
 
   const handleDeleteTenant = async (tenantId: string) => {
     if (tenantId === "default") return
-
     setTenantLoading(true)
     setTenantError(null)
     setCreatedProposal(null)
-
     try {
       const proposal = await deleteTenant(tenantId)
       setCreatedProposal(proposal)
       setTenants((prev) => prev.filter((t) => t.id !== tenantId))
-      if (tenant === tenantId) {
-        setTenant("default")
-      }
+      if (tenant === tenantId) setTenant("default")
     } catch (err) {
-      setTenantError(
-        err instanceof Error ? err.message : "Failed to remove tenant proposal"
-      )
+      setTenantError(errorMessage(err, "Failed to remove tenant proposal"))
     } finally {
       setTenantLoading(false)
     }
   }
 
-  const openAddCatalogModal = () => {
-    setEditingCatalogItem(null)
-    setAppError(null)
-    setSchemaJsonText("")
-    setSchemaFields([])
-    setShowSchemaEditor(false)
-    setAppForm({
-      kind: "app",
-      id: "",
-      name: "",
-      category: "Applications",
-      description: "",
-      runtime: "helm",
-      repoUrl: "",
-      chart: "",
-      version: "",
-      path: "",
-      flaggerSupported: false,
-      provider: "kind",
-      pulumiRuntime: "yaml",
-      entrypoint: "Pulumi.yaml",
-      protectByDefault: false,
-      terraformProvider: "",
-      pulumiYaml: "",
-      manifestsYaml: "",
-      defaultEngine: "flux",
-      items: [],
-    })
-    setIsAddAppModalOpen(true)
-  }
-
-  const openEditCatalogModal = (item: CatalogItem) => {
-    const normalizedKind: "app" | "infra" | "bundle" =
-      item.type === "infrastructure" || item.type === "infra"
-        ? "infra"
-        : item.type === "bundle"
-          ? "bundle"
-          : "app"
-    setEditingCatalogItem(item)
-    setAppError(null)
-    const initialSchemaJson = JSON.stringify(
-      item.schema ?? { type: "object", properties: {} },
-      null,
-      2
-    )
-    setSchemaJsonText(initialSchemaJson)
-    setSchemaFields(schemaJsonToFields(initialSchemaJson) ?? [])
-    setShowSchemaEditor(false)
-    setAppForm({
-      kind: normalizedKind,
-      id: item.id,
-      name: item.name,
-      category:
-        item.category ||
-        (normalizedKind === "infra"
-          ? "Infrastructure"
-          : normalizedKind === "bundle"
-            ? "Platform"
-            : "Applications"),
-      description: item.description || "",
-      runtime: (item.runtime as "helm" | "kustomize" | "manifest") || "helm",
-      manifestsYaml:
-        item.manifestsYaml ||
-        (item.runtime === "manifest" ? DEFAULT_STARTER_MANIFEST : ""),
-      defaultEngine:
-        item.defaultEngine ||
-        (item.runtime === "manifest" ? "flux" : undefined),
-      repoUrl: item.repoUrl || "",
-      chart: item.chart || "",
-      version: item.version || "",
-      path: item.path || "",
-      flaggerSupported: !!item.flaggerSupported,
-      provider: item.provider || "kind",
-      pulumiRuntime: item.pulumiRuntime || "yaml",
-      entrypoint: item.entrypoint || "Pulumi.yaml",
-      protectByDefault: !!item.protectByDefault,
-      protected: Boolean(item.protected),
-      tenant: item.tenant || "",
-      resourceKind: item.resourceKind,
-      terraformProvider: "",
-      pulumiYaml: item.pulumiYaml || "",
-      items: item.bundleItems
-        ? item.bundleItems.map((b) => ({
-            ...b,
-            dependsOn: b.dependsOn ? [...b.dependsOn] : [],
-          }))
-        : [],
-    })
-    setIsAddAppModalOpen(true)
-  }
-
-  const handleCreateCatalogApp = async (e: React.FormEvent) => {
-    e.preventDefault()
-    const isInfra = appForm.kind === "infra"
-    const isBundle = appForm.kind === "bundle"
-    const isManifest = appForm.kind === "app" && appForm.runtime === "manifest"
-    if (
-      !appForm.id.trim() ||
-      !appForm.name.trim() ||
-      (!isInfra && !isBundle && !isManifest && !appForm.repoUrl?.trim()) ||
-      (isBundle && (!appForm.items || appForm.items.length === 0))
-    )
-      return
-
-    let parsedSchema: RJSFSchema | undefined
-    if (showSchemaEditor && schemaJsonText.trim()) {
-      try {
-        parsedSchema = JSON.parse(schemaJsonText) as RJSFSchema
-      } catch (err) {
-        setAppError(
-          `Invalid JSON Schema: ${err instanceof Error ? err.message : "parse error"}`
-        )
-        return
-      }
-    }
-
-    setAppLoading(true)
-    setAppError(null)
-    setCreatedProposal(null)
-
+  const handleDeleteCatalogItem = async (item: CatalogItem) => {
+    if (item.protected || deletingCatalogId === item.id) return
+    setDeletingCatalogId(item.id)
     try {
-      const isEditing = Boolean(editingCatalogItem)
-
-      const protectedChanged =
-        isEditing &&
-        Boolean(appForm.protected) !== Boolean(editingCatalogItem?.protected)
-      const tenantChanged =
-        isEditing &&
-        (appForm.tenant?.trim() || "") !== (editingCatalogItem?.tenant || "")
-
-      const basePayloadFields = {
-        ...(appForm.protected || protectedChanged
-          ? { protected: Boolean(appForm.protected) }
-          : {}),
-        ...(appForm.tenant?.trim()
-          ? { tenant: appForm.tenant.trim() }
-          : tenantChanged
-            ? { tenant: "" }
-            : {}),
-      }
-
-      const payload: CreateCatalogItemPayload = isBundle
-        ? {
-            kind: "bundle",
-            id: appForm.id.trim(),
-            name: appForm.name.trim(),
-            category: appForm.category.trim() || "Platform",
-            ...basePayloadFields,
-            description: isEditing
-              ? (appForm.description?.trim() ?? "")
-              : appForm.description?.trim() || undefined,
-            items: (appForm.items ?? []).map((item) => ({
-              id: item.id.trim(),
-              kind: item.kind,
-              catalogRef: item.catalogRef.trim(),
-              ...(item.dependsOn && item.dependsOn.length > 0
-                ? { dependsOn: item.dependsOn }
-                : {}),
-              ...(item.kind === "app" && item.targetClusterFrom?.trim()
-                ? { targetClusterFrom: item.targetClusterFrom.trim() }
-                : {}),
-              ...(item.kind === "app" && item.targetNamespace?.trim()
-                ? { targetNamespace: item.targetNamespace.trim() }
-                : {}),
-              ...(item.kind === "app" && item.canary ? { canary: true } : {}),
-            })),
-            ...(parsedSchema ? { schema: parsedSchema } : {}),
-          }
-        : isInfra
-          ? {
-              kind: "infra",
-              id: appForm.id.trim(),
-              name: appForm.name.trim(),
-              category: appForm.category.trim() || "Infrastructure",
-              ...basePayloadFields,
-              ...(appForm.resourceKind
-                ? { resourceKind: appForm.resourceKind }
-                : {}),
-              ...(isEditing
-                ? { description: appForm.description?.trim() ?? "" }
-                : appForm.description?.trim()
-                  ? { description: appForm.description.trim() }
-                  : {}),
-              provider: appForm.provider || "kind",
-              pulumiRuntime: appForm.pulumiRuntime || "yaml",
-              entrypoint: appForm.entrypoint?.trim() || "Pulumi.yaml",
-              terraformProvider: appForm.terraformProvider?.trim() || undefined,
-              protectByDefault: !!appForm.protectByDefault,
-              ...(appForm.pulumiYaml?.trim()
-                ? { pulumiYaml: appForm.pulumiYaml }
-                : {}),
-              ...(parsedSchema ? { schema: parsedSchema } : {}),
-            }
-          : {
-              kind: "app",
-              id: appForm.id.trim(),
-              name: appForm.name.trim(),
-              category: appForm.category.trim() || "Applications",
-              ...basePayloadFields,
-              ...(isEditing
-                ? { description: appForm.description?.trim() ?? "" }
-                : appForm.description?.trim()
-                  ? { description: appForm.description.trim() }
-                  : {}),
-              runtime: appForm.runtime || "helm",
-              ...(appForm.runtime === "manifest"
-                ? {
-                    manifestsYaml:
-                      appForm.manifestsYaml || DEFAULT_STARTER_MANIFEST,
-                    defaultEngine: appForm.defaultEngine || "flux",
-                    repoUrl: !appForm.repoUrl?.trim()
-                      ? "https://kubernetes.io/docs/concepts/overview/working-with-objects/"
-                      : appForm.repoUrl.trim(),
-                    path: !appForm.path?.trim()
-                      ? "./manifests.yaml"
-                      : appForm.path.trim(),
-                    chart: isEditing ? "" : undefined,
-                    version: isEditing ? "" : undefined,
-                  }
-                : appForm.runtime === "kustomize"
-                  ? {
-                      repoUrl: appForm.repoUrl?.trim() || "",
-                      path: isEditing
-                        ? (appForm.path?.trim() ?? "")
-                        : appForm.path?.trim() || undefined,
-                      version: isEditing
-                        ? (appForm.version?.trim() ?? "")
-                        : appForm.version?.trim() || undefined,
-                      chart: isEditing ? "" : undefined,
-                    }
-                  : {
-                      repoUrl: appForm.repoUrl?.trim() || "",
-                      chart: isEditing
-                        ? (appForm.chart?.trim() ?? "")
-                        : appForm.chart?.trim() || undefined,
-                      version: isEditing
-                        ? (appForm.version?.trim() ?? "")
-                        : appForm.version?.trim() || undefined,
-                      path: isEditing ? "" : undefined,
-                    }),
-              flaggerSupported: !!appForm.flaggerSupported,
-              ...(parsedSchema ? { schema: parsedSchema } : {}),
-            }
-
-      const proposal = editingCatalogItem
-        ? await updateCatalogItem(
-            editingCatalogItem.type,
-            editingCatalogItem.id,
-            {
-              name: payload.name,
-              category: payload.category,
-              description: payload.description,
-              runtime: payload.runtime,
-              manifestsYaml: payload.manifestsYaml,
-              defaultEngine: payload.defaultEngine,
-              repoUrl: payload.repoUrl,
-              chart: payload.chart,
-              version: payload.version,
-              path: payload.path,
-              flaggerSupported: payload.flaggerSupported,
-              provider: payload.provider,
-              pulumiRuntime: payload.pulumiRuntime,
-              entrypoint: payload.entrypoint,
-              protectByDefault: payload.protectByDefault,
-              ...(payload.protected !== undefined
-                ? { protected: payload.protected }
-                : {}),
-              ...(payload.tenant !== undefined
-                ? { tenant: payload.tenant }
-                : {}),
-              ...(payload.resourceKind
-                ? { resourceKind: payload.resourceKind }
-                : {}),
-              ...(payload.pulumiYaml ? { pulumiYaml: payload.pulumiYaml } : {}),
-              items: payload.items,
-              schema: payload.schema,
-            }
-          )
-        : await createCatalogApp(payload)
+      const proposal = await deleteCatalogItem(item.type, item.id)
       setCreatedProposal(proposal)
-      setIsAddAppModalOpen(false)
-      setEditingCatalogItem(null)
-      setSchemaJsonText("")
-      setShowSchemaEditor(false)
-      setAppForm({
-        kind: "app",
-        id: "",
-        name: "",
-        category: "Applications",
-        description: "",
-        runtime: "helm",
-        repoUrl: "",
-        chart: "",
-        version: "",
-        path: "",
-        flaggerSupported: false,
-        provider: "kind",
-        pulumiRuntime: "yaml",
-        entrypoint: "Pulumi.yaml",
-        protectByDefault: false,
-        terraformProvider: "",
-        pulumiYaml: "",
-        manifestsYaml: "",
-        defaultEngine: "flux",
-        items: [],
-      })
+      setCatalog((prev) => prev.filter((c) => c.id !== item.id))
     } catch (err) {
-      setAppError(
-        err instanceof Error
-          ? err.message
-          : editingCatalogItem
-            ? "Failed to update catalog item proposal"
-            : "Failed to create catalog app proposal"
-      )
+      setError(errorMessage(err, "Failed to delete catalog item"))
     } finally {
-      setAppLoading(false)
+      setDeletingCatalogId(null)
     }
   }
 
-  const handleExtractManifestVars = () => {
-    const yaml = appForm.manifestsYaml || DEFAULT_STARTER_MANIFEST
-    const extracted = extractManifestVariables(yaml)
-    const existingNames = new Set(schemaFields.map((f) => f.name))
-    const newFields: SchemaFieldDraft[] = []
-
-    for (const varName of extracted) {
-      if (!existingNames.has(varName)) {
-        const isSecret = /secret|token|password|key/i.test(varName)
-        newFields.push({
-          name: varName,
-          title: humanizeFieldName(varName),
-          type: "string",
-          defaultValue: "",
-          required: true,
-          secret: isSecret,
-        })
-        existingNames.add(varName)
-      }
-    }
-
-    const updated = [...schemaFields, ...newFields]
-    setSchemaFields(updated)
-    setSchemaJsonText(fieldsToSchemaJson(updated, schemaJsonText))
-    setShowSchemaEditor(true)
-  }
+  const tenantIsProtected = tenant === "default" || tenant === "all" || !tenant
+  const shownError = error ?? loadError
 
   return (
     <div className="space-y-6">
-      {/* Header */}
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 bg-slate-900 border border-slate-800 p-6 rounded-2xl">
-        <div>
-          <h2 className="text-xl font-bold text-white flex items-center gap-2">
-            <Layers className="h-6 w-6 text-indigo-400" />
-            Self-Service Catalog &amp; Dynamic Form Wizard
-          </h2>
-          <p className="text-xs text-slate-400 mt-1">
-            Browse approved infrastructure and application blueprints, configure
-            parameters, and propose changes via pull request
-          </p>
-        </div>
-
-        <div className="flex items-center space-x-3">
-          <label
-            htmlFor="tenant-select-catalog"
-            className="text-xs text-slate-400"
-          >
-            Target Tenant:
-          </label>
-          <select
-            id="tenant-select-catalog"
-            value={tenant}
-            onChange={(e) => {
-              const nextVal = e.target.value
-              setTenant(nextVal)
-              setTenantFilter(nextVal)
-            }}
-            className="bg-slate-950 border border-slate-800 text-xs text-slate-200 rounded-lg px-3 py-1.5 focus:outline-none focus:ring-1 focus:ring-indigo-500 font-mono"
-          >
-            <option value="all">All Tenants</option>
-            {tenants.map((t) => (
-              <option key={t.id} value={t.id}>
-                {t.id}
-              </option>
-            ))}
-          </select>
-
-          <button
-            type="button"
-            onClick={() => handleDeleteTenant(tenant)}
-            disabled={
-              tenant === "default" ||
-              tenant === "all" ||
-              !tenant ||
-              tenantLoading
-            }
-            title={
-              tenant === "default" || tenant === "all"
-                ? "The default tenant is protected and cannot be removed"
-                : `Propose removal of tenant ${tenant}`
-            }
-            aria-label={
-              tenant === "default" || tenant === "all"
-                ? "Remove tenant (disabled for protected default tenant)"
-                : `Remove tenant ${tenant}`
-            }
-            className="px-2.5 py-1.5 bg-red-950/60 hover:bg-red-900/80 disabled:hover:bg-red-950/60 border border-red-500/30 text-red-300 rounded-lg text-xs font-medium transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-1"
-          >
-            <Trash2 className="h-3.5 w-3.5" />
-            <span>Remove</span>
-          </button>
-
-          <button
-            type="button"
-            onClick={() => setIsNewTenantModalOpen(true)}
-            className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-indigo-300 rounded-lg text-xs font-semibold transition-colors border border-slate-700 flex items-center gap-1"
-          >
-            <Plus className="h-3.5 w-3.5" />
-            <span>New Tenant</span>
-          </button>
-        </div>
-      </div>
-
-      {createdProposal && (
-        <div
-          aria-label="Proposal Floating Toast"
-          className="fixed bottom-6 right-6 z-50 max-w-md bg-slate-900/95 backdrop-blur-md border border-emerald-500/40 shadow-2xl shadow-black/60 rounded-2xl p-4 text-slate-200 space-y-3"
-        >
-          <div className="flex items-start justify-between gap-3">
-            <div className="flex items-start space-x-2.5 min-w-0">
-              <CheckCircle2 className="h-5 w-5 text-emerald-400 shrink-0 mt-0.5" />
-              <div className="min-w-0">
-                <p className="text-xs font-bold text-white">
-                  PR #{createdProposal.id} Opened
-                </p>
-                <p className="text-[11px] text-slate-400 truncate font-mono mt-0.5">
-                  {createdProposal.branch}
-                </p>
+      <PageHeader
+        inlineAt="4xl"
+        icon={<Layers className="h-6 w-6 text-indigo-400" />}
+        title="Self-Service Catalog & Dynamic Form Wizard"
+        description="Browse approved infrastructure and application blueprints, configure parameters, and propose changes via pull request"
+        actions={
+          <>
+            <div className="flex min-w-0 items-center gap-2">
+              <label
+                htmlFor="tenant-select-catalog"
+                className="shrink-0 whitespace-nowrap text-xs text-slate-400"
+              >
+                Target Tenant:
+              </label>
+              <div className="w-36 min-w-0">
+                <NativeSelect
+                  id="tenant-select-catalog"
+                  value={tenant}
+                  onChange={(e) => setTenant(e.target.value)}
+                  className="h-8 py-1"
+                >
+                  <option value="all">All Tenants</option>
+                  {tenants.map((t) => (
+                    <option key={t.id} value={t.id}>
+                      {t.id}
+                    </option>
+                  ))}
+                </NativeSelect>
               </div>
             </div>
-            <button
-              type="button"
-              onClick={() => setCreatedProposal(null)}
-              aria-label="Dismiss notification"
-              className="p-1 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 transition-colors cursor-pointer shrink-0"
-            >
-              <X className="h-3.5 w-3.5" />
-            </button>
-          </div>
-          <div className="flex items-center justify-end gap-2">
-            {createdProposal.prUrl && (
-              <a
-                href={createdProposal.prUrl}
-                target="_blank"
-                rel="noreferrer"
-                className="inline-flex items-center space-x-1 px-2.5 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 rounded-lg text-xs font-medium transition-colors"
-              >
-                <span>View on Forge</span>
-              </a>
+            {authz.isAdmin && (
+              <div className="flex items-center gap-2">
+                <Button
+                  variant="destructive-subtle"
+                  onClick={() => handleDeleteTenant(tenant)}
+                  disabled={tenantIsProtected || tenantLoading}
+                  title={
+                    tenantIsProtected
+                      ? "The default tenant is protected and cannot be removed"
+                      : `Propose removal of tenant ${tenant}`
+                  }
+                  aria-label={
+                    tenantIsProtected
+                      ? "Remove tenant (disabled for protected default tenant)"
+                      : `Remove tenant ${tenant}`
+                  }
+                >
+                  <Trash2 className="h-3.5 w-3.5" />
+                  <span>Remove</span>
+                </Button>
+                <Button
+                  variant="secondary"
+                  className="text-indigo-300"
+                  onClick={() => setIsNewTenantModalOpen(true)}
+                >
+                  <Plus className="h-3.5 w-3.5" />
+                  <span>New Tenant</span>
+                </Button>
+              </div>
             )}
-            {onNavigateToPreview && (
-              <button
-                type="button"
-                onClick={onNavigateToPreview}
-                className="inline-flex items-center space-x-1.5 px-3 py-1.5 bg-purple-600 hover:bg-purple-500 text-white rounded-lg text-xs font-semibold transition-colors cursor-pointer"
-              >
-                <span>Go to PR</span>
-                <ArrowRight className="h-3.5 w-3.5" />
-              </button>
-            )}
-          </div>
-        </div>
+          </>
+        }
+      />
+
+      {tenantError && !isNewTenantModalOpen && (
+        <InlineAlert>{tenantError}</InlineAlert>
       )}
 
       {createdProposal && (
-        <div
-          aria-label="Proposal Success Notification"
-          className="bg-emerald-950/40 border border-emerald-500/30 p-5 rounded-2xl text-emerald-300 space-y-3 animate-in fade-in duration-300"
-        >
-          <div className="flex items-center space-x-3">
-            <div className="p-2 bg-emerald-500/20 text-emerald-400 rounded-lg">
-              <CheckCircle2 className="h-6 w-6" />
-            </div>
-            <div>
-              <h3 className="text-sm font-bold text-white">
-                Git PR Proposal Successfully Opened!
-              </h3>
-              <p className="text-xs text-emerald-300">
-                PR #{createdProposal.id} created on branch{" "}
-                <code className="font-mono bg-slate-900 px-1 py-0.5 rounded">
-                  {createdProposal.branch}
-                </code>
-              </p>
-            </div>
-          </div>
-          <div className="text-xs bg-slate-900/90 border border-slate-800 rounded-xl p-4 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 text-slate-300 font-mono">
-            <div>
-              <span className="text-slate-500">PR Title: </span>
-              <span className="text-slate-100 font-semibold">
-                {createdProposal.title}
-              </span>
-            </div>
-            <div className="flex items-center space-x-2 shrink-0">
-              {onNavigateToPreview && (
-                <button
-                  type="button"
-                  onClick={onNavigateToPreview}
-                  className="inline-flex items-center space-x-1.5 px-3 py-1.5 bg-purple-600 hover:bg-purple-500 text-white rounded-lg font-sans text-xs font-medium transition-colors cursor-pointer"
-                >
-                  <span>Go to PR</span>
-                  <ArrowRight className="h-3.5 w-3.5" />
-                </button>
-              )}
-              {createdProposal.prUrl && (
-                <a
-                  href={createdProposal.prUrl}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="inline-flex items-center space-x-1.5 px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg font-sans text-xs font-medium transition-colors"
-                >
-                  <span>View PR on Forge</span>
-                  <GitPullRequest className="h-3.5 w-3.5" />
-                </a>
-              )}
-            </div>
-          </div>
-        </div>
+        <ProposalCreatedNotice
+          proposal={createdProposal}
+          onDismiss={() => setCreatedProposal(null)}
+          onNavigateToPreview={onNavigateToPreview}
+        />
       )}
 
-      {/* Search & Add Catalog Item Bar */}
       <div className="flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3">
         <div className="relative flex-1">
-          <Search className="absolute left-3 top-2.5 h-4 w-4 text-slate-500" />
-          <input
-            type="text"
+          <Search
+            className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-slate-500"
+            aria-hidden="true"
+          />
+          <Input
+            type="search"
+            aria-label="Search catalog blueprints"
             placeholder="Search catalog blueprints..."
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
-            className="w-full pl-9 pr-4 py-2 bg-slate-900 border border-slate-800 rounded-xl text-xs text-slate-100 placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+            className="pl-9 rounded-xl bg-slate-900 font-sans"
           />
         </div>
-        <button
-          type="button"
-          onClick={openAddCatalogModal}
-          className="px-3.5 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-xs font-semibold transition-colors shrink-0 flex items-center justify-center gap-1.5 shadow-md shadow-indigo-600/20 cursor-pointer"
-        >
-          <Plus className="h-4 w-4" />
-          <span>Add Catalog Item</span>
-        </button>
+        {canAddCatalogItem && (
+          <Button
+            size="lg"
+            className="rounded-xl"
+            onClick={() =>
+              editor.openCreate(
+                authz.isAdmin
+                  ? undefined
+                  : {
+                      tenant:
+                        tenants.find((t) => authz.canAdminTenant(t.id))?.id ??
+                        "",
+                    }
+              )
+            }
+          >
+            <Plus className="h-4 w-4" />
+            <span>Add Catalog Item</span>
+          </Button>
+        )}
       </div>
 
-      {error && (
+      {activeKindFilter && (
         <div
-          role="alert"
-          className="p-4 bg-red-950/40 border border-red-500/30 rounded-xl text-red-300 text-xs flex items-start space-x-2"
+          className="flex flex-wrap items-center gap-2 text-xs text-slate-400"
+          data-testid="catalog-kind-filter"
         >
-          <AlertCircle className="h-4 w-4 text-red-400 shrink-0 mt-0.5" />
-          <span>{error}</span>
+          <Filter className="h-3.5 w-3.5 text-indigo-400" aria-hidden="true" />
+          <span>Showing:</span>
+          <span className="inline-flex items-center gap-1 rounded-full border border-indigo-500/40 bg-indigo-500/10 pl-2.5 pr-1 py-0.5 text-indigo-200">
+            {KIND_FILTER_LABELS[activeKindFilter]}
+            <button
+              type="button"
+              onClick={clearKindFilter}
+              aria-label="Clear catalog kind filter"
+              className="rounded-full p-0.5 hover:bg-indigo-500/20 cursor-pointer"
+            >
+              <X className="h-3 w-3" />
+            </button>
+          </span>
         </div>
       )}
 
-      {/* Catalog Grid */}
+      {shownError && <InlineAlert>{shownError}</InlineAlert>}
+
       <div
         data-testid="catalog-list"
         className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4"
       >
         {filteredCatalog.map((item) => (
-          <div
+          <CatalogItemCard
             key={`${item.type}-${item.id}`}
-            className="p-5 rounded-2xl border border-slate-800 bg-slate-900 flex flex-col justify-between gap-4 text-left"
-          >
-            <div className="space-y-2.5">
-              <div className="flex items-start justify-between gap-2">
-                <div className="flex flex-col gap-1">
-                  <span className="text-sm font-bold text-white flex items-center gap-2">
-                    <Box className="h-4 w-4 text-indigo-400 shrink-0" />
-                    <span>{item.name}</span>
-                  </span>
-                  <div className="flex items-center gap-2 mt-1">
-                    {item.protected && (
-                      <span
-                        data-testid={`catalog-protected-badge-${item.id}`}
-                        className="text-[9px] uppercase font-bold px-1.5 py-0.5 rounded bg-amber-900/30 text-amber-500 border border-amber-900/50"
-                      >
-                        Protected
-                      </span>
-                    )}
-                    {item.tenant ? (
-                      <span className="text-[9px] uppercase font-bold px-1.5 py-0.5 rounded bg-slate-800 text-slate-400 border border-slate-700">
-                        Tenant: {item.tenant}
-                      </span>
-                    ) : (
-                      <span className="text-[9px] uppercase font-bold px-1.5 py-0.5 rounded bg-indigo-900/30 text-indigo-400 border border-indigo-900/50">
-                        Global
-                      </span>
-                    )}
-                  </div>
-                </div>
-                <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-slate-800 text-slate-400 shrink-0">
-                  {item.type === "bundle"
-                    ? "bundle"
-                    : `v${item.version.replace(/^v/i, "")}`}
-                </span>
-              </div>
-              <p className="text-xs text-slate-400 line-clamp-2">
-                {item.description}
-              </p>
-              <div className="flex items-center justify-between text-[10px] pt-1">
-                <span className="px-2 py-0.5 rounded-full bg-slate-800 text-slate-300 font-medium">
-                  {item.category}
-                </span>
-                <div className="flex items-center gap-2">
-                  {item.provider && (
-                    <span className="uppercase font-mono text-indigo-400">
-                      {item.provider}
-                    </span>
-                  )}
-                  <span className="font-mono text-slate-500">{item.id}</span>
-                </div>
-              </div>
-            </div>
-
-            <div className="flex items-center justify-between gap-2 pt-3 border-t border-slate-800/80">
-              <button
-                type="button"
-                data-testid={`delete-catalog-item-${item.id}`}
-                aria-label={`Delete catalog item ${item.name}`}
-                title={
-                  item.protected
-                    ? "Protected catalog item — disable protection in Edit to delete"
-                    : "Delete catalog item via Git PR"
-                }
-                disabled={
-                  Boolean(item.protected) || deletingCatalogId === item.id
-                }
-                onClick={async () => {
-                  if (item.protected || deletingCatalogId === item.id) return
-                  setDeletingCatalogId(item.id)
-                  try {
-                    const proposal = await deleteCatalogItem(item.type, item.id)
-                    setCreatedProposal(proposal)
-                    setCatalog((prev) => prev.filter((c) => c.id !== item.id))
-                  } catch (err) {
-                    setError(
-                      err instanceof Error
-                        ? err.message
-                        : "Failed to delete catalog item"
-                    )
-                  } finally {
-                    setDeletingCatalogId(null)
-                  }
-                }}
-                className="inline-flex items-center justify-center p-1.5 rounded text-slate-400 hover:text-red-400 hover:bg-slate-800 disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
-              >
-                <Trash2 className="h-4 w-4" />
-              </button>
-              <div className="flex items-center gap-2">
-                <button
-                  type="button"
-                  onClick={() => openEditCatalogModal(item)}
-                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition-colors cursor-pointer"
-                  title="Edit catalog item definition via Git PR"
-                >
-                  <Pencil className="h-3.5 w-3.5" />
-                  <span>Edit</span>
-                </button>
-                <button
-                  type="button"
-                  onClick={() => openDeployModal(item)}
-                  className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg text-xs font-semibold bg-indigo-600 hover:bg-indigo-500 text-white transition-colors shadow-sm shadow-indigo-600/20 cursor-pointer"
-                >
-                  <Plus className="h-3.5 w-3.5" />
-                  <span>Create</span>
-                </button>
-              </div>
-            </div>
-          </div>
+            item={item}
+            canManage={canManageItem(item)}
+            deleting={deletingCatalogId === item.id}
+            onDelete={() => handleDeleteCatalogItem(item)}
+            onEdit={() => editor.openEdit(item)}
+            onCreate={() => {
+              setDeployModal({ item, initialConfig: null, editMode: false })
+              setCreatedProposal(null)
+              setError(null)
+            }}
+          />
         ))}
         {filteredCatalog.length === 0 && (
           <div className="col-span-full p-6 rounded-2xl bg-slate-900 border border-slate-800 text-xs text-slate-500 text-center">
             {catalog.length === 0
               ? "No catalog blueprints available — check server configuration or authenticate."
-              : `No catalog blueprints matching "${searchQuery}".`}
+              : activeKindFilter && !searchQuery
+                ? `No ${KIND_FILTER_LABELS[activeKindFilter].toLowerCase()} blueprints in the catalog.`
+                : `No catalog blueprints matching "${searchQuery}".`}
           </div>
         )}
       </div>
 
-      {/* Deploy / Edit Instance Modal */}
       <DeployInstanceModal
-        isOpen={isDeployModalOpen}
-        onClose={() => {
-          setIsDeployModalOpen(false)
-          setDeployModalItem(null)
-          setDeployInitialConfig(null)
-          setIsDeployEditMode(false)
-        }}
-        catalogItem={deployModalItem}
+        isOpen={Boolean(deployModal?.item)}
+        onClose={() => setDeployModal(null)}
+        catalogItem={deployModal?.item ?? null}
         tenant={
-          deployModalItem?.tenant ||
+          deployModal?.item?.tenant ||
           (tenant && tenant !== "all" ? tenant : tenants[0]?.id || "default")
         }
         tenants={tenants}
-        onTenantChange={(nextTenant) => {
-          setTenant(nextTenant)
-          setTenantFilter(nextTenant)
-        }}
+        onTenantChange={setTenant}
         stacks={stacks}
         releases={releases}
-        initialConfig={deployInitialConfig}
-        isEditMode={isDeployEditMode}
-        onProposalCreated={(proposal) => setCreatedProposal(proposal)}
-        onCatalogItemUpdated={(updatedItem) => {
-          setDeployModalItem(updatedItem)
+        initialConfig={deployModal?.initialConfig}
+        isEditMode={deployModal?.editMode ?? false}
+        onProposalCreated={setCreatedProposal}
+        onCatalogItemUpdated={(updated) => {
+          setDeployModal((prev) => (prev ? { ...prev, item: updated } : prev))
           setCatalog((prev) =>
-            prev.map((c) => (c.id === updatedItem.id ? updatedItem : c))
+            prev.map((c) => (c.id === updated.id ? updated : c))
           )
         }}
       />
 
-      {/* New Tenant Modal */}
-      <CreateTenantModal
-        isOpen={isNewTenantModalOpen}
-        newTenantId={newTenantId}
-        onNewTenantIdChange={setNewTenantId}
-        tenantLoading={tenantLoading}
-        tenantError={tenantError}
-        onSubmit={handleCreateTenant}
-        onClose={() => {
-          setIsNewTenantModalOpen(false)
-          setTenantError(null)
-        }}
-        onCancel={() => {
-          setIsNewTenantModalOpen(false)
-          setTenantError(null)
-        }}
-      />
+      {authz.isAdmin && (
+        <CreateTenantModal
+          isOpen={isNewTenantModalOpen}
+          newTenantId={newTenantId}
+          onNewTenantIdChange={setNewTenantId}
+          tenantLoading={tenantLoading}
+          tenantError={tenantError}
+          onSubmit={handleCreateTenant}
+          onClose={() => {
+            setIsNewTenantModalOpen(false)
+            setTenantError(null)
+          }}
+          onCancel={() => {
+            setIsNewTenantModalOpen(false)
+            setTenantError(null)
+          }}
+        />
+      )}
 
-      {/* Add Catalog Item Modal */}
       <CatalogItemModal
-        isOpen={isAddAppModalOpen}
-        editingCatalogItem={editingCatalogItem}
+        {...editor.modalProps}
         catalog={catalog}
-        appForm={appForm}
-        setAppForm={setAppForm}
         tenants={tenants}
-        schemaJsonText={schemaJsonText}
-        setSchemaJsonText={setSchemaJsonText}
-        schemaFields={schemaFields}
-        setSchemaFields={setSchemaFields}
-        showSchemaEditor={showSchemaEditor}
-        setShowSchemaEditor={setShowSchemaEditor}
-        appLoading={appLoading}
-        appError={appError}
-        onSubmit={handleCreateCatalogApp}
-        onExtractManifestVars={handleExtractManifestVars}
-        onClose={() => {
-          setIsAddAppModalOpen(false)
-          setEditingCatalogItem(null)
-          setAppError(null)
-        }}
-        onCancel={() => {
-          setIsAddAppModalOpen(false)
-          setEditingCatalogItem(null)
-          setAppError(null)
-        }}
       />
     </div>
   )

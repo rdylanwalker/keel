@@ -1,8 +1,10 @@
 import {
   CatalogItem,
   CrdWatchEvent,
+  ManagementAddonStatus,
   PreviewReport,
   Proposal,
+  ProviderRegistryEntry,
   StackSummary,
   TenantSummary,
 } from "../types/api"
@@ -240,20 +242,23 @@ export const DEFAULT_EVENTS: CrdWatchEvent[] = [
   },
 ]
 
-export const BOOTSTRAP_MANAGEMENT_STACK: StackSummary = {
+/** Demo-only management stack fixture (never rendered outside `?demo=true`, OPEN-7). */
+const DEMO_MANAGEMENT_STACK: StackSummary = {
   id: "stack-mgmt-01",
   name: "management-cluster-core",
-  tenant: "keel-system",
+  namespace: "flux-system",
+  tenant: "management",
   provider: "kind",
   type: "management",
   status: "synced",
+  protect: true,
   resourceCount: 24,
-  lastSynced: "2 minutes ago",
+  lastSynced: new Date(Date.now() - 120_000).toISOString(),
   resourceKind: "cluster",
 }
 
 export const DEFAULT_STACKS: StackSummary[] = [
-  BOOTSTRAP_MANAGEMENT_STACK,
+  DEMO_MANAGEMENT_STACK,
   {
     id: "stack-pve-01",
     name: "pve-workload-cluster-prod",
@@ -328,6 +333,8 @@ export const DEFAULT_PROPOSALS: Proposal[] = [
 export const DEFAULT_PREVIEW: PreviewReport = {
   prUrl: "https://git.internal/keel-io/infra/pulls/42",
   policyStatus: "passed",
+  source: "pko",
+  run: { phase: "succeeded" },
   summary: {
     create: 3,
     update: 2,
@@ -383,61 +390,66 @@ export const DEFAULT_PREVIEW: PreviewReport = {
   ],
 }
 
-export interface ProviderInfo {
-  id: string
-  name: string
-  type: string
-  enabled: boolean
-  nodesOrRegions: string
-}
-
-export const DEFAULT_PROVIDERS: ProviderInfo[] = [
+/** Demo-only provider registry entries (same shape as `GET /api/v1/providers`). */
+export const DEFAULT_PROVIDERS: ProviderRegistryEntry[] = [
   {
     id: "proxmox",
-    name: "Proxmox VE Cluster",
-    type: "On-Prem Hypervisor",
     enabled: true,
-    nodesOrRegions: "3 Nodes (pve-01, pve-02, pve-03)",
+    description: "Proxmox VE Cluster",
+    package: "bpg/proxmox",
   },
   {
     id: "aws",
-    name: "Amazon Web Services",
-    type: "Public Cloud Provider",
     enabled: true,
-    nodesOrRegions: "us-east-1, eu-west-1",
+    description: "Amazon Web Services",
+    package: "pulumi/aws",
   },
   {
     id: "gcp",
-    name: "Google Cloud Platform",
-    type: "Public Cloud Provider",
     enabled: false,
-    nodesOrRegions: "us-central1",
+    description: "Google Cloud Platform",
+    package: "pulumi/gcp",
   },
   {
     id: "hetzner",
-    name: "Hetzner Cloud",
-    type: "Bare Metal / Cloud",
     enabled: true,
-    nodesOrRegions: "fsn1 (Frankfurt)",
+    description: "Hetzner Cloud",
+    package: "hetznercloud/hcloud",
   },
   {
     id: "kind",
-    name: "Local kind / k3s",
-    type: "Stage 0 Bootstrap Target",
     enabled: true,
-    nodesOrRegions: "1 Control Plane Node",
+    description: "Local kind / k3s",
   },
 ]
+
+/** Demo-only live add-on statuses (same shape as `GET /api/v1/management/addons`). */
+export const DEMO_MANAGEMENT_ADDON_STATUSES: ManagementAddonStatus[] = [
+  "s3-state-backend",
+  "kyverno",
+  "cert-manager",
+  "rauthy",
+  "envoy-gateway",
+  "prometheus",
+  "flagger",
+  "pulumi-kubernetes-operator",
+].map((id) => ({
+  id,
+  name: id,
+  namespace: "keel-system",
+  status: "Ready",
+  tracked: true,
+}))
 
 export const DEFAULT_CORE_ADDONS: CatalogItem[] = [
   {
     id: "s3-state-backend",
     name: "S3 State Backend",
-    description: "MinIO / S3-compatible state and artifact storage",
+    description: "SeaweedFS S3-compatible state and artifact storage",
     type: "app",
     category: "Management Addons",
-    chart: "minio",
-    version: "5.4.0",
+    chart: "seaweedfs",
+    version: "4.54.0",
     schema: { type: "object", properties: {} },
   },
   {
@@ -447,7 +459,7 @@ export const DEFAULT_CORE_ADDONS: CatalogItem[] = [
     type: "app",
     category: "Management Addons",
     chart: "kyverno",
-    version: "3.3.4",
+    version: "3.10.0",
     schema: { type: "object", properties: {} },
   },
   {
@@ -480,7 +492,7 @@ export const DEFAULT_CORE_ADDONS: CatalogItem[] = [
     type: "app",
     category: "Management Addons",
     chart: "gateway-helm",
-    version: "1.2.4",
+    version: "v1.10.0",
     schema: { type: "object", properties: {} },
   },
   {
@@ -489,8 +501,8 @@ export const DEFAULT_CORE_ADDONS: CatalogItem[] = [
     description: "Metrics collection and alerting for progressive delivery",
     type: "app",
     category: "Management Addons",
-    chart: "kube-prometheus-stack",
-    version: "67.4.0",
+    chart: "prometheus",
+    version: "29.48.0",
     schema: { type: "object", properties: {} },
   },
   {
@@ -500,7 +512,7 @@ export const DEFAULT_CORE_ADDONS: CatalogItem[] = [
     type: "app",
     category: "Management Addons",
     chart: "flagger",
-    version: "1.40.0",
+    version: "1.45.0",
     schema: { type: "object", properties: {} },
   },
   {
@@ -510,7 +522,7 @@ export const DEFAULT_CORE_ADDONS: CatalogItem[] = [
     type: "app",
     category: "Management Addons",
     chart: "pulumi-kubernetes-operator",
-    version: "2.1.0",
+    version: "2.10.1",
     schema: { type: "object", properties: {} },
   },
 ]

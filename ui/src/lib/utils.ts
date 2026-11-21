@@ -1,9 +1,23 @@
 import { clsx, type ClassValue } from "clsx"
 import { twMerge } from "tailwind-merge"
+import { stringify as stringifyYaml } from "yaml"
+
+/**
+ * Demo mode (`?demo=true`) renders bundled fixture data without any live API calls.
+ * It is available in development builds, and in production builds only when compiled with
+ * `VITE_ENABLE_DEMO=true`, so a production control plane can never be made to show
+ * fabricated state by a crafted link (UI-9). When active, the shell shows a persistent
+ * "DEMO DATA" banner.
+ */
+export function isDemoModeAllowed(): boolean {
+  const env = import.meta.env ?? {}
+  return Boolean(env.DEV) || env.VITE_ENABLE_DEMO === "true"
+}
 
 export function isDemoMode(): boolean {
   return (
     typeof window !== "undefined" &&
+    isDemoModeAllowed() &&
     new URLSearchParams(window.location.search).get("demo") === "true"
   )
 }
@@ -123,44 +137,18 @@ export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs))
 }
 
-export function jsonToYaml(obj: unknown, indentLevel = 0): string {
-  const indent = "  ".repeat(indentLevel)
-  if (obj === null || obj === undefined) return "null\n"
-  if (typeof obj === "boolean" || typeof obj === "number") return `${obj}\n`
-  if (typeof obj === "string") {
-    if (
-      obj.includes("\n") ||
-      obj.includes("\r") ||
-      obj.includes(":") ||
-      obj.includes("#") ||
-      obj.includes('"') ||
-      obj.includes("\\")
-    ) {
-      return `${JSON.stringify(obj)}\n`
-    }
-    return `${obj}\n`
+/**
+ * Serializes JSON-compatible data to YAML using the `yaml` library so strings that would
+ * otherwise be re-typed (`"true"`, `"123"`, `""`, `"null"`) or alter structure (leading `-`,
+ * `: `, `#`, newlines) are quoted/escaped correctly.
+ */
+export function jsonToYaml(obj: unknown): string {
+  if (
+    obj === undefined ||
+    typeof obj === "function" ||
+    typeof obj === "symbol"
+  ) {
+    return "null\n"
   }
-  if (Array.isArray(obj)) {
-    if (obj.length === 0) return "[]\n"
-    let out = "\n"
-    for (const item of obj) {
-      out += `${indent}- ${jsonToYaml(item, indentLevel + 1).trim()}\n`
-    }
-    return out
-  }
-  if (typeof obj === "object") {
-    const keys = Object.keys(obj as Record<string, unknown>)
-    if (keys.length === 0) return "{}\n"
-    let out = "\n"
-    for (const key of keys) {
-      const val = (obj as Record<string, unknown>)[key]
-      if (typeof val === "object" && val !== null) {
-        out += `${indent}${key}:${jsonToYaml(val, indentLevel + 1)}`
-      } else {
-        out += `${indent}${key}: ${jsonToYaml(val, 0)}`
-      }
-    }
-    return out
-  }
-  return String(obj)
+  return stringifyYaml(obj, { lineWidth: 0 })
 }

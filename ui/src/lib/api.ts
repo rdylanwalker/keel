@@ -7,6 +7,8 @@ import {
   CreateProposalPayload,
   CrdWatchEvent,
   PreviewReport,
+  RawResourceDiff,
+  ResourceDiff,
   Proposal,
   ProviderRegistryEntry,
   ReleaseConfig,
@@ -21,6 +23,7 @@ import {
   UpgradeManagementAddonPayload,
 } from "../types/api"
 import { isDemoMode } from "./utils"
+import { DemoModeError, parseApiError } from "./errors"
 
 let inMemoryToken: string | null = null
 
@@ -46,38 +49,76 @@ function getHeaders(
   return headers
 }
 
+export { DemoModeError }
+
+/**
+ * Single network entry point for the Keel REST API. In demo mode no request ever leaves the
+ * browser: callers receive a {@link DemoModeError} and keep rendering bundled fixtures (UI-9).
+ */
+async function apiFetch(input: string, init?: RequestInit): Promise<Response> {
+  if (isDemoMode()) {
+    throw new DemoModeError()
+  }
+  return fetch(input, init)
+}
+
 async function handleResponse<T>(res: Response): Promise<T> {
   if (!res.ok) {
     if (res.status === 401 && typeof window !== "undefined") {
       window.dispatchEvent(new CustomEvent("keel:unauthorized"))
     }
-    let errorText = res.statusText
+    let body: string | undefined
     try {
       if (typeof res.text === "function") {
-        const text = await res.text()
-        if (text) errorText = text
+        body = await res.text()
       }
     } catch {
       // fallback to statusText
     }
-    throw new Error(`API error (${res.status}): ${errorText || res.statusText}`)
+    throw parseApiError(res.status, body, res.statusText)
   }
   return res.json() as Promise<T>
 }
 
+const POST_LOGIN_HASH_KEY = "keel:post-login-hash"
+
+/** Remembers the current deep link (hash route only; never secrets) before an OIDC redirect. */
+export function rememberPostLoginLocation(): void {
+  try {
+    const hash = window.location.hash
+    if (hash && hash !== "#") {
+      window.sessionStorage.setItem(POST_LOGIN_HASH_KEY, hash)
+    }
+  } catch {
+    // sessionStorage unavailable (privacy mode); deep link is best-effort.
+  }
+}
+
+/** Returns and clears the deep link stored by {@link rememberPostLoginLocation}. */
+export function consumePostLoginLocation(): string | null {
+  try {
+    const hash = window.sessionStorage.getItem(POST_LOGIN_HASH_KEY)
+    window.sessionStorage.removeItem(POST_LOGIN_HASH_KEY)
+    return hash && /^#[A-Za-z0-9/_.-]*$/.test(hash) ? hash : null
+  } catch {
+    return null
+  }
+}
+
 export function startOidcLogin(): void {
+  rememberPostLoginLocation()
   window.location.assign("/api/v1/auth/login")
 }
 
 export async function getAuthStatus(): Promise<AuthStatus> {
-  const res = await fetch("/api/v1/auth/status", {
+  const res = await apiFetch("/api/v1/auth/status", {
     headers: getHeaders(),
   })
   return handleResponse<AuthStatus>(res)
 }
 
 export async function logout(): Promise<{ authenticated: boolean }> {
-  const res = await fetch("/api/v1/auth/logout", {
+  const res = await apiFetch("/api/v1/auth/logout", {
     method: "POST",
     headers: getHeaders(),
   })
@@ -158,7 +199,7 @@ function mapCatalogApplication(app: RawCatalogEntry): CatalogItem {
 }
 
 export async function getCatalog(): Promise<CatalogItem[]> {
-  const res = await fetch("/api/v1/catalog", {
+  const res = await apiFetch("/api/v1/catalog", {
     headers: getHeaders(),
   })
   const raw = await handleResponse<CatalogItem[] | RawCatalogResponse>(res)
@@ -211,7 +252,7 @@ export async function getCatalog(): Promise<CatalogItem[]> {
 }
 
 export async function getCoreAddons(): Promise<CatalogItem[]> {
-  const res = await fetch("/api/v1/catalog", {
+  const res = await apiFetch("/api/v1/catalog", {
     headers: getHeaders(),
   })
   const raw = await handleResponse<CatalogItem[] | RawCatalogResponse>(res)
@@ -226,7 +267,7 @@ export async function upgradeManagementAddon(
   id: string,
   payload: UpgradeManagementAddonPayload
 ): Promise<Proposal> {
-  const res = await fetch(
+  const res = await apiFetch(
     `/api/v1/management/addons/${encodeURIComponent(id)}/upgrade`,
     {
       method: "POST",
@@ -241,7 +282,7 @@ export async function upgradeManagementAddon(
 }
 
 export async function rollbackManagementAddon(id: string): Promise<Proposal> {
-  const res = await fetch(
+  const res = await apiFetch(
     `/api/v1/management/addons/${encodeURIComponent(id)}/rollback`,
     {
       method: "POST",
@@ -259,7 +300,7 @@ export async function fetchCatalogSchema(payload: {
   chart: string
   version?: string
 }): Promise<{ schema: RJSFSchema; source: string }> {
-  const res = await fetch("/api/v1/catalog/fetch-schema", {
+  const res = await apiFetch("/api/v1/catalog/fetch-schema", {
     method: "POST",
     headers: getHeaders(),
     body: JSON.stringify(payload),
@@ -307,7 +348,7 @@ export async function getProposals(
   if (status) params.set("status", status)
   const qs = params.toString()
   const url = qs ? `/api/v1/proposals?${qs}` : "/api/v1/proposals"
-  const res = await fetch(url, {
+  const res = await apiFetch(url, {
     headers: getHeaders(),
   })
   const raw = await handleResponse<
@@ -332,7 +373,7 @@ function unwrapProposalResponse(
 export async function createProposal(
   payload: CreateProposalPayload
 ): Promise<Proposal> {
-  const res = await fetch("/api/v1/proposals", {
+  const res = await apiFetch("/api/v1/proposals", {
     method: "POST",
     headers: getHeaders(),
     body: JSON.stringify(payload),
@@ -343,37 +384,68 @@ export async function createProposal(
   return unwrapProposalResponse(raw)
 }
 
+/** Maps a wire (camelCase, legacy snake_case fallback) resource diff to the UI shape. */
+export function normalizeResourceDiff(raw: RawResourceDiff): ResourceDiff {
+  return {
+    urn: raw.urn ?? "",
+    name: raw.name ?? "",
+    op: raw.op,
+    resource_type: raw.resourceType ?? raw.resource_type ?? "",
+    changed_fields: raw.changedFields ?? raw.changed_fields ?? [],
+  }
+}
+
+type RawPreviewReport = Omit<PreviewReport, "resources"> & {
+  resources?: RawResourceDiff[]
+}
+
 export async function getProposalPreview(
   id: string | number
 ): Promise<PreviewReport> {
-  const res = await fetch(
+  const res = await apiFetch(
     `/api/v1/proposals/${encodeURIComponent(id)}/preview`,
     {
       headers: getHeaders(),
     }
   )
   const raw = await handleResponse<
-    PreviewReport | { url?: string; report?: PreviewReport; gitDiff?: string }
+    | RawPreviewReport
+    | {
+        url?: string
+        report?: RawPreviewReport
+        gitDiff?: string
+        run?: PreviewReport["run"]
+      }
   >(res)
   if ("report" in raw && raw.report) {
     return {
       prUrl: raw.url,
-      policyStatus: raw.report.policyStatus ?? "passed",
+      // Never default to "passed": absent status means policy was not evaluated.
+      policyStatus: raw.report.policyStatus,
+      source: raw.report.source,
+      run: raw.report.run ?? ("run" in raw ? raw.run : undefined),
       summary: raw.report.summary,
-      resources: raw.report.resources ?? [],
+      resources: (raw.report.resources ?? []).map(normalizeResourceDiff),
       gitDiff: raw.gitDiff,
     }
   }
-  return raw as PreviewReport
+  const flat = raw as RawPreviewReport
+  return {
+    ...flat,
+    resources: (flat.resources ?? []).map(normalizeResourceDiff),
+  }
 }
 
 export async function mergeProposal(
   id: string | number
 ): Promise<{ success: boolean; message?: string }> {
-  const res = await fetch(`/api/v1/proposals/${encodeURIComponent(id)}/merge`, {
-    method: "POST",
-    headers: getHeaders(),
-  })
+  const res = await apiFetch(
+    `/api/v1/proposals/${encodeURIComponent(id)}/merge`,
+    {
+      method: "POST",
+      headers: getHeaders(),
+    }
+  )
   const raw = await handleResponse<
     | { success: boolean; message?: string }
     | { proposal?: { id?: string; state?: string } }
@@ -393,7 +465,7 @@ export async function mergeProposal(
 export async function rejectProposal(
   id: string | number
 ): Promise<{ success: boolean; message?: string }> {
-  const res = await fetch(
+  const res = await apiFetch(
     `/api/v1/proposals/${encodeURIComponent(id)}/reject`,
     {
       method: "POST",
@@ -419,7 +491,7 @@ export async function rejectProposal(
 export async function reopenProposal(
   id: string | number
 ): Promise<{ success: boolean; message?: string }> {
-  const res = await fetch(
+  const res = await apiFetch(
     `/api/v1/proposals/${encodeURIComponent(id)}/reopen`,
     {
       method: "POST",
@@ -453,7 +525,7 @@ export async function getStacksWithMeta(
   tenant?: string
 ): Promise<StacksWithMeta> {
   const qs = tenant ? `?tenant=${encodeURIComponent(tenant)}` : ""
-  const res = await fetch(`/api/v1/stacks${qs}`, {
+  const res = await apiFetch(`/api/v1/stacks${qs}`, {
     headers: getHeaders(),
   })
   const raw = await handleResponse<
@@ -485,7 +557,7 @@ export async function getStackDiagnostics(
   namespace: string,
   name: string
 ): Promise<StackDiagnostics> {
-  const res = await fetch(
+  const res = await apiFetch(
     `/api/v1/stacks/${encodeURIComponent(namespace)}/${encodeURIComponent(name)}/diagnostics`,
     { headers: getHeaders() }
   )
@@ -515,7 +587,7 @@ export async function fetchStackSshInfo(
     }
   }
 
-  const res = await fetch(
+  const res = await apiFetch(
     `/api/v1/stacks/${encodeURIComponent(namespace)}/${encodeURIComponent(name)}/ssh-info`,
     { headers: getHeaders() }
   )
@@ -526,7 +598,7 @@ export async function getReleaseDiagnostics(
   namespace: string,
   name: string
 ): Promise<StackDiagnostics> {
-  const res = await fetch(
+  const res = await apiFetch(
     `/api/v1/releases/${encodeURIComponent(namespace)}/${encodeURIComponent(name)}/diagnostics`,
     { headers: getHeaders() }
   )
@@ -537,7 +609,7 @@ export async function getStackConfig(
   namespace: string,
   name: string
 ): Promise<ReleaseConfig> {
-  const res = await fetch(
+  const res = await apiFetch(
     `/api/v1/stacks/${encodeURIComponent(namespace)}/${encodeURIComponent(name)}/config`,
     {
       headers: getHeaders(),
@@ -550,7 +622,7 @@ export async function getReleaseConfig(
   namespace: string,
   name: string
 ): Promise<ReleaseConfig> {
-  const res = await fetch(
+  const res = await apiFetch(
     `/api/v1/releases/${encodeURIComponent(namespace)}/${encodeURIComponent(name)}/config`,
     {
       headers: getHeaders(),
@@ -568,7 +640,7 @@ export async function deleteStack(
   branch: string
   proposal: Proposal
 }> {
-  const res = await fetch(
+  const res = await apiFetch(
     `/api/v1/stacks/${encodeURIComponent(namespace)}/${encodeURIComponent(name)}`,
     {
       method: "DELETE",
@@ -598,7 +670,7 @@ export async function deleteRelease(
   branch: string
   proposal: Proposal
 }> {
-  const res = await fetch(
+  const res = await apiFetch(
     `/api/v1/releases/${encodeURIComponent(namespace)}/${encodeURIComponent(name)}`,
     {
       method: "DELETE",
@@ -623,7 +695,7 @@ export async function getBundleConfig(
   namespace: string,
   name: string
 ): Promise<{ tenant: string; name: string; values: Record<string, unknown> }> {
-  const res = await fetch(
+  const res = await apiFetch(
     `/api/v1/bundles/${encodeURIComponent(namespace)}/${encodeURIComponent(name)}/config`,
     {
       headers: getHeaders(),
@@ -640,7 +712,7 @@ export async function restartStackWorkspace(
   namespace: string,
   name: string
 ): Promise<RestartStackResponse> {
-  const res = await fetch(
+  const res = await apiFetch(
     `/api/v1/stacks/${encodeURIComponent(namespace)}/${encodeURIComponent(name)}/restart`,
     {
       method: "POST",
@@ -659,7 +731,7 @@ export async function reconcileStack(
   name: string
   message: string
 }> {
-  const res = await fetch(
+  const res = await apiFetch(
     `/api/v1/stacks/${encodeURIComponent(namespace)}/${encodeURIComponent(name)}/reconcile`,
     {
       method: "POST",
@@ -678,7 +750,7 @@ export async function forceDeleteStack(
   namespace: string,
   name: string
 ): Promise<ForceDeleteStackResponse> {
-  const res = await fetch(
+  const res = await apiFetch(
     `/api/v1/stacks/${encodeURIComponent(namespace)}/${encodeURIComponent(name)}/force-delete`,
     {
       method: "POST",
@@ -692,7 +764,7 @@ export async function unlockStack(
   namespace: string,
   name: string
 ): Promise<UnlockStackResponse> {
-  const res = await fetch(
+  const res = await apiFetch(
     `/api/v1/stacks/${encodeURIComponent(namespace)}/${encodeURIComponent(name)}/unlock`,
     {
       method: "POST",
@@ -711,7 +783,7 @@ export async function reconcileRelease(
   name: string
   message: string
 }> {
-  const res = await fetch(
+  const res = await apiFetch(
     `/api/v1/releases/${encodeURIComponent(namespace)}/${encodeURIComponent(name)}/reconcile`,
     {
       method: "POST",
@@ -728,7 +800,7 @@ export async function reconcileRelease(
 
 export async function getReleases(tenant?: string): Promise<ReleaseSummary[]> {
   const qs = tenant ? `?tenant=${encodeURIComponent(tenant)}` : ""
-  const res = await fetch(`/api/v1/releases${qs}`, {
+  const res = await apiFetch(`/api/v1/releases${qs}`, {
     headers: getHeaders(),
   })
   const raw = await handleResponse<
@@ -738,7 +810,7 @@ export async function getReleases(tenant?: string): Promise<ReleaseSummary[]> {
 }
 
 export async function getTenants(): Promise<TenantSummary[]> {
-  const res = await fetch("/api/v1/tenants", {
+  const res = await apiFetch("/api/v1/tenants", {
     headers: getHeaders(),
   })
   const raw = await handleResponse<
@@ -748,7 +820,7 @@ export async function getTenants(): Promise<TenantSummary[]> {
 }
 
 export async function getProviders(): Promise<ProviderRegistryEntry[]> {
-  const res = await fetch("/api/v1/providers", {
+  const res = await apiFetch("/api/v1/providers", {
     headers: getHeaders(),
   })
   const raw = await handleResponse<
@@ -761,7 +833,7 @@ export async function toggleProvider(
   id: string,
   enabled: boolean
 ): Promise<Proposal> {
-  const res = await fetch(`/api/v1/providers/${encodeURIComponent(id)}`, {
+  const res = await apiFetch(`/api/v1/providers/${encodeURIComponent(id)}`, {
     method: "PUT",
     headers: getHeaders(),
     body: JSON.stringify({ enabled }),
@@ -771,7 +843,7 @@ export async function toggleProvider(
 }
 
 export async function createTenant(id: string): Promise<Proposal> {
-  const res = await fetch("/api/v1/tenants", {
+  const res = await apiFetch("/api/v1/tenants", {
     method: "POST",
     headers: getHeaders(),
     body: JSON.stringify({ id }),
@@ -783,7 +855,7 @@ export async function createTenant(id: string): Promise<Proposal> {
 }
 
 export async function deleteTenant(id: string): Promise<Proposal> {
-  const res = await fetch(`/api/v1/tenants/${encodeURIComponent(id)}`, {
+  const res = await apiFetch(`/api/v1/tenants/${encodeURIComponent(id)}`, {
     method: "DELETE",
     headers: getHeaders(),
   })
@@ -796,7 +868,7 @@ export async function deleteTenant(id: string): Promise<Proposal> {
 export async function createCatalogApp(
   payload: CreateCatalogItemPayload
 ): Promise<Proposal> {
-  const res = await fetch("/api/v1/catalog", {
+  const res = await apiFetch("/api/v1/catalog", {
     method: "POST",
     headers: getHeaders(),
     body: JSON.stringify(payload),
@@ -818,7 +890,7 @@ export async function updateCatalogItem(
       : kind === "bundle"
         ? "bundle"
         : "app"
-  const res = await fetch(
+  const res = await apiFetch(
     `/api/v1/catalog/${normalizedKind}/${encodeURIComponent(id)}`,
     {
       method: "PUT",
@@ -865,7 +937,7 @@ export async function deleteCatalogItem(
       : kind === "bundle"
         ? "bundle"
         : "app"
-  const res = await fetch(
+  const res = await apiFetch(
     `/api/v1/catalog/${encodeURIComponent(normalizedKind)}/${encodeURIComponent(id)}`,
     {
       method: "DELETE",
@@ -876,4 +948,21 @@ export async function deleteCatalogItem(
     RawProposal | { proposal: RawProposal; branch?: string }
   >(res)
   return unwrapProposalResponse(raw)
+}
+
+/** `GET /api/v1/management/addons` — admin-only live status of management core add-ons. */
+export async function getManagementAddons(): Promise<
+  import("../types/api").ManagementAddonsResponse
+> {
+  const res = await apiFetch("/api/v1/management/addons", {
+    headers: getHeaders(),
+  })
+  const raw =
+    await handleResponse<
+      Partial<import("../types/api").ManagementAddonsResponse>
+    >(res)
+  return {
+    addons: Array.isArray(raw.addons) ? raw.addons : [],
+    liveStatusAvailable: Boolean(raw.liveStatusAvailable),
+  }
 }

@@ -1,23 +1,6 @@
-import React, { useState } from "react"
-import Form from "@rjsf/core"
-import validator from "@rjsf/validator-ajv8"
-import { IconButtonProps, RJSFSchema, ValidatorType } from "@rjsf/utils"
-import {
-  AlertCircle,
-  AlertTriangle,
-  ArrowDown,
-  ArrowRight,
-  ArrowUp,
-  Copy,
-  FileCode2,
-  Loader2,
-  Maximize2,
-  Minimize2,
-  Plus,
-  RefreshCw,
-  Trash2,
-  X,
-} from "lucide-react"
+import React, { useMemo, useState } from "react"
+import type { CustomValidator, RJSFSchema } from "@rjsf/utils"
+import { AlertTriangle, ArrowRight, Loader2, RefreshCw } from "lucide-react"
 import {
   CatalogItem,
   Proposal,
@@ -30,101 +13,41 @@ import {
   fetchCatalogSchema,
   upgradeManagementAddon,
 } from "../lib/api"
+import { errorMessage } from "../lib/errors"
+import { toErrorSchema } from "../lib/formErrors"
+import { validateManifestValues } from "../lib/manifestVars"
 import { extractSchemaDefaults } from "../lib/schemaBuilder"
 import { jsonToYaml, classifyStackResourceKind } from "../lib/utils"
+import {
+  buildSecretAwareUiSchema,
+  maskSecretValues,
+  relaxSecretRequirements,
+} from "../lib/secretFields"
+import { Button } from "./ui/button"
+import { Badge } from "./ui/badge"
+import {
+  Dialog,
+  DialogBody,
+  DialogContent,
+  DialogFullscreenToggle,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from "./ui/dialog"
+import { SchemaForm } from "./rjsf/SchemaForm"
+import { InlineAlert } from "./catalog/InlineAlert"
+import { BundleExecutionGraph } from "./deploy/BundleExecutionGraph"
+import { InstanceTargetFields } from "./deploy/InstanceTargetFields"
+import { ValuesYamlPreview } from "./deploy/ValuesYamlPreview"
+import {
+  buildDeployProposalPayload,
+  CUSTOM_CLUSTER,
+  DeployTargetState,
+  mergeUpstreamSchema,
+} from "./deploy/deployPayload"
+import { serverFieldErrors } from "./deploy/serverFieldErrors"
 
-const RjsfAddButton: React.FC<IconButtonProps> = ({
-  onClick,
-  disabled,
-  className,
-}) => (
-  <button
-    type="button"
-    onClick={onClick}
-    disabled={disabled}
-    className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium bg-indigo-600/20 hover:bg-indigo-600/30 text-indigo-300 border border-indigo-500/30 transition-colors cursor-pointer disabled:opacity-50 ${className ?? ""}`}
-    title="Add item"
-  >
-    <Plus className="h-3.5 w-3.5" />
-    <span>Add</span>
-  </button>
-)
-
-const RjsfRemoveButton: React.FC<IconButtonProps> = ({
-  onClick,
-  disabled,
-  className,
-}) => (
-  <button
-    type="button"
-    onClick={onClick}
-    disabled={disabled}
-    className={`inline-flex items-center justify-center p-1.5 rounded-lg text-xs bg-red-500/10 hover:bg-red-500/20 text-red-400 border border-red-500/25 transition-colors cursor-pointer disabled:opacity-50 ${className ?? ""}`}
-    title="Remove item"
-    aria-label="Remove item"
-  >
-    <Trash2 className="h-3.5 w-3.5" />
-  </button>
-)
-
-const RjsfMoveUpButton: React.FC<IconButtonProps> = ({
-  onClick,
-  disabled,
-  className,
-}) => (
-  <button
-    type="button"
-    onClick={onClick}
-    disabled={disabled}
-    className={`inline-flex items-center justify-center p-1.5 rounded-lg text-xs bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 transition-colors cursor-pointer disabled:opacity-40 ${className ?? ""}`}
-    title="Move up"
-    aria-label="Move up"
-  >
-    <ArrowUp className="h-3.5 w-3.5" />
-  </button>
-)
-
-const RjsfMoveDownButton: React.FC<IconButtonProps> = ({
-  onClick,
-  disabled,
-  className,
-}) => (
-  <button
-    type="button"
-    onClick={onClick}
-    disabled={disabled}
-    className={`inline-flex items-center justify-center p-1.5 rounded-lg text-xs bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 transition-colors cursor-pointer disabled:opacity-40 ${className ?? ""}`}
-    title="Move down"
-    aria-label="Move down"
-  >
-    <ArrowDown className="h-3.5 w-3.5" />
-  </button>
-)
-
-const RjsfCopyButton: React.FC<IconButtonProps> = ({
-  onClick,
-  disabled,
-  className,
-}) => (
-  <button
-    type="button"
-    onClick={onClick}
-    disabled={disabled}
-    className={`inline-flex items-center justify-center p-1.5 rounded-lg text-xs bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 transition-colors cursor-pointer disabled:opacity-40 ${className ?? ""}`}
-    title="Duplicate item"
-    aria-label="Duplicate item"
-  >
-    <Copy className="h-3.5 w-3.5" />
-  </button>
-)
-
-const RJSF_BUTTON_TEMPLATES = {
-  AddButton: RjsfAddButton,
-  RemoveButton: RjsfRemoveButton,
-  MoveUpButton: RjsfMoveUpButton,
-  MoveDownButton: RjsfMoveDownButton,
-  CopyButton: RjsfCopyButton,
-}
+type Values = Record<string, unknown>
 
 export interface DeployInstanceInitialConfig {
   values?: Record<string, unknown>
@@ -164,34 +87,63 @@ export const DeployInstanceModal: React.FC<DeployInstanceModalProps> = (
   return <DeployInstanceModalBody key={modalKey} {...props} />
 }
 
-const DeployInstanceModalBody: React.FC<DeployInstanceModalProps> = ({
-  onClose,
-  catalogItem,
-  managementAddon = null,
-  tenant,
-  tenants,
-  onTenantChange,
-  stacks = [],
-  releases = [],
-  initialConfig,
-  isEditMode = false,
-  loadingConfig = false,
-  configError = null,
-  onProposalCreated,
-  onCatalogItemUpdated,
-}) => {
+function initialTargetState(
+  props: DeployInstanceModalProps,
+  item: CatalogItem | null,
+  clusterStacks: StackSummary[]
+): DeployTargetState {
+  const { initialConfig, tenant, catalogItem } = props
+  const cluster = initialConfig?.targetCluster
+  const matchesStack =
+    Boolean(cluster) &&
+    clusterStacks.some((s) => `${s.name}-kubeconfig` === cluster)
+  return {
+    tenant: initialConfig?.tenant ?? tenant,
+    instanceName: initialConfig?.name ?? item?.id ?? "",
+    chartVersion: initialConfig?.version ?? item?.version ?? "",
+    targetCluster: !cluster ? "" : matchesStack ? cluster : CUSTOM_CLUSTER,
+    customClusterSecret: cluster && !matchesStack ? cluster : "",
+    targetNamespace: initialConfig?.targetNamespace ?? "",
+    enableCanary:
+      initialConfig?.canary !== undefined
+        ? Boolean(initialConfig.canary)
+        : Boolean(catalogItem?.flaggerSupported && catalogItem?.defaultCanary),
+    actionEngine:
+      initialConfig?.actionEngine ??
+      (item?.defaultEngine as "flux" | "pulumi" | undefined) ??
+      "flux",
+  }
+}
+
+const DeployInstanceModalBody: React.FC<DeployInstanceModalProps> = (props) => {
+  const {
+    onClose,
+    catalogItem,
+    managementAddon = null,
+    tenant,
+    tenants,
+    onTenantChange,
+    stacks = [],
+    releases = [],
+    initialConfig,
+    isEditMode = false,
+    loadingConfig = false,
+    configError = null,
+    onProposalCreated,
+    onCatalogItemUpdated,
+  } = props
   const isManagementAddon = Boolean(managementAddon)
   const resolvedCatalogItem = managementAddon ?? catalogItem
   const [activeItem, setActiveItem] = useState<CatalogItem | null>(
     resolvedCatalogItem
   )
-  const [formData, setFormData] = useState<Record<string, unknown>>(() => {
+  const [formData, setFormData] = useState<Values>(() => {
     if (!resolvedCatalogItem) return initialConfig?.values ?? {}
     const baseValues =
       initialConfig?.values ??
-      (resolvedCatalogItem.defaultValues as Record<string, unknown> | undefined)
+      (resolvedCatalogItem.defaultValues as Values | undefined)
     return extractSchemaDefaults(
-      resolvedCatalogItem.schema as Record<string, unknown>,
+      resolvedCatalogItem.schema as Values,
       baseValues
     )
   })
@@ -200,192 +152,117 @@ const DeployInstanceModalBody: React.FC<DeployInstanceModalProps> = ({
       classifyStackResourceKind(s) === "cluster" &&
       s.name !== "management-cluster-core"
   )
-
-  const [instanceName, setInstanceName] = useState<string>(
-    () => initialConfig?.name ?? resolvedCatalogItem?.id ?? ""
+  const [target, setTarget] = useState<DeployTargetState>(() =>
+    initialTargetState(props, resolvedCatalogItem, clusterStacks)
   )
-  const [chartVersion, setChartVersion] = useState<string>(
-    () => initialConfig?.version ?? resolvedCatalogItem?.version ?? ""
-  )
-  const [targetCluster, setTargetCluster] = useState<string>(() => {
-    if (!initialConfig?.targetCluster) return ""
-    const matchesStack = clusterStacks.some(
-      (s) => `${s.name}-kubeconfig` === initialConfig.targetCluster
-    )
-    return matchesStack ? initialConfig.targetCluster : "__custom__"
-  })
-  const [customClusterSecret, setCustomClusterSecret] = useState<string>(() => {
-    if (!initialConfig?.targetCluster) return ""
-    const matchesStack = clusterStacks.some(
-      (s) => `${s.name}-kubeconfig` === initialConfig.targetCluster
-    )
-    return matchesStack ? "" : initialConfig.targetCluster
-  })
-  const [targetNamespace, setTargetNamespace] = useState<string>(
-    () => initialConfig?.targetNamespace ?? ""
-  )
-  const [enableCanary, setEnableCanary] = useState<boolean>(() =>
-    initialConfig?.canary !== undefined
-      ? Boolean(initialConfig.canary)
-      : Boolean(catalogItem?.flaggerSupported && catalogItem?.defaultCanary)
-  )
-  const [localTenant, setLocalTenant] = useState<string>(
-    () => initialConfig?.tenant ?? tenant
-  )
-  const [actionEngine, setActionEngine] = useState<"flux" | "pulumi">(() => {
-    return (
-      initialConfig?.actionEngine ??
-      (resolvedCatalogItem?.defaultEngine as "flux" | "pulumi") ??
-      "flux"
-    )
-  })
   const [loading, setLoading] = useState(false)
   const [syncingSchema, setSyncingSchema] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [fieldErrors, setFieldErrors] = useState<Record<string, string[]>>({})
   const [isFullscreen, setIsFullscreen] = useState(false)
 
-  const effectiveTenant = localTenant || tenant || "default"
+  const effectiveTenant = target.tenant || tenant || "default"
+  const effectiveTarget = { ...target, tenant: effectiveTenant }
 
-  const handleFormChange = (data: { formData?: Record<string, unknown> }) => {
-    if (data.formData) {
-      setFormData(data.formData)
+  const formSchema = useMemo(
+    () =>
+      (isEditMode
+        ? relaxSecretRequirements(activeItem?.schema)
+        : activeItem?.schema) as RJSFSchema | undefined,
+    [activeItem?.schema, isEditMode]
+  )
+  const formUiSchema = useMemo(
+    () =>
+      buildSecretAwareUiSchema(activeItem?.schema, activeItem?.uiSchema, {
+        editMode: isEditMode,
+      }),
+    [activeItem?.schema, activeItem?.uiSchema, isEditMode]
+  )
+  const manifestTemplate =
+    activeItem?.runtime === "manifest" ? activeItem.manifestsYaml : undefined
+  const customValidate = useMemo<
+    CustomValidator<Values, RJSFSchema> | undefined
+  >(() => {
+    if (!manifestTemplate) return undefined
+    return (data, errors) => {
+      const problems = validateManifestValues(manifestTemplate, data)
+      for (const [name, messages] of Object.entries(problems)) {
+        const slot = (errors as Record<string, unknown>)[name] as
+          { addError?: (m: string) => void } | undefined
+        messages.forEach((m) => slot?.addError?.(m))
+      }
+      return errors
     }
-  }
+  }, [manifestTemplate])
 
   const handleSyncUpstreamSchema = async () => {
     if (!activeItem?.repoUrl) return
-    const chartName = activeItem.chart || activeItem.id
     setSyncingSchema(true)
     setError(null)
     try {
       const { schema: upstreamSchema } = await fetchCatalogSchema({
         repoUrl: activeItem.repoUrl,
-        chart: chartName,
+        chart: activeItem.chart || activeItem.id,
         version: activeItem.version,
       })
-      const existingSchema = (activeItem.schema ?? {}) as Record<
-        string,
-        unknown
-      >
-      const existingProps =
-        (existingSchema.properties as Record<string, unknown> | undefined) ?? {}
-      const upstreamProps =
-        (upstreamSchema.properties as Record<string, unknown> | undefined) ?? {}
-      const mergedSchema: RJSFSchema = {
-        ...upstreamSchema,
-        required: Array.isArray(existingSchema.required)
-          ? (existingSchema.required as string[])
-          : (upstreamSchema.required as string[] | undefined),
-        properties: {
-          ...upstreamProps,
-          ...existingProps,
-        } as RJSFSchema["properties"],
-      }
+      const mergedSchema = mergeUpstreamSchema(
+        activeItem.schema,
+        upstreamSchema
+      )
       const updatedItem: CatalogItem = { ...activeItem, schema: mergedSchema }
       setActiveItem(updatedItem)
       onCatalogItemUpdated?.(updatedItem)
       setFormData(
         extractSchemaDefaults(
-          mergedSchema as Record<string, unknown>,
-          updatedItem.defaultValues as Record<string, unknown> | undefined
+          mergedSchema as Values,
+          updatedItem.defaultValues as Values | undefined
         )
       )
     } catch (err: unknown) {
       setError(
-        err instanceof Error
-          ? err.message
-          : "Failed to sync schema from upstream Helm chart"
+        errorMessage(err, "Failed to sync schema from upstream Helm chart")
       )
     } finally {
       setSyncingSchema(false)
     }
   }
 
-  const handleSubmit = async (
-    data?: { formData?: Record<string, unknown> } | React.FormEvent
-  ) => {
+  const handleSubmit = async (values: Values) => {
     if (!activeItem) return
-    if (
-      data &&
-      "preventDefault" in data &&
-      typeof data.preventDefault === "function"
-    ) {
-      data.preventDefault()
-    }
-    const valuesToSubmit =
-      data && "formData" in data && data.formData ? data.formData : formData
-
     setLoading(true)
     setError(null)
-
+    setFieldErrors({})
     try {
       if (isManagementAddon) {
-        const trimmedChartVersion = chartVersion.trim()
+        const version = target.chartVersion.trim()
         const proposal = await upgradeManagementAddon(activeItem.id, {
-          ...(trimmedChartVersion ? { version: trimmedChartVersion } : {}),
-          values: valuesToSubmit,
+          ...(version ? { version } : {}),
+          values,
         })
         onProposalCreated?.(proposal)
         onClose()
         return
       }
-
-      const resolvedTargetCluster =
-        activeItem.type === "app"
-          ? targetCluster === "__custom__"
-            ? customClusterSecret.trim() || undefined
-            : targetCluster || undefined
-          : undefined
-
-      const trimmedInstanceName = instanceName.trim()
-      const trimmedChartVersion = chartVersion.trim()
-      const trimmedTargetNs = resolvedTargetCluster
-        ? targetNamespace.trim()
-        : ""
-      const isCustomName =
-        Boolean(trimmedInstanceName) && trimmedInstanceName !== activeItem.id
-
-      const proposal = await createProposal({
-        catalogId: activeItem.id,
-        tenant: effectiveTenant,
-        values: valuesToSubmit,
-        ...(isCustomName ? { name: trimmedInstanceName } : {}),
-        ...(activeItem.type === "app" &&
-        trimmedChartVersion &&
-        trimmedChartVersion !== activeItem.version
-          ? { version: trimmedChartVersion }
-          : {}),
-        ...(trimmedTargetNs ? { targetNamespace: trimmedTargetNs } : {}),
-        title: `Deploy ${isCustomName ? trimmedInstanceName : activeItem.name} for ${effectiveTenant}`,
-        kind:
-          activeItem.type === "infrastructure"
-            ? "infra"
-            : (activeItem.type as "app" | "infra" | "bundle"),
-        ...(resolvedTargetCluster
-          ? { targetCluster: resolvedTargetCluster }
-          : {}),
-        ...(activeItem.type === "app" &&
-        activeItem.flaggerSupported &&
-        enableCanary
-          ? { canary: true }
-          : {}),
-        ...(activeItem.runtime === "manifest" ? { actionEngine } : {}),
-      })
+      const proposal = await createProposal(
+        buildDeployProposalPayload(activeItem, effectiveTarget, values)
+      )
       onProposalCreated?.(proposal)
       onClose()
     } catch (err) {
-      setError(
-        err instanceof Error ? err.message : "Failed to create Git PR proposal"
-      )
+      setError(errorMessage(err, "Failed to create Git PR proposal"))
+      setFieldErrors(serverFieldErrors(err))
     } finally {
       setLoading(false)
     }
   }
 
-  const yamlPreview = jsonToYaml(formData).trim()
+  // Secret (writeOnly / format: password) values are masked in the on-screen preview.
+  const yamlPreview = jsonToYaml(
+    maskSecretValues(activeItem?.schema, formData)
+  ).trim()
 
   const effectiveInstanceName =
-    instanceName.trim() || activeItem?.id || initialConfig?.name || ""
+    target.instanceName.trim() || activeItem?.id || initialConfig?.name || ""
   const isExistingInstance =
     Boolean(activeItem) &&
     (activeItem!.type === "app"
@@ -399,230 +276,34 @@ const DeployInstanceModalBody: React.FC<DeployInstanceModalProps> = ({
             s.name === effectiveInstanceName && s.tenant === effectiveTenant
         ))
 
+  const verb = isManagementAddon ? "Upgrade" : isEditMode ? "Edit" : "Create"
+  const canSyncSchema =
+    (activeItem?.type === "app" || isManagementAddon) &&
+    activeItem?.runtime !== "manifest" &&
+    Boolean(activeItem?.repoUrl)
+
   const formContent = activeItem ? (
     <>
       {activeItem.type === "bundle" &&
         activeItem.bundleItems &&
         activeItem.bundleItems.length > 0 && (
-          <div className="bg-indigo-950/20 border border-indigo-500/30 rounded-xl p-3.5 space-y-2">
-            <div className="text-[11px] font-semibold uppercase tracking-wider text-indigo-300">
-              Bundle Execution Graph ({activeItem.bundleItems.length} items)
-            </div>
-            <div className="flex flex-wrap gap-2">
-              {activeItem.bundleItems.map((bi) => (
-                <div
-                  key={bi.id}
-                  className="text-[11px] font-mono bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1.5 text-slate-200 flex items-center gap-1.5"
-                >
-                  <span className="px-1.5 py-0.5 rounded bg-indigo-500/20 text-indigo-300 text-[10px] uppercase">
-                    {bi.kind}
-                  </span>
-                  <span className="font-semibold text-white">{bi.id}</span>
-                  <span className="text-slate-500">({bi.catalogRef})</span>
-                  {bi.canary && (
-                    <span className="px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 text-[10px] uppercase">
-                      canary
-                    </span>
-                  )}
-                  {bi.dependsOn && bi.dependsOn.length > 0 && (
-                    <span className="text-amber-300 text-[10px]">
-                      ← {bi.dependsOn.join(", ")}
-                    </span>
-                  )}
-                </div>
-              ))}
-            </div>
-          </div>
+          <BundleExecutionGraph items={activeItem.bundleItems} />
         )}
 
-      {/* Deployment Instance Metadata */}
-      <div
-        className={`grid grid-cols-1 gap-3 ${
-          !isManagementAddon && activeItem.type === "app"
-            ? "sm:grid-cols-2"
-            : "sm:grid-cols-1"
-        }`}
-      >
-        {!isManagementAddon && tenants && tenants.length > 0 && (
-          <div>
-            <label
-              htmlFor="deploy-modal-tenant-select"
-              className="block text-[11px] font-medium text-slate-300 mb-1"
-            >
-              Target Tenant
-            </label>
-            <select
-              id="deploy-modal-tenant-select"
-              value={effectiveTenant}
-              onChange={(e) => {
-                setLocalTenant(e.target.value)
-                onTenantChange?.(e.target.value)
-              }}
-              className="w-full bg-slate-950 border border-slate-800 text-xs text-slate-200 rounded-lg px-3 py-1.5 focus:outline-none focus:ring-1 focus:ring-indigo-500 font-mono"
-            >
-              {tenants.map((t) => (
-                <option key={t.id} value={t.id}>
-                  {t.id}
-                </option>
-              ))}
-            </select>
-          </div>
-        )}
-        {!isManagementAddon && (
-          <div>
-            <label
-              htmlFor="instance-name-input"
-              className="block text-[11px] font-medium text-slate-300 mb-1"
-            >
-              Instance Name
-            </label>
-            <input
-              id="instance-name-input"
-              type="text"
-              value={instanceName}
-              onChange={(e) => setInstanceName(e.target.value)}
-              placeholder={activeItem.id}
-              className="w-full bg-slate-950 border border-slate-800 text-xs text-slate-200 rounded-lg px-3 py-1.5 focus:outline-none focus:ring-1 focus:ring-indigo-500 font-mono"
-            />
-          </div>
-        )}
-        {activeItem.runtime === "manifest" && (
-          <div>
-            <label
-              htmlFor="deploy-action-engine-select"
-              className="block text-[11px] font-medium text-slate-300 mb-1"
-            >
-              Action Engine
-            </label>
-            <select
-              id="deploy-action-engine-select"
-              data-testid="deploy-action-engine-select"
-              value={actionEngine}
-              onChange={(e) =>
-                setActionEngine(e.target.value as "flux" | "pulumi")
-              }
-              className="w-full bg-slate-950 border border-slate-800 text-xs text-slate-200 rounded-lg px-3 py-1.5 focus:outline-none focus:ring-1 focus:ring-indigo-500 font-mono"
-            >
-              <option value="flux">Flux CD (Kustomization)</option>
-              <option value="pulumi">Pulumi (PKO v2 Stack)</option>
-            </select>
-          </div>
-        )}
-        {activeItem.runtime !== "manifest" &&
-          (isManagementAddon || activeItem.type === "app") && (
-            <div>
-              <label
-                htmlFor="chart-version-input"
-                className="block text-[11px] font-medium text-slate-300 mb-1"
-              >
-                {activeItem.runtime === "kustomize"
-                  ? "Git Ref / Version"
-                  : "Chart Version"}
-              </label>
-              <input
-                id="chart-version-input"
-                type="text"
-                value={chartVersion}
-                onChange={(e) => setChartVersion(e.target.value)}
-                placeholder={
-                  activeItem.version ||
-                  (activeItem.runtime === "kustomize" ? "main" : "latest")
-                }
-                className="w-full bg-slate-950 border border-slate-800 text-xs text-slate-200 rounded-lg px-3 py-1.5 focus:outline-none focus:ring-1 focus:ring-indigo-500 font-mono"
-              />
-            </div>
-          )}
-        {!isManagementAddon && activeItem.type === "app" && (
-          <>
-            <div>
-              <label
-                htmlFor="cluster-select-catalog"
-                className="block text-[11px] font-medium text-slate-300 mb-1"
-              >
-                Target Cluster
-              </label>
-              <select
-                id="cluster-select-catalog"
-                value={targetCluster}
-                onChange={(e) => setTargetCluster(e.target.value)}
-                className="w-full bg-slate-950 border border-slate-800 text-xs text-slate-200 rounded-lg px-3 py-1.5 focus:outline-none focus:ring-1 focus:ring-indigo-500 font-mono"
-              >
-                <option value="">Management Cluster (local)</option>
-                {clusterStacks.map((s) => (
-                  <option key={s.id} value={`${s.name}-kubeconfig`}>
-                    {s.name} ({s.tenant})
-                  </option>
-                ))}
-                <option value="__custom__">Custom kubeconfig Secret...</option>
-              </select>
-              {targetCluster === "__custom__" && (
-                <input
-                  type="text"
-                  value={customClusterSecret}
-                  onChange={(e) => setCustomClusterSecret(e.target.value)}
-                  placeholder="e.g. workload-kubeconfig"
-                  aria-label="Custom kubeconfig Secret name"
-                  className="mt-2 w-full bg-slate-950 border border-slate-800 text-xs text-slate-200 rounded-lg px-3 py-1.5 focus:outline-none focus:ring-1 focus:ring-indigo-500 font-mono"
-                />
-              )}
-            </div>
-            <div>
-              <label
-                htmlFor="target-namespace-input"
-                className="block text-[11px] font-medium text-slate-300 mb-1"
-              >
-                Target Namespace
-              </label>
-              <input
-                id="target-namespace-input"
-                type="text"
-                value={targetCluster ? targetNamespace : ""}
-                onChange={(e) => setTargetNamespace(e.target.value)}
-                disabled={!targetCluster}
-                placeholder={
-                  targetCluster
-                    ? "e.g. apps-prod (optional)"
-                    : `tenant-${effectiveTenant} (local)`
-                }
-                title={
-                  targetCluster
-                    ? "Destination namespace on the remote workload cluster"
-                    : "Management cluster apps are isolated to the tenant namespace; select a remote Target Cluster to override"
-                }
-                className="w-full bg-slate-950 border border-slate-800 text-xs text-slate-200 rounded-lg px-3 py-1.5 focus:outline-none focus:ring-1 focus:ring-indigo-500 font-mono disabled:opacity-50 disabled:cursor-not-allowed"
-              />
-            </div>
-            {activeItem.flaggerSupported && (
-              <div className="sm:col-span-2 flex items-start space-x-2.5 bg-slate-950/70 border border-slate-800 rounded-lg px-3 py-2.5">
-                <input
-                  id="deploy-enable-canary"
-                  type="checkbox"
-                  checked={enableCanary}
-                  onChange={(e) => setEnableCanary(e.target.checked)}
-                  className="mt-0.5 h-3.5 w-3.5 rounded border-slate-700 bg-slate-900 text-indigo-500 focus:ring-indigo-500 cursor-pointer"
-                />
-                <label
-                  htmlFor="deploy-enable-canary"
-                  className="text-xs text-slate-200 cursor-pointer select-none"
-                >
-                  <span className="font-medium block">
-                    Enable Flagger Canary
-                  </span>
-                  <span className="text-[11px] text-slate-400">
-                    Generates a Flagger Canary CR for progressive traffic
-                    shifting via Envoy Gateway &amp; Prometheus.
-                  </span>
-                </label>
-              </div>
-            )}
-          </>
-        )}
-      </div>
+      <InstanceTargetFields
+        item={activeItem}
+        isManagementAddon={isManagementAddon}
+        tenants={tenants}
+        clusterStacks={clusterStacks}
+        state={effectiveTarget}
+        onChange={(patch) => setTarget((prev) => ({ ...prev, ...patch }))}
+        onTenantChange={onTenantChange}
+      />
 
       {!isManagementAddon && isExistingInstance && (
         <div
           role="status"
-          className="flex items-start space-x-2 p-3 rounded-xl bg-amber-950/30 border border-amber-500/30 text-amber-200 text-xs"
+          className="flex items-start gap-2 p-3 rounded-xl bg-amber-950/30 border border-amber-500/30 text-amber-200 text-xs"
         >
           <AlertTriangle className="h-4 w-4 text-amber-400 shrink-0 mt-0.5" />
           <span>
@@ -638,35 +319,22 @@ const DeployInstanceModalBody: React.FC<DeployInstanceModalProps> = ({
         </div>
       )}
 
-      {/* RJSF Form Container */}
-      <div className="rjsf-container bg-slate-950 p-5 rounded-xl border border-slate-800">
-        <Form
+      <div className="bg-slate-950 p-4 sm:p-5 rounded-xl border border-slate-800">
+        <SchemaForm
           key={activeItem.id}
-          schema={activeItem.schema as RJSFSchema}
-          templates={{ ButtonTemplates: RJSF_BUTTON_TEMPLATES }}
-          validator={
-            validator as unknown as ValidatorType<
-              Record<string, unknown>,
-              RJSFSchema
-            >
-          }
+          schema={formSchema as RJSFSchema}
+          uiSchema={formUiSchema}
           formData={formData}
-          onChange={handleFormChange}
+          onChange={setFormData}
           onSubmit={handleSubmit}
+          customValidate={customValidate}
+          extraErrors={toErrorSchema(fieldErrors)}
         >
-          <div className="mt-4 pt-4 border-t border-slate-800 flex items-center justify-end gap-2">
-            <button
-              type="button"
-              onClick={onClose}
-              className="px-4 py-2.5 bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-medium rounded-lg transition-colors cursor-pointer"
-            >
+          <div className="mt-4 pt-4 border-t border-slate-800 flex flex-col-reverse sm:flex-row sm:items-center sm:justify-end gap-2">
+            <Button variant="secondary" size="lg" onClick={onClose}>
               Cancel
-            </button>
-            <button
-              type="submit"
-              disabled={loading}
-              className="flex items-center space-x-2 px-6 py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold rounded-lg transition-colors shadow-lg shadow-indigo-600/20 disabled:opacity-50 cursor-pointer"
-            >
+            </Button>
+            <Button type="submit" size="lg" disabled={loading}>
               {loading ? (
                 <>
                   <Loader2 className="h-4 w-4 animate-spin" />
@@ -678,111 +346,67 @@ const DeployInstanceModalBody: React.FC<DeployInstanceModalProps> = ({
                   <ArrowRight className="h-4 w-4" />
                 </>
               )}
-            </button>
+            </Button>
           </div>
-        </Form>
+        </SchemaForm>
       </div>
 
-      {error && (
-        <div
-          role="alert"
-          className="p-4 bg-red-950/40 border border-red-500/30 rounded-xl text-red-300 text-xs flex items-start space-x-2"
-        >
-          <AlertCircle className="h-4 w-4 text-red-400 shrink-0 mt-0.5" />
-          <span>{error}</span>
-        </div>
-      )}
+      {error && <InlineAlert>{error}</InlineAlert>}
     </>
   ) : null
 
-  const yamlPreviewSection = (
-    <div
-      className={
-        isFullscreen ? "flex flex-col h-full min-h-0 space-y-2" : "space-y-2"
-      }
-    >
-      <div className="flex items-center justify-between shrink-0">
-        <h4 className="text-xs font-semibold text-slate-300 flex items-center gap-1.5 uppercase tracking-wider">
-          <FileCode2 className="h-4 w-4 text-emerald-400" />
-          Live values.yaml Preview
-        </h4>
-        <span className="text-[10px] text-slate-500 font-mono">
-          SOPS + age encrypted on secret fields before git commit
-        </span>
-      </div>
-      <pre
-        aria-label="values.yaml preview"
-        className={`bg-slate-950 border border-slate-800 rounded-xl p-4 text-xs font-mono text-emerald-400 overflow-auto leading-relaxed ${
-          isFullscreen ? "flex-1 min-h-0" : "max-h-56"
-        }`}
-      >
-        {yamlPreview}
-      </pre>
-    </div>
-  )
-
   return (
-    <div
-      role="dialog"
-      aria-modal="true"
-      aria-label={
-        activeItem
-          ? `${isManagementAddon ? "Upgrade" : isEditMode ? "Edit" : "Create"} ${activeItem.name}`
-          : "Instance Configuration"
-      }
-      className={`fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm ${
-        isFullscreen ? "p-0" : "p-4"
-      }`}
-    >
-      <div
+    <Dialog open onOpenChange={(open) => !open && onClose()}>
+      <DialogContent
+        size="xl"
+        closeLabel="Close modal"
         data-testid="deploy-instance-modal"
-        className={`bg-slate-900 border-slate-800 flex flex-col shadow-2xl ${
+        aria-describedby={
+          activeItem?.description ? "deploy-modal-description" : undefined
+        }
+        className={
           isFullscreen
-            ? "w-full h-full rounded-none border-0 p-6"
-            : "border rounded-2xl max-w-4xl w-full max-h-[90vh] p-6"
-        }`}
+            ? "sm:max-w-none w-screen h-dvh max-h-dvh rounded-none border-0"
+            : "sm:max-h-[90vh]"
+        }
+        controls={
+          <DialogFullscreenToggle
+            fullscreen={isFullscreen}
+            onToggle={() => setIsFullscreen((prev) => !prev)}
+          />
+        }
       >
-        {/* Modal Header */}
-        <div className="flex items-start justify-between gap-4 border-b border-slate-800 pb-4 shrink-0">
-          <div className="min-w-0">
-            <h3 className="text-lg font-semibold text-white flex items-center gap-2 flex-wrap">
-              <span>
-                {activeItem
-                  ? activeItem.name
-                  : initialConfig?.name || "Instance Configuration"}
-              </span>
-              {activeItem && (
-                <span className="text-xs font-normal text-slate-400">
-                  ({activeItem.type})
-                </span>
-              )}
-              {isManagementAddon && (
-                <span className="text-[10px] font-semibold uppercase tracking-wider px-2 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">
-                  Management Addon
-                </span>
-              )}
-              {!isManagementAddon && isEditMode && (
-                <span className="text-[10px] font-semibold uppercase tracking-wider px-2 py-0.5 rounded bg-indigo-500/20 text-indigo-300 border border-indigo-500/30">
-                  Editing Instance
-                </span>
-              )}
-            </h3>
-            {activeItem?.description && (
-              <p className="text-xs text-slate-400 mt-0.5">
-                {activeItem.description}
-              </p>
+        <DialogHeader>
+          <DialogTitle>
+            <span className="text-slate-400 font-medium">{verb}</span>{" "}
+            {activeItem
+              ? activeItem.name
+              : initialConfig?.name || "Instance Configuration"}
+          </DialogTitle>
+          <div className="flex flex-wrap items-center gap-2">
+            {activeItem && (
+              <Badge variant="secondary" className="font-mono">
+                {activeItem.type}
+              </Badge>
             )}
-          </div>
-
-          <div className="flex items-center space-x-2 shrink-0">
-            {(activeItem?.type === "app" || isManagementAddon) &&
-              activeItem?.runtime !== "manifest" &&
-              activeItem?.repoUrl && (
-                <button
-                  type="button"
+            {activeItem && <Badge className="font-mono">{activeItem.id}</Badge>}
+            {isManagementAddon && (
+              <Badge variant="success" className="uppercase tracking-wider">
+                Management Addon
+              </Badge>
+            )}
+            {!isManagementAddon && isEditMode && (
+              <Badge className="uppercase tracking-wider">
+                Editing Instance
+              </Badge>
+            )}
+            {canSyncSchema && (
+              <div className="ml-auto flex items-center gap-1.5">
+                <Button
+                  variant="secondary"
+                  size="sm"
                   onClick={handleSyncUpstreamSchema}
                   disabled={syncingSchema}
-                  className="flex items-center space-x-1.5 px-2.5 py-1 rounded-lg text-xs font-medium bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition-colors cursor-pointer disabled:opacity-50"
                   title="Pull values.schema.json or values.yaml from upstream Helm chart"
                 >
                   <RefreshCw
@@ -791,84 +415,51 @@ const DeployInstanceModalBody: React.FC<DeployInstanceModalProps> = ({
                   <span>
                     {syncingSchema ? "Syncing..." : "Sync Upstream Schema"}
                   </span>
-                </button>
-              )}
-            {activeItem && (
-              <span className="text-xs font-mono px-3 py-1 rounded-lg bg-indigo-500/10 text-indigo-400 border border-indigo-500/20">
-                {activeItem.id}
-              </span>
+                </Button>
+              </div>
             )}
-            <button
-              type="button"
-              onClick={() => setIsFullscreen((prev) => !prev)}
-              aria-label={
-                isFullscreen ? "Exit full screen" : "Enter full screen"
-              }
-              title={isFullscreen ? "Exit full screen" : "Full screen"}
-              className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 transition-colors cursor-pointer"
-            >
-              {isFullscreen ? (
-                <Minimize2 className="h-4 w-4" />
-              ) : (
-                <Maximize2 className="h-4 w-4" />
-              )}
-            </button>
-            <button
-              type="button"
-              onClick={onClose}
-              aria-label="Close modal"
-              className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 transition-colors cursor-pointer"
-            >
-              <X className="h-5 w-5" />
-            </button>
           </div>
-        </div>
+          {activeItem?.description && (
+            <DialogDescription id="deploy-modal-description">
+              {activeItem.description}
+            </DialogDescription>
+          )}
+        </DialogHeader>
 
-        {/* Modal Body */}
         {loadingConfig ? (
           <div className="flex-1 flex items-center justify-center py-12 text-slate-400 text-xs gap-2">
             <Loader2 className="h-4 w-4 animate-spin text-indigo-400" />
             <span>Loading instance configuration...</span>
           </div>
         ) : configError ? (
-          <div className="py-6 space-y-4">
-            <div
-              role="alert"
-              className="p-4 bg-red-950/40 border border-red-500/30 rounded-xl text-red-300 text-xs flex items-start space-x-2"
-            >
-              <AlertCircle className="h-4 w-4 text-red-400 shrink-0 mt-0.5" />
-              <span>{configError}</span>
-            </div>
+          <DialogBody className="space-y-4">
+            <InlineAlert>{configError}</InlineAlert>
             <div className="flex justify-end">
-              <button
-                type="button"
-                onClick={onClose}
-                className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-medium rounded-lg transition-colors"
-              >
+              <Button variant="secondary" onClick={onClose}>
                 Close
-              </button>
+              </Button>
             </div>
-          </div>
+          </DialogBody>
         ) : !activeItem ? (
           <div className="py-8 text-center text-xs text-slate-400">
             No catalog blueprint found for this instance.
           </div>
         ) : isFullscreen ? (
-          <div className="flex-1 min-h-0 mt-5 grid grid-cols-1 lg:grid-cols-2 gap-6 overflow-hidden">
+          <div className="flex-1 min-h-0 p-6 grid grid-cols-1 lg:grid-cols-2 gap-6 overflow-hidden">
             <div className="min-h-0 overflow-y-auto pr-2 space-y-5">
               {formContent}
             </div>
             <div className="min-h-0 overflow-hidden flex flex-col">
-              {yamlPreviewSection}
+              <ValuesYamlPreview yaml={yamlPreview} fullscreen />
             </div>
           </div>
         ) : (
-          <div className="flex-1 min-h-0 overflow-y-auto pr-2 space-y-5 mt-5">
+          <DialogBody className="space-y-5">
             {formContent}
-            {yamlPreviewSection}
-          </div>
+            <ValuesYamlPreview yaml={yamlPreview} fullscreen={false} />
+          </DialogBody>
         )}
-      </div>
-    </div>
+      </DialogContent>
+    </Dialog>
   )
 }

@@ -9,6 +9,9 @@ import {
   Trash2,
 } from "lucide-react"
 import { CrdWatchEvent } from "../types/api"
+import { Button } from "./ui/button"
+import { PageHeader } from "./ui/page-header"
+import { TruncatedText } from "./ui/truncated-text"
 
 export interface TelemetryStreamPanelProps {
   filteredEvents: CrdWatchEvent[]
@@ -31,100 +34,99 @@ export const TelemetryStreamPanel: React.FC<TelemetryStreamPanelProps> = ({
 }) => {
   return (
     <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 space-y-4">
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-slate-800 pb-4">
-        <div className="flex items-center space-x-3">
-          <Radio className="h-5 w-5 text-indigo-400" />
-          <div>
-            <h3 className="text-base font-semibold text-white">
-              Live Reconciler Event Stream
-            </h3>
-            <p className="text-xs text-slate-400">
-              kube-rs CRD condition transitions for Flux &amp; PKO v2 Stacks
-            </p>
-          </div>
-        </div>
-
-        <div className="flex items-center space-x-3">
-          <div className="flex items-center space-x-1 bg-slate-950 border border-slate-800 rounded-lg p-1">
-            <Filter className="h-3.5 w-3.5 text-slate-500 ml-2" />
-            <select
-              aria-label="Filter events by CRD kind"
-              value={eventFilterKind}
-              onChange={(e) => onEventFilterKindChange(e.target.value)}
-              style={{ colorScheme: "dark" }}
-              className="bg-slate-950 border-0 text-xs text-slate-200 rounded focus:outline-none focus:ring-0 py-0.5 px-2"
+      <PageHeader
+        variant="section"
+        inlineAt="2xl"
+        className="border-b border-slate-800 pb-4"
+        titleClassName="font-semibold"
+        icon={<Radio className="h-5 w-5 text-indigo-400" />}
+        title="Live Reconciler Event Stream"
+        description={
+          <>kube-rs CRD condition transitions for Flux &amp; PKO v2 Stacks</>
+        }
+        actions={
+          <>
+            <div className="flex h-8 items-center gap-1 rounded-lg border border-slate-800 bg-slate-950 px-2">
+              <Filter className="h-3.5 w-3.5 shrink-0 text-slate-500" />
+              <select
+                aria-label="Filter events by CRD kind"
+                value={eventFilterKind}
+                onChange={(e) => onEventFilterKindChange(e.target.value)}
+                style={{ colorScheme: "dark" }}
+                className="bg-slate-950 border-0 text-xs text-slate-200 rounded focus:outline-none focus:ring-0 py-0.5 pl-1 pr-2 min-w-0"
+              >
+                <option value="all" className="bg-slate-950 text-slate-200">
+                  All CRDs
+                </option>
+                <option
+                  value="GitRepository"
+                  className="bg-slate-950 text-slate-200"
+                >
+                  GitRepository
+                </option>
+                <option
+                  value="Kustomization"
+                  className="bg-slate-950 text-slate-200"
+                >
+                  Kustomization
+                </option>
+                <option
+                  value="HelmRelease"
+                  className="bg-slate-950 text-slate-200"
+                >
+                  HelmRelease
+                </option>
+                <option value="Stack" className="bg-slate-950 text-slate-200">
+                  Stack
+                </option>
+                <option value="Canary" className="bg-slate-950 text-slate-200">
+                  Canary
+                </option>
+              </select>
+            </div>
+            <Button
+              variant="secondary"
+              onClick={onToggleStreamPaused}
+              className={
+                isStreamPaused
+                  ? "bg-amber-500/10 text-amber-400 border-amber-500/30 hover:bg-amber-500/20"
+                  : "text-slate-300"
+              }
             >
-              <option value="all" className="bg-slate-950 text-slate-200">
-                All CRDs
-              </option>
-              <option
-                value="GitRepository"
-                className="bg-slate-950 text-slate-200"
-              >
-                GitRepository
-              </option>
-              <option
-                value="Kustomization"
-                className="bg-slate-950 text-slate-200"
-              >
-                Kustomization
-              </option>
-              <option
-                value="HelmRelease"
-                className="bg-slate-950 text-slate-200"
-              >
-                HelmRelease
-              </option>
-              <option value="Stack" className="bg-slate-950 text-slate-200">
-                Stack
-              </option>
-              <option value="Canary" className="bg-slate-950 text-slate-200">
-                Canary
-              </option>
-            </select>
-          </div>
+              {isStreamPaused ? (
+                <>
+                  <Play className="h-3.5 w-3.5" />
+                  <span>Resume Stream</span>
+                </>
+              ) : (
+                <>
+                  <Pause className="h-3.5 w-3.5" />
+                  <span>Pause Stream</span>
+                </>
+              )}
+            </Button>
+            <Button
+              variant="secondary"
+              size="icon"
+              onClick={onClearEvents}
+              className="text-slate-400 hover:text-red-400"
+              title="Clear event logs"
+              aria-label="Clear event logs"
+            >
+              <Trash2 className="h-4 w-4" />
+            </Button>
+          </>
+        }
+      />
 
-          <button
-            type="button"
-            onClick={onToggleStreamPaused}
-            className={`flex items-center space-x-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border transition-colors cursor-pointer ${
-              isStreamPaused
-                ? "bg-amber-500/10 text-amber-400 border-amber-500/30 hover:bg-amber-500/20"
-                : "bg-slate-800 text-slate-300 border-slate-700 hover:bg-slate-700"
-            }`}
-          >
-            {isStreamPaused ? (
-              <>
-                <Play className="h-3.5 w-3.5" />
-                <span>Resume Stream</span>
-              </>
-            ) : (
-              <>
-                <Pause className="h-3.5 w-3.5" />
-                <span>Pause Stream</span>
-              </>
-            )}
-          </button>
-
-          <button
-            type="button"
-            onClick={onClearEvents}
-            className="p-1.5 text-slate-400 hover:text-red-400 bg-slate-950 hover:bg-slate-800 border border-slate-800 rounded-lg transition-colors cursor-pointer"
-            title="Clear event logs"
-          >
-            <Trash2 className="h-4 w-4" />
-          </button>
-        </div>
-      </div>
-
-      <div className="bg-slate-950 border border-slate-800 rounded-xl p-4 font-mono text-xs space-y-2 max-h-96 overflow-y-auto">
+      <div className="@container/events bg-slate-950 border border-slate-800 rounded-xl p-3 sm:p-4 font-mono text-xs space-y-2 max-h-96 overflow-y-auto">
         {filteredEvents.map((evt, idx) => (
           <div
             key={`${evt.name}-${idx}`}
-            className="flex flex-col sm:flex-row sm:items-center justify-between p-2.5 rounded-lg bg-slate-900/60 border border-slate-800/80 hover:bg-slate-900 transition-colors gap-2"
+            className="flex flex-col @2xl/events:flex-row @2xl/events:items-center justify-between p-2.5 rounded-lg bg-slate-900/60 border border-slate-800/80 hover:bg-slate-900 transition-colors gap-2"
           >
-            <div className="flex items-start sm:items-center space-x-3 min-w-0 flex-1">
-              <span className="text-[10px] text-slate-500 flex items-center gap-1 shrink-0 mt-0.5 sm:mt-0">
+            <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5 min-w-0 flex-1 @md/events:flex-nowrap">
+              <span className="text-[10px] text-slate-500 flex items-center gap-1 shrink-0 whitespace-nowrap">
                 <Clock className="h-3 w-3" />
                 {evt.timestamp}
               </span>
@@ -145,20 +147,21 @@ export const TelemetryStreamPanel: React.FC<TelemetryStreamPanelProps> = ({
                 {evt.kind}
               </span>
 
-              <div className="min-w-0 flex-1">
-                <span className="font-semibold text-slate-200">
-                  {evt.namespace}/{evt.name}
-                </span>
+              <div className="min-w-0 basis-full @md/events:basis-auto flex-1">
+                <TruncatedText
+                  text={`${evt.namespace}/${evt.name}`}
+                  className="font-semibold text-slate-200"
+                />
                 <p className="text-slate-400 truncate mt-0.5">{evt.message}</p>
               </div>
             </div>
 
-            <div className="flex items-center space-x-2 shrink-0 self-end sm:self-center">
+            <div className="flex flex-wrap items-center justify-end gap-2 min-w-0 self-end @2xl/events:shrink-0 @2xl/events:self-center">
               {evt.kind === "Stack" && (
                 <button
                   type="button"
                   onClick={() => onInspectStack(evt.namespace, evt.name)}
-                  className="inline-flex items-center space-x-1 text-[10px] px-2 py-0.5 rounded bg-indigo-500/10 hover:bg-indigo-500/20 text-indigo-300 border border-indigo-500/30 transition-colors cursor-pointer"
+                  className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap text-[10px] px-2 py-0.5 rounded bg-indigo-500/10 hover:bg-indigo-500/20 text-indigo-300 border border-indigo-500/30 transition-colors cursor-pointer"
                 >
                   <Terminal className="h-3 w-3" />
                   <span>Inspect</span>
@@ -167,13 +170,13 @@ export const TelemetryStreamPanel: React.FC<TelemetryStreamPanelProps> = ({
               {evt.revision && (
                 <span
                   title={evt.revision}
-                  className="text-[10px] px-1.5 py-0.5 rounded bg-slate-950 border border-slate-800 text-slate-400 max-w-44 truncate"
+                  className="min-w-0 text-[10px] px-1.5 py-0.5 rounded bg-slate-950 border border-slate-800 text-slate-400 max-w-44 truncate"
                 >
                   {evt.revision}
                 </span>
               )}
               <span
-                className={`text-[10px] px-2 py-0.5 rounded font-bold ${
+                className={`shrink-0 whitespace-nowrap text-[10px] px-2 py-0.5 rounded font-bold ${
                   evt.status === "Ready" || evt.status === "Healthy"
                     ? "text-emerald-400 bg-emerald-500/10 border border-emerald-500/20"
                     : evt.status === "Progressing"

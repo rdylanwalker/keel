@@ -1,42 +1,34 @@
-import React, { useEffect, useState } from "react"
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
+import { Key, LogOut, Menu, ShieldAlert, ShieldCheck } from "lucide-react"
+
+import { AuthStatus, Proposal, TenantSummary } from "./types/api"
 import {
-  Boxes,
-  Layers,
-  GitPullRequest,
-  Server,
-  ShieldCheck,
-  ShieldAlert,
-  Key,
-  LogOut,
-  CheckCircle2,
-  ArrowRight,
-  X,
-} from "lucide-react"
-import {
-  AuthStatus,
-  CatalogItem,
-  Proposal,
-  ReleaseSummary,
-  StackSummary,
-  TenantSummary,
-} from "./types/api"
-import {
+  consumePostLoginLocation,
   getAuthStatus,
-  getCatalog,
-  getReleaseConfig,
-  getReleases,
-  getStackConfig,
-  getStacks,
   getTenants,
   logout,
   setStoredToken,
   startOidcLogin,
 } from "./lib/api"
 import { isDemoMode } from "./lib/utils"
+import { ADMIN_AUTHZ, buildAuthz } from "./lib/authz"
+import { AuthzProvider } from "./lib/authz-context"
 import {
-  DeployInstanceInitialConfig,
-  DeployInstanceModal,
-} from "./components/DeployInstanceModal"
+  ActiveTab,
+  CatalogKindFilter,
+  formatHashRoute,
+  HashRoute,
+  parseHashRoute,
+} from "./lib/routes"
+import { DeployInstanceModal } from "./components/DeployInstanceModal"
+import { NavMenu } from "./components/shell/NavMenu"
+import { DemoBanner } from "./components/shell/DemoBanner"
+import { TenantSelector } from "./components/shell/TenantSelector"
+import { ProposalToast } from "./components/shell/ProposalToast"
+import { useEditInstance } from "./components/shell/useEditInstance"
+import { Sheet, SheetContent, SheetTitle } from "./components/ui/sheet"
+import { Button } from "./components/ui/button"
+import { Badge } from "./components/ui/badge"
 
 const TopologyView = React.lazy(() =>
   import("./components/TopologyView").then((m) => ({ default: m.TopologyView }))
@@ -57,144 +49,75 @@ const ControlPlaneProvidersView = React.lazy(() =>
   }))
 )
 
-export type ActiveTab = "topology" | "catalog" | "preview" | "providers"
+export type { ActiveTab }
 
-const VALID_TABS: readonly ActiveTab[] = [
-  "topology",
-  "catalog",
-  "preview",
-  "providers",
+const DEMO_TENANTS: TenantSummary[] = [
+  { id: "default", namespace: "tenant-default" },
+  { id: "acme", namespace: "tenant-acme" },
 ]
 
-function parseHashTab(hash: string): ActiveTab {
-  const normalized = hash.replace(/^#\/?/, "").trim() as ActiveTab
-  return VALID_TABS.includes(normalized) ? normalized : "topology"
+/** Hash-routed navigation (`#tab[/param]`), kept in sync with browser history. */
+function useHashRoute() {
+  const [route, setRoute] = useState<HashRoute>(() =>
+    parseHashRoute(window.location.hash)
+  )
+  useEffect(() => {
+    const canonical = formatHashRoute(parseHashRoute(window.location.hash))
+    if (window.location.hash !== canonical) {
+      window.history.replaceState(null, "", canonical)
+    }
+    const onChange = () => setRoute(parseHashRoute(window.location.hash))
+    window.addEventListener("hashchange", onChange)
+    return () => window.removeEventListener("hashchange", onChange)
+  }, [])
+  const navigate = useCallback((next: HashRoute) => {
+    setRoute(next)
+    const hash = formatHashRoute(next)
+    if (window.location.hash !== hash) {
+      window.location.hash = hash
+    }
+  }, [])
+  return { route, navigate }
 }
 
 export const App: React.FC = () => {
-  const [activeTab, setActiveTab] = useState<ActiveTab>(() =>
-    parseHashTab(window.location.hash)
-  )
-  const [editModalOpen, setEditModalOpen] = useState(false)
-  const [editModalLoading, setEditModalLoading] = useState(false)
-  const [editModalError, setEditModalError] = useState<string | null>(null)
-  const [editCatalogItem, setEditCatalogItem] = useState<CatalogItem | null>(
-    null
-  )
-  const [editInitialConfig, setEditInitialConfig] =
-    useState<DeployInstanceInitialConfig | null>(null)
-  const [editStacks, setEditStacks] = useState<StackSummary[]>([])
-  const [editReleases, setEditReleases] = useState<ReleaseSummary[]>([])
-  const [topologyProposal, setTopologyProposal] = useState<Proposal | null>(
-    null
-  )
-
-  const navigateToTab = (tab: ActiveTab) => {
-    setActiveTab(tab)
-    const nextHash = `#${tab}`
-    if (window.location.hash !== nextHash) {
-      window.location.hash = nextHash
-    }
-  }
-
-  const openEditInstanceModal = async (
-    namespace: string,
-    name: string,
-    kind: "app" | "infra"
-  ) => {
-    setEditModalOpen(true)
-    setEditModalLoading(true)
-    setEditModalError(null)
-    setEditCatalogItem(null)
-    setEditInitialConfig({ name })
-
-    try {
-      const [cfg, catalogItems, stackList, releaseList] = await Promise.all([
-        kind === "infra"
-          ? getStackConfig(namespace, name)
-          : getReleaseConfig(namespace, name),
-        getCatalog().catch(() => [] as CatalogItem[]),
-        typeof getStacks === "function"
-          ? getStacks().catch(() => [] as StackSummary[])
-          : Promise.resolve([] as StackSummary[]),
-        typeof getReleases === "function"
-          ? getReleases().catch(() => [] as ReleaseSummary[])
-          : Promise.resolve([] as ReleaseSummary[]),
-      ])
-
-      const matched =
-        (catalogItems || []).find((item) => item.id === cfg.catalogId) ?? null
-      setEditStacks(
-        (stackList || []).filter((s) => s.name !== "management-cluster-core")
-      )
-      setEditReleases(releaseList || [])
-      setEditCatalogItem(matched)
-      setEditInitialConfig({
-        values: cfg.values,
-        name: cfg.name || name,
-        version: cfg.version || matched?.version || "",
-        tenant: cfg.tenant || "default",
-        targetCluster: cfg.targetCluster,
-        targetNamespace: cfg.targetNamespace,
-        canary: cfg.canary,
-      })
-      if (!matched) {
-        setEditModalError(
-          `Catalog blueprint "${cfg.catalogId}" was not found for this instance.`
-        )
-      }
-    } catch (err) {
-      setEditModalError(
-        err instanceof Error
-          ? err.message
-          : "Failed to load instance configuration"
-      )
-    } finally {
-      setEditModalLoading(false)
-    }
-  }
-
-  const handleEditRelease = (namespace: string, name: string) => {
-    void openEditInstanceModal(namespace, name, "app")
-  }
-
-  const handleEditStack = (namespace: string, name: string) => {
-    void openEditInstanceModal(namespace, name, "infra")
-  }
-
-  useEffect(() => {
-    const initialTab = parseHashTab(window.location.hash)
-    const expectedHash = `#${initialTab}`
-    if (window.location.hash !== expectedHash) {
-      window.history.replaceState(null, "", expectedHash)
-    }
-    const handleHashChange = () => {
-      setActiveTab(parseHashTab(window.location.hash))
-    }
-    window.addEventListener("hashchange", handleHashChange)
-    return () => window.removeEventListener("hashchange", handleHashChange)
-  }, [])
+  const demo = isDemoMode()
+  const { route, navigate } = useHashRoute()
   const [authStatus, setAuthStatus] = useState<AuthStatus>({
     authenticated: false,
     phase: "oidc-active",
   })
   const [tenants, setTenants] = useState<TenantSummary[]>([])
   const [selectedTenant, setSelectedTenant] = useState<string>("")
+  const [navOpen, setNavOpen] = useState(false)
+  const [toastProposal, setToastProposal] = useState<Proposal | null>(null)
+  const edit = useEditInstance()
+
+  const navigateToTab = useCallback(
+    (tab: ActiveTab) => {
+      setNavOpen(false)
+      navigate({ tab })
+    },
+    [navigate]
+  )
 
   useEffect(() => {
     let cancelled = false
     getAuthStatus()
       .then((status) => {
-        if (!cancelled) {
-          setAuthStatus(status)
+        if (cancelled) return
+        setAuthStatus(status)
+        if (status.authenticated) {
+          // Restore the deep link captured before the OIDC redirect (UI-13).
+          const hash = consumePostLoginLocation()
+          if (hash && hash !== window.location.hash) {
+            window.location.hash = hash
+          }
         }
       })
       .catch(() => {
         if (!cancelled) {
-          setAuthStatus((prev) => ({
-            ...prev,
-            authenticated: false,
-          }))
+          setAuthStatus((prev) => ({ ...prev, authenticated: false }))
         }
       })
     return () => {
@@ -203,9 +126,7 @@ export const App: React.FC = () => {
   }, [])
 
   useEffect(() => {
-    if (!authStatus.authenticated) {
-      return
-    }
+    if (!authStatus.authenticated || demo) return
     let cancelled = false
     getTenants()
       .then((items) => {
@@ -222,18 +143,7 @@ export const App: React.FC = () => {
     return () => {
       cancelled = true
     }
-  }, [authStatus.authenticated, authStatus.isAdmin])
-
-  const visibleTenants: TenantSummary[] = authStatus.authenticated
-    ? tenants
-    : isDemoMode()
-      ? [
-          { id: "default", namespace: "tenant-default" },
-          { id: "acme", namespace: "tenant-acme" },
-        ]
-      : []
-  const activeSelectedTenant =
-    authStatus.authenticated || isDemoMode() ? selectedTenant : ""
+  }, [authStatus.authenticated, authStatus.isAdmin, demo])
 
   useEffect(() => {
     const handleUnauthorized = () => {
@@ -248,8 +158,13 @@ export const App: React.FC = () => {
       window.removeEventListener("keel:unauthorized", handleUnauthorized)
   }, [])
 
+  const authz = useMemo(
+    () => (demo ? ADMIN_AUTHZ : buildAuthz(authStatus)),
+    [demo, authStatus]
+  )
+
   const handleLogin = () => {
-    if (isDemoMode()) {
+    if (demo) {
       setAuthStatus({
         authenticated: true,
         phase: "oidc-active",
@@ -265,13 +180,10 @@ export const App: React.FC = () => {
 
   const handleLogout = async () => {
     setStoredToken(null)
-    setAuthStatus({
-      authenticated: false,
-      phase: "oidc-active",
-    })
+    setAuthStatus({ authenticated: false, phase: "oidc-active" })
     setTenants([])
     setSelectedTenant("")
-    if (!isDemoMode()) {
+    if (!demo) {
       try {
         await logout()
       } catch {
@@ -280,10 +192,16 @@ export const App: React.FC = () => {
     }
   }
 
+  const visibleTenants: TenantSummary[] = demo
+    ? DEMO_TENANTS
+    : authStatus.authenticated
+      ? tenants
+      : []
+  const activeSelectedTenant =
+    authStatus.authenticated || demo ? selectedTenant : ""
+
   const derivedTenantLabel = (() => {
-    if (visibleTenants.length === 1) {
-      return visibleTenants[0].namespace
-    }
+    if (visibleTenants.length === 1) return visibleTenants[0].namespace
     const groupTenant = authStatus.groups?.find(
       (g) => !["keel-admins", "admin", "admins"].includes(g)
     )
@@ -292,316 +210,250 @@ export const App: React.FC = () => {
         ? groupTenant
         : `tenant-${groupTenant}`
     }
-    return authStatus.tenant || "tenant-default"
+    return authStatus.tenant || "—"
   })()
 
-  const showTenantSwitcher =
-    visibleTenants.length > 1 || Boolean(authStatus.isAdmin)
+  const showTenantSwitcher = visibleTenants.length > 1 || authz.isAdmin
   const userDisplayLabel =
     authStatus.name ||
     authStatus.email ||
     authStatus.sub ||
     authStatus.username ||
     (authStatus.phase === "break-glass" ? "Break-Glass" : "OIDC Auth")
+  const canViewApp = authStatus.authenticated || demo
+
+  const openPreview = (id?: string) =>
+    navigate({ tab: "preview", proposalId: id })
+
+  // The sidebar sticks directly below the (sticky) header. The header height changes with
+  // viewport width (subtitle wrapping) and the demo banner, so track its real bottom edge.
+  const headerRef = useRef<HTMLElement | null>(null)
+  const [stickyTop, setStickyTop] = useState(0)
+  useEffect(() => {
+    const el = headerRef.current
+    if (!el) return
+    const update = () => setStickyTop(el.offsetTop + el.offsetHeight)
+    update()
+    if (typeof ResizeObserver === "undefined") return
+    const ro = new ResizeObserver(update)
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [demo])
 
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans antialiased">
-      {/* Header Bar */}
-      <header className="border-b border-slate-800 bg-slate-900/90 backdrop-blur sticky top-0 z-40 px-6 py-3 flex items-center justify-between">
-        <div className="flex items-center space-x-3">
-          <img
-            src="/keel-logo.svg"
-            alt="Keel Control Plane logo"
-            className="h-10 w-10 rounded-xl shadow-lg shadow-indigo-600/30"
-          />
-          <div>
-            <h1 className="text-lg font-bold tracking-tight text-white flex items-center gap-2">
-              Keel Control Plane
-              <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
-                keel.io/v1alpha1
-              </span>
-            </h1>
-            <p className="text-xs text-slate-400">
-              Provider-Agnostic GitOps &amp; Infrastructure Orchestration
-            </p>
+    <AuthzProvider value={authz}>
+      <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans antialiased">
+        {demo && <DemoBanner />}
+        <header
+          ref={headerRef}
+          className={`border-b border-slate-800 bg-slate-900/90 backdrop-blur sticky ${demo ? "top-7" : "top-0"} z-40 px-3 sm:px-6 py-3 flex items-center justify-between gap-2`}
+        >
+          <div className="flex items-center gap-2 sm:gap-3 min-w-0">
+            <Button
+              variant="ghost"
+              size="icon"
+              className="md:hidden"
+              aria-label="Open navigation"
+              aria-expanded={navOpen}
+              onClick={() => setNavOpen(true)}
+            >
+              <Menu className="h-5 w-5" />
+            </Button>
+            <img
+              src="/keel-logo.svg"
+              alt="Keel Control Plane logo"
+              className="h-8 w-8 sm:h-10 sm:w-10 rounded-xl shadow-lg shadow-indigo-600/30 shrink-0"
+            />
+            <div className="min-w-0">
+              <h1 className="text-sm sm:text-lg font-bold tracking-tight text-white flex items-center gap-2">
+                <span className="truncate">Keel Control Plane</span>
+                <span className="hidden lg:inline text-[10px] font-mono px-2 py-0.5 rounded-full bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
+                  keel.io/v1alpha1
+                </span>
+              </h1>
+              <p className="hidden sm:block text-xs text-slate-400">
+                Provider-Agnostic GitOps &amp; Infrastructure Orchestration
+              </p>
+            </div>
           </div>
-        </div>
 
-        {/* Auth status & Tenant header pill */}
-        <div className="flex items-center space-x-3">
-          {(authStatus.authenticated || isDemoMode()) &&
-            (showTenantSwitcher ? (
-              <div className="hidden sm:flex items-center space-x-2 h-9 text-xs bg-slate-950 px-3 rounded-lg border border-slate-800">
-                <span className="w-2 h-2 rounded-full bg-emerald-400"></span>
-                <label
-                  htmlFor="header-tenant-select"
-                  className="text-slate-400"
+          <div className="flex items-center gap-2 min-w-0">
+            {canViewApp && (
+              <TenantSelector
+                tenants={visibleTenants}
+                value={activeSelectedTenant}
+                onChange={setSelectedTenant}
+                switchable={showTenantSwitcher}
+                fixedLabel={derivedTenantLabel}
+              />
+            )}
+            {authStatus.authenticated ? (
+              <div className="flex items-center gap-1.5">
+                <span className="flex items-center gap-2 h-9 text-xs bg-slate-950 text-slate-100 border border-slate-700 px-2.5 sm:px-3 rounded-lg font-medium">
+                  <ShieldCheck className="h-3.5 w-3.5 text-emerald-400 shrink-0" />
+                  <span className="hidden sm:inline max-w-[12rem] truncate">
+                    {userDisplayLabel}
+                  </span>
+                  {authz.isAdmin ? (
+                    <Badge className="rounded-md uppercase tracking-wide">
+                      Admin
+                    </Badge>
+                  ) : (
+                    <Badge variant="info" className="rounded-md uppercase">
+                      User
+                    </Badge>
+                  )}
+                </span>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  onClick={handleLogout}
+                  aria-label="Logout"
+                  title="Logout"
+                  className="hover:text-red-400"
                 >
-                  Tenant:
-                </label>
-                <select
-                  id="header-tenant-select"
-                  aria-label="Active Tenant"
-                  value={activeSelectedTenant}
-                  onChange={(e) => setSelectedTenant(e.target.value)}
-                  className="bg-transparent font-mono font-semibold text-slate-200 focus:outline-none cursor-pointer"
-                >
-                  <option value="" className="bg-slate-900 text-slate-200">
-                    All Tenants
-                  </option>
-                  {visibleTenants.map((t) => (
-                    <option
-                      key={t.id}
-                      value={t.id}
-                      className="bg-slate-900 text-slate-200"
-                    >
-                      {t.id}
-                    </option>
-                  ))}
-                </select>
+                  <LogOut className="h-4 w-4" />
+                </Button>
+              </div>
+            ) : demo ? (
+              <Button onClick={handleLogin}>
+                <Key className="h-3.5 w-3.5" />
+                <span>Demo Login</span>
+              </Button>
+            ) : (
+              <span className="flex items-center gap-1.5 text-xs bg-amber-500/10 text-amber-300 border border-amber-500/20 px-3 py-1.5 rounded-lg font-medium">
+                <ShieldAlert className="h-3.5 w-3.5 text-amber-400" />
+                <span className="hidden sm:inline">Unauthenticated</span>
+              </span>
+            )}
+          </div>
+        </header>
+
+        <Sheet open={navOpen} onOpenChange={setNavOpen}>
+          <SheetContent aria-describedby={undefined}>
+            <SheetTitle className="px-1 pb-2 text-sm font-bold text-white">
+              Navigation
+            </SheetTitle>
+            <NavMenu activeTab={route.tab} onNavigate={navigateToTab} />
+          </SheetContent>
+        </Sheet>
+
+        <div className="flex-1 flex flex-col md:flex-row min-w-0">
+          <aside className="hidden md:block md:w-64 border-r border-slate-800 bg-slate-900/40 shrink-0">
+            {/* Pinned below the header while the page scrolls; scrolls itself if taller. */}
+            <div
+              data-testid="sidebar-sticky"
+              className="sticky overflow-y-auto overscroll-contain p-4"
+              style={{
+                top: stickyTop,
+                maxHeight: `calc(100vh - ${stickyTop}px)`,
+              }}
+            >
+              <NavMenu activeTab={route.tab} onNavigate={navigateToTab} />
+            </div>
+          </aside>
+
+          <main className="flex-1 min-w-0 p-3 sm:p-6 overflow-x-hidden">
+            {!canViewApp ? (
+              <div className="max-w-lg mx-auto mt-12 bg-slate-900 border border-slate-800 rounded-2xl p-8 text-center space-y-4 shadow-xl">
+                <div className="mx-auto w-12 h-12 rounded-2xl bg-indigo-500/10 border border-indigo-500/20 flex items-center justify-center text-indigo-400">
+                  <Key className="h-6 w-6" />
+                </div>
+                <h2 className="text-lg font-bold text-white">
+                  Authentication Required
+                </h2>
+                <p className="text-xs text-slate-400 leading-relaxed">
+                  Sign in with your cluster OIDC identity provider (Rauthy or
+                  your configured external IdP) to view cluster topology,
+                  enabled providers, catalog blueprints, and open pull requests.
+                </p>
+                <Button size="lg" onClick={handleLogin}>
+                  <Key className="h-4 w-4" />
+                  <span>Sign in with OIDC</span>
+                </Button>
               </div>
             ) : (
-              <div className="hidden sm:flex items-center space-x-2 h-9 text-xs bg-slate-950 px-3 rounded-lg border border-slate-800">
-                <span className="w-2 h-2 rounded-full bg-emerald-400"></span>
-                <span className="text-slate-400">Tenant:</span>
-                <span className="font-mono font-semibold text-slate-200">
-                  {derivedTenantLabel}
-                </span>
-              </div>
-            ))}
-
-          {authStatus.authenticated ? (
-            <div className="flex items-center space-x-2">
-              <span className="flex items-center space-x-2 h-9 text-xs bg-slate-950 text-slate-100 border border-slate-700 px-3 rounded-lg font-medium">
-                <ShieldCheck className="h-3.5 w-3.5 text-emerald-400 shrink-0" />
-                <span>{userDisplayLabel}</span>
-                {authStatus.isAdmin ? (
-                  <span className="px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide rounded-md bg-indigo-500/25 text-indigo-200 border border-indigo-400/60">
-                    Admin
-                  </span>
-                ) : (
-                  <span className="px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide rounded-md bg-sky-500/20 text-sky-200 border border-sky-400/50">
-                    User
-                  </span>
+              <React.Suspense
+                fallback={
+                  <div className="flex items-center justify-center p-12 text-slate-400 text-xs">
+                    <span>Loading view...</span>
+                  </div>
+                }
+              >
+                {route.tab === "topology" && (
+                  <TopologyView
+                    authenticated={authStatus.authenticated}
+                    selectedTenant={activeSelectedTenant || undefined}
+                    onNavigateToCatalog={(kind?: CatalogKindFilter) =>
+                      navigate({ tab: "catalog", kind })
+                    }
+                    onNavigateToPreview={() => openPreview()}
+                    onNavigateToProviders={() => navigateToTab("providers")}
+                    onEditRelease={(ns, name) =>
+                      void edit.open(ns, name, "app")
+                    }
+                    onEditStack={(ns, name) =>
+                      void edit.open(ns, name, "infra")
+                    }
+                  />
                 )}
-              </span>
-              <button
-                onClick={handleLogout}
-                aria-label="Logout"
-                className="p-1.5 text-slate-400 hover:text-red-400 hover:bg-slate-800 rounded-lg transition-colors"
-                title="Logout"
-              >
-                <LogOut className="h-4 w-4" />
-              </button>
-            </div>
-          ) : isDemoMode() ? (
-            <button
-              onClick={handleLogin}
-              className="flex items-center space-x-1.5 px-3.5 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg text-xs font-semibold transition-colors shadow-lg shadow-indigo-600/20"
-            >
-              <Key className="h-3.5 w-3.5" />
-              <span>Demo Login</span>
-            </button>
-          ) : (
-            <span className="flex items-center space-x-1.5 text-xs bg-amber-500/10 text-amber-300 border border-amber-500/20 px-3 py-1.5 rounded-lg font-medium">
-              <ShieldAlert className="h-3.5 w-3.5 text-amber-400" />
-              <span>Unauthenticated</span>
-            </span>
-          )}
-        </div>
-      </header>
-
-      {/* Main Container Layout */}
-      <div className="flex-1 flex flex-col md:flex-row">
-        {/* Navigation Sidebar */}
-        <aside className="w-full md:w-64 border-r border-slate-800 bg-slate-900/40 p-4 space-y-1 shrink-0">
-          <button
-            onClick={() => navigateToTab("topology")}
-            className={`w-full flex items-center space-x-3 px-3.5 py-2.5 rounded-xl text-xs font-semibold transition-all ${
-              activeTab === "topology"
-                ? "bg-indigo-600 text-white shadow-lg shadow-indigo-600/20"
-                : "text-slate-400 hover:text-slate-200 hover:bg-slate-800/60"
-            }`}
-          >
-            <Boxes className="h-4 w-4" />
-            <span>Topology Map</span>
-          </button>
-
-          <button
-            onClick={() => navigateToTab("catalog")}
-            className={`w-full flex items-center space-x-3 px-3.5 py-2.5 rounded-xl text-xs font-semibold transition-all ${
-              activeTab === "catalog"
-                ? "bg-indigo-600 text-white shadow-lg shadow-indigo-600/20"
-                : "text-slate-400 hover:text-slate-200 hover:bg-slate-800/60"
-            }`}
-          >
-            <Layers className="h-4 w-4" />
-            <span>Catalog &amp; Form Wizard</span>
-          </button>
-
-          <button
-            onClick={() => navigateToTab("preview")}
-            className={`w-full flex items-center space-x-3 px-3.5 py-2.5 rounded-xl text-xs font-semibold transition-all ${
-              activeTab === "preview"
-                ? "bg-indigo-600 text-white shadow-lg shadow-indigo-600/20"
-                : "text-slate-400 hover:text-slate-200 hover:bg-slate-800/60"
-            }`}
-          >
-            <GitPullRequest className="h-4 w-4" />
-            <span>PR &amp; Preview Inspector</span>
-          </button>
-
-          <button
-            onClick={() => navigateToTab("providers")}
-            className={`w-full flex items-center space-x-3 px-3.5 py-2.5 rounded-xl text-xs font-semibold transition-all ${
-              activeTab === "providers"
-                ? "bg-indigo-600 text-white shadow-lg shadow-indigo-600/20"
-                : "text-slate-400 hover:text-slate-200 hover:bg-slate-800/60"
-            }`}
-          >
-            <Server className="h-4 w-4" />
-            <span>Control Plane &amp; Providers</span>
-          </button>
-        </aside>
-
-        {/* Content Body */}
-        <main className="flex-1 p-6 overflow-x-hidden">
-          {!authStatus.authenticated && !isDemoMode() ? (
-            <div className="max-w-lg mx-auto mt-12 bg-slate-900 border border-slate-800 rounded-2xl p-8 text-center space-y-4 shadow-xl">
-              <div className="mx-auto w-12 h-12 rounded-2xl bg-indigo-500/10 border border-indigo-500/20 flex items-center justify-center text-indigo-400">
-                <Key className="h-6 w-6" />
-              </div>
-              <h2 className="text-lg font-bold text-white">
-                Authentication Required
-              </h2>
-              <p className="text-xs text-slate-400 leading-relaxed">
-                Sign in with your cluster OIDC identity provider (Dex or your
-                configured external IdP) to view cluster topology, enabled
-                providers, catalog blueprints, and open pull requests.
-              </p>
-              <button
-                type="button"
-                onClick={handleLogin}
-                className="inline-flex items-center space-x-2 px-5 py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-xs font-semibold transition-colors shadow-lg shadow-indigo-600/20 cursor-pointer"
-              >
-                <Key className="h-4 w-4" />
-                <span>Sign in with OIDC</span>
-              </button>
-            </div>
-          ) : (
-            <React.Suspense
-              fallback={
-                <div className="flex items-center justify-center p-12 text-slate-400 text-xs">
-                  <span>Loading view...</span>
-                </div>
-              }
-            >
-              {activeTab === "topology" && (
-                <TopologyView
-                  authenticated={authStatus.authenticated}
-                  selectedTenant={activeSelectedTenant || undefined}
-                  onNavigateToCatalog={() => navigateToTab("catalog")}
-                  onNavigateToPreview={() => navigateToTab("preview")}
-                  onNavigateToProviders={() => navigateToTab("providers")}
-                  onEditRelease={handleEditRelease}
-                  onEditStack={handleEditStack}
-                />
-              )}
-              {activeTab === "catalog" && (
-                <CatalogWizardView
-                  selectedTenant={activeSelectedTenant}
-                  onNavigateToPreview={() => navigateToTab("preview")}
-                />
-              )}
-              {activeTab === "preview" && (
-                <PreviewInspectorView
-                  selectedTenant={activeSelectedTenant || undefined}
-                />
-              )}
-              {activeTab === "providers" && (
-                <ControlPlaneProvidersView
-                  authenticated={authStatus.authenticated}
-                  onNavigateToCatalog={() => navigateToTab("catalog")}
-                  onNavigateToPreview={() => navigateToTab("preview")}
-                />
-              )}
-            </React.Suspense>
-          )}
-        </main>
-      </div>
-
-      {/* In-Place Instance Edit Modal (from Topology) */}
-      <DeployInstanceModal
-        isOpen={editModalOpen}
-        onClose={() => {
-          setEditModalOpen(false)
-          setEditCatalogItem(null)
-          setEditInitialConfig(null)
-          setEditModalError(null)
-        }}
-        catalogItem={editCatalogItem}
-        tenant={editInitialConfig?.tenant || "default"}
-        stacks={editStacks}
-        releases={editReleases}
-        initialConfig={editInitialConfig}
-        isEditMode={true}
-        loadingConfig={editModalLoading}
-        configError={editModalError}
-        onProposalCreated={(proposal) => setTopologyProposal(proposal)}
-      />
-
-      {topologyProposal && (
-        <div
-          aria-label="Proposal Floating Toast"
-          className="fixed bottom-6 right-6 z-50 max-w-md bg-slate-900/95 backdrop-blur-md border border-emerald-500/40 shadow-2xl shadow-black/60 rounded-2xl p-4 text-slate-200 space-y-3"
-        >
-          <div className="flex items-start justify-between gap-3">
-            <div className="flex items-start space-x-2.5 min-w-0">
-              <CheckCircle2 className="h-5 w-5 text-emerald-400 shrink-0 mt-0.5" />
-              <div className="min-w-0">
-                <p className="text-xs font-bold text-white">
-                  PR #{topologyProposal.id} Opened
-                </p>
-                <p className="text-[11px] text-slate-400 truncate font-mono mt-0.5">
-                  {topologyProposal.branch}
-                </p>
-              </div>
-            </div>
-            <button
-              type="button"
-              onClick={() => setTopologyProposal(null)}
-              aria-label="Dismiss notification"
-              className="p-1 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 transition-colors cursor-pointer shrink-0"
-            >
-              <X className="h-3.5 w-3.5" />
-            </button>
-          </div>
-          <div className="flex items-center justify-end gap-2">
-            {topologyProposal.prUrl && (
-              <a
-                href={topologyProposal.prUrl}
-                target="_blank"
-                rel="noreferrer"
-                className="inline-flex items-center space-x-1 px-2.5 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 rounded-lg text-xs font-medium transition-colors"
-              >
-                <span>View on Forge</span>
-              </a>
+                {route.tab === "catalog" && (
+                  <CatalogWizardView
+                    selectedTenant={activeSelectedTenant}
+                    onNavigateToPreview={() => openPreview()}
+                    kindFilter={route.kind}
+                    onKindFilterChange={(kind) =>
+                      navigate({ tab: "catalog", kind })
+                    }
+                  />
+                )}
+                {route.tab === "preview" && (
+                  <PreviewInspectorView
+                    selectedTenant={activeSelectedTenant || undefined}
+                    selectedProposalId={route.proposalId}
+                    onSelectProposal={(id) =>
+                      navigate({ tab: "preview", proposalId: id ?? undefined })
+                    }
+                  />
+                )}
+                {route.tab === "providers" && (
+                  <ControlPlaneProvidersView
+                    authenticated={authStatus.authenticated}
+                    onNavigateToCatalog={() => navigateToTab("catalog")}
+                    onNavigateToPreview={() => openPreview()}
+                  />
+                )}
+              </React.Suspense>
             )}
-            <button
-              type="button"
-              onClick={() => {
-                setTopologyProposal(null)
-                navigateToTab("preview")
-              }}
-              className="inline-flex items-center space-x-1.5 px-3 py-1.5 bg-purple-600 hover:bg-purple-500 text-white rounded-lg text-xs font-semibold transition-colors cursor-pointer"
-            >
-              <span>Go to PR</span>
-              <ArrowRight className="h-3.5 w-3.5" />
-            </button>
-          </div>
+          </main>
         </div>
-      )}
-    </div>
+
+        <DeployInstanceModal
+          isOpen={edit.state.open}
+          onClose={edit.close}
+          catalogItem={edit.state.catalogItem}
+          tenant={edit.state.initialConfig?.tenant || "default"}
+          stacks={edit.state.stacks}
+          releases={edit.state.releases}
+          initialConfig={edit.state.initialConfig}
+          isEditMode={true}
+          loadingConfig={edit.state.loading}
+          configError={edit.state.error}
+          onProposalCreated={(proposal) => setToastProposal(proposal)}
+        />
+
+        {toastProposal && (
+          <ProposalToast
+            proposal={toastProposal}
+            onDismiss={() => setToastProposal(null)}
+            onOpen={(id) => {
+              setToastProposal(null)
+              openPreview(id)
+            }}
+          />
+        )}
+      </div>
+    </AuthzProvider>
   )
 }
 

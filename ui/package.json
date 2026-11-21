@@ -14,16 +14,19 @@
     "test:unit": "vitest run"
   },
   "dependencies": {
+    "@cfworker/json-schema": "^4.1.6",
     "@rjsf/core": "^6.11.1",
     "@rjsf/utils": "^6.11.1",
-    "@rjsf/validator-ajv8": "^6.11.1",
     "@tanstack/react-table": "^9.3.1",
+    "@wterm/dom": "^0.6.0",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "lucide-react": "^1.73.0",
+    "radix-ui": "^1.8.1",
     "react": "^19.3.1",
     "react-dom": "^19.3.1",
-    "tailwind-merge": "^3.7.0"
+    "tailwind-merge": "^3.7.0",
+    "yaml": "^2.9.1"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",

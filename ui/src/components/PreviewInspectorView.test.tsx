@@ -1,8 +1,21 @@
-import { render, screen, fireEvent, waitFor } from "@testing-library/react"
+import {
+  render,
+  screen,
+  fireEvent,
+  waitFor,
+  within,
+  act,
+} from "@testing-library/react"
 import { describe, it, expect, vi, beforeEach } from "vitest"
-import { PreviewInspectorView } from "./PreviewInspectorView"
+import {
+  PolicyStatusBanner,
+  PreviewInspectorView,
+} from "./PreviewInspectorView"
 import * as api from "../lib/api"
-import { PreviewReport, Proposal } from "../types/api"
+import { ApiError } from "../lib/errors"
+import { buildAuthz } from "../lib/authz"
+import { renderWithAuthz } from "../test/render"
+import { CrdWatchEvent, PreviewReport, Proposal } from "../types/api"
 
 vi.mock("../lib/api", () => ({
   getProposals: vi.fn(),
@@ -10,6 +23,7 @@ vi.mock("../lib/api", () => ({
   mergeProposal: vi.fn(),
   rejectProposal: vi.fn(),
   reopenProposal: vi.fn(),
+  createEventSourceStream: vi.fn(() => ({ close: vi.fn() })),
 }))
 
 const mockProposals: Proposal[] = [
@@ -70,35 +84,50 @@ const mockPreview: PreviewReport = {
   ],
 }
 
+async function confirmReject() {
+  fireEvent.click(screen.getByRole("button", { name: /Reject PR/i }))
+  const dialog = await screen.findByRole("alertdialog")
+  fireEvent.click(within(dialog).getByRole("button", { name: /Reject PR/i }))
+}
+
 describe("PreviewInspectorView component", () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    window.history.replaceState({}, "", "/")
   })
 
   it("renders PR preview inspector and loads proposals and diff tree", async () => {
     vi.mocked(api.getProposals).mockResolvedValue(mockProposals)
     vi.mocked(api.getProposalPreview).mockResolvedValue(mockPreview)
 
-    render(<PreviewInspectorView />)
+    renderWithAuthz(<PreviewInspectorView />)
 
-    expect(
-      screen.getByText("PR & PKO v2 Preview Inspector")
-    ).toBeInTheDocument()
-
+    expect(screen.getByText("PR & Preview Inspector")).toBeInTheDocument()
     await waitFor(() => {
       expect(
         screen.getByText("PR #101: Deploy Redis Cache")
       ).toBeInTheDocument()
       expect(screen.getByText("redis-master")).toBeInTheDocument()
-      expect(screen.getAllByText("Create").length).toBeGreaterThan(0)
-      expect(screen.getAllByText("Update").length).toBeGreaterThan(0)
-      expect(
-        screen.getByRole("link", { name: /Forge Link/i })
-      ).toBeInTheDocument()
-      expect(
-        screen.getAllByRole("tooltip").map((el) => el.textContent)
-      ).toEqual(["Forge Link", "Reject PR", "Merge PR Proposal"])
     })
+    expect(screen.getByRole("link", { name: /Forge Link/i })).toHaveAttribute(
+      "href",
+      "https://git.internal/pr/101"
+    )
+    // Labeled (icon + text) action buttons.
+    expect(screen.getByRole("button", { name: "Reject PR" })).toHaveTextContent(
+      "Reject PR"
+    )
+    expect(screen.getByRole("button", { name: "Merge PR" })).toHaveTextContent(
+      "Merge PR"
+    )
+    // No source reported: generic title, unknown-source badge, no policy card.
+    expect(screen.getByTestId("preview-section-title")).toHaveTextContent(
+      /^Preview$/
+    )
+    expect(screen.getByTestId("preview-source-badge")).toHaveTextContent(
+      "Unknown source"
+    )
+    expect(screen.queryByTestId("policy-status-banner")).not.toBeInTheDocument()
   })
 
   it("merges PR successfully when Merge PR button is clicked", async () => {
@@ -109,34 +138,20 @@ describe("PreviewInspectorView component", () => {
       message: "Merged cleanly into main",
     })
 
-    render(<PreviewInspectorView />)
+    renderWithAuthz(<PreviewInspectorView />)
 
-    await waitFor(() => {
-      expect(
-        screen.getByText("PR #101: Deploy Redis Cache")
-      ).toBeInTheDocument()
-    })
-
-    const mergeBtn = screen.getByRole("button", { name: /Merge PR Proposal/i })
-    fireEvent.click(mergeBtn)
+    await screen.findByText("PR #101: Deploy Redis Cache")
+    fireEvent.click(screen.getByRole("button", { name: /Merge PR/i }))
 
     await waitFor(() => {
       expect(api.mergeProposal).toHaveBeenCalledWith("101")
-      expect(screen.getByText("Merged cleanly into main")).toBeInTheDocument()
       expect(screen.getByRole("status")).toHaveTextContent(
         "Merged cleanly into main"
       )
-      const rejectBtn = screen.getByRole("button", { name: /Reject PR/i })
-      expect(mergeBtn).toHaveAttribute("aria-label", "Merged")
-      expect(mergeBtn).toBeDisabled()
-      expect(rejectBtn).toBeDisabled()
-      expect(mergeBtn.className).toContain("disabled:cursor-not-allowed")
-      expect(rejectBtn.className).toContain("disabled:cursor-not-allowed")
-      expect(mergeBtn.className).toContain("enabled:hover:bg-purple-500")
-      expect(rejectBtn.className).toContain("enabled:hover:bg-rose-600/30")
+      expect(screen.getByRole("button", { name: "Merged" })).toBeDisabled()
+      expect(screen.getByRole("button", { name: /Reject PR/i })).toBeDisabled()
     })
 
-    // Verify snackbar dismiss button closes notification
     fireEvent.click(
       screen.getByRole("button", { name: /Dismiss notification/i })
     )
@@ -145,46 +160,79 @@ describe("PreviewInspectorView component", () => {
     ).not.toBeInTheDocument()
   })
 
+  it("asks for confirmation before rejecting and can be cancelled", async () => {
+    vi.mocked(api.getProposals).mockResolvedValue(mockProposals)
+    vi.mocked(api.getProposalPreview).mockResolvedValue(mockPreview)
+    vi.mocked(api.rejectProposal).mockResolvedValue({ success: true })
+
+    renderWithAuthz(<PreviewInspectorView />)
+    await screen.findByText("PR #101: Deploy Redis Cache")
+
+    fireEvent.click(screen.getByRole("button", { name: /Reject PR/i }))
+    const dialog = await screen.findByRole("alertdialog")
+    expect(dialog).toHaveTextContent("Reject PR #101?")
+    expect(dialog).toHaveTextContent("keel/tenant-acme/redis-101")
+    fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }))
+    await waitFor(() =>
+      expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument()
+    )
+    expect(api.rejectProposal).not.toHaveBeenCalled()
+
+    await confirmReject()
+    await waitFor(() => {
+      expect(api.rejectProposal).toHaveBeenCalledWith("101")
+      expect(screen.getByRole("status")).toHaveTextContent(
+        "PR #101 rejected and closed."
+      )
+      expect(screen.getByRole("button", { name: /Reopen PR/i })).toBeEnabled()
+    })
+  })
+
   it("handles merge failure and preview fetch error gracefully", async () => {
     vi.mocked(api.getProposals).mockResolvedValue(mockProposals)
     vi.mocked(api.getProposalPreview).mockRejectedValue(
       new Error("PKO preview runner unavailable")
     )
 
-    render(<PreviewInspectorView />)
+    renderWithAuthz(<PreviewInspectorView />)
 
-    await waitFor(() => {
-      expect(
-        screen.getByText("PKO preview runner unavailable")
-      ).toBeInTheDocument()
-    })
+    await screen.findByText("PKO preview runner unavailable")
 
     vi.mocked(api.mergeProposal).mockResolvedValue({
       success: false,
       message: "Merge conflicts detected",
     })
-
-    const mergeBtn = screen.getByRole("button", { name: /Merge PR Proposal/i })
-    fireEvent.click(mergeBtn)
-
-    await waitFor(() => {
-      expect(screen.getByText("Merge conflicts detected")).toBeInTheDocument()
-    })
+    fireEvent.click(screen.getByRole("button", { name: /Merge PR/i }))
+    await screen.findByText("Merge conflicts detected")
 
     vi.mocked(api.rejectProposal).mockResolvedValue({
       success: true,
       message: "PR #101 rejected and closed.",
     })
-    fireEvent.click(screen.getByRole("button", { name: /Reject PR/i }))
-    await waitFor(() => {
-      expect(
-        screen.getByText("PR #101 rejected and closed.")
-      ).toBeInTheDocument()
-    })
+    await confirmReject()
+    await screen.findByText("PR #101 rejected and closed.")
 
     fireEvent.click(screen.getByRole("button", { name: /^merged$/i }))
     await waitFor(() => {
       expect(api.getProposals).toHaveBeenCalledWith(undefined, "merged")
+    })
+  })
+
+  it("shows the correlation id for 5xx action errors", async () => {
+    vi.mocked(api.getProposals).mockResolvedValue(mockProposals)
+    vi.mocked(api.getProposalPreview).mockResolvedValue(mockPreview)
+    vi.mocked(api.mergeProposal).mockRejectedValue(
+      new ApiError(500, "Internal server error", { correlationId: "abc-123" })
+    )
+
+    renderWithAuthz(<PreviewInspectorView />)
+    await screen.findByText("PR #101: Deploy Redis Cache")
+    fireEvent.click(screen.getByRole("button", { name: /Merge PR/i }))
+
+    await waitFor(() => {
+      expect(screen.getByRole("alert")).toHaveTextContent(
+        "Internal server error (reference: abc-123)"
+      )
     })
   })
 
@@ -198,17 +246,11 @@ describe("PreviewInspectorView component", () => {
       message: "Cannot reject merged PR",
     })
 
-    render(<PreviewInspectorView />)
+    renderWithAuthz(<PreviewInspectorView />)
+    await waitFor(() => expect(api.getProposalPreview).toHaveBeenCalled())
 
-    await waitFor(() => {
-      expect(screen.getAllByText(/Deploy Redis Cache/i)[0]).toBeInTheDocument()
-      expect(api.getProposalPreview).toHaveBeenCalled()
-    })
-
-    fireEvent.click(screen.getByRole("button", { name: /Reject PR/i }))
-    await waitFor(() => {
-      expect(screen.getByText("Cannot reject merged PR")).toBeInTheDocument()
-    })
+    await confirmReject()
+    await screen.findByText("Cannot reject merged PR")
   })
 
   it("reopens a closed PR when Reopen PR button is clicked", async () => {
@@ -221,29 +263,118 @@ describe("PreviewInspectorView component", () => {
       message: "PR #101 reopened.",
     })
 
-    render(<PreviewInspectorView />)
+    renderWithAuthz(<PreviewInspectorView />)
 
-    await waitFor(() => {
-      expect(screen.getAllByText(/Deploy Redis Cache/i)[0]).toBeInTheDocument()
-    })
-
-    const reopenBtn = screen.getByRole("button", { name: /Reopen PR/i })
+    const reopenBtn = await screen.findByRole("button", { name: /Reopen PR/i })
     fireEvent.click(reopenBtn)
 
     await waitFor(() => {
       expect(api.reopenProposal).toHaveBeenCalledWith("101")
       expect(screen.getByText("PR #101 reopened.")).toBeInTheDocument()
-      expect(
-        screen.getByRole("button", { name: /Merge PR Proposal/i })
-      ).toBeEnabled()
+      expect(screen.getByRole("button", { name: /Merge PR/i })).toBeEnabled()
       expect(screen.getByRole("button", { name: /Reject PR/i })).toBeEnabled()
     })
+  })
+
+  it("disables PR actions for users who are not admins of the PR tenant", async () => {
+    vi.mocked(api.getProposals).mockResolvedValue(mockProposals)
+    vi.mocked(api.getProposalPreview).mockResolvedValue(mockPreview)
+
+    const member = buildAuthz({
+      authenticated: true,
+      phase: "oidc-active",
+      groups: ["tenant-acme"],
+    })
+    const { unmount } = renderWithAuthz(<PreviewInspectorView />, member)
+    await screen.findByText("PR #101: Deploy Redis Cache")
+    expect(screen.getByRole("button", { name: /Merge PR/i })).toBeDisabled()
+    expect(screen.getByRole("button", { name: /Reject PR/i })).toBeDisabled()
+    expect(screen.getByTestId("pr-actions-permission-hint")).toHaveTextContent(
+      'Requires cluster admin or tenant admin for "tenant-acme"'
+    )
+    unmount()
+
+    const tenantAdmin = buildAuthz({
+      authenticated: true,
+      phase: "oidc-active",
+      groups: ["tenant-acme-admin"],
+    })
+    renderWithAuthz(<PreviewInspectorView />, tenantAdmin)
+    await screen.findByText("PR #101: Deploy Redis Cache")
+    expect(screen.getByRole("button", { name: /Merge PR/i })).toBeEnabled()
+    expect(
+      screen.queryByTestId("pr-actions-permission-hint")
+    ).not.toBeInTheDocument()
+  })
+
+  it("disables actions without an authz provider (unauthenticated default)", async () => {
+    vi.mocked(api.getProposals).mockResolvedValue(mockProposals)
+    vi.mocked(api.getProposalPreview).mockResolvedValue(mockPreview)
+    render(<PreviewInspectorView />)
+    await screen.findByText("PR #101: Deploy Redis Cache")
+    expect(screen.getByRole("button", { name: /Merge PR/i })).toBeDisabled()
+  })
+
+  it("selects the deep-linked PR and reports user selection", async () => {
+    const onSelect = vi.fn()
+    vi.mocked(api.getProposals).mockResolvedValue([
+      mockProposals[0],
+      { ...mockProposals[0], id: "102", title: "Second PR" },
+    ])
+    vi.mocked(api.getProposalPreview).mockResolvedValue(mockPreview)
+
+    const { rerender } = renderWithAuthz(
+      <PreviewInspectorView
+        selectedProposalId="102"
+        onSelectProposal={onSelect}
+      />
+    )
+    await screen.findByText("PR #102: Second PR")
+    expect(api.getProposalPreview).toHaveBeenCalledWith("102")
+    expect(onSelect).not.toHaveBeenCalled()
+
+    fireEvent.click(screen.getByText("Deploy Redis Cache"))
+    await screen.findByText("PR #101: Deploy Redis Cache")
+    expect(onSelect).toHaveBeenCalledWith("101")
+
+    // A new deep link supersedes the manual click.
+    rerender(
+      <PreviewInspectorView
+        selectedProposalId="102"
+        onSelectProposal={onSelect}
+      />
+    )
+    rerender(
+      <PreviewInspectorView
+        selectedProposalId="101"
+        onSelectProposal={onSelect}
+      />
+    )
+    rerender(
+      <PreviewInspectorView
+        selectedProposalId="102"
+        onSelectProposal={onSelect}
+      />
+    )
+    await screen.findByText("PR #102: Second PR")
+  })
+
+  it("shows a notice when the deep-linked PR is not visible", async () => {
+    vi.mocked(api.getProposals).mockResolvedValue(mockProposals)
+    vi.mocked(api.getProposalPreview).mockResolvedValue(mockPreview)
+
+    renderWithAuthz(<PreviewInspectorView selectedProposalId="999" />)
+
+    expect(await screen.findByTestId("pr-deeplink-missing")).toHaveTextContent(
+      "PR #999 not found or not visible"
+    )
+    await screen.findByText("PR #101: Deploy Redis Cache")
   })
 
   it("renders clean empty state when getProposals returns empty array in non-demo mode", async () => {
     vi.mocked(api.getProposals).mockResolvedValue([])
 
-    render(<PreviewInspectorView />)
+    renderWithAuthz(<PreviewInspectorView />)
 
     await waitFor(() => {
       expect(
@@ -253,24 +384,22 @@ describe("PreviewInspectorView component", () => {
       ).toBeInTheDocument()
       expect(
         screen.getByText(
-          "No proposal selected. Create a proposal from the Catalog to inspect PKO preview diffs."
+          "No proposal selected. Create a proposal from the Catalog to inspect its preview diff."
         )
       ).toBeInTheDocument()
     })
   })
 
-  it("initializes with DEFAULT_PROPOSALS and DEFAULT_PREVIEW when demo=true is in location search", async () => {
+  it("renders demo fixtures without calling the live API when demo=true", async () => {
     window.history.replaceState({}, "", "/?demo=true")
-    vi.mocked(api.getProposals).mockResolvedValue([])
-    vi.mocked(api.getProposalPreview).mockRejectedValueOnce(
-      new Error("Preview unavailable in demo")
-    )
-
-    render(<PreviewInspectorView />)
+    renderWithAuthz(<PreviewInspectorView />)
 
     await waitFor(() => {
       expect(screen.getByText(/PR #\d+:/)).toBeInTheDocument()
     })
+    expect(api.getProposals).not.toHaveBeenCalled()
+    expect(api.getProposalPreview).not.toHaveBeenCalled()
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument()
     window.history.replaceState({}, "", "/")
   })
 
@@ -279,24 +408,17 @@ describe("PreviewInspectorView component", () => {
     vi.mocked(api.getProposalPreview).mockResolvedValue(mockPreview)
     vi.mocked(api.mergeProposal).mockRejectedValue("Server timeout")
 
-    render(<PreviewInspectorView />)
-
-    await waitFor(() => {
-      expect(
-        screen.getByText("PR #101: Deploy Redis Cache")
-      ).toBeInTheDocument()
-    })
+    renderWithAuthz(<PreviewInspectorView />)
+    await screen.findByText("PR #101: Deploy Redis Cache")
 
     const prCard = screen.getByText("PR #101").closest('[role="button"]')!
     fireEvent.keyDown(prCard, { key: "Enter" })
     fireEvent.keyDown(prCard, { key: " " })
 
-    const mergeBtn = screen.getByRole("button", { name: /Merge PR Proposal/i })
-    fireEvent.click(mergeBtn)
-
+    fireEvent.click(screen.getByRole("button", { name: /Merge PR/i }))
     await waitFor(() => {
       expect(screen.getByRole("alert")).toHaveTextContent(
-        "Merge operation failed"
+        "Failed to merge PR proposal"
       )
     })
   })
@@ -305,11 +427,11 @@ describe("PreviewInspectorView component", () => {
     vi.mocked(api.getProposals).mockResolvedValue(mockProposals)
     vi.mocked(api.getProposalPreview).mockRejectedValue("Preview offline")
 
-    render(<PreviewInspectorView />)
+    renderWithAuthz(<PreviewInspectorView />)
 
     await waitFor(() => {
       expect(screen.getByRole("alert")).toHaveTextContent(
-        "Failed to load PKO v2 preview diff"
+        "Failed to load preview diff"
       )
     })
   })
@@ -341,7 +463,7 @@ describe("PreviewInspectorView component", () => {
       .mockResolvedValueOnce({ success: false, message: "Cannot reopen" })
       .mockRejectedValueOnce(new Error("Reopen network error"))
 
-    render(<PreviewInspectorView />)
+    renderWithAuthz(<PreviewInspectorView />)
 
     await waitFor(() => {
       expect(screen.getByText("Drift")).toBeInTheDocument()
@@ -372,13 +494,15 @@ describe("PreviewInspectorView component", () => {
       ])
     vi.mocked(api.getProposalPreview).mockResolvedValue(mockPreview)
 
-    render(<PreviewInspectorView />)
+    renderWithAuthz(<PreviewInspectorView />)
 
     await waitFor(() => {
       expect(screen.getByRole("alert")).toHaveTextContent("Proposals API down")
     })
 
-    fireEvent.click(screen.getByRole("button", { name: /^merged$/i }))
+    const mergedTab = screen.getByRole("button", { name: /^merged$/i })
+    fireEvent.click(mergedTab)
+    expect(mergedTab).toHaveAttribute("aria-pressed", "true")
     await waitFor(() => {
       expect(api.getProposals).toHaveBeenCalledWith(undefined, "merged")
       expect(screen.getByText("Pull Requests (3)")).toBeInTheDocument()
@@ -400,7 +524,7 @@ describe("PreviewInspectorView component", () => {
       .mockResolvedValueOnce({ success: false, message: "" })
       .mockRejectedValueOnce("reject string error")
 
-    render(<PreviewInspectorView />)
+    renderWithAuthz(<PreviewInspectorView />)
 
     const secondPr = await screen.findByText("Second PR")
     const card = secondPr.closest("[role='button']") as HTMLElement
@@ -411,20 +535,86 @@ describe("PreviewInspectorView component", () => {
       expect(api.getProposalPreview).toHaveBeenCalledWith("102")
     })
 
-    const rejectBtn = screen.getByRole("button", { name: /Reject PR/i })
-    fireEvent.click(rejectBtn)
+    await confirmReject()
     await waitFor(() => {
       expect(screen.getByRole("alert")).toHaveTextContent(
         "Failed to reject PR proposal"
       )
     })
 
-    fireEvent.click(rejectBtn)
+    await confirmReject()
     await waitFor(() => {
+      expect(api.rejectProposal).toHaveBeenCalledTimes(2)
       expect(screen.getByRole("alert")).toHaveTextContent(
-        "Reject operation failed"
+        "Failed to reject PR proposal"
       )
     })
+  })
+
+  it("shows the PKO run phase and refreshes the preview on PKO preview SSE events", async () => {
+    let onEvent: ((e: CrdWatchEvent) => void) | undefined
+    vi.mocked(api.createEventSourceStream).mockImplementation((ev) => {
+      onEvent = ev
+      return { close: vi.fn() } as unknown as EventSource
+    })
+    vi.mocked(api.getProposals).mockResolvedValue(mockProposals)
+    vi.mocked(api.getProposalPreview)
+      .mockResolvedValueOnce({
+        ...mockPreview,
+        source: "pko",
+        run: { phase: "running", message: "pulumi preview in progress" },
+      })
+      .mockResolvedValue({
+        ...mockPreview,
+        source: "pko",
+        run: { phase: "succeeded", stack: "keel-previews/pr-101" },
+      })
+
+    renderWithAuthz(<PreviewInspectorView />)
+
+    expect(await screen.findByTestId("preview-run-status")).toHaveAttribute(
+      "data-phase",
+      "running"
+    )
+    await waitFor(() => expect(onEvent).toBeDefined())
+    act(() =>
+      onEvent!({
+        kind: "Stack",
+        namespace: "keel-previews",
+        name: "pr-101",
+        status: "Ready",
+        message: "PKO preview succeeded",
+        timestamp: "now",
+      })
+    )
+    await waitFor(() => {
+      expect(screen.getByTestId("preview-run-status")).toHaveAttribute(
+        "data-phase",
+        "succeeded"
+      )
+    })
+    expect(api.getProposalPreview).toHaveBeenCalledTimes(2)
+    expect(screen.getByTestId("preview-run-status")).toHaveTextContent(
+      "keel-previews/pr-101"
+    )
+    expect(screen.getByTestId("policy-status-banner")).toBeInTheDocument()
+  })
+
+  it("hides the policy card when the PKO preview was not executed", async () => {
+    vi.mocked(api.getProposals).mockResolvedValue(mockProposals)
+    vi.mocked(api.getProposalPreview).mockResolvedValue({
+      ...mockPreview,
+      source: "pko",
+      run: { phase: "notExecuted", message: "no infrastructure changes" },
+    })
+
+    renderWithAuthz(<PreviewInspectorView />)
+
+    expect(await screen.findByTestId("preview-run-status")).toHaveTextContent(
+      "Not executed: no infrastructure changes"
+    )
+    expect(screen.queryByTestId("policy-status-banner")).not.toBeInTheDocument()
+    expect(api.createEventSourceStream).not.toHaveBeenCalled()
   })
 
   it("filters PRs via client-side search query by title, branch, ID, tenant, or author", async () => {
@@ -457,7 +647,7 @@ describe("PreviewInspectorView component", () => {
     vi.mocked(api.getProposals).mockResolvedValue(multiPRs)
     vi.mocked(api.getProposalPreview).mockResolvedValue(mockPreview)
 
-    render(<PreviewInspectorView />)
+    renderWithAuthz(<PreviewInspectorView />)
 
     await waitFor(() => {
       expect(screen.getByText("Deploy Redis Cache")).toBeInTheDocument()
@@ -489,5 +679,76 @@ describe("PreviewInspectorView component", () => {
       screen.getByText("No pull requests matching your search.")
     ).toBeInTheDocument()
     expect(screen.queryByText("Scale Kafka")).toBeNull()
+  })
+
+  it("renders policy banner from status instead of hardcoded pass", () => {
+    const { rerender } = render(<PolicyStatusBanner />)
+    const banner = screen.getByTestId("policy-status-banner")
+    expect(banner).toHaveAttribute("data-status", "unknown")
+    expect(
+      screen.getByText("Policy evaluation not available for this preview")
+    ).toBeInTheDocument()
+    expect(screen.getByText("not evaluated")).toBeInTheDocument()
+    expect(screen.queryByText(/PSS passed/)).not.toBeInTheDocument()
+
+    rerender(<PolicyStatusBanner status="failed" />)
+    expect(banner).toHaveAttribute("data-status", "failed")
+    expect(screen.getByText("failed")).toHaveClass("text-red-400")
+
+    rerender(<PolicyStatusBanner status="warning" />)
+    expect(screen.getByText("warning")).toHaveClass("text-amber-400")
+
+    rerender(<PolicyStatusBanner status="passed" />)
+    expect(screen.getByText("passed")).toHaveClass("text-emerald-400")
+  })
+
+  it("shows simulated diff badge and hides the policy card for synthesized previews", async () => {
+    vi.mocked(api.getProposals).mockResolvedValue(mockProposals)
+    vi.mocked(api.getProposalPreview).mockResolvedValue({
+      ...mockPreview,
+      policyStatus: "passed",
+      source: "synthesized",
+    })
+
+    renderWithAuthz(<PreviewInspectorView />)
+
+    await waitFor(() => {
+      expect(screen.getByTestId("simulated-preview-badge")).toHaveTextContent(
+        "Simulated diff — PKO preview not executed"
+      )
+    })
+    expect(screen.getByTestId("preview-source-badge")).toHaveTextContent(
+      "Synthesized (not executed)"
+    )
+    expect(screen.getByTestId("preview-section-title")).toHaveTextContent(
+      /^Preview$/
+    )
+    expect(screen.queryByTestId("policy-status-banner")).not.toBeInTheDocument()
+  })
+
+  it("omits simulated badge for real PKO previews", async () => {
+    vi.mocked(api.getProposals).mockResolvedValue(mockProposals)
+    vi.mocked(api.getProposalPreview).mockResolvedValue({
+      ...mockPreview,
+      source: "pko",
+    })
+
+    renderWithAuthz(<PreviewInspectorView />)
+
+    await waitFor(() => {
+      expect(screen.getByTestId("policy-status-banner")).toHaveAttribute(
+        "data-status",
+        "passed"
+      )
+    })
+    expect(
+      screen.queryByTestId("simulated-preview-badge")
+    ).not.toBeInTheDocument()
+    expect(screen.getByTestId("preview-section-title")).toHaveTextContent(
+      "PKO Preview"
+    )
+    expect(screen.getByTestId("preview-source-badge")).toHaveTextContent(
+      "PKO preview"
+    )
   })
 })

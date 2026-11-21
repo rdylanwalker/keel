@@ -1,4 +1,5 @@
 import { describe, it, expect, afterEach } from "vitest"
+import { parse as parseYaml } from "yaml"
 import {
   cn,
   jsonToYaml,
@@ -17,20 +18,45 @@ describe("jsonToYaml utility", () => {
   it("formats primitives and objects into yaml syntax", () => {
     expect(jsonToYaml(null)).toBe("null\n")
     expect(jsonToYaml(undefined)).toBe("null\n")
+    expect(jsonToYaml(() => {})).toBe("null\n")
     expect(jsonToYaml(true)).toBe("true\n")
     expect(jsonToYaml(42)).toBe("42\n")
     expect(jsonToYaml("hello")).toBe("hello\n")
     expect(jsonToYaml("key: val")).toBe('"key: val"\n')
-    expect(jsonToYaml('quote " test')).toBe('"quote \\" test"\n')
-    expect(jsonToYaml("backslash \\ test")).toBe('"backslash \\\\ test"\n')
-    expect(jsonToYaml("line1\nline2")).toBe('"line1\\nline2"\n')
-    expect(jsonToYaml(["a", "b"])).toBe("\n- a\n- b\n")
+    expect(jsonToYaml(["a", "b"])).toBe("- a\n- b\n")
     expect(jsonToYaml([])).toBe("[]\n")
     expect(jsonToYaml({})).toBe("{}\n")
-    expect(jsonToYaml({ name: "test", nested: { val: 1 } })).toContain(
-      "name: test"
+    expect(jsonToYaml({ name: "test", nested: { val: 1 } })).toBe(
+      "name: test\nnested:\n  val: 1\n"
     )
-    expect(jsonToYaml(() => {})).toContain("=>")
+  })
+
+  it("quotes strings that would otherwise change type or structure", () => {
+    const tricky = {
+      boolLike: "true",
+      empty: "",
+      numLike: "123",
+      nullLike: "null",
+      dash: "-",
+      dashSpace: "- item",
+      hash: "# comment",
+      colon: "a: b",
+      quote: 'quote " test',
+      backslash: "back\\slash",
+      multi: "line1\nline2",
+      docSep: "x\n---\nkind: Secret",
+    }
+    const out = jsonToYaml(tricky)
+    expect(out).toContain('boolLike: "true"')
+    expect(out).toContain('empty: ""')
+    expect(out).toContain('numLike: "123"')
+    expect(out).toContain('nullLike: "null"')
+    expect(out).toContain('dash: "-"')
+    expect(out).toContain('dashSpace: "- item"')
+    expect(out).toContain('hash: "# comment"')
+    expect(out).toContain('colon: "a: b"')
+    // Round-trips exactly (no injected keys/documents, no type coercion).
+    expect(parseYaml(out)).toEqual(tricky)
   })
 })
 

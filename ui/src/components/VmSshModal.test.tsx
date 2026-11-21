@@ -47,6 +47,53 @@ vi.mock("../lib/api", () => ({
   fetchStackSshInfo: vi.fn(),
 }))
 
+// jsdom has no layout/WASM: replace wterm with a DOM-text fake that records writes and
+// lets tests emit keystrokes (onData) and geometry changes (onResize).
+const wtermMock = vi.hoisted(() => {
+  type Opts = {
+    scrollbackLines?: number
+    onData?: (d: string) => void
+    onResize?: (cols: number, rows: number) => void
+  }
+  class FakeWTerm {
+    static instances: FakeWTerm[] = []
+    options: Opts
+    element: HTMLElement
+    written = ""
+    destroyed = false
+    constructor(element: HTMLElement, options: Opts = {}) {
+      this.element = element
+      this.options = options
+      FakeWTerm.instances.push(this)
+    }
+    async init() {
+      return this
+    }
+    // Emulates the container measurement wterm performs on fit().
+    fit() {
+      this.emitResize(100, 30)
+    }
+    write(data: string) {
+      this.written += data
+      this.element.textContent = this.written
+    }
+    focus() {}
+    emitData(d: string) {
+      this.options.onData?.(d)
+    }
+    emitResize(cols: number, rows: number) {
+      this.options.onResize?.(cols, rows)
+    }
+    destroy() {
+      this.destroyed = true
+    }
+  }
+  return { FakeWTerm }
+})
+
+vi.mock("@wterm/dom", () => ({ WTerm: wtermMock.FakeWTerm }))
+vi.mock("@wterm/dom/src/terminal.css", () => ({}))
+
 const sampleSshInfo: StackSshInfo = {
   stackName: "pve-workload-prod",
   namespace: "tenant-acme",
@@ -65,6 +112,7 @@ describe("VmSshModal component", () => {
   beforeEach(() => {
     vi.clearAllMocks()
     MockWebSocket.instances = []
+    wtermMock.FakeWTerm.instances = []
     vi.stubGlobal("WebSocket", MockWebSocket)
     Object.assign(navigator, {
       clipboard: {
@@ -225,10 +273,12 @@ describe("VmSshModal component", () => {
       expect(ws.sentMessages.length).toBeGreaterThan(0)
     })
     const connectFrame = JSON.parse(ws.sentMessages[0])
-    // Verify connect frame contains overridden host
+    // Verify connect frame contains overridden host and fitted terminal geometry
     expect(connectFrame).toEqual(
       expect.objectContaining({
         type: "connect",
+        cols: 100,
+        rows: 30,
         host: "192.168.1.150",
         user: "debian",
         port: 22,
@@ -250,24 +300,37 @@ describe("VmSshModal component", () => {
       )
     })
 
-    // Type a command and send it
-    const commandInput = screen.getByTestId("terminal-command-input")
-    fireEvent.change(commandInput, { target: { value: "uptime" } })
-    fireEvent.click(screen.getByTestId("terminal-send-btn"))
-
-    expect(ws.sentMessages).toHaveLength(2)
-    const inputFrame = JSON.parse(ws.sentMessages[1])
-    expect(inputFrame).toEqual({
-      type: "input",
-      data: "uptime\n",
+    // Raw keystrokes stream as-is (no line buffering), incl. control characters
+    const term = wtermMock.FakeWTerm.instances[0]
+    expect(term.options.scrollbackLines).toBe(5000)
+    act(() => {
+      term.emitData("u")
+      term.emitData("\x03")
+      term.emitData("uptime\r")
     })
-    expect(commandInput).toHaveValue("")
+    expect(ws.sentMessages.slice(1).map((m) => JSON.parse(m))).toEqual([
+      { type: "input", data: "u" },
+      { type: "input", data: "\x03" },
+      { type: "input", data: "uptime\r" },
+    ])
 
-    // Disconnect terminal
+    // Terminal geometry changes are forwarded as PTY resize frames
+    act(() => {
+      term.emitResize(132, 40)
+    })
+    expect(JSON.parse(ws.sentMessages[4])).toEqual({
+      type: "resize",
+      cols: 132,
+      rows: 40,
+    })
+
+    // Disconnect terminal: polite disconnect frame, then close
     const disconnectBtn = screen.getByTestId("disconnect-browser-terminal-btn")
     fireEvent.click(disconnectBtn)
 
+    expect(JSON.parse(ws.sentMessages[5])).toEqual({ type: "disconnect" })
     expect(ws.readyState).toBe(MockWebSocket.CLOSED)
+    expect(term.destroyed).toBe(true)
     expect(
       screen.getByTestId("launch-browser-terminal-btn")
     ).toBeInTheDocument()
@@ -383,6 +446,12 @@ describe("VmSshModal component", () => {
     expect(screen.getByTestId("browser-ssh-terminal")).toHaveTextContent(
       "[Session Connected]"
     )
+    expect(screen.getByTestId("ssh-terminal-status")).toHaveTextContent(
+      "Connected"
+    )
+    expect(screen.getByTestId("ssh-host-key-fingerprint")).toHaveTextContent(
+      "fingerprint unavailable"
+    )
 
     // Error message
     act(() => {
@@ -419,13 +488,127 @@ describe("VmSshModal component", () => {
       "[WebSocket connection error]"
     )
 
-    // ws.onclose
+    // Server-side disconnected frame, then ws.onclose
+    act(() => {
+      ws.receiveMessage({ type: "disconnected" })
+    })
+    expect(screen.getByTestId("ssh-terminal-status")).not.toHaveTextContent(
+      /^Connected$/
+    )
     act(() => {
       ws.close()
     })
     expect(screen.getByTestId("browser-ssh-terminal")).toHaveTextContent(
       "[Session Disconnected]"
     )
+    expect(screen.getByTestId("ssh-terminal-status")).toHaveTextContent(
+      "Connecting..."
+    )
+  })
+
+  it("shows the host key fingerprint with a warning badge when the host key is unverified", async () => {
+    vi.mocked(api.fetchStackSshInfo).mockResolvedValue(sampleSshInfo)
+
+    render(
+      <VmSshModal
+        stackName="pve-workload-prod"
+        namespace="tenant-acme"
+        tenant="acme"
+        onClose={vi.fn()}
+      />
+    )
+
+    fireEvent.click(await screen.findByTestId("launch-browser-terminal-btn"))
+    const ws = MockWebSocket.instances[0]
+
+    act(() => {
+      ws.receiveMessage({
+        type: "connected",
+        host: "192.168.1.150",
+        user: "debian",
+        port: 22,
+        message: "Connected to debian@192.168.1.150:22",
+        hostKeyFingerprint: "SHA256:abc123",
+        hostKeyVerified: false,
+      })
+    })
+
+    expect(screen.getByTestId("ssh-host-key-unverified")).toHaveTextContent(
+      "Host key NOT verified"
+    )
+    expect(screen.getByTestId("ssh-host-key-fingerprint")).toHaveTextContent(
+      "SHA256:abc123"
+    )
+    expect(screen.getByText(/Compare this fingerprint/i)).toBeInTheDocument()
+  })
+
+  it("shows a verified badge when the server verified the host key", async () => {
+    vi.mocked(api.fetchStackSshInfo).mockResolvedValue(sampleSshInfo)
+
+    render(
+      <VmSshModal
+        stackName="pve-workload-prod"
+        namespace="tenant-acme"
+        tenant="acme"
+        onClose={vi.fn()}
+      />
+    )
+
+    fireEvent.click(await screen.findByTestId("launch-browser-terminal-btn"))
+    const ws = MockWebSocket.instances[0]
+    act(() => {
+      ws.receiveMessage({
+        type: "connected",
+        hostKeyFingerprint: "SHA256:pinned",
+        hostKeyVerified: true,
+      })
+    })
+
+    expect(screen.getByText("Host key verified")).toBeInTheDocument()
+    expect(
+      screen.queryByTestId("ssh-host-key-unverified")
+    ).not.toBeInTheDocument()
+    expect(screen.getByTestId("ssh-host-key-fingerprint")).toHaveTextContent(
+      "SHA256:pinned"
+    )
+  })
+
+  it("closes on Escape via the dialog", async () => {
+    vi.mocked(api.fetchStackSshInfo).mockResolvedValue(sampleSshInfo)
+    const onClose = vi.fn()
+
+    render(
+      <VmSshModal
+        stackName="pve-workload-prod"
+        namespace="tenant-acme"
+        tenant="acme"
+        onClose={onClose}
+      />
+    )
+
+    const dialog = await screen.findByRole("dialog")
+    fireEvent.keyDown(dialog, { key: "Escape" })
+    expect(onClose).toHaveBeenCalled()
+  })
+
+  it("closes when the hash route changes", async () => {
+    vi.mocked(api.fetchStackSshInfo).mockResolvedValue(sampleSshInfo)
+    const onClose = vi.fn()
+
+    render(
+      <VmSshModal
+        stackName="pve-workload-prod"
+        namespace="tenant-acme"
+        tenant="acme"
+        onClose={onClose}
+      />
+    )
+
+    await screen.findByRole("dialog")
+    act(() => {
+      window.dispatchEvent(new HashChangeEvent("hashchange"))
+    })
+    expect(onClose).toHaveBeenCalled()
   })
 
   it("handles WebSocket constructor failure", async () => {
@@ -454,9 +637,12 @@ describe("VmSshModal component", () => {
     vi.stubGlobal("WebSocket", FailingWebSocket)
 
     fireEvent.click(screen.getByTestId("launch-browser-terminal-btn"))
-    expect(screen.getByTestId("browser-ssh-terminal")).toHaveTextContent(
-      "[Failed to launch terminal: WebSocket creation failed]"
-    )
+    // wterm initializes asynchronously; buffered output is flushed once it is ready.
+    await waitFor(() => {
+      expect(screen.getByTestId("browser-ssh-terminal")).toHaveTextContent(
+        "[Failed to launch terminal: WebSocket creation failed]"
+      )
+    })
   })
 
   it("handles fallback values when provider, tenant, user and port are empty", async () => {

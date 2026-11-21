@@ -1,7 +1,10 @@
-import { render, screen, fireEvent, waitFor } from "@testing-library/react"
+import { screen, fireEvent, waitFor, act } from "@testing-library/react"
 import { describe, it, expect, vi, beforeEach } from "vitest"
 import { StackInspectorModal } from "./StackInspectorModal"
 import * as api from "../lib/api"
+import { ApiError } from "../lib/errors"
+import { ANONYMOUS_AUTHZ, buildAuthz } from "../lib/authz"
+import { renderWithAuthz } from "../test/render"
 
 vi.mock("../lib/api", () => ({
   getStackDiagnostics: vi.fn(),
@@ -68,7 +71,7 @@ describe("StackInspectorModal component", () => {
   it("loads and renders stack diagnostics, metadata, conditions, events, and logs", async () => {
     vi.mocked(api.getStackDiagnostics).mockResolvedValue(sampleDiagnostics)
 
-    render(
+    renderWithAuthz(
       <StackInspectorModal
         namespace="tenant-acme"
         name="prod-cluster"
@@ -115,7 +118,7 @@ describe("StackInspectorModal component", () => {
       message: "Workspace pod deleted for rollout restart",
     })
 
-    render(
+    renderWithAuthz(
       <StackInspectorModal
         namespace="tenant-acme"
         name="prod-cluster"
@@ -142,7 +145,7 @@ describe("StackInspectorModal component", () => {
       new Error("Release not found")
     )
 
-    render(
+    renderWithAuthz(
       <StackInspectorModal
         namespace="tenant-acme"
         name="podinfo"
@@ -155,13 +158,144 @@ describe("StackInspectorModal component", () => {
     expect(
       screen.queryByTestId("inspector-advanced-toggle")
     ).not.toBeInTheDocument()
+    // UI-11: release-appropriate section labels
+    expect(screen.getByText("Release Conditions")).toBeInTheDocument()
+    expect(screen.getByText(/Release Events \(0\)/)).toBeInTheDocument()
+    expect(screen.getByText(/Application Pod Logs/)).toBeInTheDocument()
+    expect(screen.queryByText("Stack Conditions")).not.toBeInTheDocument()
+    expect(screen.queryByText(/Workspace Pod Logs/)).not.toBeInTheDocument()
+  })
+
+  it("uses stack labels for PKO stacks", async () => {
+    vi.mocked(api.getStackDiagnostics).mockResolvedValue(sampleDiagnostics)
+    renderWithAuthz(
+      <StackInspectorModal
+        namespace="tenant-acme"
+        name="prod-cluster"
+        onClose={onClose}
+      />
+    )
+    expect(await screen.findByText("Stack Conditions")).toBeInTheDocument()
+    expect(screen.getByText(/Workspace Pod Logs/)).toBeInTheDocument()
+    expect(screen.getByText(/Recent Kubernetes Events/)).toBeInTheDocument()
+  })
+
+  it("shows correlation id for server errors", async () => {
+    vi.mocked(api.getStackDiagnostics).mockRejectedValueOnce(
+      new ApiError(500, "Internal server error", { correlationId: "corr-42" })
+    )
+    renderWithAuthz(
+      <StackInspectorModal
+        namespace="tenant-acme"
+        name="prod-cluster"
+        onClose={onClose}
+      />
+    )
+    expect(
+      await screen.findByText("Internal server error (reference: corr-42)")
+    ).toBeInTheDocument()
+  })
+
+  it("disables unlock/force-delete/restart for non tenant-admins (read-only)", async () => {
+    vi.mocked(api.getStackDiagnostics).mockResolvedValue(sampleDiagnostics)
+    const member = buildAuthz({
+      authenticated: true,
+      phase: "oidc-active",
+      groups: ["tenant-acme"],
+    })
+    renderWithAuthz(
+      <StackInspectorModal
+        namespace="tenant-acme"
+        name="prod-cluster"
+        tenant="acme"
+        onClose={onClose}
+      />,
+      member
+    )
+    await screen.findByText("Pod: Running")
+    expect(screen.getByTestId("inspector-unlock-btn")).toBeDisabled()
+    expect(screen.getByTestId("inspector-force-delete-btn")).toBeDisabled()
+    expect(screen.getByTestId("inspector-force-delete-btn")).toHaveAttribute(
+      "title",
+      "Tenant administrator privileges required"
+    )
+    expect(screen.getByTestId("inspector-readonly-note")).toBeInTheDocument()
+    fireEvent.click(screen.getByTestId("inspector-advanced-toggle"))
+    expect(screen.getByTestId("inspector-restart-workspace-btn")).toBeDisabled()
+  })
+
+  it("enables operational actions for the tenant admin of the stack's tenant", async () => {
+    vi.mocked(api.getStackDiagnostics).mockResolvedValue(sampleDiagnostics)
+    const tenantAdmin = buildAuthz({
+      authenticated: true,
+      phase: "oidc-active",
+      groups: ["tenant-acme-admin"],
+    })
+    renderWithAuthz(
+      <StackInspectorModal
+        namespace="tenant-acme"
+        name="prod-cluster"
+        onClose={onClose}
+      />,
+      tenantAdmin
+    )
+    await screen.findByText("Pod: Running")
+    expect(screen.getByTestId("inspector-unlock-btn")).toBeEnabled()
+    expect(screen.getByTestId("inspector-force-delete-btn")).toBeEnabled()
+    expect(
+      screen.queryByTestId("inspector-readonly-note")
+    ).not.toBeInTheDocument()
+  })
+
+  it("restricts management-plane stack actions to cluster admins", async () => {
+    vi.mocked(api.getStackDiagnostics).mockResolvedValue(sampleDiagnostics)
+    const tenantAdmin = buildAuthz({
+      authenticated: true,
+      phase: "oidc-active",
+      groups: ["flux-system-admin"],
+    })
+    renderWithAuthz(
+      <StackInspectorModal
+        namespace="flux-system"
+        name="management-cluster-core"
+        onClose={onClose}
+      />,
+      tenantAdmin
+    )
+    await screen.findByText("Pod: Running")
+    expect(screen.getByTestId("inspector-unlock-btn")).toBeDisabled()
+    expect(screen.getByTestId("inspector-unlock-btn")).toHaveAttribute(
+      "title",
+      "Cluster administrator privileges required for management-plane stacks"
+    )
+  })
+
+  it("treats anonymous callers as read-only and closes on Escape and route change", async () => {
+    vi.mocked(api.getStackDiagnostics).mockResolvedValue(sampleDiagnostics)
+    const close = vi.fn()
+    renderWithAuthz(
+      <StackInspectorModal
+        namespace="tenant-acme"
+        name="prod-cluster"
+        onClose={close}
+      />,
+      ANONYMOUS_AUTHZ
+    )
+    await screen.findByText("Pod: Running")
+    expect(screen.getByTestId("inspector-unlock-btn")).toBeDisabled()
+    fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" })
+    expect(close).toHaveBeenCalledTimes(1)
+    act(() => {
+      window.dispatchEvent(new HashChangeEvent("hashchange"))
+    })
+    expect(close).toHaveBeenCalledTimes(2)
   })
 
   it("renders SSH / Connect button for stacks and triggers onOpenSsh", async () => {
     vi.mocked(api.getStackDiagnostics).mockResolvedValue(sampleDiagnostics)
     const onOpenSsh = vi.fn()
 
-    render(
+    renderWithAuthz(
       <StackInspectorModal
         namespace="tenant-acme"
         name="prod-vm"
@@ -180,7 +314,7 @@ describe("StackInspectorModal component", () => {
   it("disables SSH / Connect button for kind and non-VM stacks", async () => {
     vi.mocked(api.getStackDiagnostics).mockResolvedValue(sampleDiagnostics)
 
-    render(
+    renderWithAuthz(
       <StackInspectorModal
         namespace="flux-system"
         name="management-cluster-core"
@@ -208,7 +342,7 @@ describe("StackInspectorModal component", () => {
         "Cleared finalizers on terminating Stack tenant-default/azure-free-tier-vm",
     })
 
-    render(
+    renderWithAuthz(
       <StackInspectorModal
         namespace="tenant-default"
         name="azure-free-tier-vm"
@@ -244,7 +378,7 @@ describe("StackInspectorModal component", () => {
       .mockRejectedValueOnce(new Error("Forbidden: protected stack"))
       .mockRejectedValueOnce("unexpected string error")
 
-    render(
+    renderWithAuthz(
       <StackInspectorModal
         namespace="tenant-default"
         name="azure-free-tier-vm"
@@ -255,22 +389,37 @@ describe("StackInspectorModal component", () => {
     )
 
     fireEvent.click(await screen.findByTestId("inspector-force-delete-btn"))
+    expect(
+      await screen.findByRole("alertdialog", {
+        name: "Force delete this Stack?",
+      })
+    ).toBeInTheDocument()
     expect(screen.getByTestId("confirm-force-delete-btn")).toBeInTheDocument()
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }))
-    expect(
-      screen.queryByTestId("confirm-force-delete-btn")
-    ).not.toBeInTheDocument()
+    await waitFor(() =>
+      expect(
+        screen.queryByTestId("confirm-force-delete-btn")
+      ).not.toBeInTheDocument()
+    )
     expect(api.forceDeleteStack).not.toHaveBeenCalled()
 
     // First failure: Error instance
     fireEvent.click(screen.getByTestId("inspector-force-delete-btn"))
-    fireEvent.click(screen.getByTestId("confirm-force-delete-btn"))
+    fireEvent.click(await screen.findByTestId("confirm-force-delete-btn"))
     expect(
       await screen.findByText("Forbidden: protected stack")
     ).toBeInTheDocument()
 
+    // Confirming closes the dialog; the second attempt re-opens it.
+    await waitFor(() =>
+      expect(
+        screen.queryByTestId("confirm-force-delete-btn")
+      ).not.toBeInTheDocument()
+    )
+
     // Second failure: non-Error thrown
-    fireEvent.click(screen.getByTestId("confirm-force-delete-btn"))
+    fireEvent.click(screen.getByTestId("inspector-force-delete-btn"))
+    fireEvent.click(await screen.findByTestId("confirm-force-delete-btn"))
     expect(
       await screen.findByText("Failed to force-delete stack")
     ).toBeInTheDocument()
@@ -291,7 +440,7 @@ describe("StackInspectorModal component", () => {
       message: "Unlocked stack tenant-default/azure-free-tier-vm",
     })
 
-    render(
+    renderWithAuthz(
       <StackInspectorModal
         namespace="tenant-default"
         name="azure-free-tier-vm"
@@ -336,7 +485,7 @@ describe("StackInspectorModal component", () => {
       ],
     })
 
-    render(
+    renderWithAuthz(
       <StackInspectorModal
         namespace="tenant-default"
         name="azure-free-tier-vm"

@@ -71,9 +71,7 @@ describe("api client module", () => {
       })
     )
 
-    await expect(getAuthStatus()).rejects.toThrow(
-      "API error (400): Validation error occurred"
-    )
+    await expect(getAuthStatus()).rejects.toThrow("Validation error occurred")
 
     vi.stubGlobal(
       "fetch",
@@ -88,7 +86,7 @@ describe("api client module", () => {
     )
 
     await expect(getAuthStatus()).rejects.toThrow(
-      "API error (502): Bad Gateway"
+      "The Keel server could not complete the request (HTTP 502 Bad Gateway)."
     )
   })
 
@@ -233,6 +231,7 @@ describe("api client module", () => {
               url: "https://git.local/pr/7",
               report: {
                 summary: { create: 1, update: 0, delete: 0, replace: 0 },
+                source: "synthesized",
               },
             }),
           })
@@ -247,6 +246,9 @@ describe("api client module", () => {
     const wrappedPreview = await getProposalPreview(7)
     expect(wrappedPreview.prUrl).toBe("https://git.local/pr/7")
     expect(wrappedPreview.resources).toEqual([])
+    // Absent policy status must not be reported as "passed".
+    expect(wrappedPreview.policyStatus).toBeUndefined()
+    expect(wrappedPreview.source).toBe("synthesized")
 
     const wrappedMerge = await mergeProposal(7)
     expect(wrappedMerge.success).toBe(true)
@@ -706,7 +708,7 @@ describe("api client module", () => {
     )
 
     await expect(getStacks()).rejects.toThrow(
-      "API error (401): Authentication session has expired"
+      "Authentication session has expired"
     )
     expect(onUnauthorized).toHaveBeenCalledTimes(1)
 

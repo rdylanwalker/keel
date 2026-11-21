@@ -1,19 +1,37 @@
-import React, { useEffect, useRef, useState } from "react"
+import React, { useCallback, useEffect, useRef, useState } from "react"
 import {
   AlertCircle,
   Check,
-  Copy,
   Key,
   Loader2,
   Maximize2,
   Minimize2,
   Play,
+  ShieldAlert,
+  ShieldCheck,
   Square,
   Terminal as TerminalIcon,
   X,
 } from "lucide-react"
 import { StackSshInfo } from "../types/api"
 import { fetchStackSshInfo } from "../lib/api"
+import { errorMessage } from "../lib/errors"
+import { cn } from "../lib/utils"
+import {
+  Dialog,
+  DialogBody,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from "./ui/dialog"
+import { Badge } from "./ui/badge"
+import { Button } from "./ui/button"
+import { Input } from "./ui/input"
+import { Label } from "./ui/label"
+import { Textarea } from "./ui/textarea"
+import { TerminalHandle, WebTerminal } from "./ssh/WebTerminal"
+import { CopyCommandBlock } from "./ssh/CopyCommandBlock"
 
 export interface VmSshModalProps {
   stackName: string
@@ -22,6 +40,39 @@ export interface VmSshModalProps {
   provider?: string
   onClose: () => void
 }
+
+/** Host key details reported by the server's `connected` frame. */
+export interface SshHostKeyInfo {
+  fingerprint?: string
+  verified: boolean
+}
+
+/**
+ * Server → client WebSocket frames (`crates/keel-server/src/ssh.rs` `SshWsServerMessage`).
+ * Client → server frames: `connect` (with cols/rows/host/user/port/privateKey), raw
+ * keystroke `input` (`{type:"input",data}`), PTY `resize` (`{type:"resize",cols,rows}`),
+ * and `disconnect`.
+ */
+type SshServerFrame =
+  | {
+      type: "connected"
+      host?: string
+      user?: string
+      port?: number
+      message?: string
+      hostKeyFingerprint?: string | null
+      hostKeyVerified?: boolean
+    }
+  | { type: "output"; data: string }
+  | { type: "error"; message?: string }
+  | { type: "disconnected" }
+  | { type?: string; data?: unknown; message?: unknown }
+
+const ANSI_DIM = "\x1b[90m"
+const ANSI_RED = "\x1b[31m"
+const ANSI_GREEN = "\x1b[32m"
+const ANSI_YELLOW = "\x1b[33m"
+const ANSI_RESET = "\x1b[0m"
 
 export const VmSshModal: React.FC<VmSshModalProps> = ({
   stackName,
@@ -42,18 +93,17 @@ export const VmSshModal: React.FC<VmSshModalProps> = ({
   const [privateKey, setPrivateKey] = useState("")
   const [showPrivateKeyInput, setShowPrivateKeyInput] = useState(false)
 
-  // Copy status indicators
   const [copiedKey, setCopiedKey] = useState<string | null>(null)
 
   // Terminal state - CRITICAL: terminal and WebSocket must NEVER be opened automatically on mount!
   const [isTerminalActive, setIsTerminalActive] = useState(false)
   const [terminalConnected, setTerminalConnected] = useState(false)
-  const [terminalOutput, setTerminalOutput] = useState<string>("")
-  const [terminalInput, setTerminalInput] = useState("")
-  const [terminalError, setTerminalError] = useState<string | null>(null)
+  const [sessionEstablished, setSessionEstablished] = useState(false)
+  const [hostKey, setHostKey] = useState<SshHostKeyInfo | null>(null)
 
   const wsRef = useRef<WebSocket | null>(null)
-  const terminalScrollRef = useRef<HTMLDivElement | null>(null)
+  const termRef = useRef<TerminalHandle | null>(null)
+  const pendingWritesRef = useRef<string[]>([])
 
   useEffect(() => {
     let cancelled = false
@@ -73,9 +123,7 @@ export const VmSshModal: React.FC<VmSshModalProps> = ({
       .catch((err) => {
         if (!cancelled) {
           setError(
-            err instanceof Error
-              ? err.message
-              : "Failed to load stack SSH connection info"
+            errorMessage(err, "Failed to load stack SSH connection info")
           )
         }
       })
@@ -104,21 +152,13 @@ export const VmSshModal: React.FC<VmSshModalProps> = ({
     }
   }, [])
 
-  // Auto-scroll terminal viewport on new output
-  useEffect(() => {
-    if (terminalScrollRef.current) {
-      terminalScrollRef.current.scrollTop =
-        terminalScrollRef.current.scrollHeight
-    }
-  }, [terminalOutput])
-
   const effectiveUser = userOverride.trim() || sshInfo?.sshUser || "root"
   const effectivePort = portOverride.trim()
     ? parseInt(portOverride.trim(), 10) || 22
     : sshInfo?.sshPort || 22
   const effectiveHost = hostOverride.trim() || sshInfo?.sshHost || "127.0.0.1"
   const effectiveTenant = tenant || sshInfo?.tenant || "default"
-  const effectiveProvider = provider || sshInfo?.provider || "proxmox"
+  const effectiveProvider = provider || sshInfo?.provider || "unknown"
 
   const rawSshCommand = `ssh ${effectiveUser}@${effectiveHost} -p ${effectivePort}`
   const cliPrintCommand = `keel infra ssh ${stackName} --tenant ${effectiveTenant}`
@@ -134,14 +174,91 @@ export const VmSshModal: React.FC<VmSshModalProps> = ({
     }, 2000)
   }
 
+  const writeTerm = useCallback((data: string) => {
+    if (termRef.current) {
+      termRef.current.write(data)
+    } else {
+      pendingWritesRef.current.push(data)
+    }
+  }, [])
+
+  const sendFrame = useCallback((frame: Record<string, unknown>) => {
+    const ws = wsRef.current
+    if (!ws || ws.readyState !== WebSocket.OPEN) return false
+    ws.send(JSON.stringify(frame))
+    return true
+  }, [])
+
+  const handleTerminalReady = useCallback((handle: TerminalHandle) => {
+    termRef.current = handle
+    const pending = pendingWritesRef.current
+    pendingWritesRef.current = []
+    pending.forEach((chunk) => handle.write(chunk))
+  }, [])
+
+  const handleTerminalData = useCallback(
+    (data: string) => {
+      sendFrame({ type: "input", data })
+    },
+    [sendFrame]
+  )
+
+  const handleTerminalResize = useCallback(
+    (cols: number, rows: number) => {
+      sendFrame({ type: "resize", cols, rows })
+    },
+    [sendFrame]
+  )
+
+  const handleServerFrame = (raw: unknown) => {
+    let msg: SshServerFrame
+    try {
+      msg = JSON.parse(String(raw)) as SshServerFrame
+    } catch {
+      // Non-JSON raw stream output
+      writeTerm(String(raw))
+      return
+    }
+    if (msg.type === "output" && typeof msg.data === "string") {
+      writeTerm(msg.data)
+    } else if (msg.type === "connected") {
+      const connected = msg as Extract<SshServerFrame, { type: "connected" }>
+      setTerminalConnected(true)
+      setSessionEstablished(true)
+      setHostKey({
+        fingerprint: connected.hostKeyFingerprint || undefined,
+        verified: Boolean(connected.hostKeyVerified),
+      })
+      writeTerm(
+        `${ANSI_GREEN}[Session Connected]${ANSI_RESET} ${ANSI_DIM}${connected.message ?? ""}${ANSI_RESET}\r\n`
+      )
+      termRef.current?.focus()
+    } else if (msg.type === "error") {
+      const errorMsg =
+        typeof msg.message === "string" && msg.message
+          ? msg.message
+          : "SSH Terminal error"
+      writeTerm(`\r\n${ANSI_RED}[Error: ${errorMsg}]${ANSI_RESET}\r\n`)
+    } else if (msg.type === "disconnected") {
+      setSessionEstablished(false)
+    } else {
+      const loose = msg as { data?: unknown }
+      if (typeof loose.data === "string") {
+        writeTerm(loose.data)
+      }
+    }
+  }
+
   const handleLaunchTerminal = () => {
     if (isTerminalActive && wsRef.current) return
 
+    pendingWritesRef.current = []
     setIsTerminalActive(true)
     setTerminalConnected(false)
-    setTerminalError(null)
-    setTerminalOutput(
-      `[Connecting to ${effectiveUser}@${effectiveHost}:${effectivePort}...]\r\n`
+    setSessionEstablished(false)
+    setHostKey(null)
+    writeTerm(
+      `${ANSI_YELLOW}[Connecting to ${effectiveUser}@${effectiveHost}:${effectivePort}...]${ANSI_RESET}\r\n`
     )
 
     try {
@@ -154,163 +271,154 @@ export const VmSshModal: React.FC<VmSshModalProps> = ({
 
       ws.onopen = () => {
         setTerminalConnected(true)
-        const connectFrame = {
-          type: "connect",
+        const { cols, rows } = termRef.current?.size() ?? {
           cols: 80,
           rows: 24,
-          host: effectiveHost,
-          user: effectiveUser,
-          port: effectivePort,
-          ...(privateKey.trim() ? { privateKey: privateKey.trim() } : {}),
         }
-        ws.send(JSON.stringify(connectFrame))
+        ws.send(
+          JSON.stringify({
+            type: "connect",
+            cols,
+            rows,
+            host: effectiveHost,
+            user: effectiveUser,
+            port: effectivePort,
+            ...(privateKey.trim() ? { privateKey: privateKey.trim() } : {}),
+          })
+        )
       }
 
-      ws.onmessage = (event) => {
-        try {
-          const msg = JSON.parse(event.data)
-          if (msg.type === "output" && typeof msg.data === "string") {
-            setTerminalOutput((prev) => prev + msg.data)
-          } else if (msg.type === "connected") {
-            setTerminalConnected(true)
-            setTerminalOutput((prev) => prev + `[Session Connected]\r\n`)
-          } else if (msg.type === "error") {
-            const errorMsg = msg.message || "SSH Terminal error"
-            setTerminalError(errorMsg)
-            setTerminalOutput((prev) => prev + `\r\n[Error: ${errorMsg}]\r\n`)
-          } else if (typeof msg.data === "string") {
-            setTerminalOutput((prev) => prev + msg.data)
-          }
-        } catch {
-          // If non-JSON raw stream output
-          setTerminalOutput((prev) => prev + String(event.data))
-        }
-      }
+      ws.onmessage = (event) => handleServerFrame(event.data)
 
       ws.onerror = () => {
-        setTerminalError("WebSocket connection error")
-        setTerminalOutput(
-          (prev) => prev + `\r\n[WebSocket connection error]\r\n`
+        writeTerm(
+          `\r\n${ANSI_RED}[WebSocket connection error]${ANSI_RESET}\r\n`
         )
       }
 
       ws.onclose = () => {
         setTerminalConnected(false)
-        setTerminalOutput((prev) => prev + `\r\n[Session Disconnected]\r\n`)
+        setSessionEstablished(false)
+        writeTerm(`\r\n${ANSI_DIM}[Session Disconnected]${ANSI_RESET}\r\n`)
       }
     } catch (err) {
-      const msg =
-        err instanceof Error ? err.message : "Failed to open WebSocket"
-      setTerminalError(msg)
-      setTerminalOutput(
-        (prev) => prev + `\r\n[Failed to launch terminal: ${msg}]\r\n`
+      const msg = errorMessage(err, "Failed to open WebSocket")
+      writeTerm(
+        `\r\n${ANSI_RED}[Failed to launch terminal: ${msg}]${ANSI_RESET}\r\n`
       )
     }
   }
 
   const handleDisconnectTerminal = () => {
-    if (wsRef.current) {
+    const ws = wsRef.current
+    if (ws) {
       try {
-        wsRef.current.close()
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: "disconnect" }))
+        }
+        ws.close()
       } catch {
         // ignore
       }
       wsRef.current = null
     }
+    termRef.current = null
+    pendingWritesRef.current = []
     setTerminalConnected(false)
+    setSessionEstablished(false)
     setIsTerminalActive(false)
   }
 
-  const handleSendTerminalInput = (e?: React.FormEvent) => {
-    if (e) e.preventDefault()
-    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return
-
-    const data = terminalInput + "\n"
-    wsRef.current.send(JSON.stringify({ type: "input", data }))
-    setTerminalInput("")
-  }
-
   return (
-    <div
-      role="dialog"
-      aria-modal="true"
-      aria-label={`SSH Connect - ${stackName}`}
-      className={`fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm ${
-        isFullscreen ? "p-0" : "p-4"
-      }`}
+    <Dialog
+      open
+      onOpenChange={(open) => {
+        if (!open) onClose()
+      }}
     >
-      <div
-        className={`w-full flex flex-col bg-slate-900 border border-slate-700/80 shadow-2xl overflow-hidden ${
-          isFullscreen
-            ? "h-screen max-w-none rounded-none border-0"
-            : "max-w-4xl max-h-[92vh] rounded-2xl"
-        }`}
+      <DialogContent
+        size="xl"
+        hideClose
+        aria-label={`SSH Connect - ${stackName}`}
+        className={cn(
+          isFullscreen &&
+            "w-screen h-dvh max-h-dvh sm:max-w-none rounded-none border-0"
+        )}
       >
-        {/* Header */}
-        <div className="flex items-center justify-between px-6 py-4 border-b border-slate-800 bg-slate-950/70">
-          <div className="flex items-center gap-3">
-            <div className="p-2 rounded-xl bg-emerald-500/10 border border-emerald-500/20 text-emerald-400">
-              <TerminalIcon className="h-5 w-5" />
-            </div>
-            <div>
-              <div className="flex items-center gap-2">
-                <h3 className="text-base font-bold text-white font-mono">
-                  SSH Connect: {stackName}
-                </h3>
-                <span className="text-[10px] font-semibold uppercase px-2 py-0.5 rounded-full bg-slate-800 text-slate-300 border border-slate-700">
-                  {effectiveProvider}
-                </span>
-                {effectiveTenant && (
-                  <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-indigo-500/10 text-indigo-300 border border-indigo-500/20">
-                    tenant: {effectiveTenant}
-                  </span>
-                )}
+        <DialogHeader className="pr-5 bg-slate-950/70">
+          <div className="flex items-start justify-between gap-3">
+            <div className="flex items-start gap-3 min-w-0">
+              <div className="p-2 rounded-xl bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 shrink-0">
+                <TerminalIcon className="h-5 w-5" />
               </div>
-              <p className="text-xs text-slate-400 mt-0.5">
-                Target VM connection info, direct SSH commands, and optional
-                in-browser web terminal
-              </p>
+              <div className="min-w-0">
+                <DialogTitle
+                  className="truncate font-mono"
+                  title={`SSH Connect: ${stackName}`}
+                >
+                  SSH Connect: {stackName}
+                </DialogTitle>
+                <div className="flex flex-wrap items-center gap-1.5 mt-1">
+                  <Badge variant="secondary" className="uppercase">
+                    {effectiveProvider}
+                  </Badge>
+                  {effectiveTenant && (
+                    <Badge className="font-mono">
+                      tenant: {effectiveTenant}
+                    </Badge>
+                  )}
+                </div>
+                <DialogDescription className="mt-1">
+                  Target VM connection info, direct SSH commands, and optional
+                  in-browser web terminal
+                </DialogDescription>
+              </div>
+            </div>
+
+            <div className="flex items-center gap-1 shrink-0">
+              <Button
+                variant="ghost"
+                size="icon-sm"
+                onClick={() => setIsFullscreen((prev) => !prev)}
+                aria-label={
+                  isFullscreen ? "Exit fullscreen" : "Expand fullscreen"
+                }
+              >
+                {isFullscreen ? (
+                  <Minimize2 className="h-4 w-4" />
+                ) : (
+                  <Maximize2 className="h-4 w-4" />
+                )}
+              </Button>
+              <Button
+                variant="ghost"
+                size="icon-sm"
+                data-testid="vm-ssh-modal-close-btn"
+                onClick={onClose}
+                aria-label="Close"
+              >
+                <X className="h-4 w-4" />
+              </Button>
             </div>
           </div>
+        </DialogHeader>
 
-          <div className="flex items-center gap-2">
-            <button
-              type="button"
-              onClick={() => setIsFullscreen((prev) => !prev)}
-              aria-label={
-                isFullscreen ? "Exit fullscreen" : "Expand fullscreen"
-              }
-              className="p-1.5 rounded-lg text-slate-400 hover:text-slate-200 hover:bg-slate-800 transition-colors"
-            >
-              {isFullscreen ? (
-                <Minimize2 className="h-4 w-4" />
-              ) : (
-                <Maximize2 className="h-4 w-4" />
-              )}
-            </button>
-            <button
-              type="button"
-              data-testid="vm-ssh-modal-close-btn"
-              onClick={onClose}
-              aria-label="Close"
-              className="p-1.5 rounded-lg text-slate-400 hover:text-slate-200 hover:bg-slate-800 transition-colors"
-            >
-              <X className="h-4 w-4" />
-            </button>
-          </div>
-        </div>
-
-        {/* Body */}
-        <div className="flex-1 overflow-y-auto p-6 space-y-6">
+        <DialogBody className="space-y-6">
           {loading && (
-            <div className="flex items-center justify-center py-12 text-slate-400 gap-2 text-sm">
+            <div
+              role="status"
+              className="flex items-center justify-center py-12 text-slate-400 gap-2 text-sm"
+            >
               <Loader2 className="h-5 w-5 animate-spin text-emerald-400" />
               <span>Resolving VM network endpoints and SSH secrets...</span>
             </div>
           )}
 
           {error && (
-            <div className="p-4 rounded-xl bg-red-500/10 border border-red-500/30 text-red-300 text-xs flex items-start gap-2.5">
+            <div
+              role="alert"
+              className="p-4 rounded-xl bg-red-500/10 border border-red-500/30 text-red-300 text-xs flex items-start gap-2.5"
+            >
               <AlertCircle className="h-4 w-4 shrink-0 mt-0.5" />
               <div>
                 <p className="font-semibold">Unable to resolve VM SSH info</p>
@@ -327,74 +435,53 @@ export const VmSshModal: React.FC<VmSshModalProps> = ({
                   Target Endpoint &amp; Credentials
                 </div>
                 <div className="grid grid-cols-1 sm:grid-cols-4 gap-3 text-xs">
-                  <div>
-                    <label
-                      htmlFor="ssh-host-display"
-                      className="block text-slate-400 mb-1"
-                    >
-                      Host
-                    </label>
-                    <input
+                  <div className="space-y-1">
+                    <Label htmlFor="ssh-host-display">Host</Label>
+                    <Input
                       id="ssh-host-display"
                       type="text"
                       value={hostOverride}
                       onChange={(e) => setHostOverride(e.target.value)}
                       data-testid="ssh-host-display"
                       placeholder="e.g. 192.168.1.150"
-                      className="w-full bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1.5 font-mono text-white focus:outline-none focus:ring-1 focus:ring-emerald-500"
                     />
                   </div>
-
-                  <div>
-                    <label
-                      htmlFor="ssh-user-input"
-                      className="block text-slate-400 mb-1"
-                    >
-                      User
-                    </label>
-                    <input
+                  <div className="space-y-1">
+                    <Label htmlFor="ssh-user-input">User</Label>
+                    <Input
                       id="ssh-user-input"
                       type="text"
                       value={userOverride}
                       onChange={(e) => setUserOverride(e.target.value)}
                       data-testid="ssh-user-input"
                       placeholder="e.g. debian"
-                      className="w-full bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1.5 font-mono text-white focus:outline-none focus:ring-1 focus:ring-emerald-500"
                     />
                   </div>
-
-                  <div>
-                    <label
-                      htmlFor="ssh-port-input"
-                      className="block text-slate-400 mb-1"
-                    >
-                      Port
-                    </label>
-                    <input
+                  <div className="space-y-1">
+                    <Label htmlFor="ssh-port-input">Port</Label>
+                    <Input
                       id="ssh-port-input"
                       type="number"
                       value={portOverride}
                       onChange={(e) => setPortOverride(e.target.value)}
                       data-testid="ssh-port-input"
                       placeholder="22"
-                      className="w-full bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1.5 font-mono text-white focus:outline-none focus:ring-1 focus:ring-emerald-500"
                     />
                   </div>
-
-                  <div>
-                    <span className="block text-slate-400 mb-1">
+                  <div className="space-y-1">
+                    <span className="block text-xs font-medium text-slate-300">
                       Key Storage
                     </span>
                     <div className="flex items-center gap-1.5 py-1.5">
                       {sshInfo?.hasSavedSshKey ? (
-                        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 font-medium">
+                        <Badge variant="success" className="text-[11px]">
                           <Check className="h-3 w-3" />
                           Saved in Secret
-                        </span>
+                        </Badge>
                       ) : (
-                        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] bg-amber-500/10 text-amber-400 border border-amber-500/20 font-medium">
+                        <Badge variant="warning" className="text-[11px]">
                           Ephemeral / Not Saved
-                        </span>
+                        </Badge>
                       )}
                     </div>
                   </div>
@@ -402,11 +489,13 @@ export const VmSshModal: React.FC<VmSshModalProps> = ({
 
                 {/* Collapsible Private Key Input */}
                 <div className="pt-2 border-t border-slate-800/80">
-                  <div className="flex items-center justify-between">
-                    <button
-                      type="button"
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <Button
+                      variant="link"
+                      size="sm"
+                      className="px-0"
+                      aria-expanded={showPrivateKeyInput}
                       onClick={() => setShowPrivateKeyInput((v) => !v)}
-                      className="text-xs text-indigo-400 hover:text-indigo-300 font-medium flex items-center gap-1.5 transition-colors cursor-pointer"
                     >
                       <Key className="h-3.5 w-3.5" />
                       <span>
@@ -414,7 +503,7 @@ export const VmSshModal: React.FC<VmSshModalProps> = ({
                           ? "Hide Ephemeral Private Key"
                           : "Provide Ephemeral Private Key (Optional)"}
                       </span>
-                    </button>
+                    </Button>
                     {privateKey.trim() && (
                       <span className="text-[11px] text-emerald-400 font-mono">
                         Key provided ({privateKey.trim().length} chars)
@@ -423,13 +512,17 @@ export const VmSshModal: React.FC<VmSshModalProps> = ({
                   </div>
                   {showPrivateKeyInput && (
                     <div className="mt-2">
-                      <textarea
+                      <Textarea
                         data-testid="ssh-private-key-input"
+                        aria-label="Ephemeral SSH private key"
                         rows={4}
                         value={privateKey}
+                        autoComplete="off"
+                        spellCheck={false}
                         onChange={(e) => setPrivateKey(e.target.value)}
-                        placeholder="-----BEGIN OPENSSH PRIVATE KEY-----&#10;...&#10;-----END OPENSSH PRIVATE KEY-----"
-                        className="w-full bg-slate-900 border border-slate-800 rounded-lg p-2.5 font-mono text-xs text-slate-200 placeholder-slate-600 focus:outline-none focus:ring-1 focus:ring-emerald-500"
+                        placeholder={
+                          "-----BEGIN OPENSSH PRIVATE KEY-----\n...\n-----END OPENSSH PRIVATE KEY-----"
+                        }
                       />
                       <p className="text-[11px] text-slate-500 mt-1">
                         Ephemeral private key passed securely over WebSocket for
@@ -446,108 +539,38 @@ export const VmSshModal: React.FC<VmSshModalProps> = ({
                 <div className="text-xs font-semibold text-slate-300 uppercase tracking-wider">
                   Copyable Connection Commands
                 </div>
-
-                {/* Standard SSH Command */}
-                <div className="bg-slate-950 border border-slate-800 rounded-xl p-3 space-y-1.5">
-                  <div className="flex items-center justify-between text-xs text-slate-400">
-                    <span className="font-medium">1. Standard SSH Client</span>
-                    <button
-                      type="button"
-                      data-testid="copy-ssh-raw-btn"
-                      onClick={() => handleCopy(rawSshCommand, "ssh-raw")}
-                      className="flex items-center gap-1 text-[11px] text-slate-300 hover:text-white px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 transition-colors"
-                    >
-                      {copiedKey === "ssh-raw" ? (
-                        <>
-                          <Check className="h-3 w-3 text-emerald-400" />
-                          <span className="text-emerald-400">Copied!</span>
-                        </>
-                      ) : (
-                        <>
-                          <Copy className="h-3 w-3" />
-                          <span>Copy</span>
-                        </>
-                      )}
-                    </button>
-                  </div>
-                  <pre
-                    data-testid="ssh-raw-command"
-                    className="font-mono text-xs text-emerald-400 bg-slate-900/90 rounded-lg p-2.5 overflow-x-auto select-all"
-                  >
-                    {rawSshCommand}
-                  </pre>
-                </div>
-
-                {/* Keel CLI Print Command */}
-                <div className="bg-slate-950 border border-slate-800 rounded-xl p-3 space-y-1.5">
-                  <div className="flex items-center justify-between text-xs text-slate-400">
-                    <span className="font-medium">
-                      2. Keel CLI (Print Connection Info)
-                    </span>
-                    <button
-                      type="button"
-                      data-testid="copy-cli-print-btn"
-                      onClick={() => handleCopy(cliPrintCommand, "cli-print")}
-                      className="flex items-center gap-1 text-[11px] text-slate-300 hover:text-white px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 transition-colors"
-                    >
-                      {copiedKey === "cli-print" ? (
-                        <>
-                          <Check className="h-3 w-3 text-emerald-400" />
-                          <span className="text-emerald-400">Copied!</span>
-                        </>
-                      ) : (
-                        <>
-                          <Copy className="h-3 w-3" />
-                          <span>Copy</span>
-                        </>
-                      )}
-                    </button>
-                  </div>
-                  <pre
-                    data-testid="ssh-cli-print-command"
-                    className="font-mono text-xs text-indigo-300 bg-slate-900/90 rounded-lg p-2.5 overflow-x-auto select-all"
-                  >
-                    {cliPrintCommand}
-                  </pre>
-                </div>
-
-                {/* Keel CLI Interactive Exec Command */}
-                <div className="bg-slate-950 border border-slate-800 rounded-xl p-3 space-y-1.5">
-                  <div className="flex items-center justify-between text-xs text-slate-400">
-                    <span className="font-medium">
-                      3. Keel CLI (Interactive Direct Exec)
-                    </span>
-                    <button
-                      type="button"
-                      data-testid="copy-cli-exec-btn"
-                      onClick={() => handleCopy(cliExecCommand, "cli-exec")}
-                      className="flex items-center gap-1 text-[11px] text-slate-300 hover:text-white px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 transition-colors"
-                    >
-                      {copiedKey === "cli-exec" ? (
-                        <>
-                          <Check className="h-3 w-3 text-emerald-400" />
-                          <span className="text-emerald-400">Copied!</span>
-                        </>
-                      ) : (
-                        <>
-                          <Copy className="h-3 w-3" />
-                          <span>Copy</span>
-                        </>
-                      )}
-                    </button>
-                  </div>
-                  <pre
-                    data-testid="ssh-cli-exec-command"
-                    className="font-mono text-xs text-amber-300 bg-slate-900/90 rounded-lg p-2.5 overflow-x-auto select-all"
-                  >
-                    {cliExecCommand}
-                  </pre>
-                </div>
+                <CopyCommandBlock
+                  label="1. Standard SSH Client"
+                  command={rawSshCommand}
+                  copied={copiedKey === "ssh-raw"}
+                  onCopy={() => handleCopy(rawSshCommand, "ssh-raw")}
+                  copyTestId="copy-ssh-raw-btn"
+                  commandTestId="ssh-raw-command"
+                  tone="emerald"
+                />
+                <CopyCommandBlock
+                  label="2. Keel CLI (Print Connection Info)"
+                  command={cliPrintCommand}
+                  copied={copiedKey === "cli-print"}
+                  onCopy={() => handleCopy(cliPrintCommand, "cli-print")}
+                  copyTestId="copy-cli-print-btn"
+                  commandTestId="ssh-cli-print-command"
+                  tone="indigo"
+                />
+                <CopyCommandBlock
+                  label="3. Keel CLI (Interactive Direct Exec)"
+                  command={cliExecCommand}
+                  copied={copiedKey === "cli-exec"}
+                  onCopy={() => handleCopy(cliExecCommand, "cli-exec")}
+                  copyTestId="copy-cli-exec-btn"
+                  commandTestId="ssh-cli-exec-command"
+                  tone="amber"
+                />
               </div>
 
               {/* Opt-In In-Browser Terminal Section */}
               <div className="pt-2 border-t border-slate-800/80 space-y-3">
-                <div className="flex items-center justify-between">
+                <div className="flex flex-wrap items-center justify-between gap-3">
                   <div>
                     <h4 className="text-xs font-semibold text-slate-200 uppercase tracking-wider">
                       Opt-In In-Browser Terminal
@@ -558,94 +581,109 @@ export const VmSshModal: React.FC<VmSshModalProps> = ({
                     </p>
                   </div>
                   {!isTerminalActive ? (
-                    <button
-                      type="button"
+                    <Button
+                      variant="success"
                       data-testid="launch-browser-terminal-btn"
                       onClick={handleLaunchTerminal}
-                      className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg text-xs font-semibold bg-emerald-600 hover:bg-emerald-500 text-white transition-colors cursor-pointer shadow-lg shadow-emerald-900/30"
                     >
                       <Play className="h-3.5 w-3.5 fill-current" />
                       <span>Launch Browser Terminal</span>
-                    </button>
+                    </Button>
                   ) : (
-                    <button
-                      type="button"
+                    <Button
+                      variant="destructive-subtle"
                       data-testid="disconnect-browser-terminal-btn"
                       onClick={handleDisconnectTerminal}
-                      className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-red-600/20 hover:bg-red-600/30 text-red-300 border border-red-500/30 transition-colors cursor-pointer"
                     >
                       <Square className="h-3.5 w-3.5 fill-current" />
                       <span>Disconnect Terminal</span>
-                    </button>
+                    </Button>
                   )}
                 </div>
 
                 {isTerminalActive && (
                   <div className="border border-slate-800 rounded-xl bg-slate-950 overflow-hidden shadow-2xl">
-                    <div className="flex items-center justify-between px-3 py-1.5 bg-slate-900 border-b border-slate-800 text-[11px] text-slate-400 font-mono">
-                      <div className="flex items-center gap-2">
+                    <div className="flex flex-wrap items-center justify-between gap-2 px-3 py-1.5 bg-slate-900 border-b border-slate-800 text-[11px] text-slate-400 font-mono">
+                      <div className="flex items-center gap-2 min-w-0">
                         <span
-                          className={`h-2 w-2 rounded-full ${
-                            terminalConnected
+                          aria-hidden="true"
+                          className={`h-2 w-2 rounded-full shrink-0 ${
+                            sessionEstablished
                               ? "bg-emerald-400 animate-pulse"
                               : "bg-amber-400"
                           }`}
                         />
-                        <span>
+                        <span className="truncate">
                           {effectiveUser}@{effectiveHost}:{effectivePort}
                         </span>
                       </div>
-                      <span>
-                        {terminalConnected ? "Connected" : "Connecting..."}
+                      <span data-testid="ssh-terminal-status" role="status">
+                        {sessionEstablished
+                          ? "Connected"
+                          : terminalConnected
+                            ? "Authenticating..."
+                            : "Connecting..."}
                       </span>
                     </div>
 
-                    {/* Terminal Output Viewport */}
-                    <div
-                      data-testid="browser-ssh-terminal"
-                      ref={terminalScrollRef}
-                      className="p-3 font-mono text-xs text-slate-200 bg-slate-950 h-64 overflow-y-auto whitespace-pre-wrap select-text leading-relaxed"
-                    >
-                      {terminalOutput}
-                      {terminalError && (
-                        <span className="text-red-400">
-                          {`\r\n`}[Error: {terminalError}]
-                        </span>
-                      )}
-                    </div>
-
-                    {/* Command Input Row */}
-                    <form
-                      onSubmit={handleSendTerminalInput}
-                      className="flex items-center border-t border-slate-800 bg-slate-900/80 px-3 py-2 gap-2"
-                    >
-                      <span className="text-emerald-400 font-mono text-xs font-bold">
-                        $
-                      </span>
-                      <input
-                        type="text"
-                        data-testid="terminal-command-input"
-                        value={terminalInput}
-                        onChange={(e) => setTerminalInput(e.target.value)}
-                        placeholder="Type a command and press Enter..."
-                        className="flex-1 bg-transparent font-mono text-xs text-white placeholder-slate-500 focus:outline-none"
-                      />
-                      <button
-                        type="submit"
-                        data-testid="terminal-send-btn"
-                        disabled={!terminalConnected}
-                        className="px-2.5 py-1 rounded text-[11px] font-medium bg-emerald-600/30 hover:bg-emerald-600/40 text-emerald-300 border border-emerald-500/30 disabled:opacity-40 disabled:cursor-not-allowed"
+                    {hostKey && (
+                      <div
+                        data-testid="ssh-host-key-info"
+                        className={cn(
+                          "flex flex-wrap items-center gap-2 px-3 py-1.5 border-b text-[11px]",
+                          hostKey.verified
+                            ? "border-slate-800 bg-emerald-500/5"
+                            : "border-amber-500/30 bg-amber-500/10"
+                        )}
                       >
-                        Send
-                      </button>
-                    </form>
+                        {hostKey.verified ? (
+                          <Badge variant="success">
+                            <ShieldCheck className="h-3 w-3" />
+                            Host key verified
+                          </Badge>
+                        ) : (
+                          <Badge
+                            variant="warning"
+                            data-testid="ssh-host-key-unverified"
+                          >
+                            <ShieldAlert className="h-3 w-3" />
+                            Host key NOT verified
+                          </Badge>
+                        )}
+                        <code
+                          className="font-mono text-slate-300 break-all"
+                          data-wrap-ok
+                          data-testid="ssh-host-key-fingerprint"
+                        >
+                          {hostKey.fingerprint ?? "fingerprint unavailable"}
+                        </code>
+                        {!hostKey.verified && (
+                          <span className="text-amber-200/90">
+                            No expected host key is published in the stack
+                            outputs. Compare this fingerprint out-of-band before
+                            entering secrets.
+                          </span>
+                        )}
+                      </div>
+                    )}
+
+                    <WebTerminal
+                      data-testid="browser-ssh-terminal"
+                      className={cn(
+                        "p-2 bg-slate-950",
+                        isFullscreen ? "h-[60dvh]" : "h-72"
+                      )}
+                      onData={handleTerminalData}
+                      onResize={handleTerminalResize}
+                      onReady={handleTerminalReady}
+                    />
                   </div>
                 )}
               </div>
             </>
           )}
-        </div>
-      </div>
-    </div>
+        </DialogBody>
+      </DialogContent>
+    </Dialog>
   )
 }

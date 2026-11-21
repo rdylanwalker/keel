@@ -22,10 +22,14 @@ export const BundleBadge: React.FC<BundleBadgeProps> = ({
           ? `Bundle: ${bundle} (item: ${bundleItem})`
           : `Bundle: ${bundle}`
       }
-      className="inline-flex items-center whitespace-nowrap px-2 py-0.5 rounded-md text-[10px] font-mono bg-purple-500/15 text-purple-300 border border-purple-500/30 shrink-0"
+      className="inline-flex min-w-0 max-w-[11rem] items-center whitespace-nowrap px-2 py-0.5 rounded-md text-[10px] font-mono bg-purple-500/15 text-purple-300 border border-purple-500/30 shrink-0"
     >
-      <span>{bundle}</span>
-      {bundleItem && <span className="text-purple-400/80">/{bundleItem}</span>}
+      <span className="min-w-0 truncate">{bundle}</span>
+      {bundleItem && (
+        <span className="min-w-0 truncate text-purple-400/80">
+          /{bundleItem}
+        </span>
+      )}
     </span>
   )
 }

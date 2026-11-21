@@ -602,4 +602,249 @@ describe("DeployInstanceModal component", () => {
       screen.queryByRole("option", { name: /management-cluster-core/i })
     ).toBeNull()
   })
+
+  it("passes catalog uiSchema, renders writeOnly fields as password inputs, and masks secrets in the values.yaml preview", () => {
+    const secretItem: CatalogItem = {
+      ...sampleAppItem,
+      id: "secret-app",
+      schema: {
+        type: "object",
+        properties: {
+          adminUser: { type: "string", title: "Admin User", default: "root" },
+          apiToken: {
+            type: "string",
+            title: "API Token",
+            writeOnly: true,
+            default: "super-secret-token",
+          },
+          dbPassword: {
+            type: "string",
+            title: "DB Password",
+            format: "password",
+            default: "hunter2",
+          },
+        },
+      },
+      uiSchema: {
+        adminUser: { "ui:help": "Catalog provided help text" },
+      },
+    }
+
+    render(
+      <DeployInstanceModal
+        isOpen={true}
+        onClose={onClose}
+        catalogItem={secretItem}
+        tenant="acme"
+      />
+    )
+
+    expect(screen.getByText("Catalog provided help text")).toBeInTheDocument()
+    expect(screen.getByLabelText(/API Token/)).toHaveAttribute(
+      "type",
+      "password"
+    )
+    expect(screen.getByLabelText(/DB Password/)).toHaveAttribute(
+      "type",
+      "password"
+    )
+
+    const preview = screen.getByLabelText("values.yaml preview")
+    expect(preview.textContent).toContain("adminUser: root")
+    expect(preview.textContent).toContain('apiToken: "********"')
+    expect(preview.textContent).toContain('dbPassword: "********"')
+    expect(preview.textContent).not.toContain("super-secret-token")
+    expect(preview.textContent).not.toContain("hunter2")
+  })
+})
+
+describe("DeployInstanceModal validation, secrets and server errors", () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  const secretItem: CatalogItem = {
+    id: "svc",
+    name: "Secret Service",
+    description: "Needs a token",
+    category: "apps",
+    type: "app",
+    runtime: "helm",
+    version: "1.0.0",
+    schema: {
+      type: "object",
+      required: ["apiToken", "host"],
+      properties: {
+        host: { type: "string", title: "Host" },
+        apiToken: {
+          type: "string",
+          title: "API Secret Token",
+          writeOnly: true,
+        },
+      },
+    },
+  }
+
+  it("requires secrets on create but keeps existing secrets in edit mode", async () => {
+    vi.mocked(api.createProposal).mockResolvedValue({
+      id: "1",
+      title: "t",
+      branch: "b",
+      author: "a",
+      tenant: "default",
+      status: "open",
+      createdAt: "now",
+    })
+    const { unmount } = render(
+      <DeployInstanceModal
+        isOpen
+        onClose={vi.fn()}
+        catalogItem={secretItem}
+        tenant="default"
+      />
+    )
+    fireEvent.change(screen.getByLabelText(/^Host/), {
+      target: { value: "h" },
+    })
+    fireEvent.click(
+      screen.getByRole("button", { name: /Submit & Open Git PR Proposal/i })
+    )
+    expect(
+      await screen.findByText("API Secret Token is required")
+    ).toBeInTheDocument()
+    expect(api.createProposal).not.toHaveBeenCalled()
+    unmount()
+
+    render(
+      <DeployInstanceModal
+        isOpen
+        onClose={vi.fn()}
+        catalogItem={secretItem}
+        tenant="default"
+        isEditMode
+        initialConfig={{ name: "svc", values: { host: "h" } }}
+      />
+    )
+    const token = screen.getByLabelText(/API Secret Token/)
+    expect(token).toHaveAttribute(
+      "placeholder",
+      "Leave blank to keep existing secret"
+    )
+    expect(token).toHaveAttribute("type", "password")
+    fireEvent.click(
+      screen.getByRole("button", { name: /Submit & Open Git PR Proposal/i })
+    )
+    await waitFor(() => expect(api.createProposal).toHaveBeenCalled())
+    expect(vi.mocked(api.createProposal).mock.calls[0][0].values).toEqual({
+      host: "h",
+    })
+  })
+
+  const manifestItem: CatalogItem = {
+    id: "raw",
+    name: "Raw App",
+    description: "manifest",
+    category: "apps",
+    type: "app",
+    runtime: "manifest",
+    version: "1",
+    manifestsYaml:
+      "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: ${name}\ndata:\n  image: repo/${image}:1\n",
+    schema: {
+      type: "object",
+      properties: {
+        name: { type: "string", title: "Name" },
+        image: { type: "string", title: "Image" },
+      },
+    },
+  }
+
+  it("blocks manifest values the server would reject inside a scalar", async () => {
+    render(
+      <DeployInstanceModal
+        isOpen
+        onClose={vi.fn()}
+        catalogItem={manifestItem}
+        tenant="default"
+        initialConfig={{ values: { name: "a: b # ok", image: "x#y" } }}
+      />
+    )
+    fireEvent.click(
+      screen.getByRole("button", { name: /Submit & Open Git PR Proposal/i })
+    )
+    expect(
+      (await screen.findAllByText(/cannot contain "#"/)).length
+    ).toBeGreaterThan(0)
+    expect(api.createProposal).not.toHaveBeenCalled()
+  })
+
+  it("maps server validation details and manifest errors to fields, shows correlation ids", async () => {
+    const { ApiError } = await import("../lib/errors")
+    vi.mocked(api.createProposal)
+      .mockRejectedValueOnce(
+        new ApiError(400, "Schema validation failed", {
+          details: [{ fieldPath: "/host", message: "host is not reachable" }],
+        })
+      )
+      .mockRejectedValueOnce(
+        new ApiError(
+          400,
+          "Manifest variable 'image' contains YAML-structural characters"
+        )
+      )
+      .mockRejectedValueOnce(
+        new ApiError(500, "Internal server error", { correlationId: "abc-123" })
+      )
+    render(
+      <DeployInstanceModal
+        isOpen
+        onClose={vi.fn()}
+        catalogItem={{
+          ...manifestItem,
+          manifestsYaml: undefined,
+          schema: {
+            type: "object",
+            properties: {
+              host: { type: "string", title: "Host" },
+              image: { type: "string", title: "Image" },
+            },
+          },
+        }}
+        tenant="default"
+        initialConfig={{ values: { host: "h", image: "i" } }}
+      />
+    )
+    const submit = () =>
+      fireEvent.click(
+        screen.getByRole("button", { name: /Submit & Open Git PR Proposal/i })
+      )
+    submit()
+    expect(await screen.findByText("host is not reachable")).toBeInTheDocument()
+    expect(screen.getByText("Schema validation failed")).toBeInTheDocument()
+    submit()
+    expect(
+      await screen.findByText("contains YAML-structural characters")
+    ).toBeInTheDocument()
+    submit()
+    expect(
+      await screen.findByText(/Internal server error \(reference: abc-123\)/)
+    ).toBeInTheDocument()
+  })
+
+  it("closes on Escape via the Shadcn Dialog", async () => {
+    const onClose = vi.fn()
+    render(
+      <DeployInstanceModal
+        isOpen
+        onClose={onClose}
+        catalogItem={manifestItem}
+        tenant="default"
+      />
+    )
+    screen.getByRole("dialog", { name: /Create Raw App/ })
+    fireEvent.keyDown(document.activeElement ?? document.body, {
+      key: "Escape",
+    })
+    await waitFor(() => expect(onClose).toHaveBeenCalled())
+  })
 })

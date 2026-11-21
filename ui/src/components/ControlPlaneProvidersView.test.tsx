@@ -1,18 +1,43 @@
-import { render, screen, fireEvent, waitFor } from "@testing-library/react"
-import { describe, it, expect, vi, beforeEach } from "vitest"
+import { screen, fireEvent, waitFor, within } from "@testing-library/react"
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest"
 import { ControlPlaneProvidersView } from "./ControlPlaneProvidersView"
 import * as api from "../lib/api"
+import { ApiError } from "../lib/errors"
+import { buildAuthz } from "../lib/authz"
+import { renderWithAuthz } from "../test/render"
+import { CatalogItem } from "../types/api"
 
 vi.mock("../lib/api", () => ({
   getStacksWithMeta: vi.fn(),
   getProviders: vi.fn(),
   getProposals: vi.fn().mockResolvedValue([]),
   getCoreAddons: vi.fn().mockResolvedValue([]),
-  getReleases: vi.fn().mockResolvedValue([]),
+  getManagementAddons: vi.fn(),
   toggleProvider: vi.fn(),
   rollbackManagementAddon: vi.fn(),
   upgradeManagementAddon: vi.fn(),
 }))
+
+const TENANT_USER = buildAuthz({
+  authenticated: true,
+  phase: "oidc-active",
+  groups: ["acme"],
+  isAdmin: false,
+})
+
+function addon(id: string, extra: Partial<CatalogItem> = {}): CatalogItem {
+  return {
+    id,
+    name: id,
+    description: `${id} addon`,
+    type: "app",
+    category: "Management Addons",
+    chart: id,
+    version: "1.0.0",
+    schema: { type: "object", properties: {} },
+    ...extra,
+  }
+}
 
 describe("ControlPlaneProvidersView component", () => {
   beforeEach(() => {
@@ -26,16 +51,28 @@ describe("ControlPlaneProvidersView component", () => {
     vi.mocked(api.getProviders).mockResolvedValue([])
     vi.mocked(api.getProposals).mockResolvedValue([])
     vi.mocked(api.getCoreAddons).mockResolvedValue([])
-    vi.mocked(api.getReleases).mockResolvedValue([])
+    vi.mocked(api.getManagementAddons).mockResolvedValue({
+      addons: [],
+      liveStatusAvailable: true,
+    })
   })
 
-  it("renders management control plane cluster and live providers", async () => {
+  afterEach(() => {
+    window.history.replaceState({}, "", "/")
+  })
+
+  it("renders only real provider registry fields (no fixture names/regions)", async () => {
     vi.mocked(api.getProviders).mockResolvedValueOnce([
       { id: "aws", enabled: true },
-      { id: "gcp", enabled: true, description: "Google Cloud Platform" },
+      {
+        id: "gcp",
+        enabled: true,
+        description: "Google Cloud Platform",
+        package: "pulumi/gcp",
+      },
     ])
 
-    render(<ControlPlaneProvidersView />)
+    renderWithAuthz(<ControlPlaneProvidersView />)
 
     expect(screen.getByText("Control Plane & Providers")).toBeInTheDocument()
     expect(
@@ -48,6 +85,21 @@ describe("ControlPlaneProvidersView component", () => {
         screen.getByText(
           "GitOps: Flux CD v2 · Forge: Forgejo · Secrets: SOPS + age / S3"
         )
+      ).toBeInTheDocument()
+    })
+    expect(screen.getByText("pulumi/gcp")).toBeInTheDocument()
+    expect(within(screen.getByTestId("provider-aws")).getByText("aws"))
+    // Fixture-only details never appear outside demo mode
+    expect(screen.queryByText("Amazon Web Services")).not.toBeInTheDocument()
+    expect(screen.queryByText(/us-east-1/)).not.toBeInTheDocument()
+    expect(screen.queryByText("Proxmox VE Cluster")).not.toBeInTheDocument()
+  })
+
+  it("shows an empty state when no providers are registered", async () => {
+    renderWithAuthz(<ControlPlaneProvidersView />)
+    await waitFor(() => {
+      expect(
+        screen.getByText("No infrastructure providers registered.")
       ).toBeInTheDocument()
     })
   })
@@ -73,121 +125,79 @@ describe("ControlPlaneProvidersView component", () => {
       createdAt: "now",
     })
 
-    render(
+    renderWithAuthz(
       <ControlPlaneProvidersView onNavigateToCatalog={onNavigateToCatalog} />
     )
 
     await waitFor(() => {
-      expect(api.getProviders).toHaveBeenCalled()
       expect(screen.getByText("Custom Cloud Provider")).toBeInTheDocument()
     })
 
-    const provisionBtn = screen.getAllByRole("button", {
-      name: /Provision →/i,
-    })[0]
-    fireEvent.click(provisionBtn)
+    fireEvent.click(screen.getAllByRole("button", { name: /Provision →/i })[0])
     expect(onNavigateToCatalog).toHaveBeenCalled()
 
-    const gcpEnableBtn = screen.getAllByRole("button", { name: /^Enable$/i })[0]
-    fireEvent.click(gcpEnableBtn)
+    fireEvent.click(screen.getAllByRole("button", { name: /^Enable$/i })[0])
 
     await waitFor(() => {
       expect(api.toggleProvider).toHaveBeenCalledWith("gcp", true)
       expect(
         screen.getByText("PR #789 opened on branch feature/enable-gcp")
       ).toBeInTheDocument()
+      expect(
+        screen.getByRole("button", { name: "Go to PR #789 →" })
+      ).toBeInTheDocument()
     })
 
-    const closeBannerBtn = screen.getByRole("button", { name: /Dismiss/i })
-    fireEvent.click(closeBannerBtn)
+    fireEvent.click(screen.getByRole("button", { name: /Dismiss/i }))
     expect(
       screen.queryByText("PR #789 opened on branch feature/enable-gcp")
     ).not.toBeInTheDocument()
   })
 
-  it("handles failure during provider toggle cleanly", async () => {
+  it("surfaces friendly API errors when a provider toggle fails", async () => {
     vi.mocked(api.getProviders).mockResolvedValueOnce([
       { id: "aws", enabled: true },
     ])
-    vi.mocked(api.toggleProvider).mockRejectedValueOnce("Toggle error string")
+    vi.mocked(api.toggleProvider)
+      .mockRejectedValueOnce("Toggle error string")
+      .mockRejectedValueOnce(
+        new ApiError(500, "Internal server error", { correlationId: "c-1" })
+      )
 
-    render(<ControlPlaneProvidersView />)
-
+    renderWithAuthz(<ControlPlaneProvidersView />)
     await waitFor(() => {
-      expect(api.getProviders).toHaveBeenCalled()
+      expect(screen.getByRole("button", { name: /^Disable$/i }))
     })
 
-    const disableBtn = screen.getAllByRole("button", { name: /^Disable$/i })[0]
-    fireEvent.click(disableBtn)
-
+    fireEvent.click(screen.getByRole("button", { name: /^Disable$/i }))
     await waitFor(() => {
       expect(screen.getByRole("alert")).toHaveTextContent(
-        "Failed to toggle provider proxmox"
+        "Failed to toggle provider aws"
+      )
+    })
+    fireEvent.click(screen.getByRole("button", { name: /^Disable$/i }))
+    await waitFor(() => {
+      expect(screen.getByRole("alert")).toHaveTextContent(
+        "Internal server error (reference: c-1)"
       )
     })
   })
 
-  it("refreshes control plane and provider data on Refresh click", async () => {
-    render(<ControlPlaneProvidersView />)
+  it("refreshes data on Refresh click and shows load errors", async () => {
+    renderWithAuthz(<ControlPlaneProvidersView />)
+    await waitFor(() => expect(api.getProviders).toHaveBeenCalledTimes(1))
 
-    await waitFor(() => {
-      expect(api.getProviders).toHaveBeenCalledTimes(1)
-    })
-
+    vi.mocked(api.getProviders).mockRejectedValueOnce(
+      new ApiError(403, "Access denied")
+    )
     fireEvent.click(screen.getByRole("button", { name: /Refresh/i }))
-
     await waitFor(() => {
       expect(api.getProviders).toHaveBeenCalledTimes(2)
-    })
-  })
-
-  it("shows Go to PR button for pending provider toggle PRs and handles fetch error", async () => {
-    const onNavigateToPreview = vi.fn()
-    vi.mocked(api.getProviders).mockResolvedValueOnce([
-      { id: "gcp", enabled: false, description: "Google Cloud Platform" },
-    ])
-    vi.mocked(api.getProposals).mockResolvedValueOnce([
-      {
-        id: "55",
-        title: "Toggle gcp",
-        branch: "keel/providers/toggle-gcp-12345",
-        author: "user",
-        tenant: "keel-system",
-        status: "open",
-        createdAt: "now",
-      },
-    ])
-
-    render(
-      <ControlPlaneProvidersView onNavigateToPreview={onNavigateToPreview} />
-    )
-
-    await waitFor(() => {
-      expect(
-        screen.getByRole("button", { name: /Go to PR #55/i })
-      ).toBeInTheDocument()
+      expect(screen.getByRole("alert")).toHaveTextContent("Access denied")
     })
 
-    fireEvent.click(screen.getByRole("button", { name: /Go to PR #55/i }))
-    expect(onNavigateToPreview).toHaveBeenCalled()
-
-    vi.mocked(api.getStacksWithMeta).mockRejectedValueOnce(
-      new Error("Backend unreachable")
-    )
+    vi.mocked(api.getProviders).mockRejectedValueOnce("non-error failure")
     fireEvent.click(screen.getByRole("button", { name: /Refresh/i }))
-    await waitFor(() => {
-      expect(screen.getByRole("alert")).toHaveTextContent("Backend unreachable")
-    })
-  })
-
-  it("handles unauthenticated state and initial load rejection", async () => {
-    const { rerender } = render(
-      <ControlPlaneProvidersView authenticated={false} />
-    )
-    expect(api.getStacksWithMeta).not.toHaveBeenCalled()
-
-    vi.mocked(api.getStacksWithMeta).mockRejectedValueOnce("String failure")
-    rerender(<ControlPlaneProvidersView authenticated={true} />)
     await waitFor(() => {
       expect(screen.getByRole("alert")).toHaveTextContent(
         "Failed to load control plane & provider state"
@@ -195,67 +205,223 @@ describe("ControlPlaneProvidersView component", () => {
     })
   })
 
-  it("renders management plane base addons with live status, upgrade modal, and rollback PR", async () => {
-    vi.mocked(api.getCoreAddons).mockResolvedValueOnce([
+  it("shows Go to PR for pending provider toggle PRs", async () => {
+    const onNavigateToPreview = vi.fn()
+    vi.mocked(api.getProviders).mockResolvedValueOnce([
+      { id: "aws", enabled: true },
+    ])
+    vi.mocked(api.getProposals).mockResolvedValueOnce([
       {
-        id: "kyverno",
-        name: "Kyverno",
-        description: "Policy engine",
-        type: "app",
-        category: "Management Addons",
-        repoUrl: "https://kyverno.github.io/kyverno/",
-        chart: "kyverno",
-        version: "3.3.4",
-        schema: {
-          type: "object",
-          properties: {
-            replicaCount: { type: "integer", default: 1 },
-          },
-        },
+        id: "999",
+        title: "Toggle AWS",
+        branch: "keel/providers/toggle-aws-1234",
+        author: "admin",
+        tenant: "keel-system",
+        status: "open",
+        createdAt: "now",
       },
       {
-        id: "flagger",
-        name: "Flagger",
-        description: "Canary operator",
-        type: "app",
-        category: "Management Addons",
-        chart: "flagger",
-        version: "1.40.0",
-        schema: { type: "object", properties: {} },
-      },
-      {
-        id: "rauthy",
-        name: "Rauthy OIDC Provider",
-        description: "Lightweight Rust OIDC provider",
-        type: "app",
-        category: "Management Addons",
-        chart: "rauthy",
-        version: "0.37.2",
-        serviceUrl: "https://idp.keel.local:8888/auth/v1/admin",
-        schema: { type: "object", properties: {} },
-      },
-      {
-        id: "cert-manager",
-        name: "cert-manager",
-        description: "Certificate manager",
-        type: "app",
-        category: "Management Addons",
-        chart: "cert-manager",
-        version: "v1.21.3",
-        schema: { type: "object", properties: {} },
+        id: "1000",
+        title: "Old",
+        branch: "keel/providers/toggle-aws-1",
+        author: "admin",
+        tenant: "keel-system",
+        status: "merged",
+        createdAt: "now",
       },
     ])
-    vi.mocked(api.getReleases).mockResolvedValueOnce([
-      {
-        id: "kyverno",
-        name: "kyverno",
-        tenant: "keel-system",
-        namespace: "kyverno",
-        type: "helm",
-        status: "healthy",
-        version: "3.3.4",
-        chart: "kyverno",
-      },
+
+    renderWithAuthz(
+      <ControlPlaneProvidersView onNavigateToPreview={onNavigateToPreview} />
+    )
+
+    const goBtn = await screen.findByRole("button", {
+      name: "Go to PR #999 →",
+    })
+    fireEvent.click(goBtn)
+    expect(onNavigateToPreview).toHaveBeenCalled()
+  })
+
+  it("does not load data when unauthenticated", () => {
+    renderWithAuthz(<ControlPlaneProvidersView authenticated={false} />)
+    expect(api.getProviders).not.toHaveBeenCalled()
+  })
+
+  it("hides admin-only controls and management sections for non-admins", async () => {
+    vi.mocked(api.getProviders).mockResolvedValueOnce([
+      { id: "aws", enabled: true, description: "AWS" },
+      { id: "gcp", enabled: false },
+    ])
+
+    renderWithAuthz(<ControlPlaneProvidersView />, TENANT_USER)
+
+    await waitFor(() => {
+      expect(screen.getByText("AWS")).toBeInTheDocument()
+    })
+    expect(
+      screen.queryByRole("button", { name: /^(Enable|Disable)$/ })
+    ).not.toBeInTheDocument()
+    expect(
+      screen.queryByText("Management Control Plane Cluster")
+    ).not.toBeInTheDocument()
+    expect(
+      screen.queryByText("Management Plane Base Addons")
+    ).not.toBeInTheDocument()
+    expect(api.getCoreAddons).not.toHaveBeenCalled()
+    expect(api.getManagementAddons).not.toHaveBeenCalled()
+    expect(api.getProposals).not.toHaveBeenCalled()
+  })
+
+  it("maps add-on status by namespace/name and never by chart name", async () => {
+    vi.mocked(api.getCoreAddons).mockResolvedValueOnce([
+      addon("kyverno"),
+      addon("flagger", { version: "1.40.0" }),
+      addon("prometheus"),
+      addon("cert-manager", { version: "v1.21.3" }),
+      addon("rauthy", {
+        serviceUrl: "https://idp.keel.local:8888/auth/v1/admin",
+      }),
+    ])
+    vi.mocked(api.getManagementAddons).mockResolvedValueOnce({
+      liveStatusAvailable: true,
+      addons: [
+        {
+          id: "kyverno",
+          name: "kyverno",
+          namespace: "keel-system",
+          chart: "kyverno",
+          desiredVersion: "3.3.4",
+          status: "Ready",
+          tracked: true,
+        },
+        {
+          id: "prometheus",
+          name: "prometheus",
+          namespace: "keel-system",
+          status: "Reconciling",
+          tracked: true,
+        },
+        {
+          id: "flagger",
+          name: "flagger",
+          namespace: "keel-system",
+          tracked: false,
+        },
+        {
+          id: "extra-addon",
+          name: "extra-addon",
+          namespace: "flux-system",
+          status: "Error",
+          tracked: true,
+        },
+      ],
+    })
+
+    renderWithAuthz(<ControlPlaneProvidersView />)
+
+    await waitFor(() => {
+      expect(screen.getByTestId("core-addon-kyverno")).toBeInTheDocument()
+    })
+    expect(screen.getByTestId("core-addon-status-kyverno")).toHaveTextContent(
+      "Ready"
+    )
+    expect(
+      within(screen.getByTestId("core-addon-kyverno")).getByText("v3.3.4")
+    ).toBeInTheDocument()
+    expect(
+      screen.getByTestId("core-addon-status-prometheus")
+    ).toHaveTextContent("Reconciling")
+    expect(screen.getByTestId("core-addon-status-flagger")).toHaveTextContent(
+      "Not tracked (installed by bootstrap)"
+    )
+    // absent from endpoint entirely
+    expect(screen.getByTestId("core-addon-status-rauthy")).toHaveTextContent(
+      "Not tracked (installed by bootstrap)"
+    )
+    expect(
+      screen.getByTestId("core-addon-status-extra-addon")
+    ).toHaveTextContent("Failed")
+    expect(screen.getByText("v1.21.3")).toBeInTheDocument()
+    expect(screen.queryByText("vv1.21.3")).not.toBeInTheDocument()
+    expect(
+      screen.getByRole("link", {
+        name: "https://idp.keel.local:8888/auth/v1/admin",
+      })
+    ).toHaveAttribute("href", "https://idp.keel.local:8888/auth/v1/admin")
+    expect(screen.getAllByText("Protected")).toHaveLength(6)
+    // Health is derived from real statuses, never assumed
+    expect(screen.getByTestId("management-health")).toHaveTextContent(
+      "Degraded"
+    )
+    expect(screen.queryByText("Healthy")).not.toBeInTheDocument()
+  })
+
+  it("derives Healthy only when all tracked add-ons are ready", async () => {
+    vi.mocked(api.getCoreAddons).mockResolvedValueOnce([addon("kyverno")])
+    vi.mocked(api.getManagementAddons).mockResolvedValueOnce({
+      liveStatusAvailable: true,
+      addons: [
+        {
+          id: "kyverno",
+          name: "kyverno",
+          namespace: "keel-system",
+          status: "Ready",
+          tracked: true,
+        },
+      ],
+    })
+    renderWithAuthz(<ControlPlaneProvidersView />)
+    await waitFor(() => {
+      expect(screen.getByTestId("management-health")).toHaveTextContent(
+        "Healthy"
+      )
+    })
+  })
+
+  it("reports unknown health when status endpoint is unavailable or offline", async () => {
+    vi.mocked(api.getCoreAddons).mockResolvedValue([addon("kyverno")])
+    vi.mocked(api.getManagementAddons).mockRejectedValueOnce(
+      new ApiError(404, "not found")
+    )
+    renderWithAuthz(<ControlPlaneProvidersView />)
+    await waitFor(() => {
+      expect(screen.getByTestId("core-addon-status-kyverno")).toHaveTextContent(
+        "Not tracked (installed by bootstrap)"
+      )
+    })
+    expect(screen.getByTestId("management-health")).toHaveTextContent(
+      "Status unknown"
+    )
+
+    vi.mocked(api.getManagementAddons).mockResolvedValueOnce({
+      liveStatusAvailable: false,
+      addons: [],
+    })
+    fireEvent.click(screen.getByRole("button", { name: /Refresh/i }))
+    await waitFor(() => {
+      expect(screen.getByTestId("management-health")).toHaveTextContent(
+        "No live cluster connection"
+      )
+    })
+  })
+
+  it("opens the upgrade modal for a management add-on", async () => {
+    vi.mocked(api.getCoreAddons).mockResolvedValueOnce([
+      addon("kyverno", { name: "Kyverno" }),
+    ])
+    renderWithAuthz(<ControlPlaneProvidersView />)
+    fireEvent.click(
+      await screen.findByRole("button", { name: /Upgrade \/ Configure/i })
+    )
+    expect(
+      screen.getByRole("dialog", { name: /Upgrade Kyverno/i })
+    ).toBeInTheDocument()
+  })
+
+  it("confirms before opening a rollback PR and reports failures", async () => {
+    vi.mocked(api.getCoreAddons).mockResolvedValueOnce([
+      addon("kyverno"),
+      addon("flagger"),
     ])
     vi.mocked(api.rollbackManagementAddon)
       .mockResolvedValueOnce({
@@ -268,51 +434,28 @@ describe("ControlPlaneProvidersView component", () => {
         createdAt: "now",
       })
       .mockRejectedValueOnce(
-        new Error("No previous revision found for flagger")
+        new ApiError(400, "No previous revision found to roll back to")
       )
 
-    render(<ControlPlaneProvidersView />)
-
+    renderWithAuthz(<ControlPlaneProvidersView />)
     await waitFor(() => {
-      expect(
-        screen.getByText("Management Plane Base Addons")
-      ).toBeInTheDocument()
-      const rauthyLink = screen.getByRole("link", {
-        name: "https://idp.keel.local:8888/auth/v1/admin",
-      })
-      expect(rauthyLink).toHaveAttribute(
-        "href",
-        "https://idp.keel.local:8888/auth/v1/admin"
-      )
-      expect(screen.getByTestId("core-addon-kyverno")).toBeInTheDocument()
       expect(screen.getByTestId("core-addon-flagger")).toBeInTheDocument()
     })
 
-    // Status badges, Protected badge, and no Delete button
-    expect(screen.getByText("Ready")).toBeInTheDocument()
-    expect(screen.getAllByText("Unknown")).toHaveLength(3)
-    expect(screen.getAllByText("Protected")).toHaveLength(4)
-    expect(screen.getByText("v1.21.3")).toBeInTheDocument()
-    expect(screen.queryByText("vv1.21.3")).not.toBeInTheDocument()
-    expect(
-      screen.queryByRole("button", { name: /Delete/i })
-    ).not.toBeInTheDocument()
-
-    // Upgrade / Configure opens DeployInstanceModal in managementAddon mode
-    const upgradeBtns = screen.getAllByRole("button", {
-      name: /Upgrade \/ Configure/i,
-    })
-    fireEvent.click(upgradeBtns[0])
-    expect(
-      screen.getByRole("dialog", { name: /Upgrade Kyverno/i })
-    ).toBeInTheDocument()
-    fireEvent.click(screen.getByRole("button", { name: /Close modal/i }))
-
-    // Rollback PR succeeds and shows PrNotificationBanner
     const rollbackBtns = screen.getAllByRole("button", {
       name: /Rollback PR/i,
     })
+
+    // Cancel does nothing
     fireEvent.click(rollbackBtns[0])
+    fireEvent.click(await screen.findByRole("button", { name: "Cancel" }))
+    expect(api.rollbackManagementAddon).not.toHaveBeenCalled()
+
+    fireEvent.click(rollbackBtns[0])
+    expect(
+      await screen.findByRole("alertdialog", { name: /Roll back kyverno/i })
+    ).toBeInTheDocument()
+    fireEvent.click(screen.getByRole("button", { name: "Open Rollback PR" }))
     await waitFor(() => {
       expect(api.rollbackManagementAddon).toHaveBeenCalledWith("kyverno")
       expect(
@@ -320,64 +463,26 @@ describe("ControlPlaneProvidersView component", () => {
       ).toBeInTheDocument()
     })
 
-    // Rollback PR failure shows error alert
     fireEvent.click(rollbackBtns[1])
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Open Rollback PR" })
+    )
     await waitFor(() => {
       expect(screen.getByRole("alert")).toHaveTextContent(
-        "No previous revision found for flagger"
+        "No previous revision found to roll back to"
       )
     })
   })
 
-  it("uses demo addons fallback when getCoreAddons is empty in demo mode and handles refresh errors", async () => {
+  it("renders demo fixtures without any live API calls in demo mode", async () => {
     window.history.replaceState({}, "", "/?demo=true")
-    vi.mocked(api.getCoreAddons).mockResolvedValue([])
-    vi.mocked(api.getStacksWithMeta)
-      .mockResolvedValueOnce({
-        stacks: [],
-        gitRepoUrl: "https://git.example.com/org/infra.git",
-        forgeProvider: "forgejo",
-        stateBackend: "s3://keel-state",
-      })
-      .mockResolvedValueOnce({
-        stacks: [],
-        gitRepoUrl: "https://git.example.com/org/infra.git",
-        forgeProvider: "forgejo",
-        stateBackend: "s3://keel-state",
-      })
-      .mockRejectedValueOnce(new Error("API error (401): unauthorized"))
-      .mockRejectedValueOnce("non-error failure")
+    renderWithAuthz(<ControlPlaneProvidersView />)
 
-    render(<ControlPlaneProvidersView />)
-
-    await waitFor(() => {
-      expect(
-        screen.getByText("Management Plane Base Addons")
-      ).toBeInTheDocument()
-    })
-
-    const refreshBtn = screen.getByRole("button", { name: /Refresh/i })
-    // 1st refresh: succeeds with demo addons fallback
-    fireEvent.click(refreshBtn)
-    await waitFor(() => {
-      expect(api.getStacksWithMeta).toHaveBeenCalledTimes(2)
-    })
-
-    // 2nd refresh: 401 in demo mode is suppressed
-    fireEvent.click(refreshBtn)
-    await waitFor(() => {
-      expect(api.getStacksWithMeta).toHaveBeenCalledTimes(3)
-    })
-    expect(screen.queryByRole("alert")).not.toBeInTheDocument()
-
-    // 3rd refresh: non-Error string surfaces fallback alert
-    fireEvent.click(refreshBtn)
-    await waitFor(() => {
-      expect(screen.getByRole("alert")).toHaveTextContent(
-        "Failed to load control plane & provider state"
-      )
-    })
-
-    window.history.replaceState({}, "", "/")
+    expect(screen.getByText("Proxmox VE Cluster")).toBeInTheDocument()
+    expect(screen.getByTestId("core-addon-kyverno")).toBeInTheDocument()
+    expect(screen.getByTestId("management-health")).toHaveTextContent("Healthy")
+    fireEvent.click(screen.getByRole("button", { name: /Refresh/i }))
+    expect(api.getProviders).not.toHaveBeenCalled()
+    expect(api.getStacksWithMeta).not.toHaveBeenCalled()
   })
 })

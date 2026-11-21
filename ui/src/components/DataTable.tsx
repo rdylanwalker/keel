@@ -16,6 +16,56 @@ import {
 } from "@tanstack/react-table"
 import { ArrowDown, ArrowUp, ArrowUpDown, Search, X } from "lucide-react"
 
+/**
+ * Column `meta` understood by {@link DataTable}:
+ * - `align: "right"` right-aligns header and cells
+ * - `sticky: true` pins the column to the right edge (actions) so it stays visible when the
+ *   table scrolls horizontally (UI-10)
+ * - `grow: true` makes the column absorb all leftover width and truncate its content only when
+ *   the table is genuinely out of room (`w-full max-w-0` table-cell truncation); use it for the
+ *   primary name column so status/actions stay visible without horizontal scrolling
+ * - `hideBelow` hides a low-priority column when the *table container* is narrower than the
+ *   given size (container queries, so the sidebar/card width is accounted for — not the viewport):
+ *   `md` < 42rem, `lg` < 48rem, `xl` < 56rem, `2xl` < 64rem, `3xl` < 72rem
+ */
+export interface DataTableColumnMeta {
+  align?: "right"
+  sticky?: boolean
+  hideBelow?: "md" | "lg" | "xl" | "2xl" | "3xl"
+  grow?: boolean
+}
+
+const HIDE_BELOW_CLASS: Record<
+  NonNullable<DataTableColumnMeta["hideBelow"]>,
+  string
+> = {
+  md: "hidden @2xl:table-cell",
+  lg: "hidden @3xl:table-cell",
+  xl: "hidden @4xl:table-cell",
+  "2xl": "hidden @5xl:table-cell",
+  "3xl": "hidden @6xl:table-cell",
+}
+
+function columnClasses(meta: unknown, kind: "th" | "td"): string {
+  const m = (meta ?? {}) as DataTableColumnMeta
+  const classes: string[] = []
+  if (m.align === "right") classes.push("text-right")
+  if (m.hideBelow) classes.push(HIDE_BELOW_CLASS[m.hideBelow])
+  if (m.grow)
+    classes.push(
+      kind === "th"
+        ? "w-full min-w-[5.5rem] @md:min-w-[7rem] @xl:min-w-[11rem] @5xl:min-w-[12rem]"
+        : "w-full max-w-0 min-w-[5.5rem] @md:min-w-[7rem] @xl:min-w-[11rem] @5xl:min-w-[12rem]"
+    )
+  if (m.sticky) {
+    classes.push(
+      "sticky right-0 z-10 shadow-[-8px_0_8px_-8px_rgba(0,0,0,0.6)]",
+      kind === "th" ? "bg-slate-950" : "bg-slate-900"
+    )
+  }
+  return classes.join(" ")
+}
+
 const dataTableFeatures = tableFeatures({
   rowSortingFeature,
   columnFilteringFeature,
@@ -93,7 +143,7 @@ export function DataTable<TData extends RowData>({
         )}
       </div>
 
-      <div className="overflow-x-auto">
+      <div className="@container overflow-x-auto overscroll-x-contain">
         <table className="w-full text-left text-xs text-slate-300">
           <thead className="bg-slate-950 text-slate-400 border-b border-slate-800 uppercase font-mono">
             {table.getHeaderGroups().map((headerGroup) => (
@@ -116,7 +166,7 @@ export function DataTable<TData extends RowData>({
                               ? "none"
                               : undefined
                       }
-                      className={`py-3 px-4 select-none ${alignRight ? "text-right" : ""}`}
+                      className={`py-3 px-2 @md:px-3 select-none whitespace-nowrap ${columnClasses(header.column.columnDef.meta, "th")}`}
                     >
                       {header.isPlaceholder ? null : canSort ? (
                         <button
@@ -156,16 +206,13 @@ export function DataTable<TData extends RowData>({
             {rows.map((row) => (
               <tr
                 key={row.id}
-                className="hover:bg-slate-800/40 transition-colors"
+                className="group hover:bg-slate-800/40 transition-colors"
               >
                 {row.getAllCells().map((cell) => {
-                  const alignRight =
-                    (cell.column.columnDef.meta as { align?: string })
-                      ?.align === "right"
                   return (
                     <td
                       key={cell.id}
-                      className={`py-3.5 px-4 ${alignRight ? "text-right" : ""}`}
+                      className={`py-3 px-2 @md:px-3 whitespace-nowrap align-middle ${columnClasses(cell.column.columnDef.meta, "td")}`}
                     >
                       {flexRender(
                         cell.column.columnDef.cell,

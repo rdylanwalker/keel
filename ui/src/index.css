@@ -77,48 +77,6 @@
   margin-left: 0.25rem;
 }
 
-.rjsf-container .form-control {
-  display: block;
-  width: 100%;
-  padding: 0.5rem 0.75rem;
-  font-size: 0.8125rem;
-  line-height: 1.25rem;
-  color: #f8fafc;
-  background-color: #0f172a;
-  border: 1px solid #334155;
-  border-radius: 0.5rem;
-  outline: none;
-  transition:
-    border-color 0.15s ease,
-    box-shadow 0.15s ease;
-}
-
-.rjsf-container .form-control:focus {
-  border-color: #6366f1;
-  box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.25);
-}
-
-.rjsf-container .form-control::placeholder {
-  color: #64748b;
-}
-
-.rjsf-container .checkbox label {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.5rem;
-  font-size: 0.8125rem;
-  color: #e2e8f0;
-  cursor: pointer;
-}
-
-.rjsf-container .checkbox input[type="checkbox"] {
-  width: 1rem;
-  height: 1rem;
-  accent-color: #6366f1;
-  border-radius: 0.25rem;
-  cursor: pointer;
-}
-
 .rjsf-container .field-description,
 .rjsf-container .help-block {
   font-size: 0.75rem;
@@ -257,4 +215,16 @@
 .rjsf-container .row > .col-xs-3,
 .rjsf-container .row > .array-item-toolbox {
   flex: 0 0 auto;
+}
+
+/* SSH web terminal (wterm) — match the Keel dark palette. */
+.keel-web-terminal.wterm {
+  --term-bg: #020617;
+  --term-fg: #e2e8f0;
+  --term-cursor: #34d399;
+  --term-selection-bg: rgb(51 65 85 / 70%);
+  --term-font-family:
+    ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono",
+    monospace;
+  --term-font-size: 12px;
 }

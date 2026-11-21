@@ -1,12 +1,8 @@
-import {
-  render,
-  screen,
-  fireEvent,
-  waitFor,
-  within,
-} from "@testing-library/react"
+import { screen, fireEvent, waitFor, within } from "@testing-library/react"
 import { describe, it, expect, vi, beforeEach } from "vitest"
 import { CatalogWizardView } from "./CatalogWizardView"
+import { renderWithAuthz as render } from "../test/render"
+import { buildAuthz } from "../lib/authz"
 import * as api from "../lib/api"
 import { CatalogItem } from "../types/api"
 import { jsonToYaml } from "../lib/utils"
@@ -58,7 +54,7 @@ describe("CatalogWizardView component and jsonToYaml helper", () => {
     expect(jsonToYaml(42)).toBe("42\n")
     expect(jsonToYaml("simple")).toBe("simple\n")
     expect(jsonToYaml("string: with colon")).toBe('"string: with colon"\n')
-    expect(jsonToYaml(["a", "b"])).toBe("\n- a\n- b\n")
+    expect(jsonToYaml(["a", "b"])).toBe("- a\n- b\n")
     expect(jsonToYaml([])).toBe("[]\n")
     expect(jsonToYaml({})).toBe("{}\n")
     expect(jsonToYaml({ name: "app", nested: { count: 3 } })).toContain(
@@ -581,6 +577,7 @@ describe("CatalogWizardView component and jsonToYaml helper", () => {
     fireEvent.click(screen.getByRole("button", { name: /Create Tenant PR/i }))
 
     expect(await screen.findByText("Tenant quota exceeded")).toBeInTheDocument()
+    fireEvent.click(screen.getByRole("button", { name: /Cancel/i }))
 
     // Remove tenant string error failure
     const select = await screen.findByLabelText(/Target Tenant:/i)
@@ -700,16 +697,25 @@ describe("CatalogWizardView component and jsonToYaml helper", () => {
     expect(screen.queryByText("{}")).not.toBeInTheDocument()
   })
 
-  it("handles catalog API rejection in demo mode gracefully", async () => {
+  it("renders demo fixtures without any live API calls in demo mode", async () => {
     window.history.replaceState({}, "", "/?demo=true")
+    try {
+      vi.mocked(api.getCatalog).mockRejectedValue(new Error("Network error"))
+      render(<CatalogWizardView />)
+      const list = screen.getByTestId("catalog-list")
+      expect(list.children.length).toBeGreaterThan(0)
+      expect(api.getCatalog).not.toHaveBeenCalled()
+      expect(api.getTenants).not.toHaveBeenCalled()
+      expect(screen.queryByText("Network error")).not.toBeInTheDocument()
+    } finally {
+      window.history.replaceState({}, "", "/")
+    }
+  })
+
+  it("shows a friendly load error when the catalog API fails", async () => {
     vi.mocked(api.getCatalog).mockRejectedValue(new Error("Network error"))
-
     render(<CatalogWizardView />)
-
-    await waitFor(() => {
-      expect(screen.getByText("Network error")).toBeInTheDocument()
-    })
-    window.history.replaceState({}, "", "/")
+    expect(await screen.findByText("Network error")).toBeInTheDocument()
   })
 
   it("submits infrastructure proposal with kind='infra'", async () => {
@@ -1069,44 +1075,36 @@ describe("CatalogWizardView component and jsonToYaml helper", () => {
     fireEvent.click(createBtn)
 
     const deployModal = await screen.findByTestId("deploy-instance-modal")
-    expect(deployModal.className).toContain("max-w-4xl")
+    expect(deployModal.className).toContain("sm:max-w-4xl")
 
     fireEvent.click(screen.getByRole("button", { name: /Enter full screen/i }))
-    expect(deployModal.className).toContain("w-full h-full")
+    expect(deployModal.className).toContain("w-screen")
     expect(deployModal.className).toContain("rounded-none")
 
     fireEvent.click(screen.getByRole("button", { name: /Exit full screen/i }))
-    expect(deployModal.className).toContain("max-w-4xl")
+    expect(deployModal.className).toContain("sm:max-w-4xl")
     fireEvent.click(screen.getByRole("button", { name: /Close modal/i }))
 
     // 2. Add/Edit Catalog Item modal full-screen toggle
     fireEvent.click(screen.getByRole("button", { name: /^Add Catalog Item$/i }))
     const catalogItemModal = screen.getByTestId("catalog-item-modal")
-    expect(catalogItemModal.className).toContain("max-w-4xl")
-    expect(catalogItemModal.className).toContain("w-full")
+    expect(catalogItemModal.className).toContain("sm:max-w-4xl")
     fireEvent.click(screen.getByRole("button", { name: /Enter full screen/i }))
-    expect(catalogItemModal.className).toContain("w-full h-full")
+    expect(catalogItemModal.className).toContain("w-screen")
     expect(catalogItemModal.className).toContain("rounded-none")
     fireEvent.click(screen.getByRole("button", { name: /Exit full screen/i }))
-    expect(catalogItemModal.className).toContain("max-w-4xl")
+    expect(catalogItemModal.className).toContain("sm:max-w-4xl")
     expect(
       screen.getByRole("button", { name: /Enter full screen/i })
     ).toBeInTheDocument()
     fireEvent.click(screen.getByRole("button", { name: /Close modal/i }))
 
-    // 3. New Tenant modal full-screen toggle
+    // 3. New Tenant modal is a compact dialog (no full-screen mode)
     fireEvent.click(screen.getByRole("button", { name: /New Tenant/i }))
-    const tenantModal = screen.getByTestId("new-tenant-modal")
-    expect(tenantModal.className).toContain("max-w-4xl")
-    expect(tenantModal.className).toContain("w-full")
-    fireEvent.click(screen.getByRole("button", { name: /Enter full screen/i }))
-    expect(tenantModal.className).toContain("w-full h-full")
-    expect(tenantModal.className).toContain("rounded-none")
-    fireEvent.click(screen.getByRole("button", { name: /Exit full screen/i }))
-    expect(tenantModal.className).toContain("max-w-4xl")
+    expect(screen.getByTestId("new-tenant-modal")).toBeInTheDocument()
     expect(
-      screen.getByRole("button", { name: /Enter full screen/i })
-    ).toBeInTheDocument()
+      screen.queryByRole("button", { name: /Enter full screen/i })
+    ).not.toBeInTheDocument()
     fireEvent.click(screen.getByRole("button", { name: /Close modal/i }))
   })
 
@@ -1736,8 +1734,26 @@ spec:
     )
     expect(deleteGlobalAppBtn).toBeEnabled()
 
-    // Delete item
+    // Delete requires confirmation; cancelling sends nothing.
     fireEvent.click(deleteGlobalAppBtn)
+    expect(
+      await screen.findByRole("alertdialog", {
+        name: "Delete catalog item Global App?",
+      })
+    ).toBeInTheDocument()
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }))
+    await waitFor(() =>
+      expect(
+        screen.queryByTestId("confirm-delete-catalog-item-global-app")
+      ).toBeNull()
+    )
+    expect(api.deleteCatalogItem).not.toHaveBeenCalled()
+
+    // Confirm the deletion
+    fireEvent.click(deleteGlobalAppBtn)
+    fireEvent.click(
+      await screen.findByTestId("confirm-delete-catalog-item-global-app")
+    )
 
     await waitFor(() => {
       expect(api.deleteCatalogItem).toHaveBeenCalledWith("app", "global-app")
@@ -1815,5 +1831,160 @@ spec:
     expect(
       within(screen.getByTestId("catalog-list")).getByText("Stark App")
     ).toBeInTheDocument()
+  })
+})
+
+describe("CatalogWizardView roles and kind filter", () => {
+  const mixedCatalog: CatalogItem[] = [
+    { ...mockCatalog[0], id: "web", name: "Web App", type: "app" },
+    {
+      ...mockCatalog[0],
+      id: "eks-cluster",
+      name: "EKS Cluster",
+      type: "infra",
+      resourceKind: "cluster",
+    },
+    {
+      ...mockCatalog[0],
+      id: "proxmox-vm",
+      name: "Proxmox VM",
+      type: "infra",
+      provider: "proxmox",
+    },
+    {
+      ...mockCatalog[0],
+      id: "pg",
+      name: "Postgres",
+      type: "infra",
+      resourceKind: "service",
+    },
+    {
+      ...mockCatalog[0],
+      id: "platform",
+      name: "Platform Bundle",
+      type: "bundle",
+      version: "bundle",
+    },
+    {
+      ...mockCatalog[0],
+      id: "acme-only",
+      name: "Acme Only",
+      type: "app",
+      tenant: "acme",
+    },
+  ]
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    vi.mocked(api.getCatalog).mockResolvedValue(mixedCatalog)
+    vi.mocked(api.getTenants).mockResolvedValue([
+      { id: "default", namespace: "tenant-default" },
+      { id: "acme", namespace: "tenant-acme" },
+    ])
+  })
+
+  it("pre-filters by kind with a clearable chip", async () => {
+    const onKindFilterChange = vi.fn()
+    const { rerender } = render(
+      <CatalogWizardView
+        kindFilter="vm"
+        onKindFilterChange={onKindFilterChange}
+      />
+    )
+    const list = await screen.findByTestId("catalog-list")
+    await waitFor(() =>
+      expect(within(list).getByText("Proxmox VM")).toBeInTheDocument()
+    )
+    expect(within(list).queryByText("Web App")).toBeNull()
+    expect(screen.getByTestId("catalog-kind-filter")).toHaveTextContent(
+      "Virtual machines"
+    )
+
+    rerender(<CatalogWizardView kindFilter="cluster" />)
+    await waitFor(() =>
+      expect(within(list).getByText("EKS Cluster")).toBeInTheDocument()
+    )
+    expect(within(list).getByText("Platform Bundle")).toBeInTheDocument()
+    expect(within(list).queryByText("Proxmox VM")).toBeNull()
+
+    rerender(
+      <CatalogWizardView
+        kindFilter="service"
+        onKindFilterChange={onKindFilterChange}
+      />
+    )
+    await waitFor(() =>
+      expect(within(list).getByText("Postgres")).toBeInTheDocument()
+    )
+    fireEvent.click(
+      screen.getByRole("button", { name: /Clear catalog kind filter/i })
+    )
+    expect(onKindFilterChange).toHaveBeenCalledWith(undefined)
+    expect(within(list).getByText("Web App")).toBeInTheDocument()
+    expect(screen.queryByTestId("catalog-kind-filter")).toBeNull()
+  })
+
+  it("shows an empty-state message for a kind with no blueprints", async () => {
+    vi.mocked(api.getCatalog).mockResolvedValue([mixedCatalog[0]])
+    render(<CatalogWizardView kindFilter="vm" />)
+    expect(
+      await screen.findByText("No virtual machines blueprints in the catalog.")
+    ).toBeInTheDocument()
+  })
+
+  it("hides admin-only controls for a tenant member", async () => {
+    render(
+      <CatalogWizardView />,
+      buildAuthz({
+        authenticated: true,
+        phase: "oidc-active",
+        groups: ["acme"],
+      })
+    )
+    const list = await screen.findByTestId("catalog-list")
+    await waitFor(() =>
+      expect(within(list).getByText("Web App")).toBeInTheDocument()
+    )
+    expect(screen.queryByRole("button", { name: /New Tenant/i })).toBeNull()
+    expect(screen.queryByRole("button", { name: /Remove/i })).toBeNull()
+    expect(
+      screen.queryByRole("button", { name: /^Add Catalog Item$/i })
+    ).toBeNull()
+    expect(within(list).queryByRole("button", { name: /^Edit$/i })).toBeNull()
+    expect(screen.getByTestId("delete-catalog-item-web")).toBeDisabled()
+    // Deploying (proposal creation) remains available to tenant members.
+    expect(
+      within(list).getAllByRole("button", { name: /^Create$/i }).length
+    ).toBeGreaterThan(0)
+  })
+
+  it("lets a tenant admin manage only their tenant's items and scopes new items", async () => {
+    render(
+      <CatalogWizardView />,
+      buildAuthz({
+        authenticated: true,
+        phase: "oidc-active",
+        groups: ["tenant-acme-admin"],
+      })
+    )
+    const list = await screen.findByTestId("catalog-list")
+    await waitFor(() =>
+      expect(within(list).getByText("Acme Only")).toBeInTheDocument()
+    )
+    expect(
+      within(list).getAllByRole("button", { name: /^Edit$/i })
+    ).toHaveLength(1)
+    expect(screen.getByTestId("delete-catalog-item-acme-only")).toBeEnabled()
+    expect(screen.getByTestId("delete-catalog-item-web")).toBeDisabled()
+
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: /^Add Catalog Item$/i })
+      ).toBeInTheDocument()
+    )
+    fireEvent.click(screen.getByRole("button", { name: /^Add Catalog Item$/i }))
+    const scope = screen.getByLabelText(/Tenant Visibility/i)
+    expect(scope).toHaveValue("acme")
+    expect(within(scope).queryByRole("option", { name: /Global/i })).toBeNull()
   })
 })

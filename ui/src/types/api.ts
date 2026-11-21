@@ -98,12 +98,27 @@ export interface Proposal {
 export type ChangeOp =
   "Create" | "Update" | "Delete" | "Replace" | "Same" | "Drift"
 
+/** Normalized resource diff consumed by the preview components. */
 export interface ResourceDiff {
   urn: string
   resource_type: string
   name: string
   op: ChangeOp
   changed_fields: string[]
+}
+
+/**
+ * Resource diff as sent by the server: camelCase (`resourceType`, `changedFields`). The
+ * snake_case keys are accepted as a fallback for reports persisted by older servers.
+ */
+export interface RawResourceDiff {
+  urn?: string
+  name?: string
+  op: ChangeOp
+  resourceType?: string
+  changedFields?: string[]
+  resource_type?: string
+  changed_fields?: string[]
 }
 
 export interface PreviewSummary {
@@ -120,8 +135,29 @@ export interface PreviewReport {
   resources: ResourceDiff[]
   summary: PreviewSummary
   prUrl?: string
-  policyStatus?: "passed" | "failed" | "warning"
+  /** Policy verdict; `undefined` means no policy evaluation was performed/reported. */
+  policyStatus?: PolicyStatus
+  /** `synthesized` = control-plane simulation (no PKO `pulumi preview` executed). */
+  source?: PreviewSource
+  /** Ephemeral PKO preview run state (absent for legacy/synthesized reports). */
+  run?: PreviewRun
   gitDiff?: string
+}
+
+export type PolicyStatus = "passed" | "failed" | "warning"
+
+export type PreviewSource = "pko" | "synthesized"
+
+export type PreviewRunPhase =
+  "pending" | "running" | "succeeded" | "failed" | "notExecuted"
+
+/** Execution state of the ephemeral PKO v2 preview `Stack` backing a report. */
+export interface PreviewRun {
+  phase: PreviewRunPhase
+  message?: string
+  stack?: string
+  commit?: string
+  update?: string
 }
 
 export interface StackSummary {
@@ -131,7 +167,21 @@ export interface StackSummary {
   tenant: string
   provider: "proxmox" | "aws" | "gcp" | "azure" | "hetzner" | "kind" | string
   type: "management" | "workload" | "cloud"
-  status: "synced" | "reconciling" | "pending" | "error" | "drift"
+  /**
+   * Live/desired state. `orphaned` = live in the cluster but absent from Git; `deleting` =
+   * strictly terminating. Server labels are capitalized (`Synced`, `Orphaned`, ...).
+   */
+  status:
+    | "synced"
+    | "reconciling"
+    | "pending"
+    | "error"
+    | "drift"
+    | "orphaned"
+    | "deleting"
+    | string
+  /** `protect: true` (management plane core and protected stacks). */
+  protect?: boolean
   resourceCount?: number
   lastSynced?: string
   bundle?: string
@@ -293,4 +343,25 @@ export interface CreateProposalPayload {
 export interface UpgradeManagementAddonPayload {
   version?: string
   values: Record<string, unknown>
+}
+
+/** Management-plane core add-on with live Flux HelmRelease status (`GET /api/v1/management/addons`). */
+export interface ManagementAddonStatus {
+  /** HelmRelease name (equals the `catalog/core` application id). */
+  id: string
+  name: string
+  namespace: string
+  chart?: string
+  desiredVersion?: string
+  /** Live status label (`Ready`, `Reconciling`, `Error`, ...); absent when not tracked. */
+  status?: string
+  /** `true` when a live HelmRelease with the same namespace/name was observed. */
+  tracked: boolean
+  lastSynced?: string
+}
+
+export interface ManagementAddonsResponse {
+  addons: ManagementAddonStatus[]
+  /** `false` when the server has no live Kubernetes connection (Git-only view). */
+  liveStatusAvailable: boolean
 }

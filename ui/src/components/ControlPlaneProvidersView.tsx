@@ -1,134 +1,107 @@
 import React, { useCallback, useEffect, useState } from "react"
-import {
-  Server,
-  Cloud,
-  RefreshCw,
-  AlertTriangle,
-  ExternalLink,
-  Package,
-  RotateCcw,
-  SlidersHorizontal,
-} from "lucide-react"
+import { AlertTriangle, Cloud, Package, RefreshCw, Server } from "lucide-react"
+
 import {
   CatalogItem,
+  ManagementAddonStatus,
   ProviderRegistryEntry,
-  ReleaseSummary,
 } from "../types/api"
 import {
   getCoreAddons,
+  getManagementAddons,
   getProposals,
   getProviders,
-  getReleases,
   getStacksWithMeta,
   rollbackManagementAddon,
   toggleProvider,
 } from "../lib/api"
+import { errorMessage, visibleLoadError } from "../lib/errors"
 import { formatForgeProvider, isDemoMode } from "../lib/utils"
-import { DeployInstanceModal } from "./DeployInstanceModal"
-import { PrNotificationBanner } from "./PrNotificationBanner"
+import { useAuthz } from "../lib/authz-context"
 import {
   DEFAULT_CORE_ADDONS,
   DEFAULT_PROVIDERS,
-  ProviderInfo,
+  DEMO_MANAGEMENT_ADDON_STATUSES,
 } from "../lib/demoFixtures"
+import { DeployInstanceModal } from "./DeployInstanceModal"
+import { PrNotificationBanner } from "./PrNotificationBanner"
+import { Badge } from "./ui/badge"
+import { Button } from "./ui/button"
+import { PageHeader } from "./ui/page-header"
+import { ConfirmDialog } from "./ui/confirm-dialog"
+import { ProviderCard } from "./providers/ProviderCard"
+import { ManagementAddonCard } from "./providers/ManagementAddonCard"
+import {
+  deriveManagementHealth,
+  extractPendingProviderPrs,
+  ManagementHealth,
+} from "./providers/addonStatus"
 
-function findAddonRelease(
-  addon: CatalogItem,
-  releases: ReleaseSummary[]
-): ReleaseSummary | undefined {
-  return releases.find(
-    (r) =>
-      r.name === addon.id ||
-      r.id === addon.id ||
-      (addon.chart && (r.name === addon.chart || r.chart === addon.chart))
-  )
+interface ClusterMeta {
+  gitRepoUrl?: string
+  forgeProvider?: string
+  stateBackend?: string
 }
 
-function getAddonStatusBadge(release?: ReleaseSummary): {
-  label: "Ready" | "Pending" | "Failed" | "Unknown"
-  className: string
-} {
-  const raw = release?.status?.toLowerCase()
-  if (raw === "healthy" || raw === "ready") {
-    return {
-      label: "Ready",
-      className:
-        "bg-emerald-500/10 text-emerald-400 border border-emerald-500/20",
-    }
-  }
-  if (raw === "progressing" || raw === "pending") {
-    return {
-      label: "Pending",
-      className: "bg-amber-500/10 text-amber-400 border border-amber-500/20",
-    }
-  }
-  if (raw === "failed" || raw === "degraded") {
-    return {
-      label: "Failed",
-      className: "bg-red-500/10 text-red-400 border border-red-500/20",
-    }
-  }
-  return {
-    label: "Unknown",
-    className: "bg-slate-800 text-slate-400 border border-slate-700",
-  }
+interface LoadResult {
+  error: string | null
+  clusterMeta?: ClusterMeta
+  providers?: ProviderRegistryEntry[]
+  coreAddons?: CatalogItem[]
+  addonStatuses?: ManagementAddonStatus[] | null
+  liveStatusAvailable?: boolean
+  pendingProviderPrs?: Record<string, { id: string; branch: string }>
 }
 
-async function safeGetCoreAddons(): Promise<CatalogItem[]> {
+const LOAD_ERROR = "Failed to load control plane & provider state"
+
+/**
+ * Loads providers (all users) and, for cluster admins only, management-plane data:
+ * core add-on catalog entries, live add-on HelmRelease status, and pending toggle PRs.
+ * Never throws; failures are reported through `error`.
+ */
+async function loadProvidersState(isAdmin: boolean): Promise<LoadResult> {
   try {
-    return await getCoreAddons()
-  } catch {
-    return []
-  }
-}
-
-async function safeGetReleases(): Promise<ReleaseSummary[]> {
-  try {
-    return await getReleases()
-  } catch {
-    return []
-  }
-}
-
-function mergeProviders(liveEntries: ProviderRegistryEntry[]): ProviderInfo[] {
-  if (!liveEntries || liveEntries.length === 0) {
-    return DEFAULT_PROVIDERS
-  }
-  const knownIds = new Set(DEFAULT_PROVIDERS.map((p) => p.id))
-  const updatedDefaults = DEFAULT_PROVIDERS.map((def) => {
-    const live = liveEntries.find((e) => e.id === def.id)
-    return live
-      ? {
-          ...def,
-          enabled: live.enabled,
-          name: live.description || def.name,
-        }
-      : def
-  })
-  const extras: ProviderInfo[] = liveEntries
-    .filter((e) => !knownIds.has(e.id))
-    .map((e) => ({
-      id: e.id,
-      name: e.description || e.id,
-      type: e.package || "Infrastructure Provider",
-      enabled: e.enabled,
-      nodesOrRegions: "Default Region",
-    }))
-  return [...updatedDefaults, ...extras]
-}
-
-function extractPendingProviderPrs(
-  proposals: { id: string; branch: string; status: string }[]
-) {
-  const map: Record<string, { id: string; branch: string }> = {}
-  for (const pr of proposals) {
-    if (pr.status !== "open") continue
-    const match = /^keel\/providers\/toggle-([a-z0-9-]+)-\d+$/.exec(pr.branch)
-    if (match) {
-      map[match[1]] = { id: pr.id, branch: pr.branch }
+    const [providers, meta] = await Promise.all([
+      getProviders(),
+      getStacksWithMeta().catch(() => null),
+    ])
+    const result: LoadResult = {
+      error: null,
+      providers: providers ?? [],
+      clusterMeta: meta
+        ? {
+            gitRepoUrl: meta.gitRepoUrl,
+            forgeProvider: meta.forgeProvider,
+            stateBackend: meta.stateBackend,
+          }
+        : undefined,
     }
+    if (isAdmin) {
+      const [coreAddons, statuses, proposals] = await Promise.all([
+        getCoreAddons().catch(() => [] as CatalogItem[]),
+        getManagementAddons().catch(() => null),
+        getProposals().catch(() => []),
+      ])
+      result.coreAddons = coreAddons ?? []
+      result.addonStatuses = statuses ? statuses.addons : null
+      result.liveStatusAvailable = statuses?.liveStatusAvailable ?? false
+      result.pendingProviderPrs = extractPendingProviderPrs(proposals ?? [])
+    }
+    return result
+  } catch (err) {
+    return { error: visibleLoadError(err, LOAD_ERROR) }
   }
-  return map
+}
+
+const HEALTH_STYLES: Record<
+  ManagementHealth["tone"],
+  { dot: string; text: string }
+> = {
+  healthy: { dot: "bg-emerald-400 animate-pulse", text: "text-emerald-400" },
+  warning: { dot: "bg-amber-400", text: "text-amber-300" },
+  error: { dot: "bg-red-400", text: "text-red-400" },
+  unknown: { dot: "bg-slate-500", text: "text-slate-400" },
 }
 
 export interface ControlPlaneProvidersViewProps {
@@ -140,24 +113,28 @@ export interface ControlPlaneProvidersViewProps {
 export const ControlPlaneProvidersView: React.FC<
   ControlPlaneProvidersViewProps
 > = ({ onNavigateToCatalog, onNavigateToPreview, authenticated = true }) => {
-  const [clusterMeta, setClusterMeta] = useState<{
-    gitRepoUrl?: string
-    forgeProvider?: string
-    stateBackend?: string
-  }>({})
-  const [providers, setProviders] = useState<ProviderInfo[]>(() =>
-    isDemoMode() ? DEFAULT_PROVIDERS : []
+  const { isAdmin } = useAuthz()
+  const demo = isDemoMode()
+  const [clusterMeta, setClusterMeta] = useState<ClusterMeta>({})
+  const [providers, setProviders] = useState<ProviderRegistryEntry[]>(() =>
+    demo ? DEFAULT_PROVIDERS : []
   )
   const [coreAddons, setCoreAddons] = useState<CatalogItem[]>(() =>
-    isDemoMode() ? DEFAULT_CORE_ADDONS : []
+    demo ? DEFAULT_CORE_ADDONS : []
   )
-  const [releases, setReleases] = useState<ReleaseSummary[]>([])
+  const [addonStatuses, setAddonStatuses] = useState<
+    ManagementAddonStatus[] | null
+  >(() => (demo ? DEMO_MANAGEMENT_ADDON_STATUSES : null))
+  const [liveStatusAvailable, setLiveStatusAvailable] = useState(demo)
   const [pendingProviderPrs, setPendingProviderPrs] = useState<
     Record<string, { id: string; branch: string }>
   >({})
-  const [loading, setLoading] = useState(false)
+  const [loading, setLoading] = useState(() => authenticated && !demo)
   const [togglingId, setTogglingId] = useState<string | null>(null)
   const [rollingBackId, setRollingBackId] = useState<string | null>(null)
+  const [confirmRollbackId, setConfirmRollbackId] = useState<string | null>(
+    null
+  )
   const [selectedAddon, setSelectedAddon] = useState<CatalogItem | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [prNotification, setPrNotification] = useState<{
@@ -166,117 +143,39 @@ export const ControlPlaneProvidersView: React.FC<
     prUrl?: string
   } | null>(null)
 
-  const fetchData = useCallback(async () => {
-    setLoading(true)
-    try {
-      const [
-        stacksRes,
-        providersData,
-        proposalsData,
-        coreAddonsData,
-        releasesData,
-      ] = await Promise.all([
-        getStacksWithMeta(),
-        getProviders(),
-        getProposals().catch(() => []),
-        safeGetCoreAddons(),
-        safeGetReleases(),
-      ])
-      setError(null)
-      setClusterMeta({
-        gitRepoUrl: stacksRes.gitRepoUrl,
-        forgeProvider: stacksRes.forgeProvider,
-        stateBackend: stacksRes.stateBackend,
-      })
-      if (providersData) {
-        setProviders(mergeProviders(providersData))
-      }
-      if (coreAddonsData && coreAddonsData.length > 0) {
-        setCoreAddons(coreAddonsData)
-      } else if (isDemoMode()) {
-        setCoreAddons(DEFAULT_CORE_ADDONS)
-      } else {
-        setCoreAddons([])
-      }
-      setReleases(releasesData || [])
-      setPendingProviderPrs(extractPendingProviderPrs(proposalsData || []))
-    } catch (err) {
-      const msg =
-        err instanceof Error
-          ? err.message
-          : "Failed to load control plane & provider state"
-      if (!(isDemoMode() && msg.includes("API error (401)"))) {
-        setError(msg)
-      }
-    } finally {
-      setLoading(false)
+  const applyLoadResult = useCallback((result: LoadResult) => {
+    setError(result.error)
+    if (result.clusterMeta) setClusterMeta(result.clusterMeta)
+    if (result.providers) setProviders(result.providers)
+    if (result.coreAddons) setCoreAddons(result.coreAddons)
+    if (result.addonStatuses !== undefined) {
+      setAddonStatuses(result.addonStatuses)
+      setLiveStatusAvailable(Boolean(result.liveStatusAvailable))
     }
+    if (result.pendingProviderPrs) {
+      setPendingProviderPrs(result.pendingProviderPrs)
+    }
+    setLoading(false)
   }, [])
 
   useEffect(() => {
-    if (!authenticated) {
+    if (!authenticated || isDemoMode()) {
       return
     }
     let cancelled = false
-    Promise.all([
-      getStacksWithMeta(),
-      getProviders(),
-      getProposals().catch(() => []),
-      safeGetCoreAddons(),
-      safeGetReleases(),
-    ])
-      .then(
-        ([
-          stacksRes,
-          providersData,
-          proposalsData,
-          coreAddonsData,
-          releasesData,
-        ]) => {
-          if (!cancelled) {
-            setError(null)
-            setClusterMeta({
-              gitRepoUrl: stacksRes.gitRepoUrl,
-              forgeProvider: stacksRes.forgeProvider,
-              stateBackend: stacksRes.stateBackend,
-            })
-            if (providersData) {
-              setProviders(mergeProviders(providersData))
-            }
-            if (coreAddonsData && coreAddonsData.length > 0) {
-              setCoreAddons(coreAddonsData)
-            } else if (isDemoMode()) {
-              setCoreAddons(DEFAULT_CORE_ADDONS)
-            } else {
-              setCoreAddons([])
-            }
-            setReleases(releasesData || [])
-            setPendingProviderPrs(
-              extractPendingProviderPrs(proposalsData || [])
-            )
-          }
-        }
-      )
-      .catch((err) => {
-        if (!cancelled) {
-          const msg =
-            err instanceof Error
-              ? err.message
-              : "Failed to load control plane & provider state"
-          if (!(isDemoMode() && msg.includes("API error (401)"))) {
-            setError(msg)
-          }
-        }
-      })
-      .finally(() => {
-        if (!cancelled) {
-          setLoading(false)
-        }
-      })
+    void loadProvidersState(isAdmin).then((result) => {
+      if (!cancelled) applyLoadResult(result)
+    })
     return () => {
       cancelled = true
     }
-  }, [authenticated])
+  }, [authenticated, isAdmin, applyLoadResult])
+
+  const handleRefresh = async () => {
+    if (isDemoMode()) return
+    setLoading(true)
+    applyLoadResult(await loadProvidersState(isAdmin))
+  }
 
   const handleToggleProvider = async (
     id: string,
@@ -296,9 +195,7 @@ export const ControlPlaneProvidersView: React.FC<
         [id]: { id: proposal.id, branch: proposal.branch || "main" },
       }))
     } catch (err) {
-      setError(
-        err instanceof Error ? err.message : `Failed to toggle provider ${id}`
-      )
+      setError(errorMessage(err, `Failed to toggle provider ${id}`))
     } finally {
       setTogglingId(null)
     }
@@ -315,55 +212,57 @@ export const ControlPlaneProvidersView: React.FC<
         prUrl: proposal.prUrl,
       })
     } catch (err) {
-      setError(
-        err instanceof Error
-          ? err.message
-          : `Failed to create rollback PR for ${id}`
-      )
+      setError(errorMessage(err, `Failed to create rollback PR for ${id}`))
     } finally {
       setRollingBackId(null)
     }
   }
 
+  const health = deriveManagementHealth(addonStatuses, liveStatusAvailable)
+  const statusById = new Map(
+    (addonStatuses ?? []).map((s) => [s.id, s] as const)
+  )
+  const catalogIds = new Set(coreAddons.map((a) => a.id))
+  const statusOnlyAddons = (addonStatuses ?? []).filter(
+    (s) => !catalogIds.has(s.id)
+  )
+
   return (
     <div className="space-y-6">
-      {/* Header */}
-      <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 bg-slate-900 border border-slate-800 p-6 rounded-2xl">
-        <div>
-          <h2 className="text-xl font-bold text-white flex items-center gap-2">
-            <Server className="h-6 w-6 text-indigo-400" />
-            Control Plane &amp; Providers
-          </h2>
-          <p className="text-xs text-slate-400 mt-1">
-            Inspect the protected management cluster core and enable or disable
-            infrastructure providers
-          </p>
-        </div>
-        <div className="flex items-center gap-2">
-          <button
-            type="button"
-            onClick={fetchData}
+      <PageHeader
+        icon={<Server className="h-6 w-6 text-indigo-400" aria-hidden="true" />}
+        title="Control Plane & Providers"
+        description={
+          isAdmin
+            ? "Inspect the protected management cluster core and enable or disable infrastructure providers"
+            : "Infrastructure providers available to your tenants"
+        }
+        actions={
+          <Button
+            variant="secondary"
+            onClick={handleRefresh}
             disabled={loading}
-            className="flex items-center space-x-2 px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 rounded-lg text-xs transition-colors cursor-pointer"
+            aria-busy={loading}
           >
             <RefreshCw
+              aria-hidden="true"
               className={`h-3.5 w-3.5 ${loading ? "animate-spin" : ""}`}
             />
             <span>Refresh</span>
-          </button>
-        </div>
-      </div>
+          </Button>
+        }
+      />
 
       {error && authenticated && (
         <div
           role="alert"
           className="p-4 bg-amber-950/40 border border-amber-500/30 rounded-xl text-amber-300 text-xs flex items-center space-x-2"
         >
-          <AlertTriangle className="h-4 w-4 text-amber-400 shrink-0" />
-          <span>
-            {error}
-            {isDemoMode() ? " (showing fallback local providers)" : ""}
-          </span>
+          <AlertTriangle
+            className="h-4 w-4 text-amber-400 shrink-0"
+            aria-hidden="true"
+          />
+          <span>{error}</span>
         </div>
       )}
 
@@ -377,256 +276,168 @@ export const ControlPlaneProvidersView: React.FC<
         />
       )}
 
-      {/* Management Cluster Core Card */}
-      <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6">
-        <div className="flex items-center justify-between gap-4">
-          <div className="flex items-center space-x-3">
-            <div className="p-3 bg-indigo-600 rounded-xl text-white shadow-lg shadow-indigo-600/30">
-              <Server className="h-6 w-6" />
-            </div>
-            <div>
-              <div className="flex items-center space-x-2">
-                <h3 className="text-lg font-semibold text-white">
-                  Management Control Plane Cluster
-                </h3>
-                <span className="text-xs px-2.5 py-0.5 rounded-full bg-indigo-500/10 text-indigo-400 border border-indigo-500/30 font-medium">
-                  protect: true
-                </span>
+      {/* Management Cluster Core Card (cluster admins only) */}
+      {isAdmin && (
+        <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6">
+          <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
+            <div className="flex items-center space-x-3 min-w-0">
+              <div className="p-3 bg-indigo-600 rounded-xl text-white shadow-lg shadow-indigo-600/30 shrink-0">
+                <Server className="h-6 w-6" aria-hidden="true" />
               </div>
-              <p className="text-xs text-slate-400 mt-1">
-                GitOps: Flux CD v2 &middot; Forge:{" "}
-                {formatForgeProvider(clusterMeta.forgeProvider)} &middot;
-                Secrets: SOPS + age / S3
-              </p>
-            </div>
-          </div>
-          <div className="flex items-center space-x-2 shrink-0">
-            <span className="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-pulse"></span>
-            <span className="text-xs font-semibold text-emerald-400">
-              Healthy
-            </span>
-          </div>
-        </div>
-      </div>
-
-      {/* Enabled Infrastructure Providers Grid */}
-      <div className="space-y-3">
-        <h3 className="text-sm font-semibold text-slate-300 uppercase tracking-wider flex items-center gap-2">
-          <Cloud className="h-4 w-4 text-indigo-400" /> Enabled Provider Mesh
-        </h3>
-        <div className="grid grid-cols-1 md:grid-cols-3 lg:grid-cols-5 gap-4">
-          {providers.map((provider) => (
-            <div
-              key={provider.id}
-              className={`flex flex-col justify-between h-full bg-slate-900 border p-4 rounded-xl transition-all ${
-                provider.enabled
-                  ? "border-slate-800 hover:border-indigo-500/60"
-                  : "border-slate-800/60 opacity-75"
-              }`}
-            >
-              <div className="space-y-2">
-                <div className="flex items-start justify-between gap-2">
-                  <span className="text-xs font-semibold text-white leading-snug">
-                    {provider.name}
-                  </span>
-                  <span
-                    className={`shrink-0 text-[10px] px-2 py-0.5 rounded-full font-medium ${
-                      provider.enabled
-                        ? "bg-emerald-500/10 text-emerald-400 border border-emerald-500/20"
-                        : "bg-slate-800 text-slate-500 border border-slate-700"
-                    }`}
-                  >
-                    {provider.enabled ? "enabled" : "disabled"}
-                  </span>
+              <div className="min-w-0">
+                <div className="flex flex-wrap items-center gap-2">
+                  <h3 className="text-lg font-semibold text-white">
+                    Management Control Plane Cluster
+                  </h3>
+                  <Badge className="text-xs">protect: true</Badge>
                 </div>
-                <p className="text-[11px] text-slate-400">{provider.type}</p>
-                <p className="text-[10px] font-mono text-slate-500 truncate">
-                  {provider.nodesOrRegions}
+                <p className="text-xs text-slate-400 mt-1">
+                  GitOps: Flux CD v2 &middot; Forge:{" "}
+                  {formatForgeProvider(clusterMeta.forgeProvider)} &middot;
+                  Secrets: SOPS + age / S3
                 </p>
               </div>
-              <div className="mt-3 pt-2 border-t border-slate-800/60 flex items-center justify-between gap-2">
-                {pendingProviderPrs[provider.id] ? (
-                  <button
-                    type="button"
-                    onClick={onNavigateToPreview}
-                    className="text-[11px] px-2.5 py-1 rounded-md font-medium bg-purple-500/10 text-purple-300 border border-purple-500/30 hover:bg-purple-500/20 transition-colors cursor-pointer"
-                  >
-                    Go to PR #{pendingProviderPrs[provider.id].id} →
-                  </button>
-                ) : (
-                  <button
-                    type="button"
-                    onClick={() =>
-                      handleToggleProvider(provider.id, provider.enabled)
-                    }
-                    disabled={togglingId === provider.id}
-                    className={`text-[11px] px-2.5 py-1 rounded-md font-medium transition-colors ${
-                      provider.enabled
-                        ? "bg-rose-500/10 text-rose-400 border border-rose-500/20 hover:bg-rose-500/20 cursor-pointer"
-                        : "bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 hover:bg-emerald-500/20 cursor-pointer"
-                    } ${togglingId === provider.id ? "opacity-50 cursor-wait" : ""}`}
-                  >
-                    {togglingId === provider.id
-                      ? "Updating..."
-                      : provider.enabled
-                        ? "Disable"
-                        : "Enable"}
-                  </button>
-                )}
-                {provider.enabled && onNavigateToCatalog && (
-                  <button
-                    type="button"
-                    onClick={onNavigateToCatalog}
-                    className="text-[11px] font-medium text-indigo-400 hover:text-indigo-300 flex items-center gap-1 shrink-0 cursor-pointer"
-                  >
-                    Provision &rarr;
-                  </button>
-                )}
-              </div>
             </div>
-          ))}
+            <div
+              className="flex items-center space-x-2 shrink-0"
+              data-testid="management-health"
+              title={health.detail}
+            >
+              <span
+                aria-hidden="true"
+                className={`w-2.5 h-2.5 rounded-full ${HEALTH_STYLES[health.tone].dot}`}
+              ></span>
+              <span
+                className={`text-xs font-semibold ${HEALTH_STYLES[health.tone].text}`}
+              >
+                {health.label}
+              </span>
+              {health.detail && (
+                <span className="text-[11px] text-slate-500">
+                  ({health.detail})
+                </span>
+              )}
+            </div>
+          </div>
         </div>
-      </div>
+      )}
 
-      {/* Management Plane Base Addons */}
+      {/* Infrastructure Providers Grid */}
       <div className="space-y-3">
-        <div className="flex items-center justify-between">
-          <h3 className="text-sm font-semibold text-slate-300 uppercase tracking-wider flex items-center gap-2">
-            <Package className="h-4 w-4 text-emerald-400" /> Management Plane
-            Base Addons
-          </h3>
-          <span className="text-[11px] text-slate-500">
-            Protected core HelmReleases (PR-driven upgrades &amp; rollbacks)
-          </span>
-        </div>
-
-        {coreAddons.length === 0 ? (
+        <h3 className="text-sm font-semibold text-slate-300 uppercase tracking-wider flex items-center gap-2">
+          <Cloud className="h-4 w-4 text-indigo-400" aria-hidden="true" />{" "}
+          Enabled Provider Mesh
+        </h3>
+        {providers.length === 0 ? (
           <div className="bg-slate-900 border border-slate-800 rounded-xl p-6 text-center text-xs text-slate-400">
-            No management plane base addons found.
+            {loading
+              ? "Loading providers..."
+              : "No infrastructure providers registered."}
           </div>
         ) : (
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-            {coreAddons.map((addon) => {
-              const release = findAddonRelease(addon, releases)
-              const statusBadge = getAddonStatusBadge(release)
-              const displayChart = release?.chart || addon.chart || addon.id
-              const displayVersion = release?.version || addon.version
-              return (
-                <div
-                  key={addon.id}
-                  data-testid={`core-addon-${addon.id}`}
-                  className="flex flex-col justify-between bg-slate-900 border border-slate-800 hover:border-indigo-500/50 p-4 rounded-xl transition-all space-y-3"
-                >
-                  <div className="space-y-2">
-                    <div className="flex items-start justify-between gap-2">
-                      <div className="min-w-0">
-                        <h4 className="text-sm font-semibold text-white truncate">
-                          {addon.name}
-                        </h4>
-                        <p className="text-[11px] font-mono text-slate-500 truncate">
-                          {addon.id}
-                        </p>
-                      </div>
-                      <div className="flex items-center gap-1.5 shrink-0">
-                        <span
-                          title="keel.io/protect: true"
-                          className="text-[10px] px-2 py-0.5 rounded-full font-medium bg-indigo-500/10 text-indigo-300 border border-indigo-500/30"
-                        >
-                          Protected
-                        </span>
-                        <span
-                          className={`text-[10px] px-2 py-0.5 rounded-full font-medium ${statusBadge.className}`}
-                        >
-                          {statusBadge.label}
-                        </span>
-                      </div>
-                    </div>
-
-                    {addon.description && (
-                      <p className="text-[11px] text-slate-400 line-clamp-2">
-                        {addon.description}
-                      </p>
-                    )}
-
-                    <div className="flex items-center gap-2 text-[11px] font-mono text-slate-400 pt-1">
-                      <span className="px-2 py-0.5 rounded bg-slate-950 border border-slate-800 truncate">
-                        {displayChart}
-                      </span>
-                      <span className="px-2 py-0.5 rounded bg-slate-950 border border-slate-800 text-slate-300 shrink-0">
-                        v{displayVersion.replace(/^v/i, "")}
-                      </span>
-                    </div>
-
-                    {addon.serviceUrl && (
-                      <div className="bg-slate-950 p-2.5 rounded-lg border border-slate-800 text-xs">
-                        <p className="text-[10px] uppercase tracking-wider text-slate-500">
-                          Service
-                        </p>
-                        <a
-                          href={addon.serviceUrl}
-                          target="_blank"
-                          rel="noreferrer"
-                          className="mt-0.5 inline-flex items-center gap-1.5 text-[11px] font-mono text-indigo-400 hover:text-indigo-300 break-all"
-                        >
-                          <span>{addon.serviceUrl}</span>
-                          <ExternalLink className="h-3 w-3 shrink-0" />
-                        </a>
-                      </div>
-                    )}
-                  </div>
-
-                  <div className="pt-3 border-t border-slate-800/60 flex items-center justify-between gap-2">
-                    <button
-                      type="button"
-                      onClick={() => setSelectedAddon(addon)}
-                      className="flex items-center gap-1.5 text-[11px] px-2.5 py-1.5 rounded-lg font-medium bg-indigo-600/20 hover:bg-indigo-600/30 text-indigo-300 border border-indigo-500/30 transition-colors cursor-pointer"
-                    >
-                      <SlidersHorizontal className="h-3 w-3" />
-                      <span>Upgrade / Configure</span>
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => handleRollbackAddon(addon.id)}
-                      disabled={rollingBackId === addon.id}
-                      className="flex items-center gap-1.5 text-[11px] px-2.5 py-1.5 rounded-lg font-medium bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition-colors cursor-pointer disabled:opacity-50"
-                    >
-                      <RotateCcw
-                        className={`h-3 w-3 ${rollingBackId === addon.id ? "animate-spin" : ""}`}
-                      />
-                      <span>
-                        {rollingBackId === addon.id
-                          ? "Rolling back..."
-                          : "Rollback PR"}
-                      </span>
-                    </button>
-                  </div>
-                </div>
-              )
-            })}
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5 gap-4">
+            {providers.map((provider) => (
+              <ProviderCard
+                key={provider.id}
+                provider={provider}
+                canManage={isAdmin}
+                pendingPr={pendingProviderPrs[provider.id]}
+                toggling={togglingId === provider.id}
+                onToggle={handleToggleProvider}
+                onNavigateToCatalog={onNavigateToCatalog}
+                onNavigateToPreview={onNavigateToPreview}
+              />
+            ))}
           </div>
         )}
       </div>
 
-      <DeployInstanceModal
-        isOpen={Boolean(selectedAddon)}
-        onClose={() => setSelectedAddon(null)}
-        catalogItem={selectedAddon}
-        managementAddon={selectedAddon}
-        tenant="keel-system"
-        onProposalCreated={(proposal) => {
-          setPrNotification({
-            id: proposal.id,
-            branch: proposal.branch || "main",
-            prUrl: proposal.prUrl,
-          })
+      {/* Management Plane Base Addons (cluster admins only) */}
+      {isAdmin && (
+        <div className="space-y-3">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-1">
+            <h3 className="text-sm font-semibold text-slate-300 uppercase tracking-wider flex items-center gap-2">
+              <Package
+                className="h-4 w-4 text-emerald-400"
+                aria-hidden="true"
+              />{" "}
+              Management Plane Base Addons
+            </h3>
+            <span className="text-[11px] text-slate-500">
+              Protected core HelmReleases (PR-driven upgrades &amp; rollbacks)
+            </span>
+          </div>
+
+          {coreAddons.length === 0 && statusOnlyAddons.length === 0 ? (
+            <div className="bg-slate-900 border border-slate-800 rounded-xl p-6 text-center text-xs text-slate-400">
+              No management plane base addons found.
+            </div>
+          ) : (
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+              {coreAddons.map((addon) => (
+                <ManagementAddonCard
+                  key={addon.id}
+                  id={addon.id}
+                  addon={addon}
+                  status={statusById.get(addon.id)}
+                  canManage={isAdmin}
+                  rollingBack={rollingBackId === addon.id}
+                  onUpgrade={setSelectedAddon}
+                  onRollback={setConfirmRollbackId}
+                />
+              ))}
+              {statusOnlyAddons.map((status) => (
+                <ManagementAddonCard
+                  key={`${status.namespace}/${status.id}`}
+                  id={status.id}
+                  status={status}
+                  canManage={isAdmin}
+                  rollingBack={rollingBackId === status.id}
+                  onRollback={setConfirmRollbackId}
+                />
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      <ConfirmDialog
+        open={confirmRollbackId !== null}
+        onOpenChange={(open) => {
+          if (!open) setConfirmRollbackId(null)
         }}
-        onCatalogItemUpdated={(updated) => {
-          setCoreAddons((prev) =>
-            prev.map((a) => (a.id === updated.id ? updated : a))
-          )
-          setSelectedAddon(updated)
+        title={`Roll back ${confirmRollbackId ?? ""}?`}
+        description="This opens a pull request reverting the management add-on manifest to its previous Git revision. Nothing changes until the PR is reviewed and merged."
+        confirmLabel="Open Rollback PR"
+        onConfirm={() => {
+          const id = confirmRollbackId
+          setConfirmRollbackId(null)
+          if (id) void handleRollbackAddon(id)
         }}
       />
+
+      {isAdmin && (
+        <DeployInstanceModal
+          isOpen={Boolean(selectedAddon)}
+          onClose={() => setSelectedAddon(null)}
+          catalogItem={selectedAddon}
+          managementAddon={selectedAddon}
+          tenant="keel-system"
+          onProposalCreated={(proposal) => {
+            setPrNotification({
+              id: proposal.id,
+              branch: proposal.branch || "main",
+              prUrl: proposal.prUrl,
+            })
+          }}
+          onCatalogItemUpdated={(updated) => {
+            setCoreAddons((prev) =>
+              prev.map((a) => (a.id === updated.id ? updated : a))
+            )
+            setSelectedAddon(updated)
+          }}
+        />
+      )}
     </div>
   )
 }

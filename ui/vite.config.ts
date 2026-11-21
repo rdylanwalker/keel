@@ -9,13 +9,20 @@ export default defineConfig({
   resolve: {
     alias: {
       "@": path.resolve(import.meta.dirname, "./src"),
+      // @rjsf/core's barrel re-exports `getTestRegistry`, which statically imports
+      // @rjsf/validator-ajv8 (an rjsf devDependency). AJV compiles with `new Function`, which our
+      // CSP forbids, so the package is not installed; point the import at the eval-free validator.
+      "@rjsf/validator-ajv8": path.resolve(
+        import.meta.dirname,
+        "./src/components/rjsf/validator.ts"
+      ),
     },
   },
   build: {
     rolldownOptions: {
       output: {
         manualChunks(id: string) {
-          if (id.includes("@rjsf") || id.includes("ajv")) {
+          if (id.includes("@rjsf") || id.includes("@cfworker/json-schema")) {
             return "vendor-rjsf"
           }
           if (
@@ -35,6 +42,8 @@ export default defineConfig({
     globals: true,
     environment: "jsdom",
     setupFiles: ["./src/test/setup.ts"],
+    // Inline @rjsf/core so the `@rjsf/validator-ajv8` alias above also applies under vitest.
+    server: { deps: { inline: [/@rjsf\/core/] } },
     coverage: {
       provider: "v8",
       reporter: ["text", "json", "html"],
