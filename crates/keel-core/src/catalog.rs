@@ -635,6 +635,35 @@ pub fn manifest_cluster_scoped_kinds(raw_yaml: &str) -> Vec<String> {
     kinds
 }
 
+/// Returns `Kind/name` (or `Kind/name (namespace)`) of every namespaced object (any kind outside
+/// [`CLUSTER_SCOPED_KINDS`]) in a multi-document manifest whose `metadata.namespace` is missing or
+/// not one of `allowed`. Documents that do not parse as YAML mappings with a `kind` are skipped
+/// (structure is validated separately).
+pub fn manifest_objects_outside_namespaces(raw_yaml: &str, allowed: &[String]) -> Vec<String> {
+    let mut offenders = Vec::new();
+    for doc_str in split_yaml_documents(raw_yaml) {
+        let Ok(doc) = serde_yml::from_str::<Value>(&doc_str) else {
+            continue;
+        };
+        let Some(kind) = doc.get("kind").and_then(Value::as_str).map(str::trim) else {
+            continue;
+        };
+        if CLUSTER_SCOPED_KINDS.contains(&kind) {
+            continue;
+        }
+        let name = doc
+            .pointer("/metadata/name")
+            .and_then(Value::as_str)
+            .unwrap_or("<unnamed>");
+        match doc.pointer("/metadata/namespace").and_then(Value::as_str) {
+            Some(ns) if allowed.iter().any(|a| a == ns) => {}
+            Some(ns) => offenders.push(format!("{kind}/{name} ({ns})")),
+            None => offenders.push(format!("{kind}/{name}")),
+        }
+    }
+    offenders
+}
+
 /// Extracts unique placeholder variable names matching `${var_name}` or `${var_name:=default}`
 /// (where `var_name` is `[A-Za-z_][A-Za-z0-9_]*`), preserving first-seen order.
 pub fn extract_manifest_variables(raw_yaml: &str) -> Vec<String> {
@@ -1871,6 +1900,104 @@ metadata:
     }
 
     #[test]
+    fn test_catalog_application_placement_additional_namespaces() {
+        let manifest_app = |placement: &str, runtime: &str| {
+            format!(
+                "apiVersion: keel.io/v1alpha1\nkind: CatalogApplication\nmetadata:\n  id: multi\n  \
+                 name: Multi\n  description: d\n  category: c\n  runtime: {runtime}\nspec:\n  \
+                 upstream:\n    chart: multi\n    repoURL: https://example.com/charts\n    \
+                 version: \"1.0.0\"\n  placement:\n{placement}  schema:\n    type: object\n"
+            )
+        };
+        let app = parse_catalog_application(&manifest_app(
+            "    scope: cluster\n    namespace: keel-system\n    additionalNamespaces: [keel-previews, flux-system]\n",
+            "manifest",
+        ))
+        .unwrap();
+        assert_eq!(
+            app.multi_namespace_placement(),
+            vec!["keel-system", "keel-previews", "flux-system"]
+        );
+        assert!(
+            serde_yml::to_string(&app)
+                .unwrap()
+                .contains("additionalNamespaces:")
+        );
+        // Single-namespace apps keep the Flux `targetNamespace` path (and serialize unchanged).
+        let single = parse_catalog_application(&manifest_app(
+            "    scope: cluster\n    namespace: keel-system\n",
+            "manifest",
+        ))
+        .unwrap();
+        assert!(single.multi_namespace_placement().is_empty());
+        assert!(
+            !serde_yml::to_string(&single)
+                .unwrap()
+                .contains("additionalNamespaces")
+        );
+        single
+            .ensure_manifest_namespaces("kind: ConfigMap\nmetadata:\n  name: x\n")
+            .unwrap();
+
+        let rendered = "apiVersion: v1\nkind: ServiceAccount\nmetadata:\n  name: sa\n  namespace: keel-system\n---\n\
+            apiVersion: rbac.authorization.k8s.io/v1\nkind: ClusterRole\nmetadata:\n  name: cr\n---\n\
+            apiVersion: rbac.authorization.k8s.io/v1\nkind: Role\nmetadata:\n  name: r\n  namespace: flux-system\n";
+        app.ensure_manifest_namespaces(rendered).unwrap();
+        let bad = format!(
+            "{rendered}---\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: loose\n---\n\
+             apiVersion: v1\nkind: Secret\nmetadata:\n  name: elsewhere\n  namespace: kube-system\n"
+        );
+        let allowed: Vec<String> = app.multi_namespace_placement();
+        assert_eq!(
+            manifest_objects_outside_namespaces(&bad, &allowed),
+            vec!["ConfigMap/loose", "Secret/elsewhere (kube-system)"]
+        );
+        let err = app
+            .ensure_manifest_namespaces(&bad)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("ConfigMap/loose"), "{err}");
+        assert!(
+            err.contains("keel-system, keel-previews, flux-system"),
+            "{err}"
+        );
+
+        for (placement, runtime) in [
+            // Needs a dedicated namespace (and therefore scope: cluster).
+            (
+                "    scope: cluster\n    additionalNamespaces: [keel-previews]\n",
+                "manifest",
+            ),
+            // A HelmRelease installs into exactly one namespace.
+            (
+                "    scope: cluster\n    namespace: keel-system\n    additionalNamespaces: [keel-previews]\n",
+                "helm",
+            ),
+            (
+                "    scope: cluster\n    namespace: keel-system\n    additionalNamespaces: [tenant-acme]\n",
+                "manifest",
+            ),
+            (
+                "    scope: cluster\n    namespace: keel-system\n    additionalNamespaces: [Bad_NS]\n",
+                "manifest",
+            ),
+            (
+                "    scope: cluster\n    namespace: keel-system\n    additionalNamespaces: [keel-system]\n",
+                "manifest",
+            ),
+            (
+                "    scope: cluster\n    namespace: keel-system\n    additionalNamespaces: [a, a]\n",
+                "manifest",
+            ),
+        ] {
+            assert!(
+                parse_catalog_application(&manifest_app(placement, runtime)).is_err(),
+                "{placement} ({runtime})"
+            );
+        }
+    }
+
+    #[test]
     fn test_built_in_catalog_app_placement_scopes() {
         // Charts verified (helm template, default values) to install CRDs, ClusterRoles/Bindings or
         // webhooks (dex 0.21.0 and authentik 2024.12.2 render a ClusterRole/ClusterRoleBinding).
@@ -1886,6 +2013,9 @@ metadata:
             include_str!("../../../deploy/catalog/apps/kyverno/catalog.yaml"),
             include_str!("../../../deploy/catalog/apps/pulumi-kubernetes-operator/catalog.yaml"),
             include_str!("../../../deploy/catalog/apps/flux2/catalog.yaml"),
+            // keel-server ships ClusterRoles/ClusterRoleBindings (read-only CRD watch, Kyverno
+            // policies, preview workspace delegation).
+            include_str!("../../../deploy/catalog/apps/keel-server/catalog.yaml"),
         ] {
             let app = parse_catalog_application(raw).unwrap();
             assert_eq!(

@@ -1143,6 +1143,10 @@ pub struct AppState {
     pub auth_phase: Arc<RwLock<AuthPhase>>,
     pub oidc_config: Arc<RwLock<Option<OidcConfig>>>,
     pub oidc_ca_pem: Option<Vec<u8>>,
+    /// Confidential OIDC client secret (`KEEL_OIDC_CLIENT_SECRET`), sent only in the token
+    /// exchange (`client_secret_post`). Never serialized, logged or returned; `None` for a public
+    /// PKCE client.
+    pub oidc_client_secret: Option<Arc<str>>,
     pub state_provider: Arc<dyn ClusterStateProvider>,
     pub backend_url: String,
     pub s3_credentials_secret: Option<String>,
@@ -1185,6 +1189,7 @@ impl AppState {
             auth_phase: Arc::new(RwLock::new(auth_phase)),
             oidc_config: Arc::new(RwLock::new(None)),
             oidc_ca_pem: None,
+            oidc_client_secret: None,
             state_provider,
             backend_url: "s3://pulumi-state".to_string(),
             s3_credentials_secret: None,
@@ -1221,6 +1226,15 @@ impl AppState {
     /// Configures an optional PEM-encoded root CA certificate for OIDC discovery/token/JWKS calls.
     pub fn with_oidc_ca_pem(mut self, pem: Option<Vec<u8>>) -> Self {
         self.oidc_ca_pem = pem;
+        self
+    }
+
+    /// Configures the confidential OIDC client secret (blank values mean a public PKCE client).
+    pub fn with_oidc_client_secret(mut self, secret: Option<String>) -> Self {
+        self.oidc_client_secret = secret
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .map(Arc::from);
         self
     }
 

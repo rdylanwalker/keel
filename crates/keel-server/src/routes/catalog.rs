@@ -525,6 +525,7 @@ pub async fn register_catalog_app(
                     placement: PlacementSpec {
                         scope: req.placement_scope.unwrap_or_default(),
                         namespace: None,
+                        additional_namespaces: Vec::new(),
                     },
                     gateway_routes: Vec::new(),
                     network_policy: None,

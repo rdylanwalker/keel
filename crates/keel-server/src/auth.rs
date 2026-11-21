@@ -79,6 +79,53 @@ fn break_glass_admin_allowlist() -> Vec<String> {
         .collect()
 }
 
+/// Environment variable holding extra comma-separated IdP groups granted cluster-administrator
+/// privileges, in addition to the built-in [`BUILT_IN_ADMIN_GROUPS`] (e.g. a catalog-installed
+/// keel-server serving a separate team whose IdP names its admin group differently).
+pub const ADMIN_GROUPS_ENV: &str = "KEEL_ADMIN_GROUPS";
+
+/// IdP groups that always grant cluster-administrator privileges.
+pub const BUILT_IN_ADMIN_GROUPS: [&str; 3] = ["keel-admins", "admin", "admins"];
+
+/// Parses a comma-separated [`ADMIN_GROUPS_ENV`] value (trimmed, blanks dropped; case-sensitive
+/// like IdP group claims).
+fn parse_admin_groups(raw: Option<&str>) -> Vec<String> {
+    raw.unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|g| !g.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Whether `group` grants cluster-administrator privileges: a built-in admin group or one of
+/// `extra` ([`ADMIN_GROUPS_ENV`]).
+fn is_admin_group(group: &str, extra: &[String]) -> bool {
+    BUILT_IN_ADMIN_GROUPS.contains(&group) || extra.iter().any(|g| g == group)
+}
+
+/// Form of the OIDC authorization-code token exchange (PKCE). A confidential client also sends
+/// its secret (`client_secret_post`); public clients omit it.
+fn token_exchange_form<'a>(
+    code: &'a str,
+    redirect_uri: &'a str,
+    client_id: &'a str,
+    code_verifier: &'a str,
+    client_secret: Option<&'a str>,
+) -> Vec<(&'static str, &'a str)> {
+    let mut form = vec![
+        ("grant_type", "authorization_code"),
+        ("code", code),
+        ("redirect_uri", redirect_uri),
+        ("client_id", client_id),
+        ("code_verifier", code_verifier),
+    ];
+    if let Some(secret) = client_secret {
+        form.push(("client_secret", secret));
+    }
+    form
+}
+
 /// Returns `true` when `claims` identify an allowlisted break-glass administrator.
 fn is_break_glass_identity(claims: &SessionClaims) -> bool {
     let allow = break_glass_admin_allowlist();
@@ -94,16 +141,17 @@ fn is_break_glass_identity(claims: &SessionClaims) -> bool {
 
 impl AuthSession {
     /// Returns `true` when the caller holds cluster-administrator privileges: membership of
-    /// `keel-admins`, or — only while the control plane is in the `BreakGlass` phase — being an
-    /// allowlisted break-glass identity ([`BREAK_GLASS_ADMINS_ENV`], default `admin@keel.local`).
+    /// `keel-admins` / `admin` / `admins` or of a group listed in [`ADMIN_GROUPS_ENV`], or — only
+    /// while the control plane is in the `BreakGlass` phase — being an allowlisted break-glass
+    /// identity ([`BREAK_GLASS_ADMINS_ENV`], default `admin@keel.local`).
     /// Ordinary OIDC users never gain admin merely because the phase is `BreakGlass` (OPEN-12).
     pub fn is_admin(&self) -> bool {
-        (self.claims.auth_phase == AuthPhase::BreakGlass && is_break_glass_identity(&self.claims))
-            || self
-                .claims
-                .groups
-                .iter()
-                .any(|g| matches!(g.as_str(), "keel-admins" | "admin" | "admins"))
+        if self.claims.auth_phase == AuthPhase::BreakGlass && is_break_glass_identity(&self.claims)
+        {
+            return true;
+        }
+        let extra = parse_admin_groups(std::env::var(ADMIN_GROUPS_ENV).ok().as_deref());
+        self.claims.groups.iter().any(|g| is_admin_group(g, &extra))
     }
 
     /// Enforces cluster-administrator privileges, returning `403 Forbidden` otherwise.
@@ -769,13 +817,13 @@ pub async fn oidc_callback(
     let client = build_oidc_http_client(5, state.oidc_ca_pem.as_deref())?;
     let token_res = client
         .post(&endpoints.token_endpoint)
-        .form(&[
-            ("grant_type", "authorization_code"),
-            ("code", code.as_str()),
-            ("redirect_uri", pkce.redirect_uri.as_str()),
-            ("client_id", oidc.client_id.as_str()),
-            ("code_verifier", pkce.code_verifier.as_str()),
-        ])
+        .form(&token_exchange_form(
+            code.as_str(),
+            pkce.redirect_uri.as_str(),
+            oidc.client_id.as_str(),
+            pkce.code_verifier.as_str(),
+            state.oidc_client_secret.as_deref(),
+        ))
         .send()
         .await
         .map_err(|e| ServerError::Internal(format!("OIDC token exchange failed: {e}")))?;
@@ -1341,6 +1389,55 @@ mod tests {
     use serde_json::json;
     use std::sync::Arc;
     use tower::ServiceExt;
+
+    #[test]
+    fn admin_groups_extend_built_ins_without_prefix_matching() {
+        let extra = parse_admin_groups(Some(" platform-ops , ,team-a:admins "));
+        assert_eq!(extra, vec!["platform-ops", "team-a:admins"]);
+        assert!(parse_admin_groups(None).is_empty());
+        assert!(parse_admin_groups(Some(" , ")).is_empty());
+        for group in [
+            "keel-admins",
+            "admin",
+            "admins",
+            "platform-ops",
+            "team-a:admins",
+        ] {
+            assert!(is_admin_group(group, &extra), "{group}");
+        }
+        for group in [
+            "platform",
+            "Platform-Ops",
+            "tenant-acme-admin",
+            "",
+            "keel-admins-x",
+        ] {
+            assert!(!is_admin_group(group, &extra), "{group}");
+        }
+        assert!(!is_admin_group("platform-ops", &[]));
+    }
+
+    #[test]
+    fn token_exchange_sends_client_secret_only_for_confidential_clients() {
+        let public = token_exchange_form("c", "https://keel.example/cb", "keel", "v", None);
+        assert!(public.iter().all(|(k, _)| *k != "client_secret"));
+        assert!(public.contains(&("code_verifier", "v")));
+        assert!(public.contains(&("client_id", "keel")));
+        let confidential =
+            token_exchange_form("c", "https://keel.example/cb", "keel", "v", Some("s3cr3t"));
+        assert!(confidential.contains(&("client_secret", "s3cr3t")));
+        assert!(confidential.contains(&("code_verifier", "v")));
+    }
+
+    #[test]
+    fn oidc_client_secret_is_trimmed_and_blank_means_public_client() {
+        let state = AppState::default_ephemeral();
+        assert!(state.oidc_client_secret.is_none());
+        let state = state.with_oidc_client_secret(Some("  ".to_string()));
+        assert!(state.oidc_client_secret.is_none());
+        let state = state.with_oidc_client_secret(Some(" abc \n".to_string()));
+        assert_eq!(state.oidc_client_secret.as_deref(), Some("abc"));
+    }
 
     const TEST_ED25519_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIEHTjl7kWr8Ms/aazqxV5Dg4GBB6U7dw6rkd1ozfHJpc\n-----END PRIVATE KEY-----\n";
     const TEST_ED25519_X: &str = "MzdB74SujNsw41A0r_Z-PuCEw_OqK4KToymtSTaOUA8";

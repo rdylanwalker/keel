@@ -1,0 +1,508 @@
+# Self-service keel-server for a remote workload cluster (`catalog/apps/keel-server`).
+#
+# Every namespaced object names its namespace (`keel-system`, `keel-previews` or `flux-system`):
+# the app declares them in `spec.placement`, so Keel creates the namespaces first and does not set
+# a Flux `targetNamespace` (which would collapse the per-namespace Roles into one namespace).
+# Non-secret `${...}` values are rendered by Keel at proposal time. The secret placeholders
+# (`${gitToken}`, `${oidcClientSecret}`) are never rendered into Git: Flux fills them in from the
+# SOPS-decrypted `<instance>-secrets` Secret (`postBuild.substituteFrom`) on the management cluster.
+#
+# RBAC: `deploy/bootstrap/keel-server/rbac.yaml` (keel-cli test), with one deliberate difference:
+# Kyverno `policies.kyverno.io` objects are read-only cluster-wide, and the only write is to the
+# `restrict-pulumi-providers` ValidatingPolicy the server re-applies (no `PolicyException` or
+# `GeneratingPolicy` writes, which the workload cluster's own Kyverno would honour without Keel's
+# management-plane policies around them). Per-tenant access is a `keel-server` RoleBinding to
+# `keel-server-tenant` in each `tenant-<id>` namespace, carried by the served repository's
+# `tenants/<id>/rbac.yaml`.
+#
+# The `flux-system` reconcile-request grant is confined by the native
+# `ValidatingAdmissionPolicy/keel-server-reconcile-only` below (Kubernetes >= 1.30), not by Keel's
+# Kyverno `protect-control-plane` policy, which only exists on Keel-bootstrapped clusters.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: keel-server
+  namespace: keel-system
+  labels:
+    app.kubernetes.io/name: keel-server
+    app.kubernetes.io/managed-by: keel
+automountServiceAccountToken: true
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: keel-server-read
+  labels:
+    app.kubernetes.io/managed-by: keel
+rules:
+  - apiGroups: ["pulumi.com"]
+    resources: ["stacks", "programs"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["auto.pulumi.com"]
+    resources: ["workspaces", "updates"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["helm.toolkit.fluxcd.io"]
+    resources: ["helmreleases"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["kustomize.toolkit.fluxcd.io"]
+    resources: ["kustomizations"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["source.toolkit.fluxcd.io"]
+    resources: ["gitrepositories", "helmrepositories", "ocirepositories"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["flagger.app"]
+    resources: ["canaries"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["namespaces", "events"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["events.k8s.io"]
+    resources: ["events"]
+    verbs: ["get", "list", "watch"]
+  # Kyverno policy objects: read-only cluster-wide. The only write is the provider allowlist
+  # (`restrict-pulumi-providers`, server-side applied by keel-server; `create` with
+  # `resourceNames` covers the apply-creates-object path). Unlike the management bundle, no
+  # `generatingpolicies` / `policyexceptions` writes: on a workload cluster nothing else stops a
+  # leaked token from exempting workloads or generating objects with Kyverno's own RBAC.
+  - apiGroups: ["policies.kyverno.io"]
+    resources: ["validatingpolicies", "generatingpolicies", "policyexceptions"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["policies.kyverno.io"]
+    resources: ["validatingpolicies"]
+    resourceNames: ["restrict-pulumi-providers"]
+    verbs: ["create", "update", "patch"]
+  - apiGroups: ["wgpolicyk8s.io"]
+    resources: ["policyreports", "clusterpolicyreports"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: keel-server-read
+  labels:
+    app.kubernetes.io/managed-by: keel
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: keel-server-read
+subjects:
+  - kind: ServiceAccount
+    name: keel-server
+    namespace: keel-system
+---
+# Bound per tenant namespace via RoleBinding (never via ClusterRoleBinding).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: keel-server-tenant
+  labels:
+    app.kubernetes.io/managed-by: keel
+rules:
+  # Scoped tenant credentials (S3 / git / kubeconfig secrets) read and rotated by the server.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  # Out-of-band operations: reconcile / unlock / force-delete (finalizer removal).
+  - apiGroups: ["pulumi.com"]
+    resources: ["stacks"]
+    verbs: ["get", "list", "watch", "patch", "update", "delete"]
+  - apiGroups: ["helm.toolkit.fluxcd.io"]
+    resources: ["helmreleases"]
+    verbs: ["get", "list", "watch", "patch"]
+  - apiGroups: ["kustomize.toolkit.fluxcd.io"]
+    resources: ["kustomizations"]
+    verbs: ["get", "list", "watch", "patch"]
+  - apiGroups: [""]
+    resources: ["pods", "pods/log", "configmaps"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: keel-server
+  namespace: keel-system
+  labels:
+    app.kubernetes.io/managed-by: keel
+rules:
+  # Session/OIDC keys, forge token, user git credentials, Stage 0 credentials.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  # SeaweedFS tenant identity provisioning (`weed shell` in the filer pod via exec).
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  # Exec only into the SeaweedFS filer (`keel_kube::s3_identity::SEAWEEDFS_FILER_POD`), never
+  # into Rauthy, Forgejo or other control-plane pods.
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    resourceNames: ["s3-state-backend-seaweedfs-filer-0"]
+    verbs: ["create", "get"]
+  - apiGroups: ["apps"]
+    resources: ["statefulsets"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: keel-server
+  namespace: keel-system
+  labels:
+    app.kubernetes.io/managed-by: keel
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: keel-server
+subjects:
+  - kind: ServiceAccount
+    name: keel-server
+    namespace: keel-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: keel-server
+  namespace: keel-previews
+  labels:
+    app.kubernetes.io/managed-by: keel
+rules:
+  # Ephemeral preview Stacks + their copied tenant-scoped creds (keel-preview-s3-<tenant>,
+  # keel-preview-git-<tenant>) and result ConfigMaps; garbage-collected on PR merge/close.
+  - apiGroups: ["pulumi.com"]
+    resources: ["stacks"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["auto.pulumi.com"]
+    resources: ["workspaces", "updates"]
+    verbs: ["get", "list", "watch", "delete"]
+  - apiGroups: ["source.toolkit.fluxcd.io"]
+    resources: ["gitrepositories"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["secrets", "configmaps"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods", "pods/log"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: keel-server
+  namespace: keel-previews
+  labels:
+    app.kubernetes.io/managed-by: keel
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: keel-server
+subjects:
+  - kind: ServiceAccount
+    name: keel-server
+    namespace: keel-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: keel-server
+  namespace: flux-system
+  labels:
+    app.kubernetes.io/managed-by: keel
+rules:
+  # Reconcile requests on platform Kustomizations / HelmReleases / sources and Stacks. Changes
+  # go through Git PRs, never through these objects. `ValidatingAdmissionPolicy/
+  # keel-server-reconcile-only` (end of this file) limits these patches to the
+  # `reconcile.fluxcd.io/requestedAt` / `pulumi.com/reconcile-request` annotations: a spec change
+  # here would be applied by the cluster-admin `kustomize-controller`.
+  - apiGroups: ["kustomize.toolkit.fluxcd.io"]
+    resources: ["kustomizations"]
+    verbs: ["get", "list", "watch", "patch"]
+  - apiGroups: ["helm.toolkit.fluxcd.io"]
+    resources: ["helmreleases"]
+    verbs: ["get", "list", "watch", "patch"]
+  - apiGroups: ["source.toolkit.fluxcd.io"]
+    resources: ["gitrepositories"]
+    verbs: ["get", "list", "watch", "patch"]
+  - apiGroups: ["pulumi.com"]
+    resources: ["stacks"]
+    verbs: ["get", "list", "watch", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: keel-server
+  namespace: flux-system
+  labels:
+    app.kubernetes.io/managed-by: keel
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: keel-server
+subjects:
+  - kind: ServiceAccount
+    name: keel-server
+    namespace: keel-system
+---
+# Preview workspace identity for ephemeral PKO preview Stacks in `keel-previews`; identical to
+# `deploy/bootstrap/manifests/preview-workspace-rbac.yaml` (read-only `view` + TokenReview).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: keel-preview-readonly
+  namespace: keel-previews
+  labels:
+    app.kubernetes.io/managed-by: keel
+    keel.io/role: preview-readonly
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: keel-preview-readonly:auth-delegator
+  labels:
+    app.kubernetes.io/managed-by: keel
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:auth-delegator
+subjects:
+  - kind: ServiceAccount
+    name: keel-preview-readonly
+    namespace: keel-previews
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: keel-preview-readonly:view
+  labels:
+    app.kubernetes.io/managed-by: keel
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: view
+subjects:
+  - kind: ServiceAccount
+    name: keel-preview-readonly
+    namespace: keel-previews
+---
+# Git token + OIDC client secret, substituted by Flux from the SOPS-decrypted `<instance>-secrets`.
+# A rotated value only reaches the running pod after a restart (env is read at start).
+apiVersion: v1
+kind: Secret
+metadata:
+  name: keel-server-credentials
+  namespace: keel-system
+  labels:
+    app.kubernetes.io/name: keel-server
+    app.kubernetes.io/managed-by: keel
+type: Opaque
+stringData:
+  git-token: "${gitToken}"
+  oidc-client-secret: "${oidcClientSecret}"
+---
+# keel-server Deployment (stateless; `restricted` Pod Security Standard). Same pod spec as
+# `deploy/bootstrap/keel-server/deployment.yaml`; only the environment differs.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: keel-server
+  namespace: keel-system
+  labels:
+    app.kubernetes.io/name: keel-server
+    app.kubernetes.io/managed-by: keel
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: keel-server
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: keel-server
+    spec:
+      serviceAccountName: keel-server
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: keel-server
+          # Pinned to `spec.upstream.version` (bumped by semantic-release with the crate version).
+          image: ghcr.io/rdylanwalker/keel:0.8.0
+          args:
+            - serve
+            - --bind
+            - 0.0.0.0:8080
+            - --repo-dir
+            - /var/lib/keel/work
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: HOME
+              value: /var/lib/keel
+            # The workdir is hydrated from the GitOps remote (clone when fresh, fetch on restart).
+            - name: KEEL_GIT_URL
+              value: ${gitUrl}
+            - name: KEEL_GIT_USERNAME
+              value: ${gitUsername:=keel}
+            # Injected as env only; keel passes it to git via ephemeral config env, never argv or
+            # logs.
+            - name: KEEL_GIT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: keel-server-credentials
+                  key: git-token
+            # OIDC client of this Keel (overrides the served repository's `.keel/config.yaml`).
+            - name: KEEL_OIDC_ISSUER_URL
+              value: ${oidcIssuerUrl}
+            - name: KEEL_OIDC_CLIENT_ID
+              value: ${oidcClientId}
+            - name: KEEL_OIDC_REDIRECT_URL
+              value: https://${hostname}${publicPortSuffix:=}/api/v1/auth/callback
+            - name: KEEL_OIDC_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: keel-server-credentials
+                  key: oidc-client-secret
+            # Extra IdP admin group (in addition to keel-admins/admin/admins).
+            - name: KEEL_ADMIN_GROUPS
+              value: ${adminGroup:=keel-admins}
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: work
+              mountPath: /var/lib/keel
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: work
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: keel-server
+  namespace: keel-system
+  labels:
+    app.kubernetes.io/name: keel-server
+    app.kubernetes.io/managed-by: keel
+spec:
+  selector:
+    app.kubernetes.io/name: keel-server
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+# Portal/API route (same shape as `deploy/seed/addons/keel-server/httproute.yaml`), attached to
+# the workload cluster's Gateway (all listeners admitting routes from `keel-system`).
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: keel-server-ingress
+  namespace: keel-system
+  labels:
+    app.kubernetes.io/name: keel-server
+    app.kubernetes.io/managed-by: keel
+spec:
+  parentRefs:
+    - name: ${gatewayName:=keel-ingress}
+      namespace: ${gatewayNamespace:=keel-system}
+  hostnames:
+    - ${hostname}
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        - name: keel-server
+          port: 8080
+---
+# Native admission guard for the `flux-system` / `keel-system` `patch` grants above
+# (`admissionregistration.k8s.io/v1`, GA since Kubernetes 1.30; no Kyverno needed). The CEL rule is
+# the keel-server rule of Keel's Kyverno `protect-control-plane` policy, verbatim (keel-cli test):
+# an UPDATE by `keel-system/keel-server` to a Flux Kustomization / HelmRelease / source or a PKO
+# Stack in those namespaces may only add or change the reconcile-request annotations. Spec, label,
+# finalizer and other annotation changes are denied, so a leaked token or a server bug cannot
+# repoint the cluster-admin `kustomize-controller` at other content.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: keel-server-reconcile-only
+  labels:
+    app.kubernetes.io/name: keel-server
+    app.kubernetes.io/managed-by: keel
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    namespaceSelector:
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: In
+          values: ["flux-system", "keel-system"]
+    resourceRules:
+      - apiGroups: ["kustomize.toolkit.fluxcd.io"]
+        apiVersions: ["*"]
+        operations: ["UPDATE"]
+        resources: ["kustomizations"]
+      - apiGroups: ["helm.toolkit.fluxcd.io"]
+        apiVersions: ["*"]
+        operations: ["UPDATE"]
+        resources: ["helmreleases"]
+      - apiGroups: ["source.toolkit.fluxcd.io"]
+        apiVersions: ["*"]
+        operations: ["UPDATE"]
+        resources: ["*"]
+      - apiGroups: ["pulumi.com"]
+        apiVersions: ["*"]
+        operations: ["UPDATE"]
+        resources: ["stacks"]
+  matchConditions:
+    - name: keel-server-service-account
+      expression: "request.userInfo.username == 'system:serviceaccount:keel-system:keel-server'"
+  validations:
+    - expression: >-
+        !(request.operation == 'UPDATE' && ((has(request.namespace) ? request.namespace : '') == 'flux-system' || (has(request.namespace) ? request.namespace : '') == 'keel-system') && has(request.userInfo) && has(request.userInfo.username) && request.userInfo.username == 'system:serviceaccount:keel-system:keel-server' && ((request.kind.group == 'kustomize.toolkit.fluxcd.io' && request.kind.kind == 'Kustomization') || (request.kind.group == 'helm.toolkit.fluxcd.io' && request.kind.kind == 'HelmRelease') || request.kind.group == 'source.toolkit.fluxcd.io' || (request.kind.group == 'pulumi.com' && request.kind.kind == 'Stack')) && !((has(object.spec) ? object.spec : {}) == (has(oldObject.spec) ? oldObject.spec : {}) && (has(object.metadata.labels) ? object.metadata.labels : {}) == (has(oldObject.metadata.labels) ? oldObject.metadata.labels : {}) && (has(object.metadata.finalizers) ? object.metadata.finalizers : []) == (has(oldObject.metadata.finalizers) ? oldObject.metadata.finalizers : []) && (has(object.metadata.annotations) ? object.metadata.annotations : {}).all(k, k == 'reconcile.fluxcd.io/requestedAt' || k == 'pulumi.com/reconcile-request' || (has(oldObject.metadata.annotations) && k in oldObject.metadata.annotations && oldObject.metadata.annotations[k] == object.metadata.annotations[k])) && (has(oldObject.metadata.annotations) ? oldObject.metadata.annotations : {}).all(k, k == 'reconcile.fluxcd.io/requestedAt' || k == 'pulumi.com/reconcile-request' || (has(object.metadata.annotations) && k in object.metadata.annotations))))
+      message: "keel-server may only request reconciliation (`reconcile.fluxcd.io/requestedAt` / `pulumi.com/reconcile-request` annotations) on Flux objects and Stacks in flux-system/keel-system; spec, label, finalizer and other annotation changes must go through a GitOps PR."
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: keel-server-reconcile-only
+  labels:
+    app.kubernetes.io/name: keel-server
+    app.kubernetes.io/managed-by: keel
+spec:
+  policyName: keel-server-reconcile-only
+  validationActions:
+    - Deny

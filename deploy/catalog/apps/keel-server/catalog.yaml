@@ -1,0 +1,164 @@
+# Self-Service keel-server Catalog Application (`SDD.md` §5.1, §6.3, `NFR-SEC-05`)
+#
+# A separate Keel control plane (REST/SSE API + web portal) for a remote WORKLOAD cluster, e.g. for
+# a team that runs its own GitOps repository, IdP client and tenants on that cluster while the
+# management plane keeps installing, upgrading and auditing the server itself. It is NOT the
+# management keel-server: that one is `catalog/core/keel-server` (`--with-keel-server`), managed
+# from the Topology Map. Raw manifest template `manifests.yaml`, Flux engine.
+#
+# Install config: the RBAC and restricted Deployment/Service of `deploy/bootstrap/keel-server/`
+# (shared with the management add-on; Kyverno writes narrowed to the provider allowlist policy),
+# a native ValidatingAdmissionPolicy confining the `flux-system` patch grant to reconcile
+# requests (Keel's Kyverno `protect-control-plane` rule, ported), the preview workspace RBAC
+# of `deploy/bootstrap/manifests/preview-workspace-rbac.yaml` and the `keel-ingress` HTTPRoute of
+# `deploy/seed/addons/keel-server/`; keel-cli tests fail when they drift apart. Only the
+# environment differs: the OIDC client and admin group come from `KEEL_OIDC_*` /
+# `KEEL_ADMIN_GROUPS` (overriding the served repository's `.keel/config.yaml`), and the Git remote
+# from `KEEL_GIT_URL`.
+#
+# Version: `upstream.version` is the `ghcr.io/rdylanwalker/keel` release tag and must equal
+# `catalog/core/keel-server` and the workspace crate version. semantic-release bumps this file and
+# `manifests.yaml` in the Keel source tree with every release (`.releaserc.json` prepareCmd;
+# enforced by a keel-cli test). A GitOps repository keeps the copy `keel bootstrap init` seeded:
+# upgrading installed instances means a PR updating `catalog/apps/keel-server/` there, then
+# re-submitting each instance (see `docs/catalog/keel-server.md`).
+#
+# Placement: `scope: cluster` (it ships ClusterRoles/ClusterRoleBindings and an admission policy), so
+# it only installs into a remote workload cluster, once per cluster (a second instance for the same
+# kubeconfig Secret of a tenant is rejected with 409). It spans `keel-system` (server), `keel-previews`
+# (ephemeral PKO preview Stacks) and `flux-system` (reconcile requests), each named explicitly in
+# the template (`spec.placement.additionalNamespaces`: no Flux `targetNamespace`).
+#
+# Secrets: the Git token and OIDC client secret are `format: password` fields: SOPS-encrypted with
+# the tenant `age` key into `<instance>-secrets` on the management cluster and substituted by Flux
+# into `keel-system/keel-server-credentials` on the workload cluster. Git holds only `${...}`
+# placeholders and SOPS ciphertext. Flux engine only (Keel rejects `engine: pulumi` for apps with
+# secret fields).
+#
+# Prerequisites on the workload cluster (see `docs/catalog/keel-server.md`): Flux and PKO (catalog
+# apps `flux2` and `pulumi-kubernetes-operator`), a Gateway API Gateway for the HTTPRoute (catalog
+# app `envoy-gateway` plus a Gateway whose listeners admit routes from `keel-system`), a Keel
+# GitOps repository whose `.keel/config.yaml` names its forge, synced by Flux on that cluster, and
+# an OIDC client whose redirect URI is `https://<hostname>[port]/api/v1/auth/callback`. Kubernetes
+# >= 1.30 (ValidatingAdmissionPolicy v1). The tenant identity on the workload cluster must be
+# allowed to create the ClusterRoles it binds and the admission policy.
+apiVersion: keel.io/v1alpha1
+kind: CatalogApplication
+metadata:
+  id: keel-server
+  name: Keel Control Plane (Workload Cluster)
+  description: A separate Keel control plane (API, portal, PR + PKO preview workflow) for a team's own GitOps repository on a workload cluster, with its own OIDC client and admin group. Install once per cluster.
+  category: platform
+  runtime: manifest
+spec:
+  defaultEngine: flux
+  upstream:
+    repoURL: https://github.com/rdylanwalker/keel
+    path: ./manifests.yaml
+    version: "0.8.0"
+  placement:
+    scope: cluster
+    namespace: keel-system
+    additionalNamespaces:
+      - keel-previews
+      - flux-system
+  progressiveDelivery:
+    flaggerSupported: false
+    defaultCanary: false
+  schema:
+    type: object
+    required:
+      - hostname
+      - oidcIssuerUrl
+      - oidcClientId
+      - oidcClientSecret
+      - gitUrl
+      - gitToken
+    properties:
+      hostname:
+        type: string
+        title: Public Hostname
+        description: Unique DNS name of the portal/API, routed by the HTTPRoute (e.g. keel.team-a.example.com). Platform hosts (idp., keel., forgejo. of the management domain) and hostnames already used by another app are rejected.
+        format: hostname
+      publicPortSuffix:
+        type: string
+        title: Public HTTPS Port Suffix
+        description: Appended to the hostname in the OIDC redirect URI. Empty when served on 443; ':8888' for a local kind Gateway.
+        pattern: "^(:[0-9]{1,5})?$"
+        default: ""
+      gatewayName:
+        type: string
+        title: Gateway Name
+        description: Gateway API Gateway on the workload cluster the HTTPRoute attaches to. Its listeners must admit HTTPRoutes from the keel-system namespace and terminate TLS for the hostname.
+        pattern: "^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$"
+        default: keel-ingress
+      gatewayNamespace:
+        type: string
+        title: Gateway Namespace
+        pattern: "^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$"
+        default: keel-system
+      oidcIssuerUrl:
+        type: string
+        title: OIDC Issuer URL
+        description: Issuer of the team's identity provider (discovery at <issuer>/.well-known/openid-configuration), e.g. https://auth.team-a.example.com/auth/v1. Overrides the oidc block of the repository's .keel/config.yaml.
+        format: uri
+        pattern: "^https://[^\\s\"'$@\\\\]+$"
+      oidcClientId:
+        type: string
+        title: OIDC Client ID
+        description: Confidential OIDC client registered with redirect URI https://<hostname><port suffix>/api/v1/auth/callback (authorization code + PKCE).
+        pattern: "^[A-Za-z0-9._:@/-]{1,255}$"
+      oidcClientSecret:
+        type: string
+        title: OIDC Client Secret
+        description: Secret of the OIDC client (sent on the token exchange as client_secret_post). 8-512 characters without whitespace, double quotes, backslashes or '$'.
+        format: password
+        writeOnly: true
+        pattern: '^[^"\\\s$]{8,512}$'
+      adminGroup:
+        type: string
+        title: Admin Group
+        description: IdP group (groups claim) whose members administer this Keel, in addition to keel-admins/admin/admins. Tenant access still follows tenant-<id> / tenant-<id>-admin groups.
+        pattern: "^[A-Za-z0-9._:@/-]{1,128}$"
+        default: keel-admins
+      gitUrl:
+        type: string
+        title: GitOps Repository URL
+        description: HTTPS clone URL of the team's Keel GitOps repository (cloned on start, PR branches pushed to it), without embedded credentials, e.g. https://git.example.com/team-a/infra-gitops.git. Plain http:// is rejected because the Git token is sent with every clone, fetch and push.
+        format: uri
+        pattern: "^https://[^\\s\"'$@\\\\]+$"
+      gitUsername:
+        type: string
+        title: Git HTTPS Username
+        description: Username paired with the token for HTTPS Git (Forgejo/Gitea user, 'x-access-token' for GitHub, 'oauth2' for GitLab).
+        pattern: "^[A-Za-z0-9._-]{1,128}$"
+        default: keel
+      gitToken:
+        type: string
+        title: Git / Forge API Token
+        description: Personal access token for HTTPS Git and the forge API (pull requests). 8-512 characters without whitespace, double quotes, backslashes or '$'.
+        format: password
+        writeOnly: true
+        pattern: '^[^"\\\s$]{8,512}$'
+  uiSchema:
+    ui:order:
+      - hostname
+      - publicPortSuffix
+      - oidcIssuerUrl
+      - oidcClientId
+      - oidcClientSecret
+      - adminGroup
+      - gitUrl
+      - gitUsername
+      - gitToken
+      - gatewayName
+      - gatewayNamespace
+    hostname:
+      ui:placeholder: "keel.<team>.example.com"
+      ui:help: "Add a DNS record pointing at the workload cluster's Gateway."
+    oidcClientSecret:
+      ui:widget: password
+      ui:help: "Encrypted via SOPS + per-tenant age key before committing to Git (never stored in plaintext). Re-enter it on Edit to change it; blank keeps the stored value."
+    gitToken:
+      ui:widget: password
+      ui:help: "Encrypted via SOPS + per-tenant age key before committing to Git. Needs repository read/write and pull-request scopes."

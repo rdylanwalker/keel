@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use keel_core::{
     AuthPhase, FLUX_SYSTEM_NAMESPACE, ForgeKind, KEEL_SYSTEM_NAMESPACE, KeelConfig,
-    ProviderRegistry,
+    OIDC_CLIENT_SECRET_ENV, OidcConfig, ProviderRegistry,
 };
 use keel_git::{
     CommitAuthor, ForgeProvider, ForgejoGiteaProvider, GitCredentials, GitHubProvider,
@@ -298,11 +298,14 @@ async fn build_serve_state_with_forward(
         .as_ref()
         .map(|c| c.auth_phase)
         .unwrap_or(AuthPhase::OidcActive);
-    let oidc_cfg = parsed_keel_cfg
+    let repo_oidc_cfg = parsed_keel_cfg
         .as_ref()
         .and_then(|c| c.oidc.as_ref())
         .filter(|o| o.enabled)
         .cloned();
+    // `KEEL_OIDC_*` env overrides (e.g. the catalog-installed keel-server, whose OIDC client is
+    // configured in its Deployment) win over the repository `oidc` block.
+    let oidc_cfg = OidcConfig::with_env_overrides(repo_oidc_cfg, |name| std::env::var(name).ok())?;
 
     let telemetry = TelemetryMux::default();
     let kube_reader = KubeClusterStatusReader::try_default().await.ok();
@@ -461,6 +464,7 @@ async fn build_serve_state_with_forward(
         auth_phase,
     )
     .with_oidc_config(oidc_cfg)
+    .with_oidc_client_secret(std::env::var(OIDC_CLIENT_SECRET_ENV).ok())
     // Tenant Stack proposals require the tenant state passphrase Secret whenever Secrets live in
     // the cluster; cluster-less local dev (in-memory store, nothing applied) skips the gate.
     .with_require_pulumi_passphrase(cluster_secret_store);

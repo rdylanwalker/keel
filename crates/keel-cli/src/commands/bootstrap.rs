@@ -791,6 +791,12 @@ const STARTER_PKO_APP_YAML: &str =
 /// Flux ([`CORE_CATALOG_FLUX2_YAML`]); both pin the same chart version.
 const STARTER_FLUX2_APP_YAML: &str =
     include_str!("../../../../deploy/catalog/apps/flux2/catalog.yaml");
+/// Self-service workload-cluster keel-server (`runtime: manifest`, `scope: cluster`), twin of the
+/// management add-on ([`CORE_CATALOG_KEEL_SERVER_YAML`]); both pin [`KEEL_SERVER_IMAGE_TAG`].
+const STARTER_KEEL_SERVER_APP_YAML: &str =
+    include_str!("../../../../deploy/catalog/apps/keel-server/catalog.yaml");
+const STARTER_KEEL_SERVER_APP_MANIFESTS_YAML: &str =
+    include_str!("../../../../deploy/catalog/apps/keel-server/manifests.yaml");
 const CORE_CATALOG_ENVOY_GATEWAY_YAML: &str =
     include_str!("../../../../deploy/catalog/core/envoy-gateway/catalog.yaml");
 const CORE_CATALOG_PROMETHEUS_YAML: &str =
@@ -1524,6 +1530,15 @@ async fn initialize_seed_git_repo_with_push(
                 STARTER_PKO_APP_YAML,
             ),
             ("catalog/apps/flux2/catalog.yaml", STARTER_FLUX2_APP_YAML),
+            // A team's own Keel control plane on a workload cluster.
+            (
+                "catalog/apps/keel-server/catalog.yaml",
+                STARTER_KEEL_SERVER_APP_YAML,
+            ),
+            (
+                "catalog/apps/keel-server/manifests.yaml",
+                STARTER_KEEL_SERVER_APP_MANIFESTS_YAML,
+            ),
         ] {
             files_to_write.push((path.to_string(), contents.to_string()));
         }
@@ -2475,6 +2490,8 @@ mod security_hardening_tests {
             "deploy/bootstrap/keel-server/deployment.yaml",
             "deploy/seed/core-addons/keel-server.yaml",
             "deploy/catalog/core/keel-server/catalog.yaml",
+            "deploy/catalog/apps/keel-server/catalog.yaml",
+            "deploy/catalog/apps/keel-server/manifests.yaml",
         ] {
             assert!(prepare.contains(pinned_file), "{pinned_file} not bumped");
             assert!(
@@ -3514,7 +3531,7 @@ mod security_hardening_tests {
                 .unwrap(),
             STARTER_RAUTHY_APP_MANIFESTS_YAML
         );
-        // Self-service Forgejo, SeaweedFS and the workload-cluster operator twins (Helm) are
+        // Self-service Forgejo, SeaweedFS and the workload-cluster twins (operators, keel-server) are
         // seeded with or without `--with-forge` (independent of the management-plane add-ons).
         for (path, contents) in [
             (
@@ -3534,6 +3551,14 @@ mod security_hardening_tests {
                 STARTER_PKO_APP_YAML,
             ),
             ("catalog/apps/flux2/catalog.yaml", STARTER_FLUX2_APP_YAML),
+            (
+                "catalog/apps/keel-server/catalog.yaml",
+                STARTER_KEEL_SERVER_APP_YAML,
+            ),
+            (
+                "catalog/apps/keel-server/manifests.yaml",
+                STARTER_KEEL_SERVER_APP_MANIFESTS_YAML,
+            ),
         ] {
             assert!(
                 res.written_files.iter().any(|p| p == path),
@@ -4631,5 +4656,590 @@ mod workload_operator_app_tests {
             schema["logLevel"]["enum"],
             yaml(CORE_CATALOG_FLUX2_YAML)["spec"]["schema"]["properties"]["logLevel"]["enum"]
         );
+    }
+}
+
+/// Self-service workload-cluster keel-server catalog app (`deploy/catalog/apps/keel-server`).
+#[cfg(test)]
+mod tenant_keel_server_app_tests {
+    use super::*;
+
+    use serde_json::{Value, json};
+
+    const SECRET_FIELDS: [&str; 2] = ["oidcClientSecret", "gitToken"];
+    const SAMPLE_CLIENT_SECRET: &str = "oidc-Client-Secret-0123456789";
+    const SAMPLE_GIT_TOKEN: &str = "glpat-SampleGitToken0123456789";
+
+    fn yaml_docs(yaml: &str) -> Vec<Value> {
+        keel_core::split_yaml_documents(yaml)
+            .iter()
+            .filter_map(|d| serde_yml::from_str::<Value>(d).ok())
+            .filter(|d| d.is_object())
+            .collect()
+    }
+
+    fn sample_values() -> Value {
+        json!({
+            "hostname": "keel.team-a.example.com",
+            "publicPortSuffix": ":8443",
+            "gatewayName": "edge",
+            "gatewayNamespace": "gateway-system",
+            "oidcIssuerUrl": "https://auth.team-a.example.com/auth/v1",
+            "oidcClientId": "team-a-keel",
+            "oidcClientSecret": SAMPLE_CLIENT_SECRET,
+            "adminGroup": "team-a-platform",
+            "gitUrl": "https://git.example.com/team-a/infra-gitops.git",
+            "gitUsername": "keel-bot",
+            "gitToken": SAMPLE_GIT_TOKEN,
+        })
+    }
+
+    fn app() -> keel_core::CatalogApplication {
+        keel_core::parse_catalog_application(STARTER_KEEL_SERVER_APP_YAML).unwrap()
+    }
+
+    /// Renders the template like `POST /api/v1/proposals` (Flux engine): only the non-secret
+    /// partition is substituted at proposal time.
+    fn render(values: &Value) -> (String, Value, Vec<Value>) {
+        let app = app();
+        keel_core::validate_schema_values(&app.spec.schema, values).unwrap();
+        let partitioned = keel_core::partition_values_by_schema(&app.spec.schema, values).unwrap();
+        let rendered = keel_core::render_manifest_template(
+            STARTER_KEEL_SERVER_APP_MANIFESTS_YAML,
+            &partitioned.normal_values,
+        )
+        .unwrap();
+        let docs = keel_core::verify_rendered_manifest_structure(
+            STARTER_KEEL_SERVER_APP_MANIFESTS_YAML,
+            &rendered,
+        )
+        .unwrap();
+        (rendered, partitioned.secret_values, docs)
+    }
+
+    fn find<'a>(docs: &'a [Value], kind: &str, name: &str, ns: Option<&str>) -> &'a Value {
+        docs.iter()
+            .find(|d| {
+                d["kind"] == kind
+                    && d["metadata"]["name"] == name
+                    && d["metadata"]["namespace"].as_str() == ns
+            })
+            .unwrap_or_else(|| panic!("{kind}/{name} ({ns:?}) missing"))
+    }
+
+    fn container(docs: &[Value]) -> Value {
+        find(docs, "Deployment", "keel-server", Some("keel-system"))["spec"]["template"]["spec"]
+            ["containers"][0]
+            .clone()
+    }
+
+    fn env_entry(container: &Value, name: &str) -> Value {
+        container["env"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["name"] == name)
+            .unwrap_or_else(|| panic!("env {name} missing"))
+            .clone()
+    }
+
+    #[test]
+    fn catalog_entry_is_workload_cluster_manifest_app_pinned_to_release_tag() {
+        let app = app();
+        assert_eq!(app.metadata.id, "keel-server");
+        assert_ne!(app.metadata.category, keel_core::MANAGEMENT_CORE_CATEGORY);
+        assert_eq!(app.metadata.runtime, keel_core::AppRuntime::Manifest);
+        assert_eq!(
+            app.spec.default_engine,
+            Some(keel_core::ManifestEngine::Flux)
+        );
+        assert!(app.spec.placement.requires_remote_cluster());
+        assert_eq!(app.spec.placement.namespace.as_deref(), Some("keel-system"));
+        assert_eq!(
+            app.multi_namespace_placement(),
+            vec!["keel-system", "keel-previews", "flux-system"]
+        );
+        assert!(!app.spec.progressive_delivery.flagger_supported);
+
+        // One release tag everywhere: crate version == catalog/core == catalog/apps == image.
+        let tag = KEEL_SERVER_IMAGE_TAG;
+        let core = keel_core::parse_catalog_application(CORE_CATALOG_KEEL_SERVER_YAML).unwrap();
+        assert_eq!(core.spec.upstream.version.as_deref(), Some(tag));
+        assert_eq!(
+            app.spec.upstream.version.as_deref(),
+            Some(tag),
+            "catalog/apps/keel-server version drifts from the crate / catalog/core/keel-server"
+        );
+        assert_eq!(core.spec.upstream.image.as_deref(), Some(KEEL_SERVER_IMAGE));
+        let (rendered, _, docs) = render(&sample_values());
+        assert_eq!(
+            container(&docs)["image"],
+            format!("{KEEL_SERVER_IMAGE}:{tag}").as_str()
+        );
+        assert!(!rendered.contains(":latest"));
+        // The release `sed` only rewrites the pinned tag and `upstream.version`: no other quoted,
+        // indented `version:` / `newTag:` line may exist in the bumped files.
+        let bumped = |raw: &str| {
+            raw.lines()
+                .filter(|l| {
+                    let t = l.trim_start();
+                    l.starts_with(' ')
+                        && (t.starts_with("version: \"") || t.starts_with("newTag: \""))
+                })
+                .count()
+        };
+        assert_eq!(bumped(STARTER_KEEL_SERVER_APP_YAML), 1);
+        assert_eq!(bumped(STARTER_KEEL_SERVER_APP_MANIFESTS_YAML), 0);
+        assert_eq!(
+            STARTER_KEEL_SERVER_APP_MANIFESTS_YAML
+                .matches("ghcr.io/rdylanwalker/keel:")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn manifests_reuse_the_known_good_install_config() {
+        let (_, _, docs) = render(&sample_values());
+        // Least-privilege RBAC identical to `deploy/bootstrap/keel-server/rbac.yaml`, plus the
+        // preview workspace identity of the Stage 0 manifests.
+        let mut expected: Vec<Value> = yaml_docs(KEEL_SERVER_RBAC_YAML);
+        expected.extend(yaml_docs(include_str!(
+            "../../../../deploy/bootstrap/manifests/preview-workspace-rbac.yaml"
+        )));
+        for want in &expected {
+            let got = find(
+                &docs,
+                want["kind"].as_str().unwrap(),
+                want["metadata"]["name"].as_str().unwrap(),
+                want["metadata"]["namespace"].as_str(),
+            );
+            let mut want = want.clone();
+            if want["kind"] == "ClusterRole" && want["metadata"]["name"] == "keel-server-read" {
+                // The one deliberate difference: Kyverno writes are narrowed to the provider
+                // allowlist policy (no PolicyException / GeneratingPolicy writes).
+                let rules: Vec<Value> = want["rules"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .flat_map(|rule| {
+                        if rule["apiGroups"] == json!(["policies.kyverno.io"]) {
+                            let mut read = rule.clone();
+                            read["verbs"] = json!(["get", "list", "watch"]);
+                            vec![read, workload_kyverno_write_rule()]
+                        } else {
+                            vec![rule.clone()]
+                        }
+                    })
+                    .collect();
+                want["rules"] = Value::Array(rules);
+            }
+            assert_eq!(got, &want, "RBAC drift: {}", want["metadata"]["name"]);
+        }
+        let rbac_kinds = [
+            "ServiceAccount",
+            "ClusterRole",
+            "ClusterRoleBinding",
+            "Role",
+            "RoleBinding",
+        ];
+        assert_eq!(
+            docs.iter()
+                .filter(|d| rbac_kinds.contains(&d["kind"].as_str().unwrap()))
+                .count(),
+            expected.len(),
+            "unexpected extra RBAC objects"
+        );
+
+        // Same pod spec as the shared Deployment; only the environment differs.
+        let bundle = yaml_docs(KEEL_SERVER_DEPLOYMENT_YAML);
+        let known = bundle.iter().find(|d| d["kind"] == "Deployment").unwrap();
+        let ours = find(&docs, "Deployment", "keel-server", Some("keel-system"));
+        let strip = |d: &Value| {
+            let mut pod = d["spec"]["template"]["spec"].clone();
+            let c = &mut pod["containers"][0];
+            c.as_object_mut().unwrap().remove("env");
+            c.as_object_mut().unwrap().remove("envFrom");
+            pod
+        };
+        assert_eq!(strip(ours), strip(known));
+        assert_eq!(ours["spec"]["selector"], known["spec"]["selector"]);
+        let svc = bundle.iter().find(|d| d["kind"] == "Service").unwrap();
+        assert_eq!(
+            find(&docs, "Service", "keel-server", Some("keel-system")),
+            svc
+        );
+
+        // Route shape of the management add-on, attached to the configured Gateway.
+        let route = find(
+            &docs,
+            "HTTPRoute",
+            "keel-server-ingress",
+            Some("keel-system"),
+        );
+        let seed: Value = serde_yml::from_str(SEED_ADDON_KEEL_SERVER_HTTPROUTE_YAML).unwrap();
+        assert_eq!(route["spec"]["rules"], seed["spec"]["rules"]);
+        assert_eq!(
+            route["spec"]["parentRefs"],
+            json!([{ "name": "edge", "namespace": "gateway-system" }])
+        );
+        assert_eq!(
+            route["spec"]["hostnames"],
+            json!(["keel.team-a.example.com"])
+        );
+
+        // Every namespaced object names one of the placement namespaces (no targetNamespace).
+        let rendered =
+            keel_core::render_manifest_template(STARTER_KEEL_SERVER_APP_MANIFESTS_YAML, &json!({}))
+                .unwrap();
+        app().ensure_manifest_namespaces(&rendered).unwrap();
+        assert!(
+            docs.iter().all(|d| d["kind"] != "Namespace"),
+            "Keel synthesizes the namespaces"
+        );
+    }
+
+    /// The only Kyverno write of the workload variant of `keel-server-read`.
+    fn workload_kyverno_write_rule() -> Value {
+        json!({
+            "apiGroups": ["policies.kyverno.io"],
+            "resources": ["validatingpolicies"],
+            "resourceNames": [keel_kube::kyverno::POLICY_RESTRICT_PULUMI_PROVIDERS],
+            "verbs": ["create", "update", "patch"],
+        })
+    }
+
+    #[test]
+    fn kyverno_writes_are_limited_to_the_provider_allowlist_policy() {
+        let (_, _, docs) = render(&sample_values());
+        let role = find(&docs, "ClusterRole", "keel-server-read", None);
+        let writes = [
+            "create",
+            "update",
+            "patch",
+            "delete",
+            "deletecollection",
+            "*",
+        ];
+        let kyverno_writes: Vec<&Value> = role["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| {
+                r["apiGroups"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|g| g == "policies.kyverno.io" || g == "*")
+                    && r["verbs"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|v| writes.contains(&v.as_str().unwrap()))
+            })
+            .collect();
+        assert_eq!(kyverno_writes, vec![&workload_kyverno_write_rule()]);
+        // No other Role/ClusterRole of the app touches Kyverno objects.
+        for d in docs
+            .iter()
+            .filter(|d| d["kind"] == "Role" || d["kind"] == "ClusterRole")
+            .filter(|d| d["metadata"]["name"] != "keel-server-read")
+        {
+            assert!(
+                !serde_json::to_string(d).unwrap().contains("kyverno"),
+                "{}",
+                d["metadata"]["name"]
+            );
+        }
+    }
+
+    /// Keel's Kyverno `protect-control-plane` rule confining keel-server's reconcile requests.
+    fn protect_control_plane_keel_server_rule() -> String {
+        let policy: Value = serde_yml::from_str(include_str!(
+            "../../../../deploy/seed/kyverno-policies/protect-control-plane.yaml"
+        ))
+        .unwrap();
+        policy["spec"]["validations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v["expression"].as_str())
+            .find(|e| e.contains("'system:serviceaccount:keel-system:keel-server'"))
+            .expect("keel-server rule of protect-control-plane")
+            .to_string()
+    }
+
+    #[test]
+    fn flux_system_patch_grant_is_confined_by_a_native_admission_policy() {
+        let (_, _, docs) = render(&sample_values());
+        let policy = find(
+            &docs,
+            "ValidatingAdmissionPolicy",
+            "keel-server-reconcile-only",
+            None,
+        );
+        assert_eq!(policy["apiVersion"], "admissionregistration.k8s.io/v1");
+        let spec = &policy["spec"];
+        assert_eq!(spec["failurePolicy"], "Fail");
+        // Same CEL as the management cluster's Kyverno rule (kept in sync by this test).
+        let validations = spec["validations"].as_array().unwrap();
+        assert_eq!(validations.len(), 1);
+        assert_eq!(
+            validations[0]["expression"].as_str().unwrap(),
+            protect_control_plane_keel_server_rule()
+        );
+        assert_eq!(
+            spec["matchConditions"],
+            json!([{
+                "name": "keel-server-service-account",
+                "expression":
+                    "request.userInfo.username == 'system:serviceaccount:keel-system:keel-server'",
+            }])
+        );
+        assert_eq!(
+            spec["matchConstraints"]["namespaceSelector"],
+            json!({ "matchExpressions": [{
+                "key": "kubernetes.io/metadata.name",
+                "operator": "In",
+                "values": ["flux-system", "keel-system"],
+            }]})
+        );
+        let rules = spec["matchConstraints"]["resourceRules"]
+            .as_array()
+            .unwrap();
+        assert!(
+            rules
+                .iter()
+                .all(|r| r["operations"] == json!(["UPDATE"]) && r["apiVersions"] == json!(["*"]))
+        );
+        let covers = |group: &str, resource: &str| {
+            rules.iter().any(|r| {
+                r["apiGroups"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|g| g == group)
+                    && r["resources"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|x| x == resource || x == "*")
+            })
+        };
+        // Every object the server may patch in flux-system is matched by the policy.
+        let flux_role = find(&docs, "Role", "keel-server", Some("flux-system"));
+        for rule in flux_role["rules"].as_array().unwrap() {
+            if !rule["verbs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v == "patch" || v == "update")
+            {
+                continue;
+            }
+            for group in rule["apiGroups"].as_array().unwrap() {
+                for resource in rule["resources"].as_array().unwrap() {
+                    let (g, r) = (group.as_str().unwrap(), resource.as_str().unwrap());
+                    assert!(covers(g, r), "{g}/{r} patchable but not policed");
+                }
+            }
+        }
+
+        let binding = find(
+            &docs,
+            "ValidatingAdmissionPolicyBinding",
+            "keel-server-reconcile-only",
+            None,
+        );
+        assert_eq!(binding["spec"]["policyName"], "keel-server-reconcile-only");
+        assert_eq!(binding["spec"]["validationActions"], json!(["Deny"]));
+        assert!(binding["spec"].get("paramRef").is_none());
+        assert!(binding["spec"].get("matchResources").is_none());
+    }
+
+    #[test]
+    fn rendered_manifests_apply_form_values_and_defaults() {
+        let (_, _, docs) = render(&sample_values());
+        let c = container(&docs);
+        let value = |name: &str| env_entry(&c, name)["value"].as_str().unwrap().to_string();
+        assert_eq!(
+            value("KEEL_GIT_URL"),
+            "https://git.example.com/team-a/infra-gitops.git"
+        );
+        assert_eq!(value("KEEL_GIT_USERNAME"), "keel-bot");
+        assert_eq!(
+            value(keel_core::OIDC_ISSUER_URL_ENV),
+            "https://auth.team-a.example.com/auth/v1"
+        );
+        assert_eq!(value(keel_core::OIDC_CLIENT_ID_ENV), "team-a-keel");
+        assert_eq!(
+            value(keel_core::OIDC_REDIRECT_URL_ENV),
+            "https://keel.team-a.example.com:8443/api/v1/auth/callback"
+        );
+        assert_eq!(value("KEEL_ADMIN_GROUPS"), "team-a-platform");
+        assert_eq!(value("HOME"), "/var/lib/keel");
+
+        // The env the server reads resolves to a complete OIDC config.
+        let env: Vec<(String, String)> = c["env"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|e| {
+                Some((
+                    e["name"].as_str()?.to_string(),
+                    e["value"].as_str()?.to_string(),
+                ))
+            })
+            .collect();
+        let oidc = keel_core::OidcConfig::with_env_overrides(None, |name| {
+            env.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone())
+        })
+        .unwrap()
+        .unwrap();
+        assert!(oidc.enabled);
+        assert_eq!(oidc.client_id, "team-a-keel");
+
+        // Optional fields fall back to the schema defaults (443, keel-ingress, keel-admins, keel).
+        let mut minimal = sample_values();
+        for field in [
+            "publicPortSuffix",
+            "gatewayName",
+            "gatewayNamespace",
+            "adminGroup",
+            "gitUsername",
+        ] {
+            minimal.as_object_mut().unwrap().remove(field);
+        }
+        let (rendered, _, docs) = render(&minimal);
+        assert!(!rendered.contains(":="), "unrendered default left");
+        let c = container(&docs);
+        assert_eq!(
+            env_entry(&c, keel_core::OIDC_REDIRECT_URL_ENV)["value"],
+            "https://keel.team-a.example.com/api/v1/auth/callback"
+        );
+        assert_eq!(env_entry(&c, "KEEL_ADMIN_GROUPS")["value"], "keel-admins");
+        assert_eq!(env_entry(&c, "KEEL_GIT_USERNAME")["value"], "keel");
+        let route = find(
+            &docs,
+            "HTTPRoute",
+            "keel-server-ingress",
+            Some("keel-system"),
+        );
+        assert_eq!(
+            route["spec"]["parentRefs"],
+            json!([{ "name": "keel-ingress", "namespace": "keel-system" }])
+        );
+        let app = app();
+        let props = &app.spec.schema["properties"];
+        assert_eq!(props["publicPortSuffix"]["default"], "");
+        assert_eq!(props["gatewayName"]["default"], "keel-ingress");
+        assert_eq!(props["gatewayNamespace"]["default"], "keel-system");
+        assert_eq!(props["adminGroup"]["default"], "keel-admins");
+        assert_eq!(props["gitUsername"]["default"], "keel");
+    }
+
+    #[test]
+    fn secrets_only_reach_the_pod_through_the_flux_substituted_secret() {
+        let app = app();
+        let props = &app.spec.schema["properties"];
+        let required: Vec<&str> = app.spec.schema["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        for field in SECRET_FIELDS {
+            assert_eq!(props[field]["format"], "password", "{field}");
+            assert_eq!(props[field]["writeOnly"], true, "{field}");
+            assert!(props[field].get("default").is_none(), "{field} defaulted");
+            assert!(required.contains(&field), "{field} not required");
+        }
+
+        let (rendered, secrets, docs) = render(&sample_values());
+        for (field, value) in [
+            ("oidcClientSecret", SAMPLE_CLIENT_SECRET),
+            ("gitToken", SAMPLE_GIT_TOKEN),
+        ] {
+            assert_eq!(secrets[field], value);
+            assert!(!rendered.contains(value), "{field} leaked into manifests");
+            // `${field}` stays for Flux `postBuild.substituteFrom` and never has a default
+            // (Keel would otherwise render the default at proposal time).
+            assert!(rendered.contains(&format!("${{{field}}}")), "{field}");
+            assert!(!rendered.contains(&format!("${{{field}:=")), "{field}");
+        }
+        let secret = find(
+            &docs,
+            "Secret",
+            "keel-server-credentials",
+            Some("keel-system"),
+        );
+        assert_eq!(secret["stringData"]["git-token"], "${gitToken}");
+        assert_eq!(
+            secret["stringData"]["oidc-client-secret"],
+            "${oidcClientSecret}"
+        );
+        let c = container(&docs);
+        for (name, key) in [
+            ("KEEL_GIT_TOKEN", "git-token"),
+            (keel_core::OIDC_CLIENT_SECRET_ENV, "oidc-client-secret"),
+        ] {
+            let e = env_entry(&c, name);
+            assert!(e.get("value").is_none(), "{name} inlined");
+            assert_eq!(
+                e["valueFrom"]["secretKeyRef"]["name"],
+                "keel-server-credentials"
+            );
+            assert_eq!(e["valueFrom"]["secretKeyRef"]["key"], key);
+        }
+    }
+
+    #[test]
+    fn schema_rejects_values_that_would_break_substitution_or_leak_credentials() {
+        let schema = app().spec.schema;
+        let reject = |field: &str, value: &str| {
+            let mut v = sample_values();
+            v[field] = json!(value);
+            assert!(
+                keel_core::validate_schema_values(&schema, &v).is_err(),
+                "{field}={value:?} accepted"
+            );
+        };
+        // No credentials in URLs (the token is injected by keel, never via the remote URL).
+        reject("gitUrl", "https://user:pw@git.example.com/a/b.git");
+        reject("gitUrl", "ssh://git@git.example.com/a/b.git");
+        reject("gitUrl", "https://git.example.com/a/${b}.git");
+        // The Git token is sent on every clone/fetch/push: never over cleartext HTTP.
+        reject("gitUrl", "http://git.example.com/team-a/infra-gitops.git");
+        reject("oidcIssuerUrl", "http://auth.team-a.example.com");
+        reject("oidcIssuerUrl", "https://auth.example.com/\"x");
+        for secret in SECRET_FIELDS {
+            reject(secret, "short");
+            reject(secret, "has space-1234567890");
+            reject(secret, "has\"quote-1234567");
+            reject(secret, "has\\backslash-1234567");
+            reject(secret, "has${dollar}-1234567");
+        }
+        reject("adminGroup", "a,b");
+        reject("adminGroup", "with space");
+        reject("gatewayName", "Edge_GW");
+        reject("gatewayNamespace", "-bad");
+        reject("publicPortSuffix", "8443");
+        reject("oidcClientId", "has space");
+        reject("gitUsername", "a/b");
+        for field in [
+            "hostname",
+            "oidcIssuerUrl",
+            "oidcClientId",
+            "oidcClientSecret",
+            "gitUrl",
+            "gitToken",
+        ] {
+            let mut missing = sample_values();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(
+                keel_core::validate_schema_values(&schema, &missing).is_err(),
+                "{field} not required"
+            );
+        }
     }
 }

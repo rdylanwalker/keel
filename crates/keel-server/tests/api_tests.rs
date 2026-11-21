@@ -8697,3 +8697,356 @@ spec:
     assert_eq!(hr["spec"]["values"]["multitenancy"]["enabled"], true);
     git.checkout_branch(&workdir, "main").await.unwrap();
 }
+
+const KEEL_SERVER_APP_CATALOG: &str =
+    include_str!("../../../deploy/catalog/apps/keel-server/catalog.yaml");
+const KEEL_SERVER_APP_MANIFESTS: &str =
+    include_str!("../../../deploy/catalog/apps/keel-server/manifests.yaml");
+
+async fn seed_keel_server_catalog(fixture: &TestFixture) {
+    commit_to_main(
+        fixture,
+        &[
+            (
+                "catalog/apps/keel-server/catalog.yaml",
+                KEEL_SERVER_APP_CATALOG,
+            ),
+            (
+                "catalog/apps/keel-server/manifests.yaml",
+                KEEL_SERVER_APP_MANIFESTS,
+            ),
+        ],
+        "feat(catalog): add keel-server",
+    )
+    .await;
+}
+
+fn keel_server_values(hostname: &str) -> Value {
+    json!({
+        "hostname": hostname,
+        "oidcIssuerUrl": "https://auth.team-a.example.com/auth/v1",
+        "oidcClientId": "team-a-keel",
+        "oidcClientSecret": "oidc-Client-Secret-0123456789",
+        "adminGroup": "team-a-platform",
+        "gitUrl": "https://git.example.com/team-a/infra-gitops.git",
+        "gitToken": "glpat-SampleGitToken0123456789",
+    })
+}
+
+/// The built-in workload-cluster keel-server (`deploy/catalog/apps/keel-server`) renders a
+/// multi-namespace Flux manifest app on the remote cluster: its three namespaces are created
+/// first, no `targetNamespace` collapses the per-namespace Roles, and the Git token / OIDC client
+/// secret only reach Git SOPS-encrypted on the management cluster.
+#[tokio::test]
+async fn test_keel_server_catalog_app_renders_multi_namespace_remote_layout() {
+    let fixture = setup_fixture().await;
+    let cookie = login_and_get_cookie(&fixture).await;
+    seed_keel_server_catalog(&fixture).await;
+    let workdir = fixture.state.repo_workdir.clone();
+
+    let values = keel_server_values("keel.team-a.example.com");
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "keel-server",
+                "targetCluster": "team-a-kubeconfig", "values": values }),
+    )
+    .await;
+    if sops_unavailable(status, &body) {
+        return;
+    }
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    checkout_proposal_branch(&fixture, &body).await;
+
+    let dir = workdir.join("tenants/acme/apps/keel-server");
+    let read = |file: &str| std::fs::read_to_string(dir.join(file)).unwrap();
+    let yaml = |file: &str| serde_yml::from_str::<Value>(&read(file)).unwrap();
+    let committed = read_tree(&dir);
+    for field in ["oidcClientSecret", "gitToken"] {
+        let secret = values[field].as_str().unwrap();
+        assert!(
+            !committed.contains(secret),
+            "{field} committed in plaintext"
+        );
+    }
+    assert!(read("config/secrets.enc.yaml").contains("ENC[AES256_GCM,"));
+
+    let fk = yaml("flux-kustomization.yaml");
+    assert_eq!(fk["metadata"]["name"], "keel-server");
+    assert_eq!(
+        fk["spec"]["kubeConfig"]["secretRef"]["name"],
+        "team-a-kubeconfig"
+    );
+    assert!(
+        fk["spec"].get("targetNamespace").is_none(),
+        "a targetNamespace would collapse the keel-previews / flux-system Roles: {fk}"
+    );
+    assert!(
+        fk["spec"]["postBuild"]["substituteFrom"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["kind"] == "Secret" && s["name"] == "keel-server-secrets")
+    );
+    let config_fk = yaml("config-kustomization.yaml");
+    assert!(config_fk["spec"].get("kubeConfig").is_none());
+    assert_eq!(config_fk["spec"]["targetNamespace"], "tenant-acme");
+
+    assert_eq!(
+        yaml("kustomization.yaml")["resources"],
+        json!(["namespace.yaml", "manifests.yaml"])
+    );
+    let namespaces: Vec<Value> = keel_core::split_yaml_documents(&read("namespace.yaml"))
+        .iter()
+        .map(|d| serde_yml::from_str(d).unwrap())
+        .collect();
+    assert_eq!(
+        namespaces
+            .iter()
+            .map(|n| n["metadata"]["name"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["keel-system", "keel-previews", "flux-system"]
+    );
+    for ns in &namespaces {
+        assert_eq!(ns["kind"], "Namespace");
+        assert_eq!(
+            ns["metadata"]["annotations"]["kustomize.toolkit.fluxcd.io/ssa"],
+            "IfNotPresent"
+        );
+        assert_restricted_pss(ns);
+    }
+
+    let manifests = read("manifests.yaml");
+    assert!(manifests.contains("${gitToken}"));
+    assert!(manifests.contains("${oidcClientSecret}"));
+    assert!(manifests.contains("https://keel.team-a.example.com/api/v1/auth/callback"));
+    assert!(manifests.contains("team-a-platform"));
+    let docs: Vec<Value> = keel_core::split_yaml_documents(&manifests)
+        .iter()
+        .filter_map(|d| serde_yml::from_str::<Value>(d).ok())
+        .filter(Value::is_object)
+        .collect();
+    let role_namespaces: Vec<&str> = docs
+        .iter()
+        .filter(|d| d["kind"] == "Role")
+        .map(|d| d["metadata"]["namespace"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        role_namespaces,
+        vec!["keel-system", "keel-previews", "flux-system"]
+    );
+    // The flux-system reconcile-request grant ships with its native admission guard (the
+    // workload cluster has no Keel Kyverno `protect-control-plane` policy).
+    for kind in [
+        "ValidatingAdmissionPolicy",
+        "ValidatingAdmissionPolicyBinding",
+    ] {
+        let doc = docs
+            .iter()
+            .find(|d| d["kind"] == kind && d["metadata"]["name"] == "keel-server-reconcile-only")
+            .unwrap_or_else(|| panic!("{kind} missing"));
+        assert_eq!(doc["apiVersion"], "admissionregistration.k8s.io/v1");
+        assert!(doc["metadata"].get("namespace").is_none());
+    }
+
+    let resources = tenants_kustomization_resources(&fixture);
+    for file in ["config-kustomization.yaml", "flux-kustomization.yaml"] {
+        assert!(
+            resources.contains(&format!("acme/apps/keel-server/{file}")),
+            "{resources:?}"
+        );
+    }
+    fixture
+        .state
+        .git_runner
+        .checkout_branch(&workdir, "main")
+        .await
+        .unwrap();
+}
+
+/// The workload keel-server never installs on the management cluster, never leaves its
+/// namespaces, only uses the Flux engine and keeps the platform hostname guards.
+#[tokio::test]
+async fn test_keel_server_catalog_app_rejects_management_cluster_and_bad_requests() {
+    let fixture = setup_fixture().await;
+    let cookie = login_and_get_cookie(&fixture).await;
+    seed_keel_server_catalog(&fixture).await;
+    let git = &fixture.state.git_runner;
+    let workdir = &fixture.state.repo_workdir;
+    let head_before = git.rev_parse(workdir, "HEAD").await.unwrap();
+
+    let remote = |extra: Value| {
+        let mut req = json!({ "tenant": "acme", "catalogId": "keel-server",
+                              "targetCluster": "team-a-kubeconfig",
+                              "values": keel_server_values("keel.team-a.example.com") });
+        for (k, v) in extra.as_object().unwrap() {
+            req[k] = v.clone();
+        }
+        req
+    };
+    let cases = [
+        // scope: cluster (ClusterRoles) => management cluster rejected.
+        (
+            json!({ "tenant": "acme", "catalogId": "keel-server",
+                    "values": keel_server_values("keel.team-a.example.com") }),
+            "scope: cluster",
+        ),
+        (
+            remote(json!({ "targetNamespace": "tenant-acme" })),
+            "keel-system",
+        ),
+        (remote(json!({ "actionEngine": "pulumi" })), "flux engine"),
+        // Platform host of the management plane.
+        (
+            remote(json!({ "values": keel_server_values("keel.keel.local") })),
+            "keel.keel.local",
+        ),
+    ];
+    for (req, needle) in cases {
+        let (status, body) = post_proposal(&fixture, &cookie, req.clone()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{req}: {body}");
+        assert!(body.contains(needle), "{needle}: {body}");
+        for secret in [
+            "oidc-Client-Secret-0123456789",
+            "glpat-SampleGitToken0123456789",
+        ] {
+            assert!(!body.contains(secret), "secret echoed: {body}");
+        }
+    }
+    assert_eq!(git.rev_parse(workdir, "HEAD").await.unwrap(), head_before);
+}
+
+/// A multi-namespace manifest app (`spec.placement.additionalNamespaces`) must name one of its
+/// namespaces on every namespaced object: Keel sets no Flux `targetNamespace` for it.
+#[tokio::test]
+async fn test_multi_namespace_manifest_app_requires_explicit_namespaces() {
+    let fixture = setup_fixture().await;
+    let cookie = login_and_get_cookie(&fixture).await;
+    let catalog = "apiVersion: keel.io/v1alpha1\nkind: CatalogApplication\nmetadata:\n  id: multi-ns\n  name: Multi\n  description: d\n  category: platform\n  runtime: manifest\nspec:\n  defaultEngine: flux\n  upstream:\n    repoURL: https://example.com/multi\n    path: ./manifests.yaml\n    version: \"1.0.0\"\n  placement:\n    scope: cluster\n    namespace: ops\n    additionalNamespaces: [ops-extra]\n  schema:\n    type: object\n    properties:\n      ns:\n        type: string\n        default: ops\n";
+    let manifests = "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: a\n  namespace: ${ns:=ops}\ndata: {}\n---\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: b\n  namespace: ops-extra\ndata: {}\n";
+    commit_to_main(
+        &fixture,
+        &[
+            ("catalog/apps/multi-ns/catalog.yaml", catalog),
+            ("catalog/apps/multi-ns/manifests.yaml", manifests),
+        ],
+        "feat(catalog): add multi-ns",
+    )
+    .await;
+    let git = &fixture.state.git_runner;
+    let workdir = fixture.state.repo_workdir.clone();
+    let head_before = git.rev_parse(&workdir, "HEAD").await.unwrap();
+
+    for ns in ["kube-system", "tenant-acme"] {
+        let (status, body) = post_proposal(
+            &fixture,
+            &cookie,
+            json!({ "tenant": "acme", "catalogId": "multi-ns", "targetCluster": "ops-kubeconfig",
+                    "values": { "ns": ns } }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{ns}: {body}");
+        assert!(body.contains("ConfigMap/a"), "{body}");
+        assert!(body.contains("ops, ops-extra"), "{body}");
+    }
+    // Only the Flux layout creates the namespaces and omits `targetNamespace`.
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "multi-ns", "targetCluster": "ops-kubeconfig",
+                "actionEngine": "pulumi", "values": { "ns": "ops" } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("additionalNamespaces"), "{body}");
+    assert_eq!(git.rev_parse(&workdir, "HEAD").await.unwrap(), head_before);
+
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "multi-ns", "targetCluster": "ops-kubeconfig",
+                "values": { "ns": "ops-extra" } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    checkout_proposal_branch(&fixture, &body).await;
+    let dir = workdir.join("tenants/acme/apps/multi-ns");
+    let fk: Value =
+        serde_yml::from_str(&std::fs::read_to_string(dir.join("flux-kustomization.yaml")).unwrap())
+            .unwrap();
+    assert!(fk["spec"].get("targetNamespace").is_none(), "{fk}");
+    let ns_yaml = std::fs::read_to_string(dir.join("namespace.yaml")).unwrap();
+    assert_eq!(keel_core::split_yaml_documents(&ns_yaml).len(), 2);
+    git.checkout_branch(&workdir, "main").await.unwrap();
+}
+
+/// `scope: cluster` manifest apps ship fixed-name cluster-wide objects, so a tenant can install
+/// the workload keel-server only once per target cluster; edits of that instance and installs on
+/// other clusters still work.
+#[tokio::test]
+async fn test_keel_server_catalog_app_installs_once_per_cluster() {
+    let fixture = setup_fixture().await;
+    let cookie = login_and_get_cookie(&fixture).await;
+    seed_keel_server_catalog(&fixture).await;
+    let git = &fixture.state.git_runner;
+    let workdir = fixture.state.repo_workdir.clone();
+
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "keel-server",
+                "targetCluster": "team-a-kubeconfig",
+                "values": keel_server_values("keel.team-a.example.com") }),
+    )
+    .await;
+    if sops_unavailable(status, &body) {
+        return;
+    }
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    merge_proposal_and_sync(&fixture, &cookie, &body).await;
+    let head_before = git.rev_parse(&workdir, "HEAD").await.unwrap();
+
+    // A second instance (another name and hostname) on the same cluster.
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "keel-server", "name": "keel-server-2",
+                "targetCluster": "team-a-kubeconfig",
+                "values": keel_server_values("keel2.team-a.example.com") }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body.contains("once per cluster"), "{body}");
+    assert!(body.contains("tenants/acme/apps/keel-server"), "{body}");
+    for secret in [
+        "oidc-Client-Secret-0123456789",
+        "glpat-SampleGitToken0123456789",
+    ] {
+        assert!(!body.contains(secret), "secret echoed: {body}");
+    }
+    assert_eq!(git.rev_parse(&workdir, "HEAD").await.unwrap(), head_before);
+
+    // Editing the installed instance is not a second install.
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "keel-server",
+                "targetCluster": "team-a-kubeconfig",
+                "values": keel_server_values("keel.team-a.example.com") }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    git.checkout_branch(&workdir, "main").await.unwrap();
+
+    // Another workload cluster of the same tenant.
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "keel-server", "name": "keel-server-b",
+                "targetCluster": "team-b-kubeconfig",
+                "values": keel_server_values("keel.team-b.example.com") }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    git.checkout_branch(&workdir, "main").await.unwrap();
+}

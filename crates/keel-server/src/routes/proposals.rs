@@ -535,6 +535,9 @@ struct FluxManifestAppLayoutInput<'a> {
     encrypted_secret_yaml: Option<&'a str>,
     kube_config: Option<RemoteKubeConfigRef>,
     target_namespace: Option<String>,
+    /// Namespaces of a multi-namespace app ([`CatalogApplication::multi_namespace_placement`]);
+    /// empty for single-namespace apps.
+    multi_namespaces: Vec<String>,
     depends_on: Vec<FluxDependencyRef>,
     extra_labels: std::collections::BTreeMap<String, String>,
 }
@@ -572,9 +575,15 @@ fn build_flux_manifest_app_files(
     input: FluxManifestAppLayoutInput<'_>,
 ) -> Result<FluxManifestAppFiles, ServerError> {
     let remote = input.kube_config.is_some();
+    // A multi-namespace app (`spec.placement.additionalNamespaces`, remote only) names every
+    // object's namespace itself: no `targetNamespace` (it would collapse them into one), and all
+    // of its namespaces are created first.
+    let multi_namespace = remote && !input.multi_namespaces.is_empty();
     // Remote apps always pin a target namespace (default: the tenant namespace) and create it
     // first, like remote canaries: nothing else creates it on the workload cluster.
-    let target_namespace = if remote {
+    let target_namespace = if multi_namespace {
+        None
+    } else if remote {
         Some(
             input
                 .target_namespace
@@ -600,11 +609,25 @@ fn build_flux_manifest_app_files(
 
     let mut files = Vec::new();
     let mut app_resources = Vec::new();
-    if let (true, Some(ns)) = (remote, target_namespace.as_deref()) {
-        files.push((
-            "namespace.yaml".to_string(),
-            synthesize_remote_target_namespace_yaml(input.tenant, ns)?,
-        ));
+    let remote_namespaces: Vec<&str> = if multi_namespace {
+        input.multi_namespaces.iter().map(String::as_str).collect()
+    } else if remote {
+        target_namespace.as_deref().into_iter().collect()
+    } else {
+        Vec::new()
+    };
+    if !remote_namespaces.is_empty() {
+        let mut namespace_yaml = String::new();
+        for ns in &remote_namespaces {
+            if !namespace_yaml.is_empty() {
+                namespace_yaml.push_str("---\n");
+            }
+            namespace_yaml.push_str(&synthesize_remote_target_namespace_yaml(input.tenant, ns)?);
+            if !namespace_yaml.ends_with('\n') {
+                namespace_yaml.push('\n');
+            }
+        }
+        files.push(("namespace.yaml".to_string(), namespace_yaml));
         app_resources.push("namespace.yaml");
     }
     files.push((
@@ -938,6 +961,73 @@ async fn ensure_flux_kustomization_names_unclaimed(
                 return Err(ServerError::Conflict(format!(
                     "Flux Kustomization '{name}' already exists in tenant '{tenant}' ('{owner}'); \
                      choose another instance name"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Rejects a second instance of the `scope: cluster` manifest app `catalog_id` on the workload
+/// cluster behind the tenant's kubeconfig Secret `kube_config_secret`: another committed Flux app
+/// `Kustomization` of `tenant` (outside `own_rel_dir`, the instance being created/edited) with the
+/// same `keel.io/catalog-id` label and `spec.kubeConfig.secretRef.name` gives `409`. Such apps
+/// ship fixed-name cluster-wide objects (`ClusterRole`s, admission policies, a fixed-name
+/// `Secret`), so two instances would overwrite each other and deleting either would prune the
+/// other's objects. The kubeconfig Secret name identifies the cluster only within one tenant
+/// (another tenant's Secret of the same name may point elsewhere), so other tenants are not
+/// checked.
+async fn ensure_cluster_scoped_manifest_app_not_installed(
+    repo_workdir: &Path,
+    tenant: &str,
+    own_rel_dir: &str,
+    catalog_id: &str,
+    kube_config_secret: &str,
+) -> Result<(), ServerError> {
+    let own_dir = repo_workdir.join(own_rel_dir);
+    let mut stack = vec![repo_workdir.join("tenants").join(tenant)];
+    while let Some(dir) = stack.pop() {
+        let Ok(mut entries) = tokio::fs::read_dir(&dir).await else {
+            continue;
+        };
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let path = entry.path();
+            let Ok(file_type) = entry.file_type().await else {
+                continue;
+            };
+            if file_type.is_dir() {
+                if path != own_dir {
+                    stack.push(path);
+                }
+                continue;
+            }
+            if !file_type.is_file() || entry.file_name() != "flux-kustomization.yaml" {
+                continue;
+            }
+            let Ok(raw) = tokio::fs::read_to_string(&path).await else {
+                continue;
+            };
+            let Ok(doc) = serde_yml::from_str::<Value>(&raw) else {
+                continue;
+            };
+            let same_app = doc
+                .pointer("/metadata/labels/keel.io~1catalog-id")
+                .and_then(Value::as_str)
+                == Some(catalog_id);
+            let same_cluster = doc
+                .pointer("/spec/kubeConfig/secretRef/name")
+                .and_then(Value::as_str)
+                == Some(kube_config_secret);
+            if same_app && same_cluster {
+                let owner = path
+                    .parent()
+                    .and_then(|p| p.strip_prefix(repo_workdir).ok())
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default();
+                return Err(ServerError::Conflict(format!(
+                    "Catalog application '{catalog_id}' installs cluster-wide objects and is \
+                     already installed on target cluster '{kube_config_secret}' by '{owner}'; \
+                     install it once per cluster (edit that instance instead)"
                 )));
             }
         }
@@ -1702,6 +1792,17 @@ pub async fn create_proposal(
             req.catalog_id
         )));
     }
+    // Multi-namespace manifest apps rely on the Flux layout (namespaces created first, no
+    // `targetNamespace`); the Pulumi manifest Stack has no such path.
+    if let CatalogManifest::Application(app) = &manifest
+        && manifest_engine == Some(ManifestEngine::Pulumi)
+        && !app.multi_namespace_placement().is_empty()
+    {
+        return Err(ServerError::BadRequest(format!(
+            "Catalog application '{}' spans several namespaces (spec.placement.additionalNamespaces), which only the flux engine supports",
+            req.catalog_id
+        )));
+    }
     let values_yaml = render_helm_values_yaml(&partitioned.normal_values)?;
     let plaintext_secrets_yaml = match partitioned.secret_values.as_object() {
         Some(obj) if !obj.is_empty() => Some(render_helm_values_yaml(&partitioned.secret_values)?),
@@ -1815,6 +1916,20 @@ pub async fn create_proposal(
             let remote_kc = remote_target_cluster(req.target_cluster.as_deref())
                 .map(|t| RemoteKubeConfigRef::with_key(t, "kubeconfig"));
             ensure_rendered_manifest_placement(&app.metadata.id, &rendered, remote_kc.is_some())?;
+            app.ensure_manifest_namespaces(&rendered)
+                .map_err(|e| ServerError::BadRequest(e.to_string()))?;
+            if let Some(kc) = &remote_kc
+                && app.spec.placement.requires_remote_cluster()
+            {
+                ensure_cluster_scoped_manifest_app_not_installed(
+                    &state.repo_workdir,
+                    &req.tenant,
+                    &rel_dir,
+                    &app.metadata.id,
+                    &kc.secret_name,
+                )
+                .await?;
+            }
             let remote_ns = if let Some(target_ns) = req
                 .target_namespace
                 .as_deref()
@@ -1860,6 +1975,7 @@ pub async fn create_proposal(
                         encrypted_secret_yaml: encrypted_infra_k8s_secret_yaml.as_deref(),
                         kube_config: remote_kc.clone(),
                         target_namespace: remote_ns.clone(),
+                        multi_namespaces: app.multi_namespace_placement(),
                         depends_on,
                         extra_labels: labels,
                     })?;
@@ -3183,6 +3299,21 @@ async fn create_bundle_proposal(
                         &rendered,
                         item_kube_config.is_some(),
                     )?;
+                    app.ensure_manifest_namespaces(&rendered).map_err(|e| {
+                        ServerError::BadRequest(format!("Bundle item '{}': {e}", item.id))
+                    })?;
+                    if let Some(kc) = &item_kube_config
+                        && app.spec.placement.requires_remote_cluster()
+                    {
+                        ensure_cluster_scoped_manifest_app_not_installed(
+                            &state.repo_workdir,
+                            &req.tenant,
+                            &bundle_rel_dir,
+                            &app.metadata.id,
+                            &kc.secret_name,
+                        )
+                        .await?;
+                    }
                     let encrypted_secret = resolve_manifest_app_secret(
                         &state,
                         &req.tenant,
@@ -3208,6 +3339,7 @@ async fn create_bundle_proposal(
                         encrypted_secret_yaml: encrypted_secret.as_deref(),
                         kube_config: item_kube_config,
                         target_namespace: item_target_namespace.clone(),
+                        multi_namespaces: app.multi_namespace_placement(),
                         depends_on: item
                             .depends_on
                             .iter()

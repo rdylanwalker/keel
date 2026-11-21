@@ -14,6 +14,7 @@
 # Catalog & Blueprints
 
 - [Catalog Overview](catalog/overview.md)
+- [Keel Control Plane for a Workload Cluster](catalog/keel-server.md)
 - [Provider Blueprint Examples](catalog/provider-examples.md)
 
 # Operations

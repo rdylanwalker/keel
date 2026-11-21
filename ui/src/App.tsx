@@ -11,7 +11,7 @@ import {
   startOidcLogin,
 } from "./lib/api"
 import { isDemoMode } from "./lib/utils"
-import { ADMIN_AUTHZ, buildAuthz } from "./lib/authz"
+import { ADMIN_AUTHZ, buildAuthz, deriveTenantLabel } from "./lib/authz"
 import { AuthzProvider } from "./lib/authz-context"
 import {
   ActiveTab,
@@ -200,18 +200,10 @@ export const App: React.FC = () => {
   const activeSelectedTenant =
     authStatus.authenticated || demo ? selectedTenant : ""
 
-  const derivedTenantLabel = (() => {
-    if (visibleTenants.length === 1) return visibleTenants[0].namespace
-    const groupTenant = authStatus.groups?.find(
-      (g) => !["keel-admins", "admin", "admins"].includes(g)
-    )
-    if (groupTenant) {
-      return groupTenant.startsWith("tenant-")
-        ? groupTenant
-        : `tenant-${groupTenant}`
-    }
-    return authStatus.tenant || "—"
-  })()
+  const derivedTenantLabel = deriveTenantLabel(
+    visibleTenants.map((t) => t.namespace),
+    authStatus
+  )
 
   const showTenantSwitcher = visibleTenants.length > 1 || authz.isAdmin
   const userDisplayLabel =

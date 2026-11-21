@@ -51,7 +51,7 @@
     [
       "@semantic-release/exec",
       {
-        "prepareCmd": "cargo set-version ${nextRelease.version} && cargo update --workspace && cargo metadata --locked --format-version 1 > /dev/null && npm --prefix ui version ${nextRelease.version} --no-git-tag-version && sed -i -E -e 's#^( +(newTag|version): )\"[^\"]*\"#\\1\"${nextRelease.version}\"#' -e 's#(ghcr\\.io/rdylanwalker/keel:)[0-9A-Za-z._-]+#\\1${nextRelease.version}#' deploy/bootstrap/keel-server/kustomization.yaml deploy/bootstrap/keel-server/deployment.yaml deploy/seed/core-addons/keel-server.yaml deploy/catalog/core/keel-server/catalog.yaml"
+        "prepareCmd": "cargo set-version ${nextRelease.version} && cargo update --workspace && cargo metadata --locked --format-version 1 > /dev/null && npm --prefix ui version ${nextRelease.version} --no-git-tag-version && sed -i -E -e 's#^( +(newTag|version): )\"[^\"]*\"#\\1\"${nextRelease.version}\"#' -e 's#(ghcr\\.io/rdylanwalker/keel:)[0-9A-Za-z._-]+#\\1${nextRelease.version}#' deploy/bootstrap/keel-server/kustomization.yaml deploy/bootstrap/keel-server/deployment.yaml deploy/seed/core-addons/keel-server.yaml deploy/catalog/core/keel-server/catalog.yaml deploy/catalog/apps/keel-server/catalog.yaml deploy/catalog/apps/keel-server/manifests.yaml"
       }
     ],
     [
@@ -65,7 +65,9 @@
           "deploy/bootstrap/keel-server/kustomization.yaml",
           "deploy/bootstrap/keel-server/deployment.yaml",
           "deploy/seed/core-addons/keel-server.yaml",
-          "deploy/catalog/core/keel-server/catalog.yaml"
+          "deploy/catalog/core/keel-server/catalog.yaml",
+          "deploy/catalog/apps/keel-server/catalog.yaml",
+          "deploy/catalog/apps/keel-server/manifests.yaml"
         ],
         "message": "chore(release): ${nextRelease.version} [skip ci]\n\n${nextRelease.notes}"
       }

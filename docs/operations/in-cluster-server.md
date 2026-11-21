@@ -32,6 +32,10 @@ configMapGenerator:
 
 Inside a pod (`KUBERNETES_SERVICE_HOST` set), the laptop-only automatic port-forwards to Forgejo and Envoy Gateway are skipped, because the in-cluster Service DNS resolves directly.
 
+### OIDC and Admin Group Overrides
+
+By default the server reads its OIDC client from the `oidc` block of the served repository's `.keel/config.yaml`. The environment variables `KEEL_OIDC_ISSUER_URL`, `KEEL_OIDC_CLIENT_ID` and `KEEL_OIDC_REDIRECT_URL` override that block field by field, `KEEL_OIDC_CLIENT_SECRET` makes the server a confidential client, and `KEEL_ADMIN_GROUPS` adds comma-separated IdP admin groups to `keel-admins` / `admin` / `admins`. The [`keel-server` catalog app](../catalog/keel-server.md) uses them to run a separate Keel for a team on a workload cluster.
+
 ## Flux-Managed Add-on
 
 ```bash

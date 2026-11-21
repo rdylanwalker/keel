@@ -3,6 +3,7 @@ import {
   ADMIN_AUTHZ,
   ANONYMOUS_AUTHZ,
   buildAuthz,
+  deriveTenantLabel,
   tenantIdFromNamespace,
 } from "./authz"
 
@@ -69,5 +70,47 @@ describe("buildAuthz (mirror of server AuthSession)", () => {
     expect(tenantIdFromNamespace("tenant-acme")).toBe("acme")
     expect(tenantIdFromNamespace(" acme ")).toBe("acme")
     expect(tenantIdFromNamespace(undefined)).toBe("")
+  })
+})
+
+describe("deriveTenantLabel", () => {
+  const oidc = { authenticated: true, phase: "oidc-active" } as const
+
+  it("uses the only visible tenant", () => {
+    expect(
+      deriveTenantLabel(["tenant-acme"], {
+        ...oidc,
+        groups: ["tenant-other"],
+      })
+    ).toBe("tenant-acme")
+  })
+
+  it("never treats an admin's custom admin group (KEEL_ADMIN_GROUPS) as a tenant", () => {
+    expect(
+      deriveTenantLabel(["tenant-a", "tenant-b"], {
+        ...oidc,
+        isAdmin: true,
+        groups: ["team-a-platform"],
+      })
+    ).toBe("—")
+    expect(
+      deriveTenantLabel([], {
+        ...oidc,
+        isAdmin: true,
+        groups: ["team-a-platform", "tenant-a"],
+        tenant: "tenant-a",
+      })
+    ).toBe("tenant-a")
+  })
+
+  it("derives the tenant from tenant groups only", () => {
+    expect(
+      deriveTenantLabel([], { ...oidc, groups: ["devs", "tenant-acme"] })
+    ).toBe("tenant-acme")
+    expect(
+      deriveTenantLabel([], { ...oidc, groups: ["tenant-acme-admin"] })
+    ).toBe("tenant-acme")
+    expect(deriveTenantLabel([], { ...oidc, groups: ["devs"] })).toBe("—")
+    expect(deriveTenantLabel([], null)).toBe("—")
   })
 })

@@ -43,6 +43,31 @@ export function buildAuthz(status: AuthStatus | null | undefined): Authz {
   return { authenticated, isAdmin, canAdminTenant, canAccessTenant }
 }
 
+/**
+ * Tenant namespace shown in the header when no tenant switcher is needed: the only visible
+ * tenant, otherwise the caller's first `tenant-<id>` / `tenant-<id>-admin` group (bare ids are not
+ * honored, matching the server). Cluster admins' groups are never treated as tenants, including
+ * extra admin groups (`KEEL_ADMIN_GROUPS`) that only show up in the server-computed `isAdmin`.
+ */
+export function deriveTenantLabel(
+  visibleTenantNamespaces: string[],
+  status: AuthStatus | null | undefined
+): string {
+  if (visibleTenantNamespaces.length === 1) return visibleTenantNamespaces[0]
+  if (!buildAuthz(status).isAdmin) {
+    const group = (status?.groups ?? []).find(
+      (g) => g.startsWith("tenant-") && g.length > "tenant-".length
+    )
+    if (group) {
+      const ns = group.endsWith("-admin")
+        ? group.slice(0, -"-admin".length)
+        : group
+      if (ns.length > "tenant-".length) return ns
+    }
+  }
+  return status?.tenant || "—"
+}
+
 /** Fully-privileged authz used for demo mode and as the test default. */
 export const ADMIN_AUTHZ: Authz = buildAuthz({
   authenticated: true,

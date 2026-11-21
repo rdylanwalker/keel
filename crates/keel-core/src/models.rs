@@ -408,6 +408,88 @@ pub struct OidcConfig {
     pub scopes: Vec<String>,
 }
 
+/// Environment variables that override the `.keel/config.yaml` `oidc` block of `keel serve`
+/// (e.g. a catalog-installed keel-server whose OIDC client is configured in its Deployment rather
+/// than in the GitOps repository it serves). The client secret (`KEEL_OIDC_CLIENT_SECRET`) is
+/// deliberately not part of [`OidcConfig`] (never serialized into Git); `keel serve` reads it
+/// separately.
+pub const OIDC_ISSUER_URL_ENV: &str = "KEEL_OIDC_ISSUER_URL";
+/// See [`OIDC_ISSUER_URL_ENV`].
+pub const OIDC_CLIENT_ID_ENV: &str = "KEEL_OIDC_CLIENT_ID";
+/// See [`OIDC_ISSUER_URL_ENV`].
+pub const OIDC_REDIRECT_URL_ENV: &str = "KEEL_OIDC_REDIRECT_URL";
+/// Confidential-client secret sent on the OIDC token exchange (`client_secret_post`).
+pub const OIDC_CLIENT_SECRET_ENV: &str = "KEEL_OIDC_CLIENT_SECRET";
+
+impl OidcConfig {
+    /// Applies the `KEEL_OIDC_*` environment overrides ([`OIDC_ISSUER_URL_ENV`],
+    /// [`OIDC_CLIENT_ID_ENV`], [`OIDC_REDIRECT_URL_ENV`]) on top of the repository `oidc` block.
+    ///
+    /// Blank variables are ignored. Without any override `base` is returned unchanged. With at
+    /// least one, the result is an enabled config whose issuer, client id and redirect URL come
+    /// from the environment or (field by field) from `base`; all three must then be non-empty
+    /// `http(s)` URLs / ids, otherwise a validation error is returned (fail closed at startup
+    /// instead of silently serving without login).
+    pub fn with_env_overrides(
+        base: Option<Self>,
+        get: impl Fn(&str) -> Option<String>,
+    ) -> Result<Option<Self>, CoreError> {
+        let var = |name: &str| {
+            get(name)
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        };
+        let issuer = var(OIDC_ISSUER_URL_ENV);
+        let client_id = var(OIDC_CLIENT_ID_ENV);
+        let redirect = var(OIDC_REDIRECT_URL_ENV);
+        if issuer.is_none() && client_id.is_none() && redirect.is_none() {
+            return Ok(base);
+        }
+        let base_ref = base.as_ref();
+        let pick = |over: Option<String>, from_base: Option<&String>| {
+            over.or_else(|| from_base.filter(|v| !v.trim().is_empty()).cloned())
+        };
+        let issuer_url = pick(issuer, base_ref.map(|b| &b.issuer_url));
+        let client_id = pick(client_id, base_ref.map(|b| &b.client_id));
+        let redirect_url = pick(redirect, base_ref.map(|b| &b.redirect_url));
+        let (Some(issuer_url), Some(client_id), Some(redirect_url)) =
+            (issuer_url, client_id, redirect_url)
+        else {
+            return Err(CoreError::Validation(format!(
+                "OIDC environment overrides need an issuer URL, client id and redirect URL \
+                 ({OIDC_ISSUER_URL_ENV}, {OIDC_CLIENT_ID_ENV}, {OIDC_REDIRECT_URL_ENV}, or the \
+                 .keel/config.yaml oidc block)"
+            )));
+        };
+        for (name, url) in [
+            (OIDC_ISSUER_URL_ENV, &issuer_url),
+            (OIDC_REDIRECT_URL_ENV, &redirect_url),
+        ] {
+            let valid = url
+                .strip_prefix("https://")
+                .or_else(|| url.strip_prefix("http://"))
+                .and_then(|rest| rest.split(['/', '?', '#']).next())
+                .is_some_and(|authority| {
+                    !authority.is_empty()
+                        && !authority.contains('@')
+                        && !url.chars().any(char::is_whitespace)
+                });
+            if !valid {
+                return Err(CoreError::Validation(format!(
+                    "{name} must be an absolute http(s) URL"
+                )));
+            }
+        }
+        Ok(Some(Self {
+            enabled: true,
+            issuer_url: issuer_url.trim_end_matches('/').to_string(),
+            client_id,
+            redirect_url,
+            scopes: base.map(|b| b.scopes).unwrap_or_else(default_oidc_scopes),
+        }))
+    }
+}
+
 fn default_oidc_scopes() -> Vec<String> {
     vec![
         "openid".to_string(),
@@ -1090,6 +1172,13 @@ pub struct PlacementSpec {
     /// webhook namespace exclusions would affect the tenant's other apps).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub namespace: Option<String>,
+    /// Further namespaces a `runtime: manifest` app with a dedicated [`Self::namespace`] spans on
+    /// the remote workload cluster (e.g. keel-server's `keel-previews` and `flux-system` Roles).
+    /// Keel then does not force a Flux `targetNamespace` (which would collapse every object into
+    /// one namespace): instead every namespaced object of the rendered manifests must name one of
+    /// `namespace` + `additionalNamespaces` explicitly, and Keel creates all of them first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub additional_namespaces: Vec<String>,
 }
 
 impl PlacementSpec {
@@ -1414,6 +1503,36 @@ impl CatalogApplication {
                 )));
             }
         }
+        let extra = &self.spec.placement.additional_namespaces;
+        if !extra.is_empty() {
+            let Some(primary) = self.spec.placement.namespace.as_deref() else {
+                return Err(CoreError::Validation(
+                    "spec.placement.additionalNamespaces requires spec.placement.namespace"
+                        .to_string(),
+                ));
+            };
+            if self.metadata.runtime != AppRuntime::Manifest {
+                return Err(CoreError::Validation(
+                    "spec.placement.additionalNamespaces is only supported for runtime: manifest \
+                     (a HelmRelease installs into a single namespace)"
+                        .to_string(),
+                ));
+            }
+            for (i, ns) in extra.iter().enumerate() {
+                validate_dns_label(ns, "spec.placement.additionalNamespaces[]")?;
+                if ns.starts_with("tenant-") {
+                    return Err(CoreError::Validation(format!(
+                        "spec.placement.additionalNamespaces entry '{ns}' must be a dedicated \
+                         namespace, not a tenant namespace"
+                    )));
+                }
+                if ns == primary || extra[..i].contains(ns) {
+                    return Err(CoreError::Validation(format!(
+                        "spec.placement.additionalNamespaces entry '{ns}' is listed twice"
+                    )));
+                }
+            }
+        }
         if (!self.spec.gateway_routes.is_empty()
             || self.spec.network_policy.is_some()
             || self.spec.locked_values.is_some()
@@ -1510,6 +1629,45 @@ impl CatalogApplication {
                 self.metadata.id
             ))),
         }
+    }
+
+    /// Namespaces a multi-namespace manifest app (`spec.placement.additionalNamespaces`) spans on
+    /// the remote cluster: the dedicated namespace first, then the additional ones. Empty for
+    /// every other app (whose Flux `Kustomization` pins a single `targetNamespace`).
+    pub fn multi_namespace_placement(&self) -> Vec<String> {
+        match self.spec.placement.namespace.as_deref() {
+            Some(primary) if !self.spec.placement.additional_namespaces.is_empty() => {
+                std::iter::once(primary.to_string())
+                    .chain(self.spec.placement.additional_namespaces.iter().cloned())
+                    .collect()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// For a multi-namespace manifest app ([`Self::multi_namespace_placement`]), rejects rendered
+    /// manifests with a namespaced object (any kind outside
+    /// [`crate::catalog::CLUSTER_SCOPED_KINDS`]) that does not name one of the placement
+    /// namespaces in `metadata.namespace`: without a Flux `targetNamespace` such an object would
+    /// land in an arbitrary namespace of the workload cluster. A no-op for other apps.
+    pub fn ensure_manifest_namespaces(&self, rendered_yaml: &str) -> Result<(), CoreError> {
+        let allowed = self.multi_namespace_placement();
+        if allowed.is_empty() {
+            return Ok(());
+        }
+        let offenders =
+            crate::catalog::manifest_objects_outside_namespaces(rendered_yaml, &allowed);
+        if offenders.is_empty() {
+            return Ok(());
+        }
+        Err(CoreError::Validation(format!(
+            "Catalog application '{}' spans the namespaces {} (spec.placement.namespace + \
+             additionalNamespaces), so every namespaced object must set one of them as \
+             metadata.namespace; offending objects: {}",
+            self.metadata.id,
+            allowed.join(", "),
+            offenders.join(", ")
+        )))
     }
 
     /// Rejects a `scope: namespaced` `runtime: manifest` app whose manifests declare well-known
@@ -2418,6 +2576,99 @@ pub fn resolve_ssh_target_from_sources(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_oidc_env_overrides() {
+        fn env<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+            move |name: &str| {
+                pairs
+                    .iter()
+                    .find(|(k, _)| *k == name)
+                    .map(|(_, v)| v.to_string())
+            }
+        }
+        let base = OidcConfig {
+            enabled: true,
+            issuer_url: "https://idp.keel.local:8888/auth/v1".to_string(),
+            client_id: "keel-server".to_string(),
+            redirect_url: "https://keel.keel.local:8888/api/v1/auth/callback".to_string(),
+            scopes: vec!["openid".to_string()],
+        };
+        // No (or only blank) overrides: unchanged, including "no OIDC at all".
+        assert_eq!(
+            OidcConfig::with_env_overrides(Some(base.clone()), env(&[])).unwrap(),
+            Some(base.clone())
+        );
+        assert_eq!(
+            OidcConfig::with_env_overrides(None, env(&[(OIDC_CLIENT_ID_ENV, "  ")])).unwrap(),
+            None
+        );
+
+        // Full override without a repository block (catalog-installed keel-server).
+        let full = OidcConfig::with_env_overrides(
+            None,
+            env(&[
+                (
+                    OIDC_ISSUER_URL_ENV,
+                    " https://login.team-a.example/realms/a/ ",
+                ),
+                (OIDC_CLIENT_ID_ENV, "team-a-keel"),
+                (
+                    OIDC_REDIRECT_URL_ENV,
+                    "https://keel.team-a.example/api/v1/auth/callback",
+                ),
+                // Never part of the config (read separately by `keel serve`).
+                (OIDC_CLIENT_SECRET_ENV, "s3cr3t"),
+            ]),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(full.enabled);
+        assert_eq!(full.issuer_url, "https://login.team-a.example/realms/a");
+        assert_eq!(full.client_id, "team-a-keel");
+        assert_eq!(full.scopes, default_oidc_scopes());
+        assert!(!serde_yml::to_string(&full).unwrap().contains("s3cr3t"));
+
+        // Partial override merges field by field with the repository block.
+        let merged = OidcConfig::with_env_overrides(
+            Some(OidcConfig {
+                enabled: false,
+                ..base.clone()
+            }),
+            env(&[(OIDC_CLIENT_ID_ENV, "other")]),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(merged.enabled);
+        assert_eq!(merged.client_id, "other");
+        assert_eq!(merged.issuer_url, base.issuer_url);
+        assert_eq!(merged.scopes, base.scopes);
+
+        // Incomplete or malformed overrides fail closed.
+        for pairs in [
+            &[(OIDC_ISSUER_URL_ENV, "https://idp.example")][..],
+            &[
+                (OIDC_ISSUER_URL_ENV, "idp.example"),
+                (OIDC_CLIENT_ID_ENV, "c"),
+                (OIDC_REDIRECT_URL_ENV, "https://keel.example/cb"),
+            ][..],
+            &[
+                (OIDC_ISSUER_URL_ENV, "https://user@idp.example"),
+                (OIDC_CLIENT_ID_ENV, "c"),
+                (OIDC_REDIRECT_URL_ENV, "https://keel.example/cb"),
+            ][..],
+            &[
+                (OIDC_ISSUER_URL_ENV, "https://idp.example"),
+                (OIDC_CLIENT_ID_ENV, "c"),
+                (OIDC_REDIRECT_URL_ENV, "ftp://keel.example/cb"),
+            ][..],
+        ] {
+            assert!(
+                OidcConfig::with_env_overrides(None, env(pairs)).is_err(),
+                "{pairs:?}"
+            );
+        }
+    }
 
     #[test]
     fn test_bootstrap_target_kind_roundtrip_and_traits() {
