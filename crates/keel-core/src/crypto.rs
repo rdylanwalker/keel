@@ -26,6 +26,10 @@ pub const AES_GCM_NONCE_LEN: usize = 12;
 /// AES-GCM authentication tag length in bytes.
 pub const AES_GCM_TAG_LEN: usize = 16;
 
+/// SOPS `encrypted_regex` for Kubernetes `Secret` manifests consumed by Flux: only `data` and
+/// `stringData` are encrypted so kustomize can still read and transform `metadata`.
+pub const K8S_SECRET_ENCRYPTED_REGEX: &str = "^(data|stringData)$";
+
 /// Computes the lowercase hexadecimal SHA-256 digest of `data`.
 pub fn sha256_hex(data: &[u8]) -> String {
     let digest = Sha256::digest(data);
@@ -502,6 +506,43 @@ impl SopsManager {
         self.encrypt_file(age_public_key, temp.path(), None).await
     }
 
+    /// Encrypts an in-memory Kubernetes `Secret` manifest for Flux, leaving `apiVersion`, `kind`
+    /// and `metadata` in plaintext.
+    ///
+    /// kustomize-controller runs kustomize transformers (e.g. a Flux `Kustomization`'s
+    /// `targetNamespace`) **before** SOPS decryption, so an encrypted `metadata.namespace` is
+    /// overwritten with plaintext and decryption fails ("does not match sops' data format").
+    /// Only `data`/`stringData` are encrypted, and the MAC covers encrypted values only, so
+    /// metadata transforms cannot break integrity verification.
+    pub async fn encrypt_k8s_secret_yaml(
+        &self,
+        age_public_key: &str,
+        plaintext_secret_yaml: &str,
+    ) -> Result<String, CoreError> {
+        let temp = ScopedTempFile::create(plaintext_secret_yaml).await?;
+        let args = Self::build_k8s_secret_encrypt_args(age_public_key, temp.path())?;
+        self.run_sops(&args, None).await
+    }
+
+    /// `sops --encrypt` arguments for a Kubernetes `Secret` manifest (see
+    /// [`Self::encrypt_k8s_secret_yaml`]).
+    pub fn build_k8s_secret_encrypt_args(
+        age_public_key: &str,
+        target_file: &Path,
+    ) -> Result<Vec<String>, CoreError> {
+        let mut args = Self::build_encrypt_args(age_public_key, target_file, None)?;
+        let file = args.pop().ok_or_else(|| {
+            CoreError::Crypto("sops encrypt arguments are missing the target file".to_string())
+        })?;
+        args.extend([
+            "--encrypted-regex".to_string(),
+            K8S_SECRET_ENCRYPTED_REGEX.to_string(),
+            "--mac-only-encrypted".to_string(),
+            file,
+        ]);
+        Ok(args)
+    }
+
     /// Decrypts an in-memory SOPS-encrypted YAML string using `age_secret_key`.
     pub async fn decrypt_yaml(
         &self,
@@ -519,7 +560,11 @@ impl SopsManager {
     ) -> Result<String, CoreError> {
         let program_label = self.sops_bin.display().to_string();
         let mut cmd = Command::new(&self.sops_bin);
+        // Run from the temp dir that holds the scoped input file: sops walks up from its working
+        // directory looking for `.sops.yaml`, and an unrelated config there (e.g. the GitOps
+        // checkout keel-server was started in) fails with "no matching creation rules found".
         cmd.args(args)
+            .current_dir(std::env::temp_dir())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -928,6 +973,64 @@ mod tests {
         let orig_val: serde_json::Value = serde_yml::from_str(plaintext).unwrap();
         let dec_val: serde_json::Value = serde_yml::from_str(&decrypted).unwrap();
         assert_eq!(orig_val, dec_val);
+    }
+
+    #[test]
+    fn k8s_secret_encrypt_args_keep_metadata_plaintext() {
+        let pk = "age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p";
+        let args =
+            SopsManager::build_k8s_secret_encrypt_args(pk, Path::new("tenants/acme/s.enc.yaml"))
+                .unwrap();
+        let pos = |flag: &str| args.iter().position(|a| a == flag).unwrap();
+        assert_eq!(
+            args[pos("--encrypted-regex") + 1],
+            K8S_SECRET_ENCRYPTED_REGEX
+        );
+        assert!(args.contains(&"--mac-only-encrypted".to_string()));
+        // The target file stays last so sops never treats a flag as the input path.
+        assert_eq!(args.last().unwrap(), "tenants/acme/s.enc.yaml");
+    }
+
+    #[tokio::test]
+    async fn test_real_k8s_secret_encryption_survives_metadata_transform() {
+        let (Some(local_sops), Some(local_keygen)) =
+            (find_on_path("sops"), find_on_path("age-keygen"))
+        else {
+            assert!(
+                std::env::var_os("KEEL_REQUIRE_SOPS").is_none(),
+                "KEEL_REQUIRE_SOPS=1 but `sops`/`age-keygen` are not on PATH"
+            );
+            eprintln!("SKIPPED test_real_k8s_secret_encryption_survives_metadata_transform");
+            return;
+        };
+        let manager = SopsManager::with_binaries(local_sops, local_keygen);
+        let keypair = manager.generate_age_keypair().await.unwrap();
+        let plaintext = "apiVersion: v1\nkind: Secret\nmetadata:\n  name: app-secrets\n  namespace: tenant-acme\n  labels:\n    app.kubernetes.io/managed-by: keel\ntype: Opaque\nstringData:\n  apiToken: s3cr3t-token-value\n";
+        let encrypted = manager
+            .encrypt_k8s_secret_yaml(&keypair.public_key, plaintext)
+            .await
+            .unwrap();
+        assert!(!encrypted.contains("s3cr3t-token-value"));
+        let doc: serde_json::Value = serde_yml::from_str(&encrypted).unwrap();
+        assert_eq!(doc["kind"], "Secret");
+        assert_eq!(doc["metadata"]["name"], "app-secrets");
+        assert_eq!(doc["metadata"]["namespace"], "tenant-acme");
+
+        // Simulate kustomize transformers (targetNamespace / common labels) running before
+        // Flux decrypts: decryption must still succeed.
+        let transformed = encrypted
+            .replace("namespace: tenant-acme", "namespace: tenant-other")
+            .replace(
+                "app.kubernetes.io/managed-by: keel",
+                "app.kubernetes.io/managed-by: flux",
+            );
+        let decrypted = manager
+            .decrypt_yaml(keypair.secret_key(), &transformed)
+            .await
+            .unwrap();
+        let dec: serde_json::Value = serde_yml::from_str(&decrypted).unwrap();
+        assert_eq!(dec["stringData"]["apiToken"], "s3cr3t-token-value");
+        assert_eq!(dec["metadata"]["namespace"], "tenant-other");
     }
 
     #[tokio::test]

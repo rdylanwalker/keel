@@ -1167,10 +1167,17 @@ async fn resolve_tenant_app_secret(
     }
     let mut merged = match stored {
         None if submitted.is_empty() => return Ok(None),
-        Some(stored) if submitted.is_empty() => {
+        Some(stored)
+            if submitted.is_empty() && secret_metadata_is_plaintext(&stored.ciphertext) =>
+        {
             return Ok(Some((stored.ciphertext.clone(), stored.keys.clone())));
         }
-        Some(stored) if !stored.keys.iter().all(|k| submitted.contains_key(k)) => {
+        // Legacy ciphertext (metadata encrypted, written before `encrypt_k8s_secret_yaml`) is
+        // re-encrypted on any edit: kustomize transforms metadata before Flux decrypts, which
+        // breaks fully encrypted `Secret`s in the split `<name>-config` Kustomization.
+        Some(stored)
+            if submitted.is_empty() || !stored.keys.iter().all(|k| submitted.contains_key(k)) =>
+        {
             decrypt_stored_secret_string_data(state, tenant, &stored.ciphertext).await?
         }
         _ => std::collections::BTreeMap::new(),
@@ -1192,9 +1199,31 @@ async fn resolve_tenant_app_secret(
     let (plain, _) = build_infra_secret_manifest_yaml(secret_name, tenant_ns, &merged_values)?;
     let recipients = tenant_sops_recipients(state, tenant).await?;
     Ok(Some((
-        SopsManager::new().encrypt_yaml(&recipients, &plain).await?,
+        SopsManager::new()
+            .encrypt_k8s_secret_yaml(&recipients, &plain)
+            .await?,
         keys,
     )))
+}
+
+/// `true` when a stored SOPS `Secret` keeps `kind`/`metadata.name` in plaintext and has a MAC over
+/// encrypted values only (written by `SopsManager::encrypt_k8s_secret_yaml`), i.e. it is safe to
+/// reuse verbatim under kustomize transformers. Legacy or partially hardened files return `false`.
+fn secret_metadata_is_plaintext(ciphertext: &str) -> bool {
+    serde_yml::from_str::<Value>(ciphertext).is_ok_and(|doc| {
+        // `--encrypted-regex` without `--mac-only-encrypted` still fails under kustomize
+        // metadata transforms (MAC mismatch), so both must be present.
+        doc.get("sops")
+            .and_then(|m| m.get("mac_only_encrypted"))
+            .and_then(Value::as_bool)
+            == Some(true)
+            && doc.get("kind").and_then(Value::as_str) == Some("Secret")
+            && doc
+                .get("metadata")
+                .and_then(|m| m.get("name"))
+                .and_then(Value::as_str)
+                .is_some_and(|n| !n.starts_with("ENC["))
+    })
 }
 
 /// Decrypts a stored manifest-app `Secret` (encrypted to the tenant `age` key) into its
@@ -1832,7 +1861,7 @@ pub async fn create_proposal(
                     &partitioned.secret_values,
                 )?;
                 let enc_k8s = sops
-                    .encrypt_yaml(&sops_recipients, &plain_k8s_secret)
+                    .encrypt_k8s_secret_yaml(&sops_recipients, &plain_k8s_secret)
                     .await?;
                 (Some(enc_k8s), keys)
             } else {
@@ -5068,6 +5097,18 @@ mod tests {
 
     fn files(paths: &[&str]) -> Vec<String> {
         paths.iter().map(|p| (*p).to_string()).collect()
+    }
+
+    #[test]
+    fn legacy_fully_encrypted_secrets_are_not_reused_verbatim() {
+        let partial = "apiVersion: v1\nkind: Secret\nmetadata:\n  name: app-secrets\n  namespace: tenant-acme\nstringData:\n  apiToken: ENC[AES256_GCM,data:abc,type:str]\nsops:\n  mac_only_encrypted: true\n";
+        // encrypted_regex alone (MAC over all values) still breaks under metadata transforms.
+        let regex_only = partial.replace("  mac_only_encrypted: true\n", "  encrypted_regex: x\n");
+        assert!(!secret_metadata_is_plaintext(&regex_only));
+        let legacy = "apiVersion: ENC[AES256_GCM,data:Vgk=,type:str]\nkind: ENC[AES256_GCM,data:l5N0,type:str]\nmetadata:\n  name: ENC[AES256_GCM,data:0Dx,type:str]\nstringData:\n  apiToken: ENC[AES256_GCM,data:abc,type:str]\n";
+        assert!(secret_metadata_is_plaintext(partial));
+        assert!(!secret_metadata_is_plaintext(legacy));
+        assert!(!secret_metadata_is_plaintext("not: [valid"));
     }
 
     #[test]
