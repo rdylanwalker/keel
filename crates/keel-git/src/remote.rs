@@ -9,7 +9,8 @@ use std::fmt;
 use std::time::Duration;
 
 use crate::forge::{
-    CreatePrRequest, ForgeError, ForgeProvider, PullRequestInfo, PullRequestState, matches_tenant,
+    CreatePrRequest, ForgeError, ForgeProvider, PullRequestInfo, PullRequestState,
+    RepositoryEnsureOutcome, matches_tenant, validate_commit_sha,
 };
 use crate::git::parse_proposal_branch_tenant;
 
@@ -192,6 +193,15 @@ async fn map_error_response(
 // Forgejo / Gitea Provider (REST API v1)
 // ============================================================================
 
+/// Credentials used by [`ForgejoGiteaProvider`].
+#[derive(Clone)]
+enum ForgejoAuth {
+    /// Personal access token (`Authorization: token <pat>`).
+    Token(String),
+    /// HTTP basic auth (used by Stage 0 before any access token has been minted).
+    Basic { username: String, password: String },
+}
+
 /// Forgejo / Gitea REST v1 [`ForgeProvider`] adapter (`/api/v1/repos/{owner}/{repo}/...`).
 #[derive(Clone)]
 pub struct ForgejoGiteaProvider {
@@ -199,7 +209,7 @@ pub struct ForgejoGiteaProvider {
     base_url: String,
     owner: String,
     repo: String,
-    token: String,
+    auth: ForgejoAuth,
 }
 
 impl fmt::Debug for ForgejoGiteaProvider {
@@ -208,7 +218,7 @@ impl fmt::Debug for ForgejoGiteaProvider {
             .field("base_url", &self.base_url)
             .field("owner", &self.owner)
             .field("repo", &self.repo)
-            .field("token", &"[REDACTED]")
+            .field("auth", &"[REDACTED]")
             .finish()
     }
 }
@@ -227,12 +237,45 @@ impl ForgejoGiteaProvider {
                 "Forgejo/Gitea token must not be empty".to_string(),
             ));
         }
+        Self::with_auth(base_url, owner, repo, ForgejoAuth::Token(token))
+    }
+
+    /// Creates a [`ForgejoGiteaProvider`] authenticating with HTTP basic auth (username +
+    /// password), e.g. the Stage 0 Forgejo admin before an access token exists.
+    pub fn with_basic_auth(
+        base_url: impl AsRef<str>,
+        owner: impl AsRef<str>,
+        repo: impl AsRef<str>,
+        username: impl Into<String>,
+        password: impl Into<String>,
+    ) -> Result<Self, ForgeError> {
+        let username = username.into();
+        let password = password.into();
+        if username.trim().is_empty() || password.is_empty() {
+            return Err(ForgeError::InvalidInput(
+                "Forgejo/Gitea basic auth username and password must not be empty".to_string(),
+            ));
+        }
+        Self::with_auth(
+            base_url,
+            owner,
+            repo,
+            ForgejoAuth::Basic { username, password },
+        )
+    }
+
+    fn with_auth(
+        base_url: impl AsRef<str>,
+        owner: impl AsRef<str>,
+        repo: impl AsRef<str>,
+        auth: ForgejoAuth,
+    ) -> Result<Self, ForgeError> {
         Ok(Self {
             client: build_http_client()?,
             base_url: normalize_base_url(base_url.as_ref())?,
             owner: validate_slug(owner.as_ref(), "owner")?,
             repo: validate_slug(repo.as_ref(), "repo")?,
-            token,
+            auth,
         })
     }
 
@@ -244,11 +287,57 @@ impl ForgejoGiteaProvider {
         )
     }
 
-    /// Builds an authenticated `reqwest::RequestBuilder` with Forgejo/Gitea token auth.
+    /// Mints a personal access token for the basic-auth user (`POST /api/v1/users/{user}/tokens`).
+    /// Forgejo/Gitea only accept basic auth on this endpoint, so token-authenticated providers
+    /// return [`ForgeError::InvalidInput`].
+    pub async fn create_access_token(
+        &self,
+        name: &str,
+        scopes: &[&str],
+    ) -> Result<String, ForgeError> {
+        let ForgejoAuth::Basic { username, .. } = &self.auth else {
+            return Err(ForgeError::InvalidInput(
+                "minting a Forgejo/Gitea access token requires basic auth".to_string(),
+            ));
+        };
+        if name.trim().is_empty() {
+            return Err(ForgeError::InvalidInput(
+                "access token name must not be empty".to_string(),
+            ));
+        }
+        let user = validate_slug(username, "username")?;
+        let resp = self
+            .authorized(
+                self.client
+                    .post(format!("{}/api/v1/users/{user}/tokens", self.base_url)),
+            )
+            .json(&serde_json::json!({ "name": name, "scopes": scopes }))
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(map_error_response(resp, Some("access token"), false).await);
+        }
+        let body: serde_json::Value = resp.json().await?;
+        body.get("sha1")
+            .or_else(|| body.get("token"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| ForgeError::Api {
+                status: 200,
+                message: "Forgejo access token response missing token field".to_string(),
+            })
+    }
+
+    /// Builds an authenticated `reqwest::RequestBuilder` with Forgejo/Gitea token (or basic) auth.
     pub fn authorized(&self, builder: RequestBuilder) -> RequestBuilder {
-        builder
-            .header("Authorization", format!("token {}", self.token))
-            .header("Accept", "application/json")
+        let builder = match &self.auth {
+            ForgejoAuth::Token(token) => builder.header("Authorization", format!("token {token}")),
+            ForgejoAuth::Basic { username, password } => {
+                builder.basic_auth(username, Some(password))
+            }
+        };
+        builder.header("Accept", "application/json")
     }
 }
 
@@ -264,6 +353,8 @@ struct GiteaCreatePrBody<'a> {
 struct GiteaMergeBody<'a> {
     #[serde(rename = "Do")]
     merge_style: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    head_commit_id: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -293,6 +384,44 @@ struct GiteaGitHubPrResponse {
     html_url: String,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
+    #[serde(default)]
+    merge_commit_sha: Option<String>,
+}
+
+/// Page size requested from forge list endpoints (GitHub/GitLab cap at 100, Gitea at its
+/// configured `MAX_RESPONSE_ITEMS`, default 50).
+const LIST_PAGE_SIZE: usize = 50;
+
+/// Hard cap on pages fetched per listing (`LIST_PAGE_SIZE * MAX_LIST_PAGES` PRs) so a huge or
+/// misbehaving forge cannot pin a request handler; truncation is logged.
+const MAX_LIST_PAGES: usize = 40;
+
+/// Returns `true` when an RFC 8288 `Link` header advertises a `rel="next"` page.
+fn link_header_has_next(headers: &reqwest::header::HeaderMap) -> bool {
+    headers
+        .get_all(reqwest::header::LINK)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .any(|part| {
+            part.split(';')
+                .skip(1)
+                .any(|p| matches!(p.trim(), "rel=\"next\"" | "rel=next"))
+        })
+}
+
+/// Decides whether another page must be fetched: an explicit `next` link wins; otherwise a full
+/// page implies more results (Gitea does not always emit `Link` headers).
+fn page_has_more(batch_len: usize, has_next_link: bool) -> bool {
+    batch_len > 0 && (has_next_link || batch_len >= LIST_PAGE_SIZE)
+}
+
+fn warn_list_truncated(what: &str, fetched: usize) {
+    tracing::warn!(
+        fetched,
+        max_pages = MAX_LIST_PAGES,
+        "Forge listing of {what} truncated at page cap; older entries are omitted"
+    );
 }
 
 fn rewrite_local_forge_url(base_url: &str, html_url: String) -> String {
@@ -339,6 +468,13 @@ impl GiteaGitHubPrResponse {
             updated_at: self.updated_at,
             comments: Vec::new(),
             diff_stat: None,
+            // GitHub reports a speculative test-merge SHA for open PRs; only trust it once merged.
+            merge_commit_sha: if state == PullRequestState::Merged {
+                self.merge_commit_sha.filter(|s| !s.trim().is_empty())
+            } else {
+                None
+            },
+            base_sha: None,
         }
     }
 }
@@ -426,25 +562,39 @@ async fn list_gitea_github_prs<F>(
     client: &Client,
     base_url: &str,
     repo_api_url: &str,
-    page_size_query: &str,
+    page_size_param: &str,
     authorize: F,
     tenant: Option<&str>,
     state: Option<PullRequestState>,
 ) -> Result<Vec<PullRequestInfo>, ForgeError>
 where
-    F: FnOnce(RequestBuilder) -> RequestBuilder,
+    F: Fn(RequestBuilder) -> RequestBuilder,
 {
     let state_param = match state {
         None => "all",
         Some(PullRequestState::Open) => "open",
         Some(PullRequestState::Closed | PullRequestState::Merged) => "closed",
     };
-    let url = format!("{repo_api_url}/pulls?state={state_param}&{page_size_query}");
-    let resp = authorize(client.get(&url)).send().await?;
-    if !resp.status().is_success() {
-        return Err(map_error_response(resp, None, false).await);
+    let mut items: Vec<GiteaGitHubPrResponse> = Vec::new();
+    for page in 1..=MAX_LIST_PAGES {
+        let url = format!(
+            "{repo_api_url}/pulls?state={state_param}&{page_size_param}={LIST_PAGE_SIZE}&page={page}"
+        );
+        let resp = authorize(client.get(&url)).send().await?;
+        if !resp.status().is_success() {
+            return Err(map_error_response(resp, None, false).await);
+        }
+        let has_next_link = link_header_has_next(resp.headers());
+        let batch: Vec<GiteaGitHubPrResponse> = resp.json().await?;
+        let batch_len = batch.len();
+        items.extend(batch);
+        if !page_has_more(batch_len, has_next_link) {
+            break;
+        }
+        if page == MAX_LIST_PAGES {
+            warn_list_truncated("pull requests", items.len());
+        }
     }
-    let items: Vec<GiteaGitHubPrResponse> = resp.json().await?;
     let prs = items
         .into_iter()
         .map(|item| item.into_pr_info(None, base_url))
@@ -475,6 +625,58 @@ where
         return Err(map_error_response(resp, Some(id), false).await);
     }
     get_gitea_github_pr(client, base_url, repo_api_url, authorize, id).await
+}
+
+/// Looks up `repo_url`: `Ok(true)` when it exists, `Ok(false)` on HTTP 404.
+async fn repository_exists<F>(
+    client: &Client,
+    repo_url: &str,
+    authorize: F,
+) -> Result<bool, ForgeError>
+where
+    F: Fn(RequestBuilder) -> RequestBuilder,
+{
+    let resp = authorize(client.get(repo_url)).send().await?;
+    if resp.status().is_success() {
+        return Ok(true);
+    }
+    if resp.status() == StatusCode::NOT_FOUND {
+        return Ok(false);
+    }
+    Err(map_error_response(resp, Some("repository"), false).await)
+}
+
+/// Creates a repository via the Gitea/GitHub "organization" endpoint, falling back to the
+/// authenticated user's endpoint when the owner is not an organization (HTTP 404). A 409
+/// (concurrent creation) is reported as [`RepositoryEnsureOutcome::Existed`].
+async fn create_gitea_github_repo<F>(
+    client: &Client,
+    org_url: &str,
+    user_url: &str,
+    body: &serde_json::Value,
+    authorize: F,
+) -> Result<RepositoryEnsureOutcome, ForgeError>
+where
+    F: Fn(RequestBuilder) -> RequestBuilder,
+{
+    let org = authorize(client.post(org_url)).json(body).send().await?;
+    if org.status().is_success() {
+        return Ok(RepositoryEnsureOutcome::Created);
+    }
+    if org.status() == StatusCode::CONFLICT {
+        return Ok(RepositoryEnsureOutcome::Existed);
+    }
+    if org.status() != StatusCode::NOT_FOUND {
+        return Err(map_error_response(org, Some("repository"), false).await);
+    }
+    let user = authorize(client.post(user_url)).json(body).send().await?;
+    if user.status().is_success() {
+        return Ok(RepositoryEnsureOutcome::Created);
+    }
+    if user.status() == StatusCode::CONFLICT {
+        return Ok(RepositoryEnsureOutcome::Existed);
+    }
+    Err(map_error_response(user, Some("repository"), false).await)
 }
 
 #[async_trait]
@@ -536,7 +738,7 @@ impl ForgeProvider for ForgejoGiteaProvider {
             &self.client,
             &self.base_url,
             &self.repo_api_url(),
-            "limit=50",
+            "limit",
             |b| self.authorized(b),
             tenant,
             state,
@@ -544,14 +746,20 @@ impl ForgeProvider for ForgejoGiteaProvider {
         .await
     }
 
-    async fn merge_pull_request(&self, pr_id: &str) -> Result<PullRequestInfo, ForgeError> {
+    async fn merge_pull_request(
+        &self,
+        pr_id: &str,
+        expected_head_sha: Option<&str>,
+    ) -> Result<PullRequestInfo, ForgeError> {
         let id = validate_pr_number(pr_id)?;
+        let head_commit_id = expected_head_sha.map(validate_commit_sha).transpose()?;
         let url = format!("{}/pulls/{id}/merge", self.repo_api_url());
         for attempt in 0..6 {
             let resp = self
                 .authorized(self.client.post(&url))
                 .json(&GiteaMergeBody {
                     merge_style: "merge",
+                    head_commit_id,
                 })
                 .send()
                 .await?;
@@ -591,6 +799,25 @@ impl ForgeProvider for ForgejoGiteaProvider {
             |b| self.authorized(b),
             pr_id,
             "open",
+        )
+        .await
+    }
+
+    async fn ensure_repository(
+        &self,
+        private: bool,
+    ) -> Result<RepositoryEnsureOutcome, ForgeError> {
+        let authorize = |b| self.authorized(b);
+        if repository_exists(&self.client, &self.repo_api_url(), authorize).await? {
+            return Ok(RepositoryEnsureOutcome::Existed);
+        }
+        let body = serde_json::json!({ "name": self.repo, "private": private, "auto_init": false });
+        create_gitea_github_repo(
+            &self.client,
+            &format!("{}/api/v1/orgs/{}/repos", self.base_url, self.owner),
+            &format!("{}/api/v1/user/repos", self.base_url),
+            &body,
+            authorize,
         )
         .await
     }
@@ -661,6 +888,8 @@ impl GitHubProvider {
 #[derive(Serialize)]
 struct GitHubMergeBody<'a> {
     merge_method: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sha: Option<&'a str>,
 }
 
 #[async_trait]
@@ -722,7 +951,7 @@ impl ForgeProvider for GitHubProvider {
             &self.client,
             &self.base_url,
             &self.repo_api_url(),
-            "per_page=50",
+            "per_page",
             |b| self.authorized(b),
             tenant,
             state,
@@ -730,13 +959,19 @@ impl ForgeProvider for GitHubProvider {
         .await
     }
 
-    async fn merge_pull_request(&self, pr_id: &str) -> Result<PullRequestInfo, ForgeError> {
+    async fn merge_pull_request(
+        &self,
+        pr_id: &str,
+        expected_head_sha: Option<&str>,
+    ) -> Result<PullRequestInfo, ForgeError> {
         let id = validate_pr_number(pr_id)?;
+        let sha = expected_head_sha.map(validate_commit_sha).transpose()?;
         let url = format!("{}/pulls/{id}/merge", self.repo_api_url());
         let resp = self
             .authorized(self.client.put(&url))
             .json(&GitHubMergeBody {
                 merge_method: "rebase",
+                sha,
             })
             .send()
             .await?;
@@ -766,6 +1001,25 @@ impl ForgeProvider for GitHubProvider {
             |b| self.authorized(b),
             pr_id,
             "open",
+        )
+        .await
+    }
+
+    async fn ensure_repository(
+        &self,
+        private: bool,
+    ) -> Result<RepositoryEnsureOutcome, ForgeError> {
+        let authorize = |b| self.authorized(b);
+        if repository_exists(&self.client, &self.repo_api_url(), authorize).await? {
+            return Ok(RepositoryEnsureOutcome::Existed);
+        }
+        let body = serde_json::json!({ "name": self.repo, "private": private, "auto_init": false });
+        create_gitea_github_repo(
+            &self.client,
+            &format!("{}/orgs/{}/repos", self.base_url, self.owner),
+            &format!("{}/user/repos", self.base_url),
+            &body,
+            authorize,
         )
         .await
     }
@@ -854,6 +1108,18 @@ struct GitLabMrResponse {
     web_url: String,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
+    #[serde(default)]
+    merge_commit_sha: Option<String>,
+    #[serde(default)]
+    squash_commit_sha: Option<String>,
+    #[serde(default)]
+    diff_refs: Option<GitLabDiffRefs>,
+}
+
+#[derive(Deserialize)]
+struct GitLabDiffRefs {
+    #[serde(default)]
+    base_sha: Option<String>,
 }
 
 impl GitLabMrResponse {
@@ -879,6 +1145,14 @@ impl GitLabMrResponse {
             updated_at: self.updated_at,
             comments: Vec::new(),
             diff_stat: None,
+            merge_commit_sha: self
+                .merge_commit_sha
+                .or(self.squash_commit_sha)
+                .filter(|s| !s.trim().is_empty()),
+            base_sha: self
+                .diff_refs
+                .and_then(|d| d.base_sha)
+                .filter(|s| !s.trim().is_empty()),
         }
     }
 }
@@ -968,15 +1242,32 @@ impl ForgeProvider for GitLabProvider {
             Some(PullRequestState::Merged) => "merged",
             Some(PullRequestState::Closed) => "closed",
         };
-        let url = format!(
-            "{}/merge_requests?state={state_param}&per_page=50",
-            self.project_api_url()
-        );
-        let resp = self.authorized(self.client.get(&url)).send().await?;
-        if !resp.status().is_success() {
-            return Err(map_error_response(resp, None, false).await);
+        let mut items: Vec<GitLabMrResponse> = Vec::new();
+        for page in 1..=MAX_LIST_PAGES {
+            let url = format!(
+                "{}/merge_requests?state={state_param}&per_page={LIST_PAGE_SIZE}&page={page}",
+                self.project_api_url()
+            );
+            let resp = self.authorized(self.client.get(&url)).send().await?;
+            if !resp.status().is_success() {
+                return Err(map_error_response(resp, None, false).await);
+            }
+            let has_next = link_header_has_next(resp.headers())
+                || resp
+                    .headers()
+                    .get("x-next-page")
+                    .and_then(|v| v.to_str().ok())
+                    .is_some_and(|v| !v.trim().is_empty());
+            let batch: Vec<GitLabMrResponse> = resp.json().await?;
+            let batch_len = batch.len();
+            items.extend(batch);
+            if !page_has_more(batch_len, has_next) {
+                break;
+            }
+            if page == MAX_LIST_PAGES {
+                warn_list_truncated("merge requests", items.len());
+            }
         }
-        let items: Vec<GitLabMrResponse> = resp.json().await?;
         let prs = items
             .into_iter()
             .map(|item| item.into_pr_info(None))
@@ -985,10 +1276,19 @@ impl ForgeProvider for GitLabProvider {
         Ok(prs)
     }
 
-    async fn merge_pull_request(&self, pr_id: &str) -> Result<PullRequestInfo, ForgeError> {
+    async fn merge_pull_request(
+        &self,
+        pr_id: &str,
+        expected_head_sha: Option<&str>,
+    ) -> Result<PullRequestInfo, ForgeError> {
         let iid = validate_pr_number(pr_id)?;
         let url = format!("{}/merge_requests/{iid}/merge", self.project_api_url());
-        let resp = self.authorized(self.client.put(&url)).send().await?;
+        let mut req = self.authorized(self.client.put(&url));
+        if let Some(sha) = expected_head_sha {
+            // GitLab rejects the merge (409) if `sha` no longer matches the MR source HEAD.
+            req = req.json(&serde_json::json!({ "sha": validate_commit_sha(sha)? }));
+        }
+        let resp = req.send().await?;
         if !resp.status().is_success() {
             return Err(map_error_response(resp, Some(iid), true).await);
         }
@@ -1024,6 +1324,59 @@ impl ForgeProvider for GitLabProvider {
         }
         let parsed: GitLabMrResponse = resp.json().await?;
         Ok(parsed.into_pr_info(None))
+    }
+
+    /// Creates the project inside its namespace (group or user, resolved via
+    /// `/api/v4/namespaces/{path}`). Non-private projects are created `internal`, never `public`.
+    async fn ensure_repository(
+        &self,
+        private: bool,
+    ) -> Result<RepositoryEnsureOutcome, ForgeError> {
+        let authorize = |b| self.authorized(b);
+        if repository_exists(&self.client, &self.project_api_url(), authorize).await? {
+            return Ok(RepositoryEnsureOutcome::Existed);
+        }
+        let (namespace, name) = self.project_path.rsplit_once('/').ok_or_else(|| {
+            ForgeError::InvalidInput(format!(
+                "GitLab project path '{}' must include a namespace",
+                self.project_path
+            ))
+        })?;
+        let ns_resp = authorize(self.client.get(format!(
+            "{}/api/v4/namespaces/{}",
+            self.base_url,
+            url_encode_project_path(namespace)
+        )))
+        .send()
+        .await?;
+        if !ns_resp.status().is_success() {
+            return Err(map_error_response(ns_resp, Some(namespace), false).await);
+        }
+        let ns: serde_json::Value = ns_resp.json().await?;
+        let namespace_id = ns
+            .get("id")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| {
+                ForgeError::InvalidInput(format!(
+                    "GitLab namespace '{namespace}' response has no id"
+                ))
+            })?;
+        let created = authorize(
+            self.client
+                .post(format!("{}/api/v4/projects", self.base_url)),
+        )
+        .json(&serde_json::json!({
+            "name": name,
+            "path": name,
+            "namespace_id": namespace_id,
+            "visibility": if private { "private" } else { "internal" },
+        }))
+        .send()
+        .await?;
+        if created.status().is_success() {
+            return Ok(RepositoryEnsureOutcome::Created);
+        }
+        Err(map_error_response(created, Some("repository"), false).await)
     }
 }
 
@@ -1117,6 +1470,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_pull_requests_follows_pages_until_exhausted() {
+        let pr_json = |n: usize| {
+            format!(
+                r#"{{"number": {n}, "title": "PR {n}", "state": "open", "merged": false,
+                "head": {{"ref": "keel/acme/deploy-{n}-1", "sha": "abc{n}"}},
+                "base": {{"ref": "main", "sha": "000"}},
+                "html_url": "http://forge.local/pulls/{n}",
+                "created_at": "2026-11-14T10:00:00Z", "updated_at": "2026-11-14T10:00:00Z"}}"#
+            )
+        };
+        let page1 = format!(
+            "[{}]",
+            (1..=LIST_PAGE_SIZE)
+                .map(pr_json)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let page2 = format!("[{}]", pr_json(LIST_PAGE_SIZE + 1));
+        let (url, handle) = spawn_mock_http_server(vec![(200, page1), (200, page2)]).await;
+        let provider = ForgejoGiteaProvider::new(&url, "keel", "gitops", "tok").unwrap();
+        let prs = provider
+            .list_pull_requests(Some("acme"), Some(PullRequestState::Open))
+            .await
+            .unwrap();
+        assert_eq!(prs.len(), LIST_PAGE_SIZE + 1);
+        let reqs = handle.await.unwrap();
+        assert!(reqs[0].contains("limit=50&page=1"));
+        assert!(reqs[1].contains("limit=50&page=2"));
+
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::LINK,
+            r#"<https://api.github.com/x?page=2>; rel="next", <https://api.github.com/x?page=9>; rel="last""#
+                .parse()
+                .unwrap(),
+        );
+        assert!(link_header_has_next(&headers));
+        headers.insert(
+            reqwest::header::LINK,
+            r#"<https://api.github.com/x?page=1>; rel="prev""#.parse().unwrap(),
+        );
+        assert!(!link_header_has_next(&headers));
+        assert!(page_has_more(LIST_PAGE_SIZE, false));
+        assert!(page_has_more(3, true));
+        assert!(!page_has_more(3, false));
+        assert!(!page_has_more(0, true));
+    }
+
+    #[tokio::test]
     async fn test_forgejo_and_github_providers_via_trait_object() {
         let open_json = r#"{
             "number": 42,
@@ -1185,10 +1587,18 @@ mod tests {
             .unwrap();
         assert_eq!(acme_prs.len(), 1);
 
-        let merged = dyn_forge.merge_pull_request("42").await.unwrap();
+        let merged = dyn_forge
+            .merge_pull_request("42", Some("abc1234def"))
+            .await
+            .unwrap();
         assert_eq!(merged.state, PullRequestState::Merged);
 
         let fg_reqs = fg_handle.await.unwrap();
+        assert!(
+            fg_reqs
+                .iter()
+                .any(|r| r.contains(r#""head_commit_id":"abc1234def""#))
+        );
         assert!(
             fg_reqs[0]
                 .to_ascii_lowercase()
@@ -1228,18 +1638,22 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        let gh_merged = dyn_gh.merge_pull_request("42").await.unwrap();
+        let gh_merged = dyn_gh
+            .merge_pull_request("42", Some("abc1234def"))
+            .await
+            .unwrap();
         assert_eq!(gh_merged.state, PullRequestState::Merged);
         assert!(matches!(
             dyn_gh.get_pull_request("404").await,
             Err(ForgeError::NotFound(_))
         ));
         assert!(matches!(
-            dyn_gh.merge_pull_request("42").await,
+            dyn_gh.merge_pull_request("42", None).await,
             Err(ForgeError::MergeConflict(_, _))
         ));
 
         let gh_reqs = gh_handle.await.unwrap();
+        assert!(gh_reqs.iter().any(|r| r.contains(r#""sha":"abc1234def""#)));
         assert!(
             gh_reqs[0]
                 .to_ascii_lowercase()
@@ -1303,10 +1717,18 @@ mod tests {
             .unwrap();
         assert_eq!(listed.len(), 1);
 
-        let merged = dyn_gl.merge_pull_request("7").await.unwrap();
+        let merged = dyn_gl
+            .merge_pull_request("7", Some("999888777666"))
+            .await
+            .unwrap();
         assert_eq!(merged.state, PullRequestState::Merged);
 
         let gl_reqs = gl_handle.await.unwrap();
+        assert!(
+            gl_reqs
+                .iter()
+                .any(|r| r.contains(r#""sha":"999888777666""#))
+        );
         assert!(
             gl_reqs[0]
                 .to_ascii_lowercase()
@@ -1449,5 +1871,228 @@ mod tests {
 
         assert!(parse_remote_repo_url("/local/path/repo.git").is_err());
         assert!(parse_remote_repo_url("").is_err());
+    }
+
+    fn request_line(req: &str) -> &str {
+        req.lines().next().unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn forgejo_ensure_repository_existing_user_fallback_and_basic_auth() {
+        // 1. Repository already exists.
+        let (url, handle) = spawn_mock_http_server(vec![(200, "{}".to_string())]).await;
+        let p = ForgejoGiteaProvider::new(&url, "keel", "infra-gitops", "fg-tok").unwrap();
+        assert_eq!(
+            p.ensure_repository(true).await.unwrap(),
+            RepositoryEnsureOutcome::Existed
+        );
+        let reqs = handle.await.unwrap();
+        assert_eq!(
+            request_line(&reqs[0]),
+            "GET /api/v1/repos/keel/infra-gitops HTTP/1.1"
+        );
+
+        // 2. Missing; owner is a user (org endpoint 404) -> created via /user/repos with basic auth.
+        let (url, handle) = spawn_mock_http_server(vec![
+            (404, "{}".to_string()),
+            (404, r#"{"message":"org not found"}"#.to_string()),
+            (201, r#"{"id":1}"#.to_string()),
+        ])
+        .await;
+        let p = ForgejoGiteaProvider::with_basic_auth(&url, "keel", "infra-gitops", "keel", "pw")
+            .unwrap();
+        assert!(!format!("{p:?}").contains("pw\""));
+        assert_eq!(
+            p.ensure_repository(true).await.unwrap(),
+            RepositoryEnsureOutcome::Created
+        );
+        let reqs = handle.await.unwrap();
+        assert_eq!(
+            request_line(&reqs[1]),
+            "POST /api/v1/orgs/keel/repos HTTP/1.1"
+        );
+        assert_eq!(request_line(&reqs[2]), "POST /api/v1/user/repos HTTP/1.1");
+        assert!(reqs[2].contains(r#""private":true"#), "{}", reqs[2]);
+        assert!(reqs[2].contains(r#""name":"infra-gitops""#));
+        // base64("keel:pw") == "a2VlbDpwdw=="
+        assert!(
+            reqs[0]
+                .to_ascii_lowercase()
+                .contains("authorization: basic a2vlbdpwdw==")
+        );
+
+        // 3. Org creation conflict (concurrent create) is reported as existing.
+        let (url, handle) = spawn_mock_http_server(vec![
+            (404, "{}".to_string()),
+            (409, r#"{"message":"exists"}"#.to_string()),
+        ])
+        .await;
+        let p = ForgejoGiteaProvider::new(&url, "acme", "infra", "fg-tok").unwrap();
+        assert_eq!(
+            p.ensure_repository(false).await.unwrap(),
+            RepositoryEnsureOutcome::Existed
+        );
+        let reqs = handle.await.unwrap();
+        assert!(reqs[1].contains(r#""private":false"#));
+
+        // 4. Lookup failures (non-404) surface as API errors; org 403 does not fall back.
+        let (url, handle) = spawn_mock_http_server(vec![(500, "boom".to_string())]).await;
+        let p = ForgejoGiteaProvider::new(&url, "acme", "infra", "fg-tok").unwrap();
+        let err = p.ensure_repository(true).await.unwrap_err();
+        assert!(matches!(err, ForgeError::Api { status: 500, .. }), "{err}");
+        handle.await.unwrap();
+
+        let (url, handle) = spawn_mock_http_server(vec![
+            (404, "{}".to_string()),
+            (403, "forbidden".to_string()),
+        ])
+        .await;
+        let p = ForgejoGiteaProvider::new(&url, "acme", "infra", "fg-tok").unwrap();
+        let err = p.ensure_repository(true).await.unwrap_err();
+        assert!(matches!(err, ForgeError::Api { status: 403, .. }), "{err}");
+        assert_eq!(handle.await.unwrap().len(), 2);
+
+        assert!(ForgejoGiteaProvider::with_basic_auth(&url, "o", "r", " ", "pw").is_err());
+        assert!(ForgejoGiteaProvider::with_basic_auth(&url, "o", "r", "u", "").is_err());
+    }
+
+    #[tokio::test]
+    async fn github_ensure_repository_creates_in_org_or_user() {
+        let (url, handle) = spawn_mock_http_server(vec![
+            (404, "{}".to_string()),
+            (201, r#"{"id":1}"#.to_string()),
+        ])
+        .await;
+        let p = GitHubProvider::new(&url, "acme", "infra", "gh-tok").unwrap();
+        assert_eq!(
+            p.ensure_repository(true).await.unwrap(),
+            RepositoryEnsureOutcome::Created
+        );
+        let reqs = handle.await.unwrap();
+        assert_eq!(request_line(&reqs[0]), "GET /repos/acme/infra HTTP/1.1");
+        assert_eq!(request_line(&reqs[1]), "POST /orgs/acme/repos HTTP/1.1");
+        assert!(
+            reqs[1]
+                .to_ascii_lowercase()
+                .contains("authorization: bearer gh-tok")
+        );
+        assert!(reqs[1].contains(r#""private":true"#));
+
+        let (url, handle) = spawn_mock_http_server(vec![
+            (404, "{}".to_string()),
+            (404, "{}".to_string()),
+            (201, r#"{"id":2}"#.to_string()),
+        ])
+        .await;
+        let p = GitHubProvider::new(&url, "octocat", "infra", "gh-tok").unwrap();
+        assert_eq!(
+            p.ensure_repository(false).await.unwrap(),
+            RepositoryEnsureOutcome::Created
+        );
+        let reqs = handle.await.unwrap();
+        assert_eq!(request_line(&reqs[2]), "POST /user/repos HTTP/1.1");
+
+        let (url, handle) = spawn_mock_http_server(vec![
+            (404, "{}".to_string()),
+            (404, "{}".to_string()),
+            (422, r#"{"message":"Validation Failed"}"#.to_string()),
+        ])
+        .await;
+        let p = GitHubProvider::new(&url, "octocat", "infra", "gh-tok").unwrap();
+        let err = p.ensure_repository(true).await.unwrap_err();
+        assert!(matches!(err, ForgeError::Api { status: 422, .. }), "{err}");
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn gitlab_ensure_repository_resolves_namespace_and_visibility() {
+        let (url, handle) = spawn_mock_http_server(vec![(200, r#"{"id":5}"#.to_string())]).await;
+        let p = GitLabProvider::new(&url, "team/sub/infra", "gl-tok").unwrap();
+        assert_eq!(
+            p.ensure_repository(true).await.unwrap(),
+            RepositoryEnsureOutcome::Existed
+        );
+        handle.await.unwrap();
+
+        let (url, handle) = spawn_mock_http_server(vec![
+            (404, "{}".to_string()),
+            (200, r#"{"id":42,"kind":"group"}"#.to_string()),
+            (201, r#"{"id":7}"#.to_string()),
+        ])
+        .await;
+        let p = GitLabProvider::new(&url, "team/sub/infra", "gl-tok").unwrap();
+        assert_eq!(
+            p.ensure_repository(false).await.unwrap(),
+            RepositoryEnsureOutcome::Created
+        );
+        let reqs = handle.await.unwrap();
+        assert_eq!(
+            request_line(&reqs[0]),
+            "GET /api/v4/projects/team%2Fsub%2Finfra HTTP/1.1"
+        );
+        assert_eq!(
+            request_line(&reqs[1]),
+            "GET /api/v4/namespaces/team%2Fsub HTTP/1.1"
+        );
+        assert_eq!(request_line(&reqs[2]), "POST /api/v4/projects HTTP/1.1");
+        assert!(reqs[2].contains(r#""namespace_id":42"#), "{}", reqs[2]);
+        assert!(reqs[2].contains(r#""visibility":"internal""#));
+        assert!(reqs[2].contains(r#""path":"infra""#));
+        assert!(
+            reqs[2]
+                .to_ascii_lowercase()
+                .contains("private-token: gl-tok")
+        );
+
+        // Unknown namespace is an error (never silently created under another owner).
+        let (url, handle) =
+            spawn_mock_http_server(vec![(404, "{}".to_string()), (404, "{}".to_string())]).await;
+        let p = GitLabProvider::new(&url, "ghost/infra", "gl-tok").unwrap();
+        let err = p.ensure_repository(true).await.unwrap_err();
+        assert!(
+            matches!(err, ForgeError::NotFound(ref ns) if ns == "ghost"),
+            "{err}"
+        );
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn forgejo_create_access_token_requires_basic_auth() {
+        let (url, handle) = spawn_mock_http_server(vec![
+            (
+                201,
+                r#"{"id":3,"name":"keel-stage0","sha1":"abc123"}"#.to_string(),
+            ),
+            (201, r#"{"id":4}"#.to_string()),
+            (401, r#"{"message":"bad creds"}"#.to_string()),
+        ])
+        .await;
+        let p = ForgejoGiteaProvider::with_basic_auth(&url, "keel", "infra-gitops", "keel", "pw")
+            .unwrap();
+        let token = p
+            .create_access_token("keel-stage0", &["read:repository"])
+            .await
+            .unwrap();
+        assert_eq!(token, "abc123");
+        assert!(p.create_access_token("missing", &[]).await.is_err());
+        let err = p.create_access_token("denied", &[]).await.unwrap_err();
+        assert!(matches!(err, ForgeError::Api { status: 401, .. }), "{err}");
+        let reqs = handle.await.unwrap();
+        assert_eq!(
+            request_line(&reqs[0]),
+            "POST /api/v1/users/keel/tokens HTTP/1.1"
+        );
+        assert!(
+            reqs[0].contains(r#""scopes":["read:repository"]"#),
+            "{}",
+            reqs[0]
+        );
+
+        let token_auth = ForgejoGiteaProvider::new(&url, "keel", "r", "tok").unwrap();
+        assert!(matches!(
+            token_auth.create_access_token("x", &[]).await,
+            Err(ForgeError::InvalidInput(_))
+        ));
+        assert!(p.create_access_token(" ", &[]).await.is_err());
     }
 }

@@ -9,7 +9,7 @@ use tokio::sync::Mutex;
 
 use crate::forge::{
     CreatePrRequest, ForgeError, ForgeProvider, PullRequestComment, PullRequestInfo,
-    PullRequestState, matches_tenant,
+    PullRequestState, RepositoryEnsureOutcome, matches_tenant, validate_commit_sha,
 };
 use crate::git::{
     CommitAuthor, GitError, GitRunner, parse_proposal_branch_tenant, sanitize_branch_segment,
@@ -370,6 +370,8 @@ impl ForgeProvider for LocalGitProvider {
             updated_at: now,
             comments: Vec::new(),
             diff_stat,
+            merge_commit_sha: None,
+            base_sha: None,
         };
 
         self.write_proposal_unlocked(&pr, &format!("chore(proposals): open proposal #{pr_id}"))
@@ -463,8 +465,15 @@ impl ForgeProvider for LocalGitProvider {
         Ok(filtered)
     }
 
-    async fn merge_pull_request(&self, pr_id: &str) -> Result<PullRequestInfo, ForgeError> {
+    async fn merge_pull_request(
+        &self,
+        pr_id: &str,
+        expected_head_sha: Option<&str>,
+    ) -> Result<PullRequestInfo, ForgeError> {
         validate_pr_id(pr_id)?;
+        if let Some(sha) = expected_head_sha {
+            validate_commit_sha(sha)?;
+        }
         let _guard = self.mutex.lock().await;
 
         let mut pr = self
@@ -482,9 +491,37 @@ impl ForgeProvider for LocalGitProvider {
         self.git_runner.fetch(tmp.path(), "origin").await?;
 
         let remote_source_ref = format!("origin/{}", pr.source_branch);
+        let actual_head = self
+            .git_runner
+            .rev_parse(tmp.path(), &remote_source_ref)
+            .await?;
+        if let Some(expected) = expected_head_sha
+            && !actual_head
+                .to_ascii_lowercase()
+                .starts_with(&expected.to_ascii_lowercase())
+        {
+            return Err(ForgeError::MergeConflict(
+                pr_id.to_string(),
+                format!(
+                    "source branch head moved: expected {expected}, found {actual_head}; re-review required"
+                ),
+            ));
+        }
+        // Record the merge-base so merged-PR diffs stay stable after `main` moves on.
+        let base_sha = self
+            .git_runner
+            .merge_base(
+                tmp.path(),
+                &format!("origin/{}", pr.target_branch),
+                &actual_head,
+            )
+            .await
+            .ok()
+            .filter(|s| !s.is_empty());
+        // Merge the exact commit that was verified, not the (re-resolvable) branch name.
         let merged_sha = match self
             .git_runner
-            .fast_forward_merge(tmp.path(), &pr.target_branch, &remote_source_ref)
+            .fast_forward_merge(tmp.path(), &pr.target_branch, &actual_head)
             .await
         {
             Ok(sha) => sha,
@@ -505,6 +542,8 @@ impl ForgeProvider for LocalGitProvider {
             })?;
 
         pr.state = PullRequestState::Merged;
+        pr.merge_commit_sha = Some(merged_sha.clone());
+        pr.base_sha = base_sha;
         pr.head_sha = merged_sha;
         pr.updated_at = Utc::now();
 
@@ -520,6 +559,30 @@ impl ForgeProvider for LocalGitProvider {
 
     async fn reopen_pull_request(&self, pr_id: &str) -> Result<PullRequestInfo, ForgeError> {
         LocalGitProvider::reopen_pull_request(self, pr_id).await
+    }
+
+    /// Initializes the backing bare repository when missing. `private` has no meaning for a
+    /// filesystem repository and is ignored.
+    async fn ensure_repository(
+        &self,
+        _private: bool,
+    ) -> Result<RepositoryEnsureOutcome, ForgeError> {
+        let _guard = self.mutex.lock().await;
+        let path = &self.bare_repo_path;
+        if path.join("HEAD").is_file() && path.join("objects").is_dir() {
+            return Ok(RepositoryEnsureOutcome::Existed);
+        }
+        if path.exists() {
+            let mut entries = tokio::fs::read_dir(path).await?;
+            if entries.next_entry().await?.is_some() {
+                return Err(ForgeError::InvalidInput(format!(
+                    "'{}' exists but is not a bare Git repository",
+                    path.display()
+                )));
+            }
+        }
+        self.git_runner.init_bare(path).await?;
+        Ok(RepositoryEnsureOutcome::Created)
     }
 }
 
@@ -715,8 +778,23 @@ mod tests {
         assert_eq!(fetched_pr1.comments[0].body, report);
         assert_eq!(fetched_pr1.head_sha, alpha_commit_sha);
 
-        // Fast-forward merge PR #1 into main
-        let merged_pr1 = provider.merge_pull_request("1").await.unwrap();
+        // Merging with a stale/mismatched reviewed SHA is refused.
+        assert!(matches!(
+            provider
+                .merge_pull_request("1", Some("0000000000000000000000000000000000000000"))
+                .await,
+            Err(ForgeError::MergeConflict(_, _))
+        ));
+        assert!(matches!(
+            provider.merge_pull_request("1", Some("not-a-sha")).await,
+            Err(ForgeError::InvalidInput(_))
+        ));
+
+        // Fast-forward merge PR #1 into main pinned to the reviewed head SHA
+        let merged_pr1 = provider
+            .merge_pull_request("1", Some(&alpha_commit_sha))
+            .await
+            .unwrap();
         assert_eq!(merged_pr1.state, PullRequestState::Merged);
         assert_eq!(merged_pr1.head_sha, alpha_commit_sha);
 
@@ -738,13 +816,13 @@ mod tests {
 
         // Re-merging PR #1 fails with InvalidState
         assert!(matches!(
-            provider.merge_pull_request("1").await,
+            provider.merge_pull_request("1", None).await,
             Err(ForgeError::InvalidState(_, PullRequestState::Merged))
         ));
 
         // PR #2 is no longer a fast-forward of main because main advanced; must return MergeConflict
         assert!(matches!(
-            provider.merge_pull_request("2").await,
+            provider.merge_pull_request("2", None).await,
             Err(ForgeError::MergeConflict(_, _))
         ));
 
@@ -826,5 +904,42 @@ mod tests {
                 .await,
             Err(ForgeError::InvalidInput(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn ensure_repository_initializes_missing_bare_repo_and_is_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        let bare = tmp.path().join("nested/infra-gitops.git");
+        let provider = LocalGitProvider::new(&bare);
+        assert_eq!(
+            provider.ensure_repository(true).await.unwrap(),
+            RepositoryEnsureOutcome::Created
+        );
+        assert!(bare.join("HEAD").is_file());
+        assert_eq!(
+            provider.ensure_repository(false).await.unwrap(),
+            RepositoryEnsureOutcome::Existed
+        );
+
+        // A seeded repository is reported as existing.
+        let (seeded, _, _) = seed_bare_repo(&tmp).await;
+        assert_eq!(
+            LocalGitProvider::new(&seeded)
+                .ensure_repository(true)
+                .await
+                .unwrap(),
+            RepositoryEnsureOutcome::Existed
+        );
+
+        // A non-empty, non-repository directory is never clobbered.
+        let junk = tmp.path().join("junk");
+        std::fs::create_dir_all(&junk).unwrap();
+        std::fs::write(junk.join("file.txt"), "x").unwrap();
+        let err = LocalGitProvider::new(&junk)
+            .ensure_repository(true)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ForgeError::InvalidInput(_)), "{err}");
+        assert!(junk.join("file.txt").is_file());
     }
 }

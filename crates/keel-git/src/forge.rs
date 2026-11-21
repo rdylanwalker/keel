@@ -77,31 +77,57 @@ impl CreatePrRequest {
 }
 
 /// Comment attached to a Pull Request (such as a PKO v2 ephemeral preview diff report).
+///
+/// Serialized in `camelCase` (consistent with the rest of the REST API); `snake_case` keys are
+/// still accepted on deserialization for previously persisted local proposal metadata.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PullRequestComment {
     pub id: String,
     pub body: String,
+    #[serde(alias = "created_at")]
     pub created_at: DateTime<Utc>,
 }
 
 /// Canonical Pull Request / proposal representation returned by [`ForgeProvider`] implementations.
+///
+/// Serialized in `camelCase` (consistent with the rest of the REST API); `snake_case` keys are
+/// still accepted on deserialization for previously persisted local proposal metadata and older
+/// servers.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PullRequestInfo {
     pub id: String,
     pub title: String,
     pub body: String,
     pub state: PullRequestState,
+    #[serde(alias = "source_branch")]
     pub source_branch: String,
+    #[serde(alias = "target_branch")]
     pub target_branch: String,
+    #[serde(alias = "head_sha")]
     pub head_sha: String,
     pub tenant: Option<String>,
     pub url: String,
+    #[serde(alias = "created_at")]
     pub created_at: DateTime<Utc>,
+    #[serde(alias = "updated_at")]
     pub updated_at: DateTime<Utc>,
     #[serde(default)]
     pub comments: Vec<PullRequestComment>,
-    #[serde(default)]
+    #[serde(default, alias = "diff_stat")]
     pub diff_stat: Option<String>,
+    /// Merge (or squash) commit created on the target branch once the PR is merged.
+    #[serde(
+        default,
+        alias = "merge_commit_sha",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub merge_commit_sha: Option<String>,
+    /// Merge-base / target-branch commit the PR diff is computed against (recorded at merge time
+    /// by the local forge, `diff_refs.base_sha` on GitLab).
+    #[serde(default, alias = "base_sha", skip_serializing_if = "Option::is_none")]
+    pub base_sha: Option<String>,
 }
 
 /// Errors returned by [`ForgeProvider`] implementations.
@@ -133,6 +159,16 @@ pub enum ForgeError {
 
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+}
+
+/// Result of [`ForgeProvider::ensure_repository`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RepositoryEnsureOutcome {
+    /// The repository already existed; nothing was changed.
+    Existed,
+    /// The repository was missing and has been created.
+    Created,
 }
 
 /// Thin forge abstraction isolating PR/MR operations across Forgejo/Gitea, GitHub, GitLab,
@@ -169,11 +205,34 @@ pub trait ForgeProvider: Send + Sync {
         }
     }
 
-    async fn merge_pull_request(&self, pr_id: &str) -> Result<PullRequestInfo, ForgeError>;
+    /// Merges the PR. When `expected_head_sha` is `Some`, the forge must refuse the merge if the
+    /// PR head no longer matches that commit (Gitea/Forgejo `head_commit_id`, GitHub/GitLab `sha`,
+    /// local branch head comparison), pinning the merge to the reviewed revision.
+    async fn merge_pull_request(
+        &self,
+        pr_id: &str,
+        expected_head_sha: Option<&str>,
+    ) -> Result<PullRequestInfo, ForgeError>;
 
     async fn close_pull_request(&self, pr_id: &str) -> Result<PullRequestInfo, ForgeError>;
 
     async fn reopen_pull_request(&self, pr_id: &str) -> Result<PullRequestInfo, ForgeError>;
+
+    /// Ensures the configured repository exists, creating it (with the requested visibility)
+    /// when missing. Existing repositories are left untouched (visibility is not changed).
+    async fn ensure_repository(&self, private: bool)
+    -> Result<RepositoryEnsureOutcome, ForgeError>;
+}
+
+/// Validates an expected head commit SHA (hex, 7..=64 chars) before sending it to a forge.
+pub fn validate_commit_sha(sha: &str) -> Result<&str, ForgeError> {
+    if (7..=64).contains(&sha.len()) && sha.chars().all(|c| c.is_ascii_hexdigit()) {
+        Ok(sha)
+    } else {
+        Err(ForgeError::InvalidInput(format!(
+            "expected head SHA must be a 7-64 character hex commit id, got '{sha}'"
+        )))
+    }
 }
 
 /// Checks whether a [`PullRequestInfo`] belongs to `tenant` (via explicit metadata or branch prefix).
@@ -226,8 +285,21 @@ mod tests {
             updated_at: now,
             comments: Vec::new(),
             diff_stat: None,
+            merge_commit_sha: None,
+            base_sha: None,
         };
         assert!(matches_tenant(&pr, "team-sec"));
+
+        // camelCase on the wire, snake_case still accepted for persisted metadata.
+        let json = serde_json::to_value(&pr).unwrap();
+        assert_eq!(json["sourceBranch"], "feature/custom-branch");
+        assert!(json.get("source_branch").is_none());
+        let mut legacy = json.clone();
+        let obj = legacy.as_object_mut().unwrap();
+        let v = obj.remove("sourceBranch").unwrap();
+        obj.insert("source_branch".to_string(), v);
+        let back: PullRequestInfo = serde_json::from_value(legacy).unwrap();
+        assert_eq!(back, pr);
         assert!(matches_tenant(&pr, "Team Sec"));
         assert!(!matches_tenant(&pr, "other"));
     }
