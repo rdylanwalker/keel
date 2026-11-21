@@ -9,16 +9,10 @@ import {
   Boxes,
   RotateCw,
   Terminal,
-  GitBranch,
   Package,
   Pencil,
   Trash2,
-  Radio,
-  Pause,
-  Play,
-  Filter,
   Gauge,
-  Clock,
 } from "lucide-react"
 import { CrdWatchEvent, ReleaseSummary, StackSummary } from "../types/api"
 import {
@@ -31,97 +25,19 @@ import {
   reconcileStack,
 } from "../lib/api"
 import { isDemoMode, isStackSshSupported } from "../lib/utils"
+import {
+  BOOTSTRAP_MANAGEMENT_STACK,
+  DEFAULT_EVENTS,
+  DEFAULT_STACKS,
+} from "../lib/demoFixtures"
 import { StackInspectorModal } from "./StackInspectorModal"
 import { VmSshModal } from "./VmSshModal"
 import { StatusBadge } from "./StatusBadge"
 import { BundleBadge } from "./BundleBadge"
 import { PrNotificationBanner } from "./PrNotificationBanner"
 import { DataTable, DataTableColumnDef } from "./DataTable"
-
-const DEFAULT_EVENTS: CrdWatchEvent[] = [
-  {
-    kind: "GitRepository",
-    namespace: "flux-system",
-    name: "flux-system",
-    status: "Ready",
-    message: "Fetched revision main@sha1:a1b2c3d4",
-    revision: "main@sha1:a1b2c3d4",
-    timestamp: new Date(Date.now() - 30000).toLocaleTimeString(),
-  },
-  {
-    kind: "Kustomization",
-    namespace: "tenant-acme",
-    name: "tenant-acme-apps",
-    status: "Ready",
-    message: "Applied revision main@sha1:a1b2c3d4",
-    revision: "main@sha1:a1b2c3d4",
-    timestamp: new Date(Date.now() - 24000).toLocaleTimeString(),
-  },
-  {
-    kind: "Stack",
-    namespace: "keel-system",
-    name: "pve-workload-cluster-prod",
-    status: "Ready",
-    message: "PKO v2 stack update succeeded cleanly (18 resources)",
-    revision: "v2.1.0",
-    timestamp: new Date(Date.now() - 18000).toLocaleTimeString(),
-  },
-  {
-    kind: "Canary",
-    namespace: "tenant-acme",
-    name: "frontend-portal-canary",
-    status: "Progressing",
-    message:
-      "Advance frontend-portal-canary weight 40% (5xx rate 0.02%, latency 18ms)",
-    revision: "v1.4.0",
-    timestamp: new Date(Date.now() - 5000).toLocaleTimeString(),
-  },
-]
-
-const BOOTSTRAP_MANAGEMENT_STACK: StackSummary = {
-  id: "stack-mgmt-01",
-  name: "management-cluster-core",
-  tenant: "keel-system",
-  provider: "kind",
-  type: "management",
-  status: "synced",
-  resourceCount: 24,
-  lastSynced: "2 minutes ago",
-}
-
-const DEFAULT_STACKS: StackSummary[] = [
-  BOOTSTRAP_MANAGEMENT_STACK,
-  {
-    id: "stack-pve-01",
-    name: "pve-workload-cluster-prod",
-    tenant: "tenant-acme",
-    provider: "proxmox",
-    type: "workload",
-    status: "synced",
-    resourceCount: 18,
-    lastSynced: "5 minutes ago",
-  },
-  {
-    id: "stack-aws-01",
-    name: "aws-us-east-1-cluster",
-    tenant: "tenant-globex",
-    provider: "aws",
-    type: "cloud",
-    status: "reconciling",
-    resourceCount: 42,
-    lastSynced: "1 minute ago",
-  },
-  {
-    id: "stack-hetzner-01",
-    name: "hetzner-fsn1-nodes",
-    tenant: "tenant-stark",
-    provider: "hetzner",
-    type: "workload",
-    status: "drift",
-    resourceCount: 12,
-    lastSynced: "12 minutes ago",
-  },
-]
+import { CanaryTrafficSection } from "./CanaryTrafficSection"
+import { TelemetryStreamPanel } from "./TelemetryStreamPanel"
 
 function ensureManagementStack(stackList: StackSummary[]): StackSummary[] {
   if (
@@ -1009,154 +925,7 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
       </div>
 
       {/* Active Flagger Canary Progressive Delivery Section (promoted when active) */}
-      {canaries.length > 0 && (
-        <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 space-y-4">
-          <div className="flex items-center justify-between border-b border-slate-800 pb-3">
-            <div className="flex items-center space-x-3">
-              <div className="p-2.5 bg-amber-500/10 text-amber-400 rounded-xl border border-amber-500/20">
-                <Gauge className="h-5 w-5" />
-              </div>
-              <div>
-                <h3 className="text-base font-semibold text-white">
-                  Flagger Canary Traffic Rollouts (Envoy Gateway)
-                </h3>
-                <p className="text-xs text-slate-400">
-                  Automated progressive traffic shifting with Prometheus error
-                  rate &amp; p99 latency evaluation
-                </p>
-              </div>
-            </div>
-          </div>
-
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-            {canaries.map((canary) => {
-              const weight = canary.canaryWeight ?? 0
-              const phase = canary.canaryPhase ?? ""
-              const isPromoted =
-                weight === 0 &&
-                (phase === "Succeeded" ||
-                  phase === "Initialized" ||
-                  phase === "Promoting" ||
-                  phase === "Finalising")
-              const primaryPct = isPromoted ? 100 : Math.max(0, 100 - weight)
-              const primaryVer =
-                canary.primaryVersion ||
-                (isPromoted ? canary.version : undefined) ||
-                "—"
-              const canaryVer = canary.version || "—"
-              const errRate = canary.errorRate
-              const latency = canary.latencyMs
-
-              return (
-                <div
-                  key={canary.id || `${canary.namespace}-${canary.name}`}
-                  className="bg-slate-950 border border-slate-800 rounded-xl p-4 space-y-3"
-                >
-                  <div className="flex items-center justify-between">
-                    <span className="text-xs font-bold text-white flex items-center gap-1.5">
-                      <GitBranch className="h-3.5 w-3.5 text-amber-400" />
-                      {canary.name}
-                    </span>
-                    <StatusBadge status={phase || canary.status} size="xs" />
-                  </div>
-
-                  <div className="space-y-1.5">
-                    <div className="flex items-center justify-between text-[11px]">
-                      <span className="text-slate-400">
-                        {isPromoted
-                          ? "Traffic Split (Promoted)"
-                          : "Canary Traffic Weight"}
-                      </span>
-                      <span
-                        className={`font-mono font-bold ${
-                          isPromoted
-                            ? "text-emerald-400"
-                            : phase === "Failed"
-                              ? "text-red-400"
-                              : "text-amber-400"
-                        }`}
-                      >
-                        {isPromoted ? "100% Primary" : `${weight}%`}
-                      </span>
-                    </div>
-                    <div className="w-full bg-slate-900 rounded-full h-2 overflow-hidden border border-slate-800 flex">
-                      <div
-                        className={`h-2 transition-all duration-500 ${
-                          isPromoted
-                            ? "bg-linear-to-r from-emerald-500 to-emerald-400"
-                            : phase === "Failed"
-                              ? "bg-red-500/80"
-                              : "bg-indigo-500"
-                        }`}
-                        style={{ width: `${primaryPct}%` }}
-                        title={`Primary ${primaryVer}: ${primaryPct}%`}
-                      ></div>
-                      {!isPromoted && weight > 0 && (
-                        <div
-                          className="bg-linear-to-r from-amber-400 to-emerald-400 h-2 transition-all duration-500"
-                          style={{ width: `${weight}%` }}
-                          title={`Canary ${canaryVer}: ${weight}%`}
-                        ></div>
-                      )}
-                    </div>
-                    <div className="flex items-center justify-between text-[10px] font-mono text-slate-400">
-                      <span>
-                        Primary:{" "}
-                        <strong className="text-indigo-300">
-                          {primaryVer}
-                        </strong>{" "}
-                        ({primaryPct}%)
-                      </span>
-                      {!isPromoted && (
-                        <span>
-                          Canary:{" "}
-                          <strong className="text-amber-300">
-                            {canaryVer}
-                          </strong>{" "}
-                          ({weight}%)
-                        </span>
-                      )}
-                    </div>
-                  </div>
-
-                  <div className="grid grid-cols-2 gap-2 pt-1 text-[10px] font-mono">
-                    <div className="bg-slate-900 p-2 rounded border border-slate-800">
-                      <span className="text-slate-500 block">
-                        HTTP 5xx Rate:
-                      </span>
-                      <span
-                        className={`font-bold ${
-                          errRate == null
-                            ? "text-slate-500"
-                            : errRate > 1
-                              ? "text-red-400"
-                              : "text-emerald-400"
-                        }`}
-                      >
-                        {errRate != null ? `${errRate}%` : "—"}
-                      </span>
-                    </div>
-                    <div className="bg-slate-900 p-2 rounded border border-slate-800">
-                      <span className="text-slate-500 block">p99 Latency:</span>
-                      <span
-                        className={`font-bold ${
-                          latency == null
-                            ? "text-slate-500"
-                            : latency > 500
-                              ? "text-amber-400"
-                              : "text-indigo-300"
-                        }`}
-                      >
-                        {latency != null ? `${latency}ms` : "—"}
-                      </span>
-                    </div>
-                  </div>
-                </div>
-              )
-            })}
-          </div>
-        </div>
-      )}
+      <CanaryTrafficSection canaries={canaries} />
 
       {/* Provisioned Stacks Table */}
       <div className="bg-slate-900 border border-slate-800 rounded-2xl overflow-hidden space-y-4 p-6">
@@ -1247,177 +1016,20 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
       </div>
 
       {/* Real-time SSE CRD Event Stream Console */}
-      <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 space-y-4">
-        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-slate-800 pb-4">
-          <div className="flex items-center space-x-3">
-            <Radio className="h-5 w-5 text-indigo-400" />
-            <div>
-              <h3 className="text-base font-semibold text-white">
-                Live Reconciler Event Stream
-              </h3>
-              <p className="text-xs text-slate-400">
-                kube-rs CRD condition transitions for Flux &amp; PKO v2 Stacks
-              </p>
-            </div>
-          </div>
-
-          <div className="flex items-center space-x-3">
-            <div className="flex items-center space-x-1 bg-slate-950 border border-slate-800 rounded-lg p-1">
-              <Filter className="h-3.5 w-3.5 text-slate-500 ml-2" />
-              <select
-                aria-label="Filter events by CRD kind"
-                value={eventFilterKind}
-                onChange={(e) => setEventFilterKind(e.target.value)}
-                style={{ colorScheme: "dark" }}
-                className="bg-slate-950 border-0 text-xs text-slate-200 rounded focus:outline-none focus:ring-0 py-0.5 px-2"
-              >
-                <option value="all" className="bg-slate-950 text-slate-200">
-                  All CRDs
-                </option>
-                <option
-                  value="GitRepository"
-                  className="bg-slate-950 text-slate-200"
-                >
-                  GitRepository
-                </option>
-                <option
-                  value="Kustomization"
-                  className="bg-slate-950 text-slate-200"
-                >
-                  Kustomization
-                </option>
-                <option
-                  value="HelmRelease"
-                  className="bg-slate-950 text-slate-200"
-                >
-                  HelmRelease
-                </option>
-                <option value="Stack" className="bg-slate-950 text-slate-200">
-                  Stack
-                </option>
-                <option value="Canary" className="bg-slate-950 text-slate-200">
-                  Canary
-                </option>
-              </select>
-            </div>
-
-            <button
-              type="button"
-              onClick={() => setIsStreamPaused(!isStreamPaused)}
-              className={`flex items-center space-x-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border transition-colors cursor-pointer ${
-                isStreamPaused
-                  ? "bg-amber-500/10 text-amber-400 border-amber-500/30 hover:bg-amber-500/20"
-                  : "bg-slate-800 text-slate-300 border-slate-700 hover:bg-slate-700"
-              }`}
-            >
-              {isStreamPaused ? (
-                <>
-                  <Play className="h-3.5 w-3.5" />
-                  <span>Resume Stream</span>
-                </>
-              ) : (
-                <>
-                  <Pause className="h-3.5 w-3.5" />
-                  <span>Pause Stream</span>
-                </>
-              )}
-            </button>
-
-            <button
-              type="button"
-              onClick={() => setEvents([])}
-              className="p-1.5 text-slate-400 hover:text-red-400 bg-slate-950 hover:bg-slate-800 border border-slate-800 rounded-lg transition-colors cursor-pointer"
-              title="Clear event logs"
-            >
-              <Trash2 className="h-4 w-4" />
-            </button>
-          </div>
-        </div>
-
-        <div className="bg-slate-950 border border-slate-800 rounded-xl p-4 font-mono text-xs space-y-2 max-h-96 overflow-y-auto">
-          {filteredEvents.map((evt, idx) => (
-            <div
-              key={`${evt.name}-${idx}`}
-              className="flex flex-col sm:flex-row sm:items-center justify-between p-2.5 rounded-lg bg-slate-900/60 border border-slate-800/80 hover:bg-slate-900 transition-colors gap-2"
-            >
-              <div className="flex items-start sm:items-center space-x-3 min-w-0 flex-1">
-                <span className="text-[10px] text-slate-500 flex items-center gap-1 shrink-0 mt-0.5 sm:mt-0">
-                  <Clock className="h-3 w-3" />
-                  {evt.timestamp}
-                </span>
-
-                <span
-                  className={`text-[10px] px-2 py-0.5 rounded font-bold uppercase shrink-0 ${
-                    evt.kind === "GitRepository"
-                      ? "bg-purple-500/10 text-purple-400 border border-purple-500/20"
-                      : evt.kind === "Kustomization"
-                        ? "bg-blue-500/10 text-blue-400 border border-blue-500/20"
-                        : evt.kind === "HelmRelease"
-                          ? "bg-indigo-500/10 text-indigo-400 border border-indigo-500/20"
-                          : evt.kind === "Stack"
-                            ? "bg-emerald-500/10 text-emerald-400 border border-emerald-500/20"
-                            : "bg-amber-500/10 text-amber-400 border border-amber-500/20"
-                  }`}
-                >
-                  {evt.kind}
-                </span>
-
-                <div className="min-w-0 flex-1">
-                  <span className="font-semibold text-slate-200">
-                    {evt.namespace}/{evt.name}
-                  </span>
-                  <p className="text-slate-400 truncate mt-0.5">
-                    {evt.message}
-                  </p>
-                </div>
-              </div>
-
-              <div className="flex items-center space-x-2 shrink-0 self-end sm:self-center">
-                {evt.kind === "Stack" && (
-                  <button
-                    type="button"
-                    onClick={() =>
-                      setInspectedStack({
-                        namespace: evt.namespace,
-                        name: evt.name,
-                      })
-                    }
-                    className="inline-flex items-center space-x-1 text-[10px] px-2 py-0.5 rounded bg-indigo-500/10 hover:bg-indigo-500/20 text-indigo-300 border border-indigo-500/30 transition-colors cursor-pointer"
-                  >
-                    <Terminal className="h-3 w-3" />
-                    <span>Inspect</span>
-                  </button>
-                )}
-                {evt.revision && (
-                  <span
-                    title={evt.revision}
-                    className="text-[10px] px-1.5 py-0.5 rounded bg-slate-950 border border-slate-800 text-slate-400 max-w-44 truncate"
-                  >
-                    {evt.revision}
-                  </span>
-                )}
-                <span
-                  className={`text-[10px] px-2 py-0.5 rounded font-bold ${
-                    evt.status === "Ready" || evt.status === "Healthy"
-                      ? "text-emerald-400 bg-emerald-500/10 border border-emerald-500/20"
-                      : evt.status === "Progressing"
-                        ? "text-blue-400 bg-blue-500/10 border border-blue-500/20"
-                        : "text-red-400 bg-red-500/10 border border-red-500/20"
-                  }`}
-                >
-                  {evt.status}
-                </span>
-              </div>
-            </div>
-          ))}
-
-          {filteredEvents.length === 0 && (
-            <div className="py-8 text-center text-slate-500 font-sans">
-              No CRD events received yet or stream cleared.
-            </div>
-          )}
-        </div>
-      </div>
+      <TelemetryStreamPanel
+        filteredEvents={filteredEvents}
+        eventFilterKind={eventFilterKind}
+        onEventFilterKindChange={setEventFilterKind}
+        isStreamPaused={isStreamPaused}
+        onToggleStreamPaused={() => setIsStreamPaused(!isStreamPaused)}
+        onClearEvents={() => setEvents([])}
+        onInspectStack={(namespace, name) =>
+          setInspectedStack({
+            namespace,
+            name,
+          })
+        }
+      />
 
       {/* Quiet Flagger Canary status when no rollouts are active */}
       {canaries.length === 0 && (

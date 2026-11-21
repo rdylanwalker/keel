@@ -254,10 +254,6 @@ export interface AuthStatus {
   tenant?: string
 }
 
-export interface BootstrapLoginRequest {
-  token: string
-}
-
 export interface ReleaseConfig {
   catalogId: string
   tenant: string

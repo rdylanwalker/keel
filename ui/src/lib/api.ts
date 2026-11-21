@@ -505,33 +505,11 @@ export async function fetchStackSshInfo(
     }
   }
 
-  try {
-    const res = await fetch(
-      `/api/v1/stacks/${encodeURIComponent(namespace)}/${encodeURIComponent(name)}/ssh-info`,
-      { headers: getHeaders() }
-    )
-    return await handleResponse<StackSshInfo>(res)
-  } catch (err) {
-    if (isDemoMode()) {
-      const tenant = namespace.startsWith("tenant-")
-        ? namespace.replace("tenant-", "")
-        : namespace
-      return {
-        stackName: name,
-        namespace,
-        tenant,
-        provider: "proxmox",
-        sshHost: "192.168.1.150",
-        sshUser: "debian",
-        sshPort: 22,
-        sshCommand: `ssh debian@192.168.1.150 -p 22`,
-        cliCommand: `keel infra ssh ${name} --tenant ${tenant}`,
-        cliExecCommand: `keel infra ssh ${name} --tenant ${tenant} --exec`,
-        hasSavedSshKey: true,
-      }
-    }
-    throw err
-  }
+  const res = await fetch(
+    `/api/v1/stacks/${encodeURIComponent(namespace)}/${encodeURIComponent(name)}/ssh-info`,
+    { headers: getHeaders() }
+  )
+  return handleResponse<StackSshInfo>(res)
 }
 
 export async function getReleaseDiagnostics(
