@@ -13,14 +13,19 @@ use thiserror::Error;
 
 pub use bootstrap::{
     BootstrapTarget, ClusterConnection, KubeconfigBootstrapTarget, PulumiBootstrapTarget,
-    ValidatedKubeconfig, factory as bootstrap_target_factory, validate_kubeconfig_yaml,
+    STAGE0_BACKEND_DIR, STAGE0_PASSPHRASE_FILE, Stage0Passphrase, Stage0PassphraseSource,
+    ValidatedKubeconfig, clear_stale_kind_stage0_state_in, ensure_private_dir,
+    factory as bootstrap_target_factory, generate_stage0_passphrase, keel_config_dir,
+    legacy_stage0_tmp_root, migrate_legacy_stage0_state_in, resolve_stage0_passphrase,
+    resolve_stage0_passphrase_in, stage0_cluster_dir_in, stage0_program_dir_in, stage0_state_root,
+    validate_kubeconfig_yaml, write_private_file,
 };
 pub use catalog::{
     PartitionedValues, PreparedHelmValues, SchemaFieldError, extract_manifest_variables,
     extract_secret_field_paths, is_secret_schema_node, parse_catalog, parse_catalog_application,
     parse_catalog_blueprint, parse_catalog_bundle, partition_values_by_schema, prepare_helm_values,
     render_helm_values_yaml, render_manifest_template, split_yaml_documents,
-    validate_k8s_manifests_yaml, validate_schema_values,
+    validate_k8s_manifests_yaml, validate_schema_values, verify_rendered_manifest_structure,
 };
 pub use crypto::{
     AES_256_KEY_LEN, AES_GCM_NONCE_LEN, AES_GCM_TAG_LEN, AgeKeyPair, EnvelopeCrypto, SopsConfig,

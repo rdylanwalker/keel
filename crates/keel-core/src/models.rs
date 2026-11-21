@@ -157,17 +157,18 @@ pub struct BootstrapConfig {
     /// Deploy in-cluster Rauthy OIDC provider during Stage 0 (default `true`; skipped when `oidc_issuer` is set or `--oidc-provider none`).
     #[serde(default = "default_true")]
     pub with_oidc: bool,
-    /// Optional external OIDC issuer URL (disables in-cluster Dex deployment when provided).
+    /// Optional external OIDC issuer URL (disables in-cluster Rauthy deployment when provided).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oidc_issuer: Option<String>,
     /// Optional OIDC client ID (defaults to `keel-server`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oidc_client_id: Option<String>,
-    /// Optional initial admin username/email for Stage 0 Dex seeding (defaults to `admin@keel.local`).
+    /// Optional initial admin username/email for Stage 0 Rauthy seeding (defaults to `admin@keel.local`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub admin_username: Option<String>,
-    /// Optional initial admin password for Stage 0 Dex seeding (auto-generated if omitted).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Optional initial admin password for Stage 0 Rauthy seeding (auto-generated if omitted).
+    /// Accepted on input but never serialized back out (`NFR-SEC-05`); redacted in `Debug`.
+    #[serde(default, skip_serializing)]
     pub admin_password: Option<String>,
     /// Explicit opt-in for generating a Kyverno `PolicyException` allowing local container/Docker
     /// socket mounts strictly on local `kind` management clusters. Rejected on all non-`kind` targets.
@@ -1561,46 +1562,133 @@ pub fn default_ssh_user_for_provider(provider: &str) -> &'static str {
     }
 }
 
-/// Returns `true` if `host` is `"localhost"`, ends with `".local"`, `".internal"`, or `".cluster.local"`,
-/// or parses as an `IpAddr` that is loopback, unspecified, link-local (`169.254.0.0/16` / `fe80::/10`),
-/// multicast, or broadcast.
+/// Returns `true` if `ip` is not a publicly routable unicast address: loopback, unspecified,
+/// link-local (`169.254.0.0/16` incl. the `169.254.169.254` cloud metadata endpoint,
+/// `fe80::/10`), RFC 1918 private (`10/8`, `172.16/12`, `192.168/16`), CGNAT (`100.64/10`),
+/// IPv6 unique-local (`fc00::/7`), multicast, broadcast, or "this network" (`0.0.0.0/8`).
+/// IPv4-mapped IPv6 addresses are checked as IPv4.
+///
+/// Used to vet **client-supplied** SSH targets (and their DNS resolutions) so the SSH proxy cannot
+/// be abused to reach the control-plane's internal networks. Stack-resolved targets from Pulumi
+/// outputs / GitOps manifests are trusted and are *not* subject to this check (Proxmox/kind VMs
+/// legitimately live on RFC 1918 networks).
+pub fn is_private_or_internal_ip(ip: std::net::IpAddr) -> bool {
+    fn v4_internal(v4: std::net::Ipv4Addr) -> bool {
+        let o = v4.octets();
+        v4.is_loopback()
+            || v4.is_unspecified()
+            || v4.is_link_local()
+            || v4.is_private()
+            || v4.is_multicast()
+            || v4.is_broadcast()
+            || o[0] == 0
+            || (o[0] == 100 && (o[1] & 0xc0) == 64)
+    }
+    match ip {
+        std::net::IpAddr::V4(v4) => v4_internal(v4),
+        std::net::IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return v4_internal(v4);
+            }
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_unicast_link_local()
+                || v6.is_unique_local()
+                || v6.is_multicast()
+        }
+    }
+}
+
+/// Returns `true` if `host` is a name or address that must never be targeted by a
+/// **client-supplied** SSH host override: `localhost`/`*.localhost`, mDNS/internal suffixes
+/// (`.local`, `.internal`, `.cluster.local`, `.svc`, `.svc.cluster.local`), single-label names
+/// (resolved via cluster search domains, e.g. `kubernetes`), or any IP literal rejected by
+/// [`is_private_or_internal_ip`].
+///
+/// DNS names that pass this check must additionally be resolved and every resolved address
+/// re-checked with [`is_private_or_internal_ip`] immediately before connecting (DNS rebinding).
 pub fn is_private_or_internal_ssh_host(host: &str) -> bool {
-    let lower = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    let lower = host
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
     if lower.is_empty()
         || lower == "localhost"
         || lower.ends_with(".localhost")
         || lower.ends_with(".local")
         || lower.ends_with(".internal")
         || lower.ends_with(".cluster.local")
+        || lower.ends_with(".svc")
     {
         return true;
     }
     if let Ok(ip) = lower.parse::<std::net::IpAddr>() {
-        return match ip {
-            std::net::IpAddr::V4(v4) => {
-                v4.is_loopback()
-                    || v4.is_unspecified()
-                    || v4.is_link_local()
-                    || v4.is_multicast()
-                    || v4.is_broadcast()
-            }
-            std::net::IpAddr::V6(v6) => {
-                if let Some(v4) = v6.to_ipv4_mapped() {
-                    v4.is_loopback()
-                        || v4.is_unspecified()
-                        || v4.is_link_local()
-                        || v4.is_multicast()
-                        || v4.is_broadcast()
-                } else {
-                    v6.is_loopback()
-                        || v6.is_unspecified()
-                        || v6.is_unicast_link_local()
-                        || v6.is_multicast()
-                }
-            }
-        };
+        return is_private_or_internal_ip(ip);
     }
-    false
+    // Single-label hostnames resolve through the pod's cluster search domains
+    // (`<svc>.<ns>.svc.cluster.local`), so they are treated as cluster-internal.
+    !lower.contains('.')
+}
+
+/// Returns `true` when `info.ssh_host` is the synthetic `<stack>.<tenant>.local` fallback produced
+/// by [`resolve_ssh_target_from_sources`] because no host could be resolved from Pulumi outputs or
+/// GitOps manifests.
+pub fn is_unresolved_ssh_target(info: &StackSshInfoResponse) -> bool {
+    info.ssh_host == format!("{}.{}.local", info.stack_name, info.tenant)
+}
+
+/// Output / config keys that may carry the expected SSH host key (an OpenSSH public key line such
+/// as `ssh-ed25519 AAAA...`, or a `SHA256:<base64>` fingerprint).
+const SSH_HOST_KEY_KEYS: &[&str] = &[
+    "sshHostKeyFingerprint",
+    "ssh_host_key_fingerprint",
+    "sshHostKey",
+    "ssh_host_key",
+    "hostKeyFingerprint",
+    "hostKey",
+];
+
+/// Resolves the expected SSH host key / fingerprint for a stack from live Pulumi outputs, then
+/// `values.yaml`, then `stack.yaml` `spec.config`. Returns the raw trimmed value (validation and
+/// fingerprint normalization happen in the SSH transport layer).
+pub fn resolve_ssh_host_key_from_sources(
+    live_outputs: &std::collections::HashMap<String, String>,
+    values_doc: Option<&serde_json::Value>,
+    stack_doc: Option<&serde_json::Value>,
+) -> Option<String> {
+    fn clean(raw: &str) -> Option<String> {
+        let t = raw.trim().trim_matches('"').trim_matches('\'').trim();
+        if t.is_empty() || t.starts_with("${") || t.eq_ignore_ascii_case("null") {
+            None
+        } else {
+            Some(t.to_string())
+        }
+    }
+    for key in SSH_HOST_KEY_KEYS {
+        if let Some(v) = live_outputs.get(*key).and_then(|v| clean(v)) {
+            return Some(v);
+        }
+    }
+    let objects = [
+        values_doc.and_then(serde_json::Value::as_object),
+        stack_doc
+            .and_then(|d| d.pointer("/spec/config"))
+            .and_then(serde_json::Value::as_object),
+    ];
+    for obj in objects.into_iter().flatten() {
+        for key in SSH_HOST_KEY_KEYS {
+            if let Some(v) = obj
+                .get(*key)
+                .and_then(serde_json::Value::as_str)
+                .and_then(clean)
+            {
+                return Some(v);
+            }
+        }
+    }
+    None
 }
 
 fn is_loopback_or_link_local(host: &str) -> bool {
@@ -2238,8 +2326,38 @@ mod tests {
         assert!(is_private_or_internal_ssh_host("fe80::1"));
         assert!(is_private_or_internal_ssh_host("224.0.0.1"));
         assert!(is_private_or_internal_ssh_host("255.255.255.255"));
-        assert!(!is_private_or_internal_ssh_host("192.168.1.50"));
-        assert!(!is_private_or_internal_ssh_host("203.0.113.10"));
+        // RFC 1918, CGNAT, IPv6 ULA, cluster service names, and mapped addresses are internal.
+        for host in [
+            "192.168.1.50",
+            "10.0.0.1",
+            "172.16.0.1",
+            "172.31.255.255",
+            "100.64.0.1",
+            "100.127.255.254",
+            "fc00::1",
+            "fd12:3456::1",
+            "[fd00::1]",
+            "::ffff:10.0.0.1",
+            "::ffff:169.254.169.254",
+            "0.1.2.3",
+            "kubernetes.default.svc",
+            "keel-server.keel-system.svc.cluster.local",
+            "kubernetes",
+            "metadata",
+        ] {
+            assert!(is_private_or_internal_ssh_host(host), "{host}");
+        }
+        for host in [
+            "203.0.113.10",
+            "8.8.8.8",
+            "172.32.0.1",
+            "100.128.0.1",
+            "2001:db8::1",
+            "vm.example.com",
+            "svc.example.com",
+        ] {
+            assert!(!is_private_or_internal_ssh_host(host), "{host}");
+        }
 
         assert_eq!(
             clean_candidate_ssh_host(r#"["127.0.0.1", "10.10.20.55/24"]"#).as_deref(),
@@ -2286,5 +2404,86 @@ mod tests {
         assert_eq!(info.ssh_port, 2222);
         assert_eq!(info.ssh_command, "ssh -p 2222 adminuser@10.20.30.40");
         assert!(info.has_saved_ssh_key);
+    }
+
+    #[test]
+    fn test_unresolved_ssh_target_and_host_key_resolution() {
+        let empty = std::collections::HashMap::new();
+        let info = resolve_ssh_target_from_sources(
+            "vm",
+            "tenant-acme",
+            "acme",
+            None,
+            &empty,
+            None,
+            None,
+            None,
+            false,
+        );
+        assert!(is_unresolved_ssh_target(&info));
+
+        let mut outputs = std::collections::HashMap::new();
+        outputs.insert("publicIp".to_string(), "203.0.113.7".to_string());
+        let info = resolve_ssh_target_from_sources(
+            "vm",
+            "tenant-acme",
+            "acme",
+            None,
+            &outputs,
+            None,
+            None,
+            None,
+            false,
+        );
+        assert!(!is_unresolved_ssh_target(&info));
+
+        assert_eq!(resolve_ssh_host_key_from_sources(&empty, None, None), None);
+        outputs.insert(
+            "sshHostKeyFingerprint".to_string(),
+            " SHA256:abc ".to_string(),
+        );
+        let values = serde_json::json!({ "sshHostKey": "ssh-ed25519 AAAAvalues" });
+        assert_eq!(
+            resolve_ssh_host_key_from_sources(&outputs, Some(&values), None).as_deref(),
+            Some("SHA256:abc")
+        );
+        assert_eq!(
+            resolve_ssh_host_key_from_sources(&empty, Some(&values), None).as_deref(),
+            Some("ssh-ed25519 AAAAvalues")
+        );
+        let stack = serde_json::json!({ "spec": { "config": { "ssh_host_key": "${unset}" } } });
+        assert_eq!(
+            resolve_ssh_host_key_from_sources(&empty, None, Some(&stack)),
+            None
+        );
+        let stack = serde_json::json!({ "spec": { "config": { "hostKey": "ssh-rsa AAAAstack" } } });
+        assert_eq!(
+            resolve_ssh_host_key_from_sources(&empty, None, Some(&stack)).as_deref(),
+            Some("ssh-rsa AAAAstack")
+        );
+    }
+
+    #[test]
+    fn test_is_private_or_internal_ip() {
+        use std::net::IpAddr;
+        for ip in [
+            "169.254.169.254",
+            "10.1.2.3",
+            "100.64.0.0",
+            "fd00::1",
+            "::1",
+            "127.0.0.1",
+        ] {
+            assert!(
+                is_private_or_internal_ip(ip.parse::<IpAddr>().unwrap()),
+                "{ip}"
+            );
+        }
+        for ip in ["1.1.1.1", "2606:4700:4700::1111", "::ffff:8.8.8.8"] {
+            assert!(
+                !is_private_or_internal_ip(ip.parse::<IpAddr>().unwrap()),
+                "{ip}"
+            );
+        }
     }
 }

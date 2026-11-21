@@ -524,10 +524,98 @@ pub fn extract_manifest_variables(raw_yaml: &str) -> Vec<String> {
     vars
 }
 
-/// Substitutes `${var_name}` and `${var_name:=default}` placeholders using stringified scalar values
-/// from `values` (if a key exists in `values`, replace with its string representation; else if `:=default`
-/// is present, replace with `default`; else leave `${var_name}` for Flux `postBuild` / Pulumi).
-pub fn render_manifest_template(raw_yaml: &str, values: &Value) -> String {
+/// Returns `true` when a placeholder spanning `prefix`..`suffix` on its line occupies an entire
+/// YAML scalar position: either a mapping value (`key: ${var}`) or a block sequence entry
+/// (`- ${var}`), optionally followed by a trailing ` # comment`.
+fn placeholder_is_whole_scalar(prefix: &str, suffix: &str) -> bool {
+    let suffix_ok = suffix.trim().is_empty()
+        || (suffix.starts_with(char::is_whitespace) && suffix.trim_start().starts_with('#'));
+    if !suffix_ok {
+        return false;
+    }
+    let mut rest = prefix.trim_start();
+    let mut saw_seq_dash = false;
+    while let Some(after) = rest.strip_prefix('-') {
+        if !after.starts_with(char::is_whitespace) {
+            break;
+        }
+        saw_seq_dash = true;
+        rest = after.trim_start();
+    }
+    if rest.is_empty() {
+        return saw_seq_dash;
+    }
+    rest.ends_with(char::is_whitespace) && rest.trim_end().ends_with(':')
+}
+
+/// Characters that may alter YAML structure when pasted inside a plain scalar.
+const EMBEDDED_FORBIDDEN_CHARS: &[char] = &[
+    '"', '\'', '\\', '#', '{', '}', '[', ']', ',', '&', '*', '!', '|', '>', '%', '@', '`',
+];
+
+/// Validates a value substituted into the middle of a scalar (e.g. `image: repo/${name}:tag`).
+/// Such values cannot be quoted, so anything that could change the YAML structure is rejected.
+fn validate_embedded_manifest_value(var_name: &str, value: &str) -> Result<(), CoreError> {
+    let reject = |reason: &str| {
+        Err(CoreError::Validation(format!(
+            "Manifest variable '{var_name}' {reason}"
+        )))
+    };
+    if value.chars().any(char::is_control) {
+        return reject("must not contain newlines or control characters");
+    }
+    if value.contains(EMBEDDED_FORBIDDEN_CHARS) {
+        return reject("contains YAML-structural characters that are not allowed inside a scalar");
+    }
+    if value.contains(": ") || value.ends_with(':') {
+        return reject("must not contain ': ' or end with ':' inside a scalar");
+    }
+    if value.starts_with(['-', '?', ' ']) || value.ends_with(' ') {
+        return reject("must not start with '-', '?' or whitespace, or end with whitespace");
+    }
+    Ok(())
+}
+
+/// Validates and renders a user-provided value for a placeholder.
+///
+/// Whole-scalar string values are emitted as YAML double-quoted strings (JSON string syntax is a
+/// valid YAML double-quoted scalar, so newlines/quotes/`---` are escaped and cannot inject
+/// structure). Embedded values are validated strictly by [`validate_embedded_manifest_value`].
+fn render_manifest_value(
+    var_name: &str,
+    value: &Value,
+    whole_scalar: bool,
+) -> Result<Option<String>, CoreError> {
+    let rendered = match value {
+        Value::Null => return Ok(None),
+        Value::Bool(b) => b.to_string(),
+        Value::Number(n) => n.to_string(),
+        Value::String(s) if whole_scalar => serde_json::to_string(s)?,
+        Value::String(s) => {
+            validate_embedded_manifest_value(var_name, s)?;
+            s.clone()
+        }
+        // Compact JSON is valid YAML flow syntax with all strings escaped.
+        Value::Array(_) | Value::Object(_) if whole_scalar => value.to_string(),
+        Value::Array(_) | Value::Object(_) => {
+            return Err(CoreError::Validation(format!(
+                "Manifest variable '{var_name}' is a structured value and may only be used as a whole YAML value"
+            )));
+        }
+    };
+    Ok(Some(rendered))
+}
+
+/// Substitutes `${var_name}` and `${var_name:=default}` placeholders using scalar values
+/// from `values` (if a key exists in `values`, replace with its rendered value; else if `:=default`
+/// is present, replace with the catalog-authored `default`; else leave `${var_name}` for Flux
+/// `postBuild` / Pulumi).
+///
+/// User-provided strings are rendered safely: when the placeholder is the entire YAML value
+/// (`key: ${var}` / `- ${var}`) the string is emitted as an escaped double-quoted scalar; when it is
+/// embedded in a larger scalar, values containing newlines, control characters, or YAML-structural
+/// characters are rejected with [`CoreError::Validation`] to prevent document/key injection.
+pub fn render_manifest_template(raw_yaml: &str, values: &Value) -> Result<String, CoreError> {
     let mut out = String::with_capacity(raw_yaml.len());
     let bytes = raw_yaml.as_bytes();
     let mut i = 0;
@@ -546,16 +634,20 @@ pub fn render_manifest_template(raw_yaml: &str, values: &Value) -> String {
                     None => (inner, None),
                 };
                 if is_valid_manifest_var_name(var_name) {
-                    let provided = values
-                        .as_object()
-                        .and_then(|obj| obj.get(var_name))
-                        .and_then(|v| match v {
-                            Value::Null => None,
-                            Value::String(s) => Some(s.clone()),
-                            Value::Bool(b) => Some(b.to_string()),
-                            Value::Number(n) => Some(n.to_string()),
-                            Value::Array(_) | Value::Object(_) => Some(v.to_string()),
-                        });
+                    let provided = match values.as_object().and_then(|obj| obj.get(var_name)) {
+                        Some(v) => {
+                            let line_start = raw_yaml[..i].rfind('\n').map_or(0, |p| p + 1);
+                            let line_end = raw_yaml[end + 1..]
+                                .find('\n')
+                                .map_or(raw_yaml.len(), |p| end + 1 + p);
+                            let whole = placeholder_is_whole_scalar(
+                                &raw_yaml[line_start..i],
+                                &raw_yaml[end + 1..line_end],
+                            );
+                            render_manifest_value(var_name, v, whole)?
+                        }
+                        None => None,
+                    };
                     if let Some(val_str) = provided {
                         out.push_str(&val_str);
                     } else if let Some(def) = default_opt {
@@ -574,7 +666,54 @@ pub fn render_manifest_template(raw_yaml: &str, values: &Value) -> String {
         i += ch.len_utf8();
     }
 
-    out
+    Ok(out)
+}
+
+/// Verifies that rendering a manifest template did not alter its document structure: the rendered
+/// YAML must be valid Kubernetes manifests with the same document count and the same
+/// `apiVersion`/`kind` sequence as the un-rendered template. Guards against value injection that
+/// smuggles in extra documents or changes resource kinds.
+pub fn verify_rendered_manifest_structure(
+    template_yaml: &str,
+    rendered_yaml: &str,
+) -> Result<Vec<Value>, CoreError> {
+    let rendered_docs = validate_k8s_manifests_yaml(rendered_yaml).map_err(|e| match e {
+        CoreError::Yaml(err) => {
+            CoreError::Validation(format!("Rendered manifests are not valid YAML: {err}"))
+        }
+        other => other,
+    })?;
+    let template_docs: Vec<Value> = split_yaml_documents(template_yaml)
+        .iter()
+        .map(|d| serde_yml::from_str::<Value>(d))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| CoreError::Validation(format!("Manifest template is not valid YAML: {e}")))?
+        .into_iter()
+        .filter(|d| !d.is_null())
+        .collect();
+    if template_docs.len() != rendered_docs.len() {
+        return Err(CoreError::Validation(format!(
+            "Rendered manifests contain {} document(s) but the template defines {}; refusing possible injection",
+            rendered_docs.len(),
+            template_docs.len()
+        )));
+    }
+    for (idx, (tpl, rendered)) in template_docs.iter().zip(&rendered_docs).enumerate() {
+        for field in ["apiVersion", "kind"] {
+            let tpl_val = tpl.get(field).and_then(Value::as_str);
+            // Templated identity fields (e.g. `kind: ${kind}`) are not pinned.
+            if tpl_val.is_some_and(|v| v.contains("${")) {
+                continue;
+            }
+            if tpl_val != rendered.get(field).and_then(Value::as_str) {
+                return Err(CoreError::Validation(format!(
+                    "Rendered manifest document #{} changed '{field}' from the template; refusing possible injection",
+                    idx + 1
+                )));
+            }
+        }
+    }
+    Ok(rendered_docs)
 }
 
 #[cfg(test)]
@@ -1084,7 +1223,8 @@ spec:
                 "app_name": "my-service",
                 "replicas": 3
             }),
-        );
+        )
+        .expect("render template");
         assert!(rendered.contains("name: my-service-config"));
         assert!(rendered.contains("LOG_LEVEL: info"));
         assert!(rendered.contains("SECRET_TOKEN: ${secret_token}"));
@@ -1095,6 +1235,96 @@ spec:
         assert!(validate_k8s_manifests_yaml("---\n---").is_err());
         assert!(validate_k8s_manifests_yaml("apiVersion: v1\nkind: ConfigMap\n").is_err());
         assert!(validate_k8s_manifests_yaml("kind: ConfigMap\nmetadata:\n  name: test\n").is_err());
+    }
+
+    #[test]
+    fn test_render_manifest_template_quotes_whole_scalars_and_blocks_injection() {
+        let template = "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: ${name}\ndata:\n  msg: ${msg} # comment\n  list:\n    - ${item}\n  image: repo/${tag}:v1\n";
+
+        // Injection attempt in a whole-scalar position is neutralised by quoting.
+        let injected = "x\n---\napiVersion: v1\nkind: Secret\nmetadata:\n  name: pwned";
+        let rendered = render_manifest_template(
+            template,
+            &json!({"name": "cm", "msg": injected, "item": "true", "tag": "app"}),
+        )
+        .expect("whole-scalar values are quoted");
+        assert!(rendered.contains("name: \"cm\""));
+        assert!(rendered.contains("- \"true\""));
+        assert!(rendered.contains("image: repo/app:v1"));
+        let docs =
+            verify_rendered_manifest_structure(template, &rendered).expect("structure preserved");
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0]["data"]["msg"], injected);
+        assert_eq!(docs[0]["data"]["list"][0], "true");
+
+        // Strings that look like other YAML types stay strings.
+        for tricky in ["", "123", "-leading", "null", "a: b", "'q'"] {
+            let rendered = render_manifest_template(
+                template,
+                &json!({"name": "cm", "msg": tricky, "tag": "app"}),
+            )
+            .unwrap();
+            let docs = verify_rendered_manifest_structure(template, &rendered).unwrap();
+            assert_eq!(docs[0]["data"]["msg"], tricky);
+        }
+
+        // Embedded placeholders reject structural characters and newlines.
+        for bad in [
+            "a\n---\nkind: Secret",
+            "a\rb",
+            "x\"y",
+            "x # c",
+            "x: y",
+            "{a}",
+            "[a]",
+            "-x",
+            "a\tb",
+        ] {
+            let err =
+                render_manifest_template(template, &json!({"name": "cm", "msg": "ok", "tag": bad}))
+                    .expect_err("embedded value must be rejected");
+            assert!(matches!(err, CoreError::Validation(_)), "{bad:?}: {err}");
+        }
+
+        // Structured values may only be used as whole values.
+        assert!(render_manifest_template(template, &json!({"tag": {"a": 1}})).is_err());
+        let rendered =
+            render_manifest_template(template, &json!({"name": "cm", "msg": {"k": "v\n"}}))
+                .unwrap();
+        let docs = verify_rendered_manifest_structure(template, &rendered).unwrap();
+        assert_eq!(docs[0]["data"]["msg"]["k"], "v\n");
+
+        // Numbers and booleans are rendered verbatim.
+        let rendered = render_manifest_template(
+            "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: d\nspec:\n  replicas: ${r}\n  paused: ${p}\n",
+            &json!({"r": 3, "p": false}),
+        )
+        .unwrap();
+        assert!(rendered.contains("replicas: 3"));
+        assert!(rendered.contains("paused: false"));
+    }
+
+    #[test]
+    fn test_verify_rendered_manifest_structure_rejects_new_documents_and_kinds() {
+        let template = "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: cm\n";
+        let extra_doc =
+            format!("{template}---\napiVersion: v1\nkind: Secret\nmetadata:\n  name: pwned\n");
+        let err = verify_rendered_manifest_structure(template, &extra_doc).unwrap_err();
+        assert!(err.to_string().contains("document"));
+
+        let changed_kind = "apiVersion: v1\nkind: Secret\nmetadata:\n  name: cm\n";
+        let err = verify_rendered_manifest_structure(template, changed_kind).unwrap_err();
+        assert!(err.to_string().contains("kind"));
+
+        let invalid = "apiVersion: v1\nkind: ConfigMap\nmetadata: [\n";
+        assert!(matches!(
+            verify_rendered_manifest_structure(template, invalid),
+            Err(CoreError::Validation(_))
+        ));
+
+        // Templated kinds are not pinned.
+        let tpl_kind = "apiVersion: v1\nkind: ${k}\nmetadata:\n  name: cm\n";
+        assert!(verify_rendered_manifest_structure(tpl_kind, template).is_ok());
     }
 
     #[test]

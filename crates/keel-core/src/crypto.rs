@@ -13,6 +13,7 @@ use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::process::Command;
+use zeroize::Zeroizing;
 
 use crate::{CoreError, validate_dns_label};
 
@@ -31,7 +32,7 @@ pub fn sha256_hex(data: &[u8]) -> String {
     hex::encode(digest)
 }
 
-/// Generates a cryptographically random 20-character alphanumeric admin password for Stage 0 Dex seeding.
+/// Generates a cryptographically random 20-character alphanumeric admin password for Stage 0 Rauthy admin seeding.
 pub fn generate_admin_password() -> String {
     const CHARSET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
     let mut rng = rand::rng();
@@ -46,9 +47,12 @@ pub fn generate_admin_password() -> String {
 /// `AES-256-GCM` envelope cipher for encrypting user SSH private keys and Forge PATs at rest (`NFR-SEC-05`).
 ///
 /// Ciphertext format: `Base64(12-byte random nonce || ciphertext || 16-byte GCM tag)`.
+///
+/// The key is held in a [`Zeroizing`] buffer so it is wiped with volatile writes on drop
+/// (a plain `fill(0)` may be optimized away, `NFR-SEC-05`).
 #[derive(Clone)]
 pub struct EnvelopeCrypto {
-    key: [u8; AES_256_KEY_LEN],
+    key: Zeroizing<[u8; AES_256_KEY_LEN]>,
 }
 
 impl fmt::Debug for EnvelopeCrypto {
@@ -59,35 +63,34 @@ impl fmt::Debug for EnvelopeCrypto {
     }
 }
 
-impl Drop for EnvelopeCrypto {
-    fn drop(&mut self) {
-        self.key.fill(0);
-    }
-}
-
 impl EnvelopeCrypto {
     /// Creates an `EnvelopeCrypto` instance from a 32-byte key.
     pub fn new(key: [u8; AES_256_KEY_LEN]) -> Self {
-        Self { key }
+        Self {
+            key: Zeroizing::new(key),
+        }
     }
 
     /// Creates an `EnvelopeCrypto` instance from a raw byte slice, validating 256-bit key length.
     pub fn from_slice(key_bytes: &[u8]) -> Result<Self, CoreError> {
-        let key: [u8; AES_256_KEY_LEN] = key_bytes.try_into().map_err(|_| {
-            CoreError::Crypto(format!(
-                "Invalid AES-256-GCM key length: expected {} bytes, got {}",
-                AES_256_KEY_LEN,
-                key_bytes.len()
-            ))
-        })?;
-        Ok(Self::new(key))
+        let key: Zeroizing<[u8; AES_256_KEY_LEN]> =
+            Zeroizing::new(key_bytes.try_into().map_err(|_| {
+                CoreError::Crypto(format!(
+                    "Invalid AES-256-GCM key length: expected {} bytes, got {}",
+                    AES_256_KEY_LEN,
+                    key_bytes.len()
+                ))
+            })?);
+        Ok(Self { key })
     }
 
     /// Creates an `EnvelopeCrypto` instance from a Base64-encoded 32-byte key.
     pub fn from_base64_key(b64_key: &str) -> Result<Self, CoreError> {
-        let decoded = BASE64
-            .decode(b64_key.trim())
-            .map_err(|e| CoreError::Crypto(format!("Invalid Base64 envelope key: {e}")))?;
+        let decoded = Zeroizing::new(
+            BASE64
+                .decode(b64_key.trim())
+                .map_err(|e| CoreError::Crypto(format!("Invalid Base64 envelope key: {e}")))?,
+        );
         Self::from_slice(&decoded)
     }
 
@@ -103,7 +106,7 @@ impl EnvelopeCrypto {
         plaintext: &[u8],
         aad: &[u8],
     ) -> Result<([u8; AES_GCM_NONCE_LEN], Vec<u8>), CoreError> {
-        let key: Key<Aes256Gcm> = self.key.into();
+        let key: Key<Aes256Gcm> = (*self.key).into();
         let cipher = Aes256Gcm::new(&key);
         let mut nonce_bytes = [0u8; AES_GCM_NONCE_LEN];
         rand::rng().fill(&mut nonce_bytes);
@@ -134,7 +137,7 @@ impl EnvelopeCrypto {
                 "Ciphertext payload too short to contain AES-GCM authentication tag".to_string(),
             ));
         }
-        let key: Key<Aes256Gcm> = self.key.into();
+        let key: Key<Aes256Gcm> = (*self.key).into();
         let cipher = Aes256Gcm::new(&key);
         let nonce = Nonce::try_from(nonce_bytes)
             .map_err(|_| CoreError::Crypto("Invalid AES-GCM nonce length".to_string()))?;
@@ -178,10 +181,12 @@ impl EnvelopeCrypto {
 }
 
 /// Generated `age` keypair with secret key redaction on `Debug` (`NFR-SEC-05`).
+///
+/// The secret key lives in a [`Zeroizing`] buffer wiped on drop.
 #[derive(Clone, PartialEq, Eq)]
 pub struct AgeKeyPair {
     pub public_key: String,
-    secret_key: String,
+    secret_key: Zeroizing<String>,
 }
 
 impl fmt::Debug for AgeKeyPair {
@@ -200,7 +205,8 @@ impl AgeKeyPair {
         secret_key: impl Into<String>,
     ) -> Result<Self, CoreError> {
         let public_key = public_key.into().trim().to_string();
-        let secret_key = secret_key.into().trim().to_string();
+        let raw_secret = Zeroizing::new(secret_key.into());
+        let secret_key = Zeroizing::new(raw_secret.trim().to_string());
         validate_age_public_key(&public_key)?;
         if !secret_key.starts_with("AGE-SECRET-KEY-1")
             || secret_key.chars().any(char::is_whitespace)
@@ -217,12 +223,16 @@ impl AgeKeyPair {
 
     /// Returns the raw `AGE-SECRET-KEY-1...` string for Kubernetes Secret injection or SOPS decryption.
     pub fn secret_key(&self) -> &str {
-        &self.secret_key
+        self.secret_key.as_str()
     }
 
     /// Formats the keypair as a Flux-compatible `age.agekey` file (`flux-system/sops-age`).
     pub fn to_keyfile_contents(&self) -> String {
-        format!("# public key: {}\n{}\n", self.public_key, self.secret_key)
+        format!(
+            "# public key: {}\n{}\n",
+            self.public_key,
+            self.secret_key.as_str()
+        )
     }
 }
 
@@ -700,7 +710,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sha256_and_dex_bcrypt_password_hashing() {
+    fn test_sha256_and_bcrypt_password_hashing() {
         let digest = sha256_hex(b"keel-oidc");
         assert_eq!(digest.len(), 64);
 
@@ -872,13 +882,30 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }
 
+    /// Minimal `which`: first executable `name` in `PATH`.
+    fn find_on_path(name: &str) -> Option<PathBuf> {
+        let path = std::env::var_os("PATH")?;
+        std::env::split_paths(&path)
+            .map(|dir| dir.join(name))
+            .find(|candidate| candidate.is_file())
+    }
+
     #[tokio::test]
     async fn test_real_sops_and_age_roundtrip_if_installed() {
-        let local_sops = PathBuf::from("/home/dylan/.local/bin/sops");
-        let local_keygen = PathBuf::from("/home/dylan/.local/bin/age-keygen");
-        if !(local_sops.exists() && local_keygen.exists()) {
+        // Discover real binaries on PATH (CI installs them; see docs). Skip loudly otherwise.
+        let (Some(local_sops), Some(local_keygen)) =
+            (find_on_path("sops"), find_on_path("age-keygen"))
+        else {
+            // CI sets KEEL_REQUIRE_SOPS=1 after installing pinned binaries: never skip silently there.
+            assert!(
+                std::env::var_os("KEEL_REQUIRE_SOPS").is_none(),
+                "KEEL_REQUIRE_SOPS is set but `sops`/`age-keygen` are not on PATH"
+            );
+            eprintln!(
+                "SKIPPED test_real_sops_and_age_roundtrip_if_installed: `sops` and/or `age-keygen` not found on PATH"
+            );
             return;
-        }
+        };
 
         let manager = SopsManager::with_binaries(local_sops, local_keygen);
         let keypair = manager.generate_age_keypair().await.unwrap();

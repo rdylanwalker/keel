@@ -14,11 +14,15 @@ use crate::CoreError;
 use crate::models::{BootstrapConfig, BootstrapTargetKind};
 
 /// Connection details returned after a Stage 0 `BootstrapTarget` provisions or attaches to a seed cluster.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `kubeconfig_yaml` carries cluster-admin credentials: it is redacted from `Debug` output and
+/// never serialized (`NFR-SEC-05`).
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClusterConnection {
     pub target: BootstrapTargetKind,
     pub cluster_name: String,
+    #[serde(default, skip_serializing)]
     pub kubeconfig_yaml: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kubeconfig_path: Option<PathBuf>,
@@ -26,6 +30,19 @@ pub struct ClusterConnection {
     pub context: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server_endpoint: Option<String>,
+}
+
+impl std::fmt::Debug for ClusterConnection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClusterConnection")
+            .field("target", &self.target)
+            .field("cluster_name", &self.cluster_name)
+            .field("kubeconfig_yaml", &"[REDACTED]")
+            .field("kubeconfig_path", &self.kubeconfig_path)
+            .field("context", &self.context)
+            .field("server_endpoint", &self.server_endpoint)
+            .finish()
+    }
 }
 
 /// Provider-agnostic Stage 0 cluster bootstrap interface (`SDD.md` §1.2, §2.1).
@@ -63,6 +80,8 @@ pub fn factory(kind: BootstrapTargetKind) -> Result<Box<dyn BootstrapTarget>, Co
 pub struct PulumiBootstrapTarget {
     target: BootstrapTargetKind,
     pulumi_bin: PathBuf,
+    /// Override for the Stage 0 state root (defaults to [`stage0_state_root`]).
+    state_root: Option<PathBuf>,
 }
 
 impl PulumiBootstrapTarget {
@@ -71,6 +90,7 @@ impl PulumiBootstrapTarget {
         Self {
             target,
             pulumi_bin: PathBuf::from("pulumi"),
+            state_root: None,
         }
     }
 
@@ -79,7 +99,18 @@ impl PulumiBootstrapTarget {
         Self {
             target,
             pulumi_bin: pulumi_bin.into(),
+            state_root: None,
         }
+    }
+
+    /// Overrides the Stage 0 state root directory (tests / custom layouts).
+    pub fn with_state_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.state_root = Some(root.into());
+        self
+    }
+
+    fn root(&self) -> PathBuf {
+        self.state_root.clone().unwrap_or_else(stage0_state_root)
     }
 
     /// Resolves the Stage 0 Pulumi program directory from `cfg.pulumi_program_dir` or the
@@ -118,7 +149,7 @@ impl PulumiBootstrapTarget {
     async fn materialize_program_dir(
         &self,
         cfg: &BootstrapConfig,
-        state_dir: &Path,
+        cluster_dir: &Path,
     ) -> Result<PathBuf, CoreError> {
         if let Some(explicit) = &cfg.pulumi_program_dir {
             if !explicit.is_dir() {
@@ -130,20 +161,23 @@ impl PulumiBootstrapTarget {
             return Ok(explicit.clone());
         }
 
+        // Always materialize into the private per-cluster program dir so the stack config file
+        // (`Pulumi.<stack>.yaml`, holding the passphrase salt and encrypted config) lives next to
+        // the durable state rather than in the repository checkout or `$TMP`.
         let rel = PathBuf::from("deploy/bootstrap").join(self.target.to_string());
-        if rel.join("Pulumi.yaml").is_file() {
-            return Ok(rel);
-        }
         let parent_rel = PathBuf::from("..").join(&rel);
-        if parent_rel.join("Pulumi.yaml").is_file() {
-            return Ok(parent_rel);
-        }
-
-        if let Some(yaml) = self.embedded_pulumi_yaml() {
-            let embedded_dir = state_dir.join("program");
-            tokio::fs::create_dir_all(&embedded_dir).await?;
-            tokio::fs::write(embedded_dir.join("Pulumi.yaml"), yaml).await?;
-            return Ok(embedded_dir);
+        let source_yaml = if rel.join("Pulumi.yaml").is_file() {
+            Some(tokio::fs::read_to_string(rel.join("Pulumi.yaml")).await?)
+        } else if parent_rel.join("Pulumi.yaml").is_file() {
+            Some(tokio::fs::read_to_string(parent_rel.join("Pulumi.yaml")).await?)
+        } else {
+            self.embedded_pulumi_yaml().map(str::to_string)
+        };
+        if let Some(yaml) = source_yaml {
+            let program_dir = stage0_program_dir_in(cluster_dir, self.target.as_str());
+            ensure_private_dir(&program_dir)?;
+            tokio::fs::write(program_dir.join("Pulumi.yaml"), yaml).await?;
+            return Ok(program_dir);
         }
 
         Err(CoreError::Validation(format!(
@@ -152,11 +186,14 @@ impl PulumiBootstrapTarget {
         )))
     }
 
-    /// Returns the isolated local Pulumi state directory for this Stage 0 target and cluster.
+    /// Returns the private per-cluster Stage 0 directory (`<config>/keel/stage0/<cluster>`).
+    pub fn cluster_dir(&self, cfg: &BootstrapConfig) -> PathBuf {
+        self.root().join(&cfg.cluster_name)
+    }
+
+    /// Returns the local DIY Pulumi backend directory shared by all Stage 0 stacks of the cluster.
     pub fn state_dir(&self, cfg: &BootstrapConfig) -> PathBuf {
-        std::env::temp_dir()
-            .join("keel-stage0-pulumi")
-            .join(format!("{}-{}", self.target, cfg.cluster_name))
+        self.cluster_dir(cfg).join(STAGE0_BACKEND_DIR)
     }
 
     /// Returns the Pulumi stack name for this Stage 0 target and cluster.
@@ -164,7 +201,9 @@ impl PulumiBootstrapTarget {
         format!("stage0-{}-{}", self.target, cfg.cluster_name)
     }
 
-    /// Builds explicit CLI arguments for `pulumi login file://<state_dir>`.
+    /// Builds explicit CLI arguments for `pulumi login file://<state_dir>` (informational; the
+    /// driver selects the backend through `PULUMI_BACKEND_URL` so the user's global
+    /// `pulumi login` is never modified).
     pub fn build_login_args(state_dir: &Path) -> Vec<String> {
         vec![
             "login".to_string(),
@@ -278,7 +317,13 @@ impl PulumiBootstrapTarget {
         cfg.validate()
     }
 
-    async fn run_pulumi(&self, program_dir: &Path, args: &[String]) -> Result<String, CoreError> {
+    async fn run_pulumi(
+        &self,
+        program_dir: &Path,
+        state_dir: &Path,
+        passphrase: &Stage0Passphrase,
+        args: &[String],
+    ) -> Result<String, CoreError> {
         let program_label = self.pulumi_bin.display().to_string();
         let mut cmd = Command::new(&self.pulumi_bin);
         cmd.args(args)
@@ -286,11 +331,14 @@ impl PulumiBootstrapTarget {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .env("PULUMI_SKIP_UPDATE_CHECK", "true");
-
-        if std::env::var_os("PULUMI_CONFIG_PASSPHRASE").is_none() {
-            cmd.env("PULUMI_CONFIG_PASSPHRASE", "");
-        }
+            .env("PULUMI_SKIP_UPDATE_CHECK", "true")
+            .env(
+                "PULUMI_BACKEND_URL",
+                format!("file://{}", state_dir.display()),
+            )
+            // Passed via environment only, never argv (`NFR-SEC-06`).
+            .env("PULUMI_CONFIG_PASSPHRASE", passphrase.expose())
+            .env_remove("PULUMI_CONFIG_PASSPHRASE_FILE");
 
         let output = cmd.output().await.map_err(|e| CoreError::CommandFailed {
             program: program_label.clone(),
@@ -322,60 +370,40 @@ impl BootstrapTarget for PulumiBootstrapTarget {
         cfg: &BootstrapConfig,
     ) -> Result<ClusterConnection, CoreError> {
         self.ensure_target(cfg)?;
-        let state_dir = self.state_dir(cfg);
-        if self.target == BootstrapTargetKind::Kind
-            && state_dir.exists()
-            && let Ok(output) = Command::new("kind")
-                .arg("get")
-                .arg("clusters")
-                .output()
-                .await
-            && output.status.success()
-        {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            if !parse_kind_clusters_output(&stdout, &cfg.cluster_name) {
-                tracing::info!(
-                    cluster = %cfg.cluster_name,
-                    state_dir = %state_dir.display(),
-                    "Clearing stale Stage 0 Pulumi state because kind cluster no longer exists"
-                );
-                let _ = tokio::fs::remove_dir_all(&state_dir).await;
-                let cp_state_dir = std::env::temp_dir()
-                    .join("keel-stage0-pulumi")
-                    .join(format!("control-plane-{}", cfg.cluster_name));
-                if cp_state_dir.exists() {
-                    let _ = tokio::fs::remove_dir_all(&cp_state_dir).await;
-                }
-            }
+        let root = self.root();
+        if self.target == BootstrapTargetKind::Kind {
+            clear_stale_kind_stage0_state_in(&root, &cfg.cluster_name).await;
         }
-        tokio::fs::create_dir_all(&state_dir).await?;
-        let program_dir = self.materialize_program_dir(cfg, &state_dir).await?;
+        let cluster_dir = self.cluster_dir(cfg);
+        let state_dir = self.state_dir(cfg);
+        ensure_private_dir(&state_dir)?;
+        let passphrase = resolve_stage0_passphrase_in(&root, &cfg.cluster_name)?;
+        let program_dir = self.materialize_program_dir(cfg, &cluster_dir).await?;
 
         tracing::info!(
             target = %self.target,
             cluster = %cfg.cluster_name,
             program_dir = %program_dir.display(),
+            state_dir = %state_dir.display(),
             "Provisioning Stage 0 cluster via Pulumi"
         );
 
-        self.run_pulumi(&program_dir, &Self::build_login_args(&state_dir))
-            .await?;
-        let select_args = self.build_stack_select_args(cfg, true)?;
-        self.run_pulumi(&program_dir, &select_args).await?;
-        self.run_pulumi(&program_dir, &Self::build_install_args())
-            .await?;
-
+        let run = |args: Vec<String>| {
+            let program_dir = program_dir.clone();
+            let state_dir = state_dir.clone();
+            let passphrase = &passphrase;
+            async move {
+                self.run_pulumi(&program_dir, &state_dir, passphrase, &args)
+                    .await
+            }
+        };
+        run(self.build_stack_select_args(cfg, true)?).await?;
+        run(Self::build_install_args()).await?;
         for (key, value) in self.build_config_set_pairs(cfg)? {
-            let set_args = Self::build_config_set_args(&key, &value);
-            self.run_pulumi(&program_dir, &set_args).await?;
+            run(Self::build_config_set_args(&key, &value)).await?;
         }
-
-        self.run_pulumi(&program_dir, &Self::build_up_args())
-            .await?;
-
-        let kubeconfig_yaml = self
-            .run_pulumi(&program_dir, &Self::build_stack_output_kubeconfig_args())
-            .await?;
+        run(Self::build_up_args()).await?;
+        let kubeconfig_yaml = run(Self::build_stack_output_kubeconfig_args()).await?;
         let validated = validate_kubeconfig_yaml(&kubeconfig_yaml, cfg.context.as_deref())?;
 
         Ok(ClusterConnection {
@@ -390,9 +418,12 @@ impl BootstrapTarget for PulumiBootstrapTarget {
 
     async fn teardown(&self, cfg: &BootstrapConfig) -> Result<(), CoreError> {
         self.ensure_target(cfg)?;
+        let root = self.root();
+        let cluster_dir = self.cluster_dir(cfg);
         let state_dir = self.state_dir(cfg);
-        tokio::fs::create_dir_all(&state_dir).await?;
-        let program_dir = self.materialize_program_dir(cfg, &state_dir).await?;
+        ensure_private_dir(&state_dir)?;
+        let passphrase = resolve_stage0_passphrase_in(&root, &cfg.cluster_name)?;
+        let program_dir = self.materialize_program_dir(cfg, &cluster_dir).await?;
 
         tracing::info!(
             target = %self.target,
@@ -401,15 +432,304 @@ impl BootstrapTarget for PulumiBootstrapTarget {
             "Tearing down Stage 0 cluster via Pulumi"
         );
 
-        self.run_pulumi(&program_dir, &Self::build_login_args(&state_dir))
-            .await?;
         let select_args = self.build_stack_select_args(cfg, false)?;
-        self.run_pulumi(&program_dir, &select_args).await?;
-        self.run_pulumi(&program_dir, &Self::build_destroy_args())
+        self.run_pulumi(&program_dir, &state_dir, &passphrase, &select_args)
             .await?;
+        self.run_pulumi(
+            &program_dir,
+            &state_dir,
+            &passphrase,
+            &Self::build_destroy_args(),
+        )
+        .await?;
 
         Ok(())
     }
+}
+
+// ============================================================================
+// Durable Stage 0 state layout & Pulumi passphrase (`NFR-REL-01`, `NFR-SEC-05`)
+// ============================================================================
+
+/// Sub-directory of a cluster's Stage 0 dir holding the local DIY Pulumi backend.
+pub const STAGE0_BACKEND_DIR: &str = "state";
+/// File (0600) inside a cluster's Stage 0 dir holding the generated Pulumi passphrase.
+pub const STAGE0_PASSPHRASE_FILE: &str = "pulumi-passphrase";
+/// Marker file recording that legacy (empty-passphrase) state is in use.
+pub const STAGE0_LEGACY_MARKER_FILE: &str = "legacy-empty-passphrase";
+
+/// Returns the Keel CLI config directory: `$KEEL_CONFIG_DIR`, `$XDG_CONFIG_HOME/keel`,
+/// `$HOME/.config/keel` (or `%APPDATA%\keel`), falling back to `<tmp>/keel` only if no home exists.
+pub fn keel_config_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("KEEL_CONFIG_DIR").filter(|v| !v.is_empty()) {
+        return PathBuf::from(dir);
+    }
+    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
+        return PathBuf::from(xdg).join("keel");
+    }
+    if let Some(home) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
+        return PathBuf::from(home).join(".config").join("keel");
+    }
+    if let Some(appdata) = std::env::var_os("APPDATA").filter(|v| !v.is_empty()) {
+        return PathBuf::from(appdata).join("keel");
+    }
+    std::env::temp_dir().join("keel")
+}
+
+/// Root of all durable Stage 0 state (`<config>/stage0`).
+pub fn stage0_state_root() -> PathBuf {
+    keel_config_dir().join("stage0")
+}
+
+/// Per-cluster Stage 0 directory under `root`.
+pub fn stage0_cluster_dir_in(root: &Path, cluster_name: &str) -> PathBuf {
+    root.join(cluster_name)
+}
+
+/// Per-program materialized Pulumi project directory for a cluster.
+pub fn stage0_program_dir_in(cluster_dir: &Path, program: &str) -> PathBuf {
+    cluster_dir.join("programs").join(program)
+}
+
+/// Legacy (pre-0.7) `$TMP` location of Stage 0 Pulumi state.
+pub fn legacy_stage0_tmp_root() -> PathBuf {
+    std::env::temp_dir().join("keel-stage0-pulumi")
+}
+
+/// Creates `path` (and parents) and restricts it to the current user (`0700` on Unix).
+pub fn ensure_private_dir(path: &Path) -> Result<(), CoreError> {
+    std::fs::create_dir_all(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+/// Writes `contents` to `path` with `0600` permissions (created or truncated).
+pub fn write_private_file(path: &Path, contents: &[u8]) -> Result<(), CoreError> {
+    use std::io::Write;
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        ensure_private_dir(parent)?;
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    file.write_all(contents)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+/// Where the Stage 0 Pulumi passphrase came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Stage0PassphraseSource {
+    /// `PULUMI_CONFIG_PASSPHRASE` was set by the operator.
+    Environment,
+    /// Read from an existing local `0600` passphrase file.
+    LocalFile(PathBuf),
+    /// Freshly generated and written to this `0600` file (must be escrowed by the operator).
+    Generated(PathBuf),
+    /// Pre-existing state created by older Keel versions with an empty passphrase.
+    LegacyEmpty,
+}
+
+/// Stage 0 Pulumi passphrase (zeroized on drop, never printed by `Debug`).
+#[derive(Clone)]
+pub struct Stage0Passphrase {
+    value: zeroize::Zeroizing<String>,
+    pub source: Stage0PassphraseSource,
+}
+
+impl std::fmt::Debug for Stage0Passphrase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Stage0Passphrase")
+            .field("value", &"[REDACTED]")
+            .field("source", &self.source)
+            .finish()
+    }
+}
+
+impl Stage0Passphrase {
+    /// Wraps an explicit passphrase value.
+    pub fn new(value: impl Into<String>, source: Stage0PassphraseSource) -> Self {
+        Self {
+            value: zeroize::Zeroizing::new(value.into()),
+            source,
+        }
+    }
+
+    /// Returns the passphrase for `PULUMI_CONFIG_PASSPHRASE` (environment only, never argv).
+    pub fn expose(&self) -> &str {
+        self.value.as_str()
+    }
+
+    /// `true` when the passphrase was generated during this invocation.
+    pub fn was_generated(&self) -> bool {
+        matches!(self.source, Stage0PassphraseSource::Generated(_))
+    }
+}
+
+/// Generates a strong random Stage 0 passphrase (288 bits, URL-safe base64).
+pub fn generate_stage0_passphrase() -> String {
+    use base64::Engine;
+    let bytes: [u8; 36] = rand::random();
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+fn dir_has_pulumi_stacks(backend_dir: &Path) -> bool {
+    std::fs::read_dir(backend_dir.join(".pulumi").join("stacks"))
+        .map(|mut it| it.next().is_some())
+        .unwrap_or(false)
+}
+
+/// Resolves the Stage 0 Pulumi passphrase for `cluster_name` under `root`:
+/// 1. `PULUMI_CONFIG_PASSPHRASE` (operator-provided),
+/// 2. the existing local `0600` passphrase file,
+/// 3. legacy empty passphrase if state already exists without a passphrase file,
+/// 4. otherwise a freshly generated strong passphrase persisted to a `0600` file.
+pub fn resolve_stage0_passphrase_in(
+    root: &Path,
+    cluster_name: &str,
+) -> Result<Stage0Passphrase, CoreError> {
+    crate::validate_dns_label(cluster_name, "cluster_name")?;
+    if let Ok(env) = std::env::var("PULUMI_CONFIG_PASSPHRASE") {
+        return Ok(Stage0Passphrase::new(
+            env,
+            Stage0PassphraseSource::Environment,
+        ));
+    }
+    let cluster_dir = stage0_cluster_dir_in(root, cluster_name);
+    let file = cluster_dir.join(STAGE0_PASSPHRASE_FILE);
+    if let Ok(existing) = std::fs::read_to_string(&file) {
+        let trimmed = existing.trim_end_matches(['\r', '\n']).to_string();
+        if !trimmed.is_empty() {
+            return Ok(Stage0Passphrase::new(
+                trimmed,
+                Stage0PassphraseSource::LocalFile(file),
+            ));
+        }
+    }
+    let marker = cluster_dir.join(STAGE0_LEGACY_MARKER_FILE);
+    if marker.is_file() || dir_has_pulumi_stacks(&cluster_dir.join(STAGE0_BACKEND_DIR)) {
+        if !marker.is_file() {
+            write_private_file(&marker, b"state predates passphrase generation\n")?;
+        }
+        return Ok(Stage0Passphrase::new(
+            String::new(),
+            Stage0PassphraseSource::LegacyEmpty,
+        ));
+    }
+    let generated = generate_stage0_passphrase();
+    write_private_file(&file, format!("{generated}\n").as_bytes())?;
+    Ok(Stage0Passphrase::new(
+        generated,
+        Stage0PassphraseSource::Generated(file),
+    ))
+}
+
+/// [`resolve_stage0_passphrase_in`] using the default [`stage0_state_root`].
+pub fn resolve_stage0_passphrase(cluster_name: &str) -> Result<Stage0Passphrase, CoreError> {
+    resolve_stage0_passphrase_in(&stage0_state_root(), cluster_name)
+}
+
+fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        let target = dst.join(entry.file_name());
+        if ty.is_dir() {
+            copy_dir_recursive(&entry.path(), &target)?;
+        } else if ty.is_file() && !target.exists() {
+            std::fs::copy(entry.path(), &target)?;
+        }
+    }
+    Ok(())
+}
+
+/// One-time migration of legacy `$TMP/keel-stage0-pulumi/*-<cluster>` DIY backends into the
+/// durable per-cluster backend under `root`. Returns `true` if anything was migrated.
+pub fn migrate_legacy_stage0_state_in(
+    root: &Path,
+    legacy_root: &Path,
+    cluster_name: &str,
+) -> Result<bool, CoreError> {
+    crate::validate_dns_label(cluster_name, "cluster_name")?;
+    let backend = stage0_cluster_dir_in(root, cluster_name).join(STAGE0_BACKEND_DIR);
+    if dir_has_pulumi_stacks(&backend) {
+        return Ok(false);
+    }
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    for target in BootstrapTargetKind::all() {
+        candidates.push(legacy_root.join(format!("{target}-{cluster_name}")));
+    }
+    let cp_root = legacy_root.join(format!("control-plane-{cluster_name}"));
+    if let Ok(entries) = std::fs::read_dir(&cp_root) {
+        for entry in entries.flatten() {
+            candidates.push(entry.path());
+        }
+    }
+    let mut migrated = false;
+    for dir in candidates {
+        let src = dir.join(".pulumi");
+        if src.join("stacks").is_dir() {
+            ensure_private_dir(&backend)?;
+            copy_dir_recursive(&src, &backend.join(".pulumi"))?;
+            migrated = true;
+        }
+    }
+    if migrated {
+        tracing::warn!(
+            cluster = cluster_name,
+            backend = %backend.display(),
+            "Migrated legacy Stage 0 Pulumi state out of $TMP; it was encrypted with an EMPTY passphrase. Re-bootstrap on a fresh cluster to rotate to a generated passphrase."
+        );
+    }
+    Ok(migrated)
+}
+
+/// Clears stale Stage 0 state when the `kind` cluster it describes no longer exists.
+/// The passphrase file is preserved.
+pub async fn clear_stale_kind_stage0_state_in(root: &Path, cluster_name: &str) {
+    let cluster_dir = stage0_cluster_dir_in(root, cluster_name);
+    let backend = cluster_dir.join(STAGE0_BACKEND_DIR);
+    if !backend.exists() {
+        return;
+    }
+    let Ok(output) = Command::new("kind")
+        .arg("get")
+        .arg("clusters")
+        .output()
+        .await
+    else {
+        return;
+    };
+    if !output.status.success() {
+        return;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if parse_kind_clusters_output(&stdout, cluster_name) {
+        return;
+    }
+    tracing::info!(
+        cluster = %cluster_name,
+        state_dir = %backend.display(),
+        "Clearing stale Stage 0 Pulumi state because kind cluster no longer exists"
+    );
+    let _ = tokio::fs::remove_dir_all(&backend).await;
+    let _ = tokio::fs::remove_dir_all(cluster_dir.join("programs")).await;
+    let _ = tokio::fs::remove_file(cluster_dir.join(STAGE0_LEGACY_MARKER_FILE)).await;
 }
 
 /// Pre-existing Kubernetes cluster Stage 0 driver (`k3s`, `Talos`, managed K8s) via `kubeconfig`.
@@ -696,7 +1016,8 @@ users:
         );
 
         let state_dir = driver.state_dir(&cfg);
-        assert!(state_dir.ends_with("keel-stage0-pulumi/kind-keel-dev"));
+        assert!(state_dir.ends_with("stage0/keel-dev/state"));
+        assert!(!state_dir.starts_with(std::env::temp_dir()) || std::env::var_os("HOME").is_none());
         assert_eq!(
             PulumiBootstrapTarget::build_login_args(&state_dir),
             vec!["login", &format!("file://{}", state_dir.display())]
@@ -924,7 +1245,8 @@ contexts:
         let log_file = temp_dir.join("invocations.log");
 
         let script = format!(
-            "#!/bin/sh\necho \"$@\" >> \"{}\"\nif [ \"$1\" = \"login\" ] || [ \"$1\" = \"install\" ] || [ \"$1\" = \"up\" ] || [ \"$1\" = \"destroy\" ]; then\n  exit 0\nfi\nif [ \"$1\" = \"stack\" ] && [ \"$2\" = \"select\" ]; then\n  exit 0\nfi\nif [ \"$1\" = \"config\" ] && [ \"$2\" = \"set\" ]; then\n  exit 0\nfi\nif [ \"$1\" = \"stack\" ] && [ \"$2\" = \"output\" ] && [ \"$3\" = \"kubeconfig\" ]; then\n  cat << 'EOF'\n{}\nEOF\n  exit 0\nfi\nexit 1\n",
+            "#!/bin/sh\necho \"$@\" >> \"{}\"\necho \"backend=$PULUMI_BACKEND_URL pass=${{#PULUMI_CONFIG_PASSPHRASE}}\" >> \"{}.env\"\nif [ \"$1\" = \"login\" ] || [ \"$1\" = \"install\" ] || [ \"$1\" = \"up\" ] || [ \"$1\" = \"destroy\" ]; then\n  exit 0\nfi\nif [ \"$1\" = \"stack\" ] && [ \"$2\" = \"select\" ]; then\n  exit 0\nfi\nif [ \"$1\" = \"config\" ] && [ \"$2\" = \"set\" ]; then\n  exit 0\nfi\nif [ \"$1\" = \"stack\" ] && [ \"$2\" = \"output\" ] && [ \"$3\" = \"kubeconfig\" ]; then\n  cat << 'EOF'\n{}\nEOF\n  exit 0\nfi\nexit 1\n",
+            log_file.display(),
             log_file.display(),
             SAMPLE_KUBECONFIG
         );
@@ -937,7 +1259,9 @@ contexts:
         std::fs::rename(&mock_pulumi_tmp, &mock_pulumi).unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
 
-        let driver = PulumiBootstrapTarget::with_binary(BootstrapTargetKind::Kind, &mock_pulumi);
+        let state_root = temp_dir.join("stage0-root");
+        let driver = PulumiBootstrapTarget::with_binary(BootstrapTargetKind::Kind, &mock_pulumi)
+            .with_state_root(&state_root);
         assert_eq!(driver.kind(), BootstrapTargetKind::Kind);
 
         let mut cfg = BootstrapConfig::new(BootstrapTargetKind::Kind);
@@ -958,8 +1282,24 @@ contexts:
 
         let logged = tokio::fs::read_to_string(&log_file).await.unwrap();
         let lines: Vec<&str> = logged.lines().collect();
-        assert!(lines.iter().any(|l| l.starts_with("login file://")));
+        // Backend chosen via PULUMI_BACKEND_URL (no global `pulumi login`), non-empty passphrase.
+        assert!(!lines.iter().any(|l| l.starts_with("login")));
         assert!(lines.contains(&"install"));
+        let env_log = tokio::fs::read_to_string(format!("{}.env", log_file.display()))
+            .await
+            .unwrap();
+        if std::env::var_os("PULUMI_CONFIG_PASSPHRASE").is_none() {
+            assert!(env_log.lines().all(|l| l.contains(&format!(
+                "backend=file://{}",
+                driver.state_dir(&cfg).display()
+            )) && !l.ends_with("pass=0")));
+            let pass_file = driver.cluster_dir(&cfg).join(STAGE0_PASSPHRASE_FILE);
+            #[cfg(unix)]
+            assert_eq!(
+                std::fs::metadata(&pass_file).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
         assert!(
             lines
                 .iter()
@@ -987,7 +1327,8 @@ contexts:
         let bad_driver = PulumiBootstrapTarget::with_binary(
             BootstrapTargetKind::Kind,
             temp_dir.join("missing-pulumi-bin"),
-        );
+        )
+        .with_state_root(&state_root);
         assert!(bad_driver.provision_cluster(&cfg).await.is_err());
 
         // Non-zero exit code error handling
@@ -995,7 +1336,7 @@ contexts:
         {
             use tokio::io::AsyncWriteExt;
             let mut file = tokio::fs::File::create(&failing_pulumi).await.unwrap();
-            file.write_all(b"#!/bin/sh\necho 'pulumi login failed' >&2\nexit 1\n")
+            file.write_all(b"#!/bin/sh\necho 'pulumi stack select failed' >&2\nexit 1\n")
                 .await
                 .unwrap();
             file.sync_all().await.unwrap();
@@ -1010,9 +1351,10 @@ contexts:
             .unwrap();
 
         let failing_driver =
-            PulumiBootstrapTarget::with_binary(BootstrapTargetKind::Kind, &failing_pulumi);
+            PulumiBootstrapTarget::with_binary(BootstrapTargetKind::Kind, &failing_pulumi)
+                .with_state_root(&state_root);
         let err = failing_driver.provision_cluster(&cfg).await.unwrap_err();
-        assert!(err.to_string().contains("pulumi login failed"));
+        assert!(err.to_string().contains("pulumi stack select failed"));
 
         // Default constructor & resolve_kubeconfig_path fallback
         let _default_kc = KubeconfigBootstrapTarget;
@@ -1035,5 +1377,56 @@ contexts:
             "keel-mgmt"
         ));
         assert!(!parse_kind_clusters_output("", "keel-mgmt"));
+    }
+
+    #[test]
+    fn test_stage0_passphrase_resolution_and_legacy_migration() {
+        if std::env::var_os("PULUMI_CONFIG_PASSPHRASE").is_some() {
+            eprintln!("SKIPPED: PULUMI_CONFIG_PASSPHRASE set in test environment");
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("keel-stage0-pp-{}", uuid::Uuid::new_v4()));
+        let first = resolve_stage0_passphrase_in(&root, "pp-test").unwrap();
+        assert!(first.was_generated());
+        assert!(first.expose().len() >= 40);
+        assert!(!format!("{first:?}").contains(first.expose()));
+        let second = resolve_stage0_passphrase_in(&root, "pp-test").unwrap();
+        assert_eq!(second.expose(), first.expose());
+        assert!(matches!(
+            second.source,
+            Stage0PassphraseSource::LocalFile(_)
+        ));
+        assert!(resolve_stage0_passphrase_in(&root, "../evil").is_err());
+
+        // Legacy: state exists without a passphrase file -> empty passphrase, sticky marker.
+        let legacy_root = root.join("legacy-tmp");
+        let legacy_stack = legacy_root
+            .join("control-plane-old")
+            .join("control-plane")
+            .join(".pulumi/stacks/keel-stage0-control-plane");
+        std::fs::create_dir_all(&legacy_stack).unwrap();
+        std::fs::write(legacy_stack.join("stage0-control-plane-old.json"), "{}").unwrap();
+        assert!(migrate_legacy_stage0_state_in(&root, &legacy_root, "old").unwrap());
+        assert!(!migrate_legacy_stage0_state_in(&root, &legacy_root, "old").unwrap());
+        let legacy = resolve_stage0_passphrase_in(&root, "old").unwrap();
+        assert_eq!(legacy.source, Stage0PassphraseSource::LegacyEmpty);
+        assert_eq!(legacy.expose(), "");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_cluster_connection_debug_and_serialize_redact_kubeconfig() {
+        let conn = ClusterConnection {
+            target: BootstrapTargetKind::Kind,
+            cluster_name: "c".to_string(),
+            kubeconfig_yaml: "token: super-secret-kubeconfig".to_string(),
+            kubeconfig_path: None,
+            context: None,
+            server_endpoint: None,
+        };
+        assert!(!format!("{conn:?}").contains("super-secret"));
+        let json = serde_json::to_string(&conn).unwrap();
+        assert!(!json.contains("super-secret"));
+        assert!(!json.contains("kubeconfigYaml"));
     }
 }
