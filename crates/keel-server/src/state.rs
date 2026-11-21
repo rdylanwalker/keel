@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use keel_core::{AuthPhase, OidcConfig, split_yaml_documents};
+use keel_core::{AuthPhase, InfraResourceKind, OidcConfig, split_yaml_documents};
 use keel_git::{ForgeProvider, GitRunner, LocalGitProvider};
 use keel_kube::{
     InMemorySecretStore, LiveResourceStatus, LiveStatusSource, SecretStateStore, StackDiagnostics,
@@ -36,6 +36,10 @@ pub struct StackSummary {
     #[serde(rename = "type", default = "default_stack_type")]
     pub stack_type: String,
     pub preview: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resource_kind: Option<InfraResourceKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub catalog_id: Option<String>,
     pub protect: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bundle: Option<String>,
@@ -207,6 +211,54 @@ pub struct RepoClusterStateProvider {
     repo_workdir: PathBuf,
 }
 
+fn infer_stack_resource_kind(
+    name: &str,
+    namespace: &str,
+    provider: Option<&str>,
+    label_resource_kind: Option<&str>,
+    catalog_id: Option<&str>,
+    has_kubeconfig_secret: bool,
+    is_manifest_runtime: bool,
+) -> InfraResourceKind {
+    if let Some(r) = label_resource_kind.and_then(|r| r.parse::<InfraResourceKind>().ok()) {
+        return r;
+    }
+
+    if name == "management-cluster-core"
+        || namespace == "flux-system"
+        || provider == Some("kind")
+        || has_kubeconfig_secret
+        || catalog_id.is_some_and(|c| {
+            c.contains("cluster")
+                || c.contains("eks")
+                || c.contains("gke")
+                || c.contains("aks")
+                || c.contains("k3s")
+        })
+        || name.contains("cluster")
+        || name.contains("eks")
+        || name.contains("gke")
+        || name.contains("aks")
+        || name.contains("k3s")
+    {
+        InfraResourceKind::Cluster
+    } else if is_manifest_runtime
+        || provider == Some("kubernetes")
+        || provider == Some("cloudflare")
+        || catalog_id == Some("postgres-managed")
+        || catalog_id == Some("canary-gateway-config")
+        || name.contains("postgres")
+        || name.contains("db")
+        || name.contains("gateway")
+        || name.ends_with("-net")
+        || name == "net"
+    {
+        InfraResourceKind::Service
+    } else {
+        InfraResourceKind::Vm
+    }
+}
+
 impl RepoClusterStateProvider {
     pub fn new(repo_workdir: impl Into<PathBuf>) -> Self {
         Self {
@@ -359,6 +411,31 @@ impl ClusterStateProvider for RepoClusterStateProvider {
                 let stack_type =
                     infer_stack_type(&name, &namespace, doc_provider.as_deref(), label_type);
 
+                let catalog_id = val
+                    .pointer("/metadata/labels/keel.io~1catalog-id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+
+                let is_manifest_runtime = val.pointer("/spec/manifests").is_some();
+                let has_kubeconfig_secret =
+                    val.pointer("/spec/config/kubeconfigSecretName").is_some()
+                        && doc_provider.as_deref() != Some("kubernetes")
+                        && catalog_id.as_deref() != Some("canary-gateway-config")
+                        && !name.contains("gateway");
+
+                let label_resource_kind = val
+                    .pointer("/metadata/labels/keel.io~1resource-kind")
+                    .and_then(Value::as_str);
+                let resource_kind = infer_stack_resource_kind(
+                    &name,
+                    &namespace,
+                    doc_provider.as_deref(),
+                    label_resource_kind,
+                    catalog_id.as_deref(),
+                    has_kubeconfig_secret,
+                    is_manifest_runtime,
+                );
+
                 stacks.push(StackSummary {
                     name,
                     namespace,
@@ -368,6 +445,8 @@ impl ClusterStateProvider for RepoClusterStateProvider {
                     stack_type,
                     preview,
                     protect,
+                    resource_kind: Some(resource_kind),
+                    catalog_id,
                     bundle: doc_bundle,
                     bundle_item: doc_bundle_item,
                     resource_count: None,
@@ -392,6 +471,8 @@ impl ClusterStateProvider for RepoClusterStateProvider {
                     stack_type: "management".to_string(),
                     preview: false,
                     protect: true,
+                    resource_kind: Some(InfraResourceKind::Cluster),
+                    catalog_id: None,
                     bundle: None,
                     bundle_item: None,
                     resource_count: None,
@@ -652,15 +733,21 @@ impl ClusterStateProvider for KubeClusterStateProvider {
                 continue;
             }
             if !stacks.iter().any(|s| s.namespace == *ns && s.name == *name) {
+                let stack_type = infer_stack_type(name, ns, None, None);
+                let resource_kind =
+                    infer_stack_resource_kind(name, ns, None, None, None, false, false);
+
                 stacks.push(StackSummary {
                     name: name.clone(),
                     namespace: ns.clone(),
                     tenant: inferred_tenant.map(str::to_owned),
                     stack: name.clone(),
                     provider: None,
-                    stack_type: infer_stack_type(name, ns, None, None),
+                    stack_type,
                     preview: false,
                     protect: false,
+                    resource_kind: Some(resource_kind),
+                    catalog_id: None,
                     bundle: None,
                     bundle_item: None,
                     resource_count: info.resource_count,

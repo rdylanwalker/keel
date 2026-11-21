@@ -839,7 +839,15 @@ pub async fn create_proposal(
             if bp.metadata.provider == "kind" {
                 stack_params.docker_host = state.docker_proxy_url.clone();
             }
-            let stack = synthesize_tenant_stack(&stack_params)?;
+            let mut stack = synthesize_tenant_stack(&stack_params)?;
+            stack
+                .metadata
+                .labels
+                .insert("keel.io/catalog-id".to_string(), bp.metadata.id.clone());
+            stack.metadata.labels.insert(
+                "keel.io/resource-kind".to_string(),
+                bp.effective_resource_kind().as_str().to_string(),
+            );
             let stack_yaml = stack.to_yaml()?;
             (
                 rel_dir,
@@ -1351,6 +1359,17 @@ pub async fn create_proposal(
     )?;
     if !is_app || manifest_engine == Some(ManifestEngine::Pulumi) {
         populate_stack_config_from_values(&mut preview_params.config, &partitioned.normal_values);
+        if let CatalogManifest::InfraBlueprint(bp) = &manifest
+            && bp.spec.outputs.iter().any(|o| o == "kubeconfig")
+        {
+            preview_params.config.insert(
+                "kubeconfigSecretName".to_string(),
+                format!("{instance_name}-kubeconfig"),
+            );
+            preview_params
+                .config
+                .insert("kubeconfigSecretNamespace".to_string(), tenant_ns.clone());
+        }
         if let Some(ref s3_secret) = state.s3_credentials_secret {
             let _ = state
                 .secret_store
@@ -1843,7 +1862,15 @@ async fn create_bundle_proposal(
                         stack_params.config.insert(k.clone(), str_val);
                     }
                 }
-                let stack = synthesize_tenant_stack(&stack_params)?;
+                let mut stack = synthesize_tenant_stack(&stack_params)?;
+                stack
+                    .metadata
+                    .labels
+                    .insert("keel.io/catalog-id".to_string(), bp.metadata.id.clone());
+                stack.metadata.labels.insert(
+                    "keel.io/resource-kind".to_string(),
+                    bp.effective_resource_kind().as_str().to_string(),
+                );
                 let stack_yaml = stack.to_yaml()?;
 
                 let blueprint_pulumi_path = state

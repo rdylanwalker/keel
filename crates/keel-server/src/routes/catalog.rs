@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use axum::Json;
-use axum::extract::{Path as AxumPath, State};
+use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::StatusCode;
 use chrono::Utc;
 use keel_core::{
@@ -12,9 +12,9 @@ use keel_core::{
     CATALOG_INFRA_BLUEPRINT_KIND, CatalogAppMetadata, CatalogAppSpec, CatalogApplication,
     CatalogBlueprintMetadata, CatalogBlueprintSpec, CatalogBundle, CatalogBundleItem,
     CatalogBundleMetadata, CatalogBundleSpec, CatalogInfraBlueprint, CatalogManifest,
-    ManifestEngine, ProgressiveDeliverySpec, UpstreamSource, extract_manifest_variables,
-    parse_catalog_application, parse_catalog_blueprint, parse_catalog_bundle, validate_dns_label,
-    validate_k8s_manifests_yaml,
+    InfraResourceKind, ManifestEngine, ProgressiveDeliverySpec, UpstreamSource,
+    extract_manifest_variables, parse_catalog_application, parse_catalog_blueprint,
+    parse_catalog_bundle, validate_dns_label, validate_k8s_manifests_yaml,
 };
 use keel_git::PullRequestInfo;
 use keel_pko::build_preview_branch;
@@ -119,13 +119,19 @@ async fn load_catalog_items_from_dir(
     Ok((applications, manifests_map))
 }
 
+#[derive(Debug, Deserialize)]
+pub struct GetCatalogQuery {
+    pub tenant: Option<String>,
+}
+
 /// `GET /api/v1/catalog`
 ///
 /// Scans `catalog/apps/*/catalog.yaml` and `catalog/infra/*/catalog.yaml` in `repo_workdir`,
 /// filtering infrastructure blueprints by enabled providers in `providers/registry.yaml`.
 pub async fn get_catalog(
-    _auth: AuthSession,
+    auth: AuthSession,
     State(state): State<AppState>,
+    Query(query): Query<GetCatalogQuery>,
 ) -> Result<Json<CatalogResponse>, ServerError> {
     let registry = load_provider_registry(&state.repo_workdir).await?;
 
@@ -135,8 +141,26 @@ pub async fn get_catalog(
         .map(|p| p.id.clone())
         .collect();
 
-    let (applications, manifests_yaml) =
+    let (mut applications, manifests_yaml) =
         load_catalog_items_from_dir(&state.repo_workdir.join("catalog/apps")).await?;
+
+    let filter_tenant = query
+        .tenant
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("all"));
+
+    let is_item_visible = |item_tenant: Option<&str>| -> bool {
+        match item_tenant {
+            Some(item_t) => {
+                let has_access = auth.is_admin() || auth.require_tenant_access(item_t).is_ok();
+                has_access && filter_tenant.is_none_or(|f_t| item_t == f_t)
+            }
+            None => true,
+        }
+    };
+
+    applications.retain(|a| is_item_visible(a.application.metadata.tenant.as_deref()));
 
     let mut core_addons = Vec::new();
     for path in find_catalog_files(&state.repo_workdir.join("catalog/core")).await {
@@ -155,23 +179,26 @@ pub async fn get_catalog(
     for path in find_catalog_files(&state.repo_workdir.join("catalog/infra")).await {
         let yaml = tokio::fs::read_to_string(&path).await?;
         match parse_catalog_blueprint(&yaml) {
-            Ok(bp) => {
-                let is_kubernetes_builtin = bp.metadata.provider == "kubernetes"
-                    && !registry.providers.iter().any(|p| p.id == "kubernetes");
-                if registry.is_enabled(&bp.metadata.provider) || is_kubernetes_builtin {
-                    if let Some(dir) = path.parent() {
-                        let entrypoint = if bp.spec.entrypoint.trim().is_empty() {
-                            "Pulumi.yaml"
-                        } else {
-                            bp.spec.entrypoint.as_str()
-                        };
-                        if let Some(pulumi_path) = safe_relative_path(dir, entrypoint)
-                            && let Ok(content) = tokio::fs::read_to_string(&pulumi_path).await
-                        {
-                            pulumi_yaml.insert(bp.metadata.id.clone(), content);
+            Ok(mut bp) => {
+                if is_item_visible(bp.metadata.tenant.as_deref()) {
+                    let is_kubernetes_builtin = bp.metadata.provider == "kubernetes"
+                        && !registry.providers.iter().any(|p| p.id == "kubernetes");
+                    if registry.is_enabled(&bp.metadata.provider) || is_kubernetes_builtin {
+                        bp.metadata.resource_kind = Some(bp.effective_resource_kind());
+                        if let Some(dir) = path.parent() {
+                            let entrypoint = if bp.spec.entrypoint.trim().is_empty() {
+                                "Pulumi.yaml"
+                            } else {
+                                bp.spec.entrypoint.as_str()
+                            };
+                            if let Some(pulumi_path) = safe_relative_path(dir, entrypoint)
+                                && let Ok(content) = tokio::fs::read_to_string(&pulumi_path).await
+                            {
+                                pulumi_yaml.insert(bp.metadata.id.clone(), content);
+                            }
                         }
+                        blueprints.push(bp);
                     }
-                    blueprints.push(bp);
                 }
             }
             Err(err) => {
@@ -185,7 +212,11 @@ pub async fn get_catalog(
     for path in find_catalog_files(&state.repo_workdir.join("catalog/bundles")).await {
         let yaml = tokio::fs::read_to_string(&path).await?;
         match parse_catalog_bundle(&yaml) {
-            Ok(bundle) => bundles.push(bundle),
+            Ok(bundle) => {
+                if is_item_visible(bundle.metadata.tenant.as_deref()) {
+                    bundles.push(bundle);
+                }
+            }
             Err(err) => {
                 tracing::warn!(path = %path.display(), error = %err, "Skipping invalid CatalogBundle");
             }
@@ -251,6 +282,12 @@ pub struct RegisterCatalogAppRequest {
     pub items: Option<Vec<CatalogBundleItem>>,
     #[serde(default)]
     pub schema: Option<Value>,
+    #[serde(default)]
+    pub protected: bool,
+    #[serde(default)]
+    pub tenant: Option<String>,
+    #[serde(default)]
+    pub resource_kind: Option<InfraResourceKind>,
 }
 
 /// Type alias for catalog item creation requests.
@@ -280,8 +317,21 @@ pub async fn register_catalog_app(
     State(state): State<AppState>,
     Json(req): Json<RegisterCatalogAppRequest>,
 ) -> Result<(StatusCode, Json<RegisterCatalogAppResponse>), ServerError> {
-    auth.require_admin()?;
     validate_dns_label(&req.id, "id")?;
+
+    let normalized_tenant = req
+        .tenant
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("all"))
+        .map(str::to_string);
+
+    if let Some(ref t) = normalized_tenant {
+        validate_dns_label(t, "tenant")?;
+        auth.require_tenant_admin(t)?;
+    } else {
+        auth.require_admin()?;
+    }
 
     match req.kind.as_str() {
         "app" => {
@@ -424,6 +474,8 @@ pub async fn register_catalog_app(
                     description: req.description.filter(|s| !s.trim().is_empty()),
                     category: req.category,
                     runtime,
+                    protected: req.protected,
+                    tenant: normalized_tenant.clone(),
                 },
                 spec: CatalogAppSpec {
                     upstream: UpstreamSource {
@@ -560,6 +612,9 @@ pub async fn register_catalog_app(
                     description: req.description.filter(|s| !s.trim().is_empty()),
                     category: req.category,
                     provider: provider.clone(),
+                    protected: req.protected,
+                    tenant: normalized_tenant.clone(),
+                    resource_kind: req.resource_kind,
                 },
                 spec: CatalogBlueprintSpec {
                     pulumi_runtime: pulumi_runtime.clone(),
@@ -712,6 +767,8 @@ pub async fn register_catalog_app(
                     name: req.name.clone(),
                     description: req.description.clone(),
                     category: req.category.clone(),
+                    protected: req.protected,
+                    tenant: normalized_tenant.clone(),
                 },
                 spec: CatalogBundleSpec {
                     items,
@@ -920,8 +977,15 @@ pub struct UpdateCatalogItemRequest {
     pub items: Option<Vec<CatalogBundleItem>>,
     #[serde(default)]
     pub schema: Option<Value>,
+    #[serde(default)]
+    pub protected: Option<bool>,
+    #[serde(default)]
+    pub tenant: Option<String>,
+    #[serde(default)]
+    pub resource_kind: Option<InfraResourceKind>,
 }
 
+/// `PUT /api/v1/catalog/{kind}/{id}`
 fn merge_optional_text(incoming: Option<String>, existing: Option<String>) -> Option<String> {
     match incoming {
         Some(v) => {
@@ -947,7 +1011,6 @@ pub async fn update_catalog_item(
     AxumPath((kind, id)): AxumPath<(String, String)>,
     Json(req): Json<UpdateCatalogItemRequest>,
 ) -> Result<(StatusCode, Json<RegisterCatalogAppResponse>), ServerError> {
-    auth.require_admin()?;
     validate_dns_label(&id, "id")?;
     let normalized_kind = match kind.as_str() {
         "app" => "app",
@@ -984,6 +1047,31 @@ pub async fn update_catalog_item(
             )));
         }
         let existing_yaml = tokio::fs::read_to_string(&abs_file).await?;
+        let manifest =
+            load_catalog_manifest(&state.repo_workdir, &id, Some(normalized_kind)).await?;
+
+        let existing_tenant = manifest.tenant();
+        if let Some(t) = existing_tenant {
+            auth.require_tenant_admin(t)?;
+        } else {
+            auth.require_admin()?;
+        }
+
+        let new_tenant = if let Some(ref raw_new_t) = req.tenant {
+            let trimmed = raw_new_t.trim();
+            if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("all") {
+                if existing_tenant.is_some() {
+                    auth.require_admin()?;
+                }
+                Some(None)
+            } else {
+                validate_dns_label(trimmed, "tenant")?;
+                auth.require_tenant_admin(trimmed)?;
+                Some(Some(trimmed.to_string()))
+            }
+        } else {
+            None
+        };
 
         let validated_manifests_yaml = if normalized_kind == "app"
             && let Some(raw_manifests) = req.manifests_yaml.filter(|s| !s.trim().is_empty())
@@ -1001,6 +1089,12 @@ pub async fn update_catalog_item(
         let (catalog_yaml, app_out, bp_out, bundle_out, title_name) = match normalized_kind {
             "app" => {
                 let mut app = parse_catalog_application(&existing_yaml)?;
+                if let Some(nt) = &new_tenant {
+                    app.metadata.tenant = nt.clone();
+                }
+                if let Some(p) = req.protected {
+                    app.metadata.protected = p;
+                }
                 app.metadata.name = req.name.clone();
                 app.metadata.category = req.category.clone();
                 app.metadata.description =
@@ -1081,6 +1175,15 @@ pub async fn update_catalog_item(
             }
             "infra" => {
                 let mut bp = parse_catalog_blueprint(&existing_yaml)?;
+                if let Some(nt) = &new_tenant {
+                    bp.metadata.tenant = nt.clone();
+                }
+                if let Some(p) = req.protected {
+                    bp.metadata.protected = p;
+                }
+                if let Some(rk) = req.resource_kind {
+                    bp.metadata.resource_kind = Some(rk);
+                }
                 bp.metadata.name = req.name.clone();
                 bp.metadata.category = req.category.clone();
                 bp.metadata.description =
@@ -1115,6 +1218,12 @@ pub async fn update_catalog_item(
             }
             "bundle" => {
                 let mut bundle = parse_catalog_bundle(&existing_yaml)?;
+                if let Some(nt) = &new_tenant {
+                    bundle.metadata.tenant = nt.clone();
+                }
+                if let Some(p) = req.protected {
+                    bundle.metadata.protected = p;
+                }
                 bundle.metadata.name = req.name.clone();
                 bundle.metadata.category = req.category.clone();
                 bundle.metadata.description =
@@ -1554,4 +1663,113 @@ pub async fn fetch_catalog_schema(
     let (schema, source) =
         fetch_upstream_helm_schema(&req.repo_url, &req.chart, req.version.as_deref()).await?;
     Ok(Json(FetchCatalogSchemaResponse { schema, source }))
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteCatalogItemResponse {
+    pub id: String,
+    pub kind: String,
+    pub proposal: PullRequestInfo,
+    pub branch: String,
+}
+
+/// `DELETE /api/v1/catalog/{kind}/{id}`
+pub async fn delete_catalog_item(
+    auth: AuthSession,
+    State(state): State<AppState>,
+    AxumPath((kind, id)): AxumPath<(String, String)>,
+) -> Result<Json<DeleteCatalogItemResponse>, ServerError> {
+    validate_dns_label(&id, "id")?;
+    let normalized_kind = match kind.as_str() {
+        "app" | "application" => "app",
+        "infra" | "infrastructure" | "blueprint" => "infra",
+        "bundle" => "bundle",
+        other => {
+            return Err(ServerError::BadRequest(format!(
+                "Unsupported catalog kind '{other}'; expected 'app', 'infra', or 'bundle'"
+            )));
+        }
+    };
+
+    let rel_dir = match normalized_kind {
+        "app" => format!("catalog/apps/{id}"),
+        "infra" => format!("catalog/infra/{id}"),
+        "bundle" => format!("catalog/bundles/{id}"),
+        _ => unreachable!(),
+    };
+    let rel_file = format!("{rel_dir}/catalog.yaml");
+
+    let timestamp = super::next_unique_branch_timestamp();
+    let branch = build_preview_branch("catalog", &format!("delete-{id}"), timestamp)?;
+
+    let (_commit_sha, display_name) = {
+        let _guard = state.git_lock.lock().await;
+        state
+            .git_runner
+            .sync_branch_from_remote(&state.repo_workdir, "origin", "main")
+            .await?;
+
+        let abs_dir = state.repo_workdir.join(&rel_dir);
+        let abs_file = state.repo_workdir.join(&rel_file);
+        if !tokio::fs::try_exists(&abs_file).await.unwrap_or(false) {
+            return Err(ServerError::NotFound(format!(
+                "Catalog {normalized_kind} '{id}' not found"
+            )));
+        }
+        let _existing_yaml = tokio::fs::read_to_string(&abs_file).await?;
+        let manifest =
+            load_catalog_manifest(&state.repo_workdir, &id, Some(normalized_kind)).await?;
+
+        if manifest.is_protected() {
+            return Err(ServerError::BadRequest(format!(
+                "Catalog item '{id}' is protected and cannot be deleted"
+            )));
+        }
+
+        if let Some(t) = manifest.tenant() {
+            auth.require_tenant_admin(t)?;
+        } else {
+            auth.require_admin()?;
+        }
+
+        let name = match manifest {
+            CatalogManifest::Application(app) => app.metadata.name,
+            CatalogManifest::InfraBlueprint(bp) => bp.metadata.name,
+            CatalogManifest::Bundle(b) => b.metadata.name,
+        };
+
+        state
+            .git_runner
+            .checkout_new_branch(&state.repo_workdir, &branch)
+            .await?;
+
+        tokio::fs::remove_dir_all(&abs_dir).await.map_err(|e| {
+            ServerError::Internal(format!("Failed to delete catalog directory: {e}"))
+        })?;
+
+        let commit_message = format!("feat(catalog): delete {normalized_kind} {id}");
+        let commit_sha = stage_commit_push_and_return_to_main(
+            &state,
+            &auth,
+            &branch,
+            &commit_message,
+            &[rel_dir.as_str()],
+        )
+        .await?;
+
+        (commit_sha, name)
+    };
+
+    let title = format!("Delete catalog {normalized_kind}: {display_name}");
+    let description = format!("This PR deletes the `{id}` catalog {normalized_kind}.");
+    let proposal =
+        open_pr_for_session(&state, &auth, "catalog", &branch, title, description).await?;
+
+    Ok(Json(DeleteCatalogItemResponse {
+        id,
+        kind: normalized_kind.to_string(),
+        proposal,
+        branch,
+    }))
 }

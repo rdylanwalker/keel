@@ -462,9 +462,13 @@ spec:
     #[tokio::test]
     async fn get_catalog_returns_core_addons() {
         let (_tmp, state, _workdir) = setup_test_state().await;
-        let Json(resp) = get_catalog(test_auth(), State(state))
-            .await
-            .expect("get_catalog succeeds");
+        let Json(resp) = get_catalog(
+            test_auth(),
+            State(state),
+            axum::extract::Query(crate::routes::catalog::GetCatalogQuery { tenant: None }),
+        )
+        .await
+        .expect("get_catalog succeeds");
 
         assert_eq!(resp.core_addons.len(), 1);
         assert_eq!(resp.core_addons[0].metadata.id, "s3-state-backend");
@@ -686,6 +690,9 @@ spec:
             description: Some("Multi-doc raw K8s manifest app".to_string()),
             items: None,
             schema: None,
+            protected: false,
+            tenant: None,
+            resource_kind: None,
         };
 
         let (status, Json(reg_resp)) =
@@ -714,9 +721,13 @@ spec:
         .expect("merge catalog PR");
 
         // Verify GET /api/v1/catalog returns manifests_yaml and default_engine
-        let Json(cat_resp) = get_catalog(test_auth(), State(state.clone()))
-            .await
-            .expect("get_catalog succeeds");
+        let Json(cat_resp) = get_catalog(
+            test_auth(),
+            State(state.clone()),
+            axum::extract::Query(crate::routes::catalog::GetCatalogQuery { tenant: None }),
+        )
+        .await
+        .expect("get_catalog succeeds");
         let found = cat_resp
             .applications
             .iter()
@@ -883,6 +894,9 @@ data:
                     "api_key": { "type": "string", "writeOnly": true, "format": "password" }
                 }
             })),
+            protected: None,
+            tenant: None,
+            resource_kind: None,
         };
         let (up_status, Json(up_resp)) = update_catalog_item(
             test_auth(),
@@ -1444,6 +1458,9 @@ spec:
                 default_engine: None,
                 items: None,
                 schema: None,
+                protected: None,
+                tenant: None,
+                resource_kind: None,
             }),
         )
         .await
@@ -1621,5 +1638,253 @@ spec:
             .await,
             Err(ServerError::Forbidden(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn catalog_protection_tenant_rbac_all_tenants_visibility_and_cloud_k8s_previews() {
+        let (_tmp, state, workdir) = setup_test_state().await;
+
+        // Enable aws, gcp, azure providers so cloud K8s cluster blueprints are active
+        let mut reg = keel_core::ProviderRegistry::default_day1();
+        reg.set_enabled("aws", true);
+        reg.set_enabled("gcp", true);
+        reg.set_enabled("azure", true);
+        tokio::fs::create_dir_all(workdir.join("providers"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            workdir.join("providers/registry.yaml"),
+            reg.to_yaml().unwrap(),
+        )
+        .await
+        .unwrap();
+
+        // Copy aws-eks-cluster, gcp-gke-cluster, and azure-aks-cluster blueprints into workdir
+        for bp_id in ["aws-eks-cluster", "gcp-gke-cluster", "azure-aks-cluster"] {
+            let dest_dir = workdir.join("catalog/infra").join(bp_id);
+            tokio::fs::create_dir_all(&dest_dir).await.unwrap();
+            let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../deploy/catalog/infra")
+                .join(bp_id);
+            tokio::fs::write(
+                dest_dir.join("catalog.yaml"),
+                tokio::fs::read_to_string(src_dir.join("catalog.yaml"))
+                    .await
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+            tokio::fs::write(
+                dest_dir.join("Pulumi.yaml"),
+                tokio::fs::read_to_string(src_dir.join("Pulumi.yaml"))
+                    .await
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        }
+
+        // Seed 3 apps: global protected app, acme-scoped protected app, stark-scoped unprotected app
+        for (id, tenant_line, protected_line) in [
+            ("global-app", "", "  protected: true\n"),
+            ("acme-app", "  tenant: acme\n", "  protected: true\n"),
+            ("stark-app", "  tenant: stark\n", "  protected: false\n"),
+        ] {
+            let dir = workdir.join("catalog/apps").join(id);
+            tokio::fs::create_dir_all(&dir).await.unwrap();
+            tokio::fs::write(
+                dir.join("catalog.yaml"),
+                format!(
+                    "apiVersion: keel.io/v1alpha1\nkind: CatalogApplication\nmetadata:\n  id: {id}\n  name: {id}\n  category: apps\n  runtime: helm\n{tenant_line}{protected_line}spec:\n  upstream:\n    repoURL: https://stefanprodan.github.io/podinfo\n    chart: podinfo\n    version: \"6.5.0\"\n  schema:\n    type: object\n    properties: {{}}\n"
+                ),
+            )
+            .await
+            .unwrap();
+        }
+
+        let git = GitRunner::new();
+        git.add(&workdir, ["."]).await.unwrap();
+        git.commit(
+            &workdir,
+            "feat: seed multi-tenant catalog and cloud k8s blueprints",
+            &CommitAuthor::new("Keel Test", "test@keel.local"),
+        )
+        .await
+        .unwrap();
+        git.push(&workdir, "origin", "HEAD:refs/heads/main")
+            .await
+            .unwrap();
+
+        let global_admin = test_auth();
+        let acme_admin = AuthSession {
+            claims: SessionClaims {
+                sub: "admin@acme.local".to_string(),
+                email: Some("admin@acme.local".to_string()),
+                name: Some("Acme Admin".to_string()),
+                groups: vec!["tenant-acme-admin".to_string()],
+                auth_phase: AuthPhase::OidcActive,
+                exp: Utc::now().timestamp() + 3600,
+            },
+        };
+
+        // 1. Global admin with All Tenants (`tenant: None` and `tenant: Some("all")`) sees ALL catalog items
+        for query_tenant in [None, Some("all".to_string()), Some(String::new())] {
+            let Json(cat) = get_catalog(
+                global_admin.clone(),
+                State(state.clone()),
+                Query(GetCatalogQuery {
+                    tenant: query_tenant,
+                }),
+            )
+            .await
+            .unwrap();
+            let app_ids: Vec<&str> = cat
+                .applications
+                .iter()
+                .map(|a| a.application.metadata.id.as_str())
+                .collect();
+            assert!(app_ids.contains(&"global-app"));
+            assert!(app_ids.contains(&"acme-app"));
+            assert!(app_ids.contains(&"stark-app"));
+        }
+
+        // 2. Global admin filtering by `?tenant=acme` sees global items AND acme items (not stark)
+        let Json(cat_acme) = get_catalog(
+            global_admin.clone(),
+            State(state.clone()),
+            Query(GetCatalogQuery {
+                tenant: Some("acme".to_string()),
+            }),
+        )
+        .await
+        .unwrap();
+        let acme_app_ids: Vec<&str> = cat_acme
+            .applications
+            .iter()
+            .map(|a| a.application.metadata.id.as_str())
+            .collect();
+        assert_eq!(acme_app_ids, vec!["acme-app", "global-app"]);
+
+        // 3. Tenant admin for acme with `tenant: None` sees only global items + acme items (never stark)
+        let Json(cat_acme_user) = get_catalog(
+            acme_admin.clone(),
+            State(state.clone()),
+            Query(GetCatalogQuery { tenant: None }),
+        )
+        .await
+        .unwrap();
+        let acme_user_ids: Vec<&str> = cat_acme_user
+            .applications
+            .iter()
+            .map(|a| a.application.metadata.id.as_str())
+            .collect();
+        assert_eq!(acme_user_ids, vec!["acme-app", "global-app"]);
+
+        // 4. Protected catalog item blocks deletion (even for global admin) but allows updates
+        let del_prot = delete_catalog_item(
+            global_admin.clone(),
+            State(state.clone()),
+            AxumPath(("app".to_string(), "acme-app".to_string())),
+        )
+        .await;
+        assert!(matches!(del_prot, Err(ServerError::BadRequest(_))));
+
+        // 5. Tenant admin for acme cannot delete stark's unprotected item or global items
+        let del_cross = delete_catalog_item(
+            acme_admin.clone(),
+            State(state.clone()),
+            AxumPath(("app".to_string(), "stark-app".to_string())),
+        )
+        .await;
+        assert!(matches!(del_cross, Err(ServerError::Forbidden(_))));
+
+        // 6. Global admin can delete stark's unprotected item via PR
+        let Json(del_ok) = delete_catalog_item(
+            global_admin.clone(),
+            State(state.clone()),
+            AxumPath(("app".to_string(), "stark-app".to_string())),
+        )
+        .await
+        .expect("global admin deletes unprotected stark-app");
+        assert_eq!(del_ok.id, "stark-app");
+        assert!(del_ok.branch.starts_with("keel/catalog/delete-stark-app-"));
+
+        // 7. Validate PKO preview & Stack synthesis for aws-eks-cluster, gcp-gke-cluster, and azure-aks-cluster with k8s 1.35
+        for (catalog_id, values) in [
+            (
+                "aws-eks-cluster",
+                serde_json::json!({
+                    "clusterName": "eks-prod",
+                    "region": "us-east-1",
+                    "kubernetesVersion": "1.35",
+                    "nodeInstanceType": "t3.medium",
+                    "desiredNodeCount": 2
+                }),
+            ),
+            (
+                "gcp-gke-cluster",
+                serde_json::json!({
+                    "clusterName": "gke-prod",
+                    "project": "keel-gcp",
+                    "zone": "us-central1-a",
+                    "kubernetesVersion": "1.35",
+                    "machineType": "e2-medium",
+                    "nodeCount": 2
+                }),
+            ),
+            (
+                "azure-aks-cluster",
+                serde_json::json!({
+                    "clusterName": "aks-prod",
+                    "location": "eastus",
+                    "kubernetesVersion": "1.35",
+                    "vmSize": "Standard_DS2_v2",
+                    "nodeCount": 2
+                }),
+            ),
+        ] {
+            let (status, Json(prop)) = create_proposal(
+                global_admin.clone(),
+                State(state.clone()),
+                Json(CreateProposalRequest {
+                    tenant: "default".to_string(),
+                    catalog_id: catalog_id.to_string(),
+                    kind: Some("infra".to_string()),
+                    name: Some(catalog_id.to_string()),
+                    title: None,
+                    body: None,
+                    values,
+                    canary: false,
+                    target_cluster: None,
+                    version: None,
+                    target_namespace: None,
+                    action_engine: None,
+                }),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("Failed proposal for {catalog_id}: {e}"));
+            assert_eq!(status, StatusCode::CREATED);
+            assert_eq!(prop.preview_stack.spec.preview, Some(true));
+            assert_eq!(
+                prop.preview_stack
+                    .spec
+                    .config
+                    .get("kubernetesVersion")
+                    .map(String::as_str),
+                Some("1.35")
+            );
+            assert_eq!(
+                prop.preview_stack
+                    .spec
+                    .config
+                    .get("kubeconfigSecretName")
+                    .map(String::as_str),
+                prop.preview_stack
+                    .spec
+                    .config
+                    .get("kubeconfigSecretName")
+                    .map(String::as_str)
+            );
+        }
     }
 }

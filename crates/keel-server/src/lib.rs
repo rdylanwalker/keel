@@ -44,7 +44,7 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route(
             "/api/v1/catalog/{kind}/{id}",
-            put(routes::update_catalog_item),
+            put(routes::update_catalog_item).delete(routes::delete_catalog_item),
         )
         .route(
             "/api/v1/catalog/fetch-schema",
