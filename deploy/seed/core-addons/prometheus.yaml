@@ -4,15 +4,20 @@ apiVersion: helm.toolkit.fluxcd.io/v2
 kind: HelmRelease
 metadata:
   name: prometheus
-  namespace: keel-system
+  namespace: flux-system
   labels:
     app.kubernetes.io/managed-by: keel
     keel.io/protect: "true"
 spec:
   interval: 10m
-  # Same release name/namespace as the Stage 0 Pulumi install so Flux adopts it in place.
-  storageNamespace: keel-system
+  # Adopts the Stage 0 Pulumi release in place: same release name, release namespace
+  # (target + storage), chart version and values (`flux_helmreleases_adopt_stage0_releases_in_place`).
   releaseName: prometheus
+  targetNamespace: keel-system
+  storageNamespace: keel-system
+  # Multi-tenancy lockdown: platform releases live in `flux-system` and impersonate the
+  # privileged `helm-controller` SA (never the permissionless `default`).
+  serviceAccountName: helm-controller
   chart:
     spec:
       chart: prometheus
@@ -20,7 +25,7 @@ spec:
       sourceRef:
         kind: HelmRepository
         name: prometheus-community
-        namespace: keel-system
+        namespace: flux-system
   upgrade:
     timeout: 5m
     remediation:

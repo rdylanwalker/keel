@@ -6,6 +6,15 @@
 # SOPS age key, Flux, Kyverno, PKO, S3 state backend) carry `protect: true`. Keel never runs
 # `pulumi destroy` on this stack; tearing it down requires an explicit
 # `pulumi state unprotect --all` first (or deleting the whole cluster).
+#
+# Flux handoff: every Helm release that has a seed Flux HelmRelease
+# (`deploy/seed/core-addons/*.yaml`, same release name/namespace/version/values) is adopted by
+# Flux in place after Stage 0. Those releases ignore every chart-affecting input (`chart`,
+# `version`, `values`, `repositoryOpts`, `timeout`, `waitForJobs`, `createNamespace`) so a later
+# Pulumi run (e.g. `keel bootstrap recover`) never runs a `helm upgrade` with the stale Stage 0
+# inputs and reverts an upgrade or rollback applied by Flux through a Git PR. Do not add or edit
+# other inputs of an adopted release after handoff (any non-ignored input diff triggers such an
+# upgrade); change the seed HelmRelease in Git instead (`SDD.md` §2.1).
 name: keel-stage0-control-plane
 runtime: yaml
 description: Stage 0 seed control-plane addons (Flux CD, Kyverno, PKO v2, SeaweedFS, Envoy Gateway, Prometheus, Flagger)
@@ -112,7 +121,9 @@ resources:
         # `--default-service-account=default` to kustomize/helm controllers, so any Flux
         # Kustomization/HelmRelease without `spec.serviceAccountName` impersonates the
         # permissionless `default` SA of its own namespace. Platform Kustomizations in
-        # `flux-system` explicitly impersonate `kustomize-controller`; tenant Kustomizations
+        # `flux-system` explicitly impersonate `kustomize-controller`, the core add-on
+        # HelmReleases in `flux-system` impersonate `helm-controller` (installing into
+        # `keel-system` via `targetNamespace`/`storageNamespace`); tenant Kustomizations
         # impersonate `tenant-<id>-sa`; the root tenants Kustomization impersonates
         # `keel-tenant-reconciler` (confined by Kyverno `restrict-tenant-reconciler`).
         multitenancy:
@@ -129,6 +140,17 @@ resources:
   kyverno:
     type: kubernetes:helm.sh/v3:Release
     options:
+      # Flux owns the release after the in-place handoff (seed HelmRelease); re-runs
+      # (`keel bootstrap recover`) must not revert Flux-applied upgrades, so every
+      # chart-affecting input is ignored (see the header note).
+      ignoreChanges:
+        - chart
+        - version
+        - values
+        - repositoryOpts
+        - timeout
+        - waitForJobs
+        - createNamespace
       protect: true
       provider: ${k8sProvider}
       dependsOn:
@@ -165,6 +187,17 @@ resources:
   pulumiKubernetesOperator:
     type: kubernetes:helm.sh/v3:Release
     options:
+      # Flux owns the release after the in-place handoff (seed HelmRelease); re-runs
+      # (`keel bootstrap recover`) must not revert Flux-applied upgrades, so every
+      # chart-affecting input is ignored (see the header note).
+      ignoreChanges:
+        - chart
+        - version
+        - values
+        - repositoryOpts
+        - timeout
+        - waitForJobs
+        - createNamespace
       protect: true
       provider: ${k8sProvider}
       dependsOn:
@@ -191,6 +224,17 @@ resources:
   s3StateBackend:
     type: kubernetes:helm.sh/v3:Release
     options:
+      # Flux owns the release after the in-place handoff (seed HelmRelease); re-runs
+      # (`keel bootstrap recover`) must not revert Flux-applied upgrades, so every
+      # chart-affecting input is ignored (see the header note).
+      ignoreChanges:
+        - chart
+        - version
+        - values
+        - repositoryOpts
+        - timeout
+        - waitForJobs
+        - createNamespace
       protect: true
       provider: ${k8sProvider}
       dependsOn:
@@ -238,6 +282,17 @@ resources:
   envoyGateway:
     type: kubernetes:helm.sh/v3:Release
     options:
+      # Flux owns the release after the in-place handoff (seed HelmRelease); re-runs
+      # (`keel bootstrap recover`) must not revert Flux-applied upgrades, so every
+      # chart-affecting input is ignored (see the header note).
+      ignoreChanges:
+        - chart
+        - version
+        - values
+        - repositoryOpts
+        - timeout
+        - waitForJobs
+        - createNamespace
       provider: ${k8sProvider}
       dependsOn:
         - ${keelSystemNamespace}
@@ -253,6 +308,17 @@ resources:
   prometheus:
     type: kubernetes:helm.sh/v3:Release
     options:
+      # Flux owns the release after the in-place handoff (seed HelmRelease); re-runs
+      # (`keel bootstrap recover`) must not revert Flux-applied upgrades, so every
+      # chart-affecting input is ignored (see the header note).
+      ignoreChanges:
+        - chart
+        - version
+        - values
+        - repositoryOpts
+        - timeout
+        - waitForJobs
+        - createNamespace
       provider: ${k8sProvider}
       dependsOn:
         - ${keelSystemNamespace}
@@ -284,6 +350,17 @@ resources:
   flagger:
     type: kubernetes:helm.sh/v3:Release
     options:
+      # Flux owns the release after the in-place handoff (seed HelmRelease); re-runs
+      # (`keel bootstrap recover`) must not revert Flux-applied upgrades, so every
+      # chart-affecting input is ignored (see the header note).
+      ignoreChanges:
+        - chart
+        - version
+        - values
+        - repositoryOpts
+        - timeout
+        - waitForJobs
+        - createNamespace
       provider: ${k8sProvider}
       dependsOn:
         - ${envoyGateway}
@@ -307,6 +384,17 @@ resources:
   certManager:
     type: kubernetes:helm.sh/v3:Release
     options:
+      # Flux owns the release after the in-place handoff (seed HelmRelease); re-runs
+      # (`keel bootstrap recover`) must not revert Flux-applied upgrades, so every
+      # chart-affecting input is ignored (see the header note).
+      ignoreChanges:
+        - chart
+        - version
+        - values
+        - repositoryOpts
+        - timeout
+        - waitForJobs
+        - createNamespace
       provider: ${k8sProvider}
       dependsOn:
         - ${keelSystemNamespace}

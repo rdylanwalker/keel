@@ -2146,6 +2146,81 @@ async fn test_blueprint_merge_visibility_and_proposal_status_history() {
     assert_eq!(reopen_open_res.status(), StatusCode::CONFLICT);
 }
 
+/// The built-in self-service Dex catalog app installs from its own tenant-scoped HelmRepository
+/// (Flux `--no-cross-namespace-refs`), so it never depends on a `keel-system` HelmRepository from
+/// the management core add-ons.
+#[tokio::test]
+async fn test_builtin_dex_catalog_app_installs_from_tenant_scoped_helm_repository() {
+    let fixture = setup_fixture().await;
+    let workdir = fixture.state.repo_workdir.clone();
+    tokio::fs::create_dir_all(workdir.join("catalog/apps/dex"))
+        .await
+        .unwrap();
+    tokio::fs::write(
+        workdir.join("catalog/apps/dex/catalog.yaml"),
+        include_str!("../../../deploy/catalog/apps/dex/catalog.yaml"),
+    )
+    .await
+    .unwrap();
+    let git = &fixture.state.git_runner;
+    git.add(&workdir, ["catalog/apps/dex/catalog.yaml"])
+        .await
+        .unwrap();
+    git.commit(
+        &workdir,
+        "feat: add dex starter app",
+        &CommitAuthor::new("Keel Seed", "seed@keel.local"),
+    )
+    .await
+    .unwrap();
+    git.push(&workdir, "origin", "main").await.unwrap();
+
+    let cookie = login_and_get_cookie(&fixture).await;
+    let res = build_router(fixture.state.clone())
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/proposals")
+                .header(COOKIE, &cookie)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "tenant": "acme",
+                        "catalogId": "dex",
+                        "name": "dex",
+                        "values": { "replicaCount": 1 }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let created: Value =
+        serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let branch = created["branch"].as_str().unwrap();
+    git.checkout_branch(&workdir, branch).await.unwrap();
+
+    let read = |name: &str| {
+        let path = workdir.join(format!("tenants/acme/apps/dex/{name}"));
+        async move { tokio::fs::read_to_string(path).await.unwrap() }
+    };
+    let repo: Value = serde_yml::from_str(&read("helm-repository.yaml").await).unwrap();
+    assert_eq!(repo["kind"], "HelmRepository");
+    assert_eq!(repo["metadata"]["name"], "dex-repo");
+    assert_eq!(repo["metadata"]["namespace"], "tenant-acme");
+    assert_eq!(repo["spec"]["url"], "https://charts.dexidp.io");
+
+    let hr: Value = serde_yml::from_str(&read("helmrelease.yaml").await).unwrap();
+    let chart = &hr["spec"]["chart"]["spec"];
+    assert_eq!(chart["chart"], "dex");
+    assert_eq!(chart["version"], "0.21.0");
+    assert_eq!(chart["sourceRef"]["kind"], "HelmRepository");
+    assert_eq!(chart["sourceRef"]["name"], "dex-repo");
+    assert_eq!(chart["sourceRef"]["namespace"], "tenant-acme");
+}
+
 #[tokio::test]
 async fn test_proposal_supports_multiple_instances_version_and_target_namespace() {
     let fixture = setup_fixture().await;

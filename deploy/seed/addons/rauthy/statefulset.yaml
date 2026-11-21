@@ -1,0 +1,109 @@
+# Rauthy StatefulSet (single node: Hiqlite raft membership is config-driven, so replicas are
+# not exposed as a catalog value). Image tag is overridden by the Flux Kustomization
+# `spec.images[].newTag`; keep this tag in lockstep with the Stage 0 Pulumi program.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: rauthy
+  namespace: keel-system
+  labels:
+    app.kubernetes.io/managed-by: keel
+    app: rauthy
+    keel.io/protect: "true"
+spec:
+  serviceName: rauthy-headless
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rauthy
+  template:
+    metadata:
+      labels:
+        app: rauthy
+    spec:
+      securityContext:
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: rauthy
+          image: ghcr.io/sebadob/rauthy:0.37.2
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            capabilities:
+              drop:
+                - ALL
+          ports:
+            - containerPort: 8080
+              name: http
+            - containerPort: 8100
+              name: hiqlite-raft
+            - containerPort: 8200
+              name: hiqlite-api
+          volumeMounts:
+            - name: rauthy-data
+              mountPath: /app/data
+            - name: rauthy-config
+              mountPath: /app/config.toml
+              subPath: config.toml
+              readOnly: true
+            - name: rauthy-bootstrap
+              mountPath: /app/bootstrap
+              readOnly: true
+          startupProbe:
+            httpGet:
+              scheme: HTTP
+              port: 8080
+              path: /auth/v1/health
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            failureThreshold: 30
+          readinessProbe:
+            httpGet:
+              scheme: HTTP
+              port: 8200
+              path: /ready
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            failureThreshold: 5
+          livenessProbe:
+            httpGet:
+              scheme: HTTP
+              port: 8080
+              path: /auth/v1/health
+            initialDelaySeconds: 10
+            periodSeconds: 20
+            failureThreshold: 3
+          resources:
+            requests:
+              memory: 128Mi
+              cpu: 100m
+      volumes:
+        - name: rauthy-config
+          secret:
+            secretName: rauthy-config
+            items:
+              - key: config.toml
+                path: config.toml
+        - name: rauthy-bootstrap
+          secret:
+            secretName: rauthy-config
+            items:
+              - key: groups.json
+                path: groups.json
+              - key: users.json
+                path: users.json
+              - key: clients.json
+                path: clients.json
+  volumeClaimTemplates:
+    - metadata:
+        name: rauthy-data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 128Mi

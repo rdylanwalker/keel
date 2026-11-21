@@ -1,9 +1,12 @@
 # Upstream Helm & OCI Chart Sources for Seed Control-Plane Addons (`SDD.md` §2.1, `NFR-DEVOPS-01`)
+# Only charts of management base add-ons live here. Self-service catalog apps (`catalog/apps/*`,
+# e.g. Dex) get their own instance-scoped HelmRepository in the tenant namespace on install
+# (Flux `--no-cross-namespace-refs` forbids tenant HelmReleases from using these).
 apiVersion: source.toolkit.fluxcd.io/v1
 kind: HelmRepository
 metadata:
   name: pulumi
-  namespace: keel-system
+  namespace: flux-system
   labels:
     app.kubernetes.io/managed-by: keel
 spec:
@@ -15,7 +18,7 @@ apiVersion: source.toolkit.fluxcd.io/v1
 kind: HelmRepository
 metadata:
   name: kyverno
-  namespace: keel-system
+  namespace: flux-system
   labels:
     app.kubernetes.io/managed-by: keel
 spec:
@@ -26,7 +29,7 @@ apiVersion: source.toolkit.fluxcd.io/v1
 kind: HelmRepository
 metadata:
   name: envoy-gateway
-  namespace: keel-system
+  namespace: flux-system
   labels:
     app.kubernetes.io/managed-by: keel
 spec:
@@ -38,7 +41,7 @@ apiVersion: source.toolkit.fluxcd.io/v1
 kind: HelmRepository
 metadata:
   name: prometheus-community
-  namespace: keel-system
+  namespace: flux-system
   labels:
     app.kubernetes.io/managed-by: keel
 spec:
@@ -49,7 +52,7 @@ apiVersion: source.toolkit.fluxcd.io/v1
 kind: HelmRepository
 metadata:
   name: flagger
-  namespace: keel-system
+  namespace: flux-system
   labels:
     app.kubernetes.io/managed-by: keel
 spec:
@@ -60,7 +63,7 @@ apiVersion: source.toolkit.fluxcd.io/v1
 kind: HelmRepository
 metadata:
   name: seaweedfs
-  namespace: keel-system
+  namespace: flux-system
   labels:
     app.kubernetes.io/managed-by: keel
 spec:
@@ -70,19 +73,8 @@ spec:
 apiVersion: source.toolkit.fluxcd.io/v1
 kind: HelmRepository
 metadata:
-  name: dex
-  namespace: keel-system
-  labels:
-    app.kubernetes.io/managed-by: keel
-spec:
-  interval: 30m
-  url: https://charts.dexidp.io
----
-apiVersion: source.toolkit.fluxcd.io/v1
-kind: HelmRepository
-metadata:
   name: jetstack
-  namespace: keel-system
+  namespace: flux-system
   labels:
     app.kubernetes.io/managed-by: keel
 spec:

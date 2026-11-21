@@ -440,8 +440,7 @@ metadata:
   runtime: kustomize
 spec:
   upstream:
-    repoURL: https://github.com/sebadob/rauthy
-    chart: rauthy
+    image: ghcr.io/sebadob/rauthy
     version: "0.37.2"
   progressiveDelivery:
     flaggerSupported: false
@@ -449,11 +448,33 @@ spec:
   serviceUrl: "https://idp.keel.local:8888/auth/v1/admin"
   schema:
     type: object
-    properties:
-      replicas:
-        type: integer
-        title: Replica Count
-        default: 1
+    properties: {}
+    additionalProperties: false
+`,
+  );
+
+  // Image-based plain-manifest add-on: one Flux Kustomization whose version is spec.images[].newTag.
+  fs.writeFileSync(
+    path.join(coreAddonsDir, 'rauthy.yaml'),
+    `apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: rauthy
+  namespace: flux-system
+  labels:
+    keel.io/protect: "true"
+spec:
+  interval: 10m
+  path: ./clusters/management/addons/rauthy
+  targetNamespace: keel-system
+  prune: false
+  serviceAccountName: kustomize-controller
+  sourceRef:
+    kind: GitRepository
+    name: flux-system
+  images:
+    - name: ghcr.io/sebadob/rauthy
+      newTag: "0.37.2"
 `,
   );
 
@@ -494,10 +515,14 @@ spec:
 kind: HelmRelease
 metadata:
   name: s3-state-backend
-  namespace: keel-system
+  namespace: flux-system
   labels:
     keel.io/protect: "true"
 spec:
+  releaseName: s3-state-backend
+  targetNamespace: keel-system
+  storageNamespace: keel-system
+  serviceAccountName: helm-controller
   chart:
     spec:
       chart: seaweedfs

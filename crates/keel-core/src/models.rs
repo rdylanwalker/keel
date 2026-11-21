@@ -1024,6 +1024,46 @@ pub struct UpstreamSource {
     pub path: Option<String>,
     #[serde(rename = "ref", default, skip_serializing_if = "Option::is_none")]
     pub git_ref: Option<String>,
+    /// Container image repository (no tag/digest) of an image-based `runtime: kustomize`
+    /// add-on, e.g. `ghcr.io/sebadob/rauthy`; `version` is then the image tag pinned through the
+    /// Flux Kustomization `spec.images[].newTag`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+}
+
+/// `metadata.category` of management-plane base add-ons (`catalog/core/<id>`), reconciled by one
+/// Flux object in `clusters/management/core-addons/` rather than installed into a tenant.
+pub const MANAGEMENT_CORE_CATEGORY: &str = "management-core";
+
+/// Validates an upstream image repository reference: non-empty, no whitespace/control
+/// characters, and no tag or digest (the tag is carried by `spec.upstream.version`).
+fn validate_upstream_image(image: &str) -> Result<(), CoreError> {
+    let invalid = |why: &str| {
+        Err(CoreError::Validation(format!(
+            "spec.upstream.image '{}' is invalid: {why}",
+            image.escape_debug()
+        )))
+    };
+    if image.is_empty() || image.len() > 255 {
+        return invalid("must be 1-255 characters");
+    }
+    if image
+        .chars()
+        .any(|c| c.is_whitespace() || c.is_control() || c.is_ascii_uppercase())
+    {
+        return invalid("must be a lowercase image repository without whitespace");
+    }
+    if image.contains('@') {
+        return invalid("must not contain a digest");
+    }
+    let last = image.rsplit('/').next().unwrap_or(image);
+    if last.contains(':') {
+        return invalid("must not contain a tag (use spec.upstream.version)");
+    }
+    if image.starts_with('/') || image.ends_with('/') || image.contains("//") {
+        return invalid("must be a repository path such as ghcr.io/org/name");
+    }
+    Ok(())
 }
 
 /// Flagger + Envoy Gateway progressive delivery capability settings (`SDD.md` §5.1, §5.2).
@@ -1109,7 +1149,39 @@ impl CatalogApplication {
         if let Some(ref t) = self.metadata.tenant {
             validate_dns_label(t, "metadata.tenant")?;
         }
+        if let Some(image) = self.spec.upstream.image.as_deref() {
+            // Only management base add-ons are image-based (a Flux Kustomization pinning
+            // `spec.images[].newTag`); the self-service tenant install path synthesizes
+            // HelmRelease/HelmRepository objects from `repoURL` and cannot install them.
+            if self.metadata.category != MANAGEMENT_CORE_CATEGORY {
+                return Err(CoreError::Validation(format!(
+                    "spec.upstream.image is only supported for metadata.category: \
+                     {MANAGEMENT_CORE_CATEGORY} add-ons"
+                )));
+            }
+            if self.metadata.runtime != AppRuntime::Kustomize {
+                return Err(CoreError::Validation(
+                    "spec.upstream.image is only supported for runtime: kustomize".to_string(),
+                ));
+            }
+            validate_upstream_image(image)?;
+            if self
+                .spec
+                .upstream
+                .version
+                .as_deref()
+                .is_none_or(|v| v.trim().is_empty())
+            {
+                return Err(CoreError::Validation(
+                    "spec.upstream.image requires spec.upstream.version (the image tag)"
+                        .to_string(),
+                ));
+            }
+        }
+        // Image-based kustomize add-ons are sourced from the image registry, not a repository.
+        let image_based = self.spec.upstream.image.is_some();
         if self.metadata.runtime != AppRuntime::Manifest
+            && !image_based
             && self.spec.upstream.repo_url.trim().is_empty()
         {
             return Err(CoreError::Validation(

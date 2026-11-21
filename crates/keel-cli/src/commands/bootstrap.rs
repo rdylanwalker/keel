@@ -669,6 +669,27 @@ const SEED_CORE_ADDON_CERT_MANAGER_YAML: &str =
     include_str!("../../../../deploy/seed/core-addons/cert-manager.yaml");
 const SEED_CORE_ADDON_RAUTHY_YAML: &str =
     include_str!("../../../../deploy/seed/core-addons/rauthy.yaml");
+/// Plain manifests of the Rauthy add-on (`clusters/management/addons/rauthy/`), reconciled by the
+/// Flux Kustomization in [`SEED_CORE_ADDON_RAUTHY_YAML`].
+const SEED_ADDON_RAUTHY_KUSTOMIZATION_YAML: &str =
+    include_str!("../../../../deploy/seed/addons/rauthy/kustomization.yaml");
+const SEED_ADDON_RAUTHY_SERVICES_YAML: &str =
+    include_str!("../../../../deploy/seed/addons/rauthy/services.yaml");
+const SEED_ADDON_RAUTHY_STATEFULSET_YAML: &str =
+    include_str!("../../../../deploy/seed/addons/rauthy/statefulset.yaml");
+/// `${IDP_HOST}` template of the Rauthy HTTPRoute (see [`render_rauthy_httproute`]).
+const SEED_ADDON_RAUTHY_HTTPROUTE_YAML: &str =
+    include_str!("../../../../deploy/seed/addons/rauthy/httproute.yaml");
+/// Repository-relative directory of the Rauthy plain-manifest add-on.
+const RAUTHY_ADDON_DIR: &str = "clusters/management/addons/rauthy";
+
+/// `clusters/management/flux-system/kustomization.yaml`.
+const SEED_FLUX_SYSTEM_KUSTOMIZATION_YAML: &str =
+    include_str!("../../../../deploy/seed/flux-system/kustomization.yaml");
+/// Canonical root Flux Kustomizations (`flux-system`, `core-addons`, `keel-tenants`): written to
+/// `clusters/management/flux-system/gotk-sync.yaml` and applied verbatim by Stage 0.
+pub(crate) const SEED_FLUX_GOTK_SYNC_YAML: &str =
+    include_str!("../../../../deploy/seed/flux-system/gotk-sync.yaml");
 
 const CORE_CATALOG_S3_STATE_BACKEND_YAML: &str =
     include_str!("../../../../deploy/catalog/core/s3-state-backend/catalog.yaml");
@@ -678,8 +699,8 @@ const CORE_CATALOG_CERT_MANAGER_YAML: &str =
     include_str!("../../../../deploy/catalog/core/cert-manager/catalog.yaml");
 const CORE_CATALOG_RAUTHY_YAML: &str =
     include_str!("../../../../deploy/catalog/core/rauthy/catalog.yaml");
-const CORE_CATALOG_DEX_APP_YAML: &str =
-    include_str!("../../../../deploy/catalog/apps/dex/catalog.yaml");
+/// Self-service starter app (end users may install Dex even though Keel itself uses Rauthy).
+const STARTER_DEX_APP_YAML: &str = include_str!("../../../../deploy/catalog/apps/dex/catalog.yaml");
 const STARTER_CERT_MANAGER_APP_YAML: &str =
     include_str!("../../../../deploy/catalog/apps/cert-manager/catalog.yaml");
 const CORE_CATALOG_ENVOY_GATEWAY_YAML: &str =
@@ -761,6 +782,162 @@ pub(crate) fn render_seed_kyverno_helmrelease(policy_exceptions: bool) -> String
     )
 }
 
+/// Renders the Rauthy HTTPRoute (`addons/rauthy/httproute.yaml`) for the Stage 0 ingress host (both `keel-ingress` HTTPS listeners). The same document is written to Git and
+/// applied by Stage 0, so Flux never rewrites the live route.
+pub(crate) fn render_rauthy_httproute(ingress: &Stage0Ingress) -> Result<String, CliError> {
+    render_manifest(
+        SEED_ADDON_RAUTHY_HTTPROUTE_YAML,
+        &[("IDP_HOST", ingress.idp_host.as_str())],
+    )
+}
+
+/// Renders `clusters/management/core-addons/kustomization.yaml`, listing `rauthy.yaml` only when
+/// the built-in Rauthy IdP is enabled (exactly the files [`seed_core_addon_files`] writes).
+fn render_seed_core_addons_kustomization(with_rauthy: bool) -> String {
+    if with_rauthy {
+        SEED_CORE_ADDON_KUSTOMIZATION_YAML.to_string()
+    } else {
+        SEED_CORE_ADDON_KUSTOMIZATION_YAML.replace("  - rauthy.yaml\n", "")
+    }
+}
+
+/// Management-plane files written to `clusters/management/{flux-system,core-addons,addons}/`.
+/// Everything Flux reconciles there is rendered here, so Git and the Stage 0 install always agree:
+/// the root Flux Kustomizations ([`SEED_FLUX_GOTK_SYNC_YAML`]), the cert-manager wildcard hosts and
+/// the Rauthy HTTPRoute (from `--oidc-public-url`), the Kyverno bundle and the default-tenant
+/// GitRepository. Rauthy files are only included when the built-in Rauthy IdP is enabled; its
+/// `rauthy-config` Secret is never written to Git.
+fn seed_management_files(
+    artifacts: &SeedControlPlaneArtifacts,
+) -> Result<Vec<(String, String)>, CliError> {
+    let ingress = &artifacts.ingress;
+    let with_rauthy = artifacts.rauthy_config.is_some();
+    let flux = "clusters/management/flux-system";
+    let core = keel_core::MANAGEMENT_CORE_ADDONS_DIR;
+    let mut files: Vec<(String, String)> = vec![
+        (
+            format!("{flux}/kustomization.yaml"),
+            SEED_FLUX_SYSTEM_KUSTOMIZATION_YAML.to_string(),
+        ),
+        (
+            format!("{flux}/git-repository.yaml"),
+            artifacts.flux_git_repository.to_yaml()?,
+        ),
+        (
+            format!("{flux}/tenant-reconciler-rbac.yaml"),
+            keel_kube::tenant::build_tenant_reconciler_rbac_yaml()?,
+        ),
+        (
+            format!("{flux}/gotk-sync.yaml"),
+            SEED_FLUX_GOTK_SYNC_YAML.to_string(),
+        ),
+        (
+            format!("{core}/kustomization.yaml"),
+            render_seed_core_addons_kustomization(with_rauthy),
+        ),
+    ];
+    files.extend(seed_core_addon_files(artifacts)?);
+    if with_rauthy {
+        for (name, contents) in [
+            (
+                "kustomization.yaml",
+                SEED_ADDON_RAUTHY_KUSTOMIZATION_YAML.to_string(),
+            ),
+            ("services.yaml", SEED_ADDON_RAUTHY_SERVICES_YAML.to_string()),
+            (
+                "statefulset.yaml",
+                SEED_ADDON_RAUTHY_STATEFULSET_YAML.to_string(),
+            ),
+            ("httproute.yaml", render_rauthy_httproute(ingress)?),
+        ] {
+            files.push((format!("{RAUTHY_ADDON_DIR}/{name}"), contents));
+        }
+    }
+    Ok(files)
+}
+
+/// Files under `clusters/management/core-addons/` other than its `kustomization.yaml`.
+fn seed_core_addon_files(
+    artifacts: &SeedControlPlaneArtifacts,
+) -> Result<Vec<(String, String)>, CliError> {
+    let ingress_vars = artifacts.ingress.template_vars();
+    let mut files = vec![
+        (
+            "helm-repositories.yaml",
+            SEED_CORE_ADDON_HELM_REPOSITORIES_YAML.to_string(),
+        ),
+        (
+            "s3-seaweedfs.yaml",
+            SEED_CORE_ADDON_S3_SEAWEEDFS_YAML.to_string(),
+        ),
+        ("pko.yaml", SEED_CORE_ADDON_PKO_YAML.to_string()),
+        (
+            "kyverno.yaml",
+            render_seed_kyverno_helmrelease(artifacts.kyverno_bundle.policy_exception.is_some()),
+        ),
+        (
+            "kyverno-policies.yaml",
+            artifacts.kyverno_bundle.to_multi_doc_yaml()?,
+        ),
+        (
+            "envoy-gateway.yaml",
+            SEED_CORE_ADDON_ENVOY_GATEWAY_YAML.to_string(),
+        ),
+        (
+            "prometheus.yaml",
+            SEED_CORE_ADDON_PROMETHEUS_YAML.to_string(),
+        ),
+        ("flagger.yaml", SEED_CORE_ADDON_FLAGGER_YAML.to_string()),
+        (
+            "cert-manager.yaml",
+            render_manifest(SEED_CORE_ADDON_CERT_MANAGER_YAML, &ingress_vars)?,
+        ),
+    ];
+    if artifacts.rauthy_config.is_some() {
+        files.push(("rauthy.yaml", SEED_CORE_ADDON_RAUTHY_YAML.to_string()));
+    }
+    Ok(files
+        .into_iter()
+        .map(|(name, contents)| {
+            (
+                format!("{}/{name}", keel_core::MANAGEMENT_CORE_ADDONS_DIR),
+                contents,
+            )
+        })
+        .collect())
+}
+
+/// `catalog/core/<id>/catalog.yaml` files; Rauthy only when the built-in Rauthy IdP is enabled.
+fn seed_core_catalog_files(artifacts: &SeedControlPlaneArtifacts) -> Vec<(String, String)> {
+    let mut files = vec![
+        (
+            "s3-state-backend",
+            CORE_CATALOG_S3_STATE_BACKEND_YAML.to_string(),
+        ),
+        ("kyverno", CORE_CATALOG_KYVERNO_YAML.to_string()),
+        ("cert-manager", CORE_CATALOG_CERT_MANAGER_YAML.to_string()),
+        ("envoy-gateway", CORE_CATALOG_ENVOY_GATEWAY_YAML.to_string()),
+        ("prometheus", CORE_CATALOG_PROMETHEUS_YAML.to_string()),
+        ("flagger", CORE_CATALOG_FLAGGER_YAML.to_string()),
+        (
+            "pulumi-kubernetes-operator",
+            CORE_CATALOG_PKO_YAML.to_string(),
+        ),
+    ];
+    if artifacts.rauthy_config.is_some() {
+        // The admin UI link follows `--oidc-public-url`.
+        files.push((
+            "rauthy",
+            CORE_CATALOG_RAUTHY_YAML
+                .replace(DEFAULT_OIDC_PUBLIC_URL, &artifacts.ingress.idp_origin),
+        ));
+    }
+    files
+        .into_iter()
+        .map(|(id, contents)| (format!("catalog/core/{id}/catalog.yaml"), contents))
+        .collect()
+}
+
 const DEFAULT_TENANT_NETWORK_POLICY_YAML: &str =
     include_str!("../../../../deploy/bootstrap/manifests/default-tenant-network-policy.yaml");
 
@@ -831,180 +1008,108 @@ async fn initialize_seed_git_repo_with_push(
         - default/git-repository.yaml\n"
         .to_string();
 
-    let mut files_to_write: Vec<(&str, String)> = vec![
-        (".keel/config.yaml", artifacts.keel_config.to_yaml()?),
+    let mut files_to_write: Vec<(String, String)> = vec![
         (
-            "providers/registry.yaml",
+            ".keel/config.yaml".to_string(),
+            artifacts.keel_config.to_yaml()?,
+        ),
+        (
+            "providers/registry.yaml".to_string(),
             artifacts.provider_registry.to_yaml()?,
         ),
-        (".sops.yaml", artifacts.sops_config.to_yaml()?),
-        (
-            "clusters/management/flux-system/git-repository.yaml",
-            artifacts.flux_git_repository.to_yaml()?,
-        ),
-        (
-            "clusters/management/core-addons/kustomization.yaml",
-            SEED_CORE_ADDON_KUSTOMIZATION_YAML.to_string(),
-        ),
-        (
-            "clusters/management/core-addons/helm-repositories.yaml",
-            SEED_CORE_ADDON_HELM_REPOSITORIES_YAML.to_string(),
-        ),
-        (
-            "clusters/management/core-addons/s3-seaweedfs.yaml",
-            SEED_CORE_ADDON_S3_SEAWEEDFS_YAML.to_string(),
-        ),
-        (
-            "clusters/management/core-addons/pko.yaml",
-            SEED_CORE_ADDON_PKO_YAML.to_string(),
-        ),
-        (
-            "clusters/management/core-addons/kyverno.yaml",
-            render_seed_kyverno_helmrelease(
-                artifacts.kyverno_bundle.policy_exception.is_some(),
-            ),
-        ),
-        (
-            "clusters/management/core-addons/envoy-gateway.yaml",
-            SEED_CORE_ADDON_ENVOY_GATEWAY_YAML.to_string(),
-        ),
-        (
-            "clusters/management/core-addons/prometheus.yaml",
-            SEED_CORE_ADDON_PROMETHEUS_YAML.to_string(),
-        ),
-        (
-            "clusters/management/core-addons/flagger.yaml",
-            SEED_CORE_ADDON_FLAGGER_YAML.to_string(),
-        ),
-        (
-            "clusters/management/core-addons/cert-manager.yaml",
-            SEED_CORE_ADDON_CERT_MANAGER_YAML.to_string(),
-        ),
-        (
-            "clusters/management/core-addons/rauthy.yaml",
-            SEED_CORE_ADDON_RAUTHY_YAML.to_string(),
-        ),
-        (
-            "clusters/management/core-addons/kyverno-policies.yaml",
-            artifacts.kyverno_bundle.to_multi_doc_yaml()?,
-        ),
-        (
-            "catalog/core/s3-state-backend/catalog.yaml",
-            CORE_CATALOG_S3_STATE_BACKEND_YAML.to_string(),
-        ),
-        (
-            "catalog/core/kyverno/catalog.yaml",
-            CORE_CATALOG_KYVERNO_YAML.to_string(),
-        ),
-        (
-            "catalog/core/cert-manager/catalog.yaml",
-            CORE_CATALOG_CERT_MANAGER_YAML.to_string(),
-        ),
-        (
-            "catalog/core/rauthy/catalog.yaml",
-            CORE_CATALOG_RAUTHY_YAML.to_string(),
-        ),
-        (
-            "catalog/core/envoy-gateway/catalog.yaml",
-            CORE_CATALOG_ENVOY_GATEWAY_YAML.to_string(),
-        ),
-        (
-            "catalog/core/prometheus/catalog.yaml",
-            CORE_CATALOG_PROMETHEUS_YAML.to_string(),
-        ),
-        (
-            "catalog/core/flagger/catalog.yaml",
-            CORE_CATALOG_FLAGGER_YAML.to_string(),
-        ),
-        (
-            "catalog/core/pulumi-kubernetes-operator/catalog.yaml",
-            CORE_CATALOG_PKO_YAML.to_string(),
-        ),
-        (
-            "clusters/management/management-stack.yaml",
-            artifacts.management_stack.to_yaml()?,
-        ),
-        (
-            "clusters/management/Pulumi.yaml",
-            "name: management-cluster-core\nruntime: yaml\ndescription: Keel Stage 0/1 protected management cluster core stack\n".to_string(),
-        ),
-        ("tenants/default/rbac.yaml", default_tenant_rbac),
-        (
-            "tenants/default/git-repository.yaml",
-            default_tenant_git_repo_yaml,
-        ),
-        ("tenants/kustomization.yaml", tenants_kustomization_yaml),
+        (".sops.yaml".to_string(), artifacts.sops_config.to_yaml()?),
     ];
+    files_to_write.extend(seed_management_files(artifacts)?);
+    files_to_write.extend(seed_core_catalog_files(artifacts));
+    files_to_write.extend(
+        [
+            (
+                "clusters/management/management-stack.yaml",
+                artifacts.management_stack.to_yaml()?,
+            ),
+            (
+                "clusters/management/Pulumi.yaml",
+                "name: management-cluster-core\nruntime: yaml\ndescription: Keel Stage 0/1 protected management cluster core stack\n".to_string(),
+            ),
+            ("tenants/default/rbac.yaml", default_tenant_rbac),
+            (
+                "tenants/default/git-repository.yaml",
+                default_tenant_git_repo_yaml,
+            ),
+            ("tenants/kustomization.yaml", tenants_kustomization_yaml),
+        ]
+        .map(|(path, contents)| (path.to_string(), contents)),
+    );
 
     let apps_dir = repo_dir.join("catalog/apps");
     let infra_dir = repo_dir.join("catalog/infra");
     if is_dir_empty_or_missing(&infra_dir).await && is_dir_empty_or_missing(&apps_dir).await {
         files_to_write.push((
-            "catalog/infra/kind-cluster/catalog.yaml",
+            "catalog/infra/kind-cluster/catalog.yaml".to_string(),
             STARTER_KIND_CLUSTER_CATALOG_YAML.to_string(),
         ));
         files_to_write.push((
-            "catalog/infra/kind-cluster/Pulumi.yaml",
+            "catalog/infra/kind-cluster/Pulumi.yaml".to_string(),
             STARTER_KIND_CLUSTER_PULUMI_YAML.to_string(),
         ));
         files_to_write.push((
-            "catalog/infra/aws-eks-cluster/catalog.yaml",
+            "catalog/infra/aws-eks-cluster/catalog.yaml".to_string(),
             STARTER_AWS_EKS_CLUSTER_CATALOG_YAML.to_string(),
         ));
         files_to_write.push((
-            "catalog/infra/aws-eks-cluster/Pulumi.yaml",
+            "catalog/infra/aws-eks-cluster/Pulumi.yaml".to_string(),
             STARTER_AWS_EKS_CLUSTER_PULUMI_YAML.to_string(),
         ));
         files_to_write.push((
-            "catalog/infra/gcp-gke-cluster/catalog.yaml",
+            "catalog/infra/gcp-gke-cluster/catalog.yaml".to_string(),
             STARTER_GCP_GKE_CLUSTER_CATALOG_YAML.to_string(),
         ));
         files_to_write.push((
-            "catalog/infra/gcp-gke-cluster/Pulumi.yaml",
+            "catalog/infra/gcp-gke-cluster/Pulumi.yaml".to_string(),
             STARTER_GCP_GKE_CLUSTER_PULUMI_YAML.to_string(),
         ));
         files_to_write.push((
-            "catalog/infra/azure-aks-cluster/catalog.yaml",
+            "catalog/infra/azure-aks-cluster/catalog.yaml".to_string(),
             STARTER_AZURE_AKS_CLUSTER_CATALOG_YAML.to_string(),
         ));
         files_to_write.push((
-            "catalog/infra/azure-aks-cluster/Pulumi.yaml",
+            "catalog/infra/azure-aks-cluster/Pulumi.yaml".to_string(),
             STARTER_AZURE_AKS_CLUSTER_PULUMI_YAML.to_string(),
         ));
         files_to_write.push((
-            "catalog/infra/aws-vm/catalog.yaml",
+            "catalog/infra/aws-vm/catalog.yaml".to_string(),
             STARTER_AWS_VM_CATALOG_YAML.to_string(),
         ));
         files_to_write.push((
-            "catalog/infra/aws-vm/Pulumi.yaml",
+            "catalog/infra/aws-vm/Pulumi.yaml".to_string(),
             STARTER_AWS_VM_PULUMI_YAML.to_string(),
         ));
         files_to_write.push((
-            "catalog/infra/azure-vm/catalog.yaml",
+            "catalog/infra/azure-vm/catalog.yaml".to_string(),
             STARTER_AZURE_VM_CATALOG_YAML.to_string(),
         ));
         files_to_write.push((
-            "catalog/infra/azure-vm/Pulumi.yaml",
+            "catalog/infra/azure-vm/Pulumi.yaml".to_string(),
             STARTER_AZURE_VM_PULUMI_YAML.to_string(),
         ));
         files_to_write.push((
-            "catalog/infra/gcp-vm/catalog.yaml",
+            "catalog/infra/gcp-vm/catalog.yaml".to_string(),
             STARTER_GCP_VM_CATALOG_YAML.to_string(),
         ));
         files_to_write.push((
-            "catalog/infra/gcp-vm/Pulumi.yaml",
+            "catalog/infra/gcp-vm/Pulumi.yaml".to_string(),
             STARTER_GCP_VM_PULUMI_YAML.to_string(),
         ));
         files_to_write.push((
-            "catalog/apps/podinfo/catalog.yaml",
+            "catalog/apps/podinfo/catalog.yaml".to_string(),
             STARTER_PODINFO_CATALOG_YAML.to_string(),
         ));
         files_to_write.push((
-            "catalog/apps/dex/catalog.yaml",
-            CORE_CATALOG_DEX_APP_YAML.to_string(),
+            "catalog/apps/dex/catalog.yaml".to_string(),
+            STARTER_DEX_APP_YAML.to_string(),
         ));
         files_to_write.push((
-            "catalog/apps/cert-manager/catalog.yaml",
+            "catalog/apps/cert-manager/catalog.yaml".to_string(),
             STARTER_CERT_MANAGER_APP_YAML.to_string(),
         ));
     }
@@ -1016,7 +1121,7 @@ async fn initialize_seed_git_repo_with_push(
             tokio::fs::create_dir_all(parent).await?;
         }
         tokio::fs::write(&full_path, contents).await?;
-        written_files.push((*rel_path).to_string());
+        written_files.push(rel_path.clone());
     }
 
     // Ensure catalogs & tenants skeleton directories exist
@@ -1605,15 +1710,25 @@ mod security_hardening_tests {
                 hr["spec"]["releaseName"], p["name"],
                 "{resource} release name"
             );
+            // Platform HelmReleases live in `flux-system` (impersonating `helm-controller`) and
+            // install into the Stage 0 release namespace.
+            assert_eq!(hr["metadata"]["namespace"], "flux-system", "{resource}");
             assert_eq!(
-                hr["metadata"]["namespace"], p["namespace"],
-                "{resource} namespace"
+                hr["spec"]["targetNamespace"], p["namespace"],
+                "{resource} target ns"
             );
             assert_eq!(
                 hr["spec"]["storageNamespace"], p["namespace"],
                 "{resource} storage ns"
             );
-            assert!(hr["spec"].get("targetNamespace").is_none(), "{resource}");
+            assert_eq!(
+                hr["spec"]["serviceAccountName"], "helm-controller",
+                "{resource}"
+            );
+            assert_eq!(
+                hr["spec"]["chart"]["spec"]["sourceRef"]["namespace"], "flux-system",
+                "{resource} HelmRepository must be in the HelmRelease namespace"
+            );
             let pinned = p["version"]
                 .as_str()
                 .unwrap_or_else(|| panic!("{resource} unpinned"));
@@ -1622,6 +1737,29 @@ mod security_hardening_tests {
                 pinned,
                 "{resource} version drift between Stage 0 and Flux"
             );
+            // Identical values, so the first Flux reconcile never reconfigures the release.
+            if resource != "kyverno" {
+                assert_eq!(
+                    hr["spec"]["values"], p["values"],
+                    "{resource} values drift between Stage 0 and Flux"
+                );
+            }
+        }
+        // Kyverno's Stage 0 values are templated by `enableKyvernoPolicyExceptions`.
+        let stage0_kyverno = |enabled: bool| -> Value {
+            serde_json::from_str(
+                &program["resources"]["kyverno"]["properties"]["values"]
+                    .to_string()
+                    .replace(
+                        "\"${enableKyvernoPolicyExceptions}\"",
+                        if enabled { "true" } else { "false" },
+                    ),
+            )
+            .unwrap()
+        };
+        for enabled in [true, false] {
+            let hr: Value = serde_yml::from_str(&render_seed_kyverno_helmrelease(enabled)).unwrap();
+            assert_eq!(hr["spec"]["values"], stage0_kyverno(enabled), "kyverno");
         }
         assert_eq!(
             program["resources"]["kyverno"]["properties"]["namespace"],
@@ -1723,14 +1861,494 @@ mod security_hardening_tests {
                 "{id}: deploy/catalog/core version drifts from deploy/seed/core-addons"
             );
         }
-        // Rauthy is a plain Kustomize addon: the catalog version tracks the pinned image tag.
-        let rauthy = catalog_version(include_str!(
-            "../../../../deploy/catalog/core/rauthy/catalog.yaml"
-        ));
-        assert!(
-            SEED_CORE_ADDON_RAUTHY_YAML.contains(&format!("ghcr.io/sebadob/rauthy:{rauthy}")),
-            "rauthy catalog version {rauthy} drifts from the seed image tag"
+        // Rauthy is an image-based Kustomize add-on: the catalog version is the image tag pinned
+        // by the Flux Kustomization `spec.images[].newTag`, the plain StatefulSet manifest and the
+        // Stage 0 Pulumi StatefulSet (which Flux adopts in place).
+        let catalog: Value = serde_yml::from_str(CORE_CATALOG_RAUTHY_YAML).unwrap();
+        let rauthy = catalog_version(CORE_CATALOG_RAUTHY_YAML);
+        let image = catalog["spec"]["upstream"]["image"].as_str().unwrap();
+        let ks: Value = serde_yml::from_str(SEED_CORE_ADDON_RAUTHY_YAML).unwrap();
+        let images = ks["spec"]["images"].as_array().unwrap();
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0]["name"], image);
+        assert_eq!(images[0]["newTag"], rauthy.as_str(), "Flux newTag drift");
+        assert!(images[0].get("digest").is_none());
+        let pinned = format!("{image}:{rauthy}");
+        let sts: Value = serde_yml::from_str(SEED_ADDON_RAUTHY_STATEFULSET_YAML).unwrap();
+        assert_eq!(
+            sts["spec"]["template"]["spec"]["containers"][0]["image"],
+            pinned.as_str(),
+            "addons/rauthy StatefulSet image drift"
         );
+        let program: Value = serde_yml::from_str(state::CONTROL_PLANE_RAUTHY_PULUMI_YAML).unwrap();
+        assert_eq!(
+            program["resources"]["rauthyStatefulSet"]["properties"]["spec"]["template"]["spec"]["containers"]
+                [0]["image"],
+            pinned.as_str(),
+            "Stage 0 Pulumi Rauthy image drift"
+        );
+    }
+
+    fn yaml_docs(yaml: &str) -> Vec<Value> {
+        yaml.split("\n---\n")
+            .filter(|d| {
+                d.lines()
+                    .any(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'))
+            })
+            .map(|d| serde_yml::from_str::<Value>(d).unwrap())
+            .collect()
+    }
+
+    fn kustomize_resources(yaml: &str) -> std::collections::BTreeSet<String> {
+        let doc: Value = serde_yml::from_str(yaml).unwrap();
+        doc["resources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r.as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// File names written directly under `dir` (excluding its `kustomization.yaml`).
+    fn files_in(files: &[(String, String)], dir: &str) -> std::collections::BTreeSet<String> {
+        files
+            .iter()
+            .filter_map(|(p, _)| p.strip_prefix(&format!("{dir}/")))
+            .filter(|n| !n.contains('/') && *n != "kustomization.yaml")
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn file<'a>(files: &'a [(String, String)], path: &str) -> &'a str {
+        files
+            .iter()
+            .find(|(p, _)| p == path)
+            .map(|(_, c)| c.as_str())
+            .unwrap_or_else(|| panic!("{path} not written"))
+    }
+
+    async fn artifacts_for(cfg: BootstrapConfig, public_url: &str) -> SeedControlPlaneArtifacts {
+        let ingress = Stage0Ingress::from_public_url(public_url).unwrap();
+        synthesize_seed_control_plane_with_ingress(
+            &cfg,
+            Some("https://git.example.org/keel/gitops.git"),
+            ingress,
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn seed_management_files_reconcile_with_rauthy() {
+        let cfg = BootstrapConfig::new(keel_core::BootstrapTargetKind::Kubeconfig);
+        let a = artifacts_for(cfg, "https://idp.corp.example:9443").await;
+        assert!(a.rauthy_config.is_some());
+        let files = seed_management_files(&a).unwrap();
+        let core = keel_core::MANAGEMENT_CORE_ADDONS_DIR;
+
+        // core-addons/kustomization.yaml lists exactly the core add-on files written to Git.
+        let listed = kustomize_resources(file(&files, &format!("{core}/kustomization.yaml")));
+        assert_eq!(listed, files_in(&files, core));
+        assert!(listed.contains("kyverno-policies.yaml"));
+        assert!(listed.contains("rauthy.yaml"));
+        // ... and the static seed kustomization (rauthy enabled) is that very list.
+        assert_eq!(
+            kustomize_resources(SEED_CORE_ADDON_KUSTOMIZATION_YAML),
+            listed
+        );
+
+        // flux-system/kustomization.yaml lists exactly the flux-system files, which are exactly
+        // the manifests Stage 0 applies in-cluster.
+        let flux = "clusters/management/flux-system";
+        assert_eq!(
+            kustomize_resources(file(&files, &format!("{flux}/kustomization.yaml"))),
+            files_in(&files, flux)
+        );
+        let applied = addons::stage0_flux_sync_manifests(&a).unwrap();
+        assert_eq!(
+            applied,
+            [
+                file(&files, &format!("{flux}/tenant-reconciler-rbac.yaml")),
+                file(&files, &format!("{flux}/git-repository.yaml")),
+                file(&files, &format!("{flux}/gotk-sync.yaml")),
+            ]
+        );
+        let repo = yaml_docs(file(&files, &format!("{flux}/git-repository.yaml")));
+        assert_eq!(repo[0]["spec"]["interval"], "1m");
+
+        // Rauthy plain manifests live in their own Flux Kustomization path.
+        let rauthy_listed = kustomize_resources(file(
+            &files,
+            &format!("{RAUTHY_ADDON_DIR}/kustomization.yaml"),
+        ));
+        assert_eq!(rauthy_listed, files_in(&files, RAUTHY_ADDON_DIR));
+        let ks = yaml_docs(file(&files, &format!("{core}/rauthy.yaml")));
+        assert_eq!(ks.len(), 1);
+        assert_eq!(
+            ks[0]["spec"]["path"].as_str().unwrap(),
+            format!("./{RAUTHY_ADDON_DIR}")
+        );
+        let kinds: Vec<String> = rauthy_listed
+            .iter()
+            .flat_map(|f| yaml_docs(file(&files, &format!("{RAUTHY_ADDON_DIR}/{f}"))))
+            .map(|d| d["kind"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(kinds, ["HTTPRoute", "Service", "Service", "StatefulSet"]);
+        let route = yaml_docs(file(&files, &format!("{RAUTHY_ADDON_DIR}/httproute.yaml")));
+        assert_eq!(route[0]["spec"]["hostnames"][0], "idp.corp.example");
+        assert_eq!(route[0]["spec"]["parentRefs"].as_array().unwrap().len(), 2);
+
+        // cert-manager hosts follow `--oidc-public-url`, identical to the Stage 0 local CA.
+        let cm = yaml_docs(file(&files, &format!("{core}/cert-manager.yaml")));
+        let local_ca = yaml_docs(
+            &render_manifest(
+                include_str!("../../../../deploy/bootstrap/manifests/local-ca.yaml"),
+                &a.ingress.template_vars(),
+            )
+            .unwrap(),
+        );
+        assert_eq!(&cm[1..], &local_ca[..]);
+        assert_eq!(cm[4]["spec"]["dnsNames"][1], "idp.corp.example");
+
+        // No Secret (e.g. `rauthy-config`) and no unrendered placeholder ever reaches Git.
+        for (path, contents) in &files {
+            assert!(
+                !contents.contains("${"),
+                "{path} has an unrendered placeholder"
+            );
+            for doc in yaml_docs(contents) {
+                assert_ne!(doc["kind"], "Secret", "{path} contains a Secret");
+            }
+        }
+
+        let catalogs = seed_core_catalog_files(&a);
+        let rauthy_catalog = catalogs
+            .iter()
+            .find(|(p, _)| p == "catalog/core/rauthy/catalog.yaml")
+            .unwrap();
+        assert!(
+            rauthy_catalog
+                .1
+                .contains("serviceUrl: https://idp.corp.example:9443/auth/v1/admin")
+        );
+        keel_core::parse_catalog_application(&rauthy_catalog.1).unwrap();
+    }
+
+    #[tokio::test]
+    async fn seed_management_files_omit_rauthy_when_disabled() {
+        for cfg in [
+            BootstrapConfig {
+                oidc_issuer: Some("https://login.example.org".to_string()),
+                ..BootstrapConfig::new(keel_core::BootstrapTargetKind::Kubeconfig)
+            },
+            BootstrapConfig {
+                with_oidc: false,
+                ..BootstrapConfig::new(keel_core::BootstrapTargetKind::Kubeconfig)
+            },
+        ] {
+            let a = artifacts_for(cfg, DEFAULT_OIDC_PUBLIC_URL).await;
+            assert!(a.rauthy_config.is_none());
+            let files = seed_management_files(&a).unwrap();
+            let core = keel_core::MANAGEMENT_CORE_ADDONS_DIR;
+            let listed = kustomize_resources(file(&files, &format!("{core}/kustomization.yaml")));
+            assert_eq!(listed, files_in(&files, core));
+            assert!(!listed.contains("rauthy.yaml"));
+            assert!(listed.contains("kyverno-policies.yaml"));
+            assert!(
+                files.iter().all(|(p, _)| !p.contains("rauthy")),
+                "Rauthy files written while the built-in IdP is disabled"
+            );
+            assert!(
+                seed_core_catalog_files(&a)
+                    .iter()
+                    .all(|(p, _)| !p.contains("rauthy"))
+            );
+            // The CA / wildcard Certificate and the GatewayClass / Gateway stay in Git without
+            // Rauthy, and equal what Stage 0 applies unconditionally (local-ca.yaml,
+            // ingress-gateway.yaml), so the first Flux reconcile changes nothing.
+            let vars = a.ingress.template_vars();
+            let cm = yaml_docs(file(&files, &format!("{core}/cert-manager.yaml")));
+            let local_ca = yaml_docs(
+                &render_manifest(
+                    include_str!("../../../../deploy/bootstrap/manifests/local-ca.yaml"),
+                    &vars,
+                )
+                .unwrap(),
+            );
+            assert_eq!(&cm[1..], &local_ca[..]);
+            let eg = yaml_docs(file(&files, &format!("{core}/envoy-gateway.yaml")));
+            let gateway = yaml_docs(
+                &render_manifest(
+                    include_str!("../../../../deploy/bootstrap/manifests/ingress-gateway.yaml"),
+                    &vars,
+                )
+                .unwrap(),
+            );
+            assert_eq!(&eg[1..], &gateway[..]);
+        }
+    }
+
+    #[tokio::test]
+    async fn core_addon_flux_objects_impersonate_privileged_reconcilers() {
+        // Flux runs with `--default-service-account=default`: a core add-on Flux object without
+        // `serviceAccountName` would impersonate a permissionless SA and never become Ready.
+        let cfg = BootstrapConfig::new(keel_core::BootstrapTargetKind::Kubeconfig);
+        let a = artifacts_for(cfg, DEFAULT_OIDC_PUBLIC_URL).await;
+        let files = seed_management_files(&a).unwrap();
+        let core = keel_core::MANAGEMENT_CORE_ADDONS_DIR;
+        let mut seen = 0;
+        for (path, contents) in files
+            .iter()
+            .filter(|(p, _)| p.starts_with(&format!("{core}/")))
+        {
+            for doc in yaml_docs(contents) {
+                let kind = doc["kind"].as_str().unwrap_or_default();
+                let flux_group = doc["apiVersion"]
+                    .as_str()
+                    .is_some_and(|v| v.contains("toolkit.fluxcd.io"));
+                if !flux_group {
+                    continue;
+                }
+                // Flux sources and objects live in `flux-system` (no cross-namespace refs).
+                assert_eq!(doc["metadata"]["namespace"], "flux-system", "{path} {kind}");
+                let expected = match kind {
+                    "HelmRelease" => "helm-controller",
+                    "Kustomization" => "kustomize-controller",
+                    _ => continue,
+                };
+                seen += 1;
+                assert_eq!(doc["spec"]["serviceAccountName"], expected, "{path} {kind}");
+            }
+        }
+        // 7 HelmReleases + the Rauthy Kustomization.
+        assert_eq!(seen, 8);
+    }
+
+    #[tokio::test]
+    async fn seed_repo_writes_management_files_and_starter_dex_app() {
+        let tmp = std::env::temp_dir().join(format!("keel-seed-files-{}", uuid::Uuid::new_v4()));
+        let work = tmp.join("work");
+        let bare = default_bare_repo_for_workdir(&work);
+        let cfg = BootstrapConfig::new(keel_core::BootstrapTargetKind::Kubeconfig);
+        let a = synthesize_seed_control_plane(&cfg, Some(bare.to_str().unwrap()))
+            .await
+            .unwrap();
+        let res = initialize_seed_git_repo(&work, &a)
+            .await
+            .unwrap_or_else(|e| {
+                let _ = std::fs::remove_dir_all(&tmp);
+                panic!("seed repo init failed: {e}")
+            });
+        for (path, contents) in seed_management_files(&a).unwrap() {
+            assert!(res.written_files.contains(&path), "{path} not committed");
+            assert_eq!(
+                std::fs::read_to_string(res.repo_dir.join(&path)).unwrap(),
+                contents
+            );
+        }
+        // Self-service starter app stays available even though Keel itself uses Rauthy.
+        assert!(
+            res.written_files
+                .iter()
+                .any(|p| p == "catalog/apps/dex/catalog.yaml")
+        );
+        keel_core::parse_catalog_application(STARTER_DEX_APP_YAML).unwrap();
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn core_addon_flux_objects_match_core_catalog_ids() {
+        // Exactly one Flux object per base add-on, named after its catalog/core id.
+        let mut flux_names: Vec<String> = [
+            SEED_CORE_ADDON_S3_SEAWEEDFS_YAML,
+            SEED_CORE_ADDON_PKO_YAML,
+            SEED_CORE_ADDON_KYVERNO_YAML,
+            SEED_CORE_ADDON_ENVOY_GATEWAY_YAML,
+            SEED_CORE_ADDON_PROMETHEUS_YAML,
+            SEED_CORE_ADDON_FLAGGER_YAML,
+            SEED_CORE_ADDON_CERT_MANAGER_YAML,
+            SEED_CORE_ADDON_RAUTHY_YAML,
+            SEED_CORE_ADDON_HELM_REPOSITORIES_YAML,
+        ]
+        .iter()
+        .flat_map(|f| yaml_docs(f))
+        .filter_map(|d| keel_core::management_addon_ref(&d))
+        .map(|r| r.name)
+        .collect();
+        flux_names.sort();
+        let mut catalog_ids: Vec<String> = [
+            CORE_CATALOG_S3_STATE_BACKEND_YAML,
+            CORE_CATALOG_KYVERNO_YAML,
+            CORE_CATALOG_CERT_MANAGER_YAML,
+            CORE_CATALOG_RAUTHY_YAML,
+            CORE_CATALOG_ENVOY_GATEWAY_YAML,
+            CORE_CATALOG_PROMETHEUS_YAML,
+            CORE_CATALOG_FLAGGER_YAML,
+            CORE_CATALOG_PKO_YAML,
+        ]
+        .iter()
+        .map(|c| keel_core::parse_catalog_application(c).unwrap().metadata.id)
+        .collect();
+        catalog_ids.sort();
+        assert_eq!(flux_names, catalog_ids);
+        // Core add-on HelmRepositories only serve base add-ons, not self-service apps.
+        let repos: Vec<Value> = yaml_docs(SEED_CORE_ADDON_HELM_REPOSITORIES_YAML);
+        assert!(repos.iter().all(|r| r["metadata"]["name"] != "dex"));
+    }
+
+    #[test]
+    fn root_flux_kustomizations_gate_tenants_on_core_addons() {
+        let docs = yaml_docs(SEED_FLUX_GOTK_SYNC_YAML);
+        let by_name = |n: &str| {
+            docs.iter()
+                .find(|d| d["metadata"]["name"] == n)
+                .unwrap_or_else(|| panic!("missing Kustomization {n}"))
+        };
+        assert_eq!(docs.len(), 3);
+        for d in &docs {
+            assert_eq!(d["apiVersion"], "kustomize.toolkit.fluxcd.io/v1");
+            assert_eq!(d["metadata"]["namespace"], "flux-system");
+            assert_eq!(d["spec"]["sourceRef"]["name"], "flux-system");
+            assert_eq!(d["spec"]["decryption"]["secretRef"]["name"], "sops-age");
+        }
+        for d in &docs {
+            // `flux-system` (prune: true) applies this file; it must never prune a root
+            // Kustomization (and with it the whole inventory, e.g. every tenant namespace).
+            assert_eq!(
+                d["metadata"]["annotations"]["kustomize.toolkit.fluxcd.io/prune"], "disabled",
+                "{}",
+                d["metadata"]["name"]
+            );
+        }
+        let fs = by_name("flux-system");
+        assert_eq!(fs["spec"]["path"], "./clusters/management/flux-system");
+        assert_eq!(fs["spec"]["serviceAccountName"], "kustomize-controller");
+        let core = by_name("core-addons");
+        assert_eq!(
+            core["spec"]["path"].as_str().unwrap(),
+            format!("./{}", keel_core::MANAGEMENT_CORE_ADDONS_DIR)
+        );
+        assert_eq!(core["spec"]["serviceAccountName"], "kustomize-controller");
+        assert_eq!(core["spec"]["prune"], false);
+        // Health is per add-on Flux object; a broken optional add-on must not block tenants.
+        assert_eq!(core["spec"]["wait"], false);
+        assert!(core["spec"].get("healthChecks").is_none());
+        let tenants = by_name("keel-tenants");
+        assert_eq!(tenants["spec"]["path"], "./tenants");
+        assert_eq!(
+            tenants["spec"]["serviceAccountName"],
+            keel_kube::tenant::TENANT_RECONCILER_SERVICE_ACCOUNT
+        );
+        assert_eq!(tenants["spec"]["dependsOn"][0]["name"], "core-addons");
+        assert_eq!(tenants["spec"]["interval"], "1m");
+
+        let rauthy: Value = serde_yml::from_str(SEED_CORE_ADDON_RAUTHY_YAML).unwrap();
+        assert_eq!(rauthy["metadata"]["namespace"], "flux-system");
+        assert_eq!(rauthy["metadata"]["labels"]["keel.io/protect"], "true");
+        assert_eq!(rauthy["spec"]["serviceAccountName"], "kustomize-controller");
+        assert_eq!(rauthy["spec"]["targetNamespace"], "keel-system");
+        assert_eq!(rauthy["spec"]["prune"], false);
+        assert_eq!(rauthy["spec"]["sourceRef"]["kind"], "GitRepository");
+        assert_eq!(rauthy["spec"]["sourceRef"]["name"], "flux-system");
+        assert_eq!(rauthy["spec"]["healthChecks"][0]["kind"], "StatefulSet");
+        assert_eq!(rauthy["spec"]["healthChecks"][0]["name"], "rauthy");
+    }
+
+    #[test]
+    fn stage0_pulumi_does_not_revert_flux_managed_addons() {
+        let program: Value = serde_yml::from_str(CONTROL_PLANE_PULUMI_YAML).unwrap();
+        for name in [
+            "kyverno",
+            "pulumiKubernetesOperator",
+            "s3StateBackend",
+            "envoyGateway",
+            "prometheus",
+            "flagger",
+            "certManager",
+        ] {
+            let ignored = &program["resources"][name]["options"]["ignoreChanges"];
+            assert_eq!(
+                ignored,
+                &serde_json::json!([
+                    "chart",
+                    "version",
+                    "values",
+                    "repositoryOpts",
+                    "timeout",
+                    "waitForJobs",
+                    "createNamespace"
+                ]),
+                "{name}"
+            );
+            // Every chart-affecting input set on the release is ignored after the handoff.
+            let ignored: Vec<&str> = ignored
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap())
+                .collect();
+            for input in program["resources"][name]["properties"]
+                .as_object()
+                .unwrap()
+                .keys()
+            {
+                assert!(
+                    ["name", "namespace"].contains(&input.as_str())
+                        || ignored.contains(&input.as_str()),
+                    "{name}: input `{input}` would make a Pulumi re-run upgrade the release"
+                );
+            }
+        }
+
+        let rauthy: Value = serde_yml::from_str(state::CONTROL_PLANE_RAUTHY_PULUMI_YAML).unwrap();
+        let res = &rauthy["resources"];
+        for name in [
+            "rauthyConfigSecret",
+            "rauthyService",
+            "rauthyHeadlessService",
+            "rauthyStatefulSet",
+        ] {
+            assert_eq!(
+                res[name]["options"]["protect"], true,
+                "{name} must be protected"
+            );
+        }
+        assert!(
+            res["rauthyConfigSecret"]["options"]
+                .get("ignoreChanges")
+                .is_none()
+        );
+
+        // The Stage 0 objects equal the Git manifests Flux adopts (modulo Pulumi config refs).
+        let unref = |v: &Value| -> Value {
+            serde_json::from_str(
+                &v.to_string()
+                    .replace("${rauthySecretNamespace}", "keel-system")
+                    .replace("${rauthySecretName}", RAUTHY_CONFIG_SECRET_NAME),
+            )
+            .unwrap()
+        };
+        let services = yaml_docs(SEED_ADDON_RAUTHY_SERVICES_YAML);
+        let sts: Value = serde_yml::from_str(SEED_ADDON_RAUTHY_STATEFULSET_YAML).unwrap();
+        for (name, manifest) in [
+            ("rauthyService", &services[0]),
+            ("rauthyHeadlessService", &services[1]),
+            ("rauthyStatefulSet", &sts),
+        ] {
+            assert_eq!(
+                res[name]["options"]["ignoreChanges"],
+                serde_json::json!(["spec", "metadata.labels", "metadata.annotations"]),
+                "{name}"
+            );
+            let props = unref(&res[name]["properties"]);
+            assert_eq!(props["spec"], manifest["spec"], "{name} spec drift");
+            assert_eq!(props["metadata"]["name"], manifest["metadata"]["name"]);
+            assert_eq!(
+                props["metadata"]["namespace"],
+                manifest["metadata"]["namespace"]
+            );
+            assert_eq!(props["metadata"]["labels"], manifest["metadata"]["labels"]);
+        }
     }
 
     #[test]

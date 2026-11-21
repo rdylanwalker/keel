@@ -1,173 +1,40 @@
-# Rauthy OIDC Identity Provider (`SDD.md` §2.1, §6.1, §6.3, `NFR-SEC-01`)
-# Apache-2.0 licensed, lightweight Rust OIDC provider with embedded Hiqlite DB,
-# Admin UI for users/groups/clients, and declarative first-boot JSON seeding.
-apiVersion: v1
-kind: Service
+# Rauthy OIDC Identity Provider core add-on (`SDD.md` §2.1, §2.2, §6.1, `NFR-SEC-01`)
+# Apache-2.0 licensed, lightweight Rust OIDC provider with embedded Hiqlite DB, Admin UI for
+# users/groups/clients, and declarative first-boot JSON seeding.
+#
+# Plain-manifest add-on: this Flux Kustomization (name == `catalog/core/rauthy` id) reconciles
+# `clusters/management/addons/rauthy` (Services, StatefulSet, HTTPRoute) and adopts the Stage 0
+# objects created by `deploy/bootstrap/control-plane-rauthy/Pulumi.yaml` in place. The version
+# is `spec.images[].newTag` (management API upgrades edit only that tag). The
+# `keel-system/rauthy-config` Secret stays Stage 0-managed and is never stored in Git.
+# Only written when the built-in Rauthy is enabled (not with `--oidc-issuer` /
+# `--oidc-provider none`).
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
 metadata:
   name: rauthy
-  namespace: keel-system
-  labels:
-    app.kubernetes.io/managed-by: keel
-    app: rauthy
-    keel.io/protect: "true"
-spec:
-  selector:
-    app: rauthy
-  ports:
-    - name: http
-      port: 8080
-      targetPort: 8080
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: rauthy-headless
-  namespace: keel-system
-  labels:
-    app.kubernetes.io/managed-by: keel
-    app: rauthy
-    keel.io/protect: "true"
-spec:
-  type: ClusterIP
-  clusterIP: None
-  publishNotReadyAddresses: true
-  selector:
-    app: rauthy
-  ports:
-    - name: hiqlite-raft
-      port: 8100
-      targetPort: 8100
-    - name: hiqlite-api
-      port: 8200
-      targetPort: 8200
----
-apiVersion: apps/v1
-kind: StatefulSet
-metadata:
-  name: rauthy
-  namespace: keel-system
-  labels:
-    app.kubernetes.io/managed-by: keel
-    app: rauthy
-    keel.io/protect: "true"
-spec:
-  serviceName: rauthy-headless
-  replicas: 1
-  selector:
-    matchLabels:
-      app: rauthy
-  template:
-    metadata:
-      labels:
-        app: rauthy
-    spec:
-      securityContext:
-        fsGroup: 10001
-        seccompProfile:
-          type: RuntimeDefault
-      containers:
-        - name: rauthy
-          image: ghcr.io/sebadob/rauthy:0.37.2
-          securityContext:
-            allowPrivilegeEscalation: false
-            runAsNonRoot: true
-            runAsUser: 10001
-            runAsGroup: 10001
-            capabilities:
-              drop:
-                - ALL
-          ports:
-            - containerPort: 8080
-              name: http
-            - containerPort: 8100
-              name: hiqlite-raft
-            - containerPort: 8200
-              name: hiqlite-api
-          volumeMounts:
-            - name: rauthy-data
-              mountPath: /app/data
-            - name: rauthy-config
-              mountPath: /app/config.toml
-              subPath: config.toml
-              readOnly: true
-            - name: rauthy-bootstrap
-              mountPath: /app/bootstrap
-              readOnly: true
-          startupProbe:
-            httpGet:
-              scheme: HTTP
-              port: 8080
-              path: /auth/v1/health
-            initialDelaySeconds: 10
-            periodSeconds: 5
-            failureThreshold: 30
-          readinessProbe:
-            httpGet:
-              scheme: HTTP
-              port: 8200
-              path: /ready
-            initialDelaySeconds: 2
-            periodSeconds: 5
-            failureThreshold: 5
-          livenessProbe:
-            httpGet:
-              scheme: HTTP
-              port: 8080
-              path: /auth/v1/health
-            initialDelaySeconds: 10
-            periodSeconds: 20
-            failureThreshold: 3
-          resources:
-            requests:
-              memory: 128Mi
-              cpu: 100m
-      volumes:
-        - name: rauthy-config
-          secret:
-            secretName: rauthy-config
-            items:
-              - key: config.toml
-                path: config.toml
-        - name: rauthy-bootstrap
-          secret:
-            secretName: rauthy-config
-            items:
-              - key: groups.json
-                path: groups.json
-              - key: users.json
-                path: users.json
-              - key: clients.json
-                path: clients.json
-  volumeClaimTemplates:
-    - metadata:
-        name: rauthy-data
-      spec:
-        accessModes:
-          - ReadWriteOnce
-        resources:
-          requests:
-            storage: 128Mi
----
-apiVersion: gateway.networking.k8s.io/v1
-kind: HTTPRoute
-metadata:
-  name: rauthy-ingress
-  namespace: keel-system
+  namespace: flux-system
   labels:
     app.kubernetes.io/managed-by: keel
     keel.io/protect: "true"
 spec:
-  parentRefs:
-    - name: keel-ingress
+  interval: 10m
+  path: ./clusters/management/addons/rauthy
+  targetNamespace: keel-system
+  # Never garbage-collect the IdP (or its data PVC) when a manifest is removed from Git.
+  prune: false
+  serviceAccountName: kustomize-controller
+  sourceRef:
+    kind: GitRepository
+    name: flux-system
+  images:
+    - name: ghcr.io/sebadob/rauthy
+      newTag: "0.37.2"
+  # Health is reported on this object only; `core-addons` does not wait on it.
+  wait: false
+  timeout: 5m
+  healthChecks:
+    - apiVersion: apps/v1
+      kind: StatefulSet
+      name: rauthy
       namespace: keel-system
-      sectionName: https-local
-  hostnames:
-    - idp.keel.local
-  rules:
-    - matches:
-        - path:
-            type: PathPrefix
-            value: /
-      backendRefs:
-        - name: rauthy
-          port: 8080

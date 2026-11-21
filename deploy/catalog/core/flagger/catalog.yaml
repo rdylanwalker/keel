@@ -32,7 +32,7 @@ spec:
         type: string
         title: Prometheus Metrics Server URL
         description: In-cluster Prometheus URL queried by Flagger for canary metric checks.
-        default: http://prometheus.keel-system:9090
+        default: http://prometheus.keel-system.svc.cluster.local:80
       podMonitor:
         type: object
         title: PodMonitor Integration

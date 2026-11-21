@@ -3,15 +3,20 @@ apiVersion: helm.toolkit.fluxcd.io/v2
 kind: HelmRelease
 metadata:
   name: flagger
-  namespace: keel-system
+  namespace: flux-system
   labels:
     app.kubernetes.io/managed-by: keel
     keel.io/protect: "true"
 spec:
   interval: 10m
-  # Same release name/namespace as the Stage 0 Pulumi install so Flux adopts it in place.
-  storageNamespace: keel-system
+  # Adopts the Stage 0 Pulumi release in place: same release name, release namespace
+  # (target + storage), chart version and values (`flux_helmreleases_adopt_stage0_releases_in_place`).
   releaseName: flagger
+  targetNamespace: keel-system
+  storageNamespace: keel-system
+  # Multi-tenancy lockdown: platform releases live in `flux-system` and impersonate the
+  # privileged `helm-controller` SA (never the permissionless `default`).
+  serviceAccountName: helm-controller
   dependsOn:
     - name: envoy-gateway
     - name: prometheus
@@ -22,7 +27,7 @@ spec:
       sourceRef:
         kind: HelmRepository
         name: flagger
-        namespace: keel-system
+        namespace: flux-system
   install:
     crds: CreateReplace
   upgrade:
@@ -33,6 +38,6 @@ spec:
       strategy: rollback
   values:
     meshProvider: gatewayapi:v1
-    metricsServer: http://prometheus.keel-system:9090
+    metricsServer: http://prometheus.keel-system.svc.cluster.local:80
     podMonitor:
       enabled: false

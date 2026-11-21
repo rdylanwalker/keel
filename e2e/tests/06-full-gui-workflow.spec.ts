@@ -249,6 +249,8 @@ test.describe('06 - Full Localhost GUI GitOps Workflow', () => {
     await expect(page.getByRole('heading', { name: 'Management Plane Base Addons' })).toBeVisible();
     await expect(page.getByText('s3-state-backend').first()).toBeVisible();
     await expect(page.getByTestId('core-addon-rauthy')).toBeVisible();
+    // Rauthy is an image-based Flux Kustomization add-on: its version is the pinned image tag.
+    await expect(page.getByTestId('core-addon-rauthy').getByText('v0.37.2')).toBeVisible();
     await expect(
       page
         .getByTestId('core-addon-rauthy')

@@ -1,0 +1,12 @@
+# Rauthy OIDC Identity Provider plain manifests (`SDD.md` §2.1, §2.2, §6.1, `NFR-SEC-01`).
+# Written to `clusters/management/addons/rauthy/` and reconciled by the Flux Kustomization
+# `flux-system/rauthy` (`clusters/management/core-addons/rauthy.yaml`), which pins the image tag
+# through `spec.images[].newTag`. The `keel-system/rauthy-config` Secret (config.toml + first-boot
+# JSON seed) is created by Stage 0 (`deploy/bootstrap/control-plane-rauthy/Pulumi.yaml`) and is
+# never stored in Git.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - services.yaml
+  - statefulset.yaml
+  - httproute.yaml

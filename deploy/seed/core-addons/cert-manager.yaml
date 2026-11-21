@@ -3,15 +3,20 @@ apiVersion: helm.toolkit.fluxcd.io/v2
 kind: HelmRelease
 metadata:
   name: cert-manager
-  namespace: keel-system
+  namespace: flux-system
   labels:
     app.kubernetes.io/managed-by: keel
     keel.io/protect: "true"
 spec:
   interval: 10m
-  # Same release name/namespace as the Stage 0 Pulumi install so Flux adopts it in place.
-  storageNamespace: keel-system
+  # Adopts the Stage 0 Pulumi release in place: same release name, release namespace
+  # (target + storage), chart version and values (`flux_helmreleases_adopt_stage0_releases_in_place`).
   releaseName: cert-manager
+  targetNamespace: keel-system
+  storageNamespace: keel-system
+  # Multi-tenancy lockdown: platform releases live in `flux-system` and impersonate the
+  # privileged `helm-controller` SA (never the permissionless `default`).
+  serviceAccountName: helm-controller
   chart:
     spec:
       chart: cert-manager
@@ -19,7 +24,7 @@ spec:
       sourceRef:
         kind: HelmRepository
         name: jetstack
-        namespace: keel-system
+        namespace: flux-system
   install:
     crds: CreateReplace
   upgrade:
@@ -79,11 +84,13 @@ metadata:
     app.kubernetes.io/managed-by: keel
 spec:
   secretName: keel-wildcard-tls
+  # Rendered at bootstrap from `--oidc-public-url` (identical to the Stage 0
+  # `deploy/bootstrap/manifests/local-ca.yaml`), so Flux never reverts the wildcard hosts.
   dnsNames:
-    - "*.keel.local"
-    - idp.keel.local
-    - forgejo.keel.local
-    - keel.keel.local
+    - "*.${BASE_DOMAIN}"
+    - ${IDP_HOST}
+    - ${FORGEJO_HOST}
+    - ${KEEL_HOST}
   issuerRef:
     name: keel-ca-issuer
     kind: ClusterIssuer

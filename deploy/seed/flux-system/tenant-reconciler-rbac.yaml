@@ -1,5 +1,5 @@
-# Confined identity impersonated by the root tenants Flux Kustomization (`tenants-root` /
-# `keel-tenants`) under multi-tenancy lockdown (`NFR-SEC-02`, `NFR-SEC-04`).
+# Confined identity impersonated by the root tenants Flux Kustomization `keel-tenants`
+# (`gotk-sync.yaml`) under multi-tenancy lockdown (`NFR-SEC-02`, `NFR-SEC-04`).
 # Mirrors `keel_kube::tenant::build_tenant_reconciler_rbac()`.
 #
 # - Covers only the kinds Keel writes under `tenants/` (tenant onboarding + tenant workloads).

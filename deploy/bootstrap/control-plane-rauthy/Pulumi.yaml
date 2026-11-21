@@ -1,8 +1,17 @@
 # Stage 0 In-Cluster Rauthy OIDC Identity Provider (`SDD.md` §2.1, §6.1, `NFR-SEC-01`)
 # Installed by default when no external `--oidc-issuer` is provided and `--oidc-provider` is `rauthy`.
+#
+# Flux handoff: the Services and StatefulSet below are identical to
+# `deploy/seed/addons/rauthy/` (written to `clusters/management/addons/rauthy/`), which the Flux
+# Kustomization `flux-system/rauthy` adopts in place. They ignore `spec` and metadata
+# labels/annotations so later Pulumi runs (e.g. `keel bootstrap recover`) never revert a
+# Flux-applied image upgrade or fight the kustomize-controller field manager. The
+# `rauthy-config` Secret stays owned by this stack (credentials never go to Git). The HTTPRoute is
+# applied by `keel bootstrap init` from the same rendered `addons/rauthy/httproute.yaml`.
+# All resources carry `protect: true` (anti-lockout, AGENTS.md guardrail 7).
 name: keel-stage0-control-plane-rauthy
 runtime: yaml
-description: Stage 0 in-cluster Rauthy OIDC provider, bootstrap config Secret, and Gateway HTTPRoute in keel-system
+description: Stage 0 in-cluster Rauthy OIDC provider and bootstrap config Secret in keel-system
 
 config:
   kubeconfig:
@@ -33,9 +42,11 @@ resources:
       context: ${kubeContext}
       enableServerSideApply: true
 
+  # Config + first-boot seed; Stage 0-owned and never stored in Git.
   rauthyConfigSecret:
     type: kubernetes:core/v1:Secret
     options:
+      protect: true
       provider: ${k8sProvider}
     properties:
       metadata:
@@ -55,6 +66,14 @@ resources:
   rauthyService:
     type: kubernetes:core/v1:Service
     options:
+      protect: true
+      # Flux (`flux-system/rauthy`) owns the object after the handoff; metadata labels and
+      # annotations are ignored too, so a re-run never sends a server-side apply carrying the
+      # stale Stage 0 spec.
+      ignoreChanges:
+        - spec
+        - metadata.labels
+        - metadata.annotations
       provider: ${k8sProvider}
     properties:
       metadata:
@@ -63,6 +82,7 @@ resources:
         labels:
           app.kubernetes.io/managed-by: keel
           app: rauthy
+          keel.io/protect: "true"
       spec:
         selector:
           app: rauthy
@@ -74,6 +94,14 @@ resources:
   rauthyHeadlessService:
     type: kubernetes:core/v1:Service
     options:
+      protect: true
+      # Flux (`flux-system/rauthy`) owns the object after the handoff; metadata labels and
+      # annotations are ignored too, so a re-run never sends a server-side apply carrying the
+      # stale Stage 0 spec.
+      ignoreChanges:
+        - spec
+        - metadata.labels
+        - metadata.annotations
       provider: ${k8sProvider}
     properties:
       metadata:
@@ -82,6 +110,7 @@ resources:
         labels:
           app.kubernetes.io/managed-by: keel
           app: rauthy
+          keel.io/protect: "true"
       spec:
         type: ClusterIP
         clusterIP: None
@@ -99,6 +128,14 @@ resources:
   rauthyStatefulSet:
     type: kubernetes:apps/v1:StatefulSet
     options:
+      protect: true
+      # Flux (`flux-system/rauthy`) owns the object after the handoff; metadata labels and
+      # annotations are ignored too, so a re-run never sends a server-side apply carrying the
+      # stale Stage 0 spec.
+      ignoreChanges:
+        - spec
+        - metadata.labels
+        - metadata.annotations
       provider: ${k8sProvider}
       dependsOn:
         - ${rauthyConfigSecret}
@@ -111,6 +148,7 @@ resources:
         labels:
           app.kubernetes.io/managed-by: keel
           app: rauthy
+          keel.io/protect: "true"
       spec:
         serviceName: rauthy-headless
         replicas: 1

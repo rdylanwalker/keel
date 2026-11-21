@@ -21,8 +21,9 @@ use super::state::{
     run_pulumi_control_plane_stack, store_passphrase_secret,
 };
 use super::{
-    DEFAULT_TENANT_ID, SeedControlPlaneArtifacts, Stage0Ingress, TENANT_GIT_TOKEN_ENV,
-    apply_git_credentials_secret, apply_tenant_git_credentials_secret, render_manifest,
+    DEFAULT_TENANT_ID, SEED_FLUX_GOTK_SYNC_YAML, SeedControlPlaneArtifacts, Stage0Ingress,
+    TENANT_GIT_TOKEN_ENV, apply_git_credentials_secret, apply_tenant_git_credentials_secret,
+    render_manifest, render_rauthy_httproute,
 };
 use crate::commands::CliError;
 
@@ -39,8 +40,6 @@ const MANAGEMENT_PKO_RBAC_YAML: &str =
     include_str!("../../../../../deploy/bootstrap/manifests/management-pko-rbac.yaml");
 const PREVIEW_WORKSPACE_RBAC_YAML: &str =
     include_str!("../../../../../deploy/bootstrap/manifests/preview-workspace-rbac.yaml");
-const TENANTS_KUSTOMIZATION_YAML: &str =
-    include_str!("../../../../../deploy/bootstrap/manifests/tenants-kustomization.yaml");
 
 /// Retries `kubectl apply` while Kyverno's admission webhook is still starting.
 async fn apply_with_webhook_retry(target: KubeTarget<'_>, yaml: &str) -> Result<(), CliError> {
@@ -338,10 +337,10 @@ pub(crate) async fn install_stage0_core_addons(
         Ok::<(), CliError>(())
     };
 
-    let rauthy_fut = async {
-        let Some(ref rauthy_cfg) = artifacts.rauthy_config else {
-            return Ok::<(), CliError>(());
-        };
+    let ingress_and_rauthy_fut = async {
+        // The CA, wildcard Certificate, GatewayClass and `keel-ingress` Gateway are part of the
+        // `core-addons` Git layout (cert-manager.yaml / envoy-gateway.yaml) whether or not the
+        // built-in Rauthy IdP is enabled, so Stage 0 always applies them too (Git == cluster).
         tracing::info!("Applying cert-manager self-signed CA & keel-wildcard-tls Certificate");
         apply_with_webhook_retry(
             target,
@@ -365,6 +364,9 @@ pub(crate) async fn install_stage0_core_addons(
         )
         .await?;
 
+        let Some(ref rauthy_cfg) = artifacts.rauthy_config else {
+            return Ok::<(), CliError>(());
+        };
         let groups_b64 = STANDARD.encode(rauthy_cfg.groups_json.as_bytes());
         let users_b64 = STANDARD.encode(rauthy_cfg.users_json.as_bytes());
         let clients_b64 = STANDARD.encode(rauthy_cfg.clients_json.as_bytes());
@@ -386,7 +388,10 @@ pub(crate) async fn install_stage0_core_addons(
                 ("rauthySecretNamespace", &rauthy_cfg.secret_namespace, false),
             ],
         )
-        .await
+        .await?;
+        // Same rendered document as `clusters/management/addons/rauthy/httproute.yaml`.
+        tracing::info!("Applying Rauthy HTTPRoute");
+        apply_with_webhook_retry(target, &render_rauthy_httproute(ingress)?).await
     };
 
     let forgejo_fut = async {
@@ -412,7 +417,7 @@ pub(crate) async fn install_stage0_core_addons(
         .await
     };
 
-    tokio::try_join!(infra_setup_fut, rauthy_fut, forgejo_fut)?;
+    tokio::try_join!(infra_setup_fut, ingress_and_rauthy_fut, forgejo_fut)?;
 
     if with_forge && artifacts.rauthy_config.is_some() {
         target
@@ -458,16 +463,44 @@ pub(crate) async fn install_stage0_core_addons(
                 )),
             }
         }
-        target.apply(&build_tenant_reconciler_rbac_yaml()?).await?;
-        target
-            .apply(&artifacts.flux_git_repository.to_yaml()?)
-            .await?;
-        target.apply(TENANTS_KUSTOMIZATION_YAML).await?;
+        // Exactly what `clusters/management/flux-system/` holds in Git (see
+        // `seed_management_files`): tenant reconciler RBAC, the root GitRepository and the root
+        // Flux Kustomizations (`flux-system`, `core-addons`, `keel-tenants`). From here on Flux
+        // reconciles the management add-ons and adopts the Stage 0 releases in place.
+        for yaml in stage0_flux_sync_manifests(artifacts)? {
+            target.apply(&yaml).await?;
+        }
     } else {
         tracing::info!(url = %repo_url, "Skipping in-cluster Flux GitRepository apply for local filesystem path");
+        notes.push(local_git_flux_handoff_note(repo_url));
     }
 
     Ok(notes)
+}
+
+/// Bootstrap note for a GitOps repository on the local filesystem: Flux cannot reach it, so it
+/// never adopts the Stage 0 add-ons, and the Stage 0 programs deliberately ignore version/value
+/// changes after the handoff (`ignoreChanges`), so core add-ons have no upgrade path in this mode.
+pub(crate) fn local_git_flux_handoff_note(repo_url: &str) -> String {
+    format!(
+        "GitOps repository `{repo_url}` is a local path that in-cluster Flux cannot reach: the \
+         control-plane add-ons stay Stage 0-only (no Flux reconciliation, no management API \
+         upgrades/rollbacks, and re-running `keel bootstrap init`/`recover` does not apply newer \
+         add-on versions). Push the repository to a network Git remote (`--git-url`) and re-run \
+         `keel bootstrap init` to hand the add-ons over to Flux."
+    )
+}
+
+/// Flux bootstrap manifests applied in-cluster when the GitOps repository is reachable over the
+/// network (in order). Identical to the documents written to `clusters/management/flux-system/`.
+pub(crate) fn stage0_flux_sync_manifests(
+    artifacts: &SeedControlPlaneArtifacts,
+) -> Result<Vec<String>, CliError> {
+    Ok(vec![
+        build_tenant_reconciler_rbac_yaml()?,
+        artifacts.flux_git_repository.to_yaml()?,
+        SEED_FLUX_GOTK_SYNC_YAML.to_string(),
+    ])
 }
 
 #[cfg(test)]
@@ -504,12 +537,12 @@ mod tests {
                     "Certificate",
                 ],
             ),
-            (
-                INGRESS_GATEWAY_YAML,
-                vec!["GatewayClass", "Gateway", "HTTPRoute"],
-            ),
+            (INGRESS_GATEWAY_YAML, vec!["GatewayClass", "Gateway"]),
             (FORGEJO_ROUTE_YAML, vec!["HTTPRoute"]),
-            (TENANTS_KUSTOMIZATION_YAML, vec!["Kustomization"]),
+            (
+                SEED_FLUX_GOTK_SYNC_YAML,
+                vec!["Kustomization", "Kustomization", "Kustomization"],
+            ),
             (
                 PREVIEW_WORKSPACE_RBAC_YAML,
                 vec!["ServiceAccount", "ClusterRoleBinding", "ClusterRoleBinding"],
@@ -524,8 +557,26 @@ mod tests {
             let got: Vec<&str> = parsed.iter().map(|d| d["kind"].as_str().unwrap()).collect();
             assert_eq!(got, kinds);
         }
+        let route = docs(&render_rauthy_httproute(&ingress).unwrap());
+        assert_eq!(route.len(), 1);
+        assert_eq!(route[0]["kind"], "HTTPRoute");
+        assert_eq!(route[0]["spec"]["hostnames"][0], "idp.example.org");
+        let listeners: Vec<&str> = route[0]["spec"]["parentRefs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["sectionName"].as_str().unwrap())
+            .collect();
+        assert_eq!(listeners, ["https-local", "https"]);
+        // Every listener the route binds exists on the Stage 0 Gateway.
         let gw = docs(&render_manifest(INGRESS_GATEWAY_YAML, &vars).unwrap());
-        assert_eq!(gw[2]["spec"]["hostnames"][0], "idp.example.org");
+        let gw_listeners: Vec<&str> = gw[1]["spec"]["listeners"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| l["name"].as_str().unwrap())
+            .collect();
+        assert!(listeners.iter().all(|l| gw_listeners.contains(l)));
         let ca = docs(&render_manifest(LOCAL_CA_YAML, &vars).unwrap());
         assert_eq!(ca[3]["spec"]["dnsNames"][0], "*.example.org");
 
@@ -534,11 +585,10 @@ mod tests {
         assert_eq!(rbac[0]["metadata"]["name"], "mgmt-sa");
         assert_eq!(rbac[1]["subjects"][0]["name"], "mgmt-sa");
 
-        let ks = docs(TENANTS_KUSTOMIZATION_YAML);
-        assert_eq!(
-            ks[0]["spec"]["serviceAccountName"],
-            keel_kube::tenant::TENANT_RECONCILER_SERVICE_ACCOUNT
-        );
+        let note = local_git_flux_handoff_note("/tmp/keel-gitops.git");
+        assert!(note.contains("/tmp/keel-gitops.git"));
+        assert!(note.contains("--git-url"));
+
         let fl = docs(FLAGGER_METRIC_TEMPLATES_YAML);
         assert!(
             fl[0]["spec"]["query"]

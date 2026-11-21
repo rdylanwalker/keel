@@ -1148,7 +1148,7 @@ pub const TENANT_S3_CREDENTIALS_SECRET_KIND: &str = "tenant-s3-credentials";
 pub const TENANT_GIT_CREDENTIALS_SECRET_KIND: &str = "tenant-git-credentials-readonly";
 
 /// Name of the Flux reconciler `ServiceAccount` (in `flux-system`) impersonated by the
-/// `tenants-root` / `keel-tenants` Kustomization instead of cluster-admin `kustomize-controller`.
+/// `keel-tenants` Kustomization instead of cluster-admin `kustomize-controller`.
 pub const TENANT_RECONCILER_SERVICE_ACCOUNT: &str = "keel-tenant-reconciler";
 
 /// Returns the S3 object-key prefix (`tenants/<id>`) owning a tenant's Pulumi DIY state.

@@ -1,6 +1,6 @@
 # Kyverno admission controller (`SDD.md` §6.2, `NFR-SEC-04`).
 # Adopts the Stage 0 release installed by `deploy/bootstrap/control-plane/Pulumi.yaml` in place:
-# same release name (`kyverno`), namespace (`keel-system`), chart version and values. Chart 3.10.0
+# same release name (`kyverno`), release namespace (`keel-system`), chart version and values. Chart 3.10.0
 # ships CRDs serving `policies.kyverno.io/v1` (ValidatingPolicy, GeneratingPolicy, PolicyException)
 # used by `deploy/seed/kyverno-policies`. The `# keel:policy-exceptions` marker is rendered by
 # `keel bootstrap init` to mirror `--local-dev-docker-socket-exception`.
@@ -8,14 +8,20 @@ apiVersion: helm.toolkit.fluxcd.io/v2
 kind: HelmRelease
 metadata:
   name: kyverno
-  namespace: keel-system
+  namespace: flux-system
   labels:
     app.kubernetes.io/managed-by: keel
     keel.io/protect: "true"
 spec:
   interval: 10m
+  # Adopts the Stage 0 Pulumi release in place: same release name, release namespace
+  # (target + storage), chart version and values (`flux_helmreleases_adopt_stage0_releases_in_place`).
   releaseName: kyverno
+  targetNamespace: keel-system
   storageNamespace: keel-system
+  # Multi-tenancy lockdown: platform releases live in `flux-system` and impersonate the
+  # privileged `helm-controller` SA (never the permissionless `default`).
+  serviceAccountName: helm-controller
   chart:
     spec:
       chart: kyverno
@@ -23,7 +29,7 @@ spec:
       sourceRef:
         kind: HelmRepository
         name: kyverno
-        namespace: keel-system
+        namespace: flux-system
   install:
     crds: CreateReplace
   upgrade:

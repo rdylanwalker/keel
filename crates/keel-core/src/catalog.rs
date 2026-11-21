@@ -1540,4 +1540,112 @@ spec:
         );
         assert_eq!(yaml_leading_comments("kind: A\n"), "");
     }
+
+    fn image_app(runtime: &str, upstream: &str) -> String {
+        format!(
+            "apiVersion: keel.io/v1alpha1\nkind: CatalogApplication\nmetadata:\n  id: rauthy\n  name: Rauthy\n  category: management-core\n  runtime: {runtime}\nspec:\n  upstream:\n{upstream}  schema:\n    type: object\n    properties: {{}}\n"
+        )
+    }
+
+    #[test]
+    fn image_based_kustomize_application_needs_no_repo_url() {
+        let app = parse_catalog_application(&image_app(
+            "kustomize",
+            "    image: ghcr.io/sebadob/rauthy\n    version: \"0.37.2\"\n",
+        ))
+        .unwrap();
+        assert_eq!(
+            app.spec.upstream.image.as_deref(),
+            Some("ghcr.io/sebadob/rauthy")
+        );
+        assert_eq!(app.spec.upstream.version.as_deref(), Some("0.37.2"));
+        assert!(app.spec.upstream.repo_url.is_empty());
+        // Round-trips under the `image` key and omits it when unset.
+        let yaml = serde_yml::to_string(&app).unwrap();
+        assert!(yaml.contains("image: ghcr.io/sebadob/rauthy"));
+        let authentik = parse_catalog_application(AUTHENTIK_CATALOG_YAML).unwrap();
+        assert!(authentik.spec.upstream.image.is_none());
+        assert!(!serde_yml::to_string(&authentik).unwrap().contains("image:"));
+    }
+
+    #[test]
+    fn image_upstream_is_validated() {
+        // Without an image, kustomize still requires repoURL.
+        let err = parse_catalog_application(&image_app("kustomize", "    version: \"1.0.0\"\n"))
+            .unwrap_err();
+        assert!(err.to_string().contains("repoURL"), "{err}");
+        for (runtime, upstream, needle) in [
+            (
+                "helm",
+                "    image: ghcr.io/a/b\n    version: \"1\"\n    chart: b\n    repoURL: https://x\n",
+                "only supported for runtime: kustomize",
+            ),
+            (
+                "kustomize",
+                "    image: ghcr.io/a/b\n",
+                "requires spec.upstream.version",
+            ),
+            (
+                "kustomize",
+                "    image: ghcr.io/a/b:1.0\n    version: \"1.0\"\n",
+                "must not contain a tag",
+            ),
+            (
+                "kustomize",
+                "    image: ghcr.io/a/b@sha256:abc\n    version: \"1.0\"\n",
+                "digest",
+            ),
+            (
+                "kustomize",
+                "    image: \"ghcr.io/a b\"\n    version: \"1.0\"\n",
+                "whitespace",
+            ),
+            (
+                "kustomize",
+                "    image: \"\"\n    version: \"1.0\"\n",
+                "1-255",
+            ),
+            (
+                "kustomize",
+                "    image: ghcr.io//b\n    version: \"1.0\"\n",
+                "repository path",
+            ),
+        ] {
+            let err = parse_catalog_application(&image_app(runtime, upstream)).unwrap_err();
+            assert!(err.to_string().contains(needle), "{upstream}: {err}");
+        }
+        // Self-service (non-management-core) apps cannot be image-based: the tenant install path
+        // only synthesizes HelmRelease/HelmRepository objects from `repoURL`.
+        let tenant_app = image_app(
+            "kustomize",
+            "    image: ghcr.io/sebadob/rauthy\n    version: \"0.37.2\"\n",
+        )
+        .replace("category: management-core", "category: identity");
+        let err = parse_catalog_application(&tenant_app).unwrap_err();
+        assert!(err.to_string().contains("metadata.category"), "{err}");
+        // A registry host with a port is not a tag.
+        parse_catalog_application(&image_app(
+            "kustomize",
+            "    image: registry.local:5000/team/app\n    version: \"2.0.0\"\n",
+        ))
+        .unwrap();
+    }
+
+    #[test]
+    fn builtin_rauthy_core_catalog_is_image_based_and_version_only() {
+        let app = parse_catalog_application(include_str!(
+            "../../../deploy/catalog/core/rauthy/catalog.yaml"
+        ))
+        .unwrap();
+        assert_eq!(app.metadata.runtime, AppRuntime::Kustomize);
+        assert_eq!(
+            app.spec.upstream.image.as_deref(),
+            Some("ghcr.io/sebadob/rauthy")
+        );
+        assert!(app.spec.upstream.chart.is_none());
+        // No Helm-style values (e.g. replicas): Hiqlite raft membership is config-driven.
+        assert_eq!(app.spec.schema["properties"], json!({}));
+        assert!(validate_schema_values(&app.spec.schema, &json!({"replicas": 3})).is_err());
+        assert!(validate_schema_values(&app.spec.schema, &json!({})).is_ok());
+    }
 }

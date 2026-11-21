@@ -1,4 +1,9 @@
-# Core Addons Kustomization (`SDD.md` §2.1, §3.1)
+# Core Addons Kustomization (`SDD.md` §2.1, §2.2, §3.1)
+# Reconciled by the `flux-system/core-addons` Flux Kustomization (`../flux-system/gotk-sync.yaml`).
+# Mirrors exactly the files `keel bootstrap init` writes to `clusters/management/core-addons/`:
+# - `kyverno-policies.yaml` is rendered at bootstrap from `deploy/seed/kyverno-policies/`
+#   (`KyvernoManifestBundle`, provider allowlist + optional local-dev exception).
+# - `rauthy.yaml` is only written (and listed) when the built-in Rauthy IdP is enabled.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
@@ -6,6 +11,7 @@ resources:
   - s3-seaweedfs.yaml
   - pko.yaml
   - kyverno.yaml
+  - kyverno-policies.yaml
   - envoy-gateway.yaml
   - prometheus.yaml
   - flagger.yaml

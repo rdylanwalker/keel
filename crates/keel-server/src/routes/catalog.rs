@@ -484,6 +484,7 @@ pub async fn register_catalog_app(
                         version: req.version,
                         path,
                         git_ref: None,
+                        image: None,
                     },
                     progressive_delivery: ProgressiveDeliverySpec {
                         flagger_supported: req.flagger_supported,
