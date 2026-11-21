@@ -80,9 +80,9 @@ Inspect connection details and access provisioned cloud or on-premises VMs with 
 | :---: | :---: |
 | ![PR & Preview Inspector](./docs/assets/screenshots/preview.png) | ![Control Plane & Providers](./docs/assets/screenshots/providers.png) |
 
-| Live Reconciler Event Stream (Topology) |
-| :---: |
-| ![Live Reconciler Event Stream](./docs/assets/screenshots/topology-events.png) |
+| Live Reconciler Event Stream (Topology) | Deployed Application Releases (Topology) |
+| :---: | :---: |
+| ![Live Reconciler Event Stream](./docs/assets/screenshots/topology-events.png) | ![Deployed Application Releases table with protected management add-ons](./docs/assets/screenshots/topology-releases.png) |
 
 ---
 

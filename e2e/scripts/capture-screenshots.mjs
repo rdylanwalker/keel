@@ -22,6 +22,13 @@ const PAGES = [
     filename: 'topology-events.png',
     scrollToBottom: true,
   },
+  {
+    // Unified releases table (tenant releases + protected management add-on rows for admins).
+    id: 'topology-releases',
+    label: 'Topology Map',
+    filename: 'topology-releases.png',
+    scrollToTestId: 'topology-releases-section',
+  },
   { id: 'catalog', label: 'Catalog & Form Wizard', filename: 'catalog.png' },
   { id: 'preview', label: 'PR & Preview Inspector', filename: 'preview.png' },
   { id: 'providers', label: 'Control Plane & Providers', filename: 'providers.png' },
@@ -123,7 +130,21 @@ async function main() {
       await page.waitForLoadState('networkidle').catch(() => {});
       await page.waitForTimeout(800);
 
-      if (entry.scrollToBottom) {
+      if (entry.scrollToTestId) {
+        // Align the element with the top of the viewport, just below the sticky chrome (demo
+        // banner + header), which would otherwise cover the section title. scrollIntoViewIfNeeded
+        // only nudges it to the nearest edge, which would cut off most of a tall section.
+        const target = page.getByTestId(entry.scrollToTestId);
+        await target.waitFor({ state: 'visible', timeout: 10_000 });
+        await target.evaluate((el) => {
+          const doc = el.ownerDocument;
+          const win = doc.defaultView;
+          const header = doc.querySelector('header');
+          const stickyBottom = header ? Math.max(0, header.getBoundingClientRect().bottom) : 0;
+          win.scrollTo(0, el.getBoundingClientRect().top + win.scrollY - stickyBottom - 12);
+        });
+        await page.waitForTimeout(400);
+      } else if (entry.scrollToBottom) {
         await page.evaluate('window.scrollTo(0, document.body.scrollHeight)');
         await page.waitForTimeout(400);
       } else {

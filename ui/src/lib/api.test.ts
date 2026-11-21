@@ -166,9 +166,9 @@ describe("api client module", () => {
 
   it("creates proposal", async () => {
     const payload = {
-      catalogId: "app-web-service",
+      catalogId: "podinfo",
       tenant: "tenant-acme",
-      values: { replicas: 3 },
+      values: { replicaCount: 3 },
     }
     const mockRes = { id: "100", title: "Deploy app" }
     vi.stubGlobal(

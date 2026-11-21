@@ -50,155 +50,935 @@ export const DEMO_TENANTS: TenantSummary[] = [
   { id: "stark", namespace: "tenant-stark" },
 ]
 
+/**
+ * Demo-mode catalog mirroring the real built-in catalog under `deploy/catalog` (same ids, names,
+ * descriptions, categories, versions, runtime, placement), mapped the way `getCatalog` maps
+ * `GET /api/v1/catalog` (bundles, then infra blueprints, then apps, each sorted by id). Schemas are
+ * representative subsets of the real `spec.schema`. `demoFixtures.test.ts` guards against drift.
+ */
 export const DEFAULT_CATALOG: CatalogItem[] = [
   {
-    id: "app-web-service",
-    name: "Web Service Application",
+    id: "kind-canary-platform",
+    name: "Local kind Cluster + Canary Platform",
     description:
-      "Standard HTTP microservice Helm chart with Envoy ingress and HPA",
-    type: "app",
-    category: "Applications",
-    version: "1.4.0",
+      "Provision a local kind workload cluster via PKO v2 and install Envoy Gateway, Prometheus, and Flagger into keel-system for progressive canary rollouts.",
+    type: "bundle",
+    category: "platform",
+    version: "bundle",
     protected: false,
+    bundleItems: [
+      { id: "cluster", kind: "infra", catalogRef: "kind-cluster" },
+      {
+        id: "envoy-gateway",
+        kind: "app",
+        catalogRef: "envoy-gateway",
+        dependsOn: ["cluster"],
+        targetClusterFrom: "cluster",
+        targetNamespace: "keel-system",
+      },
+      {
+        id: "prometheus",
+        kind: "app",
+        catalogRef: "prometheus",
+        dependsOn: ["cluster"],
+        targetClusterFrom: "cluster",
+        targetNamespace: "keel-system",
+      },
+      {
+        id: "flagger",
+        kind: "app",
+        catalogRef: "flagger",
+        dependsOn: ["cluster", "envoy-gateway", "prometheus"],
+        targetClusterFrom: "cluster",
+        targetNamespace: "keel-system",
+      },
+      {
+        id: "canary-config",
+        kind: "infra",
+        catalogRef: "canary-gateway-config",
+        dependsOn: ["cluster", "envoy-gateway", "flagger"],
+        targetClusterFrom: "cluster",
+      },
+    ],
     schema: {
-      title: "Web Service Blueprint",
       type: "object",
-      required: ["appName", "replicas", "image"],
+      required: ["cluster"],
       properties: {
-        appName: {
-          type: "string",
-          title: "Application Name",
-          default: "frontend-portal",
+        cluster: {
+          type: "object",
+          title: "Workload Cluster (kind)",
+          required: ["clusterName", "kubernetesVersion", "workerCount"],
+          properties: {
+            clusterName: {
+              type: "string",
+              title: "Cluster Name",
+              default: "workload-dev",
+            },
+            kubernetesVersion: {
+              type: "string",
+              title: "Kubernetes Version",
+              default: "v1.35.8",
+              enum: ["v1.37.0", "v1.36.4", "v1.35.8", "v1.34.11", "v1.33.12"],
+            },
+            workerCount: {
+              type: "integer",
+              title: "Worker Node Count",
+              default: 1,
+              minimum: 0,
+              maximum: 5,
+            },
+          },
         },
-        replicas: {
-          type: "number",
-          title: "Replica Count",
-          default: 3,
-          minimum: 1,
-        },
-        image: {
-          type: "string",
-          title: "Container Image",
-          default: "ghcr.io/acme/portal:v1.2.0",
-        },
-        ingressHost: {
-          type: "string",
-          title: "Ingress Hostname",
-          default: "portal.acme.internal",
-        },
-        enableCanary: {
-          type: "boolean",
-          title: "Enable Flagger Progressive Canary Rollouts",
-          default: true,
+        flagger: {
+          type: "object",
+          title: "Flagger",
+          properties: {
+            meshProvider: {
+              type: "string",
+              title: "Mesh / Gateway Provider",
+              default: "gatewayapi:v1",
+            },
+            metricsServer: {
+              type: "string",
+              title: "Prometheus Metrics Server URL",
+              default: "http://prometheus.keel-system:80",
+            },
+          },
         },
       },
     },
-    defaultValues: {
-      appName: "frontend-portal",
-      replicas: 3,
-      image: "ghcr.io/acme/portal:v1.2.0",
-      ingressHost: "portal.acme.internal",
-      enableCanary: true,
-    },
   },
   {
-    id: "infra-proxmox-vm",
-    name: "Proxmox VM Cluster Stack",
+    id: "aws-vm",
+    name: "AWS EC2 Virtual Machine",
     description:
-      "Proxmox VE virtual machine pool synthesized via PKO v2 OpenTofu/Pulumi provider",
-    type: "infrastructure",
-    category: "Infrastructure",
-    version: "2.1.0",
-    provider: "proxmox",
-    protected: true,
+      "Provision an AWS EC2 virtual machine with SSH access (defaults to free-tier t3.micro)",
+    type: "infra",
+    category: "compute",
+    version: "1.0.0",
+    provider: "aws",
     resourceKind: "vm",
+    pulumiRuntime: "yaml",
+    entrypoint: "Pulumi.yaml",
+    protectByDefault: true,
+    protected: false,
     schema: {
-      title: "Proxmox VM Pool Blueprint",
       type: "object",
-      required: ["poolName", "nodeCount", "cores", "memoryMb"],
+      required: ["sshPublicKey"],
       properties: {
-        poolName: {
+        instanceName: {
           type: "string",
-          title: "VM Pool Name",
-          default: "k8s-worker-pool",
+          title: "Instance Name",
+          description: "Name tag assigned to the EC2 instance.",
+          default: "keel-free-vm",
         },
-        nodeCount: {
-          type: "number",
-          title: "Node Count",
-          default: 3,
-          minimum: 1,
-        },
-        cores: {
-          type: "number",
-          title: "CPU Cores per Node",
-          default: 4,
-          minimum: 1,
-        },
-        memoryMb: {
-          type: "number",
-          title: "RAM (MB) per Node",
-          default: 8192,
-          minimum: 1024,
-        },
-        storagePool: {
+        region: {
           type: "string",
-          title: "Proxmox Storage Target",
-          default: "local-zfs",
+          title: "AWS Region",
+          description: "AWS region where the EC2 instance will be provisioned.",
+          default: "us-east-1",
+        },
+        instanceType: {
+          type: "string",
+          title: "EC2 Instance Type",
+          description:
+            "EC2 instance type (defaults to free-tier eligible t3.micro).",
+          default: "t3.micro",
+        },
+        diskSizeGb: {
+          type: "integer",
+          title: "Root Volume Size (GB)",
+          description:
+            "Root EBS volume size in GiB (AWS Free Tier includes up to 30 GB).",
+          default: 20,
+          minimum: 8,
+          maximum: 16384,
+        },
+        sshUser: { type: "string", title: "SSH Username", default: "ubuntu" },
+        sshPublicKey: { type: "string", title: "Operator SSH Public Key" },
+        awsAccessKeyId: {
+          type: "string",
+          title: "AWS Access Key ID",
+          writeOnly: true,
+        },
+        awsSecretAccessKey: {
+          type: "string",
+          title: "AWS Secret Access Key",
+          writeOnly: true,
+          format: "password",
         },
       },
     },
-    defaultValues: {
-      poolName: "k8s-worker-pool",
-      nodeCount: 3,
-      cores: 4,
-      memoryMb: 8192,
-      storagePool: "local-zfs",
+    uiSchema: {
+      instanceType: {
+        "ui:placeholder": "t3.micro",
+        "ui:help":
+          "Free-tier default: t3.micro (also supports t2.micro, t3.small, m5.large, etc.).",
+      },
+      sshPublicKey: {
+        "ui:widget": "textarea",
+        "ui:help": "SSH public key injected into the EC2 instance key pair.",
+      },
+      awsSecretAccessKey: {
+        "ui:widget": "password",
+        "ui:help":
+          "Encrypted via SOPS + tenant age key before committing to Git.",
+      },
     },
   },
   {
-    id: "app-postgres-db",
-    name: "PostgreSQL Database Cluster",
+    id: "kind-cluster",
+    name: "Local kind Workload Cluster",
     description:
-      "HA PostgreSQL database with SOPS age encrypted credentials and backup schedule",
-    type: "app",
-    category: "Databases",
-    version: "15.4.0",
+      "Provision a local Kubernetes-in-Docker (kind) workload cluster via Pulumi's OpenTofu/Terraform bridge (tehcyx/kind).",
+    type: "infra",
+    category: "kubernetes-cluster",
+    version: "1.0.0",
+    provider: "kind",
+    resourceKind: "cluster",
+    pulumiRuntime: "yaml",
+    entrypoint: "Pulumi.yaml",
+    protectByDefault: false,
     protected: false,
-    tenant: "acme",
     schema: {
-      title: "PostgreSQL Database Blueprint",
       type: "object",
-      required: ["dbName", "storageGb", "adminPassword"],
+      required: ["clusterName", "kubernetesVersion", "workerCount"],
+      properties: {
+        clusterName: {
+          type: "string",
+          title: "Cluster Name",
+          description:
+            "DNS-compatible name for the local kind workload cluster.",
+          pattern: "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$",
+          minLength: 2,
+          maxLength: 63,
+          default: "workload-dev",
+        },
+        kubernetesVersion: {
+          type: "string",
+          title: "Kubernetes Version",
+          description: "Upstream kindest/node Kubernetes image version tag.",
+          default: "v1.35.8",
+          enum: ["v1.37.0", "v1.36.4", "v1.35.8", "v1.34.11", "v1.33.12"],
+        },
+        workerCount: {
+          type: "integer",
+          title: "Worker Node Count",
+          description:
+            "Number of worker nodes provisioned alongside the control-plane node.",
+          default: 1,
+          minimum: 0,
+          maximum: 3,
+        },
+      },
+    },
+    uiSchema: {
+      clusterName: {
+        "ui:placeholder": "workload-dev",
+        "ui:help": "Lowercase alphanumeric DNS label (e.g., workload-dev).",
+      },
+      workerCount: {
+        "ui:help":
+          "Set to 0 for a single-node control-plane cluster, or 1–3 for dedicated worker nodes.",
+      },
+    },
+  },
+  {
+    id: "postgres-managed",
+    name: "Managed PostgreSQL Instance",
+    description:
+      "Provision an encrypted PostgreSQL database instance exporting connection details to tenant Secrets.",
+    type: "infra",
+    category: "database",
+    version: "1.0.0",
+    provider: "aws",
+    resourceKind: "service",
+    pulumiRuntime: "yaml",
+    entrypoint: "Pulumi.yaml",
+    protectByDefault: true,
+    protected: false,
+    schema: {
+      type: "object",
+      required: ["dbName", "storageGb", "dbPassword"],
       properties: {
         dbName: {
           type: "string",
           title: "Database Name",
-          default: "tenant_db",
+          default: "appdb",
+          pattern: "^[a-z][a-z0-9_]{1,62}$",
+        },
+        instanceClass: {
+          type: "string",
+          title: "RDS Instance Class",
+          default: "db.t4g.micro",
+          enum: ["db.t4g.micro", "db.t4g.small", "db.t4g.medium"],
         },
         storageGb: {
-          type: "number",
-          title: "Storage Size (GB)",
-          default: 50,
-          minimum: 5,
+          type: "integer",
+          title: "Allocated Storage (GiB)",
+          default: 20,
+          minimum: 20,
+          maximum: 1000,
         },
-        adminPassword: {
+        dbPassword: {
           type: "string",
-          title: "Admin Password (Encrypted with SOPS + age)",
-          format: "password",
-          default: "SecretP@ssw0rd!",
-        },
-        highAvailability: {
-          type: "boolean",
-          title: "Enable HA Replication",
-          default: true,
+          title: "Master Database Password",
+          writeOnly: true,
+          minLength: 16,
         },
       },
     },
-    defaultValues: {
-      dbName: "tenant_db",
-      storageGb: 50,
-      adminPassword: "SecretP@ssw0rd!",
-      highAvailability: true,
+    uiSchema: {
+      dbPassword: {
+        "ui:widget": "password",
+        "ui:help":
+          "Encrypted via SOPS + tenant age key before committing to Git.",
+      },
+    },
+  },
+  {
+    id: "proxmox-k3s-cluster",
+    name: "Proxmox VE k3s Workload Cluster",
+    description:
+      "Provision a multi-node k3s workload cluster on Proxmox VE via bpg/proxmox OpenTofu/Terraform bridge.",
+    type: "infra",
+    category: "kubernetes-cluster",
+    version: "1.0.0",
+    provider: "proxmox",
+    resourceKind: "cluster",
+    pulumiRuntime: "yaml",
+    entrypoint: "Pulumi.yaml",
+    protectByDefault: true,
+    protected: false,
+    schema: {
+      type: "object",
+      required: ["clusterName", "nodeName", "templateVmId", "sshPublicKey"],
+      properties: {
+        clusterName: {
+          type: "string",
+          title: "Cluster Name",
+          pattern: "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$",
+        },
+        nodeName: {
+          type: "string",
+          title: "Proxmox Target Node",
+          default: "pve1",
+        },
+        templateVmId: {
+          type: "integer",
+          title: "Cloud-Init Template VM ID",
+          default: 900,
+          minimum: 100,
+        },
+        cores: {
+          type: "integer",
+          title: "vCPU Cores per Node",
+          default: 4,
+          minimum: 2,
+          maximum: 32,
+        },
+        memoryMb: {
+          type: "integer",
+          title: "Memory (MiB) per Node",
+          default: 8192,
+          minimum: 2048,
+        },
+        sshPublicKey: { type: "string", title: "Operator SSH Public Key" },
+      },
+    },
+    uiSchema: {
+      sshPublicKey: {
+        "ui:widget": "textarea",
+        "ui:help": "ed25519 or RSA public key injected via cloud-init.",
+      },
+    },
+  },
+  {
+    id: "dex",
+    name: "Dex OIDC Provider",
+    description:
+      "OpenID Connect identity provider providing authentication and federated user management.",
+    type: "app",
+    category: "security-identity",
+    version: "0.21.0",
+    repoUrl: "https://charts.dexidp.io",
+    chart: "dex",
+    runtime: "helm",
+    placementScope: "cluster",
+    flaggerSupported: false,
+    defaultCanary: false,
+    protected: false,
+    schema: {
+      type: "object",
+      properties: {
+        replicaCount: {
+          type: "integer",
+          title: "Replica Count",
+          default: 1,
+          minimum: 1,
+          maximum: 5,
+        },
+      },
+    },
+  },
+  {
+    id: "flagger",
+    name: "Flagger Progressive Delivery",
+    description:
+      "Automated canary promotion and rollback controller integrating with Envoy Gateway (Gateway API v1) and Prometheus.",
+    type: "app",
+    category: "progressive-delivery",
+    version: "1.40.0",
+    repoUrl: "https://flagger.app",
+    chart: "flagger",
+    runtime: "helm",
+    placementScope: "cluster",
+    flaggerSupported: false,
+    defaultCanary: false,
+    protected: false,
+    schema: {
+      type: "object",
+      required: ["meshProvider", "metricsServer"],
+      properties: {
+        meshProvider: {
+          type: "string",
+          title: "Mesh / Gateway Provider",
+          description:
+            "Traffic routing provider used by Flagger for canary weight shifting.",
+          default: "gatewayapi:v1",
+          enum: ["gatewayapi:v1", "kubernetes", "istio", "nginx"],
+        },
+        metricsServer: {
+          type: "string",
+          title: "Prometheus Metrics Server URL",
+          description:
+            "In-cluster Prometheus URL queried by Flagger for canary metric checks.",
+          default: "http://prometheus.keel-system:80",
+        },
+      },
+    },
+  },
+  {
+    id: "forgejo",
+    name: "Forgejo Git Forge",
+    description:
+      "Self-service Forgejo Git forge (single replica, SQLite, persistent volume) with an optional public HTTPRoute on the shared keel-ingress Gateway and OpenID Connect login (e.g. a tenant Rauthy or Dex).",
+    type: "app",
+    category: "developer-tools",
+    version: "17.3.3",
+    repoUrl: "oci://code.forgejo.org/forgejo-helm",
+    chart: "forgejo",
+    runtime: "helm",
+    flaggerSupported: false,
+    defaultCanary: false,
+    protected: false,
+    schema: {
+      type: "object",
+      required: ["gitea"],
+      properties: {
+        gitea: {
+          type: "object",
+          title: "Forgejo",
+          required: ["admin"],
+          properties: {
+            admin: {
+              type: "object",
+              title: "Bootstrap Administrator",
+              required: ["username", "email", "password"],
+              properties: {
+                username: {
+                  type: "string",
+                  title: "Admin Username",
+                  description: "Forgejo reserves 'admin'; pick another name.",
+                  pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,38}$",
+                  not: { pattern: "^[Aa][Dd][Mm][Ii][Nn]$" },
+                  default: "forgejo-admin",
+                },
+                email: {
+                  type: "string",
+                  title: "Admin Email",
+                  format: "email",
+                  default: "admin@keel.local",
+                },
+                password: {
+                  type: "string",
+                  title: "Admin Password",
+                  description: "12-128 characters without whitespace.",
+                  format: "password",
+                  writeOnly: true,
+                  pattern: "^\\S{12,128}$",
+                },
+              },
+            },
+          },
+        },
+        persistence: {
+          type: "object",
+          title: "Persistence",
+          properties: {
+            size: {
+              type: "string",
+              title: "Volume Size",
+              description:
+                "Fixed after install (resizing needs a manual PersistentVolumeClaim expansion).",
+              pattern: "^[1-9][0-9]*(Mi|Gi|Ti)$",
+              default: "10Gi",
+            },
+          },
+        },
+        httpRoute: {
+          type: "object",
+          title: "Public Route (keel-ingress)",
+          properties: {
+            enabled: {
+              type: "boolean",
+              title: "Expose Through keel-ingress",
+              default: true,
+            },
+            hostnames: {
+              type: "array",
+              title: "Public Hostname",
+              maxItems: 1,
+              items: { type: "string", format: "hostname" },
+            },
+          },
+        },
+      },
+    },
+    uiSchema: {
+      "ui:order": ["httpRoute", "gitea", "persistence"],
+      gitea: {
+        admin: {
+          password: {
+            "ui:widget": "password",
+            "ui:help":
+              "Encrypted via SOPS + per-tenant age key before committing to Git (never stored in plaintext). Leave blank on Edit to keep it.",
+          },
+        },
+      },
+      httpRoute: {
+        hostnames: { items: { "ui:placeholder": "git-<tenant>.keel.local" } },
+      },
+    },
+  },
+  {
+    id: "kyverno",
+    name: "Kyverno Policy Engine",
+    description:
+      "Kubernetes-native policy engine (CEL ValidatingPolicy, MutatingPolicy, GeneratingPolicy and image verification) for a workload cluster. Install once per cluster.",
+    type: "app",
+    category: "security-identity",
+    version: "3.10.0",
+    repoUrl: "https://kyverno.github.io/kyverno/",
+    chart: "kyverno",
+    runtime: "helm",
+    placementScope: "cluster",
+    placementNamespace: "kyverno",
+    flaggerSupported: false,
+    defaultCanary: false,
+    protected: false,
+    schema: {
+      type: "object",
+      properties: {
+        admissionController: {
+          type: "object",
+          title: "Admission Controller",
+          properties: {
+            replicas: {
+              type: "integer",
+              title: "Replica Count",
+              description:
+                "Use 3 for high availability (the layout Kyverno documents for HA).",
+              default: 1,
+              enum: [1, 3, 5],
+            },
+          },
+        },
+        backgroundController: {
+          type: "object",
+          title: "Background Controller",
+          properties: {
+            enabled: {
+              type: "boolean",
+              title:
+                "Enable Background Controller (GeneratingPolicy, mutate-existing)",
+              default: true,
+            },
+          },
+        },
+        reportsController: {
+          type: "object",
+          title: "Reports Controller",
+          properties: {
+            enabled: {
+              type: "boolean",
+              title: "Enable Policy Reports Controller",
+              default: true,
+            },
+          },
+        },
+      },
+    },
+  },
+  {
+    id: "podinfo",
+    name: "Podinfo Microservice",
+    description:
+      "Lightweight Go web application for verifying Flux HelmReleases, SOPS + age secret encryption, and Flagger + Envoy Gateway canary rollouts.",
+    type: "app",
+    category: "demo-microservice",
+    version: "6.7.1",
+    repoUrl: "https://stefanprodan.github.io/podinfo",
+    chart: "podinfo",
+    runtime: "helm",
+    flaggerSupported: true,
+    defaultCanary: false,
+    protected: false,
+    schema: {
+      type: "object",
+      required: ["replicaCount", "ingressHost", "apiToken"],
+      properties: {
+        replicaCount: {
+          type: "integer",
+          title: "Replica Count",
+          description:
+            "Number of podinfo pod replicas managed by the Deployment.",
+          default: 2,
+          minimum: 1,
+          maximum: 10,
+        },
+        ingressHost: {
+          type: "string",
+          title: "Ingress Hostname",
+          description:
+            "DNS hostname exposed through Envoy Gateway HTTPRoute and monitored by Flagger.",
+          format: "hostname",
+          default: "podinfo.keel.local",
+        },
+        apiToken: {
+          type: "string",
+          title: "API Secret Token",
+          description:
+            "Sensitive bearer token partitioned out of plaintext values.yaml and encrypted via SOPS + tenant age key.",
+          writeOnly: true,
+          minLength: 8,
+        },
+      },
+    },
+    uiSchema: {
+      ingressHost: {
+        "ui:placeholder": "podinfo.keel.local",
+        "ui:help":
+          "Routed via Envoy Gateway HTTPRoute; traffic shifts progressively when Flagger canary delivery is enabled.",
+      },
+      apiToken: {
+        "ui:widget": "password",
+        "ui:help":
+          "Marked writeOnly: true — automatically encrypted with SOPS + per-tenant age key before git staging (never stored in plaintext).",
+      },
+    },
+  },
+  {
+    id: "prometheus",
+    name: "Prometheus",
+    description:
+      "Metrics server scraping Envoy Gateway and cluster workloads for Flagger canary SLO evaluation (HTTP 5xx rate and p99 latency).",
+    type: "app",
+    category: "observability",
+    version: "27.5.0",
+    repoUrl: "https://prometheus-community.github.io/helm-charts",
+    chart: "prometheus",
+    runtime: "helm",
+    placementScope: "cluster",
+    flaggerSupported: false,
+    defaultCanary: false,
+    protected: false,
+    schema: {
+      type: "object",
+      properties: {
+        alertmanager: {
+          type: "object",
+          title: "Alertmanager",
+          properties: {
+            enabled: {
+              type: "boolean",
+              title: "Enable Alertmanager",
+              default: false,
+            },
+          },
+        },
+        server: {
+          type: "object",
+          title: "Prometheus Server",
+          properties: {
+            fullnameOverride: {
+              type: "string",
+              title: "Service Name Override",
+              default: "prometheus",
+            },
+            retention: {
+              type: "string",
+              title: "Retention Period",
+              default: "7d",
+            },
+          },
+        },
+      },
+    },
+  },
+  {
+    id: "rauthy",
+    name: "Rauthy OIDC Provider",
+    description:
+      "Self-service Rauthy OpenID Connect identity provider (single node, Hiqlite storage) with Admin UI, exposed on the shared keel-ingress Gateway.",
+    type: "app",
+    category: "security-identity",
+    version: "0.37.2",
+    repoUrl: "https://github.com/sebadob/rauthy",
+    path: "./manifests.yaml",
+    runtime: "manifest",
+    defaultEngine: "flux",
+    flaggerSupported: false,
+    defaultCanary: false,
+    protected: false,
+    schema: {
+      type: "object",
+      required: [
+        "hostname",
+        "adminEmail",
+        "encKeyId",
+        "encKey",
+        "hiqliteSecretRaft",
+        "hiqliteSecretApi",
+        "adminPassword",
+      ],
+      properties: {
+        hostname: {
+          type: "string",
+          title: "Public Hostname",
+          description:
+            "Unique DNS name routed by the keel-ingress Gateway HTTPRoute (e.g. auth-<tenant>.keel.local); also Rauthy's issuer host (https://<hostname>[port]/auth/v1). Platform hosts (idp., keel., forgejo.) and hostnames already used by another app are rejected.",
+          format: "hostname",
+        },
+        publicPortSuffix: {
+          type: "string",
+          title: "Public HTTPS Port Suffix",
+          description:
+            "Appended to the hostname in the issuer and WebAuthn origin. ':8888' for the local kind Gateway; empty when served on 443.",
+          pattern: "^(:[0-9]{1,5})?$",
+          default: ":8888",
+        },
+        adminEmail: {
+          type: "string",
+          title: "Bootstrap Admin Email",
+          description:
+            "Initial rauthy_admin account (created on first start only).",
+          format: "email",
+          default: "admin@keel.local",
+        },
+        logLevel: {
+          type: "string",
+          title: "Log Level",
+          enum: ["error", "warn", "info", "debug", "trace"],
+          default: "info",
+        },
+        adminForceMfa: {
+          type: "boolean",
+          title: "Require MFA for Admins",
+          description:
+            "Force rauthy_admin accounts to register a passkey before using the Admin UI (needs a browser-trusted certificate). Off by default so the bootstrap admin can sign in on the local kind CA; enable it after registering a passkey.",
+          default: false,
+        },
+        storageSize: {
+          type: "string",
+          title: "Data Volume Size",
+          description:
+            "PersistentVolumeClaim size for the Hiqlite database (/app/data).",
+          pattern: "^[1-9][0-9]*(Mi|Gi)$",
+          default: "1Gi",
+        },
+        encKeyId: {
+          type: "string",
+          title: "Encryption Key ID",
+          description:
+            "Identifier of the active encryption key (ENC_KEY_ACTIVE), 2-20 alphanumeric characters. Not secret.",
+          pattern: "^[a-zA-Z0-9]{2,20}$",
+          default: "keel1",
+        },
+        encKey: {
+          type: "string",
+          title: "Encryption Key (base64, 32 bytes)",
+          description:
+            "Generate with: openssl rand -base64 32. Never change it after the first start without key rotation; data at rest is encrypted with it.",
+          format: "password",
+          writeOnly: true,
+          pattern: "^[A-Za-z0-9+/]{43}=$",
+        },
+        hiqliteSecretRaft: {
+          type: "string",
+          title: "Hiqlite Raft Secret",
+          description:
+            "16-128 characters [A-Za-z0-9+/=_.-]. Generate with: openssl rand -base64 48",
+          format: "password",
+          writeOnly: true,
+          pattern: "^[A-Za-z0-9+/=_.-]{16,128}$",
+        },
+        hiqliteSecretApi: {
+          type: "string",
+          title: "Hiqlite API Secret",
+          description:
+            "16-128 characters [A-Za-z0-9+/=_.-], different from the raft secret. Generate with: openssl rand -base64 48",
+          format: "password",
+          writeOnly: true,
+          pattern: "^[A-Za-z0-9+/=_.-]{16,128}$",
+        },
+        adminPassword: {
+          type: "string",
+          title: "Bootstrap Admin Password",
+          description:
+            "14-128 characters without whitespace, double quotes, backslashes or '$'. Only applied on the very first start (empty database).",
+          format: "password",
+          writeOnly: true,
+          pattern: '^[^"\\\\\\s$]{14,128}$',
+        },
+      },
+    },
+    uiSchema: {
+      "ui:order": [
+        "hostname",
+        "publicPortSuffix",
+        "adminEmail",
+        "adminPassword",
+        "logLevel",
+        "adminForceMfa",
+        "storageSize",
+        "encKeyId",
+        "encKey",
+        "hiqliteSecretRaft",
+        "hiqliteSecretApi",
+      ],
+      hostname: {
+        "ui:placeholder": "auth-<tenant>.keel.local",
+        "ui:help":
+          "Exposed on the shared keel-ingress Gateway (HTTPS listeners); add a DNS / hosts entry pointing at the Gateway.",
+      },
+      encKey: {
+        "ui:widget": "password",
+        "ui:help":
+          "Encrypted via SOPS + per-tenant age key before committing to Git (never stored in plaintext). Re-enter the same value on every Edit.",
+      },
+      hiqliteSecretRaft: {
+        "ui:widget": "password",
+        "ui:help":
+          "Encrypted via SOPS + per-tenant age key before committing to Git.",
+      },
+      hiqliteSecretApi: {
+        "ui:widget": "password",
+        "ui:help":
+          "Encrypted via SOPS + per-tenant age key before committing to Git.",
+      },
+      adminPassword: {
+        "ui:widget": "password",
+        "ui:help":
+          "Encrypted via SOPS + per-tenant age key before committing to Git. Change it in the Rauthy Admin UI after the first login.",
+      },
+    },
+  },
+  {
+    id: "seaweedfs",
+    name: "SeaweedFS S3 Storage",
+    description:
+      "Self-service S3-compatible object storage (SeaweedFS master, volume, filer and authenticated S3 gateway on persistent volumes) with optional buckets and an optional public S3 HTTPRoute on the shared keel-ingress Gateway.",
+    type: "app",
+    category: "storage",
+    version: "4.54.0",
+    repoUrl: "https://seaweedfs.github.io/seaweedfs/helm",
+    chart: "seaweedfs",
+    runtime: "helm",
+    flaggerSupported: false,
+    defaultCanary: false,
+    protected: false,
+    schema: {
+      type: "object",
+      required: ["s3"],
+      properties: {
+        s3: {
+          type: "object",
+          title: "S3 Gateway",
+          required: ["credentials"],
+          properties: {
+            credentials: {
+              type: "object",
+              title: "Admin Credentials",
+              required: ["admin"],
+              properties: {
+                admin: {
+                  type: "object",
+                  title: "Admin Identity",
+                  required: ["accessKey", "secretKey"],
+                  properties: {
+                    accessKey: {
+                      type: "string",
+                      title: "Access Key ID",
+                      description:
+                        "16-128 characters [A-Za-z0-9]. Generate with: openssl rand -hex 10",
+                      format: "password",
+                      writeOnly: true,
+                      pattern: "^[A-Za-z0-9]{16,128}$",
+                    },
+                    secretKey: {
+                      type: "string",
+                      title: "Secret Access Key",
+                      description:
+                        "32-128 characters [A-Za-z0-9+/=]. Generate with: openssl rand -base64 30",
+                      format: "password",
+                      writeOnly: true,
+                      pattern: "^[A-Za-z0-9+/=]{32,128}$",
+                    },
+                  },
+                },
+              },
+            },
+            createBuckets: {
+              type: "array",
+              title: "Buckets",
+              description: "Created (if missing) on install and upgrade.",
+              maxItems: 20,
+              default: [{ name: "data" }],
+              items: {
+                type: "object",
+                required: ["name"],
+                properties: {
+                  name: {
+                    type: "string",
+                    title: "Bucket Name",
+                    pattern: "^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$",
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+    uiSchema: {
+      s3: {
+        "ui:order": ["credentials", "createBuckets"],
+        credentials: {
+          admin: {
+            accessKey: {
+              "ui:widget": "password",
+              "ui:help":
+                "Encrypted via SOPS + per-tenant age key before committing to Git. Leave blank on Edit to keep it.",
+            },
+            secretKey: {
+              "ui:widget": "password",
+              "ui:help":
+                "Encrypted via SOPS + per-tenant age key before committing to Git. Leave blank on Edit to keep it.",
+            },
+          },
+        },
+      },
     },
   },
 ]
@@ -234,11 +1014,10 @@ export const DEFAULT_EVENTS: CrdWatchEvent[] = [
   {
     kind: "Canary",
     namespace: "tenant-acme",
-    name: "frontend-portal-canary",
+    name: "podinfo",
     status: "Progressing",
-    message:
-      "Advance frontend-portal-canary weight 40% (5xx rate 0.02%, latency 18ms)",
-    revision: "v1.4.0",
+    message: "Advance podinfo canary weight 40% (5xx rate 0.02%, latency 18ms)",
+    revision: "6.7.1",
     timestamp: new Date(Date.now() - 5000).toLocaleTimeString(),
   },
 ]
@@ -297,7 +1076,7 @@ export const DEFAULT_STACKS: StackSummary[] = [
     id: "stack-postgres-managed",
     name: "postgres-managed",
     tenant: "tenant-acme",
-    provider: "kubernetes",
+    provider: "aws",
     type: "workload",
     status: "synced",
     resourceCount: 5,
@@ -309,8 +1088,9 @@ export const DEFAULT_STACKS: StackSummary[] = [
 export const DEFAULT_PROPOSALS: Proposal[] = [
   {
     id: "42",
-    title: "Deploy PostgreSQL database for tenant-acme",
-    branch: "keel/tenant-acme/db-pg-42",
+    title:
+      "Provision Managed PostgreSQL Instance (postgres-managed) for tenant-acme",
+    branch: "keel/tenant-acme/postgres-managed-42",
     author: "dylan@acme.internal",
     tenant: "tenant-acme",
     status: "open",
@@ -320,10 +1100,11 @@ export const DEFAULT_PROPOSALS: Proposal[] = [
   },
   {
     id: "43",
-    title: "Scale Proxmox worker pool nodes from 3 to 5",
-    branch: "keel/tenant-globex/pve-scale-43",
+    title:
+      "Resize pve-workload-cluster-prod (proxmox-k3s-cluster) to 8 vCPU cores",
+    branch: "keel/tenant-acme/proxmox-k3s-cluster-43",
     author: "infra-bot",
-    tenant: "tenant-globex",
+    tenant: "tenant-acme",
     status: "open",
     createdAt: "25 minutes ago",
     prUrl: "https://git.internal/keel-io/infra/pulls/43",
@@ -331,6 +1112,7 @@ export const DEFAULT_PROPOSALS: Proposal[] = [
   },
 ]
 
+/** Preview of proposal #42: the `postgres-managed` blueprint's `Pulumi.yaml` for tenant-acme. */
 export const DEFAULT_PREVIEW: PreviewReport = {
   prUrl: "https://git.internal/keel-io/infra/pulls/42",
   policyStatus: "passed",
@@ -338,55 +1120,42 @@ export const DEFAULT_PREVIEW: PreviewReport = {
   run: { phase: "succeeded" },
   summary: {
     create: 3,
-    update: 2,
+    update: 0,
     delete: 0,
-    replace: 1,
-    same: 12,
+    replace: 0,
+    same: 0,
     drift: 0,
-    total: 18,
+    total: 3,
   },
   resources: [
     {
-      urn: "urn:pulumi:prod::infra::kubernetes:core/v1:Namespace::tenant-acme",
-      resource_type: "kubernetes:core/v1:Namespace",
-      name: "tenant-acme",
+      urn: "urn:pulumi:tenant-acme::postgres-managed::pulumi:pulumi:Stack::postgres-managed-tenant-acme",
+      resource_type: "pulumi:pulumi:Stack",
+      name: "postgres-managed-tenant-acme",
       op: "Create",
-      changed_fields: ["metadata.labels", "metadata.name"],
+      changed_fields: [],
     },
     {
-      urn: "urn:pulumi:prod::infra::kubernetes:helm.sh/v3:Release::pg-cluster",
-      resource_type: "kubernetes:helm.sh/v3:Release",
-      name: "pg-cluster",
+      urn: "urn:pulumi:tenant-acme::postgres-managed::pulumi:providers:aws::default",
+      resource_type: "pulumi:providers:aws",
+      name: "default",
       op: "Create",
-      changed_fields: ["spec.values", "spec.chart"],
+      changed_fields: ["region"],
     },
     {
-      urn: "urn:pulumi:prod::infra::kubernetes:core/v1:Secret::pg-credentials",
-      resource_type: "kubernetes:core/v1:Secret",
-      name: "pg-credentials",
+      urn: "urn:pulumi:tenant-acme::postgres-managed::aws:rds/instance:Instance::postgresInstance",
+      resource_type: "aws:rds/instance:Instance",
+      name: "postgresInstance",
       op: "Create",
-      changed_fields: ["stringData.password"],
-    },
-    {
-      urn: "urn:pulumi:prod::infra::proxmox:ve/vm:VirtualMachine::worker-node-04",
-      resource_type: "proxmox:ve/vm:VirtualMachine",
-      name: "worker-node-04",
-      op: "Replace",
-      changed_fields: ["cores", "memory", "storagePool"],
-    },
-    {
-      urn: "urn:pulumi:prod::infra::kubernetes:networking.k8s.io/v1:Ingress::frontend-ingress",
-      resource_type: "kubernetes:networking.k8s.io/v1:Ingress",
-      name: "frontend-ingress",
-      op: "Update",
-      changed_fields: ["spec.rules[0].host"],
-    },
-    {
-      urn: "urn:pulumi:prod::infra::kyverno.io/v1:ClusterPolicy::restrict-pulumi-providers",
-      resource_type: "kyverno.io/v1:ClusterPolicy",
-      name: "restrict-pulumi-providers",
-      op: "Update",
-      changed_fields: ["spec.rules[0].match"],
+      changed_fields: [
+        "engine",
+        "engineVersion",
+        "instanceClass",
+        "allocatedStorage",
+        "storageEncrypted",
+        "dbName",
+        "password",
+      ],
     },
   ],
 }

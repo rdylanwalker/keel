@@ -11,6 +11,8 @@
 | **PR & Preview Inspector** (`#preview`, `#preview/<pr-id>`) | Open, merged, closed, and all PRs, with the merge-base Git diff, the preview report (source badge and run status), and Merge / Reject / Reopen. |
 | **Control Plane & Providers** (`#providers`) | Provider enablement (opened as a PR) and, for cluster admins, the management cluster health summary derived from add-on status, with a link to the add-ons in the Topology Map. |
 
+![Topology Map Deployed Application Releases table with protected management add-on rows (admin view)](../assets/screenshots/topology-releases.png)
+
 Deep links, such as `#preview/42`, are kept across the OIDC login round-trip.
 
 ## Schema-Driven Forms for Unmodified Charts
@@ -39,7 +41,7 @@ The modal shows the server's host-key `SHA256:` fingerprint with a **Host key ve
 
 ## Demo Mode
 
-`?demo=true` shows fixture data without a cluster. Demo fixtures are **compiled out of production bundles**. Demo mode works only in the Vite dev server (`just dev-ui`) or in a bundle built with `VITE_ENABLE_DEMO=true`, which `just serve-demo` does for you. Run `just build-ui` afterwards to restore a production bundle. In demo mode the GUI shows a persistent **DEMO DATA** banner and makes no live API calls, so a crafted link can never make a production control plane show fabricated state.
+`?demo=true` shows fixture data without a cluster. Demo fixtures are **compiled out of production bundles**. Demo mode works only in the Vite dev server (`just dev-ui`) or in a bundle built with `VITE_ENABLE_DEMO=true`, which `just serve-demo` does for you. Run `just build-ui` afterwards to restore a production bundle. In demo mode the GUI shows a persistent **DEMO DATA** banner and makes no live API calls, so a crafted link can never make a production control plane show fabricated state. The demo catalog mirrors the built-in `deploy/catalog` apps, infrastructure blueprints, and bundles (same ids, versions, and schema fields); `ui/src/lib/demoFixtures.test.ts` fails if they drift.
 
 ## Screenshots
 

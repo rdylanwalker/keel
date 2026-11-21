@@ -196,7 +196,7 @@ describe("CatalogWizardView component and jsonToYaml helper", () => {
 
     await waitFor(() => {
       expect(
-        screen.getAllByText("Web Service Application").length
+        screen.getAllByText("Rauthy OIDC Provider").length
       ).toBeGreaterThan(0)
       expect(screen.getByText("proxmox")).toBeInTheDocument()
     })
