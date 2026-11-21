@@ -167,6 +167,20 @@ export const AppSourceFields: React.FC<
         />
       </CheckboxRow>
 
+      <CheckboxRow
+        id="app-cluster-scoped"
+        label="Installs cluster-scoped resources (CRDs, ClusterRoles, webhooks): workload clusters only"
+      >
+        <Checkbox
+          id="app-cluster-scoped"
+          data-testid="catalog-placement-cluster-checkbox"
+          checked={appForm.placementScope === "cluster"}
+          onCheckedChange={(v) =>
+            set({ placementScope: v === true ? "cluster" : "namespaced" })
+          }
+        />
+      </CheckboxRow>
+
       <Field id="app-description" label="Description">
         <Input
           id="app-description"

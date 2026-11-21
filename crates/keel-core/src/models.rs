@@ -1001,6 +1001,72 @@ impl FromStr for ManifestEngine {
     }
 }
 
+/// Where a `CatalogApplication` may be installed (`SDD.md` §5.1 `spec.placement.scope`).
+///
+/// `namespaced` (the default) apps only create namespaced objects and may be installed into the
+/// tenant namespace of the management cluster or into a remote workload cluster. `cluster` apps
+/// install cluster-scoped resources (CRDs, ClusterRoles/Bindings, admission webhooks) that would
+/// collide with — or escalate past — the management plane's own add-ons and the tenant's
+/// namespace-scoped RBAC, so they may only target a remote workload cluster (`targetCluster`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PlacementScope {
+    #[default]
+    #[serde(alias = "Namespaced", alias = "NAMESPACED")]
+    Namespaced,
+    #[serde(alias = "Cluster", alias = "CLUSTER")]
+    Cluster,
+}
+
+impl PlacementScope {
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Namespaced => "namespaced",
+            Self::Cluster => "cluster",
+        }
+    }
+}
+
+impl fmt::Display for PlacementScope {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for PlacementScope {
+    type Err = CoreError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "namespaced" => Ok(Self::Namespaced),
+            "cluster" => Ok(Self::Cluster),
+            other => Err(CoreError::Validation(format!(
+                "Unsupported placement scope '{other}'; expected 'namespaced' or 'cluster'"
+            ))),
+        }
+    }
+}
+
+/// Declarative placement rule of a `CatalogApplication` (`spec.placement`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlacementSpec {
+    #[serde(default)]
+    pub scope: PlacementScope,
+}
+
+impl PlacementSpec {
+    /// `true` when the spec is the implicit default (omitted from serialized `catalog.yaml`).
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// `true` when the app may only be installed into a remote workload cluster.
+    pub const fn requires_remote_cluster(&self) -> bool {
+        matches!(self.scope, PlacementScope::Cluster)
+    }
+}
+
 /// Metadata block for `CatalogApplication` (`SDD.md` §5.1).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1114,6 +1180,9 @@ pub struct CatalogAppSpec {
         skip_serializing_if = "Option::is_none"
     )]
     pub default_engine: Option<ManifestEngine>,
+    /// Placement rule; absent means `scope: namespaced` (backward compatible).
+    #[serde(default, skip_serializing_if = "PlacementSpec::is_default")]
+    pub placement: PlacementSpec,
 }
 
 /// Git-stored `keel.io/v1alpha1` `CatalogApplication` definition (`SDD.md` §5.1).
@@ -1223,6 +1292,44 @@ impl CatalogApplication {
             validate_dns_label(&hook.blueprint, "companionInfrastructure.blueprint")?;
         }
         Ok(())
+    }
+
+    /// Enforces `spec.placement`: a `scope: cluster` app may only be installed into a remote
+    /// workload cluster. `remote_target` is the remote kubeconfig Secret reference the install
+    /// targets, or `None` for the management cluster (tenant namespace).
+    pub fn ensure_placement_allows(&self, remote_target: Option<&str>) -> Result<(), CoreError> {
+        let remote = remote_target.map(str::trim).is_some_and(|t| !t.is_empty());
+        if self.spec.placement.requires_remote_cluster() && !remote {
+            return Err(CoreError::Validation(format!(
+                "Catalog application '{}' has spec.placement.scope: cluster (it installs \
+                 cluster-scoped resources such as CRDs, ClusterRoles or admission webhooks) and \
+                 can only be deployed to a remote workload cluster; select a targetCluster other \
+                 than the management cluster",
+                self.metadata.id
+            )));
+        }
+        Ok(())
+    }
+
+    /// Rejects a `scope: namespaced` `runtime: manifest` app whose manifests declare well-known
+    /// cluster-scoped kinds (`Namespace`, CRDs, `ClusterRole`s, webhooks, ...); such an app must
+    /// declare `spec.placement.scope: cluster`. A declarative authoring guard: the hard boundary on
+    /// the management cluster is the namespace-scoped RBAC of `tenant-<id>-sa`.
+    pub fn ensure_manifest_matches_placement(&self, manifests_yaml: &str) -> Result<(), CoreError> {
+        if self.spec.placement.requires_remote_cluster() {
+            return Ok(());
+        }
+        let kinds = crate::catalog::manifest_cluster_scoped_kinds(manifests_yaml);
+        if kinds.is_empty() {
+            return Ok(());
+        }
+        Err(CoreError::Validation(format!(
+            "Catalog application '{}' is scope: namespaced but its manifests declare cluster-scoped \
+             kinds ({}); set placementScope: cluster (spec.placement.scope: cluster) so it can only \
+             target a remote workload cluster",
+            self.metadata.id,
+            kinds.join(", ")
+        )))
     }
 }
 
@@ -2389,6 +2496,7 @@ mod tests {
                 ui_schema: None,
                 service_url: None,
                 default_engine: Some(ManifestEngine::Pulumi),
+                placement: PlacementSpec::default(),
             },
         };
         assert!(app.validate().is_ok());

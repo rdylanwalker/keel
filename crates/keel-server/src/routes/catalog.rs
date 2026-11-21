@@ -12,8 +12,8 @@ use keel_core::{
     CATALOG_INFRA_BLUEPRINT_KIND, CatalogAppMetadata, CatalogAppSpec, CatalogApplication,
     CatalogBlueprintMetadata, CatalogBlueprintSpec, CatalogBundle, CatalogBundleItem,
     CatalogBundleMetadata, CatalogBundleSpec, CatalogInfraBlueprint, CatalogManifest,
-    InfraResourceKind, ManifestEngine, ProgressiveDeliverySpec, UpstreamSource,
-    extract_manifest_variables, parse_catalog_application, parse_catalog_blueprint,
+    InfraResourceKind, ManifestEngine, PlacementScope, PlacementSpec, ProgressiveDeliverySpec,
+    UpstreamSource, extract_manifest_variables, parse_catalog_application, parse_catalog_blueprint,
     parse_catalog_bundle, validate_dns_label, validate_k8s_manifests_yaml,
 };
 use keel_git::PullRequestInfo;
@@ -312,6 +312,9 @@ pub struct RegisterCatalogAppRequest {
     pub tenant: Option<String>,
     #[serde(default)]
     pub resource_kind: Option<InfraResourceKind>,
+    /// Application `spec.placement.scope` (`namespaced` | `cluster`).
+    #[serde(default)]
+    pub placement_scope: Option<PlacementScope>,
 }
 
 /// Type alias for catalog item creation requests.
@@ -519,9 +522,15 @@ pub async fn register_catalog_app(
                     ui_schema: None,
                     service_url: None,
                     default_engine: parsed_default_engine,
+                    placement: PlacementSpec {
+                        scope: req.placement_scope.unwrap_or_default(),
+                    },
                 },
             };
             application.validate()?;
+            if let Some(manifests) = validated_manifests_yaml.as_deref() {
+                application.ensure_manifest_matches_placement(manifests)?;
+            }
 
             let catalog_yaml = serde_yml::to_string(&application)
                 .map_err(|e| ServerError::Internal(e.to_string()))?;
@@ -798,7 +807,7 @@ pub async fn register_catalog_app(
             }
 
             let schema = if let Some(custom_schema) = req.schema {
-                validate_bundle_items_canary(&state.repo_workdir, &items).await?;
+                validate_bundle_items(&state.repo_workdir, &items).await?;
                 custom_schema
             } else {
                 compose_bundle_schema(&state.repo_workdir, &items).await?
@@ -902,29 +911,57 @@ pub async fn register_catalog_app(
     }
 }
 
-async fn validate_bundle_items_canary(
+/// Rejects a bundle `kind: app` item that references a `spec.placement.scope: cluster` app without
+/// `targetClusterFrom`. GUI bundle deploys never send a request `targetCluster`, so such an item
+/// could only ever be proposed onto the management cluster, which `POST /api/v1/proposals` rejects.
+fn ensure_bundle_item_placement(
+    item: &CatalogBundleItem,
+    app: &CatalogApplication,
+) -> Result<(), ServerError> {
+    let has_target = item
+        .target_cluster_from
+        .as_deref()
+        .is_some_and(|t| !t.trim().is_empty());
+    if app.spec.placement.requires_remote_cluster() && !has_target {
+        return Err(ServerError::BadRequest(format!(
+            "Bundle item '{}' references catalog application '{}' with spec.placement.scope: cluster (cluster-scoped resources); set targetClusterFrom to a kind: infra cluster item so it targets a remote workload cluster",
+            item.id, app.metadata.id
+        )));
+    }
+    Ok(())
+}
+
+/// Validates bundle items when the request supplies its own schema (no composition): canary only on
+/// Flagger-capable app items, and cluster-scoped apps only behind `targetClusterFrom`.
+async fn validate_bundle_items(
     repo_workdir: &Path,
     items: &[CatalogBundleItem],
 ) -> Result<(), ServerError> {
     for item in items {
-        if !item.canary {
-            continue;
-        }
-        if item.kind != BundleItemKind::App {
+        if item.canary && item.kind != BundleItemKind::App {
             return Err(ServerError::BadRequest(format!(
                 "Bundle item '{}' sets canary: true, which is only valid for kind: app",
                 item.id
             )));
         }
+        if item.kind != BundleItemKind::App {
+            continue;
+        }
+        // A missing reference is only fatal for canary items (it is re-checked at proposal time).
         let ref_manifest =
-            load_catalog_manifest(repo_workdir, &item.catalog_ref, Some("app")).await?;
-        if let CatalogManifest::Application(app) = ref_manifest
-            && !app.spec.progressive_delivery.flagger_supported
-        {
-            return Err(ServerError::BadRequest(format!(
-                "Catalog application '{}' does not support Flagger canary rollouts (flaggerSupported=false)",
-                app.metadata.id
-            )));
+            match load_catalog_manifest(repo_workdir, &item.catalog_ref, Some("app")).await {
+                Ok(manifest) => manifest,
+                Err(e) if item.canary => return Err(e),
+                Err(_) => continue,
+            };
+        if let CatalogManifest::Application(app) = ref_manifest {
+            ensure_bundle_item_placement(item, &app)?;
+            if item.canary && !app.spec.progressive_delivery.flagger_supported {
+                return Err(ServerError::BadRequest(format!(
+                    "Catalog application '{}' does not support Flagger canary rollouts (flaggerSupported=false)",
+                    app.metadata.id
+                )));
+            }
         }
     }
     Ok(())
@@ -947,6 +984,7 @@ async fn compose_bundle_schema(
             load_catalog_manifest(repo_workdir, &item.catalog_ref, Some(kind_hint)).await?;
         let (ref_title, ref_schema) = match ref_manifest {
             CatalogManifest::Application(a) => {
+                ensure_bundle_item_placement(item, &a)?;
                 if item.canary && !a.spec.progressive_delivery.flagger_supported {
                     return Err(ServerError::BadRequest(format!(
                         "Catalog application '{}' does not support Flagger canary rollouts (flaggerSupported=false)",
@@ -1033,6 +1071,9 @@ pub struct UpdateCatalogItemRequest {
     pub tenant: Option<String>,
     #[serde(default)]
     pub resource_kind: Option<InfraResourceKind>,
+    /// Application `spec.placement.scope` (`namespaced` | `cluster`).
+    #[serde(default)]
+    pub placement_scope: Option<PlacementScope>,
 }
 
 /// `PUT /api/v1/catalog/{kind}/{id}`
@@ -1194,6 +1235,9 @@ pub async fn update_catalog_item(
                 {
                     app.spec.default_engine = Some(ManifestEngine::Flux);
                 }
+                if let Some(scope) = req.placement_scope {
+                    app.spec.placement.scope = scope;
+                }
                 if let Some(flagger) = req.flagger_supported {
                     app.spec.progressive_delivery.flagger_supported = flagger;
                 }
@@ -1216,6 +1260,11 @@ pub async fn update_catalog_item(
                     .await
                     .ok()
                 };
+                if app.metadata.runtime == AppRuntime::Manifest
+                    && let Some(manifests) = current_manifests.as_deref()
+                {
+                    app.ensure_manifest_matches_placement(manifests)?;
+                }
                 (
                     yaml,
                     Some(CatalogItemDto::from_application(app, current_manifests)),
@@ -1291,7 +1340,7 @@ pub async fn update_catalog_item(
                     false
                 };
                 if let Some(schema) = req.schema {
-                    validate_bundle_items_canary(&state.repo_workdir, &bundle.spec.items).await?;
+                    validate_bundle_items(&state.repo_workdir, &bundle.spec.items).await?;
                     bundle.spec.schema = schema;
                 } else if items_changed {
                     bundle.spec.schema =

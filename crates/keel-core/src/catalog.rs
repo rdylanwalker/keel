@@ -548,6 +548,58 @@ pub fn validate_k8s_manifests_yaml(raw_yaml: &str) -> Result<Vec<Value>, CoreErr
     Ok(docs)
 }
 
+/// Well-known cluster-scoped Kubernetes kinds a `scope: namespaced` manifest app must not contain
+/// (`SDD.md` §5.1 `spec.placement.scope`). A fixed allowlist keyed by `kind`: tenant objects on the
+/// management cluster impersonate `tenant-<id>-sa`, whose namespace-scoped RBAC cannot create any
+/// of these, so such manifests belong to `scope: cluster` apps on a remote workload cluster.
+pub const CLUSTER_SCOPED_KINDS: &[&str] = &[
+    "APIService",
+    "CertificateSigningRequest",
+    "ClusterIssuer",
+    "ClusterPolicy",
+    "ClusterRole",
+    "ClusterRoleBinding",
+    "CSIDriver",
+    "CustomResourceDefinition",
+    "FlowSchema",
+    "GatewayClass",
+    "IngressClass",
+    "MutatingAdmissionPolicy",
+    "MutatingAdmissionPolicyBinding",
+    "MutatingWebhookConfiguration",
+    "Namespace",
+    "Node",
+    "PersistentVolume",
+    "PriorityClass",
+    "PriorityLevelConfiguration",
+    "RuntimeClass",
+    "StorageClass",
+    "ValidatingAdmissionPolicy",
+    "ValidatingAdmissionPolicyBinding",
+    "ValidatingWebhookConfiguration",
+    "VolumeAttachment",
+    "VolumeSnapshotClass",
+];
+
+/// Returns the distinct well-known cluster-scoped kinds ([`CLUSTER_SCOPED_KINDS`]) declared by a
+/// (raw or rendered) multi-document manifest, in first-seen order. Documents that do not parse
+/// as YAML mappings are skipped (structure is validated separately).
+pub fn manifest_cluster_scoped_kinds(raw_yaml: &str) -> Vec<String> {
+    let mut kinds: Vec<String> = Vec::new();
+    for doc_str in split_yaml_documents(raw_yaml) {
+        let Ok(doc) = serde_yml::from_str::<Value>(&doc_str) else {
+            continue;
+        };
+        let Some(kind) = doc.get("kind").and_then(Value::as_str).map(str::trim) else {
+            continue;
+        };
+        if CLUSTER_SCOPED_KINDS.contains(&kind) && !kinds.iter().any(|k| k == kind) {
+            kinds.push(kind.to_string());
+        }
+    }
+    kinds
+}
+
 /// Extracts unique placeholder variable names matching `${var_name}` or `${var_name:=default}`
 /// (where `var_name` is `[A-Za-z_][A-Za-z0-9_]*`), preserving first-seen order.
 pub fn extract_manifest_variables(raw_yaml: &str) -> Vec<String> {
@@ -895,7 +947,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::models::AppRuntime;
+    use crate::models::{AppRuntime, PlacementScope};
 
     const AUTHENTIK_CATALOG_YAML: &str = r#"
 apiVersion: keel.io/v1alpha1
@@ -1355,6 +1407,160 @@ spec:
         ))
         .expect("canary-gateway-config blueprint should parse");
         assert_eq!(gw_cfg.metadata.id, "canary-gateway-config");
+    }
+
+    #[test]
+    fn test_catalog_application_placement_scope() {
+        // Absent placement defaults to namespaced and is not re-serialized (backward compatible).
+        let app = parse_catalog_application(AUTHENTIK_CATALOG_YAML).unwrap();
+        assert_eq!(app.spec.placement.scope, PlacementScope::Namespaced);
+        assert!(!app.spec.placement.requires_remote_cluster());
+        assert!(app.ensure_placement_allows(None).is_ok());
+        assert!(
+            app.ensure_placement_allows(Some("workload-kubeconfig"))
+                .is_ok()
+        );
+        let round_trip = serde_yml::to_string(&app).unwrap();
+        assert!(!round_trip.contains("placement"));
+
+        let with_scope = |scope: &str| {
+            AUTHENTIK_CATALOG_YAML.replace(
+                "  progressiveDelivery:",
+                &format!("  placement:\n    scope: {scope}\n  progressiveDelivery:"),
+            )
+        };
+        let namespaced = parse_catalog_application(&with_scope("namespaced")).unwrap();
+        assert_eq!(namespaced.spec.placement.scope, PlacementScope::Namespaced);
+
+        let cluster = parse_catalog_application(&with_scope("cluster")).unwrap();
+        assert_eq!(cluster.spec.placement.scope, PlacementScope::Cluster);
+        assert!(cluster.spec.placement.requires_remote_cluster());
+        let err = cluster
+            .ensure_placement_allows(None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("spec.placement.scope: cluster"), "{err}");
+        assert!(err.contains("remote workload cluster"), "{err}");
+        assert!(cluster.ensure_placement_allows(Some("  ")).is_err());
+        assert!(
+            cluster
+                .ensure_placement_allows(Some("workload-kubeconfig"))
+                .is_ok()
+        );
+        assert!(
+            serde_yml::to_string(&cluster)
+                .unwrap()
+                .contains("scope: cluster")
+        );
+
+        // Unknown scopes are rejected by the parser.
+        assert!(parse_catalog_application(&with_scope("global")).is_err());
+        assert_eq!(
+            "Cluster".parse::<PlacementScope>().unwrap(),
+            PlacementScope::Cluster
+        );
+        assert!("global".parse::<PlacementScope>().is_err());
+        assert_eq!(PlacementScope::Namespaced.to_string(), "namespaced");
+    }
+
+    #[test]
+    fn test_manifest_cluster_scoped_kinds_and_placement_guard() {
+        let manifests = r#"
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ${ns}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cfg
+---
+# comment-only and malformed documents are skipped
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: reader
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: reader-2
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: hook
+"#;
+        assert_eq!(
+            manifest_cluster_scoped_kinds(manifests),
+            vec![
+                "Namespace".to_string(),
+                "ClusterRole".to_string(),
+                "ValidatingWebhookConfiguration".to_string()
+            ]
+        );
+        let namespaced_only = "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: a\n---\napiVersion: rbac.authorization.k8s.io/v1\nkind: RoleBinding\nmetadata:\n  name: b\n";
+        assert!(manifest_cluster_scoped_kinds(namespaced_only).is_empty());
+        assert!(manifest_cluster_scoped_kinds("not: [valid").is_empty());
+
+        let mut app = parse_catalog_application(AUTHENTIK_CATALOG_YAML).unwrap();
+        assert!(
+            app.ensure_manifest_matches_placement(namespaced_only)
+                .is_ok()
+        );
+        let err = app
+            .ensure_manifest_matches_placement(manifests)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Namespace, ClusterRole"), "{err}");
+        assert!(err.contains("placementScope: cluster"), "{err}");
+        app.spec.placement.scope = PlacementScope::Cluster;
+        assert!(app.ensure_manifest_matches_placement(manifests).is_ok());
+
+        // The shipped manifest apps stay namespaced-only.
+        for raw in [
+            include_str!("../../../deploy/catalog/apps/rauthy/manifests.yaml"),
+            include_str!("../../../deploy/catalog/apps/http-echo-manifest/manifests.yaml"),
+        ] {
+            assert!(manifest_cluster_scoped_kinds(raw).is_empty());
+        }
+    }
+
+    #[test]
+    fn test_built_in_catalog_app_placement_scopes() {
+        // Charts verified (helm template, default values) to install CRDs, ClusterRoles/Bindings or
+        // webhooks (dex 0.21.0 and authentik 2024.12.2 render a ClusterRole/ClusterRoleBinding).
+        for raw in [
+            include_str!("../../../deploy/catalog/apps/cert-manager/catalog.yaml"),
+            include_str!("../../../deploy/catalog/apps/envoy-gateway/catalog.yaml"),
+            include_str!("../../../deploy/catalog/apps/flagger/catalog.yaml"),
+            include_str!("../../../deploy/catalog/apps/prometheus/catalog.yaml"),
+            include_str!("../../../deploy/catalog/apps/dex/catalog.yaml"),
+            include_str!("../../../deploy/catalog/apps/authentik/catalog.yaml"),
+        ] {
+            let app = parse_catalog_application(raw).unwrap();
+            assert_eq!(
+                app.spec.placement.scope,
+                PlacementScope::Cluster,
+                "{} must be scope: cluster",
+                app.metadata.id
+            );
+        }
+        for raw in [
+            include_str!("../../../deploy/catalog/apps/podinfo/catalog.yaml"),
+            include_str!("../../../deploy/catalog/apps/http-echo-manifest/catalog.yaml"),
+            include_str!("../../../deploy/catalog/apps/rauthy/catalog.yaml"),
+        ] {
+            let app = parse_catalog_application(raw).unwrap();
+            assert_eq!(
+                app.spec.placement.scope,
+                PlacementScope::Namespaced,
+                "{} must stay namespaced",
+                app.metadata.id
+            );
+        }
     }
 
     #[test]

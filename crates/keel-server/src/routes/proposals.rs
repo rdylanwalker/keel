@@ -101,6 +101,35 @@ pub async fn list_proposals(
     Ok(Json(ProposalsListResponse { proposals }))
 }
 
+/// Remote kubeconfig Secret reference of a request `targetCluster`, or `None` when the install
+/// targets the management cluster (absent, blank, or the `local` alias).
+fn remote_target_cluster(target_cluster: Option<&str>) -> Option<&str> {
+    target_cluster
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != "local")
+}
+
+/// Rejects a rendered manifest app that declares well-known cluster-scoped kinds when it targets
+/// the management cluster (`remote == false`). Tenant objects there impersonate `tenant-<id>-sa`
+/// (namespace-scoped RBAC), so they would only fail at reconcile; fail early with a clear `400`.
+fn ensure_rendered_manifest_placement(
+    app_id: &str,
+    rendered: &str,
+    remote: bool,
+) -> Result<(), ServerError> {
+    if remote {
+        return Ok(());
+    }
+    let kinds = keel_core::manifest_cluster_scoped_kinds(rendered);
+    if kinds.is_empty() {
+        return Ok(());
+    }
+    Err(ServerError::BadRequest(format!(
+        "Manifest app '{app_id}' declares cluster-scoped kinds ({}) that cannot be installed into a tenant namespace of the management cluster; declare spec.placement.scope: cluster and select a remote workload targetCluster",
+        kinds.join(", ")
+    )))
+}
+
 /// Request body for `POST /api/v1/proposals`.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1209,6 +1238,8 @@ pub async fn create_proposal(
 
     let (schema, action_label, is_app, manifest_engine) = match &manifest {
         CatalogManifest::Application(app) => {
+            app.ensure_placement_allows(remote_target_cluster(req.target_cluster.as_deref()))
+                .map_err(|e| ServerError::BadRequest(e.to_string()))?;
             if req.canary && !app.spec.progressive_delivery.flagger_supported {
                 return Err(ServerError::BadRequest(format!(
                     "Catalog application '{}' does not support Flagger canary rollouts (flaggerSupported=false)",
@@ -1379,12 +1410,9 @@ pub async fn create_proposal(
                 render_manifest_app(&state, app, &partitioned.normal_values, &rel_dir).await?;
             rendered_manifest_template_yaml = Some(rendered.clone());
 
-            let remote_kc = req
-                .target_cluster
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty() && *s != "local")
+            let remote_kc = remote_target_cluster(req.target_cluster.as_deref())
                 .map(|t| RemoteKubeConfigRef::with_key(t, "kubeconfig"));
+            ensure_rendered_manifest_placement(&app.metadata.id, &rendered, remote_kc.is_some())?;
             let remote_ns = if let Some(target_ns) = req
                 .target_namespace
                 .as_deref()
@@ -1628,12 +1656,7 @@ pub async fn create_proposal(
                 .filter(|s| !s.is_empty())
                 .map(ToString::to_string)
                 .or_else(|| app.spec.upstream.version.clone());
-            if let Some(target) = req
-                .target_cluster
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty() && *s != "local")
-            {
+            if let Some(target) = remote_target_cluster(req.target_cluster.as_deref()) {
                 hr_input.kube_config = Some(RemoteKubeConfigRef::with_key(target, "kubeconfig"));
             }
             if let Some(target_ns) = req
@@ -2682,12 +2705,15 @@ async fn create_bundle_proposal(
                         "kubeconfig",
                     ))
                 } else {
-                    req.target_cluster
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty() && *s != "local")
+                    remote_target_cluster(req.target_cluster.as_deref())
                         .map(|target| RemoteKubeConfigRef::with_key(target, "kubeconfig"))
                 };
+                if item_kube_config.is_none() && app.spec.placement.requires_remote_cluster() {
+                    return Err(ServerError::BadRequest(format!(
+                        "Bundle item '{}' references catalog application '{}' with spec.placement.scope: cluster (cluster-scoped resources); it requires targetClusterFrom or a remote targetCluster",
+                        item.id, app.metadata.id
+                    )));
+                }
                 if let Some(target_ns) = &item.target_namespace
                     && item_kube_config.is_none()
                     && target_ns != &tenant_ns
@@ -2725,6 +2751,11 @@ async fn create_bundle_proposal(
                         &item_rel_dir,
                     )
                     .await?;
+                    ensure_rendered_manifest_placement(
+                        &app.metadata.id,
+                        &rendered,
+                        item_kube_config.is_some(),
+                    )?;
                     let encrypted_secret = resolve_manifest_app_secret(
                         &state,
                         &req.tenant,
@@ -3032,12 +3063,7 @@ async fn create_bundle_proposal(
                     stack_params
                         .config
                         .insert("kubeconfigSecretNamespace".to_string(), tenant_ns.clone());
-                } else if let Some(target) = req
-                    .target_cluster
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty() && *s != "local")
-                {
+                } else if let Some(target) = remote_target_cluster(req.target_cluster.as_deref()) {
                     stack_params
                         .config
                         .insert("kubeconfigSecretName".to_string(), target.to_string());

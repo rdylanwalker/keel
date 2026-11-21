@@ -7,6 +7,9 @@ metadata:
   description: Install Envoy Gateway, Prometheus, and Flagger into keel-system on any target Kubernetes cluster to enable progressive canary rollouts.
   category: platform
 spec:
+  # The app items are spec.placement.scope: cluster and have no targetClusterFrom: propose this bundle
+  # through POST /api/v1/proposals with a remote `targetCluster` (the GUI sends none; use
+  # kind-canary-platform there). The management cluster already runs these from catalog/core/.
   items:
     - id: envoy-gateway
       kind: app

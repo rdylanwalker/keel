@@ -22,9 +22,10 @@ pub use bootstrap::{
     validate_kubeconfig_yaml, write_private_file,
 };
 pub use catalog::{
-    DEFAULT_PLATFORM_BASE_DOMAIN, GATEWAY_ROUTE_KINDS, PLATFORM_HOST_LABELS, PartitionedValues,
-    PreparedHelmValues, SchemaFieldError, extract_manifest_variables, extract_secret_field_paths,
-    gateway_route_hostnames, is_secret_schema_node, parse_catalog, parse_catalog_application,
+    CLUSTER_SCOPED_KINDS, DEFAULT_PLATFORM_BASE_DOMAIN, GATEWAY_ROUTE_KINDS, PLATFORM_HOST_LABELS,
+    PartitionedValues, PreparedHelmValues, SchemaFieldError, extract_manifest_variables,
+    extract_secret_field_paths, gateway_route_hostnames, is_secret_schema_node,
+    manifest_cluster_scoped_kinds, parse_catalog, parse_catalog_application,
     parse_catalog_blueprint, parse_catalog_bundle, partition_values_by_schema,
     platform_reserved_hostnames, prepare_helm_values, render_helm_values_yaml,
     render_manifest_template, replace_yaml_document, route_hostname_matches, split_yaml_documents,
@@ -52,10 +53,10 @@ pub use models::{
     CatalogBundleMetadata, CatalogBundleSpec, CatalogInfraBlueprint, CatalogManifest,
     CompanionInfraHook, DEFAULT_CLUSTER_NAME, DEFAULT_POLL_INTERVAL, ForgeConfig, ForgeKind,
     InfraResourceKind, KeelConfig, MANAGEMENT_CORE_CATEGORY, ManifestEngine, OidcConfig,
-    ProgressiveDeliverySpec, ProviderEntry, ProviderRegistry, ResourceQuotaSpec, S3BackendConfig,
-    StackSshInfoResponse, TenantConfig, UpstreamSource, clean_candidate_ssh_host,
-    clean_candidate_ssh_user, default_ssh_user_for_provider, is_private_or_internal_ssh_host,
-    resolve_ssh_target_from_sources,
+    PlacementScope, PlacementSpec, ProgressiveDeliverySpec, ProviderEntry, ProviderRegistry,
+    ResourceQuotaSpec, S3BackendConfig, StackSshInfoResponse, TenantConfig, UpstreamSource,
+    clean_candidate_ssh_host, clean_candidate_ssh_user, default_ssh_user_for_provider,
+    is_private_or_internal_ssh_host, resolve_ssh_target_from_sources,
 };
 
 /// Flux CD controllers namespace (`SDD.md` §1).

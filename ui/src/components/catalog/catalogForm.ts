@@ -63,6 +63,7 @@ export function catalogItemToForm(item: CatalogItem): CreateCatalogItemPayload {
       (item.runtime === "manifest" ? DEFAULT_STARTER_MANIFEST : ""),
     defaultEngine:
       item.defaultEngine || (item.runtime === "manifest" ? "flux" : undefined),
+    placementScope: item.placementScope,
     repoUrl: item.repoUrl || "",
     chart: item.chart || "",
     version: item.version || "",
@@ -122,6 +123,10 @@ export function buildCatalogPayload(
     isEditing && Boolean(form.protected) !== Boolean(editing?.protected)
   const tenantChanged =
     isEditing && (form.tenant?.trim() || "") !== (editing?.tenant || "")
+  const placementChanged =
+    isEditing &&
+    (form.placementScope ?? "namespaced") !==
+      (editing?.placementScope ?? "namespaced")
   const base = {
     id: form.id.trim(),
     name: form.name.trim(),
@@ -213,6 +218,10 @@ export function buildCatalogPayload(
     runtime,
     ...source,
     flaggerSupported: !!form.flaggerSupported,
+    // Sent when cluster-scoped, or on edit when it changed (so it can be reset to namespaced).
+    ...(form.placementScope === "cluster" || placementChanged
+      ? { placementScope: form.placementScope ?? "namespaced" }
+      : {}),
   }
 }
 
@@ -241,6 +250,9 @@ export function toUpdatePayload(
       : {}),
     ...(payload.tenant !== undefined ? { tenant: payload.tenant } : {}),
     ...(payload.resourceKind ? { resourceKind: payload.resourceKind } : {}),
+    ...(payload.placementScope
+      ? { placementScope: payload.placementScope }
+      : {}),
     ...(payload.pulumiYaml ? { pulumiYaml: payload.pulumiYaml } : {}),
     items: payload.items,
     schema: payload.schema,

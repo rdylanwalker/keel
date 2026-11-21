@@ -1400,6 +1400,7 @@ spec:
             protected: false,
             tenant: None,
             resource_kind: None,
+            placement_scope: None,
         };
 
         let (status, Json(reg_resp)) =
@@ -1607,6 +1608,7 @@ data:
             protected: None,
             tenant: None,
             resource_kind: None,
+            placement_scope: None,
         };
         let (up_status, Json(up_resp)) = update_catalog_item(
             test_auth(),
@@ -2213,6 +2215,7 @@ spec:
                 protected: None,
                 tenant: None,
                 resource_kind: None,
+                placement_scope: None,
             }),
         )
         .await

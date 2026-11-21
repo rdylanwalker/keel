@@ -43,7 +43,9 @@ import {
   buildDeployProposalPayload,
   CUSTOM_CLUSTER,
   DeployTargetState,
+  deployPlacementError,
   mergeUpstreamSchema,
+  requiresRemoteCluster,
 } from "./deploy/deployPayload"
 import { serverFieldErrors } from "./deploy/serverFieldErrors"
 
@@ -87,21 +89,51 @@ export const DeployInstanceModal: React.FC<DeployInstanceModalProps> = (
   return <DeployInstanceModalBody key={modalKey} {...props} />
 }
 
+/**
+ * Workload-cluster stacks usable by `tenant`: a remote install's `kubeConfig.secretRef` resolves in
+ * the release's own `tenant-<id>` namespace (Flux `--no-cross-namespace-refs`), so another
+ * tenant's `<stack>-kubeconfig` Secret can never be referenced.
+ */
+function stacksForTenant(
+  stacks: StackSummary[],
+  tenant: string
+): StackSummary[] {
+  return stacks.filter((s) => !s.tenant || s.tenant === tenant)
+}
+
 function initialTargetState(
   props: DeployInstanceModalProps,
   item: CatalogItem | null,
   clusterStacks: StackSummary[]
 ): DeployTargetState {
   const { initialConfig, tenant, catalogItem } = props
+  const initialTenant = initialConfig?.tenant ?? tenant
+  const tenantStacks = stacksForTenant(
+    clusterStacks,
+    initialTenant || "default"
+  )
   const cluster = initialConfig?.targetCluster
   const matchesStack =
     Boolean(cluster) &&
-    clusterStacks.some((s) => `${s.name}-kubeconfig` === cluster)
+    tenantStacks.some((s) => `${s.name}-kubeconfig` === cluster)
+  // Cluster-scoped apps cannot target the management cluster: preselect the tenant's first
+  // workload cluster for new deployments only. Edits never silently retarget an existing release.
+  const defaultCluster =
+    requiresRemoteCluster(item) &&
+    !props.managementAddon &&
+    !initialConfig &&
+    tenantStacks[0]
+      ? `${tenantStacks[0].name}-kubeconfig`
+      : ""
   return {
-    tenant: initialConfig?.tenant ?? tenant,
+    tenant: initialTenant,
     instanceName: initialConfig?.name ?? item?.id ?? "",
     chartVersion: initialConfig?.version ?? item?.version ?? "",
-    targetCluster: !cluster ? "" : matchesStack ? cluster : CUSTOM_CLUSTER,
+    targetCluster: !cluster
+      ? defaultCluster
+      : matchesStack
+        ? cluster
+        : CUSTOM_CLUSTER,
     customClusterSecret: cluster && !matchesStack ? cluster : "",
     targetNamespace: initialConfig?.targetNamespace ?? "",
     enableCanary:
@@ -163,6 +195,23 @@ const DeployInstanceModalBody: React.FC<DeployInstanceModalProps> = (props) => {
 
   const effectiveTenant = target.tenant || tenant || "default"
   const effectiveTarget = { ...target, tenant: effectiveTenant }
+  const tenantClusterStacks = stacksForTenant(clusterStacks, effectiveTenant)
+  const handleTargetChange = (patch: Partial<DeployTargetState>) =>
+    setTarget((prev) => {
+      const next = { ...prev, ...patch }
+      // A tenant switch drops a selected workload cluster that belongs to another tenant.
+      if (
+        patch.tenant !== undefined &&
+        next.targetCluster &&
+        next.targetCluster !== CUSTOM_CLUSTER &&
+        !stacksForTenant(clusterStacks, next.tenant || "default").some(
+          (s) => `${s.name}-kubeconfig` === next.targetCluster
+        )
+      ) {
+        next.targetCluster = ""
+      }
+      return next
+    })
 
   const formSchema = useMemo(
     () =>
@@ -243,6 +292,11 @@ const DeployInstanceModalBody: React.FC<DeployInstanceModalProps> = (props) => {
         onClose()
         return
       }
+      const placementError = deployPlacementError(activeItem, effectiveTarget)
+      if (placementError) {
+        setError(placementError)
+        return
+      }
       const proposal = await createProposal(
         buildDeployProposalPayload(activeItem, effectiveTarget, values)
       )
@@ -294,9 +348,9 @@ const DeployInstanceModalBody: React.FC<DeployInstanceModalProps> = (props) => {
         item={activeItem}
         isManagementAddon={isManagementAddon}
         tenants={tenants}
-        clusterStacks={clusterStacks}
+        clusterStacks={tenantClusterStacks}
         state={effectiveTarget}
-        onChange={(patch) => setTarget((prev) => ({ ...prev, ...patch }))}
+        onChange={handleTargetChange}
         onTenantChange={onTenantChange}
       />
 

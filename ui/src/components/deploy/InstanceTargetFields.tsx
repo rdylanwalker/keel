@@ -5,7 +5,11 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { NativeSelect } from "@/components/ui/native-select"
 import { CatalogItem, StackSummary, TenantSummary } from "@/types/api"
-import { CUSTOM_CLUSTER, DeployTargetState } from "./deployPayload"
+import {
+  CUSTOM_CLUSTER,
+  DeployTargetState,
+  requiresRemoteCluster,
+} from "./deployPayload"
 
 export interface InstanceTargetFieldsProps {
   item: CatalogItem
@@ -28,6 +32,7 @@ export const InstanceTargetFields: React.FC<InstanceTargetFieldsProps> = ({
   onTenantChange,
 }) => {
   const isApp = !isManagementAddon && item.type === "app"
+  const clusterScoped = isApp && requiresRemoteCluster(item)
   return (
     <div
       className={`grid grid-cols-1 gap-3 ${isApp ? "sm:grid-cols-2" : "sm:grid-cols-1"}`}
@@ -105,8 +110,19 @@ export const InstanceTargetFields: React.FC<InstanceTargetFieldsProps> = ({
               id="cluster-select-catalog"
               value={state.targetCluster}
               onChange={(e) => onChange({ targetCluster: e.target.value })}
+              required={clusterScoped}
+              aria-invalid={clusterScoped && !state.targetCluster}
+              aria-describedby={
+                clusterScoped ? "cluster-placement-hint" : undefined
+              }
             >
-              <option value="">Management Cluster (local)</option>
+              {clusterScoped ? (
+                <option value="" disabled>
+                  Select a workload cluster...
+                </option>
+              ) : (
+                <option value="">Management Cluster (local)</option>
+              )}
               {clusterStacks.map((s) => (
                 <option key={s.id} value={`${s.name}-kubeconfig`}>
                   {s.name} ({s.tenant})
@@ -126,6 +142,17 @@ export const InstanceTargetFields: React.FC<InstanceTargetFieldsProps> = ({
                 placeholder="e.g. workload-kubeconfig"
                 aria-label="Custom kubeconfig Secret name"
               />
+            )}
+            {clusterScoped && (
+              <p
+                id="cluster-placement-hint"
+                data-testid="cluster-placement-hint"
+                className="text-[11px] text-amber-300"
+              >
+                Installs cluster-scoped resources (CRDs, ClusterRoles,
+                webhooks): only remote workload clusters can be targeted, never
+                the management cluster.
+              </p>
             )}
           </div>
           <div className="space-y-1">

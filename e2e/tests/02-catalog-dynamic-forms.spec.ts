@@ -190,4 +190,58 @@ test.describe('02 - Catalog Dynamic Forms & PR Proposal Generation', () => {
     await expect(modal).toHaveCount(0);
     await expect(page.getByText(/Git PR Proposal Successfully Opened!/i)).toHaveCount(0);
   });
+
+  test('02.7 - Cluster-scoped apps (spec.placement.scope: cluster) cannot target the management cluster', async ({
+    page,
+  }) => {
+    const api = await apiAs(USERS.admin);
+    const catalog = await (await api.get('/api/v1/catalog')).json();
+    const certManager = (
+      catalog.applications as Array<{
+        metadata: { id: string };
+        spec: { placement?: { scope?: string } };
+      }>
+    ).find((a) => a.metadata.id === 'cert-manager');
+    expect(certManager?.spec.placement?.scope).toBe('cluster');
+
+    for (const targetCluster of [undefined, 'local']) {
+      const res = await api.post('/api/v1/proposals', {
+        data: {
+          tenant: 'acme',
+          catalogId: 'cert-manager',
+          name: uniq('cm'),
+          values: { replicaCount: 1 },
+          ...(targetCluster ? { targetCluster } : {}),
+        },
+      });
+      expect(res.status()).toBe(400);
+      expect(JSON.stringify(await res.json())).toContain('spec.placement.scope: cluster');
+    }
+    await api.dispose();
+
+    await uiLogin(page, USERS.admin);
+    let posted = 0;
+    page.on('request', (r) => {
+      if (r.method() === 'POST' && r.url().endsWith('/api/v1/proposals')) posted += 1;
+    });
+    await openTab(page, 'Catalog & Form Wizard');
+    const card = page.getByTestId('catalog-list').locator('.p-5', { hasText: 'cert-manager' });
+    await card.getByRole('button', { name: 'Create' }).click();
+    const modal = page.getByTestId('deploy-instance-modal');
+    await expect(modal).toBeVisible();
+    await expect(modal.getByTestId('cluster-placement-hint')).toContainText(
+      /cluster-scoped resources/i,
+    );
+    await expect(
+      modal.locator('#cluster-select-catalog option', { hasText: /Management Cluster/ }),
+    ).toHaveCount(0);
+    // Workload cluster stacks from other specs may be preselected: pick a blank custom Secret.
+    await modal.locator('#cluster-select-catalog').selectOption('__custom__');
+    await modal.getByLabel('Custom kubeconfig Secret name').fill('');
+    await modal.getByRole('button', { name: /Submit & Open Git PR Proposal/i }).click();
+    await expect(
+      modal.getByText(/can only be deployed to a remote workload cluster/i),
+    ).toBeVisible();
+    expect(posted).toBe(0);
+  });
 });

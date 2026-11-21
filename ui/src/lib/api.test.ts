@@ -457,6 +457,37 @@ describe("api client module", () => {
     expect(emptyProviders).toEqual([])
   })
 
+  it("maps spec.placement.scope: cluster onto placementScope", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          applications: [
+            {
+              metadata: { id: "cert-manager", name: "cert-manager" },
+              spec: {
+                upstream: { chart: "cert-manager" },
+                placement: { scope: "cluster" },
+              },
+            },
+            {
+              metadata: { id: "podinfo", name: "Podinfo" },
+              spec: { placement: { scope: "namespaced" } },
+            },
+            { metadata: { id: "dex", name: "Dex" }, spec: {} },
+          ],
+        }),
+      })
+    )
+    const catalog = await getCatalog()
+    expect(catalog.map((c) => [c.id, c.placementScope])).toEqual([
+      ["cert-manager", "cluster"],
+      ["podinfo", undefined],
+      ["dex", undefined],
+    ])
+  })
+
   it("unwraps keel-server object envelopes for catalog, proposals, stacks, and releases", async () => {
     vi.stubGlobal(
       "fetch",

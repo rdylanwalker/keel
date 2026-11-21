@@ -26,6 +26,7 @@ export interface CreateCatalogItemPayload {
   runtime?: "helm" | "kustomize" | "manifest"
   manifestsYaml?: string
   defaultEngine?: "flux" | "pulumi"
+  placementScope?: PlacementScope
   repoUrl?: string
   chart?: string
   version?: string
@@ -53,6 +54,12 @@ export interface CatalogBundleItem {
   canary?: boolean
 }
 
+/**
+ * `spec.placement.scope` of a catalog application: `cluster` apps install cluster-scoped
+ * resources (CRDs, ClusterRoles, webhooks) and may only target a remote workload cluster.
+ */
+export type PlacementScope = "namespaced" | "cluster"
+
 export interface CatalogItem {
   id: string
   name: string
@@ -67,6 +74,8 @@ export interface CatalogItem {
   runtime?: "helm" | "kustomize" | "manifest" | string
   manifestsYaml?: string
   defaultEngine?: "flux" | "pulumi"
+  /** Absent means `namespaced`. */
+  placementScope?: PlacementScope
   flaggerSupported?: boolean
   defaultCanary?: boolean
   pulumiRuntime?: "yaml" | "hcl" | "opentofu-bridge"

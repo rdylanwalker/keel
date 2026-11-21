@@ -264,6 +264,7 @@ async function main() {
   const s3CatalogDir = path.join(workDir, 'catalog', 'core', 's3-state-backend');
   const staticSiteCatalogDir = path.join(workDir, 'catalog', 'apps', 'static-site');
   const rauthyCatalogDir = path.join(workDir, 'catalog', 'core', 'rauthy');
+  const certManagerCatalogDir = path.join(workDir, 'catalog', 'apps', 'cert-manager');
   const coreAddonsDir = path.join(workDir, 'clusters', 'management', 'core-addons');
   const tenantAcmeInfra = path.join(workDir, 'tenants', 'acme', 'infra', 'net');
 
@@ -274,6 +275,7 @@ async function main() {
   fs.mkdirSync(s3CatalogDir, { recursive: true });
   fs.mkdirSync(staticSiteCatalogDir, { recursive: true });
   fs.mkdirSync(rauthyCatalogDir, { recursive: true });
+  fs.mkdirSync(certManagerCatalogDir, { recursive: true });
   fs.mkdirSync(coreAddonsDir, { recursive: true });
   fs.mkdirSync(tenantAcmeInfra, { recursive: true });
 
@@ -427,6 +429,12 @@ spec:
         title: Replicas
         default: 1
 `,
+  );
+
+  // Built-in cluster-scoped app (`spec.placement.scope: cluster`): remote workload clusters only.
+  fs.copyFileSync(
+    path.resolve(__dirname, '../../deploy/catalog/apps/cert-manager/catalog.yaml'),
+    path.join(certManagerCatalogDir, 'catalog.yaml'),
   );
 
   fs.writeFileSync(

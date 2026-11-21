@@ -2176,26 +2176,38 @@ async fn test_builtin_dex_catalog_app_installs_from_tenant_scoped_helm_repositor
     git.push(&workdir, "origin", "main").await.unwrap();
 
     let cookie = login_and_get_cookie(&fixture).await;
-    let res = build_router(fixture.state.clone())
-        .oneshot(
+    let post = |body: Value| {
+        build_router(fixture.state.clone()).oneshot(
             Request::builder()
                 .method(Method::POST)
                 .uri("/api/v1/proposals")
                 .header(COOKIE, &cookie)
                 .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(
-                    json!({
-                        "tenant": "acme",
-                        "catalogId": "dex",
-                        "name": "dex",
-                        "values": { "replicaCount": 1 }
-                    })
-                    .to_string(),
-                ))
+                .body(Body::from(body.to_string()))
                 .unwrap(),
         )
-        .await
-        .unwrap();
+    };
+    // Dex renders a ClusterRole/Binding (`spec.placement.scope: cluster`): management cluster → 400.
+    let res = post(json!({
+        "tenant": "acme",
+        "catalogId": "dex",
+        "name": "dex",
+        "values": { "replicaCount": 1 }
+    }))
+    .await
+    .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+    let res = post(json!({
+        "tenant": "acme",
+        "catalogId": "dex",
+        "name": "dex",
+        "targetCluster": "workload-kubeconfig",
+        "targetNamespace": "dex",
+        "values": { "replicaCount": 1 }
+    }))
+    .await
+    .unwrap();
     assert_eq!(res.status(), StatusCode::CREATED);
     let created: Value =
         serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
@@ -2219,6 +2231,10 @@ async fn test_builtin_dex_catalog_app_installs_from_tenant_scoped_helm_repositor
     assert_eq!(chart["sourceRef"]["kind"], "HelmRepository");
     assert_eq!(chart["sourceRef"]["name"], "dex-repo");
     assert_eq!(chart["sourceRef"]["namespace"], "tenant-acme");
+    assert_eq!(
+        hr["spec"]["kubeConfig"]["secretRef"]["name"],
+        "workload-kubeconfig"
+    );
 }
 
 #[tokio::test]
@@ -7099,4 +7115,437 @@ async fn test_bundle_manifest_app_item_rejects_canary_and_bind_values() {
         assert!(body.contains(needle), "{body}");
         assert!(body.contains("Helm apps"), "{body}");
     }
+}
+
+/// `spec.placement.scope: cluster` apps (cluster-scoped CRDs/ClusterRoles/webhooks) can only be
+/// proposed onto a remote workload cluster, both directly and as bundle items (`SDD.md` §5.1).
+#[tokio::test]
+async fn test_cluster_scoped_app_placement_requires_remote_target_cluster() {
+    let fixture = setup_fixture().await;
+    let workdir = fixture.state.repo_workdir.clone();
+    tokio::fs::create_dir_all(workdir.join("catalog/apps/cert-manager"))
+        .await
+        .unwrap();
+    tokio::fs::write(
+        workdir.join("catalog/apps/cert-manager/catalog.yaml"),
+        include_str!("../../../deploy/catalog/apps/cert-manager/catalog.yaml"),
+    )
+    .await
+    .unwrap();
+    tokio::fs::create_dir_all(workdir.join("catalog/bundles/tls-stack"))
+        .await
+        .unwrap();
+    tokio::fs::write(
+        workdir.join("catalog/bundles/tls-stack/catalog.yaml"),
+        r#"apiVersion: keel.io/v1alpha1
+kind: CatalogBundle
+metadata:
+  id: tls-stack
+  name: TLS Stack
+  category: platform
+spec:
+  items:
+    - id: certs
+      kind: app
+      catalogRef: cert-manager
+  schema:
+    type: object
+    properties: {}
+"#,
+    )
+    .await
+    .unwrap();
+    let git = &fixture.state.git_runner;
+    git.add(
+        &workdir,
+        [
+            "catalog/apps/cert-manager/catalog.yaml",
+            "catalog/bundles/tls-stack/catalog.yaml",
+        ],
+    )
+    .await
+    .unwrap();
+    git.commit(
+        &workdir,
+        "feat: add cert-manager app and tls bundle",
+        &CommitAuthor::new("Keel Seed", "seed@keel.local"),
+    )
+    .await
+    .unwrap();
+    git.push(&workdir, "origin", "main").await.unwrap();
+
+    let cookie = login_and_get_cookie(&fixture).await;
+    let post = |body: Value| {
+        let app = build_router(fixture.state.clone());
+        let cookie = cookie.clone();
+        async move {
+            let res = app
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/api/v1/proposals")
+                        .header(COOKIE, &cookie)
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = res.status();
+            let body =
+                String::from_utf8(res.into_body().collect().await.unwrap().to_bytes().to_vec())
+                    .unwrap();
+            (status, body)
+        }
+    };
+
+    // Management cluster (absent, blank, or `local` targetCluster) is rejected.
+    for target in [None, Some(""), Some("local")] {
+        let mut req = json!({
+            "tenant": "acme",
+            "catalogId": "cert-manager",
+            "values": { "replicaCount": 1 }
+        });
+        if let Some(t) = target {
+            req["targetCluster"] = json!(t);
+        }
+        let (status, body) = post(req).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{target:?}: {body}");
+        assert!(body.contains("spec.placement.scope: cluster"), "{body}");
+        assert!(body.contains("remote workload cluster"), "{body}");
+    }
+    // Nothing was written for the rejected proposals.
+    assert!(!workdir.join("tenants/acme/apps/cert-manager").exists());
+
+    // Bundle items without targetClusterFrom fall back to the request targetCluster.
+    let (status, body) = post(json!({
+        "tenant": "acme",
+        "catalogId": "tls-stack",
+        "kind": "bundle",
+        "values": {}
+    }))
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("Bundle item 'certs'"), "{body}");
+    assert!(body.contains("spec.placement.scope: cluster"), "{body}");
+
+    // A remote workload cluster is accepted and wires the remote kubeconfig.
+    let (status, body) = post(json!({
+        "tenant": "acme",
+        "catalogId": "cert-manager",
+        "targetCluster": "workload-kubeconfig",
+        "targetNamespace": "cert-manager",
+        "values": { "replicaCount": 1 }
+    }))
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let created: Value = serde_json::from_str(&body).unwrap();
+    let branch = created["branch"].as_str().unwrap();
+    git.checkout_branch(&workdir, branch).await.unwrap();
+    let hr_yaml =
+        tokio::fs::read_to_string(workdir.join("tenants/acme/apps/cert-manager/helmrelease.yaml"))
+            .await
+            .unwrap();
+    assert!(hr_yaml.contains("workload-kubeconfig"), "{hr_yaml}");
+    assert!(
+        hr_yaml.contains("targetNamespace: cert-manager"),
+        "{hr_yaml}"
+    );
+    git.checkout_branch(&workdir, "main").await.unwrap();
+
+    let (status, body) = post(json!({
+        "tenant": "acme",
+        "catalogId": "tls-stack",
+        "kind": "bundle",
+        "name": "tls",
+        "targetCluster": "workload-kubeconfig",
+        "values": {}
+    }))
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    // Authoring a bundle (composed or custom schema) whose cluster-scoped app item has no
+    // targetClusterFrom is rejected: GUI bundle deploys never send a request targetCluster.
+    for schema in [None, Some(json!({ "type": "object", "properties": {} }))] {
+        let mut req = json!({
+            "kind": "bundle",
+            "id": "tls-only",
+            "name": "TLS Only",
+            "category": "platform",
+            "items": [{ "id": "certs", "kind": "app", "catalogRef": "cert-manager" }]
+        });
+        if let Some(schema) = schema {
+            req["schema"] = schema;
+        }
+        let (status, body) =
+            send_text(&fixture, &cookie, Method::POST, "/api/v1/catalog", req).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("targetClusterFrom"), "{body}");
+    }
+    let (status, body) = send_text(
+        &fixture,
+        &cookie,
+        Method::POST,
+        "/api/v1/catalog",
+        json!({
+            "kind": "bundle",
+            "id": "vm-tls",
+            "name": "VM + TLS",
+            "category": "platform",
+            "items": [
+                { "id": "vm", "kind": "infra", "catalogRef": "proxmox-vm" },
+                {
+                    "id": "certs",
+                    "kind": "app",
+                    "catalogRef": "cert-manager",
+                    "dependsOn": ["vm"],
+                    "targetClusterFrom": "vm"
+                }
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    // Updating the items of a bundle (Git-seeded tls-stack) without targetClusterFrom is rejected.
+    git.checkout_branch(&workdir, "main").await.unwrap();
+    let (status, body) = send_text(
+        &fixture,
+        &cookie,
+        Method::PUT,
+        "/api/v1/catalog/bundle/tls-stack",
+        json!({
+            "name": "TLS Stack",
+            "category": "platform",
+            "items": [{ "id": "certs", "kind": "app", "catalogRef": "cert-manager" }]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+}
+
+async fn send_text(
+    fixture: &TestFixture,
+    cookie: &str,
+    method: Method,
+    uri: &str,
+    body: Value,
+) -> (StatusCode, String) {
+    let res = build_router(fixture.state.clone())
+        .oneshot(
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header(COOKIE, cookie)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = res.status();
+    let body =
+        String::from_utf8(res.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
+    (status, body)
+}
+
+/// `scope: namespaced` manifest apps may not declare well-known cluster-scoped kinds: rejected when
+/// authored, and rejected at proposal time when (Git-authored) one targets the management cluster.
+#[tokio::test]
+async fn test_namespaced_manifest_app_rejects_cluster_scoped_kinds() {
+    let fixture = setup_fixture().await;
+    let cookie = login_and_get_cookie(&fixture).await;
+    let cluster_manifests = "apiVersion: v1\nkind: Namespace\nmetadata:\n  name: ops\n---\napiVersion: rbac.authorization.k8s.io/v1\nkind: ClusterRole\nmetadata:\n  name: ops-reader\nrules: []\n";
+    let register = |id: &str, scope: Option<&str>| {
+        let mut req = json!({
+            "id": id,
+            "name": id,
+            "category": "platform",
+            "runtime": "manifest",
+            "manifestsYaml": cluster_manifests,
+        });
+        if let Some(scope) = scope {
+            req["placementScope"] = json!(scope);
+        }
+        req
+    };
+    let (status, body) = send_text(
+        &fixture,
+        &cookie,
+        Method::POST,
+        "/api/v1/catalog",
+        register("ops-ns", None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("Namespace, ClusterRole"), "{body}");
+    assert!(body.contains("placementScope: cluster"), "{body}");
+
+    let (status, body) = send_text(
+        &fixture,
+        &cookie,
+        Method::POST,
+        "/api/v1/catalog",
+        register("ops-cluster", Some("cluster")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    // A Git-authored, mislabelled namespaced manifest app is caught after rendering.
+    let workdir = fixture.state.repo_workdir.clone();
+    let git = &fixture.state.git_runner;
+    git.checkout_branch(&workdir, "main").await.unwrap();
+    tokio::fs::create_dir_all(workdir.join("catalog/apps/sneaky"))
+        .await
+        .unwrap();
+    tokio::fs::write(
+        workdir.join("catalog/apps/sneaky/catalog.yaml"),
+        r#"apiVersion: keel.io/v1alpha1
+kind: CatalogApplication
+metadata:
+  id: sneaky
+  name: Sneaky
+  category: platform
+  runtime: manifest
+spec:
+  defaultEngine: flux
+  schema:
+    type: object
+    properties: {}
+"#,
+    )
+    .await
+    .unwrap();
+    tokio::fs::write(
+        workdir.join("catalog/apps/sneaky/manifests.yaml"),
+        cluster_manifests,
+    )
+    .await
+    .unwrap();
+    git.add(
+        &workdir,
+        [
+            "catalog/apps/sneaky/catalog.yaml",
+            "catalog/apps/sneaky/manifests.yaml",
+        ],
+    )
+    .await
+    .unwrap();
+    git.commit(
+        &workdir,
+        "feat: add sneaky manifest app",
+        &CommitAuthor::new("Keel Seed", "seed@keel.local"),
+    )
+    .await
+    .unwrap();
+    git.push(&workdir, "origin", "main").await.unwrap();
+
+    let (status, body) = send_text(
+        &fixture,
+        &cookie,
+        Method::POST,
+        "/api/v1/proposals",
+        json!({ "tenant": "acme", "catalogId": "sneaky", "values": {} }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("cluster-scoped kinds"), "{body}");
+    assert!(!workdir.join("tenants/acme/apps/sneaky").exists());
+
+    // Editing the mislabelled app is rejected until it declares placementScope: cluster.
+    let (status, body) = send_text(
+        &fixture,
+        &cookie,
+        Method::PUT,
+        "/api/v1/catalog/app/sneaky",
+        json!({ "name": "Sneaky", "category": "platform" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("placementScope: cluster"), "{body}");
+    let (status, body) = send_text(
+        &fixture,
+        &cookie,
+        Method::PUT,
+        "/api/v1/catalog/app/sneaky",
+        json!({ "name": "Sneaky", "category": "platform", "placementScope": "cluster" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// Catalog authoring round-trips `placementScope` into `spec.placement.scope`.
+#[tokio::test]
+async fn test_catalog_authoring_sets_placement_scope() {
+    let fixture = setup_fixture().await;
+    let cookie = login_and_get_cookie(&fixture).await;
+    let send = |method: Method, uri: &'static str, body: Value| {
+        let app = build_router(fixture.state.clone());
+        let cookie = cookie.clone();
+        async move {
+            let res = app
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .header(COOKIE, &cookie)
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = res.status();
+            let bytes = res.into_body().collect().await.unwrap().to_bytes();
+            (
+                status,
+                serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null),
+            )
+        }
+    };
+
+    let (status, created) = send(
+        Method::POST,
+        "/api/v1/catalog",
+        json!({
+            "id": "crd-operator",
+            "name": "CRD Operator",
+            "category": "platform",
+            "runtime": "manifest",
+            "manifestsYaml": "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: crd-operator\ndata:\n  k: v\n",
+            "placementScope": "cluster"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    assert_eq!(
+        created["application"]["spec"]["placement"]["scope"],
+        "cluster"
+    );
+
+    let (status, _) = send(
+        Method::POST,
+        "/api/v1/catalog",
+        json!({
+            "id": "bad-scope",
+            "name": "Bad Scope",
+            "category": "platform",
+            "runtime": "manifest",
+            "manifestsYaml": "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: x\n",
+            "placementScope": "global"
+        }),
+    )
+    .await;
+    assert!(status.is_client_error(), "{status}");
+
+    let (status, updated) = send(
+        Method::PUT,
+        "/api/v1/catalog/app/grafana",
+        json!({ "name": "Grafana", "category": "observability", "placementScope": "cluster" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{updated}");
+    assert_eq!(
+        updated["application"]["spec"]["placement"]["scope"],
+        "cluster"
+    );
 }

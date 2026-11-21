@@ -12,6 +12,10 @@ spec:
     chart: prometheus
     repoURL: https://prometheus-community.github.io/helm-charts
     version: "27.5.0"
+  # The chart installs cluster-scoped resources (ClusterRoles/Bindings for cluster-wide scraping (server + kube-state-metrics)), so
+  # it may only target a remote workload cluster (the management cluster runs catalog/core/prometheus).
+  placement:
+    scope: cluster
   progressiveDelivery:
     flaggerSupported: false
     defaultCanary: false

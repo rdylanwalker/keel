@@ -23,8 +23,8 @@ On a fresh repository, `keel bootstrap init` seeds these self-service apps into 
 | ID | Name | Runtime | Notes |
 | :--- | :--- | :--- | :--- |
 | `podinfo` | Podinfo Microservice | `helm` | Canary-capable demo app (Flagger + Envoy Gateway) |
-| `cert-manager` | cert-manager | `helm` | For workload clusters |
-| `dex` | Dex OIDC Provider | `helm` | Tenant-owned Dex |
+| `cert-manager` | cert-manager | `helm` | Workload clusters only (`scope: cluster`) |
+| `dex` | Dex OIDC Provider | `helm` | Tenant-owned Dex. Workload clusters only (`scope: cluster`): the chart renders a `ClusterRole`/`ClusterRoleBinding` |
 | `rauthy` | Rauthy OIDC Provider | `manifest` (Flux) | Tenant-owned single-node Rauthy. Four required secret fields are SOPS-encrypted per tenant. Exposed through an `HTTPRoute` on the shared `keel-ingress` Gateway ([walkthrough](../getting-started/things-to-try.md#8-deploy-a-self-service-rauthy-oidc-provider-rauthy)) |
 
 The tenant `rauthy` app is separate from Keel's own IdP. `catalog/core/rauthy` describes the protected management-plane Rauthy in `keel-system`. Admins manage it from the Topology Map, and it never appears in the tenant catalog. Both entries pin the same `ghcr.io/sebadob/rauthy` image tag and are bumped together.
@@ -108,6 +108,33 @@ spec:
         title: Replicas
         default: 2
 ```
+
+### Placement (`spec.placement.scope`)
+
+`spec.placement.scope` declares where an application may be installed:
+
+| Scope | Meaning | Allowed targets |
+| :--- | :--- | :--- |
+| `namespaced` (default when `placement` is omitted) | The app creates only namespaced objects. | The tenant namespace on the management cluster, or a remote workload cluster. |
+| `cluster` | The app installs cluster-scoped resources: CRDs, `ClusterRole`/`ClusterRoleBinding`s or admission webhooks. | Remote workload clusters only (`targetCluster`). |
+
+```yaml
+spec:
+  placement:
+    scope: cluster # namespaced | cluster
+```
+
+Cluster-scoped apps never target the management cluster. Its tenant namespaces run under namespace-scoped RBAC, and the management plane already runs its own copy of these controllers from `catalog/core/` (two cert-manager or Envoy Gateway installs would fight over the same CRDs and webhooks).
+
+Placement is a declarative guard declared by the catalog author. It gives early, clear `400`s and UX hints, but it is not the security boundary: a tenant admin can author their own app without `placement`. What actually blocks cluster-scoped objects on the management cluster is that tenant Flux and PKO objects impersonate `tenant-<id>-sa`, which only holds a namespace-scoped `ClusterRole/admin` RoleBinding (see [Flux multitenancy lockdown](../operations/security-and-tenancy.md#multi-tenant-isolation)).
+
+- **Proposals** (`POST /api/v1/proposals`) for a `scope: cluster` app without a remote `targetCluster` (absent, empty or `local`) are rejected with `400`.
+- **Manifest apps:** a `scope: namespaced` `runtime: manifest` app whose `manifests.yaml` declares well-known cluster-scoped kinds (`Namespace`, `CustomResourceDefinition`, `ClusterRole`/`ClusterRoleBinding`, admission webhooks and policies, `PriorityClass`, `StorageClass`, `IngressClass`, `GatewayClass`, ...) is rejected with `400` when registered or edited (set `placementScope: cluster`). A Git-authored one is rejected at proposal time, after rendering, when it targets the management cluster.
+- **Bundles:** a `scope: cluster` app item needs `targetClusterFrom` or a remote request `targetCluster`. Otherwise the proposal is rejected with `400`. Registering or editing a bundle through the catalog API requires `targetClusterFrom` on such items (`400` otherwise), because the GUI deploys bundles without a request `targetCluster`. The seeded `canary-core-addons` bundle (Envoy Gateway, Prometheus, Flagger without a cluster item) can therefore only be proposed through the API with a remote `targetCluster`. Use `kind-canary-platform` from the GUI.
+- **Deploy dialog:** a cluster-scoped app does not offer *Management Cluster (local)*. Only the target tenant's workload clusters are listed, since a remote `kubeConfig.secretRef` resolves in the release's own `tenant-<id>` namespace. Switching tenant clears a cluster that belongs to another tenant. New deployments preselect the tenant's first workload cluster. Edits never preselect one, so a release without a recorded target is never silently moved. The dialog explains why and blocks submission until a remote cluster or custom kubeconfig Secret is chosen.
+- **Catalog Wizard:** tick *Installs cluster-scoped resources* to author `scope: cluster`.
+
+The built-in `cert-manager`, `envoy-gateway`, `flagger`, `prometheus`, `dex` and `authentik` apps are `scope: cluster`. `helm template` of their pinned charts with default values shows they install CRDs, webhooks or `ClusterRole`s. Prometheus has no CRDs, but its server and kube-state-metrics both create `ClusterRole`/`ClusterRoleBinding`s for cluster-wide scraping. Dex (`rbac.createClusterScoped: true`, used by its Kubernetes CRD storage) and authentik (`serviceAccount.create: true`, used by managed outposts) each render a `ClusterRole`/`ClusterRoleBinding`; turning those off would break those features.
 
 ## Raw Kubernetes Manifests & Templates (`runtime: manifest`)
 

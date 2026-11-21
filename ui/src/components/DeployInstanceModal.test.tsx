@@ -3,7 +3,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest"
 import { DeployInstanceModal } from "./DeployInstanceModal"
 import { extractSchemaDefaults } from "../lib/schemaBuilder"
 import * as api from "../lib/api"
-import { CatalogItem } from "../types/api"
+import { CatalogItem, StackSummary } from "../types/api"
 
 vi.mock("../lib/api", () => ({
   createProposal: vi.fn(),
@@ -846,5 +846,199 @@ describe("DeployInstanceModal validation, secrets and server errors", () => {
       key: "Escape",
     })
     await waitFor(() => expect(onClose).toHaveBeenCalled())
+  })
+})
+
+describe("DeployInstanceModal cluster-scoped placement", () => {
+  const clusterScopedItem: CatalogItem = {
+    ...sampleAppItem,
+    id: "cert-manager",
+    name: "cert-manager",
+    placementScope: "cluster",
+  }
+  const kindStack: StackSummary = {
+    id: "dev-kind",
+    name: "dev-kind",
+    namespace: "tenant-acme",
+    tenant: "acme",
+    provider: "kind",
+    type: "workload",
+    status: "synced",
+  }
+  const submit = () =>
+    fireEvent.click(
+      screen.getByRole("button", { name: /Submit & Open Git PR Proposal/i })
+    )
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    vi.mocked(api.createProposal).mockResolvedValue({
+      id: "77",
+      title: "deploy cert-manager",
+      branch: "keel/acme/cert-manager",
+      author: "tester",
+      tenant: "acme",
+      status: "open",
+      createdAt: "just now",
+    })
+  })
+
+  it("hides the management cluster, shows a hint, and blocks submit until a workload cluster is chosen", async () => {
+    render(
+      <DeployInstanceModal
+        isOpen
+        onClose={vi.fn()}
+        catalogItem={clusterScopedItem}
+        tenant="acme"
+      />
+    )
+    expect(
+      screen.queryByRole("option", { name: /Management Cluster \(local\)/i })
+    ).toBeNull()
+    expect(screen.getByTestId("cluster-placement-hint")).toHaveTextContent(
+      /cluster-scoped resources/i
+    )
+    const clusterSelect = screen.getByLabelText(/Target Cluster/i)
+    expect(clusterSelect).toHaveValue("")
+    expect(clusterSelect).toHaveAttribute("aria-invalid", "true")
+    expect(clusterSelect).toHaveAttribute(
+      "aria-describedby",
+      "cluster-placement-hint"
+    )
+
+    submit()
+    expect(
+      await screen.findByText(
+        /can only be deployed to a remote workload cluster/i
+      )
+    ).toBeInTheDocument()
+    expect(api.createProposal).not.toHaveBeenCalled()
+
+    fireEvent.change(clusterSelect, { target: { value: "__custom__" } })
+    fireEvent.change(screen.getByLabelText(/Custom kubeconfig Secret name/i), {
+      target: { value: "local" },
+    })
+    submit()
+    await waitFor(() =>
+      expect(
+        screen.getByText(/can only be deployed to a remote workload cluster/i)
+      ).toBeInTheDocument()
+    )
+    expect(api.createProposal).not.toHaveBeenCalled()
+
+    fireEvent.change(screen.getByLabelText(/Custom kubeconfig Secret name/i), {
+      target: { value: "edge-kubeconfig" },
+    })
+    submit()
+    await waitFor(() =>
+      expect(api.createProposal).toHaveBeenCalledWith(
+        expect.objectContaining({
+          catalogId: "cert-manager",
+          targetCluster: "edge-kubeconfig",
+        })
+      )
+    )
+  })
+
+  it("preselects the first workload cluster for cluster-scoped apps", async () => {
+    render(
+      <DeployInstanceModal
+        isOpen
+        onClose={vi.fn()}
+        catalogItem={clusterScopedItem}
+        tenant="acme"
+        stacks={[kindStack]}
+      />
+    )
+    expect(screen.getByLabelText(/Target Cluster/i)).toHaveValue(
+      "dev-kind-kubeconfig"
+    )
+    submit()
+    await waitFor(() =>
+      expect(api.createProposal).toHaveBeenCalledWith(
+        expect.objectContaining({ targetCluster: "dev-kind-kubeconfig" })
+      )
+    )
+  })
+
+  it("only offers and preselects workload clusters of the target tenant", () => {
+    const betaStack: StackSummary = {
+      ...kindStack,
+      id: "beta-kind",
+      name: "beta-kind",
+      namespace: "tenant-beta",
+      tenant: "beta",
+    }
+    render(
+      <DeployInstanceModal
+        isOpen
+        onClose={vi.fn()}
+        catalogItem={clusterScopedItem}
+        tenant="acme"
+        tenants={[
+          { id: "acme", namespace: "tenant-acme" },
+          { id: "beta", namespace: "tenant-beta" },
+        ]}
+        stacks={[betaStack, kindStack]}
+      />
+    )
+    const clusterSelect = screen.getByLabelText(/Target Cluster/i)
+    // beta's stack is listed first but belongs to another tenant: never preselected or offered.
+    expect(clusterSelect).toHaveValue("dev-kind-kubeconfig")
+    expect(screen.queryByRole("option", { name: /beta-kind/i })).toBeNull()
+
+    fireEvent.change(screen.getByLabelText(/Target Tenant/i), {
+      target: { value: "beta" },
+    })
+    // Switching tenant drops acme's cluster; the user picks one of beta's explicitly.
+    expect(clusterSelect).toHaveValue("")
+    expect(
+      screen.getByRole("option", { name: /beta-kind/i })
+    ).toBeInTheDocument()
+    expect(screen.queryByRole("option", { name: /dev-kind/i })).toBeNull()
+  })
+
+  it("never preselects a cluster when editing a release without a recorded target", async () => {
+    render(
+      <DeployInstanceModal
+        isOpen
+        onClose={vi.fn()}
+        catalogItem={clusterScopedItem}
+        tenant="acme"
+        stacks={[kindStack]}
+        isEditMode
+        initialConfig={{
+          name: "cert-manager",
+          tenant: "acme",
+          values: {},
+          targetCluster: "",
+        }}
+      />
+    )
+    expect(screen.getByLabelText(/Target Cluster/i)).toHaveValue("")
+    submit()
+    expect(
+      await screen.findByText(
+        /can only be deployed to a remote workload cluster/i
+      )
+    ).toBeInTheDocument()
+    expect(api.createProposal).not.toHaveBeenCalled()
+  })
+
+  it("keeps the management cluster default for namespaced apps", () => {
+    render(
+      <DeployInstanceModal
+        isOpen
+        onClose={vi.fn()}
+        catalogItem={sampleAppItem}
+        tenant="acme"
+        stacks={[kindStack]}
+      />
+    )
+    expect(
+      screen.getByRole("option", { name: /Management Cluster \(local\)/i })
+    ).toBeInTheDocument()
+    expect(screen.getByLabelText(/Target Cluster/i)).toHaveValue("")
+    expect(screen.queryByTestId("cluster-placement-hint")).toBeNull()
   })
 })

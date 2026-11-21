@@ -12,6 +12,10 @@ spec:
     chart: flagger
     repoURL: https://flagger.app
     version: "1.40.0"
+  # The chart installs cluster-scoped resources (Canary/MetricTemplate/AlertProvider CRDs and a ClusterRole/Binding), so
+  # it may only target a remote workload cluster (the management cluster runs catalog/core/flagger).
+  placement:
+    scope: cluster
   progressiveDelivery:
     flaggerSupported: false
     defaultCanary: false

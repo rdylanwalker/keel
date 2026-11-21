@@ -403,6 +403,93 @@ describe("CatalogWizardView component and jsonToYaml helper", () => {
     })
   })
 
+  it("authors and resets the cluster-scoped placement of a catalog app", async () => {
+    vi.mocked(api.getCatalog).mockResolvedValue([
+      {
+        id: "crd-operator",
+        name: "CRD Operator",
+        description: "Operator",
+        type: "app",
+        category: "Platform",
+        version: "1.0.0",
+        runtime: "helm",
+        repoUrl: "https://charts.example.com",
+        chart: "crd-operator",
+        placementScope: "cluster",
+        schema: { type: "object", properties: {} },
+      },
+    ])
+    const proposal = {
+      id: "120",
+      title: "catalog",
+      branch: "keel/catalog/120",
+      author: "user",
+      tenant: "catalog",
+      status: "open" as const,
+      createdAt: "just now",
+    }
+    vi.mocked(api.createCatalogApp).mockResolvedValue(proposal)
+    vi.mocked(api.updateCatalogItem).mockResolvedValue(proposal)
+
+    render(<CatalogWizardView />)
+
+    // Editing a cluster-scoped app shows the checkbox ticked; unticking resets it.
+    fireEvent.click(await screen.findByRole("button", { name: /^Edit$/i }))
+    const editCheckbox = screen.getByLabelText(
+      /Installs cluster-scoped resources/i
+    )
+    expect(editCheckbox).toHaveAttribute("data-state", "checked")
+    fireEvent.click(editCheckbox)
+    fireEvent.click(screen.getByRole("button", { name: /Submit Update PR/i }))
+    await waitFor(() =>
+      expect(api.updateCatalogItem).toHaveBeenCalledWith(
+        "app",
+        "crd-operator",
+        expect.objectContaining({ placementScope: "namespaced" })
+      )
+    )
+  })
+
+  it("sends placementScope: cluster when the cluster-scoped checkbox is ticked", async () => {
+    vi.mocked(api.getCatalog).mockResolvedValue(mockCatalog)
+    vi.mocked(api.createCatalogApp).mockResolvedValue({
+      id: "121",
+      title: "catalog",
+      branch: "keel/catalog/121",
+      author: "user",
+      tenant: "catalog",
+      status: "open",
+      createdAt: "just now",
+    })
+    render(<CatalogWizardView />)
+    fireEvent.click(screen.getByRole("button", { name: /^Add Catalog Item$/i }))
+    fireEvent.change(screen.getByLabelText(/(App|Item) ID \*/i), {
+      target: { value: "crd-operator" },
+    })
+    fireEvent.change(screen.getByLabelText(/(App|Item) Name \*/i), {
+      target: { value: "CRD Operator" },
+    })
+    fireEvent.change(screen.getByLabelText(/Repository URL \*/i), {
+      target: { value: "https://charts.example.com" },
+    })
+    fireEvent.change(screen.getByLabelText(/Chart Name \*/i), {
+      target: { value: "crd-operator" },
+    })
+    fireEvent.click(screen.getByLabelText(/Installs cluster-scoped resources/i))
+    fireEvent.click(
+      screen.getByRole("button", { name: /Submit App PR Proposal/i })
+    )
+    await waitFor(() =>
+      expect(api.createCatalogApp).toHaveBeenCalledWith(
+        expect.objectContaining({
+          kind: "app",
+          id: "crd-operator",
+          placementScope: "cluster",
+        })
+      )
+    )
+  })
+
   it("adds catalog infra blueprint via modal form when switching type to infra", async () => {
     vi.mocked(api.getCatalog).mockResolvedValue(mockCatalog)
     vi.mocked(api.createCatalogApp).mockResolvedValue({

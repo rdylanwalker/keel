@@ -147,6 +147,9 @@ interface RawCatalogEntry {
     }
     manifestsYaml?: string
     defaultEngine?: "flux" | "pulumi"
+    placement?: {
+      scope?: string
+    }
     progressiveDelivery?: {
       flaggerSupported?: boolean
       defaultCanary?: boolean
@@ -188,6 +191,9 @@ function mapCatalogApplication(app: RawCatalogEntry): CatalogItem {
     runtime: app.metadata?.runtime,
     manifestsYaml: app.spec?.manifestsYaml,
     defaultEngine: app.spec?.defaultEngine ?? app.metadata?.defaultEngine,
+    ...(app.spec?.placement?.scope === "cluster"
+      ? { placementScope: "cluster" as const }
+      : {}),
     flaggerSupported: app.spec?.progressiveDelivery?.flaggerSupported ?? false,
     defaultCanary: app.spec?.progressiveDelivery?.defaultCanary ?? false,
     serviceUrl: app.spec?.serviceUrl,

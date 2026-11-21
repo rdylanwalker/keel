@@ -15,18 +15,48 @@ export interface DeployTargetState {
   actionEngine: "flux" | "pulumi"
 }
 
+/**
+ * `true` for catalog apps with `spec.placement.scope: cluster`: they install cluster-scoped
+ * resources (CRDs, ClusterRoles, webhooks) and may only target a remote workload cluster.
+ */
+export function requiresRemoteCluster(
+  item: CatalogItem | null | undefined
+): boolean {
+  return item?.type === "app" && item.placementScope === "cluster"
+}
+
+/** Remote kubeconfig Secret selected for an app, or `undefined` for the management cluster. */
+export function resolveTargetCluster(
+  item: CatalogItem,
+  target: DeployTargetState
+): string | undefined {
+  if (item.type !== "app") return undefined
+  const cluster =
+    target.targetCluster === CUSTOM_CLUSTER
+      ? target.customClusterSecret.trim()
+      : target.targetCluster
+  // `local` is the server-side alias of the management cluster.
+  return cluster && cluster !== "local" ? cluster : undefined
+}
+
+/** Client-side mirror of the server placement rule; `null` when the target is allowed. */
+export function deployPlacementError(
+  item: CatalogItem,
+  target: DeployTargetState
+): string | null {
+  if (!requiresRemoteCluster(item) || resolveTargetCluster(item, target)) {
+    return null
+  }
+  return `${item.name} installs cluster-scoped resources (CRDs, ClusterRoles or webhooks) and can only be deployed to a remote workload cluster. Select a Target Cluster other than the management cluster.`
+}
+
 /** Builds the `POST /api/v1/proposals` payload for a catalog deployment / edit. */
 export function buildDeployProposalPayload(
   item: CatalogItem,
   target: DeployTargetState,
   values: Record<string, unknown>
 ): CreateProposalPayload {
-  const resolvedTargetCluster =
-    item.type === "app"
-      ? target.targetCluster === CUSTOM_CLUSTER
-        ? target.customClusterSecret.trim() || undefined
-        : target.targetCluster || undefined
-      : undefined
+  const resolvedTargetCluster = resolveTargetCluster(item, target)
   const name = target.instanceName.trim()
   const version = target.chartVersion.trim()
   const targetNs = resolvedTargetCluster ? target.targetNamespace.trim() : ""

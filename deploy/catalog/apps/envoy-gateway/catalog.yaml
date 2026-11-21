@@ -12,6 +12,10 @@ spec:
     chart: gateway-helm
     repoURL: oci://docker.io/envoyproxy
     version: "v1.3.0"
+  # The chart installs cluster-scoped resources (Gateway API + Envoy Gateway CRDs and a ClusterRole/Binding), so
+  # it may only target a remote workload cluster (the management cluster runs catalog/core/envoy-gateway).
+  placement:
+    scope: cluster
   progressiveDelivery:
     flaggerSupported: false
     defaultCanary: false
