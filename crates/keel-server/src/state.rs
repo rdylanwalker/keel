@@ -9,7 +9,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use keel_core::{AuthPhase, InfraResourceKind, OidcConfig, split_yaml_documents};
+use keel_core::{
+    AuthPhase, InfraResourceKind, ManagementAddonKind, OidcConfig, split_yaml_documents,
+};
 use keel_git::{ForgeProvider, GitRunner, LocalGitProvider};
 use keel_kube::{
     InMemorySecretStore, LiveResourceInfo, LiveResourceStatus, LiveStatusSource, SecretStateStore,
@@ -108,6 +110,9 @@ pub struct ReleaseSummary {
     pub status: String,
 }
 
+/// Live management add-on key: Flux object `(kind, namespace, name)`.
+pub type ManagementAddonKey = (ManagementAddonKind, String, String);
+
 /// Stateless provider reading PKO `Stack` and Flux/Flagger release summaries
 /// from Git manifests and/or in-memory CRD caches.
 #[async_trait]
@@ -184,8 +189,9 @@ pub trait ClusterStateProvider: Send + Sync {
     }
 
     /// Live Flux `HelmRelease`/`Kustomization` status for management-plane namespaces
-    /// (`keel-system`, `flux-system`) keyed by `(namespace, name)`; empty without a live cluster.
-    async fn management_addon_statuses(&self) -> HashMap<(String, String), LiveResourceInfo> {
+    /// (`keel-system`, `flux-system`) keyed by `(kind, namespace, name)`; empty without a live
+    /// cluster.
+    async fn management_addon_statuses(&self) -> HashMap<ManagementAddonKey, LiveResourceInfo> {
         HashMap::new()
     }
 
@@ -969,12 +975,25 @@ impl ClusterStateProvider for KubeClusterStateProvider {
         self.live.stack_outputs(namespace, name).await
     }
 
-    async fn management_addon_statuses(&self) -> HashMap<(String, String), LiveResourceInfo> {
-        self.live
-            .release_status_details()
+    async fn management_addon_statuses(&self) -> HashMap<ManagementAddonKey, LiveResourceInfo> {
+        let is_mgmt_ns = |ns: &str| {
+            ns == keel_core::KEEL_SYSTEM_NAMESPACE || ns == keel_core::FLUX_SYSTEM_NAMESPACE
+        };
+        let helm = self
+            .live
+            .helm_release_status_details()
             .await
             .into_iter()
-            .filter(|((ns, _), _)| ns == keel_core::KEEL_SYSTEM_NAMESPACE || ns == "flux-system")
+            .map(|(k, v)| (ManagementAddonKind::HelmRelease, k, v));
+        let kustomizations = self
+            .live
+            .kustomization_status_details()
+            .await
+            .into_iter()
+            .map(|(k, v)| (ManagementAddonKind::Kustomization, k, v));
+        helm.chain(kustomizations)
+            .filter(|(_, (ns, _), _)| is_mgmt_ns(ns))
+            .map(|(kind, (ns, name), info)| ((kind, ns, name), info))
             .collect()
     }
 
@@ -1205,6 +1224,81 @@ mod tests {
         async fn release_statuses(&self) -> HashMap<(String, String), LiveResourceStatus> {
             self.releases.clone()
         }
+    }
+
+    struct KindSplitLiveStatus;
+
+    #[async_trait]
+    impl LiveStatusSource for KindSplitLiveStatus {
+        async fn stack_statuses(&self) -> HashMap<(String, String), LiveResourceStatus> {
+            HashMap::new()
+        }
+
+        async fn release_statuses(&self) -> HashMap<(String, String), LiveResourceStatus> {
+            HashMap::new()
+        }
+
+        async fn helm_release_status_details(&self) -> HashMap<(String, String), LiveResourceInfo> {
+            HashMap::from([
+                (
+                    ("keel-system".to_string(), "kyverno".to_string()),
+                    LiveResourceInfo::from_status(LiveResourceStatus::Ready),
+                ),
+                (
+                    ("tenant-a".to_string(), "flagger".to_string()),
+                    LiveResourceInfo::from_status(LiveResourceStatus::Ready),
+                ),
+            ])
+        }
+
+        async fn kustomization_status_details(
+            &self,
+        ) -> HashMap<(String, String), LiveResourceInfo> {
+            HashMap::from([
+                (
+                    ("flux-system".to_string(), "rauthy".to_string()),
+                    LiveResourceInfo::from_status(LiveResourceStatus::Reconciling),
+                ),
+                (
+                    ("tenant-a".to_string(), "apps".to_string()),
+                    LiveResourceInfo::from_status(LiveResourceStatus::Ready),
+                ),
+            ])
+        }
+    }
+
+    #[tokio::test]
+    async fn management_addon_statuses_are_kind_aware_and_management_scoped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let provider = KubeClusterStateProvider::new(
+            RepoClusterStateProvider::new(tmp.path()),
+            Arc::new(KindSplitLiveStatus),
+        );
+        let live = provider.management_addon_statuses().await;
+        assert_eq!(live.len(), 2);
+        assert_eq!(
+            live[&(
+                ManagementAddonKind::HelmRelease,
+                "keel-system".to_string(),
+                "kyverno".to_string()
+            )]
+                .status,
+            LiveResourceStatus::Ready
+        );
+        assert_eq!(
+            live[&(
+                ManagementAddonKind::Kustomization,
+                "flux-system".to_string(),
+                "rauthy".to_string()
+            )]
+                .status,
+            LiveResourceStatus::Reconciling
+        );
+        assert!(!live.contains_key(&(
+            ManagementAddonKind::HelmRelease,
+            "flux-system".to_string(),
+            "rauthy".to_string()
+        )));
     }
 
     #[tokio::test]

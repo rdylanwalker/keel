@@ -221,6 +221,20 @@ pub trait LiveStatusSource: Send + Sync {
             .collect()
     }
 
+    /// Returns `(namespace, name) -> LiveResourceInfo` for Flux `HelmRelease` resources only.
+    ///
+    /// Defaults to [`LiveStatusSource::release_status_details`] for sources that do not
+    /// distinguish Flux kinds.
+    async fn helm_release_status_details(&self) -> HashMap<(String, String), LiveResourceInfo> {
+        self.release_status_details().await
+    }
+
+    /// Returns `(namespace, name) -> LiveResourceInfo` for Flux `Kustomization` resources only
+    /// (e.g. plain-manifest management add-ons in `flux-system`). Empty by default.
+    async fn kustomization_status_details(&self) -> HashMap<(String, String), LiveResourceInfo> {
+        HashMap::new()
+    }
+
     /// Returns `(namespace, name) -> CanaryStatusInfo` for Flagger `Canary` resources.
     async fn canary_statuses(&self) -> HashMap<(String, String), CanaryStatusInfo> {
         HashMap::new()
@@ -881,29 +895,33 @@ impl LiveStatusSource for KubeClusterStatusReader {
     }
 
     async fn release_status_details(&self) -> HashMap<(String, String), LiveResourceInfo> {
-        let mut out = self
-            .list_dynamic_status_details(
-                "helm.toolkit.fluxcd.io",
-                "v2",
-                "HelmRelease",
-                "helmreleases",
-                false,
-            )
-            .await;
-
-        let kustomizations = self
-            .list_dynamic_status_details(
-                "kustomize.toolkit.fluxcd.io",
-                "v1",
-                "Kustomization",
-                "kustomizations",
-                false,
-            )
-            .await;
-        for (key, info) in kustomizations {
+        let mut out = self.helm_release_status_details().await;
+        for (key, info) in self.kustomization_status_details().await {
             out.entry(key).or_insert(info);
         }
         out
+    }
+
+    async fn helm_release_status_details(&self) -> HashMap<(String, String), LiveResourceInfo> {
+        self.list_dynamic_status_details(
+            "helm.toolkit.fluxcd.io",
+            "v2",
+            "HelmRelease",
+            "helmreleases",
+            false,
+        )
+        .await
+    }
+
+    async fn kustomization_status_details(&self) -> HashMap<(String, String), LiveResourceInfo> {
+        self.list_dynamic_status_details(
+            "kustomize.toolkit.fluxcd.io",
+            "v1",
+            "Kustomization",
+            "kustomizations",
+            false,
+        )
+        .await
     }
 
     async fn canary_statuses(&self) -> HashMap<(String, String), CanaryStatusInfo> {
@@ -2400,6 +2418,8 @@ current-context: workload
                 .status,
             LiveResourceStatus::Synced
         );
+        assert_eq!(stub.helm_release_status_details().await, r_details);
+        assert!(stub.kustomization_status_details().await.is_empty());
         assert!(stub.canary_statuses().await.is_empty());
         assert!(stub.stack_diagnostics("tenant-a", "s1").await.is_none());
         assert!(stub.release_diagnostics("tenant-a", "r1").await.is_none());
@@ -2871,6 +2891,22 @@ current-context: workload
         );
         let release_details = reader.release_status_details().await;
         assert!(release_details.contains_key(&("tenant-a".to_string(), "podinfo".to_string())));
+        let core_key = (
+            "flux-system".to_string(),
+            "management-cluster-core".to_string(),
+        );
+        let helm_only = reader.helm_release_status_details().await;
+        assert!(helm_only.contains_key(&("tenant-a".to_string(), "podinfo".to_string())));
+        assert!(!helm_only.contains_key(&core_key));
+        let kustomizations = reader.kustomization_status_details().await;
+        assert_eq!(
+            kustomizations.get(&core_key).map(|i| i.status.clone()),
+            Some(LiveResourceStatus::Ready)
+        );
+        assert!(!kustomizations.contains_key(&("tenant-a".to_string(), "podinfo".to_string())));
+        assert!(
+            !kustomizations.contains_key(&("tenant-a".to_string(), "stack-wrapper".to_string()))
+        );
 
         let canaries = reader.canary_statuses().await;
         let canary = canaries

@@ -345,19 +345,24 @@ export interface UpgradeManagementAddonPayload {
   values: Record<string, unknown>
 }
 
-/** Management-plane core add-on with live Flux HelmRelease status (`GET /api/v1/management/addons`). */
+/** Management-plane core add-on with live Flux status (`GET /api/v1/management/addons`). */
 export interface ManagementAddonStatus {
-  /** HelmRelease name (equals the `catalog/core` application id). */
+  /** Flux object name (equals the `catalog/core` application id). */
   id: string
   name: string
   namespace: string
+  /** Flux object reconciling the add-on: a chart `HelmRelease` or a plain-manifest `Kustomization`. */
+  kind?: "HelmRelease" | "Kustomization"
   chart?: string
+  /** Chart version (`HelmRelease`) or first `spec.images[].newTag` (`Kustomization`). */
   desiredVersion?: string
   /** Live status label (`Ready`, `Reconciling`, `Error`, ...); absent when not tracked. */
   status?: string
-  /** `true` when a live HelmRelease with the same namespace/name was observed. */
+  /** `true` when a live Flux object with the same kind/namespace/name was observed. */
   tracked: boolean
   lastSynced?: string
+  /** `true` when more than one Flux object in Git is named `id` (upgrade/rollback return 409). */
+  conflict?: boolean
 }
 
 export interface ManagementAddonsResponse {

@@ -417,6 +417,65 @@ pub fn split_yaml_documents(raw_yaml: &str) -> Vec<String> {
     raw_docs
 }
 
+fn is_yaml_document_separator(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed == "---" || trimmed == "..."
+}
+
+/// Replaces the `index`-th non-empty document (same numbering as [`split_yaml_documents`]) with
+/// `replacement`, preserving every other document, separator line, and line ending verbatim.
+/// Returns `None` when `index` is out of range.
+pub fn replace_yaml_document(raw_yaml: &str, index: usize, replacement: &str) -> Option<String> {
+    let mut out = String::with_capacity(raw_yaml.len() + replacement.len());
+    let mut current = String::new();
+    let mut doc_index = 0usize;
+    let mut replaced = false;
+
+    let mut flush = |current: &mut String, out: &mut String| {
+        if current.trim().is_empty() {
+            out.push_str(current);
+        } else {
+            if doc_index == index {
+                out.push_str(replacement);
+                if !replacement.is_empty() && !replacement.ends_with('\n') {
+                    out.push('\n');
+                }
+                replaced = true;
+            } else {
+                out.push_str(current);
+            }
+            doc_index += 1;
+        }
+        current.clear();
+    };
+
+    for line in raw_yaml.split_inclusive('\n') {
+        if is_yaml_document_separator(line) {
+            flush(&mut current, &mut out);
+            out.push_str(line);
+        } else {
+            current.push_str(line);
+        }
+    }
+    flush(&mut current, &mut out);
+    replaced.then_some(out)
+}
+
+/// Returns the leading block of blank and `#` comment lines of a YAML document (verbatim), so
+/// callers that re-serialize a document can keep its header comments.
+pub fn yaml_leading_comments(doc: &str) -> &str {
+    let mut end = 0usize;
+    for line in doc.split_inclusive('\n') {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            end += line.len();
+        } else {
+            break;
+        }
+    }
+    &doc[..end]
+}
+
 /// Parses single or multi-document Kubernetes YAML, ensuring at least one non-empty document exists
 /// and every non-null document is a mapping with non-empty string `apiVersion`, `kind`, and `metadata.name`.
 pub fn validate_k8s_manifests_yaml(raw_yaml: &str) -> Result<Vec<Value>, CoreError> {
@@ -1447,5 +1506,38 @@ spec:
             assert_eq!(bp.metadata.protected, parsed2.metadata.protected);
             assert_eq!(bp.metadata.tenant, parsed2.metadata.tenant);
         }
+    }
+
+    #[test]
+    fn replace_yaml_document_preserves_other_documents_verbatim() {
+        let raw =
+            "# header\napiVersion: v1\nkind: A # keep\n---\n\n# b comment\nkind: B\n---\nkind: C\n";
+        assert_eq!(split_yaml_documents(raw).len(), 3);
+        let out = replace_yaml_document(raw, 1, "kind: B2").unwrap();
+        assert_eq!(
+            out,
+            "# header\napiVersion: v1\nkind: A # keep\n---\nkind: B2\n---\nkind: C\n"
+        );
+        let out = replace_yaml_document(raw, 2, "kind: C2\n").unwrap();
+        assert!(out.starts_with(
+            "# header\napiVersion: v1\nkind: A # keep\n---\n\n# b comment\nkind: B\n---\n"
+        ));
+        assert!(out.ends_with("kind: C2\n"));
+        assert!(replace_yaml_document(raw, 3, "x").is_none());
+        // Leading separator and CRLF line endings are kept.
+        let crlf = "---\r\nkind: A\r\n---\r\nkind: B\r\n";
+        assert_eq!(
+            replace_yaml_document(crlf, 0, "kind: Z\n").unwrap(),
+            "---\r\nkind: Z\n---\r\nkind: B\r\n"
+        );
+    }
+
+    #[test]
+    fn yaml_leading_comments_returns_header_block() {
+        assert_eq!(
+            yaml_leading_comments("\n# a\n  # b\napiVersion: v1\n# c\n"),
+            "\n# a\n  # b\n"
+        );
+        assert_eq!(yaml_leading_comments("kind: A\n"), "");
     }
 }

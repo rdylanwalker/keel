@@ -7,6 +7,7 @@
 pub mod bootstrap;
 pub mod catalog;
 pub mod crypto;
+pub mod management_addon;
 pub mod models;
 
 use thiserror::Error;
@@ -24,12 +25,21 @@ pub use catalog::{
     PartitionedValues, PreparedHelmValues, SchemaFieldError, extract_manifest_variables,
     extract_secret_field_paths, is_secret_schema_node, parse_catalog, parse_catalog_application,
     parse_catalog_blueprint, parse_catalog_bundle, partition_values_by_schema, prepare_helm_values,
-    render_helm_values_yaml, render_manifest_template, split_yaml_documents,
+    render_helm_values_yaml, render_manifest_template, replace_yaml_document, split_yaml_documents,
     validate_k8s_manifests_yaml, validate_schema_values, verify_rendered_manifest_structure,
+    yaml_leading_comments,
 };
 pub use crypto::{
     AES_256_KEY_LEN, AES_GCM_NONCE_LEN, AES_GCM_TAG_LEN, AgeKeyPair, EnvelopeCrypto, SopsConfig,
     SopsCreationRule, SopsManager, generate_admin_password, sha256_hex,
+};
+pub use management_addon::{
+    MANAGEMENT_ADDON_VERSION_MAX_LEN, MANAGEMENT_CORE_ADDONS_DIR, ManagementAddonKind,
+    ManagementAddonRef, apply_management_addon_upgrade, changed_value_paths,
+    disallowed_value_changes, ensure_management_addon_protected, management_addon_chart,
+    management_addon_desired_version, management_addon_mutable_values, management_addon_ref,
+    merge_json_values, render_management_addon_document, validate_management_addon_document,
+    validate_management_addon_version,
 };
 pub use models::{
     AppRuntime, AuthPhase, BootstrapConfig, BootstrapDistro, BootstrapTargetKind, BundleItemKind,

@@ -12,7 +12,13 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use chrono::Utc;
 use futures::{Stream, StreamExt};
-use keel_core::{KEEL_SYSTEM_NAMESPACE, validate_dns_label};
+use keel_core::{
+    KEEL_SYSTEM_NAMESPACE, MANAGEMENT_CORE_ADDONS_DIR, ManagementAddonKind, ManagementAddonRef,
+    apply_management_addon_upgrade, disallowed_value_changes, ensure_management_addon_protected,
+    management_addon_chart, management_addon_desired_version, management_addon_ref,
+    render_management_addon_document, replace_yaml_document, validate_dns_label,
+    validate_management_addon_document,
+};
 use keel_git::PullRequestInfo;
 use keel_kube::{CrdWatchEvent, UserGitCredentials, user_git_creds_secret_name};
 use serde::{Deserialize, Serialize};
@@ -20,7 +26,7 @@ use serde_json::Value;
 
 use crate::auth::AuthSession;
 use crate::error::ServerError;
-use crate::state::AppState;
+use crate::state::{AppState, ManagementAddonKey};
 
 use super::{open_pr_for_session, stage_commit_push_and_return_to_main};
 
@@ -189,26 +195,34 @@ pub async fn put_git_credentials(
     }))
 }
 
-/// One management-plane core add-on (`clusters/management/core-addons/*.yaml` HelmRelease)
-/// with its live Flux status, matched strictly by `(namespace, name)`.
+/// One management-plane core add-on (`clusters/management/core-addons/*.yaml` Flux
+/// `HelmRelease` or Flux `Kustomization`) with its live Flux status, matched strictly by
+/// `(kind, namespace, name)`.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ManagementAddonStatus {
-    /// HelmRelease `metadata.name` (equals the `catalog/core` application id).
+    /// Flux object `metadata.name` (equals the `catalog/core` application id).
     pub id: String,
     pub name: String,
     pub namespace: String,
+    /// Flux object kind reconciling the add-on (`HelmRelease` or `Kustomization`).
+    pub kind: ManagementAddonKind,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chart: Option<String>,
+    /// Chart version (`HelmRelease`) or first `spec.images[].newTag` (`Kustomization`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub desired_version: Option<String>,
     /// Live status label (`Ready`, `Reconciling`, `Error`, ...) or `None` when not tracked.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
-    /// `true` when a live HelmRelease with the same namespace/name was observed.
+    /// `true` when a live Flux object with the same kind/namespace/name was observed.
     pub tracked: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_synced: Option<String>,
+    /// `true` when more than one Flux object in Git is named `id`; upgrade/rollback of a
+    /// conflicting add-on is refused with `409` until the duplicate is removed.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub conflict: bool,
 }
 
 /// Response body for `GET /api/v1/management/addons`.
@@ -230,82 +244,126 @@ fn live_status_label(status: &keel_kube::LiveResourceStatus) -> &'static str {
     }
 }
 
-/// Reads desired management add-on HelmReleases (`keel-system` / `flux-system`) from Git.
+fn is_yaml_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("yaml") || ext.eq_ignore_ascii_case("yml"))
+}
+
+/// Lists `clusters/management/core-addons/*.yaml` sorted by file name (deterministic matching).
+async fn core_addon_yaml_files(repo_workdir: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let mut entries = tokio::fs::read_dir(repo_workdir.join(MANAGEMENT_CORE_ADDONS_DIR)).await?;
+    let mut files = Vec::new();
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        if is_yaml_path(&path) {
+            files.push(path);
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+/// Parses every document of a core add-on file, keeping its index (as numbered by
+/// [`keel_core::split_yaml_documents`]) and verbatim text. Unparseable documents are skipped.
+fn parse_documents(raw: &str) -> impl Iterator<Item = (usize, String, Value)> + '_ {
+    keel_core::split_yaml_documents(raw)
+        .into_iter()
+        .enumerate()
+        .filter_map(|(idx, text)| {
+            let val = serde_yml::from_str::<Value>(&text).ok()?;
+            Some((idx, text, val))
+        })
+}
+
+/// One add-on Flux object located in a core add-on file: document index (as numbered by
+/// [`keel_core::split_yaml_documents`]), verbatim text, parsed value and identity.
+type AddonDocument = (usize, String, Value, ManagementAddonRef);
+
+/// Finds every add-on Flux object (`HelmRelease` / Flux `Kustomization` named `id`) in `raw`,
+/// optionally constrained to an exact `(kind, namespace)`. Never matches Services,
+/// ServiceAccounts or other supporting documents that share the add-on name.
+fn find_addon_documents(
+    raw: &str,
+    id: &str,
+    expect: Option<&ManagementAddonRef>,
+) -> Vec<AddonDocument> {
+    parse_documents(raw)
+        .filter_map(|(idx, text, val)| {
+            let addon = management_addon_ref(&val)?;
+            let matches = addon.name == id
+                && expect.is_none_or(|e| e.kind == addon.kind && e.namespace == addon.namespace);
+            matches.then_some((idx, text, val, addon))
+        })
+        .collect()
+}
+
+/// `409` for an add-on id defined by more than one Flux object. Only repository-relative paths
+/// are reported (never the server's workdir).
+fn duplicate_addon_conflict(id: &str, first: &str, second: &str) -> ServerError {
+    let location = if first == second {
+        format!("more than once in {first}")
+    } else {
+        format!("in both {first} and {second}")
+    };
+    ServerError::Conflict(format!(
+        "Core add-on '{id}' is defined by more than one Flux object ({location}); remove the \
+         duplicate in Git before upgrading or rolling it back"
+    ))
+}
+
+/// Reads desired management add-ons (Flux `HelmRelease`s and Flux `Kustomization`s in
+/// `keel-system` / `flux-system`) from Git.
 async fn read_desired_core_addons(repo_workdir: &Path) -> Vec<ManagementAddonStatus> {
-    let dir = repo_workdir.join("clusters/management/core-addons");
-    let Ok(mut entries) = tokio::fs::read_dir(&dir).await else {
+    let Ok(files) = core_addon_yaml_files(repo_workdir).await else {
         return Vec::new();
     };
     let mut addons = Vec::new();
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        let path = entry.path();
-        let is_yaml = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("yaml") || ext.eq_ignore_ascii_case("yml"));
-        if !is_yaml {
-            continue;
-        }
+    for path in files {
         let Ok(raw) = tokio::fs::read_to_string(&path).await else {
             continue;
         };
-        for doc in keel_core::split_yaml_documents(&raw) {
-            let Ok(val) = serde_yml::from_str::<Value>(&doc) else {
+        for (_, _, val) in parse_documents(&raw) {
+            let Some(addon) = management_addon_ref(&val) else {
                 continue;
             };
-            if val.get("kind").and_then(Value::as_str) != Some("HelmRelease") {
-                continue;
-            }
-            let meta = val.get("metadata");
-            let Some(name) = meta.and_then(|m| m.get("name")).and_then(Value::as_str) else {
-                continue;
-            };
-            let namespace = meta
-                .and_then(|m| m.get("namespace"))
-                .and_then(Value::as_str)
-                .unwrap_or(KEEL_SYSTEM_NAMESPACE);
-            if namespace != KEEL_SYSTEM_NAMESPACE && namespace != "flux-system" {
-                continue;
-            }
-            let chart_spec = val
-                .get("spec")
-                .and_then(|s| s.get("chart"))
-                .and_then(|c| c.get("spec"));
-            let chart = chart_spec
-                .and_then(|c| c.get("chart"))
-                .and_then(Value::as_str)
-                .map(str::to_owned);
-            let desired_version = chart_spec.and_then(|c| c.get("version")).and_then(|v| {
-                v.as_str()
-                    .map(str::to_owned)
-                    .or_else(|| v.as_number().map(|n| n.to_string()))
-            });
             addons.push(ManagementAddonStatus {
-                id: name.to_string(),
-                name: name.to_string(),
-                namespace: namespace.to_string(),
-                chart,
-                desired_version,
+                id: addon.name.clone(),
+                name: addon.name,
+                namespace: addon.namespace,
+                kind: addon.kind,
+                chart: management_addon_chart(&val),
+                desired_version: management_addon_desired_version(&val),
                 status: None,
                 tracked: false,
                 last_synced: None,
+                conflict: false,
             });
         }
     }
-    addons.sort_by(|a, b| (&a.namespace, &a.id).cmp(&(&b.namespace, &b.id)));
-    addons.dedup_by(|a, b| a.namespace == b.namespace && a.id == b.id);
+    addons.sort_by(|a, b| (&a.namespace, &a.id, a.kind).cmp(&(&b.namespace, &b.id, b.kind)));
+    // Every Flux object is listed; ids defined more than once (in one file or across files, of any
+    // kind/namespace) are flagged instead of silently deduplicated, matching the 409 on upgrade.
+    let mut counts = std::collections::HashMap::<String, usize>::new();
+    for addon in &addons {
+        *counts.entry(addon.id.clone()).or_default() += 1;
+    }
+    for addon in &mut addons {
+        addon.conflict = counts.get(&addon.id).is_some_and(|n| *n > 1);
+    }
     addons
 }
 
-/// Overlays live status onto desired add-ons strictly by `(namespace, name)` — never by chart
-/// name, so a tenant release using the same chart (e.g. `tenant-x/flagger`) cannot masquerade
-/// as the management add-on.
+/// Overlays live status onto desired add-ons strictly by `(kind, namespace, name)` — never by
+/// chart name, so a tenant release using the same chart (e.g. `tenant-x/flagger`) cannot
+/// masquerade as the management add-on.
 pub fn overlay_management_addon_statuses(
     addons: &mut [ManagementAddonStatus],
-    live: &std::collections::HashMap<(String, String), keel_kube::LiveResourceInfo>,
+    live: &std::collections::HashMap<ManagementAddonKey, keel_kube::LiveResourceInfo>,
 ) {
     for addon in addons.iter_mut() {
-        if let Some(info) = live.get(&(addon.namespace.clone(), addon.name.clone())) {
+        let key = (addon.kind, addon.namespace.clone(), addon.name.clone());
+        if let Some(info) = live.get(&key) {
             addon.status = Some(live_status_label(&info.status).to_string());
             addon.tracked = true;
             addon.last_synced = info.last_synced.clone();
@@ -316,7 +374,7 @@ pub fn overlay_management_addon_statuses(
 /// `GET /api/v1/management/addons`
 ///
 /// Read-only, admin-only view of the protected management-plane core add-ons with live Flux
-/// `HelmRelease` status from `keel-system` / `flux-system`.
+/// `HelmRelease` / `Kustomization` status from `keel-system` / `flux-system`.
 pub async fn list_management_addons(
     auth: AuthSession,
     State(state): State<AppState>,
@@ -350,77 +408,91 @@ pub struct ManagementAddonProposalResponse {
     pub branch: String,
 }
 
+/// The add-on's Flux object located inside a (possibly multi-document) core add-on file.
+#[derive(Debug)]
+struct CoreAddonManifest {
+    abs_path: PathBuf,
+    rel_path: String,
+    /// Full file contents (all documents).
+    raw: String,
+    /// Index of the add-on document (as numbered by `split_yaml_documents`).
+    doc_index: usize,
+    /// Verbatim text of the add-on document.
+    doc_text: String,
+    doc: Value,
+    addon: ManagementAddonRef,
+}
+
+fn core_addon_not_found(id: &str) -> ServerError {
+    ServerError::NotFound(format!(
+        "Core add-on '{id}' (Flux HelmRelease or Kustomization) not found under \
+         {MANAGEMENT_CORE_ADDONS_DIR}/"
+    ))
+}
+
 async fn find_core_addon_manifest(
     repo_workdir: &Path,
     id: &str,
-) -> Result<(PathBuf, String, Value), ServerError> {
-    let dir = repo_workdir.join("clusters/management/core-addons");
-    let mut entries = tokio::fs::read_dir(&dir).await.map_err(|err| {
-        if err.kind() == std::io::ErrorKind::NotFound {
-            ServerError::NotFound(format!(
-                "Core addon '{id}' not found under clusters/management/core-addons/"
-            ))
-        } else {
-            ServerError::Io(err)
-        }
-    })?;
+) -> Result<CoreAddonManifest, ServerError> {
+    let files = core_addon_yaml_files(repo_workdir)
+        .await
+        .map_err(|err| match err.kind() {
+            std::io::ErrorKind::NotFound => core_addon_not_found(id),
+            _ => ServerError::Io(err),
+        })?;
 
-    while let Some(entry) = entries.next_entry().await? {
-        let path = entry.path();
-        let is_yaml = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("yaml") || ext.eq_ignore_ascii_case("yml"));
-        if !is_yaml {
-            continue;
-        }
-        let raw = tokio::fs::read_to_string(&path).await?;
-        let Ok(doc) = serde_yml::from_str::<Value>(&raw) else {
+    let mut found: Option<CoreAddonManifest> = None;
+    for abs_path in files {
+        let raw = tokio::fs::read_to_string(&abs_path).await?;
+        let mut matches = find_addon_documents(&raw, id, None).into_iter();
+        let Some((doc_index, doc_text, doc, addon)) = matches.next() else {
             continue;
         };
-        let meta_name = doc
-            .get("metadata")
-            .and_then(|m| m.get("name"))
-            .and_then(|n| n.as_str());
-        if meta_name == Some(id) {
-            let file_name = path
-                .file_name()
-                .and_then(|f| f.to_str())
-                .ok_or_else(|| ServerError::Internal("Invalid core addon filename".to_string()))?;
-            let rel_path = format!("clusters/management/core-addons/{file_name}");
-            return Ok((path, rel_path, doc));
+        let file_name = abs_path
+            .file_name()
+            .and_then(|f| f.to_str())
+            .ok_or_else(|| ServerError::Internal("Invalid core addon filename".to_string()))?;
+        let rel_path = format!("{MANAGEMENT_CORE_ADDONS_DIR}/{file_name}");
+        if matches.next().is_some() {
+            return Err(duplicate_addon_conflict(id, &rel_path, &rel_path));
         }
+        if let Some(existing) = &found {
+            return Err(duplicate_addon_conflict(id, &existing.rel_path, &rel_path));
+        }
+        found = Some(CoreAddonManifest {
+            abs_path,
+            rel_path,
+            raw,
+            doc_index,
+            doc_text,
+            doc,
+            addon,
+        });
     }
-
-    Err(ServerError::NotFound(format!(
-        "Core addon '{id}' not found under clusters/management/core-addons/"
-    )))
+    found.ok_or_else(|| core_addon_not_found(id))
 }
 
-fn merge_json_values(target: &mut Value, patch: &Value) {
-    match (target, patch) {
-        (Value::Object(target_map), Value::Object(patch_map)) => {
-            for (k, v) in patch_map {
-                match target_map.get_mut(k) {
-                    Some(existing) if existing.is_object() && v.is_object() => {
-                        merge_json_values(existing, v);
-                    }
-                    _ => {
-                        target_map.insert(k.clone(), v.clone());
-                    }
-                }
-            }
-        }
-        (target_slot, patch_val) => {
-            *target_slot = patch_val.clone();
-        }
-    }
+/// Renders `updated` from the add-on document's `base_text` (verbatim when unchanged, a targeted
+/// version edit when possible, otherwise re-serialized with its leading comments) and splices it
+/// into the current file, leaving every other document byte-for-byte unchanged.
+fn render_updated_core_addon_file(
+    manifest: &CoreAddonManifest,
+    base_text: &str,
+    updated: &Value,
+) -> Result<String, ServerError> {
+    let replacement = render_management_addon_document(base_text, updated)?;
+    replace_yaml_document(&manifest.raw, manifest.doc_index, &replacement)
+        .ok_or_else(|| ServerError::Internal("Core add-on document index out of range".to_string()))
 }
 
 /// `POST /api/v1/management/addons/{id}/upgrade`
 ///
-/// Updates a protected management-plane core addon manifest under
+/// Updates only the add-on's Flux object (`HelmRelease`: chart version + values; Flux
+/// `Kustomization`: `spec.images[].newTag`) inside its core add-on file under
 /// `clusters/management/core-addons/` on a new branch and opens a PR via `ForgeProvider`.
+/// Supporting documents in the same file are preserved verbatim, version-only upgrades keep the
+/// add-on document's comments and key order, and value changes outside the add-on's allowlist
+/// (`keel_core::management_addon_mutable_values`) are rejected with 400.
 pub async fn upgrade_management_addon(
     auth: AuthSession,
     State(state): State<AppState>,
@@ -433,109 +505,28 @@ pub async fn upgrade_management_addon(
     let timestamp = Utc::now().timestamp().max(1) as u64;
     let branch = format!("chore/core-addon-{id}-{timestamp}");
 
-    let (commit_sha, rel_path) = {
+    let (commit_sha, rel_path, kind) = {
         let _guard = state.git_lock.lock().await;
         state
             .git_runner
             .sync_branch_from_remote(&state.repo_workdir, "origin", "main")
             .await?;
 
-        let (abs_path, rel_path, mut doc) =
-            find_core_addon_manifest(&state.repo_workdir, &id).await?;
-
-        if let Some(version) = req
-            .version
-            .as_deref()
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-        {
-            let spec_obj = doc
-                .as_object_mut()
-                .and_then(|root| {
-                    root.entry("spec")
-                        .or_insert_with(|| Value::Object(Default::default()))
-                        .as_object_mut()
-                })
-                .ok_or_else(|| {
-                    ServerError::Internal(
-                        "Core addon manifest root or spec is not a mapping".to_string(),
-                    )
-                })?;
-            let chart_obj = spec_obj
-                .entry("chart")
-                .or_insert_with(|| Value::Object(Default::default()))
-                .as_object_mut()
-                .ok_or_else(|| {
-                    ServerError::Internal(
-                        "Core addon manifest spec.chart is not a mapping".to_string(),
-                    )
-                })?;
-            let chart_spec_obj = chart_obj
-                .entry("spec")
-                .or_insert_with(|| Value::Object(Default::default()))
-                .as_object_mut()
-                .ok_or_else(|| {
-                    ServerError::Internal(
-                        "Core addon manifest spec.chart.spec is not a mapping".to_string(),
-                    )
-                })?;
-            chart_spec_obj.insert("version".to_string(), Value::String(version.to_string()));
-        }
-
-        if req.values.is_object() {
-            let spec_obj = doc
-                .as_object_mut()
-                .and_then(|root| {
-                    root.entry("spec")
-                        .or_insert_with(|| Value::Object(Default::default()))
-                        .as_object_mut()
-                })
-                .ok_or_else(|| {
-                    ServerError::Internal(
-                        "Core addon manifest root or spec is not a mapping".to_string(),
-                    )
-                })?;
-            match spec_obj.get_mut("values") {
-                Some(existing) if existing.is_object() => {
-                    merge_json_values(existing, &req.values);
-                }
-                _ => {
-                    spec_obj.insert("values".to_string(), req.values.clone());
-                }
-            }
-        }
-
-        let metadata_obj = doc
-            .as_object_mut()
-            .and_then(|root| {
-                root.entry("metadata")
-                    .or_insert_with(|| Value::Object(Default::default()))
-                    .as_object_mut()
-            })
-            .ok_or_else(|| {
-                ServerError::Internal("Core addon manifest metadata is not a mapping".to_string())
-            })?;
-        let labels_obj = metadata_obj
-            .entry("labels")
-            .or_insert_with(|| Value::Object(Default::default()))
-            .as_object_mut()
-            .ok_or_else(|| {
-                ServerError::Internal("Core addon manifest labels is not a mapping".to_string())
-            })?;
-        labels_obj.insert(
-            "keel.io/protect".to_string(),
-            Value::String("true".to_string()),
-        );
-
-        let updated_yaml = serde_yml::to_string(&doc).map_err(|e| {
-            ServerError::Internal(format!("Failed to serialize core addon YAML: {e}"))
-        })?;
+        let mut manifest = find_core_addon_manifest(&state.repo_workdir, &id).await?;
+        apply_management_addon_upgrade(
+            &id,
+            &mut manifest.doc,
+            req.version.as_deref(),
+            &req.values,
+        )?;
+        let updated_yaml =
+            render_updated_core_addon_file(&manifest, &manifest.doc_text, &manifest.doc)?;
 
         state
             .git_runner
             .checkout_new_branch(&state.repo_workdir, &branch)
             .await?;
-        tokio::fs::write(&abs_path, &updated_yaml).await?;
+        tokio::fs::write(&manifest.abs_path, &updated_yaml).await?;
 
         let commit_msg = format!("chore(core-addon): upgrade {id}");
         let sha = stage_commit_push_and_return_to_main(
@@ -543,10 +534,10 @@ pub async fn upgrade_management_addon(
             &auth,
             &branch,
             &commit_msg,
-            [rel_path.as_str()],
+            [manifest.rel_path.as_str()],
         )
         .await?;
-        (sha, rel_path)
+        (sha, manifest.rel_path, manifest.addon.kind)
     };
 
     let proposal = open_pr_for_session(
@@ -556,7 +547,7 @@ pub async fn upgrade_management_addon(
         &branch,
         format!("chore(core-addon): upgrade {id}"),
         format!(
-            "Automated management-plane core addon upgrade for `{id}`\n\n- Commit: `{commit_sha}`\n- Path: `{rel_path}`"
+            "Automated management-plane core addon upgrade for `{id}` (Flux {kind})\n\n- Commit: `{commit_sha}`\n- Path: `{rel_path}`"
         ),
     )
     .await?;
@@ -571,10 +562,23 @@ pub async fn upgrade_management_addon(
     ))
 }
 
+fn protected_copy(doc: &Value) -> Value {
+    let mut copy = doc.clone();
+    // Non-mapping documents are never add-ons; leave them unchanged for the comparison.
+    let _ = ensure_management_addon_protected(&mut copy);
+    copy
+}
+
+/// How many commits touching a core add-on file are searched for a previous add-on revision.
+const ROLLBACK_SEARCH_DEPTH: usize = 25;
+
 /// `POST /api/v1/management/addons/{id}/rollback`
 ///
-/// Reverts a management-plane core addon manifest under `clusters/management/core-addons/`
-/// to its previous Git revision on a new branch and opens a PR via `ForgeProvider`.
+/// Restores only the add-on's Flux object to its most recent earlier Git revision that differs
+/// from the current one (other documents in the file are kept as they are now) on a new branch
+/// and opens a PR via `ForgeProvider`. The restored document always keeps the
+/// `keel.io/protect: "true"` label and must carry valid versions; rollbacks that would change
+/// values outside the add-on's allowlist are rejected with 400.
 pub async fn rollback_management_addon(
     auth: AuthSession,
     State(state): State<AppState>,
@@ -593,34 +597,72 @@ pub async fn rollback_management_addon(
             .sync_branch_from_remote(&state.repo_workdir, "origin", "main")
             .await?;
 
-        let (abs_path, rel_path, _doc) = find_core_addon_manifest(&state.repo_workdir, &id).await?;
+        let manifest = find_core_addon_manifest(&state.repo_workdir, &id).await?;
 
         let commits = state
             .git_runner
-            .log_file_commits(&state.repo_workdir, &rel_path, 2)
+            .log_file_commits(
+                &state.repo_workdir,
+                &manifest.rel_path,
+                ROLLBACK_SEARCH_DEPTH,
+            )
             .await?;
-        if commits.len() < 2 {
-            return Err(ServerError::BadRequest(
-                "No previous revision found to roll back to".to_string(),
-            ));
+        let mut target: Option<(String, String, Value)> = None;
+        for sha in commits {
+            let Some(prev_raw) = state
+                .git_runner
+                .show_file_at_ref(&state.repo_workdir, &sha, &manifest.rel_path)
+                .await?
+            else {
+                continue;
+            };
+            let mut prev_matches = find_addon_documents(&prev_raw, &id, Some(&manifest.addon));
+            if prev_matches.len() != 1 {
+                // Absent, or ambiguous at that revision: not a safe rollback target.
+                continue;
+            }
+            let (_, prev_text, prev_doc, _) = prev_matches.remove(0);
+            // Compare with the protect label asserted on both sides: a revision that differs
+            // only by a missing label is not a meaningful rollback target.
+            if protected_copy(&prev_doc) != protected_copy(&manifest.doc) {
+                target = Some((sha, prev_text, prev_doc));
+                break;
+            }
         }
-        let prev_sha = commits[1].clone();
+        let Some((prev_sha, prev_text, prev_doc)) = target else {
+            return Err(ServerError::BadRequest(format!(
+                "No previous revision of core add-on '{id}' found to roll back to"
+            )));
+        };
 
-        let prev_yaml = state
-            .git_runner
-            .show_file_at_ref(&state.repo_workdir, &prev_sha, &rel_path)
-            .await?
-            .ok_or_else(|| {
-                ServerError::Internal(format!(
-                    "Previous revision '{prev_sha}:{rel_path}' not found"
-                ))
-            })?;
+        let null = Value::Null;
+        let disallowed = disallowed_value_changes(
+            &id,
+            manifest.doc.pointer("/spec/values").unwrap_or(&null),
+            prev_doc.pointer("/spec/values").unwrap_or(&null),
+        );
+        if !disallowed.is_empty() {
+            return Err(ServerError::BadRequest(format!(
+                "Rolling back core add-on '{id}' to {prev_sha} would change locked settings ({}); \
+                 edit the manifest in Git directly instead",
+                disallowed.join(", ")
+            )));
+        }
+        validate_management_addon_document(&id, &prev_doc).map_err(|e| {
+            ServerError::BadRequest(format!(
+                "Cannot roll back core add-on '{id}' to {prev_sha}: {e}"
+            ))
+        })?;
+        // Never let a rollback drop the anti-lockout marker (AGENTS.md guardrail 7).
+        let mut restored = prev_doc;
+        ensure_management_addon_protected(&mut restored)?;
+        let updated_yaml = render_updated_core_addon_file(&manifest, &prev_text, &restored)?;
 
         state
             .git_runner
             .checkout_new_branch(&state.repo_workdir, &branch)
             .await?;
-        tokio::fs::write(&abs_path, &prev_yaml).await?;
+        tokio::fs::write(&manifest.abs_path, &updated_yaml).await?;
 
         let commit_msg = format!("revert(core-addon): rollback {id} to {prev_sha}");
         let sha = stage_commit_push_and_return_to_main(
@@ -628,10 +670,10 @@ pub async fn rollback_management_addon(
             &auth,
             &branch,
             &commit_msg,
-            [rel_path.as_str()],
+            [manifest.rel_path.as_str()],
         )
         .await?;
-        (sha, prev_sha, rel_path)
+        (sha, prev_sha, manifest.rel_path)
     };
 
     let proposal = open_pr_for_session(
@@ -708,7 +750,7 @@ mod addon_status_tests {
     }
 
     struct StubProvider {
-        live: HashMap<(String, String), LiveResourceInfo>,
+        live: HashMap<ManagementAddonKey, LiveResourceInfo>,
     }
 
     #[async_trait]
@@ -726,7 +768,7 @@ mod addon_status_tests {
         ) -> Result<Vec<ReleaseSummary>, ServerError> {
             Ok(Vec::new())
         }
-        async fn management_addon_statuses(&self) -> HashMap<(String, String), LiveResourceInfo> {
+        async fn management_addon_statuses(&self) -> HashMap<ManagementAddonKey, LiveResourceInfo> {
             self.live.clone()
         }
         fn has_live_status(&self) -> bool {
@@ -763,18 +805,32 @@ mod addon_status_tests {
     #[tokio::test]
     async fn live_status_matches_by_namespace_and_name_not_chart() {
         let tmp = tempfile::tempdir().unwrap();
+        let hr = ManagementAddonKind::HelmRelease;
         let mut live = HashMap::new();
         live.insert(
-            ("keel-system".to_string(), "kyverno".to_string()),
+            (hr, "keel-system".to_string(), "kyverno".to_string()),
             info(LiveResourceStatus::Ready),
         );
         // A tenant release using the same chart must never be reported as the mgmt add-on.
         live.insert(
-            ("tenant-default".to_string(), "e2e-lab-flagger".to_string()),
+            (
+                hr,
+                "tenant-default".to_string(),
+                "e2e-lab-flagger".to_string(),
+            ),
             info(LiveResourceStatus::Ready),
         );
         live.insert(
-            ("tenant-default".to_string(), "flagger".to_string()),
+            (hr, "tenant-default".to_string(), "flagger".to_string()),
+            info(LiveResourceStatus::Ready),
+        );
+        // A Flux Kustomization sharing the add-on's namespace/name is a different object.
+        live.insert(
+            (
+                ManagementAddonKind::Kustomization,
+                "keel-system".to_string(),
+                "flagger".to_string(),
+            ),
             info(LiveResourceStatus::Ready),
         );
         let state = state_with(tmp.path(), Some(Arc::new(StubProvider { live })));
@@ -813,15 +869,565 @@ mod addon_status_tests {
             id: "flagger".into(),
             name: "flagger".into(),
             namespace: "keel-system".into(),
+            kind: ManagementAddonKind::HelmRelease,
             chart: Some("flagger".into()),
             desired_version: Some("1.40.0".into()),
             status: None,
             tracked: false,
             last_synced: None,
+            conflict: false,
         };
         let v = serde_json::to_value(&addon).unwrap();
         assert_eq!(v["desiredVersion"], "1.40.0");
+        assert_eq!(v["kind"], "HelmRelease");
         assert_eq!(v["tracked"], false);
         assert!(v.get("status").is_none());
+        assert!(v.get("conflict").is_none());
+    }
+
+    // --- Multi-document, kind-aware upgrade / rollback --------------------------------------
+
+    const CERT_MANAGER_MULTI: &str = r#"# cert-manager core add-on (header comment must survive upgrades)
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: cert-manager
+  namespace: keel-system
+  labels:
+    keel.io/protect: "true"
+spec:
+  interval: 10m
+  chart:
+    spec:
+      chart: cert-manager
+      version: "1.18.2"
+  values:
+    crds:
+      enabled: true
+---
+# Self-signed bootstrap issuer
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: keel-selfsigned
+spec:
+  selfSigned: {}   # inline comment kept verbatim
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: keel-ca
+  namespace: keel-system
+spec:
+  isCA: true
+  commonName: keel-ca
+  secretName: keel-ca
+  issuerRef:
+    name: keel-selfsigned
+    kind: ClusterIssuer
+"#;
+
+    const PKO_MULTI: &str = r#"apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: keel-management-pko
+  namespace: flux-system
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: pulumi-kubernetes-operator
+  namespace: keel-previews
+---
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: pulumi-kubernetes-operator
+  namespace: keel-system
+spec:
+  chart:
+    spec:
+      chart: pulumi-kubernetes-operator
+      version: "2.3.0"
+"#;
+
+    const RAUTHY_KUSTOMIZATION: &str = r#"# Rauthy plain-manifest add-on (manifests under clusters/management/addons/rauthy)
+apiVersion: v1
+kind: Service
+metadata:
+  name: rauthy
+  namespace: keel-system
+spec:
+  ports:
+    - port: 8080
+---
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: rauthy
+  namespace: flux-system
+spec:
+  interval: 10m
+  path: ./clusters/management/addons/rauthy
+  prune: false
+  sourceRef:
+    kind: GitRepository
+    name: flux-system
+  images:
+    - name: ghcr.io/sebadob/rauthy
+      newTag: "0.37.2"
+"#;
+
+    /// Only a Service named `dex` — never a management add-on.
+    const SERVICE_ONLY: &str = "apiVersion: v1\nkind: Service\nmetadata:\n  name: dex\n  namespace: keel-system\nspec:\n  ports:\n    - port: 5556\n";
+
+    /// kustomize.config.k8s.io Kustomization listing the core add-on files.
+    const KUSTOMIZE_CONFIG: &str = "apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\nmetadata:\n  name: rauthy\nresources:\n  - cert-manager.yaml\n";
+
+    fn admin() -> AuthSession {
+        session(&["keel-admins"])
+    }
+
+    async fn git_state() -> (tempfile::TempDir, AppState, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let bare = tmp.path().join("remote.git");
+        let workdir = tmp.path().join("workdir");
+        let git = GitRunner::new();
+        git.init_bare(&bare).await.unwrap();
+        git.clone(bare.to_str().unwrap(), &workdir).await.unwrap();
+        let core = workdir.join(MANAGEMENT_CORE_ADDONS_DIR);
+        tokio::fs::create_dir_all(&core).await.unwrap();
+        for (file, body) in [
+            ("cert-manager.yaml", CERT_MANAGER_MULTI),
+            ("pko.yaml", PKO_MULTI),
+            ("rauthy.yaml", RAUTHY_KUSTOMIZATION),
+            ("dex-service.yaml", SERVICE_ONLY),
+            ("kustomization.yaml", KUSTOMIZE_CONFIG),
+        ] {
+            tokio::fs::write(core.join(file), body).await.unwrap();
+        }
+        commit_and_push(&git, &workdir, "chore: seed core add-ons").await;
+        let state = AppState::new(
+            Arc::new(LocalGitProvider::new(&bare)),
+            Arc::new(InMemorySecretStore::new()),
+            TelemetryMux::default(),
+            git,
+            &workdir,
+            bare.to_string_lossy().to_string(),
+            AuthPhase::OidcActive,
+        );
+        (tmp, state, workdir)
+    }
+
+    async fn commit_and_push(git: &GitRunner, workdir: &Path, msg: &str) {
+        git.add(workdir, ["."]).await.unwrap();
+        git.commit(
+            workdir,
+            msg,
+            &keel_git::CommitAuthor::new("Keel Seed", "seed@keel.local"),
+        )
+        .await
+        .unwrap();
+        git.push(workdir, "origin", "HEAD:refs/heads/main")
+            .await
+            .unwrap();
+    }
+
+    /// Reads `file` from `branch` and switches the worktree back to `main`.
+    async fn read_on_branch(state: &AppState, workdir: &Path, branch: &str, file: &str) -> String {
+        state
+            .git_runner
+            .checkout_branch(workdir, branch)
+            .await
+            .unwrap();
+        let raw = tokio::fs::read_to_string(workdir.join(MANAGEMENT_CORE_ADDONS_DIR).join(file))
+            .await
+            .unwrap();
+        state
+            .git_runner
+            .checkout_branch(workdir, "main")
+            .await
+            .unwrap();
+        raw
+    }
+
+    async fn upgrade(
+        state: &AppState,
+        id: &str,
+        version: Option<&str>,
+        values: Value,
+    ) -> Result<ManagementAddonProposalResponse, ServerError> {
+        upgrade_management_addon(
+            admin(),
+            State(state.clone()),
+            AxumPath(id.to_string()),
+            Json(UpgradeManagementAddonRequest {
+                version: version.map(str::to_owned),
+                values,
+            }),
+        )
+        .await
+        .map(|(_, Json(resp))| resp)
+    }
+
+    #[tokio::test]
+    async fn upgrade_preserves_supporting_documents_verbatim() {
+        let (_tmp, state, workdir) = git_state().await;
+        let resp = upgrade(
+            &state,
+            "cert-manager",
+            Some("1.19.1"),
+            serde_json::json!({"prometheus": {"enabled": true}}),
+        )
+        .await
+        .unwrap();
+        let raw = read_on_branch(&state, &workdir, &resp.branch, "cert-manager.yaml").await;
+
+        let before = keel_core::split_yaml_documents(CERT_MANAGER_MULTI);
+        let after = keel_core::split_yaml_documents(&raw);
+        assert_eq!(after.len(), 3, "{raw}");
+        assert_eq!(after[1], before[1], "ClusterIssuer must be untouched");
+        assert_eq!(after[2], before[2], "Certificate must be untouched");
+        assert!(after[0].starts_with("# cert-manager core add-on"));
+        let hr: Value = serde_yml::from_str(&after[0]).unwrap();
+        assert_eq!(hr.pointer("/spec/chart/spec/version").unwrap(), "1.19.1");
+        assert_eq!(hr.pointer("/spec/values/crds/enabled").unwrap(), true);
+        assert_eq!(hr.pointer("/spec/values/prometheus/enabled").unwrap(), true);
+    }
+
+    #[tokio::test]
+    async fn upgrade_finds_helmrelease_after_service_accounts() {
+        let (_tmp, state, workdir) = git_state().await;
+        let resp = upgrade(
+            &state,
+            "pulumi-kubernetes-operator",
+            Some("2.4.0"),
+            Value::Null,
+        )
+        .await
+        .unwrap();
+        let raw = read_on_branch(&state, &workdir, &resp.branch, "pko.yaml").await;
+        let before = keel_core::split_yaml_documents(PKO_MULTI);
+        let after = keel_core::split_yaml_documents(&raw);
+        assert_eq!(after.len(), 3);
+        assert_eq!(after[0], before[0]);
+        // The ServiceAccount sharing the add-on's name is not the add-on.
+        assert_eq!(after[1], before[1]);
+        let hr: Value = serde_yml::from_str(&after[2]).unwrap();
+        assert_eq!(hr["kind"], "HelmRelease");
+        assert_eq!(hr.pointer("/spec/chart/spec/version").unwrap(), "2.4.0");
+        assert_eq!(
+            hr.pointer("/metadata/labels/keel.io~1protect").unwrap(),
+            "true"
+        );
+    }
+
+    #[tokio::test]
+    async fn version_only_upgrade_keeps_document_comments_and_key_order() {
+        let (_tmp, state, workdir) = git_state().await;
+        let resp = upgrade(&state, "cert-manager", Some("1.19.1"), Value::Null)
+            .await
+            .unwrap();
+        let raw = read_on_branch(&state, &workdir, &resp.branch, "cert-manager.yaml").await;
+        assert_eq!(
+            raw,
+            CERT_MANAGER_MULTI.replace("version: \"1.18.2\"", "version: \"1.19.1\"")
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_flux_objects_in_one_file_conflict_and_are_flagged() {
+        let (_tmp, state, workdir) = git_state().await;
+        let dup = format!(
+            "{FLAGGER}---\napiVersion: helm.toolkit.fluxcd.io/v2\nkind: HelmRelease\nmetadata:\n  name: flagger\n  namespace: flux-system\nspec:\n  chart:\n    spec:\n      chart: flagger\n      version: \"1.41.0\"\n"
+        );
+        tokio::fs::write(
+            workdir
+                .join(MANAGEMENT_CORE_ADDONS_DIR)
+                .join("flagger.yaml"),
+            dup,
+        )
+        .await
+        .unwrap();
+        commit_and_push(&state.git_runner, &workdir, "chore: duplicate flagger").await;
+
+        let err = upgrade(&state, "flagger", Some("1.42.0"), Value::Null)
+            .await
+            .unwrap_err();
+        let ServerError::Conflict(msg) = &err else {
+            panic!("expected 409, got {err:?}");
+        };
+        assert!(
+            msg.contains("more than once in clusters/management/core-addons/flagger.yaml"),
+            "{msg}"
+        );
+        assert!(!msg.contains(&workdir.display().to_string()), "{msg}");
+        let err = rollback_management_addon(
+            admin(),
+            State(state.clone()),
+            AxumPath("flagger".to_string()),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ServerError::Conflict(_)), "{err:?}");
+
+        let Json(resp) = list_management_addons(admin(), State(state)).await.unwrap();
+        let flagger: Vec<_> = resp.addons.iter().filter(|a| a.id == "flagger").collect();
+        assert_eq!(flagger.len(), 2);
+        assert!(flagger.iter().all(|a| a.conflict));
+        assert!(
+            resp.addons
+                .iter()
+                .filter(|a| a.id != "flagger")
+                .all(|a| !a.conflict)
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicates_across_files_report_relative_paths() {
+        let (_tmp, state, workdir) = git_state().await;
+        tokio::fs::write(
+            workdir
+                .join(MANAGEMENT_CORE_ADDONS_DIR)
+                .join("zz-rauthy-copy.yaml"),
+            RAUTHY_KUSTOMIZATION,
+        )
+        .await
+        .unwrap();
+        commit_and_push(&state.git_runner, &workdir, "chore: copy rauthy").await;
+        let err = upgrade(&state, "rauthy", Some("0.38.0"), Value::Null)
+            .await
+            .unwrap_err();
+        let ServerError::Conflict(msg) = &err else {
+            panic!("expected 409, got {err:?}");
+        };
+        assert!(
+            msg.contains("clusters/management/core-addons/rauthy.yaml and clusters/management/core-addons/zz-rauthy-copy.yaml"),
+            "{msg}"
+        );
+        assert!(!msg.contains(&workdir.display().to_string()), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn kustomization_addon_upgrades_image_tag_and_rejects_values() {
+        let (_tmp, state, workdir) = git_state().await;
+        let resp = upgrade(&state, "rauthy", Some("0.38.0"), Value::Null)
+            .await
+            .unwrap();
+        let raw = read_on_branch(&state, &workdir, &resp.branch, "rauthy.yaml").await;
+        let before = keel_core::split_yaml_documents(RAUTHY_KUSTOMIZATION);
+        let after = keel_core::split_yaml_documents(&raw);
+        assert_eq!(
+            after[0], before[0],
+            "Service named like the add-on is untouched"
+        );
+        let ks: Value = serde_yml::from_str(&after[1]).unwrap();
+        assert_eq!(ks["kind"], "Kustomization");
+        assert_eq!(ks.pointer("/spec/images/0/newTag").unwrap(), "0.38.0");
+        assert_eq!(
+            ks.pointer("/spec/path").unwrap(),
+            "./clusters/management/addons/rauthy"
+        );
+        assert!(ks.pointer("/spec/chart").is_none());
+
+        let err = upgrade(&state, "rauthy", None, serde_json::json!({"replicas": 3}))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, ServerError::Core(keel_core::CoreError::Validation(m)) if m.contains("Kustomization")),
+            "{err:?}"
+        );
+        let err = upgrade(&state, "rauthy", Some("0.38.0\nevil: x"), Value::Null)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ServerError::Core(keel_core::CoreError::Validation(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn non_flux_documents_named_like_the_id_are_not_addons() {
+        let (_tmp, state, _workdir) = git_state().await;
+        let err = upgrade(&state, "dex", Some("2.0.0"), Value::Null)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ServerError::NotFound(_)), "{err:?}");
+        let err =
+            rollback_management_addon(admin(), State(state.clone()), AxumPath("dex".to_string()))
+                .await
+                .unwrap_err();
+        assert!(matches!(err, ServerError::NotFound(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn listing_includes_kustomization_addons_with_kind() {
+        let (_tmp, state, _workdir) = git_state().await;
+        let mut live = HashMap::new();
+        live.insert(
+            (
+                ManagementAddonKind::Kustomization,
+                "flux-system".to_string(),
+                "rauthy".to_string(),
+            ),
+            info(LiveResourceStatus::Ready),
+        );
+        let mut state = state;
+        state.state_provider = Arc::new(StubProvider { live });
+        let Json(resp) = list_management_addons(admin(), State(state)).await.unwrap();
+        let ids: Vec<&str> = resp.addons.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["rauthy", "cert-manager", "pulumi-kubernetes-operator"]
+        );
+        let rauthy = &resp.addons[0];
+        assert_eq!(rauthy.kind, ManagementAddonKind::Kustomization);
+        assert_eq!(rauthy.namespace, "flux-system");
+        assert_eq!(rauthy.desired_version.as_deref(), Some("0.37.2"));
+        assert!(rauthy.chart.is_none());
+        assert!(rauthy.tracked);
+        assert_eq!(rauthy.status.as_deref(), Some("Ready"));
+        assert!(!resp.addons[1].tracked);
+    }
+
+    #[tokio::test]
+    async fn rollback_restores_only_the_addon_document() {
+        let (_tmp, state, workdir) = git_state().await;
+        let path = workdir
+            .join(MANAGEMENT_CORE_ADDONS_DIR)
+            .join("cert-manager.yaml");
+
+        // Commit 2: bump the HelmRelease. Commit 3: edit only the ClusterIssuer document.
+        let bumped = CERT_MANAGER_MULTI.replace("\"1.18.2\"", "\"1.19.0\"");
+        tokio::fs::write(&path, &bumped).await.unwrap();
+        commit_and_push(&state.git_runner, &workdir, "chore: bump cert-manager").await;
+        let issuer_edit = bumped.replace(
+            "name: keel-selfsigned\nspec:",
+            "name: keel-selfsigned\n  labels:\n    team: platform\nspec:",
+        );
+        assert_ne!(issuer_edit, bumped);
+        tokio::fs::write(&path, &issuer_edit).await.unwrap();
+        commit_and_push(&state.git_runner, &workdir, "chore: label issuer").await;
+
+        let (_, Json(resp)) = rollback_management_addon(
+            admin(),
+            State(state.clone()),
+            AxumPath("cert-manager".to_string()),
+        )
+        .await
+        .unwrap();
+        let raw = read_on_branch(&state, &workdir, &resp.branch, "cert-manager.yaml").await;
+        let expected = issuer_edit.replace("\"1.19.0\"", "\"1.18.2\"");
+        assert_eq!(raw, expected);
+    }
+
+    #[tokio::test]
+    async fn rollback_reasserts_protect_label_and_validates_versions() {
+        let (_tmp, state, workdir) = git_state().await;
+        let path = workdir
+            .join(MANAGEMENT_CORE_ADDONS_DIR)
+            .join("cert-manager.yaml");
+        let unlabelled =
+            CERT_MANAGER_MULTI.replace("  labels:\n    keel.io/protect: \"true\"\n", "");
+        assert_ne!(unlabelled, CERT_MANAGER_MULTI);
+        tokio::fs::write(&path, &unlabelled).await.unwrap();
+        commit_and_push(&state.git_runner, &workdir, "chore: unlabelled").await;
+        let bumped = CERT_MANAGER_MULTI.replace("\"1.18.2\"", "\"1.19.0\"");
+        tokio::fs::write(&path, &bumped).await.unwrap();
+        commit_and_push(&state.git_runner, &workdir, "chore: bump").await;
+
+        let (_, Json(resp)) = rollback_management_addon(
+            admin(),
+            State(state.clone()),
+            AxumPath("cert-manager".to_string()),
+        )
+        .await
+        .unwrap();
+        let raw = read_on_branch(&state, &workdir, &resp.branch, "cert-manager.yaml").await;
+        let docs = keel_core::split_yaml_documents(&raw);
+        let hr: Value = serde_yml::from_str(&docs[0]).unwrap();
+        assert_eq!(hr.pointer("/spec/chart/spec/version").unwrap(), "1.18.2");
+        assert_eq!(
+            hr.pointer("/metadata/labels/keel.io~1protect").unwrap(),
+            "true"
+        );
+        assert_eq!(
+            docs[1],
+            keel_core::split_yaml_documents(CERT_MANAGER_MULTI)[1]
+        );
+
+        // A historical revision with an invalid version is not restored.
+        let ranged = CERT_MANAGER_MULTI.replace("\"1.18.2\"", "\">=1.0.0\"");
+        tokio::fs::write(&path, &ranged).await.unwrap();
+        commit_and_push(&state.git_runner, &workdir, "chore: ranged").await;
+        tokio::fs::write(&path, &bumped).await.unwrap();
+        commit_and_push(&state.git_runner, &workdir, "chore: bump again").await;
+        let err = rollback_management_addon(
+            admin(),
+            State(state.clone()),
+            AxumPath("cert-manager".to_string()),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&err, ServerError::BadRequest(m) if m.contains("Invalid add-on version")),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rollback_without_previous_addon_revision_is_rejected() {
+        let (_tmp, state, workdir) = git_state().await;
+        // Only a supporting document changed: there is no earlier add-on revision.
+        let path = workdir
+            .join(MANAGEMENT_CORE_ADDONS_DIR)
+            .join("cert-manager.yaml");
+        let edited = CERT_MANAGER_MULTI.replace("commonName: keel-ca", "commonName: keel-root-ca");
+        tokio::fs::write(&path, &edited).await.unwrap();
+        commit_and_push(&state.git_runner, &workdir, "chore: rename ca").await;
+        let err = rollback_management_addon(
+            admin(),
+            State(state.clone()),
+            AxumPath("cert-manager".to_string()),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ServerError::BadRequest(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn rollback_cannot_restore_changed_locked_values() {
+        let (_tmp, state, workdir) = git_state().await;
+        let path = workdir.join(MANAGEMENT_CORE_ADDONS_DIR).join("flux2.yaml");
+        let insecure = "apiVersion: helm.toolkit.fluxcd.io/v2\nkind: HelmRelease\nmetadata:\n  name: flux2\n  namespace: flux-system\nspec:\n  chart:\n    spec:\n      chart: flux2\n      version: \"2.19.0\"\n  values:\n    multitenancy:\n      enabled: false\n";
+        tokio::fs::write(&path, insecure).await.unwrap();
+        commit_and_push(&state.git_runner, &workdir, "chore: add flux2").await;
+        let secure = insecure
+            .replace("enabled: false", "enabled: true")
+            .replace("2.19.0", "2.20.0");
+        tokio::fs::write(&path, &secure).await.unwrap();
+        commit_and_push(&state.git_runner, &workdir, "chore: lock flux2").await;
+
+        let err =
+            rollback_management_addon(admin(), State(state.clone()), AxumPath("flux2".to_string()))
+                .await
+                .unwrap_err();
+        assert!(
+            matches!(&err, ServerError::BadRequest(m) if m.contains("/multitenancy")),
+            "{err:?}"
+        );
+        // And the API cannot flip it either.
+        let err = upgrade(
+            &state,
+            "flux2",
+            Some("2.21.0"),
+            serde_json::json!({"multitenancy": {"enabled": false}}),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            ServerError::Core(keel_core::CoreError::Validation(_))
+        ));
     }
 }

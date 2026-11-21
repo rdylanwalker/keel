@@ -634,10 +634,10 @@ spec:
             version: Some("4.54.0".to_string()),
             values: json!({
                 "s3": {
-                    "enableAuth": false
+                    "enableAuth": true
                 },
                 "filer": {
-                    "replicas": 2
+                    "resources": { "requests": { "cpu": "100m" } }
                 }
             }),
         };
@@ -673,9 +673,34 @@ spec:
         let doc: Value = serde_yml::from_str(&raw).unwrap();
         assert_eq!(doc["spec"]["chart"]["spec"]["version"], "4.54.0");
         assert_eq!(doc["spec"]["values"]["s3"]["enabled"], true);
-        assert_eq!(doc["spec"]["values"]["s3"]["enableAuth"], false);
-        assert_eq!(doc["spec"]["values"]["filer"]["replicas"], 2);
+        assert_eq!(doc["spec"]["values"]["s3"]["enableAuth"], true);
+        assert_eq!(
+            doc["spec"]["values"]["filer"]["resources"]["requests"]["cpu"],
+            "100m"
+        );
         assert_eq!(doc["metadata"]["labels"]["keel.io/protect"], "true");
+        state
+            .git_runner
+            .checkout_branch(&workdir, "main")
+            .await
+            .unwrap();
+
+        // Disabling S3 authentication on the state backend is a locked value -> 400.
+        let err = upgrade_management_addon(
+            test_auth(),
+            State(state.clone()),
+            AxumPath("s3-state-backend".to_string()),
+            Json(UpgradeManagementAddonRequest {
+                version: None,
+                values: json!({ "s3": { "enableAuth": false } }),
+            }),
+        )
+        .await
+        .expect_err("locked value change is rejected");
+        assert!(
+            matches!(&err, ServerError::Core(keel_core::CoreError::Validation(msg)) if msg.contains("/s3/enableAuth")),
+            "{err:?}"
+        );
     }
 
     #[tokio::test]
@@ -692,7 +717,10 @@ spec:
         .expect_err("rollback with 1 commit should fail");
         match err {
             ServerError::BadRequest(msg) => {
-                assert_eq!(msg, "No previous revision found to roll back to");
+                assert_eq!(
+                    msg,
+                    "No previous revision of core add-on 's3-state-backend' found to roll back to"
+                );
             }
             other => panic!("expected BadRequest, got {other:?}"),
         }
