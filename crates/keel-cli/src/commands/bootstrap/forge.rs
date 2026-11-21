@@ -396,12 +396,13 @@ mod tests {
 
     #[test]
     fn forgejo_admin_secret_is_stored_in_keel_system() {
-        let yaml = render_forgejo_admin_secret_yaml("p4ssw0rd-generated").unwrap();
+        let password = generate_admin_password();
+        let yaml = render_forgejo_admin_secret_yaml(&password).unwrap();
         let doc: Value = serde_yml::from_str(&yaml).unwrap();
         assert_eq!(doc["metadata"]["namespace"], KEEL_SYSTEM_NAMESPACE);
         assert_eq!(doc["metadata"]["name"], FORGEJO_ADMIN_SECRET_NAME);
         assert_eq!(doc["stringData"]["username"], FORGEJO_ADMIN_USERNAME);
-        assert_eq!(doc["stringData"]["password"], "p4ssw0rd-generated");
+        assert_eq!(doc["stringData"]["password"], password.as_str());
     }
 
     #[test]

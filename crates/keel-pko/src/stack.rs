@@ -2072,9 +2072,14 @@ mod tests {
         assert!(!spec.env_refs.contains_key("GITHUB_TOKEN"));
         assert!(!spec.env_refs.contains_key("AWS_ACCESS_KEY_ID"));
         // No ref in the preview points at a tenant-namespace Secret name.
-        for r in spec.env_refs.values().chain(spec.secrets_ref.values()) {
-            assert!(r.secret.name.starts_with("keel-preview-42-"), "{r:?}");
-        }
+        // Assert on the ref names only; failure output must never echo Secret-sourced structures.
+        assert!(
+            spec.env_refs
+                .values()
+                .chain(spec.secrets_ref.values())
+                .all(|r| r.secret.name.starts_with("keel-preview-42-")),
+            "a preview Stack ref points outside the keel-preview-42-* Secret copies"
+        );
         // Proposed values never leak through Debug.
         let mut with_data = vm.clone();
         with_data.proposed_data = Some(BTreeMap::from([(

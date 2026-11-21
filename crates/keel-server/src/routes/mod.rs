@@ -123,14 +123,117 @@ pub(crate) fn safe_relative_path(base: &Path, rel: &str) -> Option<PathBuf> {
     }
 }
 
-pub(crate) async fn find_catalog_files(base_dir: &Path) -> Vec<PathBuf> {
+/// Resolves `path` (following symlinks) and verifies it stays inside `root`, returning the resolved
+/// path to use for the actual I/O.
+///
+/// The Git worktree is tenant-influenced content: a committed symlink such as
+/// `catalog/apps/x/manifests.yaml -> /var/run/secrets/...` must never let the server read files
+/// outside the repository into an API response, or write through it. Non-existent targets are
+/// resolved via their nearest existing ancestor; dangling symlinks and `..` segments are rejected.
+pub(crate) async fn resolve_contained_path(root: &Path, path: &Path) -> std::io::Result<PathBuf> {
+    let escape = || {
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "path escapes the repository working directory",
+        )
+    };
+    let canon_root = tokio::fs::canonicalize(root).await?;
+    let mut probe = path.to_path_buf();
+    let mut missing: Vec<std::ffi::OsString> = Vec::new();
+    let resolved_base = loop {
+        match tokio::fs::canonicalize(&probe).await {
+            Ok(canon) => break canon,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                // A dangling symlink would be followed on write; refuse it outright.
+                if tokio::fs::symlink_metadata(&probe).await.is_ok() {
+                    return Err(escape());
+                }
+                let name = match probe.components().next_back() {
+                    Some(std::path::Component::Normal(name)) => name.to_os_string(),
+                    _ => return Err(escape()),
+                };
+                missing.push(name);
+                if !probe.pop() {
+                    return Err(escape());
+                }
+            }
+            Err(err) => return Err(err),
+        }
+    };
+    if !resolved_base.starts_with(&canon_root) {
+        return Err(escape());
+    }
+    let mut resolved = resolved_base;
+    resolved.extend(missing.iter().rev());
+    Ok(resolved)
+}
+
+/// Reads `path` as UTF-8 after [`resolve_contained_path`] confirms it stays inside `root`.
+pub(crate) async fn read_contained_to_string(root: &Path, path: &Path) -> std::io::Result<String> {
+    let resolved = resolve_contained_path(root, path).await?;
+    tokio::fs::read_to_string(resolved).await
+}
+
+/// Maps an escaping path to a client-visible `Forbidden` (other I/O errors stay internal).
+fn contained_io_error(err: std::io::Error) -> ServerError {
+    if err.kind() == std::io::ErrorKind::PermissionDenied {
+        ServerError::Forbidden("repository file escapes the working directory".to_string())
+    } else {
+        err.into()
+    }
+}
+
+/// Writes `contents` to `path` after [`resolve_contained_path`] confirms it stays inside `root`.
+pub(crate) async fn write_contained(
+    root: &Path,
+    path: &Path,
+    contents: impl AsRef<[u8]>,
+) -> Result<(), ServerError> {
+    let resolved = resolve_contained_path(root, path)
+        .await
+        .map_err(contained_io_error)?;
+    Ok(tokio::fs::write(resolved, contents).await?)
+}
+
+/// Creates `path` (and parents) after [`resolve_contained_path`] confirms it stays inside `root`,
+/// so a committed directory symlink cannot redirect directory creation outside the worktree.
+pub(crate) async fn create_dir_all_contained(root: &Path, path: &Path) -> Result<(), ServerError> {
+    let resolved = resolve_contained_path(root, path)
+        .await
+        .map_err(contained_io_error)?;
+    Ok(tokio::fs::create_dir_all(resolved).await?)
+}
+
+/// Reads an optional repository file through [`resolve_contained_path`]: `Ok(None)` when it does
+/// not exist, and a `Forbidden` error (never a silent fallback) when it escapes `root`.
+pub(crate) async fn read_contained_optional(
+    root: &Path,
+    path: &Path,
+) -> Result<Option<String>, ServerError> {
+    match read_contained_to_string(root, path).await {
+        Ok(content) => Ok(Some(content)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(contained_io_error(err)),
+    }
+}
+
+/// Lists `<base_dir>/*/catalog.yaml`, keeping only entries that resolve inside `repo_root`.
+///
+/// Containment is checked against the repository root (not `base_dir`) so a committed symlink
+/// for the catalog directory itself (e.g. `catalog/apps -> /outside`) cannot widen the root.
+pub(crate) async fn find_catalog_files(repo_root: &Path, base_dir: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
+    if resolve_contained_path(repo_root, base_dir).await.is_err() {
+        return out;
+    }
     let Ok(mut entries) = tokio::fs::read_dir(base_dir).await else {
         return out;
     };
     while let Ok(Some(entry)) = entries.next_entry().await {
         let candidate = entry.path().join("catalog.yaml");
-        if tokio::fs::try_exists(&candidate).await.unwrap_or(false) {
+        if tokio::fs::try_exists(&candidate).await.unwrap_or(false)
+            && resolve_contained_path(repo_root, &candidate).await.is_ok()
+        {
             out.push(candidate);
         }
     }
@@ -183,13 +286,21 @@ pub(crate) async fn load_catalog_manifest(
         }
     };
 
-    if !tokio::fs::try_exists(&target_path).await.unwrap_or(false) {
-        return Err(ServerError::NotFound(format!(
-            "Catalog item '{catalog_id}' not found"
-        )));
-    }
-
-    let yaml = tokio::fs::read_to_string(&target_path).await?;
+    // An escaping (symlinked) catalog.yaml is treated exactly like a missing one.
+    let yaml = match read_contained_to_string(repo_workdir, &target_path).await {
+        Ok(yaml) => yaml,
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+            ) =>
+        {
+            return Err(ServerError::NotFound(format!(
+                "Catalog item '{catalog_id}' not found"
+            )));
+        }
+        Err(err) => return Err(err.into()),
+    };
     Ok(parse_catalog(&yaml)?)
 }
 
@@ -469,6 +580,122 @@ mod tests {
 
     use super::*;
     use crate::auth::SessionClaims;
+
+    #[tokio::test]
+    async fn contained_io_rejects_symlink_and_parent_escapes() {
+        let outside = TempDir::new().unwrap();
+        let secret = outside.path().join("token");
+        tokio::fs::write(&secret, "sa-token").await.unwrap();
+        let repo = TempDir::new().unwrap();
+        let app_dir = repo.path().join("catalog/apps/demo");
+        tokio::fs::create_dir_all(&app_dir).await.unwrap();
+        tokio::fs::write(app_dir.join("catalog.yaml"), "x: 1\n")
+            .await
+            .unwrap();
+
+        // Regular files and not-yet-existing files inside the repo resolve normally.
+        assert_eq!(
+            read_contained_to_string(repo.path(), &app_dir.join("catalog.yaml"))
+                .await
+                .unwrap(),
+            "x: 1\n"
+        );
+        let fresh = app_dir.join("new/manifests.yaml");
+        tokio::fs::create_dir_all(fresh.parent().unwrap())
+            .await
+            .unwrap();
+        write_contained(repo.path(), &fresh, "kind: x\n")
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::fs::read_to_string(&fresh).await.unwrap(),
+            "kind: x\n"
+        );
+
+        // `..` segments past the root are rejected even without symlinks.
+        let err = resolve_contained_path(repo.path(), &repo.path().join("../escape.yaml"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+
+        #[cfg(unix)]
+        {
+            let link = app_dir.join("manifests.yaml");
+            std::os::unix::fs::symlink(&secret, &link).unwrap();
+            let err = read_contained_to_string(repo.path(), &link)
+                .await
+                .unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+            let err = write_contained(repo.path(), &link, "overwrite")
+                .await
+                .unwrap_err();
+            assert!(matches!(err, ServerError::Forbidden(_)), "{err:?}");
+            assert_eq!(
+                tokio::fs::read_to_string(&secret).await.unwrap(),
+                "sa-token"
+            );
+
+            // Dangling symlinks (which a write would follow) are rejected too.
+            let dangling = app_dir.join("Pulumi.yaml");
+            std::os::unix::fs::symlink(outside.path().join("missing"), &dangling).unwrap();
+            let err = write_contained(repo.path(), &dangling, "x")
+                .await
+                .unwrap_err();
+            assert!(matches!(err, ServerError::Forbidden(_)), "{err:?}");
+            assert!(!outside.path().join("missing").exists());
+
+            // A catalog entry whose catalog.yaml is an escaping symlink is not discovered.
+            let evil = repo.path().join("catalog/apps/evil");
+            tokio::fs::create_dir_all(&evil).await.unwrap();
+            std::os::unix::fs::symlink(&secret, evil.join("catalog.yaml")).unwrap();
+            let found = find_catalog_files(repo.path(), &repo.path().join("catalog/apps")).await;
+            assert_eq!(found, vec![app_dir.join("catalog.yaml")]);
+
+            // Direct-by-id lookups refuse an escaping catalog.yaml as if it were missing.
+            let err = load_catalog_manifest(repo.path(), "evil", Some("app"))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, ServerError::NotFound(_)), "{err:?}");
+            let err = load_catalog_manifest(repo.path(), "evil", None)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, ServerError::NotFound(_)), "{err:?}");
+
+            // Optional reads: missing -> None, escaping -> Forbidden (no silent fallback).
+            assert!(
+                read_contained_optional(repo.path(), &app_dir.join("absent.yaml"))
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            let err = read_contained_optional(repo.path(), &link)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, ServerError::Forbidden(_)), "{err:?}");
+
+            // A symlinked catalog directory cannot move the containment root outside the repo.
+            let outside_catalog = outside.path().join("catalog-infra");
+            let outside_item = outside_catalog.join("x");
+            tokio::fs::create_dir_all(&outside_item).await.unwrap();
+            tokio::fs::write(outside_item.join("catalog.yaml"), "x: 1\n")
+                .await
+                .unwrap();
+            tokio::fs::write(outside_item.join("manifests.yaml"), "secret: 1\n")
+                .await
+                .unwrap();
+            std::os::unix::fs::symlink(&outside_catalog, repo.path().join("catalog/infra"))
+                .unwrap();
+            assert!(
+                find_catalog_files(repo.path(), &repo.path().join("catalog/infra"))
+                    .await
+                    .is_empty()
+            );
+            let err = load_catalog_manifest(repo.path(), "x", Some("infra"))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, ServerError::NotFound(_)), "{err:?}");
+        }
+    }
 
     fn test_auth() -> AuthSession {
         AuthSession {

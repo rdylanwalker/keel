@@ -5466,7 +5466,11 @@ async fn test_tenant_stacks_use_tenant_passphrase_secret_and_fail_closed_without
     assert!(!stack_yaml.contains(&tenant_pass));
     let stack: Value = serde_yml::from_str(&stack_yaml).unwrap();
     let env = passphrase_env(&stack);
-    assert!(env.get("value").is_none(), "{env}");
+    // Never format `env` into the failure message: on regression it would hold the passphrase.
+    assert!(
+        env.get("value").is_none(),
+        "PULUMI_CONFIG_PASSPHRASE must be a secretKeyRef, not an inline value"
+    );
     assert_eq!(
         env["valueFrom"]["secretKeyRef"],
         json!({ "name": "keel-pulumi-passphrase", "key": "passphrase" })
@@ -5478,7 +5482,11 @@ async fn test_tenant_stacks_use_tenant_passphrase_secret_and_fail_closed_without
         .expect("preview Stack applied");
     let copy_name = format!("keel-preview-{pr}-keel-pulumi-passphrase");
     let env = passphrase_env(&preview_stack);
-    assert!(env.get("value").is_none(), "{env}");
+    // Never format `env` into the failure message: on regression it would hold the passphrase.
+    assert!(
+        env.get("value").is_none(),
+        "PULUMI_CONFIG_PASSPHRASE must be a secretKeyRef, not an inline value"
+    );
     assert_eq!(
         env["valueFrom"]["secretKeyRef"],
         json!({ "name": copy_name, "key": "passphrase" })
@@ -5488,6 +5496,169 @@ async fn test_tenant_stacks_use_tenant_passphrase_secret_and_fail_closed_without
         .expect("tenant passphrase copied into keel-previews");
     assert_eq!(copy.owner_stack, format!("preview-stack-pr-{pr}"));
     assert_eq!(copy.labels["keel.io/tenant"], "acme");
-    assert_eq!(copy.data["passphrase"], tenant_pass.as_bytes().to_vec());
+    assert!(
+        copy.data["passphrase"] == tenant_pass.as_bytes(),
+        "preview passphrase copy does not match the tenant passphrase"
+    );
     assert!(!preview_stack.to_string().contains(&tenant_pass));
+}
+
+/// Committed symlinks in the catalog must never leak files from outside the worktree into API
+/// responses or tenant PR branches, nor let an update write through them (CodeQL path-injection).
+#[cfg(unix)]
+#[tokio::test]
+async fn test_catalog_symlink_escapes_are_refused_by_listing_update_and_proposals() {
+    let fixture = setup_fixture().await;
+    let cookie = login_and_get_cookie(&fixture).await;
+    let app = build_router(fixture.state.clone());
+    let workdir = fixture.state.repo_workdir.clone();
+
+    let outside = TempDir::new().unwrap();
+    let secret_manifest = outside.path().join("token.yaml");
+    let secret_body = "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: outside-secret-marker\n";
+    tokio::fs::write(&secret_manifest, secret_body)
+        .await
+        .unwrap();
+
+    let app_dir = workdir.join("catalog/apps/leaky");
+    tokio::fs::create_dir_all(&app_dir).await.unwrap();
+    tokio::fs::write(
+        app_dir.join("catalog.yaml"),
+        r#"apiVersion: keel.io/v1alpha1
+kind: CatalogApplication
+metadata:
+  id: leaky
+  name: Leaky
+  category: utilities
+  runtime: manifest
+spec:
+  defaultEngine: flux
+  upstream:
+    repoURL: https://example.invalid/leaky
+    path: ./manifests.yaml
+    version: 1.0.0
+  schema:
+    type: object
+"#,
+    )
+    .await
+    .unwrap();
+    std::os::unix::fs::symlink(&secret_manifest, app_dir.join("manifests.yaml")).unwrap();
+
+    let bp_dir = workdir.join("catalog/infra/leaky-bp");
+    tokio::fs::create_dir_all(&bp_dir).await.unwrap();
+    tokio::fs::write(
+        bp_dir.join("catalog.yaml"),
+        r#"apiVersion: keel.io/v1alpha1
+kind: CatalogInfraBlueprint
+metadata:
+  id: leaky-bp
+  name: Leaky Blueprint
+  category: compute
+  provider: proxmox
+spec:
+  pulumiRuntime: yaml
+  entrypoint: Pulumi.yaml
+  protectByDefault: false
+  schema:
+    type: object
+"#,
+    )
+    .await
+    .unwrap();
+    std::os::unix::fs::symlink(&secret_manifest, bp_dir.join("Pulumi.yaml")).unwrap();
+
+    let git = &fixture.state.git_runner;
+    git.add(&workdir, ["catalog"]).await.unwrap();
+    git.commit(
+        &workdir,
+        "test: add escaping catalog symlinks",
+        &CommitAuthor::new("Keel Seed", "seed@keel.local"),
+    )
+    .await
+    .unwrap();
+    git.push(&workdir, "origin", "HEAD:refs/heads/main")
+        .await
+        .unwrap();
+
+    // 1. GET /api/v1/catalog lists the items but never returns the outside file's contents.
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/catalog")
+                .header(COOKIE, &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = res.into_body().collect().await.unwrap().to_bytes();
+    let body_str = String::from_utf8_lossy(&body);
+    assert!(!body_str.contains("outside-secret-marker"), "{body_str}");
+    let catalog: Value = serde_json::from_slice(&body).unwrap();
+    assert!(catalog["manifestsYaml"].get("leaky").is_none());
+    assert!(catalog["pulumiYaml"].get("leaky-bp").is_none());
+
+    // 2. PUT with manifestsYaml refuses to write through the symlink.
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri("/api/v1/catalog/app/leaky")
+                .header(COOKIE, &cookie)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "name": "Leaky",
+                        "category": "utilities",
+                        "manifestsYaml": "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: overwritten\n"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(!res.status().is_success(), "status {}", res.status());
+    let body = res.into_body().collect().await.unwrap().to_bytes();
+    let body_str = String::from_utf8_lossy(&body);
+    assert!(body_str.contains("escapes"), "{body_str}");
+    assert!(!body_str.contains("outside-secret-marker"));
+    assert_eq!(
+        tokio::fs::read_to_string(&secret_manifest).await.unwrap(),
+        secret_body
+    );
+
+    // 3. An infra proposal refuses the escaping blueprint Pulumi.yaml instead of copying it
+    //    (or silently substituting a stub) into the tenant PR branch.
+    git.checkout_branch(&workdir, "main").await.unwrap();
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/proposals")
+                .header(COOKIE, &cookie)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "tenant": "acme",
+                        "catalogId": "leaky-bp",
+                        "name": "leaky-vm",
+                        "values": {}
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = res.status();
+    let body = res.into_body().collect().await.unwrap().to_bytes();
+    let body_str = String::from_utf8_lossy(&body);
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body_str}");
+    assert!(body_str.contains("escapes"), "{body_str}");
+    assert!(!body_str.contains("outside-secret-marker"));
 }

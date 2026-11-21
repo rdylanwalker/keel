@@ -437,6 +437,40 @@ fn three_dot_range(base_ref: &str, head_ref: &str) -> Result<String, GitError> {
     Ok(format!("{base_ref}...{head_ref}"))
 }
 
+/// Validates a revision or revision range (`<rev>`, `<a>..<b>`, `<a>...<b>`), requiring every
+/// endpoint to be a well-formed ref so no option or pathspec can ride along (`NFR-SEC-06`).
+fn validate_revision_range(range: &str) -> Result<(), GitError> {
+    validate_non_option_arg(range, "range")?;
+    let (a, b) = match range.split_once("...") {
+        Some(parts) => parts,
+        None => match range.split_once("..") {
+            Some(parts) => parts,
+            None => return validate_git_ref(range, "range"),
+        },
+    };
+    validate_git_ref(a, "range.base")?;
+    validate_git_ref(b, "range.head")
+}
+
+/// Validates a repository-relative path used in `<rev>:<path>` object specs or after `--`:
+/// non-empty, not option-like, relative, and free of `..` segments and control characters.
+fn validate_repo_rel_path(path: &str, field: &'static str) -> Result<(), GitError> {
+    validate_non_option_arg(path, field)?;
+    if path.starts_with('/') || path.split('/').any(|seg| seg == "..") {
+        return Err(GitError::InvalidArgument {
+            field,
+            reason: format!("'{path}' must be a repository-relative path without '..'"),
+        });
+    }
+    if path.chars().any(char::is_control) {
+        return Err(GitError::InvalidArgument {
+            field,
+            reason: "path must not contain control characters".to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// Validates a hex commit object id (7..=64 chars).
 fn validate_object_id(sha: &str, field: &'static str) -> Result<(), GitError> {
     if (7..=64).contains(&sha.len()) && sha.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -988,7 +1022,7 @@ impl GitRunner {
         work_dir: &Path,
         range: &str,
     ) -> Result<Vec<String>, GitError> {
-        validate_non_option_arg(range, "range")?;
+        validate_revision_range(range)?;
         let out = self
             .exec(
                 Some(work_dir),
@@ -1012,8 +1046,8 @@ impl GitRunner {
         range: &str,
         file_path: &str,
     ) -> Result<String, GitError> {
-        validate_non_option_arg(range, "range")?;
-        validate_non_option_arg(file_path, "file_path")?;
+        validate_revision_range(range)?;
+        validate_repo_rel_path(file_path, "file_path")?;
         self.exec(
             Some(work_dir),
             "diff",
@@ -1030,7 +1064,7 @@ impl GitRunner {
         repo_rel_path: &str,
         limit: usize,
     ) -> Result<Vec<String>, GitError> {
-        validate_non_option_arg(repo_rel_path, "repo_rel_path")?;
+        validate_repo_rel_path(repo_rel_path, "repo_rel_path")?;
         let limit_str = limit.max(1).to_string();
         let out = self
             .exec(
@@ -1056,7 +1090,7 @@ impl GitRunner {
         repo_rel_path: &str,
     ) -> Result<Option<String>, GitError> {
         validate_git_ref(rev, "rev")?;
-        validate_non_option_arg(repo_rel_path, "repo_rel_path")?;
+        validate_repo_rel_path(repo_rel_path, "repo_rel_path")?;
         let spec = format!("{rev}:{repo_rel_path}");
         match self
             .exec(Some(repo_dir), "show", &["show", &spec], &[])
@@ -1102,7 +1136,7 @@ impl GitRunner {
         repo_rel_path: &str,
     ) -> Result<bool, GitError> {
         validate_git_ref(rev, "rev")?;
-        validate_non_option_arg(repo_rel_path, "repo_rel_path")?;
+        validate_repo_rel_path(repo_rel_path, "repo_rel_path")?;
         let spec = format!("{rev}:{repo_rel_path}");
         match self
             .exec(Some(repo_dir), "cat-file", &["cat-file", "-e", &spec], &[])
@@ -1122,7 +1156,7 @@ impl GitRunner {
         repo_rel_dir: &str,
     ) -> Result<Vec<String>, GitError> {
         validate_git_ref(rev, "rev")?;
-        validate_non_option_arg(repo_rel_dir, "repo_rel_dir")?;
+        validate_repo_rel_path(repo_rel_dir, "repo_rel_dir")?;
         let spec = format!("{rev}:{repo_rel_dir}");
         match self
             .exec(
@@ -1433,6 +1467,73 @@ mod tests {
         assert!(validate_git_ref("keel/null\0byte", "branch").is_err());
         assert!(validate_refspec("--mirror").is_err());
         assert!(validate_refspec("HEAD:refs/heads/main").is_ok());
+    }
+
+    #[test]
+    fn revision_ranges_and_repo_paths_reject_option_and_traversal_payloads() {
+        for ok in ["origin/main...0123abcd", "main..keel/acme/x-1", "HEAD"] {
+            assert!(validate_revision_range(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "--output=/tmp/x",
+            "main...--output=/tmp/x",
+            "-..main",
+            "main...",
+            "...main",
+            "main..bad name",
+            "main...a:b",
+        ] {
+            assert!(validate_revision_range(bad).is_err(), "{bad}");
+        }
+
+        for ok in ["tenants/kustomization.yaml", "catalog/core/a b.yaml", "./x"] {
+            assert!(validate_repo_rel_path(ok, "p").is_ok(), "{ok}");
+        }
+        for bad in [
+            "",
+            "-x",
+            "/etc/passwd",
+            "../outside",
+            "tenants/../../x",
+            "a/..",
+            "a\u{1b}b",
+        ] {
+            assert!(validate_repo_rel_path(bad, "p").is_err(), "{bad:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn object_spec_reads_reject_traversal_paths_before_spawning_git() {
+        let runner = GitRunner::new();
+        let dir = Path::new("/nonexistent-keel-repo");
+        for path in ["../secret", "/abs/path", "--help"] {
+            assert!(matches!(
+                runner.show_file_at_ref(dir, "main", path).await,
+                Err(GitError::InvalidArgument { .. })
+            ));
+            assert!(matches!(
+                runner.path_exists_at_ref(dir, "main", path).await,
+                Err(GitError::InvalidArgument { .. })
+            ));
+            assert!(matches!(
+                runner.list_dir_at_ref(dir, "main", path).await,
+                Err(GitError::InvalidArgument { .. })
+            ));
+            assert!(matches!(
+                runner.log_file_commits(dir, path, 1).await,
+                Err(GitError::InvalidArgument { .. })
+            ));
+        }
+        assert!(matches!(
+            runner.diff_name_only(dir, "main...--no-index").await,
+            Err(GitError::InvalidArgument { .. })
+        ));
+        assert!(matches!(
+            runner
+                .diff_file_zero_context(dir, "main...HEAD", "../x")
+                .await,
+            Err(GitError::InvalidArgument { .. })
+        ));
     }
 
     #[test]

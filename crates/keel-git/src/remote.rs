@@ -1383,8 +1383,14 @@ impl ForgeProvider for GitLabProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    /// Per-run random Basic-auth password so no credential literal lives in the test source.
+    fn random_test_password() -> String {
+        uuid::Uuid::new_v4().simple().to_string()
+    }
 
     /// Spawns a lightweight local HTTP server returning canned status/JSON responses sequentially.
     async fn spawn_mock_http_server(
@@ -1899,9 +1905,11 @@ mod tests {
             (201, r#"{"id":1}"#.to_string()),
         ])
         .await;
-        let p = ForgejoGiteaProvider::with_basic_auth(&url, "keel", "infra-gitops", "keel", "pw")
-            .unwrap();
-        assert!(!format!("{p:?}").contains("pw\""));
+        let password = random_test_password();
+        let p =
+            ForgejoGiteaProvider::with_basic_auth(&url, "keel", "infra-gitops", "keel", &password)
+                .unwrap();
+        assert!(!format!("{p:?}").contains(&password));
         assert_eq!(
             p.ensure_repository(true).await.unwrap(),
             RepositoryEnsureOutcome::Created
@@ -1914,11 +1922,14 @@ mod tests {
         assert_eq!(request_line(&reqs[2]), "POST /api/v1/user/repos HTTP/1.1");
         assert!(reqs[2].contains(r#""private":true"#), "{}", reqs[2]);
         assert!(reqs[2].contains(r#""name":"infra-gitops""#));
-        // base64("keel:pw") == "a2VlbDpwdw=="
+        let expected_auth = format!(
+            "authorization: basic {}",
+            base64::engine::general_purpose::STANDARD.encode(format!("keel:{password}"))
+        );
         assert!(
             reqs[0]
                 .to_ascii_lowercase()
-                .contains("authorization: basic a2vlbdpwdw==")
+                .contains(&expected_auth.to_ascii_lowercase())
         );
 
         // 3. Org creation conflict (concurrent create) is reported as existing.
@@ -1952,8 +1963,12 @@ mod tests {
         assert!(matches!(err, ForgeError::Api { status: 403, .. }), "{err}");
         assert_eq!(handle.await.unwrap().len(), 2);
 
-        assert!(ForgejoGiteaProvider::with_basic_auth(&url, "o", "r", " ", "pw").is_err());
-        assert!(ForgejoGiteaProvider::with_basic_auth(&url, "o", "r", "u", "").is_err());
+        let password = random_test_password();
+        assert!(ForgejoGiteaProvider::with_basic_auth(&url, "o", "r", " ", &password).is_err());
+        let empty_password = String::new();
+        assert!(
+            ForgejoGiteaProvider::with_basic_auth(&url, "o", "r", "u", &empty_password).is_err()
+        );
     }
 
     #[tokio::test]
@@ -2067,8 +2082,10 @@ mod tests {
             (401, r#"{"message":"bad creds"}"#.to_string()),
         ])
         .await;
-        let p = ForgejoGiteaProvider::with_basic_auth(&url, "keel", "infra-gitops", "keel", "pw")
-            .unwrap();
+        let password = random_test_password();
+        let p =
+            ForgejoGiteaProvider::with_basic_auth(&url, "keel", "infra-gitops", "keel", &password)
+                .unwrap();
         let token = p
             .create_access_token("keel-stage0", &["read:repository"])
             .await

@@ -26,8 +26,9 @@ use crate::error::ServerError;
 use crate::state::AppState;
 
 use super::{
-    find_catalog_files, load_catalog_manifest, load_provider_registry, open_pr_for_session,
-    safe_relative_path, stage_commit_push_and_return_to_main,
+    create_dir_all_contained, find_catalog_files, load_catalog_manifest, load_provider_registry,
+    open_pr_for_session, read_contained_to_string, safe_relative_path,
+    stage_commit_push_and_return_to_main, write_contained,
 };
 
 /// Application catalog DTO enriched with optional `manifestsYaml` and `defaultEngine` fields.
@@ -84,23 +85,26 @@ pub struct CatalogResponse {
 }
 
 async fn load_catalog_items_from_dir(
+    repo_root: &Path,
     base_dir: &Path,
 ) -> Result<(Vec<CatalogItemDto>, HashMap<String, String>), ServerError> {
     let mut applications = Vec::new();
     let mut manifests_map = HashMap::new();
-    for path in find_catalog_files(base_dir).await {
-        let yaml = tokio::fs::read_to_string(&path).await?;
+    for path in find_catalog_files(repo_root, base_dir).await {
+        let yaml = read_contained_to_string(repo_root, &path).await?;
         match parse_catalog_application(&yaml) {
             Ok(app) => {
                 let mut loaded_manifests = None;
                 if let Some(dir) = path.parent() {
                     let default_manifest_path = dir.join("manifests.yaml");
-                    if let Ok(content) = tokio::fs::read_to_string(&default_manifest_path).await {
+                    if let Ok(content) =
+                        read_contained_to_string(repo_root, &default_manifest_path).await
+                    {
                         loaded_manifests = Some(content);
                     } else if app.metadata.runtime == AppRuntime::Manifest
                         && let Some(rel_path) = app.spec.upstream.path.as_deref()
                         && let Some(resolved) = safe_relative_path(dir, rel_path)
-                        && let Ok(content) = tokio::fs::read_to_string(&resolved).await
+                        && let Ok(content) = read_contained_to_string(repo_root, &resolved).await
                     {
                         loaded_manifests = Some(content);
                     }
@@ -141,8 +145,11 @@ pub async fn get_catalog(
         .map(|p| p.id.clone())
         .collect();
 
-    let (mut applications, manifests_yaml) =
-        load_catalog_items_from_dir(&state.repo_workdir.join("catalog/apps")).await?;
+    let (mut applications, manifests_yaml) = load_catalog_items_from_dir(
+        &state.repo_workdir,
+        &state.repo_workdir.join("catalog/apps"),
+    )
+    .await?;
 
     let filter_tenant = query
         .tenant
@@ -163,8 +170,13 @@ pub async fn get_catalog(
     applications.retain(|a| is_item_visible(a.application.metadata.tenant.as_deref()));
 
     let mut core_addons = Vec::new();
-    for path in find_catalog_files(&state.repo_workdir.join("catalog/core")).await {
-        let yaml = tokio::fs::read_to_string(&path).await?;
+    for path in find_catalog_files(
+        &state.repo_workdir,
+        &state.repo_workdir.join("catalog/core"),
+    )
+    .await
+    {
+        let yaml = read_contained_to_string(&state.repo_workdir, &path).await?;
         match parse_catalog_application(&yaml) {
             Ok(app) => core_addons.push(app),
             Err(err) => {
@@ -176,8 +188,13 @@ pub async fn get_catalog(
 
     let mut blueprints = Vec::new();
     let mut pulumi_yaml = HashMap::new();
-    for path in find_catalog_files(&state.repo_workdir.join("catalog/infra")).await {
-        let yaml = tokio::fs::read_to_string(&path).await?;
+    for path in find_catalog_files(
+        &state.repo_workdir,
+        &state.repo_workdir.join("catalog/infra"),
+    )
+    .await
+    {
+        let yaml = read_contained_to_string(&state.repo_workdir, &path).await?;
         match parse_catalog_blueprint(&yaml) {
             Ok(mut bp) => {
                 if is_item_visible(bp.metadata.tenant.as_deref()) {
@@ -192,7 +209,9 @@ pub async fn get_catalog(
                                 bp.spec.entrypoint.as_str()
                             };
                             if let Some(pulumi_path) = safe_relative_path(dir, entrypoint)
-                                && let Ok(content) = tokio::fs::read_to_string(&pulumi_path).await
+                                && let Ok(content) =
+                                    read_contained_to_string(&state.repo_workdir, &pulumi_path)
+                                        .await
                             {
                                 pulumi_yaml.insert(bp.metadata.id.clone(), content);
                             }
@@ -209,8 +228,13 @@ pub async fn get_catalog(
     blueprints.sort_by(|a, b| a.metadata.id.cmp(&b.metadata.id));
 
     let mut bundles = Vec::new();
-    for path in find_catalog_files(&state.repo_workdir.join("catalog/bundles")).await {
-        let yaml = tokio::fs::read_to_string(&path).await?;
+    for path in find_catalog_files(
+        &state.repo_workdir,
+        &state.repo_workdir.join("catalog/bundles"),
+    )
+    .await
+    {
+        let yaml = read_contained_to_string(&state.repo_workdir, &path).await?;
         match parse_catalog_bundle(&yaml) {
             Ok(bundle) => {
                 if is_item_visible(bundle.metadata.tenant.as_deref()) {
@@ -530,11 +554,21 @@ pub async fn register_catalog_app(
                     .await?;
 
                 let target_dir = state.repo_workdir.join(&rel_dir);
-                tokio::fs::create_dir_all(&target_dir).await?;
-                tokio::fs::write(target_dir.join("catalog.yaml"), &catalog_yaml).await?;
+                create_dir_all_contained(&state.repo_workdir, &target_dir).await?;
+                write_contained(
+                    &state.repo_workdir,
+                    &target_dir.join("catalog.yaml"),
+                    &catalog_yaml,
+                )
+                .await?;
                 let mut staged_files = vec![rel_file.clone()];
                 if let Some(ref manifests_content) = validated_manifests_yaml {
-                    tokio::fs::write(target_dir.join("manifests.yaml"), manifests_content).await?;
+                    write_contained(
+                        &state.repo_workdir,
+                        &target_dir.join("manifests.yaml"),
+                        manifests_content,
+                    )
+                    .await?;
                     staged_files.push(rel_manifests.clone());
                 }
 
@@ -704,9 +738,19 @@ pub async fn register_catalog_app(
                     .await?;
 
                 let target_dir = state.repo_workdir.join(&rel_dir);
-                tokio::fs::create_dir_all(&target_dir).await?;
-                tokio::fs::write(target_dir.join("catalog.yaml"), &catalog_yaml).await?;
-                tokio::fs::write(target_dir.join("Pulumi.yaml"), &pulumi_yaml).await?;
+                create_dir_all_contained(&state.repo_workdir, &target_dir).await?;
+                write_contained(
+                    &state.repo_workdir,
+                    &target_dir.join("catalog.yaml"),
+                    &catalog_yaml,
+                )
+                .await?;
+                write_contained(
+                    &state.repo_workdir,
+                    &target_dir.join("Pulumi.yaml"),
+                    &pulumi_yaml,
+                )
+                .await?;
 
                 let commit_msg = format!("feat(catalog): add blueprint {}", req.id);
                 stage_commit_push_and_return_to_main(
@@ -809,8 +853,13 @@ pub async fn register_catalog_app(
                     .await?;
 
                 let target_dir = state.repo_workdir.join(&rel_dir);
-                tokio::fs::create_dir_all(&target_dir).await?;
-                tokio::fs::write(target_dir.join("catalog.yaml"), &catalog_yaml).await?;
+                create_dir_all_contained(&state.repo_workdir, &target_dir).await?;
+                write_contained(
+                    &state.repo_workdir,
+                    &target_dir.join("catalog.yaml"),
+                    &catalog_yaml,
+                )
+                .await?;
 
                 let commit_msg = format!("feat(catalog): add bundle {}", req.id);
                 stage_commit_push_and_return_to_main(
@@ -1047,7 +1096,7 @@ pub async fn update_catalog_item(
                 "Catalog {normalized_kind} '{id}' not found"
             )));
         }
-        let existing_yaml = tokio::fs::read_to_string(&abs_file).await?;
+        let existing_yaml = read_contained_to_string(&state.repo_workdir, &abs_file).await?;
         let manifest =
             load_catalog_manifest(&state.repo_workdir, &id, Some(normalized_kind)).await?;
 
@@ -1158,8 +1207,9 @@ pub async fn update_catalog_item(
                 let current_manifests = if let Some(ref updated_m) = validated_manifests_yaml {
                     Some(updated_m.clone())
                 } else {
-                    tokio::fs::read_to_string(
-                        state
+                    read_contained_to_string(
+                        &state.repo_workdir,
+                        &state
                             .repo_workdir
                             .join(format!("catalog/apps/{id}/manifests.yaml")),
                     )
@@ -1275,18 +1325,18 @@ pub async fn update_catalog_item(
             .git_runner
             .checkout_new_branch(&state.repo_workdir, &branch)
             .await?;
-        tokio::fs::write(&abs_file, &catalog_yaml).await?;
+        write_contained(&state.repo_workdir, &abs_file, &catalog_yaml).await?;
         let mut staged = vec![rel_file.clone()];
         if let Some(ref pulumi_content) = validated_pulumi_yaml {
             let rel_pulumi = format!("catalog/infra/{id}/Pulumi.yaml");
             let abs_pulumi = state.repo_workdir.join(&rel_pulumi);
-            tokio::fs::write(&abs_pulumi, pulumi_content).await?;
+            write_contained(&state.repo_workdir, &abs_pulumi, pulumi_content).await?;
             staged.push(rel_pulumi);
         }
         if let Some(ref manifests_content) = validated_manifests_yaml {
             let rel_manifests = format!("catalog/apps/{id}/manifests.yaml");
             let abs_manifests = state.repo_workdir.join(&rel_manifests);
-            tokio::fs::write(&abs_manifests, manifests_content).await?;
+            write_contained(&state.repo_workdir, &abs_manifests, manifests_content).await?;
             staged.push(rel_manifests);
         }
 
@@ -1989,7 +2039,7 @@ pub async fn delete_catalog_item(
                 "Catalog {normalized_kind} '{id}' not found"
             )));
         }
-        let _existing_yaml = tokio::fs::read_to_string(&abs_file).await?;
+        let _existing_yaml = read_contained_to_string(&state.repo_workdir, &abs_file).await?;
         let manifest =
             load_catalog_manifest(&state.repo_workdir, &id, Some(normalized_kind)).await?;
 

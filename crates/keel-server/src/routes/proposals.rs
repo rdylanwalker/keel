@@ -39,10 +39,11 @@ use crate::preview_lifecycle::launch_pko_preview;
 use crate::state::{AppState, CachedPreview};
 
 use super::{
-    attach_infra_secret_refs, load_catalog_manifest, load_provider_registry,
-    next_unique_branch_timestamp, open_pr_for_session, resolve_sops_recipients,
+    attach_infra_secret_refs, create_dir_all_contained, load_catalog_manifest,
+    load_provider_registry, next_unique_branch_timestamp, open_pr_for_session,
+    read_contained_optional, read_contained_to_string, resolve_sops_recipients,
     resolve_tenant_resource_dir, safe_relative_path, serialize_tenants_kustomization,
-    stage_commit_push_and_return_to_main,
+    stage_commit_push_and_return_to_main, write_contained,
 };
 
 /// Query parameters for `GET /api/v1/proposals`.
@@ -141,8 +142,16 @@ pub struct CreateProposalResponse {
 /// is actually committed next to the Stack. That is the blueprint's `Pulumi.yaml`, or, when the
 /// blueprint ships none, the generated one named after the instance (`fallback`). The catalog
 /// display name is never used. The result is sanitized to Pulumi's project-name charset.
-async fn read_pulumi_project_name(pulumi_yaml_path: &Path, fallback: &str) -> String {
-    let raw = tokio::fs::read_to_string(pulumi_yaml_path).await.ok();
+///
+/// The read is contained to `repo_workdir`; an escaping symlink is treated as absent.
+async fn read_pulumi_project_name(
+    repo_workdir: &Path,
+    pulumi_yaml_path: &Path,
+    fallback: &str,
+) -> String {
+    let raw = read_contained_to_string(repo_workdir, pulumi_yaml_path)
+        .await
+        .ok();
     pulumi_project_name_from_yaml(raw.as_deref(), fallback)
 }
 
@@ -470,12 +479,12 @@ fn build_values_configmap_manifest_yaml(
 async fn load_catalog_app_raw_manifests(repo_workdir: &Path, app: &CatalogApplication) -> String {
     let app_dir = repo_workdir.join("catalog/apps").join(&app.metadata.id);
     let default_path = app_dir.join("manifests.yaml");
-    if let Ok(content) = tokio::fs::read_to_string(&default_path).await {
+    if let Ok(content) = read_contained_to_string(repo_workdir, &default_path).await {
         return content;
     }
     if let Some(rel_path) = app.spec.upstream.path.as_deref()
         && let Some(resolved) = safe_relative_path(&app_dir, rel_path)
-        && let Ok(content) = tokio::fs::read_to_string(&resolved).await
+        && let Ok(content) = read_contained_to_string(repo_workdir, &resolved).await
     {
         return content;
     }
@@ -884,7 +893,7 @@ pub async fn create_proposal(
                         None
                     };
                 if let Some(hr_path) = existing_hr_path
-                    && let Ok(raw) = tokio::fs::read_to_string(&hr_path).await
+                    && let Ok(raw) = read_contained_to_string(&state.repo_workdir, &hr_path).await
                     && let Ok(doc) = serde_yml::from_str::<Value>(&raw)
                 {
                     if let Some(deps) = doc.pointer("/spec/dependsOn").and_then(Value::as_array) {
@@ -972,8 +981,12 @@ pub async fn create_proposal(
                 .join("catalog/infra")
                 .join(&req.catalog_id)
                 .join("Pulumi.yaml");
-            let pulumi_project =
-                read_pulumi_project_name(&blueprint_pulumi_path, &instance_name).await;
+            let pulumi_project = read_pulumi_project_name(
+                &state.repo_workdir,
+                &blueprint_pulumi_path,
+                &instance_name,
+            )
+            .await;
             let mut stack_params = TenantStackParams::new(
                 &req.tenant,
                 &instance_name,
@@ -1046,9 +1059,11 @@ pub async fn create_proposal(
                     tenant_namespace(&req.tenant)?,
                 );
             } else if bundle_item.is_some()
-                && let Ok(raw) =
-                    tokio::fs::read_to_string(state.repo_workdir.join(&rel_dir).join("stack.yaml"))
-                        .await
+                && let Ok(raw) = read_contained_to_string(
+                    &state.repo_workdir,
+                    &state.repo_workdir.join(&rel_dir).join("stack.yaml"),
+                )
+                .await
                 && let Ok(doc) = serde_yml::from_str::<Value>(&raw)
             {
                 if let Some(secret_name) = doc
@@ -1106,11 +1121,11 @@ pub async fn create_proposal(
 
         let target_dir = state.repo_workdir.join(&rel_dir);
         let is_update = tokio::fs::try_exists(&target_dir).await.unwrap_or(false);
-        tokio::fs::create_dir_all(&target_dir).await?;
+        create_dir_all_contained(&state.repo_workdir, &target_dir).await?;
 
         let mut staged_paths = Vec::new();
         let values_path = target_dir.join("values.yaml");
-        tokio::fs::write(&values_path, &values_yaml).await?;
+        write_contained(&state.repo_workdir, &values_path, &values_yaml).await?;
         staged_paths.push(format!("{rel_dir}/values.yaml"));
 
         let manifest_filename = match manifest_engine {
@@ -1129,7 +1144,7 @@ pub async fn create_proposal(
             }
         };
         let manifest_path = target_dir.join(manifest_filename);
-        tokio::fs::write(&manifest_path, &manifest_yaml).await?;
+        write_contained(&state.repo_workdir, &manifest_path, &manifest_yaml).await?;
         staged_paths.push(format!("{rel_dir}/{manifest_filename}"));
 
         if is_app {
@@ -1173,7 +1188,12 @@ pub async fn create_proposal(
 
         if let Some(eng) = manifest_engine {
             if let Some(ref rendered_manifests) = rendered_manifest_template_yaml {
-                tokio::fs::write(target_dir.join("manifests.yaml"), rendered_manifests).await?;
+                write_contained(
+                    &state.repo_workdir,
+                    &target_dir.join("manifests.yaml"),
+                    rendered_manifests,
+                )
+                .await?;
                 staged_paths.push(format!("{rel_dir}/manifests.yaml"));
             }
             match eng {
@@ -1183,12 +1203,21 @@ pub async fn create_proposal(
                         "values-configmap.yaml".to_string(),
                     ];
                     if let Some(ref cm_yaml) = values_configmap_yaml {
-                        tokio::fs::write(target_dir.join("values-configmap.yaml"), cm_yaml).await?;
+                        write_contained(
+                            &state.repo_workdir,
+                            &target_dir.join("values-configmap.yaml"),
+                            cm_yaml,
+                        )
+                        .await?;
                         staged_paths.push(format!("{rel_dir}/values-configmap.yaml"));
                     }
                     if let Some(ref enc_k8s_secret) = encrypted_infra_k8s_secret_yaml {
-                        tokio::fs::write(target_dir.join("secrets.enc.yaml"), enc_k8s_secret)
-                            .await?;
+                        write_contained(
+                            &state.repo_workdir,
+                            &target_dir.join("secrets.enc.yaml"),
+                            enc_k8s_secret,
+                        )
+                        .await?;
                         staged_paths.push(format!("{rel_dir}/secrets.enc.yaml"));
                         app_k_resources.push("secrets.enc.yaml".to_string());
                     }
@@ -1197,8 +1226,9 @@ pub async fn create_proposal(
                         "kind": "Kustomization",
                         "resources": app_k_resources,
                     });
-                    tokio::fs::write(
-                        target_dir.join("kustomization.yaml"),
+                    write_contained(
+                        &state.repo_workdir,
+                        &target_dir.join("kustomization.yaml"),
                         serde_yml::to_string(&app_k_doc).map_err(|e| {
                             ServerError::Internal(format!(
                                 "failed to serialize kustomization.yaml: {e}"
@@ -1210,13 +1240,22 @@ pub async fn create_proposal(
                 }
                 ManifestEngine::Pulumi => {
                     if let Some(ref pulumi_yaml) = synthesized_manifest_pulumi_yaml {
-                        tokio::fs::write(target_dir.join("Pulumi.yaml"), pulumi_yaml).await?;
+                        write_contained(
+                            &state.repo_workdir,
+                            &target_dir.join("Pulumi.yaml"),
+                            pulumi_yaml,
+                        )
+                        .await?;
                         staged_paths.push(format!("{rel_dir}/Pulumi.yaml"));
                     }
                     let mut app_k_resources = vec!["stack.yaml".to_string()];
                     if let Some(ref enc_k8s_secret) = encrypted_infra_k8s_secret_yaml {
-                        tokio::fs::write(target_dir.join("secret.enc.yaml"), enc_k8s_secret)
-                            .await?;
+                        write_contained(
+                            &state.repo_workdir,
+                            &target_dir.join("secret.enc.yaml"),
+                            enc_k8s_secret,
+                        )
+                        .await?;
                         staged_paths.push(format!("{rel_dir}/secret.enc.yaml"));
                         app_k_resources.push("secret.enc.yaml".to_string());
                         extra_kustomize_resources.push(format!(
@@ -1229,8 +1268,9 @@ pub async fn create_proposal(
                         "kind": "Kustomization",
                         "resources": app_k_resources,
                     });
-                    tokio::fs::write(
-                        target_dir.join("kustomization.yaml"),
+                    write_contained(
+                        &state.repo_workdir,
+                        &target_dir.join("kustomization.yaml"),
                         serde_yml::to_string(&app_k_doc).map_err(|e| {
                             ServerError::Internal(format!(
                                 "failed to serialize kustomization.yaml: {e}"
@@ -1281,7 +1321,7 @@ pub async fn create_proposal(
                     ServerError::Internal(format!("failed to serialize helm-repository.yaml: {e}"))
                 })?;
                 let helm_repo_path = target_dir.join("helm-repository.yaml");
-                tokio::fs::write(&helm_repo_path, helm_repo_yaml).await?;
+                write_contained(&state.repo_workdir, &helm_repo_path, helm_repo_yaml).await?;
                 staged_paths.push(format!("{rel_dir}/helm-repository.yaml"));
                 bundle_item_kustomize_resources.push("helm-repository.yaml".to_string());
                 extra_kustomize_resources.push(format!(
@@ -1330,9 +1370,19 @@ pub async fn create_proposal(
                 )?;
                 if let Some(ref remote_kc) = remote_app_kube_config {
                     let canary_dir = target_dir.join("canary");
-                    tokio::fs::create_dir_all(&canary_dir).await?;
-                    tokio::fs::write(canary_dir.join("canary.yaml"), canary_yaml).await?;
-                    tokio::fs::write(canary_dir.join("networkpolicy-canary.yaml"), np_yaml).await?;
+                    create_dir_all_contained(&state.repo_workdir, &canary_dir).await?;
+                    write_contained(
+                        &state.repo_workdir,
+                        &canary_dir.join("canary.yaml"),
+                        canary_yaml,
+                    )
+                    .await?;
+                    write_contained(
+                        &state.repo_workdir,
+                        &canary_dir.join("networkpolicy-canary.yaml"),
+                        np_yaml,
+                    )
+                    .await?;
                     let canary_k_doc = serde_json::json!({
                         "apiVersion": "kustomize.config.k8s.io/v1beta1",
                         "kind": "Kustomization",
@@ -1343,7 +1393,12 @@ pub async fn create_proposal(
                             "failed to serialize canary/kustomization.yaml: {e}"
                         ))
                     })?;
-                    tokio::fs::write(canary_dir.join("kustomization.yaml"), canary_k_yaml).await?;
+                    write_contained(
+                        &state.repo_workdir,
+                        &canary_dir.join("kustomization.yaml"),
+                        canary_k_yaml,
+                    )
+                    .await?;
                     staged_paths.push(format!("{rel_dir}/canary/canary.yaml"));
                     staged_paths.push(format!("{rel_dir}/canary/networkpolicy-canary.yaml"));
                     staged_paths.push(format!("{rel_dir}/canary/kustomization.yaml"));
@@ -1361,7 +1416,12 @@ pub async fn create_proposal(
                             .unwrap_or_else(|| tenant_ns.clone()),
                     );
                     let fk_yaml = synthesize_flux_kustomization_yaml(&fk_input)?;
-                    tokio::fs::write(target_dir.join("canary-kustomization.yaml"), fk_yaml).await?;
+                    write_contained(
+                        &state.repo_workdir,
+                        &target_dir.join("canary-kustomization.yaml"),
+                        fk_yaml,
+                    )
+                    .await?;
                     staged_paths.push(format!("{rel_dir}/canary-kustomization.yaml"));
                     bundle_item_kustomize_resources.push("canary-kustomization.yaml".to_string());
                     extra_kustomize_resources.push(format!(
@@ -1370,14 +1430,14 @@ pub async fn create_proposal(
                     ));
                 } else {
                     let canary_path = target_dir.join("canary.yaml");
-                    tokio::fs::write(&canary_path, canary_yaml).await?;
+                    write_contained(&state.repo_workdir, &canary_path, canary_yaml).await?;
                     staged_paths.push(format!("{rel_dir}/canary.yaml"));
                     bundle_item_kustomize_resources.push("canary.yaml".to_string());
                     extra_kustomize_resources
                         .push(format!("{}/apps/{instance_name}/canary.yaml", req.tenant));
 
                     let np_path = target_dir.join("networkpolicy-canary.yaml");
-                    tokio::fs::write(&np_path, np_yaml).await?;
+                    write_contained(&state.repo_workdir, &np_path, np_yaml).await?;
                     staged_paths.push(format!("{rel_dir}/networkpolicy-canary.yaml"));
                     bundle_item_kustomize_resources.push("networkpolicy-canary.yaml".to_string());
                     extra_kustomize_resources.push(format!(
@@ -1394,11 +1454,10 @@ pub async fn create_proposal(
                 .join("catalog/infra")
                 .join(&req.catalog_id)
                 .join("Pulumi.yaml");
-            let pulumi_yaml = if tokio::fs::try_exists(&blueprint_pulumi_path)
-                .await
-                .unwrap_or(false)
+            let pulumi_yaml = if let Some(content) =
+                read_contained_optional(&state.repo_workdir, &blueprint_pulumi_path).await?
             {
-                tokio::fs::read_to_string(&blueprint_pulumi_path).await?
+                content
             } else {
                 format!(
                     "name: {instance_name}\nruntime: yaml\ndescription: Keel provisioned {catalog_id} stack for tenant {tenant}\noutputs:\n  status: provisioned\n",
@@ -1407,12 +1466,12 @@ pub async fn create_proposal(
                 )
             };
             let target_pulumi_path = target_dir.join("Pulumi.yaml");
-            tokio::fs::write(&target_pulumi_path, pulumi_yaml).await?;
+            write_contained(&state.repo_workdir, &target_pulumi_path, pulumi_yaml).await?;
             staged_paths.push(format!("{rel_dir}/Pulumi.yaml"));
 
             if let Some(enc_k8s_secret) = &encrypted_infra_k8s_secret_yaml {
                 let secret_path = target_dir.join("secret.enc.yaml");
-                tokio::fs::write(&secret_path, enc_k8s_secret).await?;
+                write_contained(&state.repo_workdir, &secret_path, enc_k8s_secret).await?;
                 staged_paths.push(format!("{rel_dir}/secret.enc.yaml"));
                 bundle_item_kustomize_resources.push("secret.enc.yaml".to_string());
                 extra_kustomize_resources.push(format!(
@@ -1427,7 +1486,7 @@ pub async fn create_proposal(
             .await
             .unwrap_or(false)
         {
-            tokio::fs::read_to_string(&tenants_kustomization_path)
+            read_contained_to_string(&state.repo_workdir, &tenants_kustomization_path)
                 .await
                 .unwrap_or_default()
         } else {
@@ -1459,8 +1518,9 @@ pub async fn create_proposal(
                 "kind": "Kustomization",
                 "resources": bundle_item_kustomize_resources,
             });
-            tokio::fs::write(
-                target_dir.join("kustomization.yaml"),
+            write_contained(
+                &state.repo_workdir,
+                &target_dir.join("kustomization.yaml"),
                 serde_yml::to_string(&item_k_doc).map_err(|e| {
                     ServerError::Internal(format!("failed to serialize kustomization.yaml: {e}"))
                 })?,
@@ -1517,8 +1577,9 @@ pub async fn create_proposal(
                 resources.push(manifest_rel_to_tenants);
             }
         }
-        tokio::fs::create_dir_all(state.repo_workdir.join("tenants")).await?;
-        tokio::fs::write(
+        create_dir_all_contained(&state.repo_workdir, &state.repo_workdir.join("tenants")).await?;
+        write_contained(
+            &state.repo_workdir,
             &tenants_kustomization_path,
             serialize_tenants_kustomization(&resources)?,
         )
@@ -1529,7 +1590,7 @@ pub async fn create_proposal(
             && let Some(enc_yaml) = encrypted_secrets_yaml
         {
             let enc_path = target_dir.join("secrets.enc.yaml");
-            tokio::fs::write(&enc_path, enc_yaml).await?;
+            write_contained(&state.repo_workdir, &enc_path, enc_yaml).await?;
             staged_paths.push(format!("{rel_dir}/secrets.enc.yaml"));
         }
 
@@ -2087,8 +2148,12 @@ async fn create_bundle_proposal(
                     .join("catalog/infra")
                     .join(&item.catalog_ref)
                     .join("Pulumi.yaml");
-                let pulumi_project =
-                    read_pulumi_project_name(&blueprint_pulumi_path, &item_resource_name).await;
+                let pulumi_project = read_pulumi_project_name(
+                    &state.repo_workdir,
+                    &blueprint_pulumi_path,
+                    &item_resource_name,
+                )
+                .await;
                 let mut stack_params = TenantStackParams::new(
                     &req.tenant,
                     &item_resource_name,
@@ -2183,11 +2248,10 @@ async fn create_bundle_proposal(
                     .join("catalog/infra")
                     .join(&item.catalog_ref)
                     .join("Pulumi.yaml");
-                let pulumi_yaml = if tokio::fs::try_exists(&blueprint_pulumi_path)
-                    .await
-                    .unwrap_or(false)
+                let pulumi_yaml = if let Some(content) =
+                    read_contained_optional(&state.repo_workdir, &blueprint_pulumi_path).await?
                 {
-                    tokio::fs::read_to_string(&blueprint_pulumi_path).await?
+                    content
                 } else {
                     format!(
                         "name: {item_resource_name}\nruntime: yaml\ndescription: Keel provisioned {} stack for tenant {}\noutputs:\n  status: provisioned\n",
@@ -2276,19 +2340,29 @@ async fn create_bundle_proposal(
 
         let target_dir = state.repo_workdir.join(&bundle_rel_dir);
         let is_update = tokio::fs::try_exists(&target_dir).await.unwrap_or(false);
-        tokio::fs::create_dir_all(&target_dir).await?;
+        create_dir_all_contained(&state.repo_workdir, &target_dir).await?;
 
         let mut staged_paths = Vec::new();
         let mut kustomize_additions = Vec::new();
 
         for item in &prepared_items {
             let item_dir = state.repo_workdir.join(&item.item_rel_dir);
-            tokio::fs::create_dir_all(&item_dir).await?;
+            create_dir_all_contained(&state.repo_workdir, &item_dir).await?;
 
-            tokio::fs::write(item_dir.join("values.yaml"), &item.values_yaml).await?;
+            write_contained(
+                &state.repo_workdir,
+                &item_dir.join("values.yaml"),
+                &item.values_yaml,
+            )
+            .await?;
             staged_paths.push(format!("{}/values.yaml", item.item_rel_dir));
 
-            tokio::fs::write(item_dir.join(&item.primary_filename), &item.primary_yaml).await?;
+            write_contained(
+                &state.repo_workdir,
+                &item_dir.join(&item.primary_filename),
+                &item.primary_yaml,
+            )
+            .await?;
             staged_paths.push(format!("{}/{}", item.item_rel_dir, item.primary_filename));
 
             if item.kind == BundleItemKind::App {
@@ -2311,17 +2385,23 @@ async fn create_bundle_proposal(
             }
 
             for (fname, content) in &item.extra_files {
-                tokio::fs::write(item_dir.join(fname), content).await?;
+                write_contained(&state.repo_workdir, &item_dir.join(fname), content).await?;
                 staged_paths.push(format!("{}/{fname}", item.item_rel_dir));
             }
 
             if let Some(enc_yaml) = &item.encrypted_secrets_yaml {
-                tokio::fs::write(item_dir.join("secrets.enc.yaml"), enc_yaml).await?;
+                write_contained(
+                    &state.repo_workdir,
+                    &item_dir.join("secrets.enc.yaml"),
+                    enc_yaml,
+                )
+                .await?;
                 staged_paths.push(format!("{}/secrets.enc.yaml", item.item_rel_dir));
             }
 
-            tokio::fs::write(
-                item_dir.join("flux-kustomization.yaml"),
+            write_contained(
+                &state.repo_workdir,
+                &item_dir.join("flux-kustomization.yaml"),
                 &item.flux_kustomization_yaml,
             )
             .await?;
@@ -2337,7 +2417,7 @@ async fn create_bundle_proposal(
             .await
             .unwrap_or(false)
         {
-            tokio::fs::read_to_string(&tenants_kustomization_path)
+            read_contained_to_string(&state.repo_workdir, &tenants_kustomization_path)
                 .await
                 .unwrap_or_default()
         } else {
@@ -2356,8 +2436,9 @@ async fn create_bundle_proposal(
                 resources.push(res);
             }
         }
-        tokio::fs::create_dir_all(state.repo_workdir.join("tenants")).await?;
-        tokio::fs::write(
+        create_dir_all_contained(&state.repo_workdir, &state.repo_workdir.join("tenants")).await?;
+        write_contained(
+            &state.repo_workdir,
             &tenants_kustomization_path,
             serialize_tenants_kustomization(&resources)?,
         )
