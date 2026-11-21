@@ -1,3 +1,26 @@
+# [0.8.0](https://github.com/rdylanwalker/keel/compare/v0.7.0...v0.8.0) (2026-11-21)
+
+
+### Bug Fixes
+
+* **cli:** enforce scoped state credentials only with a live cluster ([aff8e2e](https://github.com/rdylanwalker/keel/commit/aff8e2e28d964cb6031ea47e6bc7ae4f75396f64))
+* **deploy:** lock down flux tenancy, pin core charts and bind tenant flux identity ([01f6b6a](https://github.com/rdylanwalker/keel/commit/01f6b6a210aee4682db7e90edaf24ad68f463be2))
+* **server:** report missing age-keygen as a server misconfiguration ([ebe6911](https://github.com/rdylanwalker/keel/commit/ebe69112d20f8c9953dcee5ca949898e174635e9))
+
+
+### Features
+
+* **cli:** add proposal, catalog and auth commands with durable stage 0 state escrow ([68bcd41](https://github.com/rdylanwalker/keel/commit/68bcd41b353dd5e3802f42726c87928c59c9b0ac))
+* **core:** add catalog protection, tenant scope, and cloud k8s blueprints ([9b94bfb](https://github.com/rdylanwalker/keel/commit/9b94bfb50fd11e66418e5dacf77ae98a3cdb2774))
+* **core:** escape manifest template values, harden ssh targets and zeroize key material ([762c053](https://github.com/rdylanwalker/keel/commit/762c053934dfdc087e2c2e285ecb327e3c3eaa98))
+* **git:** pin merges to reviewed sha, use merge-base diffs and paginate forge listings ([8000af4](https://github.com/rdylanwalker/keel/commit/8000af445992ece6e43e4b32c8b82c784ac626e3))
+* **kube:** add tenant s3 identities, preview runner and null-safe cel policies ([76bfb02](https://github.com/rdylanwalker/keel/commit/76bfb027ba3de4bfc0843728bf1c46afc84c0009))
+* **pko:** run real pko previews with tenant-scoped state and secret passphrases ([872fed7](https://github.com/rdylanwalker/keel/commit/872fed73fa6e1524682cf7efa114c388cbb8fb99))
+* **server:** add catalog deletion PRs, tenant RBAC, and stack resource kinds ([87b7dfe](https://github.com/rdylanwalker/keel/commit/87b7dfe8428ee8764a8d955fbc220065a101f58c))
+* **server:** add cli loopback login, csp headers, preview lifecycle and auth hardening ([2e0a8d0](https://github.com/rdylanwalker/keel/commit/2e0a8d0e363e8f44972980dcdf69aa1b11c34ef4))
+* **ui:** add catalog protection controls, PR search, and 3-section topology ([2c8ebc4](https://github.com/rdylanwalker/keel/commit/2c8ebc4b83b95ba8f0559d90d51b73f6d25bf7ba))
+* **ui:** add role-aware shadcn ui, wterm ssh terminal and responsive layouts ([247f865](https://github.com/rdylanwalker/keel/commit/247f865922c2ce7b9bb4e5143aefd9fabc2d0bf8))
+
 # [0.7.0](https://github.com/rdylanwalker/keel/compare/v0.6.12...v0.7.0) (2026-11-19)
 
 ### Bug Fixes
