@@ -668,6 +668,7 @@ flowchart TD
    * **Mocked Playwright E2E:** Executes headless Chromium Playwright tests (`pnpm --dir e2e test`) verifying catalog wizards, dynamic forms, PR proposals, diff viewer, and UI routes with zero cluster overhead.
    * **Documentation:** `mdbook build` ensuring the user guide compiles (link checking is not automated; see §9.5).
    * **SOPS/age:** installs pinned, checksum-verified `sops` (`v3.13.3`) and `age` (`v1.3.2`) and runs the Rust tests with `KEEL_REQUIRE_SOPS=1`, so the real SOPS round-trip test cannot silently skip.
+   * **Release Config:** installs the pinned `release/` toolchain (`npm ci --ignore-scripts`) and runs `release/verify-release-config.mjs`, asserting release-note section order, hidden types and per-type version bumps (§9.3).
    * **Container:** builds the `Dockerfile` (`linux/amd64`, static musl via `cargo-zigbuild`, no push) and smoke-tests `keel --version` and `git --version` in the image, so Dockerfile/musl breakage is caught before a release is tagged.
 2. **`e2e.yml` (Live Cluster & Cloud Verification):**
    * Callable via `workflow_call` and manually via `workflow_dispatch`; the live kind job runs only when the explicit `run_live` input is `true` (`release.yml` passes `run_live: true`).
@@ -689,6 +690,8 @@ flowchart TD
 
 ### 9.3 `semantic-release` Configuration (`.releaserc.json`)
 
+Both the commit analyzer and the release-notes generator use the `conventionalcommits` preset (`conventional-changelog-conventionalcommits`, pinned in `release/package.json`). The preset renders the `⚠ BREAKING CHANGES` note group first and then sorts commit groups in `presetConfig.types` order, so every release note and `CHANGELOG.md` entry reads **⚠ BREAKING CHANGES → Features → Bug Fixes → Performance Improvements → Reverts**. `docs`, `style`, `chore`, `refactor`, `test`, `build` and `ci` commits are hidden from the notes (they still appear if they carry a `BREAKING CHANGE`). The preset stays on 9.x while the stable `@semantic-release/release-notes-generator` (14.x) bundles `conventional-changelog-writer` 8; preset 10.x needs writer 9. Entries written before this ordering change are left as they are. `releaseRules` keeps breaking changes on a **minor** bump while Keel is pre-1.0 and adds `{ "type": "revert", "release": "patch" }` so hand-written `revert:` commits release a patch just like `git revert` commits (whose `This reverts commit <sha>.` body matches the analyzer's default revert rule). `release/verify-release-config.mjs` runs in CI (`ci.yml` *Release Config*) against the pinned `release/` toolchain, resolving plugins the same way `semantic-release` does at runtime, and asserts the note section order, the hidden types and the analyzer's bump per commit type, so Renovate updates to the release tooling cannot silently change either.
+
 ```json
 {
   "branches": ["main"],
@@ -696,21 +699,69 @@ flowchart TD
     [
       "@semantic-release/commit-analyzer",
       {
-        "releaseRules": [{ "breaking": true, "release": "minor" }]
+        "preset": "conventionalcommits",
+        "releaseRules": [
+          { "breaking": true, "release": "minor" },
+          { "type": "revert", "release": "patch" }
+        ],
+        "presetConfig": {
+          "types": [
+            { "type": "feat", "section": "Features" },
+            { "type": "fix", "section": "Bug Fixes" },
+            { "type": "perf", "section": "Performance Improvements" },
+            { "type": "revert", "section": "Reverts" },
+            { "type": "docs", "section": "Documentation", "hidden": true },
+            { "type": "style", "section": "Styles", "hidden": true },
+            { "type": "chore", "section": "Miscellaneous Chores", "hidden": true },
+            { "type": "refactor", "section": "Code Refactoring", "hidden": true },
+            { "type": "test", "section": "Tests", "hidden": true },
+            { "type": "build", "section": "Build System", "hidden": true },
+            { "type": "ci", "section": "Continuous Integration", "hidden": true }
+          ]
+        }
       }
     ],
-    "@semantic-release/release-notes-generator",
+    [
+      "@semantic-release/release-notes-generator",
+      {
+        "preset": "conventionalcommits",
+        "presetConfig": {
+          "types": [
+            { "type": "feat", "section": "Features" },
+            { "type": "fix", "section": "Bug Fixes" },
+            { "type": "perf", "section": "Performance Improvements" },
+            { "type": "revert", "section": "Reverts" },
+            { "type": "docs", "section": "Documentation", "hidden": true },
+            { "type": "style", "section": "Styles", "hidden": true },
+            { "type": "chore", "section": "Miscellaneous Chores", "hidden": true },
+            { "type": "refactor", "section": "Code Refactoring", "hidden": true },
+            { "type": "test", "section": "Tests", "hidden": true },
+            { "type": "build", "section": "Build System", "hidden": true },
+            { "type": "ci", "section": "Continuous Integration", "hidden": true }
+          ]
+        }
+      }
+    ],
     "@semantic-release/changelog",
     [
       "@semantic-release/exec",
       {
-        "prepareCmd": "cargo set-version ${nextRelease.version} && cargo update --workspace && cargo metadata --locked --format-version 1 > /dev/null && npm --prefix ui version ${nextRelease.version} --no-git-tag-version"
+        "prepareCmd": "cargo set-version ${nextRelease.version} && cargo update --workspace && cargo metadata --locked --format-version 1 > /dev/null && npm --prefix ui version ${nextRelease.version} --no-git-tag-version && sed -i -E -e 's#^( +(newTag|version): )\"[^\"]*\"#\\1\"${nextRelease.version}\"#' -e 's#(ghcr\\.io/rdylanwalker/keel:)[0-9A-Za-z._-]+#\\1${nextRelease.version}#' deploy/bootstrap/keel-server/kustomization.yaml deploy/bootstrap/keel-server/deployment.yaml deploy/seed/core-addons/keel-server.yaml deploy/catalog/core/keel-server/catalog.yaml"
       }
     ],
     [
       "@semantic-release/git",
       {
-        "assets": ["CHANGELOG.md", "Cargo.toml", "Cargo.lock", "ui/package.json"],
+        "assets": [
+          "CHANGELOG.md",
+          "Cargo.toml",
+          "Cargo.lock",
+          "ui/package.json",
+          "deploy/bootstrap/keel-server/kustomization.yaml",
+          "deploy/bootstrap/keel-server/deployment.yaml",
+          "deploy/seed/core-addons/keel-server.yaml",
+          "deploy/catalog/core/keel-server/catalog.yaml"
+        ],
         "message": "chore(release): ${nextRelease.version} [skip ci]\n\n${nextRelease.notes}"
       }
     ],

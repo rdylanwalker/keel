@@ -113,7 +113,7 @@ just docs
 All pull requests and `main` branch pushes are subject to automated verification gates. To provide fast feedback for contributors while ensuring rock-solid release stability, the pipeline is split into fast PR checks and a strict pre-release live cluster gate on `main`:
 
 * **Pull Requests (Fast Quality Gate via `ci.yml`):**
-  PRs run formatting, linting, **at least 80% line coverage** (Rust via `cargo llvm-cov`, UI via `vitest --coverage`; currently about 84% and 96%), the SOPS round-trip test with pinned `sops`/`age`, `mdbook build`, and the **mocked Playwright end-to-end suite** (`pnpm --dir e2e test`). PR checks complete in under 3 minutes without spinning up full Kubernetes clusters or consuming cloud infrastructure resources.
+  PRs run formatting, linting, **at least 80% line coverage** (Rust via `cargo llvm-cov`, UI via `vitest --coverage`; currently about 84% and 96%), the SOPS round-trip test with pinned `sops`/`age`, `mdbook build`, the `semantic-release` config check (`release/verify-release-config.mjs`), and the **mocked Playwright end-to-end suite** (`pnpm --dir e2e test`). PR checks complete in under 3 minutes without spinning up full Kubernetes clusters or consuming cloud infrastructure resources.
 * **Pushes to `main` (Strict Pre-Release Gate via `release.yml`):**
   Pushes to `main` execute `release.yml`, which orchestrates `ci.yml` and `e2e.yml` via reusable `workflow_call`. The `release` job declares `needs: [ci, e2e-live]`, ensuring `semantic-release` **only** runs if both the fast quality gates and the live `kind` E2E suite (`07-kind-live-e2e.spec.ts`) pass completely.
 
@@ -313,7 +313,9 @@ just agent-e2e
   * `feat(<scope>): ...` — new feature (minor version bump)
   * `fix(<scope>): ...` — bug fix (patch version bump)
   * `feat(<scope>)!: ...` or `BREAKING CHANGE:` footer — breaking change (currently a **minor** bump while Keel is pre-1.0, per `.releaserc.json`)
-  * `chore:`, `docs:`, `test:`, `ci:`, `refactor:` — non-release maintenance
+  * `chore:`, `docs:`, `test:`, `ci:`, `refactor:` — non-release maintenance (hidden from release notes)
+  * `perf(<scope>): ...` / `revert: ...` — patch bump, listed under *Performance Improvements* / *Reverts* (both hand-written `revert:` commits and `git revert` commits release a patch)
+  * Release notes and `CHANGELOG.md` use the `conventionalcommits` preset and list sections in the order **⚠ BREAKING CHANGES**, **Features**, **Bug Fixes**, **Performance Improvements**, **Reverts** (see `SDD.md` §9.3). After changing `.releaserc.json` or `release/package.json`, run `npm ci --prefix release --ignore-scripts && node release/verify-release-config.mjs .`
 * **Lockfile Hygiene:** Keep `Cargo.lock`, `ui/pnpm-lock.yaml`, and `e2e/pnpm-lock.yaml` synchronized whenever modifying dependencies so weekly Renovate PRs auto-merge cleanly.
 * **Tests & Docs:** Include unit tests (`cargo test` / `vitest`) for new logic, update Playwright specs in `e2e/tests/` for user-facing changes, and update [`SDD.md`](./SDD.md) if introducing a new architectural pattern.
 
