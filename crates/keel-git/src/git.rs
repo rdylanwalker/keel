@@ -562,7 +562,9 @@ impl GitRunner {
         Ok(())
     }
 
-    /// Checks out `branch` and fast-forwards/resets it to `<remote>/<branch>` when the remote ref exists.
+    /// Checks out `branch` and fast-forwards/resets it to `<remote>/<branch>` when the remote ref exists,
+    /// cleaning any dirty or untracked files before and after checkout so a previously failed operation
+    /// can never poison the shared worktree.
     pub async fn sync_branch_from_remote(
         &self,
         work_dir: &Path,
@@ -571,6 +573,12 @@ impl GitRunner {
     ) -> Result<(), GitError> {
         validate_git_ref(remote, "remote")?;
         validate_git_ref(branch, "branch")?;
+        let _ = self
+            .exec(Some(work_dir), "reset", &["reset", "--hard"], &[])
+            .await;
+        let _ = self
+            .exec(Some(work_dir), "clean", &["clean", "-fd"], &[])
+            .await;
         self.checkout_branch(work_dir, branch).await?;
         if self.fetch(work_dir, remote).await.is_ok() {
             let remote_ref = format!("refs/remotes/{remote}/{branch}");
@@ -580,6 +588,10 @@ impl GitRunner {
                     .await?;
             }
         }
+        self.exec(Some(work_dir), "reset", &["reset", "--hard"], &[])
+            .await?;
+        self.exec(Some(work_dir), "clean", &["clean", "-fd"], &[])
+            .await?;
         Ok(())
     }
 
@@ -815,6 +827,47 @@ impl GitRunner {
             )
             .await?;
         Ok(out.trim().to_string())
+    }
+
+    /// Lists modified file paths in `range` via `git diff --name-only <range> --`.
+    pub async fn diff_name_only(
+        &self,
+        work_dir: &Path,
+        range: &str,
+    ) -> Result<Vec<String>, GitError> {
+        validate_non_option_arg(range, "range")?;
+        let out = self
+            .exec(
+                Some(work_dir),
+                "diff",
+                &["diff", "--name-only", range, "--"],
+                &[],
+            )
+            .await?;
+        Ok(out
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(ToOwned::to_owned)
+            .collect())
+    }
+
+    /// Returns the zero-context unified diff (`git diff -U0 <range> -- <file_path>`) for a single file.
+    pub async fn diff_file_zero_context(
+        &self,
+        work_dir: &Path,
+        range: &str,
+        file_path: &str,
+    ) -> Result<String, GitError> {
+        validate_non_option_arg(range, "range")?;
+        validate_non_option_arg(file_path, "file_path")?;
+        self.exec(
+            Some(work_dir),
+            "diff",
+            &["diff", "-U0", range, "--", file_path],
+            &[],
+        )
+        .await
     }
 
     /// Lists up to `limit` commit SHAs touching `repo_rel_path` in `repo_dir`.
@@ -1327,6 +1380,38 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(release_sha, branch_sha);
+
+        // Verify diff_name_only and diff_file_zero_context
+        let range = format!("{initial_sha}..{branch_sha}");
+        let changed_files = runner.diff_name_only(&work_b, &range).await.unwrap();
+        assert_eq!(
+            changed_files,
+            vec!["tenants/tenant-1/infra/db/stack.yaml".to_string()]
+        );
+        let file_diff = runner
+            .diff_file_zero_context(&work_b, &range, "tenants/tenant-1/infra/db/stack.yaml")
+            .await
+            .unwrap();
+        assert!(file_diff.contains("+kind: Stack"));
+
+        // Verify sync_branch_from_remote cleans dirty & untracked files
+        tokio::fs::write(work_b.join("untracked.txt"), "dirty\n")
+            .await
+            .unwrap();
+        tokio::fs::write(work_b.join("README.md"), "corrupted\n")
+            .await
+            .unwrap();
+        runner
+            .sync_branch_from_remote(&work_b, "origin", "main")
+            .await
+            .unwrap();
+        assert!(!work_b.join("untracked.txt").exists());
+        assert_eq!(
+            tokio::fs::read_to_string(work_b.join("README.md"))
+                .await
+                .unwrap(),
+            "# Infra GitOps\n"
+        );
 
         let authed = GitRunner::default().with_credentials(GitCredentials::HttpsBasic {
             username: "git".to_string(),

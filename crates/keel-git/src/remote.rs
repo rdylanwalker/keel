@@ -343,44 +343,165 @@ impl GiteaGitHubPrResponse {
     }
 }
 
+async fn create_gitea_github_pr<F>(
+    client: &Client,
+    base_url: &str,
+    repo_api_url: &str,
+    authorize: F,
+    req: CreatePrRequest,
+) -> Result<PullRequestInfo, ForgeError>
+where
+    F: FnOnce(RequestBuilder) -> RequestBuilder,
+{
+    if req.title.trim().is_empty() {
+        return Err(ForgeError::InvalidInput(
+            "pull request title must not be empty".to_string(),
+        ));
+    }
+    let url = format!("{repo_api_url}/pulls");
+    let payload = GiteaCreatePrBody {
+        title: &req.title,
+        body: &req.body,
+        head: &req.source_branch,
+        base: &req.target_branch,
+    };
+    let resp = authorize(client.post(&url)).json(&payload).send().await?;
+    if !resp.status().is_success() {
+        return Err(map_error_response(resp, None, false).await);
+    }
+    let parsed: GiteaGitHubPrResponse = resp.json().await?;
+    Ok(parsed.into_pr_info(req.tenant, base_url))
+}
+
+async fn get_gitea_github_pr<F>(
+    client: &Client,
+    base_url: &str,
+    repo_api_url: &str,
+    authorize: F,
+    pr_id: &str,
+) -> Result<PullRequestInfo, ForgeError>
+where
+    F: FnOnce(RequestBuilder) -> RequestBuilder,
+{
+    let id = validate_pr_number(pr_id)?;
+    let url = format!("{repo_api_url}/pulls/{id}");
+    let resp = authorize(client.get(&url)).send().await?;
+    if !resp.status().is_success() {
+        return Err(map_error_response(resp, Some(id), false).await);
+    }
+    let parsed: GiteaGitHubPrResponse = resp.json().await?;
+    Ok(parsed.into_pr_info(None, base_url))
+}
+
+async fn post_gitea_github_comment<F>(
+    client: &Client,
+    repo_api_url: &str,
+    authorize: F,
+    pr_id: &str,
+    markdown_report: &str,
+) -> Result<(), ForgeError>
+where
+    F: FnOnce(RequestBuilder) -> RequestBuilder,
+{
+    let id = validate_pr_number(pr_id)?;
+    if markdown_report.trim().is_empty() {
+        return Err(ForgeError::InvalidInput(
+            "markdown_report must not be empty".to_string(),
+        ));
+    }
+    let url = format!("{repo_api_url}/issues/{id}/comments");
+    let resp = authorize(client.post(&url))
+        .json(&MarkdownCommentBody {
+            body: markdown_report,
+        })
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        return Err(map_error_response(resp, Some(id), false).await);
+    }
+    Ok(())
+}
+
+async fn list_gitea_github_prs<F>(
+    client: &Client,
+    base_url: &str,
+    repo_api_url: &str,
+    page_size_query: &str,
+    authorize: F,
+    tenant: Option<&str>,
+    state: Option<PullRequestState>,
+) -> Result<Vec<PullRequestInfo>, ForgeError>
+where
+    F: FnOnce(RequestBuilder) -> RequestBuilder,
+{
+    let state_param = match state {
+        None => "all",
+        Some(PullRequestState::Open) => "open",
+        Some(PullRequestState::Closed | PullRequestState::Merged) => "closed",
+    };
+    let url = format!("{repo_api_url}/pulls?state={state_param}&{page_size_query}");
+    let resp = authorize(client.get(&url)).send().await?;
+    if !resp.status().is_success() {
+        return Err(map_error_response(resp, None, false).await);
+    }
+    let items: Vec<GiteaGitHubPrResponse> = resp.json().await?;
+    let prs = items
+        .into_iter()
+        .map(|item| item.into_pr_info(None, base_url))
+        .filter(|pr| tenant.is_none_or(|t| matches_tenant(pr, t)))
+        .filter(|pr| state.is_none_or(|s| pr.state == s))
+        .collect();
+    Ok(prs)
+}
+
+async fn patch_gitea_github_pr_state<F>(
+    client: &Client,
+    base_url: &str,
+    repo_api_url: &str,
+    authorize: F,
+    pr_id: &str,
+    target_state: &str,
+) -> Result<PullRequestInfo, ForgeError>
+where
+    F: Fn(RequestBuilder) -> RequestBuilder,
+{
+    let id = validate_pr_number(pr_id)?;
+    let url = format!("{repo_api_url}/pulls/{id}");
+    let resp = authorize(client.patch(&url))
+        .json(&serde_json::json!({ "state": target_state }))
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        return Err(map_error_response(resp, Some(id), false).await);
+    }
+    get_gitea_github_pr(client, base_url, repo_api_url, authorize, id).await
+}
+
 #[async_trait]
 impl ForgeProvider for ForgejoGiteaProvider {
     async fn create_pull_request(
         &self,
         req: CreatePrRequest,
     ) -> Result<PullRequestInfo, ForgeError> {
-        if req.title.trim().is_empty() {
-            return Err(ForgeError::InvalidInput(
-                "pull request title must not be empty".to_string(),
-            ));
-        }
-        let url = format!("{}/pulls", self.repo_api_url());
-        let payload = serde_json::json!({
-            "title": req.title,
-            "body": req.body,
-            "head": req.source_branch,
-            "base": req.target_branch,
-        });
-        let resp = self
-            .authorized(self.client.post(&url).json(&payload))
-            .send()
-            .await?;
-        if !resp.status().is_success() {
-            return Err(map_error_response(resp, None, false).await);
-        }
-        let parsed: GiteaGitHubPrResponse = resp.json().await?;
-        Ok(parsed.into_pr_info(req.tenant, &self.base_url))
+        create_gitea_github_pr(
+            &self.client,
+            &self.base_url,
+            &self.repo_api_url(),
+            |b| self.authorized(b),
+            req,
+        )
+        .await
     }
 
     async fn get_pull_request(&self, pr_id: &str) -> Result<PullRequestInfo, ForgeError> {
-        let id = validate_pr_number(pr_id)?;
-        let url = format!("{}/pulls/{id}", self.repo_api_url());
-        let resp = self.authorized(self.client.get(&url)).send().await?;
-        if !resp.status().is_success() {
-            return Err(map_error_response(resp, Some(id), false).await);
-        }
-        let parsed: GiteaGitHubPrResponse = resp.json().await?;
-        Ok(parsed.into_pr_info(None, &self.base_url))
+        get_gitea_github_pr(
+            &self.client,
+            &self.base_url,
+            &self.repo_api_url(),
+            |b| self.authorized(b),
+            pr_id,
+        )
+        .await
     }
 
     async fn post_preview_comment(
@@ -388,24 +509,14 @@ impl ForgeProvider for ForgejoGiteaProvider {
         pr_id: &str,
         markdown_report: &str,
     ) -> Result<(), ForgeError> {
-        let id = validate_pr_number(pr_id)?;
-        if markdown_report.trim().is_empty() {
-            return Err(ForgeError::InvalidInput(
-                "markdown_report must not be empty".to_string(),
-            ));
-        }
-        let url = format!("{}/issues/{id}/comments", self.repo_api_url());
-        let resp = self
-            .authorized(self.client.post(&url))
-            .json(&MarkdownCommentBody {
-                body: markdown_report,
-            })
-            .send()
-            .await?;
-        if !resp.status().is_success() {
-            return Err(map_error_response(resp, Some(id), false).await);
-        }
-        Ok(())
+        post_gitea_github_comment(
+            &self.client,
+            &self.repo_api_url(),
+            |b| self.authorized(b),
+            pr_id,
+            markdown_report,
+        )
+        .await
     }
 
     async fn list_open_pull_requests(
@@ -421,24 +532,16 @@ impl ForgeProvider for ForgejoGiteaProvider {
         tenant: Option<&str>,
         state: Option<PullRequestState>,
     ) -> Result<Vec<PullRequestInfo>, ForgeError> {
-        let state_param = match state {
-            None => "all",
-            Some(PullRequestState::Open) => "open",
-            Some(PullRequestState::Closed | PullRequestState::Merged) => "closed",
-        };
-        let url = format!("{}/pulls?state={state_param}&limit=50", self.repo_api_url());
-        let resp = self.authorized(self.client.get(&url)).send().await?;
-        if !resp.status().is_success() {
-            return Err(map_error_response(resp, None, false).await);
-        }
-        let items: Vec<GiteaGitHubPrResponse> = resp.json().await?;
-        let prs = items
-            .into_iter()
-            .map(|item| item.into_pr_info(None, &self.base_url))
-            .filter(|pr| tenant.is_none_or(|t| matches_tenant(pr, t)))
-            .filter(|pr| state.is_none_or(|s| pr.state == s))
-            .collect();
-        Ok(prs)
+        list_gitea_github_prs(
+            &self.client,
+            &self.base_url,
+            &self.repo_api_url(),
+            "limit=50",
+            |b| self.authorized(b),
+            tenant,
+            state,
+        )
+        .await
     }
 
     async fn merge_pull_request(&self, pr_id: &str) -> Result<PullRequestInfo, ForgeError> {
@@ -469,31 +572,27 @@ impl ForgeProvider for ForgejoGiteaProvider {
     }
 
     async fn close_pull_request(&self, pr_id: &str) -> Result<PullRequestInfo, ForgeError> {
-        let id = validate_pr_number(pr_id)?;
-        let url = format!("{}/pulls/{id}", self.repo_api_url());
-        let resp = self
-            .authorized(self.client.patch(&url))
-            .json(&serde_json::json!({ "state": "closed" }))
-            .send()
-            .await?;
-        if !resp.status().is_success() {
-            return Err(map_error_response(resp, Some(id), false).await);
-        }
-        self.get_pull_request(id).await
+        patch_gitea_github_pr_state(
+            &self.client,
+            &self.base_url,
+            &self.repo_api_url(),
+            |b| self.authorized(b),
+            pr_id,
+            "closed",
+        )
+        .await
     }
 
     async fn reopen_pull_request(&self, pr_id: &str) -> Result<PullRequestInfo, ForgeError> {
-        let id = validate_pr_number(pr_id)?;
-        let url = format!("{}/pulls/{id}", self.repo_api_url());
-        let resp = self
-            .authorized(self.client.patch(&url))
-            .json(&serde_json::json!({ "state": "open" }))
-            .send()
-            .await?;
-        if !resp.status().is_success() {
-            return Err(map_error_response(resp, Some(id), false).await);
-        }
-        self.get_pull_request(id).await
+        patch_gitea_github_pr_state(
+            &self.client,
+            &self.base_url,
+            &self.repo_api_url(),
+            |b| self.authorized(b),
+            pr_id,
+            "open",
+        )
+        .await
     }
 }
 
@@ -570,39 +669,25 @@ impl ForgeProvider for GitHubProvider {
         &self,
         req: CreatePrRequest,
     ) -> Result<PullRequestInfo, ForgeError> {
-        if req.title.trim().is_empty() {
-            return Err(ForgeError::InvalidInput(
-                "pull request title must not be empty".to_string(),
-            ));
-        }
-        let url = format!("{}/pulls", self.repo_api_url());
-        let payload = GiteaCreatePrBody {
-            title: &req.title,
-            body: &req.body,
-            head: &req.source_branch,
-            base: &req.target_branch,
-        };
-        let resp = self
-            .authorized(self.client.post(&url))
-            .json(&payload)
-            .send()
-            .await?;
-        if !resp.status().is_success() {
-            return Err(map_error_response(resp, None, false).await);
-        }
-        let parsed: GiteaGitHubPrResponse = resp.json().await?;
-        Ok(parsed.into_pr_info(req.tenant, &self.base_url))
+        create_gitea_github_pr(
+            &self.client,
+            &self.base_url,
+            &self.repo_api_url(),
+            |b| self.authorized(b),
+            req,
+        )
+        .await
     }
 
     async fn get_pull_request(&self, pr_id: &str) -> Result<PullRequestInfo, ForgeError> {
-        let id = validate_pr_number(pr_id)?;
-        let url = format!("{}/pulls/{id}", self.repo_api_url());
-        let resp = self.authorized(self.client.get(&url)).send().await?;
-        if !resp.status().is_success() {
-            return Err(map_error_response(resp, Some(id), false).await);
-        }
-        let parsed: GiteaGitHubPrResponse = resp.json().await?;
-        Ok(parsed.into_pr_info(None, &self.base_url))
+        get_gitea_github_pr(
+            &self.client,
+            &self.base_url,
+            &self.repo_api_url(),
+            |b| self.authorized(b),
+            pr_id,
+        )
+        .await
     }
 
     async fn post_preview_comment(
@@ -610,24 +695,14 @@ impl ForgeProvider for GitHubProvider {
         pr_id: &str,
         markdown_report: &str,
     ) -> Result<(), ForgeError> {
-        let id = validate_pr_number(pr_id)?;
-        if markdown_report.trim().is_empty() {
-            return Err(ForgeError::InvalidInput(
-                "markdown_report must not be empty".to_string(),
-            ));
-        }
-        let url = format!("{}/issues/{id}/comments", self.repo_api_url());
-        let resp = self
-            .authorized(self.client.post(&url))
-            .json(&MarkdownCommentBody {
-                body: markdown_report,
-            })
-            .send()
-            .await?;
-        if !resp.status().is_success() {
-            return Err(map_error_response(resp, Some(id), false).await);
-        }
-        Ok(())
+        post_gitea_github_comment(
+            &self.client,
+            &self.repo_api_url(),
+            |b| self.authorized(b),
+            pr_id,
+            markdown_report,
+        )
+        .await
     }
 
     async fn list_open_pull_requests(
@@ -643,27 +718,16 @@ impl ForgeProvider for GitHubProvider {
         tenant: Option<&str>,
         state: Option<PullRequestState>,
     ) -> Result<Vec<PullRequestInfo>, ForgeError> {
-        let state_param = match state {
-            None => "all",
-            Some(PullRequestState::Open) => "open",
-            Some(PullRequestState::Closed | PullRequestState::Merged) => "closed",
-        };
-        let url = format!(
-            "{}/pulls?state={state_param}&per_page=50",
-            self.repo_api_url()
-        );
-        let resp = self.authorized(self.client.get(&url)).send().await?;
-        if !resp.status().is_success() {
-            return Err(map_error_response(resp, None, false).await);
-        }
-        let items: Vec<GiteaGitHubPrResponse> = resp.json().await?;
-        let prs = items
-            .into_iter()
-            .map(|item| item.into_pr_info(None, &self.base_url))
-            .filter(|pr| tenant.is_none_or(|t| matches_tenant(pr, t)))
-            .filter(|pr| state.is_none_or(|s| pr.state == s))
-            .collect();
-        Ok(prs)
+        list_gitea_github_prs(
+            &self.client,
+            &self.base_url,
+            &self.repo_api_url(),
+            "per_page=50",
+            |b| self.authorized(b),
+            tenant,
+            state,
+        )
+        .await
     }
 
     async fn merge_pull_request(&self, pr_id: &str) -> Result<PullRequestInfo, ForgeError> {
@@ -683,31 +747,27 @@ impl ForgeProvider for GitHubProvider {
     }
 
     async fn close_pull_request(&self, pr_id: &str) -> Result<PullRequestInfo, ForgeError> {
-        let id = validate_pr_number(pr_id)?;
-        let url = format!("{}/pulls/{id}", self.repo_api_url());
-        let resp = self
-            .authorized(self.client.patch(&url))
-            .json(&serde_json::json!({ "state": "closed" }))
-            .send()
-            .await?;
-        if !resp.status().is_success() {
-            return Err(map_error_response(resp, Some(id), false).await);
-        }
-        self.get_pull_request(id).await
+        patch_gitea_github_pr_state(
+            &self.client,
+            &self.base_url,
+            &self.repo_api_url(),
+            |b| self.authorized(b),
+            pr_id,
+            "closed",
+        )
+        .await
     }
 
     async fn reopen_pull_request(&self, pr_id: &str) -> Result<PullRequestInfo, ForgeError> {
-        let id = validate_pr_number(pr_id)?;
-        let url = format!("{}/pulls/{id}", self.repo_api_url());
-        let resp = self
-            .authorized(self.client.patch(&url))
-            .json(&serde_json::json!({ "state": "open" }))
-            .send()
-            .await?;
-        if !resp.status().is_success() {
-            return Err(map_error_response(resp, Some(id), false).await);
-        }
-        self.get_pull_request(id).await
+        patch_gitea_github_pr_state(
+            &self.client,
+            &self.base_url,
+            &self.repo_api_url(),
+            |b| self.authorized(b),
+            pr_id,
+            "open",
+        )
+        .await
     }
 }
 
