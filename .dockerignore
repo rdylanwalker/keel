@@ -1,0 +1,19 @@
+# Build context allowlist: only what the multi-stage Dockerfile needs
+# (Cargo workspace, crates, embedded deploy/ manifests, and the UI sources).
+*
+!Cargo.toml
+!Cargo.lock
+!crates/
+!deploy/
+!ui/
+
+# Never ship local build output, dependencies, or secrets into the context.
+**/target/
+**/node_modules/
+ui/dist/
+ui/coverage/
+**/*.tsbuildinfo
+**/.env
+**/.env.*
+deploy/bootstrap/*/Pulumi.stage0-*.yaml
+deploy/bootstrap/*/*-config

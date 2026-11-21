@@ -12,7 +12,7 @@
     [
       "@semantic-release/exec",
       {
-        "prepareCmd": "cargo set-version ${nextRelease.version} && npm --prefix ui version ${nextRelease.version} --no-git-tag-version && cargo generate-lockfile"
+        "prepareCmd": "cargo set-version ${nextRelease.version} && cargo update --workspace && cargo metadata --locked --format-version 1 > /dev/null && npm --prefix ui version ${nextRelease.version} --no-git-tag-version"
       }
     ],
     [
@@ -25,11 +25,7 @@
     [
       "@semantic-release/github",
       {
-        "draftRelease": true,
-        "assets": [
-          { "path": "dist/sbom.cdx.json", "label": "CycloneDX SBOM" },
-          { "path": "dist/keel-docs.tar.gz", "label": "Documentation (HTML)" }
-        ]
+        "draftRelease": true
       }
     ]
   ]

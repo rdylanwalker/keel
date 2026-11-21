@@ -4,58 +4,74 @@ on:
   push:
     branches: [main]
 
+# Least privilege by default; every job below declares exactly what it needs.
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # Pinned release tooling (SDD §9.2). Renovate updates the `# renovate:` annotated values.
+  # renovate: datasource=crate depName=mdbook
+  MDBOOK_VERSION: 0.5.4
+  # renovate: datasource=crate depName=mdbook-mermaid
+  MDBOOK_MERMAID_VERSION: 0.17.1
+  # renovate: datasource=crate depName=cargo-edit
+  CARGO_EDIT_VERSION: 0.13.14
+  # renovate: datasource=crate depName=cargo-zigbuild
+  CARGO_ZIGBUILD_VERSION: 0.24.1
+  # Zig is fetched + minisign-verified by mlugg/setup-zig; keep in sync with the Dockerfile.
+  ZIG_VERSION: 0.16.0
+  # renovate: datasource=github-releases depName=sigstore/cosign
+  COSIGN_VERSION: v3.1.4
+
 jobs:
   ci:
     name: CI Quality Gate
     uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
     secrets: inherit
 
   e2e-live:
     name: Live E2E Gate
     uses: ./.github/workflows/e2e.yml
+    permissions:
+      contents: read
+    with:
+      run_live: true
     secrets: inherit
 
   release:
-    name: Automated Release & SBOM
+    name: semantic-release (tag + draft GitHub Release)
     needs: [ci, e2e-live]
     runs-on: ubuntu-26.04
     permissions:
-      contents: write
-      issues: write
-      pull-requests: write
-      id-token: write
+      contents: write # push release commit + tag, create the draft release
+      issues: write # @semantic-release/github success/fail comments
+      pull-requests: write # @semantic-release/github comments on released PRs
     outputs:
       released: ${{ steps.release-check.outputs.released }}
       tag: ${{ steps.release-check.outputs.tag }}
+      version: ${{ steps.release-check.outputs.version }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: taiki-e/install-action@v2
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
-          tool: mdbook,mdbook-mermaid,cargo-edit
-      - uses: pnpm/action-setup@v6
+          toolchain: stable
+      - uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
         with:
-          version: 12
-      - uses: actions/setup-node@v7
+          tool: cargo-edit@${{ env.CARGO_EDIT_VERSION }}
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 26
-      - name: Install Release Dependencies
-        run: |
-          npm install -g semantic-release @semantic-release/commit-analyzer @semantic-release/release-notes-generator @semantic-release/changelog @semantic-release/exec @semantic-release/git @semantic-release/github
-      - name: Build Documentation Archive
-        run: |
-          mdbook build
-          mkdir -p dist
-          tar -czf dist/keel-docs.tar.gz -C book .
-      - name: Generate CycloneDX SBOM
-        uses: anchore/sbom-action@v0
-        with:
-          path: .
-          format: cyclonedx-json
-          output-file: dist/sbom.cdx.json
-          upload-artifact: false
+          cache: npm
+          cache-dependency-path: release/package-lock.json
+      - name: Install Pinned Release Tooling (release/package-lock.json)
+        run: npm ci --prefix release --ignore-scripts --no-audit --no-fund
       - name: Record Previous Release Tag
         id: prev-tag
         run: |
@@ -63,27 +79,27 @@ jobs:
       - name: Run semantic-release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: npx semantic-release
+        run: release/node_modules/.bin/semantic-release
       - name: Check Release Output
         id: release-check
+        env:
+          PREV_TAG: ${{ steps.prev-tag.outputs.tag }}
         run: |
           git fetch --tags --quiet
           after_tag=$(git describe --tags --abbrev=0 2>/dev/null || echo '')
-          if [ -n "$after_tag" ] && [ "$after_tag" != "${{ steps.prev-tag.outputs.tag }}" ]; then
-            echo "released=true" >> "$GITHUB_OUTPUT"
-            echo "tag=$after_tag" >> "$GITHUB_OUTPUT"
+          if [ -n "$after_tag" ] && [ "$after_tag" != "$PREV_TAG" ]; then
+            {
+              echo "released=true"
+              echo "tag=$after_tag"
+              echo "version=${after_tag#v}"
+            } >> "$GITHUB_OUTPUT"
           else
-            echo "released=false" >> "$GITHUB_OUTPUT"
-            echo "tag=" >> "$GITHUB_OUTPUT"
+            {
+              echo "released=false"
+              echo "tag="
+              echo "version="
+            } >> "$GITHUB_OUTPUT"
           fi
-      - name: Upload Docs & SBOM Artifacts
-        if: steps.release-check.outputs.released == 'true'
-        uses: actions/upload-artifact@v7
-        with:
-          name: keel-release-metadata
-          path: |
-            dist/keel-docs.tar.gz
-            dist/sbom.cdx.json
 
   build-ui:
     name: Build Release UI
@@ -93,13 +109,14 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.release.outputs.tag }}
-      - uses: pnpm/action-setup@v6
+          persist-credentials: false
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         with:
           version: 12
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 26
           cache: 'pnpm'
@@ -113,15 +130,15 @@ jobs:
           mkdir -p dist
           tar -czf dist/keel-ui.tar.gz -C ui/dist .
       - name: Upload UI Dist for Binary Embedding
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: keel-ui-dist
+          name: ui-dist
           path: ui/dist/
           retention-days: 1
-      - name: Upload UI Archive Artifact
-        uses: actions/upload-artifact@v7
+      - name: Upload UI Archive Asset
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: keel-ui
+          name: asset-keel-ui
           path: dist/keel-ui.tar.gz
 
   build-binaries:
@@ -135,47 +152,67 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Linux: fully static musl binaries (NFR-PERF-04) cross-compiled with cargo-zigbuild.
           - name: linux-amd64
             os: ubuntu-26.04
-            target: x86_64-unknown-linux-gnu
+            target: x86_64-unknown-linux-musl
             archive: keel-linux-amd64.tar.gz
             binary: keel
+            zigbuild: true
           - name: linux-arm64
             os: ubuntu-26.04
-            target: aarch64-unknown-linux-gnu
+            target: aarch64-unknown-linux-musl
             archive: keel-linux-arm64.tar.gz
             binary: keel
+            zigbuild: true
           - name: darwin-arm64
             os: macos-latest
             target: aarch64-apple-darwin
             archive: keel-darwin-arm64.tar.gz
             binary: keel
+            zigbuild: false
           - name: windows-amd64
             os: windows-latest
             target: x86_64-pc-windows-msvc
             archive: keel-windows-amd64.zip
             binary: keel.exe
+            zigbuild: false
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.release.outputs.tag }}
-      - uses: dtolnay/rust-toolchain@stable
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
+          toolchain: stable
           targets: ${{ matrix.target }}
-      - name: Install Linux ARM64 Cross-Linker
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
-      - name: Download Built UI Assets
-        uses: actions/download-artifact@v7
+      - name: Install Zig
+        if: matrix.zigbuild
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
-          name: keel-ui-dist
+          version: ${{ env.ZIG_VERSION }}
+      - name: Install cargo-zigbuild
+        if: matrix.zigbuild
+        uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
+        with:
+          tool: cargo-zigbuild@${{ env.CARGO_ZIGBUILD_VERSION }}
+      - name: Download Built UI Assets
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ui-dist
           path: ui/dist
-      - name: Build Keel Binary
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-        run: cargo build --release --locked --target ${{ matrix.target }} --bin keel
+      - name: Build Keel Binary (static musl, cargo-zigbuild)
+        if: matrix.zigbuild
+        run: cargo zigbuild --release --locked --target "${{ matrix.target }}" --bin keel
+      - name: Build Keel Binary (native)
+        if: ${{ !matrix.zigbuild }}
+        run: cargo build --release --locked --target "${{ matrix.target }}" --bin keel
+      - name: Verify Static Linkage (Linux)
+        if: matrix.zigbuild
+        run: |
+          out=$(file "target/${{ matrix.target }}/release/${{ matrix.binary }}")
+          echo "$out"
+          echo "$out" | grep -Eq 'statically linked|static-pie linked'
       - name: Package Binary (Unix)
         if: runner.os != 'Windows'
         run: |
@@ -187,37 +224,133 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Compress-Archive -Path "target/${{ matrix.target }}/release/${{ matrix.binary }}" -DestinationPath "dist/${{ matrix.archive }}" -Force
-      - name: Upload Binary Workflow Artifact
-        uses: actions/upload-artifact@v7
+      - name: Upload Binary Asset
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: keel-${{ matrix.name }}
+          name: asset-keel-${{ matrix.name }}
           path: dist/${{ matrix.archive }}
 
-  publish-release:
-    name: Publish GitHub Release
-    needs: [release, build-ui, build-binaries]
+  image:
+    name: Build, Push & Sign Container Image (GHCR)
+    needs: release
     if: needs.release.outputs.released == 'true'
     runs-on: ubuntu-26.04
     permissions:
-      contents: write
+      contents: read
+      packages: write # push ghcr.io/<owner>/keel
+      id-token: write # Cosign keyless (Fulcio) + buildx provenance
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+      image: ${{ steps.image-name.outputs.image }}
     steps:
-      - name: Download Release Artifacts
-        uses: actions/download-artifact@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          pattern: keel-*
-          path: artifacts
+          ref: ${{ needs.release.outputs.tag }}
+          persist-credentials: false
+      - name: Resolve Image Name
+        id: image-name
+        env:
+          OWNER: ${{ github.repository_owner }}
+        run: echo "image=ghcr.io/${OWNER,,}/keel" >> "$GITHUB_OUTPUT"
+      # QEMU is only needed for the arm64 runtime stage's `apk add`; Rust cross-compiles natively.
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Image Metadata
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ steps.image-name.outputs.image }}
+          tags: |
+            type=semver,pattern={{version}},value=${{ needs.release.outputs.tag }}
+            type=raw,value=latest
+      - name: Build & Push Multi-Arch Image (SBOM + provenance attestations)
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          annotations: ${{ steps.meta.outputs.annotations }}
+          sbom: true
+          provenance: mode=max
+          cache-from: type=gha,scope=keel-image
+      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+        with:
+          cosign-release: ${{ env.COSIGN_VERSION }}
+      - name: Cosign Keyless Sign Image (by digest)
+        env:
+          IMAGE: ${{ steps.image-name.outputs.image }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: cosign sign --yes "${IMAGE}@${DIGEST}"
+
+  publish-release:
+    name: Sign & Publish GitHub Release
+    needs: [release, build-ui, build-binaries, image]
+    if: needs.release.outputs.released == 'true'
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: write # upload assets + un-draft the release
+      id-token: write # Cosign keyless sign-blob
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.release.outputs.tag }}
+          persist-credentials: false
+      - uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
+        with:
+          tool: mdbook@${{ env.MDBOOK_VERSION }},mdbook-mermaid@${{ env.MDBOOK_MERMAID_VERSION }}
+      - name: Download Release Assets
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: asset-*
+          path: dist
+          merge-multiple: true
+      - name: Build Documentation Archive
+        run: |
+          mdbook build
+          tar -czf dist/keel-docs.tar.gz -C book .
+      - name: Generate CycloneDX SBOM (source dependencies)
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        with:
+          path: .
+          format: cyclonedx-json
+          output-file: dist/keel-sbom.cdx.json
+          upload-artifact: false
+          upload-release-assets: false
+      - name: Record Container Image Reference
+        env:
+          IMAGE: ${{ needs.image.outputs.image }}
+          DIGEST: ${{ needs.image.outputs.digest }}
+          VERSION: ${{ needs.release.outputs.version }}
+        run: echo "${IMAGE}:${VERSION}@${DIGEST}" > dist/keel-image.txt
+      - name: Generate Checksums
+        working-directory: dist
+        run: |
+          sha256sum -- * > SHA256SUMS
+          cat SHA256SUMS
+      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+        with:
+          cosign-release: ${{ env.COSIGN_VERSION }}
+      - name: Cosign Keyless Sign Assets (sign-blob bundles)
+        working-directory: dist
+        run: |
+          for f in *; do
+            case "$f" in *.sigstore.json) continue ;; esac
+            cosign sign-blob --yes --bundle "${f}.sigstore.json" "$f"
+          done
+          ls -la
       - name: Upload Assets & Publish Draft Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.release.outputs.tag }}
+          REPO: ${{ github.repository }}
         run: |
-          gh release upload "${{ needs.release.outputs.tag }}" \
-            -R "${{ github.repository }}" \
-            artifacts/keel-ui/keel-ui.tar.gz \
-            artifacts/keel-linux-amd64/keel-linux-amd64.tar.gz \
-            artifacts/keel-linux-arm64/keel-linux-arm64.tar.gz \
-            artifacts/keel-darwin-arm64/keel-darwin-arm64.tar.gz \
-            artifacts/keel-windows-amd64/keel-windows-amd64.zip \
-            --clobber
-          gh release edit "${{ needs.release.outputs.tag }}" \
-            -R "${{ github.repository }}" \
-            --draft=false
+          gh release upload "$TAG" -R "$REPO" dist/* --clobber
+          gh release edit "$TAG" -R "$REPO" --draft=false

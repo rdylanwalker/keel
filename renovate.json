@@ -4,9 +4,13 @@
     "config:recommended",
     ":dependencyDashboard",
     ":semanticCommits",
-    ":enableVulnerabilityAlerts"
+    ":enableVulnerabilityAlerts",
+    "helpers:pinGitHubActionDigests",
+    "docker:pinDigests"
   ],
-  "schedule": ["before 5am on monday"],
+  "schedule": [
+    "before 5am on monday"
+  ],
   "timezone": "UTC",
   "prConcurrentLimit": 5,
   "automerge": true,
@@ -14,64 +18,129 @@
   "platformAutomerge": true,
   "lockFileMaintenance": {
     "enabled": true,
-    "schedule": ["before 5am on monday"],
+    "schedule": [
+      "before 5am on monday"
+    ],
     "automerge": true
   },
   "packageRules": [
     {
       "description": "Group non-breaking Rust patch updates (>= 0.1.0)",
-      "matchManagers": ["cargo"],
+      "matchManagers": [
+        "cargo"
+      ],
       "groupName": "rust-dependencies",
       "matchCurrentVersion": "!/^0\\.0\\./",
-      "matchUpdateTypes": ["patch"],
+      "matchUpdateTypes": [
+        "patch"
+      ],
       "automerge": true
     },
     {
       "description": "Group non-breaking Rust minor updates (>= 1.0.0)",
-      "matchManagers": ["cargo"],
+      "matchManagers": [
+        "cargo"
+      ],
       "groupName": "rust-dependencies",
       "matchCurrentVersion": "!/^0\\./",
-      "matchUpdateTypes": ["minor"],
+      "matchUpdateTypes": [
+        "minor"
+      ],
       "automerge": true
     },
     {
       "description": "Require manual review for pre-1.0 Rust minor updates and 0.0.x patches (SemVer breaking)",
-      "matchManagers": ["cargo"],
+      "matchManagers": [
+        "cargo"
+      ],
       "matchCurrentVersion": "/^0\\./",
-      "matchUpdateTypes": ["minor"],
+      "matchUpdateTypes": [
+        "minor"
+      ],
       "automerge": false
     },
     {
       "description": "Require manual review for 0.0.x Rust patch updates (SemVer breaking)",
-      "matchManagers": ["cargo"],
+      "matchManagers": [
+        "cargo"
+      ],
       "matchCurrentVersion": "/^0\\.0\\./",
-      "matchUpdateTypes": ["patch"],
+      "matchUpdateTypes": [
+        "patch"
+      ],
       "automerge": false
     },
     {
       "description": "Group tightly coupled Kubernetes Rust crates",
-      "matchManagers": ["cargo"],
-      "matchPackageNames": ["kube", "k8s-openapi"],
+      "matchManagers": [
+        "cargo"
+      ],
+      "matchPackageNames": [
+        "kube",
+        "k8s-openapi"
+      ],
       "groupName": "rust-kube",
       "automerge": false
     },
     {
       "description": "Group React, Shadcn, Tailwind, and Playwright updates",
-      "matchManagers": ["npm"],
+      "matchManagers": [
+        "npm"
+      ],
       "groupName": "frontend-dependencies",
-      "matchUpdateTypes": ["minor", "patch"],
+      "matchUpdateTypes": [
+        "minor",
+        "patch"
+      ],
       "automerge": true
     },
     {
-      "description": "Group GitHub Actions updates",
-      "matchManagers": ["github-actions"],
+      "description": "Group GitHub Actions updates (SHA digests pinned via helpers:pinGitHubActionDigests)",
+      "matchManagers": [
+        "github-actions"
+      ],
       "groupName": "github-actions",
       "automerge": true
     },
     {
+      "description": "Group container base images (Dockerfile digests) and annotated release tooling",
+      "matchManagers": [
+        "dockerfile",
+        "custom.regex"
+      ],
+      "groupName": "release-tooling",
+      "automerge": true
+    },
+    {
+      "description": "Pinned semantic-release toolchain (release/package.json + package-lock.json)",
+      "matchManagers": [
+        "npm"
+      ],
+      "matchFileNames": [
+        "release/package.json"
+      ],
+      "groupName": "release-tooling",
+      "automerge": true
+    },
+    {
       "description": "Require manual review for major breaking dependency upgrades",
-      "matchUpdateTypes": ["major"],
+      "matchUpdateTypes": [
+        "major"
+      ],
       "automerge": false
+    }
+  ],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Pinned tool versions annotated with `# renovate: datasource=... depName=...` in workflows and the Dockerfile",
+      "managerFilePatterns": [
+        "/^\\.github/workflows/[^/]+\\.ya?ml$/",
+        "/(^|/)Dockerfile$/"
+      ],
+      "matchStrings": [
+        "# renovate: datasource=(?<datasource>[a-z-]+?) depName=(?<depName>\\S+?)(?: versioning=(?<versioning>\\S+?))?\\s+(?:ARG )?[A-Z0-9_]+(?:=|: )\"?(?<currentValue>[^\\s\"]+)\"?"
+      ]
     }
   ]
 }

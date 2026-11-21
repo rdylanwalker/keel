@@ -1,0 +1,6 @@
+# actionlint configuration. `ubuntu-26.04` is a GitHub-hosted runner label that older
+# actionlint releases do not know yet; declare it so the runner-label check stays useful.
+self-hosted-runner:
+  labels:
+    - ubuntu-26.04
+    - ubuntu-26.04-arm
