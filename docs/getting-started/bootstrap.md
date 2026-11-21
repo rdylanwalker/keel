@@ -116,6 +116,24 @@ keel bootstrap init \
 
 > **Testing Without In-Cluster Controllers (`--skip-core-install`):** To validate cloud infrastructure provisioning without deploying Kubernetes controllers onto the newly booted VM, append `--skip-core-install`.
 
+#### k3s Packaged Components
+
+The AWS, Azure, and GCP programs install single-node `k3s` on first boot with `INSTALL_K3S_EXEC="server --disable=traefik ..."`:
+
+| k3s packaged component | Status | Owner |
+| --- | --- | --- |
+| Traefik ingress | **Disabled** (`--disable=traefik`) | — Envoy Gateway (`keel-ingress`) is the only ingress/Gateway controller, so the two never compete for ports `80`/`443` or `LoadBalancer` addresses |
+| ServiceLB (`klipper-lb`) | Enabled | k3s — exposes the Envoy Gateway `LoadBalancer` Service on the node IP |
+| `local-path` provisioner | Enabled | k3s — default `StorageClass` for SeaweedFS, Rauthy, and Forgejo PVCs |
+| `metrics-server` | Enabled | k3s — resource metrics API |
+| CoreDNS | Enabled | k3s — Stage 0 adds Rauthy/Forgejo host rewrites |
+
+These k3s-owned components are reconciled by k3s from `/var/lib/rancher/k3s/server/manifests`, not by Flux, and are not Keel catalog add-ons. Do not delete them, and do not install a second ingress controller on the management cluster.
+
+`--target hetzner` and `--target proxmox` only provision the protected VM; they do not install `k3s`. Install your distribution of choice on the node yourself (for `k3s`, pass `--disable=traefik`, or `--k3s-arg "--disable=traefik@server:*"` for `k3d`). Then attach it with `--target kubeconfig`.
+
+> **Existing clusters:** the install script runs only on first boot, and the node resources ignore later changes to it (`ignoreChanges`), so `keel bootstrap recover` never restarts or replaces a protected node because of a script edit. Nodes created before Traefik was disabled keep it until you migrate them by hand. Add `disable: [traefik]` to `/etc/rancher/k3s/config.yaml` and run `systemctl restart k3s`. If `kubectl -n kube-system get helmchart traefik traefik-crd` still returns either chart, delete it.
+
 ### Core Controllers Installed Out of the Box
 
 By default, `keel bootstrap init` installs the core control-plane components onto the target cluster using `kubectl` and `helm`:

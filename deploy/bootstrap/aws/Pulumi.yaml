@@ -126,6 +126,12 @@ resources:
     type: aws:ec2:Instance
     options:
       protect: true
+      # The k3s install script only runs on first boot. Editing it (e.g. adding
+      # `--disable=traefik`) must not stop/start or replace an existing protected node
+      # when `keel bootstrap recover` re-runs `pulumi up`; migrate live nodes by hand
+      # (docs/getting-started/bootstrap.md "k3s Packaged Components").
+      ignoreChanges:
+        - userData
     properties:
       ami: '${amiId != "" ? amiId : ubuntuAmi.id}'
       instanceType: ${instanceType}
@@ -137,7 +143,7 @@ resources:
         #!/bin/bash
         set -euo pipefail
         PUBLIC_IP=$(curl -sf http://169.254.169.254/latest/meta-data/public-ipv4 || curl -sf https://ifconfig.me)
-        curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="server --tls-san=${PUBLIC_IP} --write-kubeconfig-mode=644" sh -
+        curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="server --disable=traefik --tls-san=$${PUBLIC_IP} --write-kubeconfig-mode=644" sh -
       rootBlockDevice:
         volumeSize: ${rootVolumeSizeGb}
         volumeType: gp3

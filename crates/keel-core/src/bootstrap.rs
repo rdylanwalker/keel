@@ -991,6 +991,128 @@ users:
   - name: staging-admin
 "#;
 
+    /// Extracts every `INSTALL_K3S_EXEC="..."` value from a Stage 0 program.
+    fn k3s_install_exec_values(program: &str) -> Vec<&str> {
+        program
+            .match_indices("INSTALL_K3S_EXEC=\"")
+            .map(|(idx, marker)| {
+                let rest = &program[idx + marker.len()..];
+                &rest[..rest.find('"').expect("unterminated INSTALL_K3S_EXEC")]
+            })
+            .collect()
+    }
+
+    #[test]
+    fn k3s_stage0_targets_disable_bundled_traefik_only() {
+        // (target, resource that runs the k3s install script, its ignored boot-script input)
+        let expected = [
+            (BootstrapTargetKind::Aws, "seedControlPlaneNode", "userData"),
+            (
+                BootstrapTargetKind::Gcp,
+                "seedControlPlaneVm",
+                "metadata[\"startup-script\"]",
+            ),
+            (
+                BootstrapTargetKind::Azure,
+                "seedControlPlaneVm",
+                "osProfile.customData",
+            ),
+        ];
+        let mut installing = Vec::new();
+        for kind in BootstrapTargetKind::all() {
+            let Some(program) = PulumiBootstrapTarget::new(*kind).embedded_pulumi_yaml() else {
+                continue;
+            };
+            let execs = k3s_install_exec_values(program);
+            if program.contains("get.k3s.io") {
+                installing.push(*kind);
+                assert!(
+                    !execs.is_empty(),
+                    "{kind}: k3s install without INSTALL_K3S_EXEC"
+                );
+            }
+            for exec in execs {
+                let flags: Vec<&str> = exec.split_whitespace().collect();
+                assert!(
+                    flags.contains(&"--disable=traefik"),
+                    "{kind}: k3s must not install Traefik alongside Envoy Gateway: {exec}"
+                );
+                // servicelb, local-storage and metrics-server stay k3s-owned.
+                for flag in &flags {
+                    if let Some(component) = flag.strip_prefix("--disable=") {
+                        assert_eq!(component, "traefik", "{kind}: unexpected {flag}");
+                    }
+                    assert_ne!(*flag, "--disable", "{kind}: use --disable=<component>");
+                }
+            }
+        }
+        assert_eq!(
+            installing,
+            expected.iter().map(|(k, _, _)| *k).collect::<Vec<_>>(),
+            "k3s-installing Stage 0 targets changed; extend this test and the docs"
+        );
+
+        for (kind, resource, ignored) in expected {
+            let program = PulumiBootstrapTarget::new(kind)
+                .embedded_pulumi_yaml()
+                .unwrap();
+            let doc: serde_yml::Value = serde_yml::from_str(program).unwrap();
+            let options = &doc["resources"][resource]["options"];
+            assert_eq!(options["protect"], serde_yml::Value::Bool(true), "{kind}");
+            let ignore: Vec<&str> = options["ignoreChanges"]
+                .as_sequence()
+                .unwrap_or_else(|| panic!("{kind}: {resource} lacks ignoreChanges"))
+                .iter()
+                .filter_map(|v| v.as_str())
+                .collect();
+            assert!(
+                ignore.contains(&ignored),
+                "{kind}: editing the k3s boot script must not churn the protected node"
+            );
+        }
+    }
+
+    /// Pulumi YAML interpolates every `${...}` in any string, so a shell
+    /// variable in an embedded boot script must be escaped as `$${VAR}`.
+    /// Otherwise `pulumi preview`/`up` fails with an unknown-reference error.
+    #[test]
+    fn stage0_programs_escape_shell_variables() {
+        for kind in BootstrapTargetKind::all() {
+            let Some(program) = PulumiBootstrapTarget::new(*kind).embedded_pulumi_yaml() else {
+                continue;
+            };
+            for (idx, _) in program.match_indices("${") {
+                if program[..idx].ends_with('$') {
+                    continue; // `$${VAR}` renders a literal `${VAR}` for the shell.
+                }
+                let rest = &program[idx + 2..];
+                let name = &rest[..rest.find('}').unwrap_or(rest.len())];
+                let shell_like = name.starts_with(|c: char| c.is_ascii_uppercase() || c == '_')
+                    && name
+                        .chars()
+                        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
+                assert!(
+                    !shell_like,
+                    "{kind}: unescaped shell variable ${{{name}}} is a Pulumi YAML \
+                     interpolation; write $${{{name}}}"
+                );
+            }
+        }
+        for kind in [
+            BootstrapTargetKind::Aws,
+            BootstrapTargetKind::Gcp,
+            BootstrapTargetKind::Azure,
+        ] {
+            let program = PulumiBootstrapTarget::new(kind)
+                .embedded_pulumi_yaml()
+                .unwrap();
+            assert!(
+                program.contains("--tls-san=$${PUBLIC_IP}"),
+                "{kind}: k3s --tls-san must reference the escaped shell PUBLIC_IP"
+            );
+        }
+    }
+
     #[test]
     fn test_factory_provider_agnostic_targets() {
         for kind in BootstrapTargetKind::all() {

@@ -92,6 +92,12 @@ resources:
     type: gcp:compute:Instance
     options:
       protect: true
+      # The k3s install script is guarded to run once. Editing it (e.g. adding
+      # `--disable=traefik`) must not churn an existing protected VM when
+      # `keel bootstrap recover` re-runs `pulumi up`; migrate live nodes by hand
+      # (docs/getting-started/bootstrap.md "k3s Packaged Components").
+      ignoreChanges:
+        - metadata["startup-script"]
     properties:
       name: ${clusterName}-cp-01
       machineType: ${machineType}
@@ -115,7 +121,7 @@ resources:
           set -euo pipefail
           if [ ! -f /etc/rancher/k3s/k3s.yaml ]; then
             PUBLIC_IP=$(curl -sf -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/access-configs/0/external-ip || curl -sf https://ifconfig.me)
-            curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="server --tls-san=${PUBLIC_IP} --write-kubeconfig-mode=644" sh -
+            curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="server --disable=traefik --tls-san=$${PUBLIC_IP} --write-kubeconfig-mode=644" sh -
           fi
       labels:
         managed-by: keel

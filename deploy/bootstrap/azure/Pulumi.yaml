@@ -39,7 +39,7 @@ variables:
       #!/bin/bash
       set -euo pipefail
       PUBLIC_IP=$(curl -sf -H Metadata:true "http://169.254.169.254/metadata/instance/network/interface/0/ipv4/ipAddress/0/publicIpAddress?api-version=2021-02-01&format=text" || curl -sf https://ifconfig.me)
-      curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="server --tls-san=${PUBLIC_IP} --write-kubeconfig-mode=644" sh -
+      curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="server --disable=traefik --tls-san=$${PUBLIC_IP} --write-kubeconfig-mode=644" sh -
 
 resources:
   storageAccountSuffix:
@@ -188,6 +188,12 @@ resources:
     type: azure-native:compute:VirtualMachine
     options:
       protect: true
+      # customData is first-boot only and immutable on Azure VMs. Editing the k3s
+      # install script (e.g. adding `--disable=traefik`) must not force replacement of
+      # the protected VM when `keel bootstrap recover` re-runs `pulumi up`; migrate live
+      # nodes by hand (docs/getting-started/bootstrap.md "k3s Packaged Components").
+      ignoreChanges:
+        - osProfile.customData
     properties:
       resourceGroupName: ${managementResourceGroup.name}
       location: ${location}
