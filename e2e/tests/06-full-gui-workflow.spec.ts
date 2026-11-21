@@ -269,16 +269,21 @@ test.describe('06 - Full Localhost GUI GitOps Workflow', () => {
       rauthy.getByRole('link', { name: 'https://idp.keel.local:8888/auth/v1/admin' }),
     ).toBeVisible();
     await expect(rauthy.getByText('Protected')).toBeVisible();
-    // Protected add-on rows offer no tenant edit/delete actions.
+    // Protected add-on rows mirror tenant rows (Edit first, Rollback in Delete's slot) but never
+    // offer delete or the tenant config editor; Edit opens the PR-driven add-on form.
     await expect(
       releasesSection
         .locator('[data-testid^="management-addon-row-"]')
-        .getByRole('button', { name: /Delete|Edit/ }),
+        .getByRole('button', { name: /Delete|Edit release/ }),
     ).toHaveCount(0);
+    await expect(rauthy.getByRole('button').first(), 'Edit is the leftmost action').toHaveAttribute(
+      'data-testid',
+      'management-addon-edit-rauthy',
+    );
     await expect(
       releasesSection.getByRole('button', { name: /Delete release (rauthy|s3-state-backend)/ }),
     ).toHaveCount(0);
-    await expect(rauthy.getByTestId('management-addon-diagnostics-rauthy')).toBeEnabled();
+    await expect(rauthy.getByTestId('management-addon-inspect-rauthy')).toBeEnabled();
     await expect(rauthy.getByTestId('management-addon-reconcile-rauthy')).toBeEnabled();
     await expect(rauthy.getByTestId('management-addon-rollback-rauthy')).toBeEnabled();
 
@@ -294,11 +299,11 @@ test.describe('06 - Full Localhost GUI GitOps Workflow', () => {
     ).toHaveCount(0);
     await filter.fill('');
 
-    await releasesSection.getByTestId('management-addon-upgrade-s3-state-backend').click();
+    await releasesSection.getByTestId('management-addon-edit-s3-state-backend').click();
     await expect(page.getByRole('button', { name: /Sync Upstream Schema/i })).toBeVisible();
     await page.getByRole('button', { name: /Submit & Open Git PR Proposal/i }).click();
     await expect(
-      releasesSection.getByText(/Opened Upgrade PR #\S+ .* for management add-on s3-state-backend/),
+      releasesSection.getByText(/Opened Edit PR #\S+ .* for management add-on s3-state-backend/),
     ).toBeVisible({ timeout: 10000 });
 
     // Roll rauthy back to its previous Git revision (seeded 0.37.1 -> 0.37.2) through a reviewed PR.

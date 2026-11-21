@@ -7,7 +7,6 @@ import {
   RotateCw,
   Search,
   ShieldCheck,
-  SlidersHorizontal,
   Terminal,
   Trash2,
 } from "lucide-react"
@@ -263,7 +262,7 @@ function StackActionsCell({
 
 /** Row actions specific to protected management add-on rows (cluster admins only). */
 export interface ManagementRowActions {
-  /** `catalog/core` entries by id; Upgrade is disabled for add-ons without one. */
+  /** `catalog/core` entries by id; Edit is disabled for add-ons without one. */
   catalogById: ReadonlyMap<string, CatalogItem>
   onUpgrade: (addon: CatalogItem) => void
   onRollback: (id: string) => void
@@ -275,7 +274,7 @@ export interface ReleaseRowActions {
   onInspect: (rel: ReleaseSummary, namespace: string) => void
   onReconcile: (rel: ReleaseSummary) => void
   onDelete: (rel: ReleaseSummary) => void
-  /** Enables the management add-on actions (Diagnostics / Reconcile / Upgrade / Rollback). */
+  /** Enables the management add-on actions (Edit / Inspect / Reconcile / Rollback). */
   management?: ManagementRowActions
 }
 
@@ -617,7 +616,7 @@ export function buildReleaseColumns(
   ]
 }
 
-/** Protected management add-on: Diagnostics, Reconcile, PR-driven Upgrade / Rollback; never Edit or Delete. */
+/** Protected management add-on, mirroring tenant rows: PR-driven Edit, Inspect, Reconcile, PR-driven Rollback (in place of Delete). */
 function ManagementActionsCell({
   rel,
   actions,
@@ -635,10 +634,28 @@ function ManagementActionsCell({
   const rollingBack = Boolean(mgmt) && busy.rollingBackId === id
   return (
     <div className="inline-flex items-center justify-end gap-1 @md:gap-1.5">
+      {mgmt && (
+        <IconAction
+          testId={`management-addon-edit-${id}`}
+          label={`Edit ${id}`}
+          title={
+            conflict
+              ? MANAGEMENT_ADDON_CONFLICT_HINT
+              : addon
+                ? "Edit (Open PR: version + values)"
+                : "No catalog/core entry for this add-on"
+          }
+          disabled={conflict || !addon}
+          onClick={() => addon && mgmt.onUpgrade(addon)}
+          tone="indigo"
+        >
+          <Pencil className="h-3.5 w-3.5" />
+        </IconAction>
+      )}
       <IconAction
-        testId={`management-addon-diagnostics-${id}`}
-        label={`Diagnostics for ${id}`}
-        title="Diagnostics"
+        testId={`management-addon-inspect-${id}`}
+        label={`Inspect ${id}`}
+        title="Inspect"
         onClick={() => actions.onInspect(rel, rel.namespace)}
         tone="indigo-soft"
       >
@@ -658,43 +675,25 @@ function ManagementActionsCell({
         />
       </IconAction>
       {mgmt && (
-        <>
-          <IconAction
-            testId={`management-addon-upgrade-${id}`}
-            label={`Upgrade ${id}`}
-            title={
-              conflict
-                ? MANAGEMENT_ADDON_CONFLICT_HINT
-                : addon
-                  ? "Upgrade (Open PR: version + values)"
-                  : "No catalog/core entry for this add-on"
-            }
-            disabled={conflict || !addon}
-            onClick={() => addon && mgmt.onUpgrade(addon)}
-            tone="indigo"
-          >
-            <SlidersHorizontal className="h-3.5 w-3.5" />
-          </IconAction>
-          <IconAction
-            testId={`management-addon-rollback-${id}`}
-            label={`Rollback ${id}`}
-            title={
-              conflict
-                ? MANAGEMENT_ADDON_CONFLICT_HINT
-                : rollingBack
-                  ? "Rolling back..."
-                  : "Rollback (Open PR)"
-            }
-            disabled={conflict || rollingBack}
-            busy={rollingBack}
-            onClick={() => mgmt.onRollback(id)}
-            tone="emerald"
-          >
-            <RotateCcw
-              className={`h-3.5 w-3.5 ${rollingBack ? "animate-spin" : ""}`}
-            />
-          </IconAction>
-        </>
+        <IconAction
+          testId={`management-addon-rollback-${id}`}
+          label={`Rollback ${id}`}
+          title={
+            conflict
+              ? MANAGEMENT_ADDON_CONFLICT_HINT
+              : rollingBack
+                ? "Rolling back..."
+                : "Rollback (Open PR)"
+          }
+          disabled={conflict || rollingBack}
+          busy={rollingBack}
+          onClick={() => mgmt.onRollback(id)}
+          tone="emerald"
+        >
+          <RotateCcw
+            className={`h-3.5 w-3.5 ${rollingBack ? "animate-spin" : ""}`}
+          />
+        </IconAction>
       )}
     </div>
   )

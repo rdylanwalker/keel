@@ -196,7 +196,7 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
   const handleAddonProposal = useCallback(
     (proposal: Proposal, action: "upgrade" | "rollback", id: string) => {
       setReleaseBanner({
-        message: `Opened ${action === "upgrade" ? "Upgrade" : "Rollback"} PR #${proposal.id} (${proposal.branch || "main"}) for management add-on ${id}`,
+        message: `Opened ${action === "upgrade" ? "Edit" : "Rollback"} PR #${proposal.id} (${proposal.branch || "main"}) for management add-on ${id}`,
         prUrl: proposal.prUrl,
         prId: proposal.id,
       })

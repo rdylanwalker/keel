@@ -293,7 +293,7 @@ describe("ControlPlaneProvidersView component", () => {
     ).not.toBeInTheDocument()
     expect(screen.queryByText("Protected")).not.toBeInTheDocument()
     expect(
-      screen.queryByRole("button", { name: /Upgrade|Rollback/i })
+      screen.queryByRole("button", { name: /Edit|Upgrade|Rollback/i })
     ).not.toBeInTheDocument()
     fireEvent.click(
       screen.getByRole("button", { name: /Manage add-ons in Topology Map/i })

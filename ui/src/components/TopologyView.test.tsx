@@ -614,18 +614,18 @@ describe("TopologyView", () => {
       ).toBeInTheDocument()
       await waitFor(() =>
         expect(
-          screen.getByRole("button", { name: "Upgrade kyverno" })
+          screen.getByRole("button", { name: "Edit kyverno" })
         ).toBeEnabled()
       )
       expect(
-        screen.getByRole("button", { name: "Upgrade forgejo" })
+        screen.getByRole("button", { name: "Edit forgejo" })
       ).toBeDisabled()
       expect(
         screen.getByRole("button", { name: "Rollback forgejo" })
       ).toBeDisabled()
       // No catalog/core entry: upgrade unavailable, rollback still possible.
       expect(
-        screen.getByRole("button", { name: "Upgrade orphan-addon" })
+        screen.getByRole("button", { name: "Edit orphan-addon" })
       ).toBeDisabled()
       expect(
         screen.getByRole("button", { name: "Rollback orphan-addon" })
@@ -640,9 +640,10 @@ describe("TopologyView", () => {
             .getAllByRole("button")
             .map((b) => b.getAttribute("aria-label"))
         ).toEqual([
-          `Diagnostics for ${id}`,
+          // Same layout as tenant rows: Edit first, Rollback in Delete's slot.
+          `Edit ${id}`,
+          `Inspect ${id}`,
           `Reconcile ${id}`,
-          `Upgrade ${id}`,
           `Rollback ${id}`,
         ])
       }
@@ -707,7 +708,7 @@ describe("TopologyView", () => {
       ).toHaveLength(2)
       for (const row of rows) {
         expect(
-          within(row).getByRole("button", { name: "Upgrade forgejo" })
+          within(row).getByRole("button", { name: "Edit forgejo" })
         ).toBeDisabled()
         expect(
           within(row).getByRole("button", { name: "Rollback forgejo" })
@@ -762,7 +763,7 @@ describe("TopologyView", () => {
       })
       renderWithAuthz(<TopologyView />)
       fireEvent.click(
-        await screen.findByTestId("management-addon-diagnostics-kyverno")
+        await screen.findByTestId("management-addon-inspect-kyverno")
       )
       expect(
         screen.getByRole("dialog", { name: "inspector kyverno release" })
@@ -812,13 +813,11 @@ describe("TopologyView", () => {
         )
       renderWithAuthz(<TopologyView />)
 
-      const upgrade = await screen.findByTestId(
-        "management-addon-upgrade-kyverno"
-      )
+      const upgrade = await screen.findByTestId("management-addon-edit-kyverno")
       await waitFor(() => expect(upgrade).toBeEnabled())
       fireEvent.click(upgrade)
       expect(
-        screen.getByRole("dialog", { name: /Upgrade Kyverno/i })
+        screen.getByRole("dialog", { name: /Edit Kyverno/i })
       ).toBeInTheDocument()
       fireEvent.change(screen.getByLabelText(/Chart Version/i), {
         target: { value: "3.5.0" },
@@ -833,13 +832,11 @@ describe("TopologyView", () => {
         })
         expect(
           screen.getByText(
-            "Opened Upgrade PR #500 (keel/mgmt/upgrade-kyverno) for management add-on kyverno"
+            "Opened Edit PR #500 (keel/mgmt/upgrade-kyverno) for management add-on kyverno"
           )
         ).toBeInTheDocument()
       })
-      expect(
-        screen.queryByRole("dialog", { name: /Upgrade Kyverno/i })
-      ).toBeNull()
+      expect(screen.queryByRole("dialog", { name: /Edit Kyverno/i })).toBeNull()
       expect(
         screen.getByRole("link", { name: "View on Forge" })
       ).toHaveAttribute("href", "https://forge.example/pr/500")
@@ -885,9 +882,7 @@ describe("TopologyView", () => {
         coreAddon("kyverno", { name: "Kyverno" }),
       ])
       renderWithAuthz(<TopologyView />)
-      const upgrade = await screen.findByTestId(
-        "management-addon-upgrade-kyverno"
-      )
+      const upgrade = await screen.findByTestId("management-addon-edit-kyverno")
       await waitFor(() => expect(upgrade).toBeEnabled())
       fireEvent.click(upgrade)
       fireEvent.change(screen.getByLabelText(/Chart Version/i), {
@@ -901,7 +896,7 @@ describe("TopologyView", () => {
         expect(screen.queryByTestId("management-addon-row-kyverno")).toBeNull()
       )
       expect(
-        screen.getByRole("dialog", { name: /Upgrade Kyverno/i })
+        screen.getByRole("dialog", { name: /Edit Kyverno/i })
       ).toBeInTheDocument()
       expect(screen.getByLabelText(/Chart Version/i)).toHaveValue("9.9.9")
       expect(api.getCoreAddons).toHaveBeenCalledTimes(1)
@@ -1007,9 +1002,7 @@ describe("TopologyView", () => {
         expect(addonRow(id)).toBeInTheDocument()
       }
       expect(within(addonRow("rauthy")).getByText("0.37.2")).toBeInTheDocument()
-      expect(
-        screen.getByRole("button", { name: "Upgrade rauthy" })
-      ).toBeEnabled()
+      expect(screen.getByRole("button", { name: "Edit rauthy" })).toBeEnabled()
       expect(api.getCoreAddons).not.toHaveBeenCalled()
     })
   })

@@ -276,7 +276,7 @@ const DeployInstanceModalBody: React.FC<DeployInstanceModalProps> = (props) => {
             s.name === effectiveInstanceName && s.tenant === effectiveTenant
         ))
 
-  const verb = isManagementAddon ? "Upgrade" : isEditMode ? "Edit" : "Create"
+  const verb = isManagementAddon || isEditMode ? "Edit" : "Create"
   const canSyncSchema =
     (activeItem?.type === "app" || isManagementAddon) &&
     activeItem?.runtime !== "manifest" &&
