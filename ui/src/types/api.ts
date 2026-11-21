@@ -264,7 +264,8 @@ export interface UnlockStackResponse {
 }
 
 export interface ReleaseSummary {
-  id: string
+  /** Optional: the server omits it; rows fall back to `<namespace>-<name>`. */
+  id?: string
   name: string
   tenant: string
   namespace: string
@@ -283,6 +284,21 @@ export interface ReleaseSummary {
   primaryVersion?: string
   errorRate?: number
   latencyMs?: number
+  /**
+   * `true` for a protected management-plane core add-on (`clusters/management/core-addons/`),
+   * returned to cluster admins only with `tenant: "management"`.
+   */
+  managementAddon?: boolean
+  /** `true` when the release cannot be edited or deleted through the API. */
+  protected?: boolean
+  /** `catalog/core` application id backing a management add-on. */
+  catalogId?: string
+  /** Flux object reconciling a management add-on. */
+  addonKind?: "HelmRelease" | "Kustomization"
+  /** Chart version / image tag declared in Git for a management add-on. */
+  desiredVersion?: string
+  /** `true` when the add-on id is defined by more than one Flux object (upgrade/rollback 409). */
+  conflict?: boolean
 }
 
 export type WatchedCrdKind =

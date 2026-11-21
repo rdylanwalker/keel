@@ -8,7 +8,11 @@ import {
 } from "../../lib/api"
 import { visibleLoadError } from "../../lib/errors"
 import { isDemoMode } from "../../lib/utils"
-import { DEFAULT_EVENTS, DEFAULT_STACKS } from "../../lib/demoFixtures"
+import {
+  DEFAULT_EVENTS,
+  DEFAULT_STACKS,
+  DEMO_MANAGEMENT_ADDON_RELEASES,
+} from "../../lib/demoFixtures"
 
 /** Live-update transport state shown in the topology header (UI-17). */
 export type StreamState = "demo" | "paused" | "connecting" | "live" | "polling"
@@ -56,20 +60,30 @@ export interface TopologyData {
   setPaused: (paused: boolean) => void
 }
 
+/** `?tenant=` value that lists only the protected management add-ons (cluster admins only). */
+export const MANAGEMENT_RELEASES_TENANT = "management"
+
 /**
  * Loads stacks/releases and keeps them fresh. Updates are driven by the SSE CRD stream
  * (debounced refetch per transition); periodic polling with exponential backoff is used only
  * while the stream is disconnected. Demo mode never touches the network.
+ *
+ * With `includeManagementAddons` (cluster admins), the protected management add-ons are merged
+ * into `releases` even when a tenant filter is active: the server only appends them to the
+ * unfiltered list, so a tenant-scoped admin view fetches `?tenant=management` alongside.
  */
 export function useTopologyData(
   authenticated: boolean,
-  selectedTenant?: string
+  selectedTenant?: string,
+  includeManagementAddons = false
 ): TopologyData {
   const demo = isDemoMode()
   const [stacks, setStacks] = useState<StackSummary[]>(() =>
     demo ? DEFAULT_STACKS : []
   )
-  const [releases, setReleases] = useState<ReleaseSummary[]>([])
+  const [releases, setReleases] = useState<ReleaseSummary[]>(() =>
+    demo ? DEMO_MANAGEMENT_ADDON_RELEASES : []
+  )
   const [events, setEvents] = useState<CrdWatchEvent[]>(() =>
     demo ? DEFAULT_EVENTS : []
   )
@@ -86,22 +100,43 @@ export function useTopologyData(
     if (demo) return
     const seq = ++requestSeq.current
     setLoading(true)
+    const fetchAddonsSeparately =
+      includeManagementAddons &&
+      Boolean(selectedTenant) &&
+      selectedTenant !== MANAGEMENT_RELEASES_TENANT
     try {
-      const [stacksRes, releasesData] = await Promise.all([
+      const [stacksRes, releasesData, addonsData] = await Promise.all([
         getStacksWithMeta(selectedTenant),
         getReleases(selectedTenant).catch(() => [] as ReleaseSummary[]),
+        fetchAddonsSeparately
+          ? getReleases(MANAGEMENT_RELEASES_TENANT).catch(
+              () => [] as ReleaseSummary[]
+            )
+          : Promise.resolve([] as ReleaseSummary[]),
       ])
       if (seq !== requestSeq.current) return
       setError(null)
       setStacks(stacksRes.stacks || [])
-      setReleases(releasesData || [])
+      const addons = (addonsData || []).map((r) => ({
+        ...r,
+        managementAddon: true,
+      }))
+      setReleases([
+        ...(releasesData || []).filter(
+          (r) =>
+            !addons.some(
+              (a) => a.namespace === r.namespace && a.name === r.name
+            )
+        ),
+        ...addons,
+      ])
     } catch (err) {
       if (seq !== requestSeq.current) return
       setError(visibleLoadError(err, "Failed to load live stack topology"))
     } finally {
       if (seq === requestSeq.current) setLoading(false)
     }
-  }, [demo, selectedTenant])
+  }, [demo, selectedTenant, includeManagementAddons])
 
   const scheduleRefresh = useCallback(
     (delayMs: number) => {

@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from "react"
+import React, { useCallback, useMemo, useState } from "react"
 import {
   Activity,
   AlertTriangle,
@@ -8,7 +8,7 @@ import {
   RefreshCw,
 } from "lucide-react"
 
-import { ReleaseSummary, StackSummary } from "../types/api"
+import { Proposal, ReleaseSummary, StackSummary } from "../types/api"
 import {
   deleteRelease,
   deleteStack,
@@ -36,6 +36,7 @@ import {
 import { TopologySection } from "./topology/TopologySection"
 import { TopologyStats } from "./topology/TopologyStats"
 import { ManagementPlaneStrip } from "./topology/ManagementPlaneStrip"
+import { ManagementAddonsGroup } from "./topology/ManagementAddonsGroup"
 import { StreamStatus } from "./topology/StreamStatus"
 
 // Load the SSH terminal (wterm WASM core) only when a session is opened.
@@ -85,7 +86,7 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
   selectedTenant,
 }) => {
   const authz = useAuthz()
-  const data = useTopologyData(authenticated, selectedTenant)
+  const data = useTopologyData(authenticated, selectedTenant, authz.isAdmin)
   const { stacks, releases, setError, scheduleRefresh } = data
 
   const [inspected, setInspected] = useState<InspectTarget | null>(null)
@@ -169,6 +170,35 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
     setError,
   ])
 
+  const handleReconcileRelease = useCallback(
+    async (rel: ReleaseSummary) => {
+      const ns = rel.namespace || "tenant-default"
+      setReconcilingReleaseKey(`${ns}/${rel.name}`)
+      setReleaseBanner(null)
+      try {
+        const res = await reconcileRelease(ns, rel.name)
+        setReleaseBanner({ message: res.message })
+        scheduleRefresh(1500)
+      } catch (err) {
+        setError(errorMessage(err, "Failed to reconcile release"))
+      } finally {
+        setReconcilingReleaseKey(null)
+      }
+    },
+    [scheduleRefresh, setError]
+  )
+
+  const handleAddonProposal = useCallback(
+    (proposal: Proposal, action: "upgrade" | "rollback", id: string) => {
+      setReleaseBanner({
+        message: `Opened ${action === "upgrade" ? "Upgrade" : "Rollback"} PR #${proposal.id} (${proposal.branch || "main"}) for management add-on ${id}`,
+        prUrl: proposal.prUrl,
+        prId: proposal.id,
+      })
+    },
+    []
+  )
+
   const releaseColumns = useMemo(
     () =>
       buildReleaseColumns({
@@ -178,20 +208,7 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
         deletingKey,
         onInspect: (rel: ReleaseSummary, ns: string) =>
           setInspected({ namespace: ns, name: rel.name, kind: "release" }),
-        onReconcile: async (rel: ReleaseSummary) => {
-          const ns = rel.namespace || "tenant-default"
-          setReconcilingReleaseKey(`${ns}/${rel.name}`)
-          setReleaseBanner(null)
-          try {
-            const res = await reconcileRelease(ns, rel.name)
-            setReleaseBanner({ message: res.message })
-            scheduleRefresh(1500)
-          } catch (err) {
-            setError(errorMessage(err, "Failed to reconcile release"))
-          } finally {
-            setReconcilingReleaseKey(null)
-          }
-        },
+        onReconcile: handleReconcileRelease,
         onDelete: async (rel: ReleaseSummary) => {
           const ns = rel.namespace || "tenant-default"
           setDeletingKey(`release:${ns}/${rel.name}`)
@@ -217,10 +234,24 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
       onEditRelease,
       reconcilingReleaseKey,
       deletingKey,
+      handleReconcileRelease,
       scheduleRefresh,
       setError,
     ]
   )
+
+  // Management add-ons (admin-only from the API) get their own protected group; the tenant
+  // table never shows them, so they can't be edited or deleted like tenant releases.
+  const { managementAddons, tenantReleases } = useMemo(() => {
+    const managementAddons: ReleaseSummary[] = []
+    const tenantReleases: ReleaseSummary[] = []
+    for (const r of releases) {
+      if (r.managementAddon) managementAddons.push(r)
+      else tenantReleases.push(r)
+    }
+    return { managementAddons, tenantReleases }
+  }, [releases])
+  const showManagementAddons = authz.isAdmin && managementAddons.length > 0
 
   const managementStack = stacks.find(isManagementStack)
   const byKind = useMemo(() => {
@@ -233,7 +264,7 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
     return groups
   }, [stacks])
 
-  const canaries = releases.filter(
+  const canaries = tenantReleases.filter(
     (r) => r.canary || r.type === "canary" || r.canaryWeight !== undefined
   )
   const filteredEvents =
@@ -291,7 +322,10 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
         </div>
       )}
 
-      <TopologyStats stacks={stacks} releases={releases} />
+      <TopologyStats
+        stacks={stacks}
+        releases={authz.isAdmin ? releases : tenantReleases}
+      />
 
       {managementStack && (
         <ManagementPlaneStrip
@@ -371,7 +405,11 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
         testId="topology-releases-section"
         icon={<Package className="h-5 w-5 text-emerald-400" />}
         title="Deployed Application Releases"
-        subtitle="Flux HelmReleases & Kustomizations reconciled across tenant namespaces"
+        subtitle={
+          showManagementAddons
+            ? "Protected management-plane add-ons and Flux HelmReleases & Kustomizations reconciled across tenant namespaces"
+            : "Flux HelmReleases & Kustomizations reconciled across tenant namespaces"
+        }
         action={deployButton("app", "+ Deploy App")}
         footer={
           releaseBanner && (
@@ -386,8 +424,26 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
           )
         }
       >
+        {/* Mounted for every admin (even with no add-ons listed) so an open upgrade form or
+            rollback confirmation survives a failed or empty releases refresh. */}
+        {authz.isAdmin && (authenticated || data.streamState === "demo") && (
+          <ManagementAddonsGroup
+            addons={managementAddons}
+            reconcilingKey={reconcilingReleaseKey}
+            onDiagnostics={(rel) =>
+              setInspected({
+                namespace: rel.namespace,
+                name: rel.name,
+                kind: "release",
+              })
+            }
+            onReconcile={(rel) => void handleReconcileRelease(rel)}
+            onProposal={handleAddonProposal}
+            onError={setError}
+          />
+        )}
         <DataTable
-          data={releases}
+          data={tenantReleases}
           columns={releaseColumns}
           filterPlaceholder="Filter releases by name, namespace, chart, status..."
           emptyMessage="No application releases deployed yet — deploy a Helm chart from the Catalog."

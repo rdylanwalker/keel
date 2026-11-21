@@ -5,7 +5,12 @@ import * as api from "../lib/api"
 import { ApiError } from "../lib/errors"
 import { buildAuthz } from "../lib/authz"
 import { renderWithAuthz } from "../test/render"
-import { CrdWatchEvent, ReleaseSummary, StackSummary } from "../types/api"
+import {
+  CatalogItem,
+  CrdWatchEvent,
+  ReleaseSummary,
+  StackSummary,
+} from "../types/api"
 
 vi.mock("../lib/api", () => ({
   getStacksWithMeta: vi.fn(),
@@ -15,6 +20,9 @@ vi.mock("../lib/api", () => ({
   deleteStack: vi.fn(),
   deleteRelease: vi.fn(),
   createEventSourceStream: vi.fn(),
+  getCoreAddons: vi.fn(),
+  rollbackManagementAddon: vi.fn(),
+  upgradeManagementAddon: vi.fn(),
 }))
 
 vi.mock("./StackInspectorModal", () => ({
@@ -86,6 +94,49 @@ const release: ReleaseSummary = {
   chart: "podinfo",
 }
 
+function addonRelease(
+  name: string,
+  extra: Partial<ReleaseSummary> = {}
+): ReleaseSummary {
+  return {
+    name,
+    namespace: "flux-system",
+    tenant: "management",
+    type: "helm",
+    runtime: "helm",
+    chart: name,
+    version: "1.0.0",
+    desiredVersion: "1.0.0",
+    status: "Ready",
+    managementAddon: true,
+    protected: true,
+    catalogId: name,
+    addonKind: "HelmRelease",
+    ...extra,
+  }
+}
+
+function coreAddon(id: string, extra: Partial<CatalogItem> = {}): CatalogItem {
+  return {
+    id,
+    name: id,
+    description: `${id} addon`,
+    type: "app",
+    category: "Management Addons",
+    chart: id,
+    version: "1.0.0",
+    schema: { type: "object", properties: {} },
+    ...extra,
+  }
+}
+
+const TENANT_MEMBER = buildAuthz({
+  authenticated: true,
+  phase: "oidc-active",
+  groups: ["tenant-acme"],
+  isAdmin: false,
+})
+
 type StreamHandlers = {
   onEvent: (e: CrdWatchEvent) => void
   onError?: (e: Event) => void
@@ -111,6 +162,7 @@ describe("TopologyView", () => {
       }
     )
     mockData([vmStack, clusterStack], [release])
+    vi.mocked(api.getCoreAddons).mockResolvedValue([])
   })
 
   afterEach(() => {
@@ -471,5 +523,316 @@ describe("TopologyView", () => {
   it("does not load when unauthenticated", () => {
     renderWithAuthz(<TopologyView authenticated={false} />)
     expect(api.getStacksWithMeta).not.toHaveBeenCalled()
+    expect(api.getCoreAddons).not.toHaveBeenCalled()
+  })
+  describe("Management Plane add-on group", () => {
+    const addons = [
+      addonRelease("kyverno", {
+        desiredVersion: "3.4.0",
+        version: "3.4.0",
+        lastSynced: new Date(Date.now() - 60_000).toISOString(),
+      }),
+      addonRelease("rauthy", {
+        addonKind: "Kustomization",
+        runtime: "kustomize",
+        type: "kustomize",
+        desiredVersion: "0.37.2",
+        status: "Reconciling",
+      }),
+      addonRelease("forgejo", { conflict: true, status: "Pending" }),
+      addonRelease("orphan-addon", { status: "Error" }),
+    ]
+
+    it("renders protected add-ons apart from tenant releases with status, version and conflict", async () => {
+      mockData([], [release, ...addons])
+      vi.mocked(api.getCoreAddons).mockResolvedValue([
+        coreAddon("kyverno", { name: "Kyverno" }),
+        coreAddon("rauthy", {
+          name: "Rauthy OIDC Provider",
+          serviceUrl: "https://idp.keel.local:8888/auth/v1/admin",
+        }),
+        coreAddon("forgejo"),
+      ])
+      renderWithAuthz(<TopologyView onEditRelease={vi.fn()} />)
+
+      const group = await screen.findByTestId("management-addons-group")
+      expect(
+        within(group).getByRole("heading", { name: "Management Plane" })
+      ).toBeInTheDocument()
+      await within(group).findByText("Kyverno")
+      expect(within(group).getAllByText("Protected")).toHaveLength(4)
+      const kyverno = within(group).getByTestId("core-addon-kyverno")
+      expect(within(kyverno).getByText("v3.4.0")).toBeInTheDocument()
+      expect(within(kyverno).getByText("synced 1m ago")).toBeInTheDocument()
+      expect(
+        within(group).getByTestId("core-addon-status-kyverno")
+      ).toHaveTextContent("Ready")
+      expect(
+        within(group).getByTestId("core-addon-status-rauthy")
+      ).toHaveTextContent("Reconciling")
+      expect(
+        within(group).getByTestId("core-addon-status-orphan-addon")
+      ).toHaveTextContent("Error")
+      expect(
+        within(group).getByRole("link", {
+          name: "https://idp.keel.local:8888/auth/v1/admin",
+        })
+      ).toBeInTheDocument()
+
+      // Conflicting definitions disable PR actions.
+      expect(
+        within(group).getByTestId("core-addon-conflict-forgejo")
+      ).toBeInTheDocument()
+      expect(
+        within(group).getByRole("button", { name: "Upgrade forgejo" })
+      ).toBeDisabled()
+      expect(
+        within(group).getByRole("button", { name: "Rollback forgejo" })
+      ).toBeDisabled()
+      // No catalog/core entry: upgrade unavailable, rollback still possible.
+      expect(
+        within(group).getByRole("button", { name: "Upgrade orphan-addon" })
+      ).toBeDisabled()
+      expect(
+        within(group).getByRole("button", { name: "Rollback orphan-addon" })
+      ).toBeEnabled()
+
+      // Never offered tenant edit/delete; tenant table only has tenant releases.
+      expect(
+        screen.queryByRole("button", { name: /(Edit|Delete) release kyverno/ })
+      ).toBeNull()
+      expect(
+        within(group).queryByRole("button", { name: /Delete|Edit/ })
+      ).toBeNull()
+      const table = screen.getByTestId("topology-releases-section")
+      expect(
+        within(table).getByRole("button", { name: "Delete release podinfo" })
+      ).toBeInTheDocument()
+    })
+
+    it("runs diagnostics and reconcile against the add-on Flux object", async () => {
+      mockData([], [addons[0]])
+      vi.mocked(api.reconcileRelease).mockResolvedValue({
+        reconciled: true,
+        namespace: "flux-system",
+        name: "kyverno",
+        message: "Reconcile requested for flux-system/kyverno",
+      })
+      renderWithAuthz(<TopologyView />)
+      fireEvent.click(
+        await screen.findByRole("button", { name: "Diagnostics for kyverno" })
+      )
+      expect(
+        screen.getByRole("dialog", { name: "inspector kyverno release" })
+      ).toBeInTheDocument()
+      fireEvent.click(screen.getByText("close inspector"))
+
+      fireEvent.click(screen.getByRole("button", { name: "Reconcile kyverno" }))
+      await waitFor(() => {
+        expect(api.reconcileRelease).toHaveBeenCalledWith(
+          "flux-system",
+          "kyverno"
+        )
+        expect(
+          screen.getByText("Reconcile requested for flux-system/kyverno")
+        ).toBeInTheDocument()
+      })
+    })
+
+    it("submits the catalog/core upgrade form and confirmed rollback PRs", async () => {
+      mockData([], [addons[0]])
+      vi.mocked(api.getCoreAddons).mockResolvedValue([
+        coreAddon("kyverno", { name: "Kyverno", version: "3.4.0" }),
+      ])
+      vi.mocked(api.upgradeManagementAddon).mockResolvedValueOnce({
+        id: "500",
+        title: "Upgrade kyverno",
+        branch: "keel/mgmt/upgrade-kyverno",
+        author: "admin",
+        tenant: "keel-system",
+        status: "open",
+        createdAt: "now",
+        prUrl: "https://forge.example/pr/500",
+      })
+      vi.mocked(api.rollbackManagementAddon)
+        .mockResolvedValueOnce({
+          id: "501",
+          title: "Rollback kyverno",
+          branch: "keel/mgmt/rollback-kyverno",
+          author: "admin",
+          tenant: "keel-system",
+          status: "open",
+          createdAt: "now",
+          prUrl: "https://forge.example/pr/501",
+        })
+        .mockRejectedValueOnce(
+          new ApiError(400, "No previous revision found to roll back to")
+        )
+      renderWithAuthz(<TopologyView />)
+
+      const upgrade = await screen.findByRole("button", {
+        name: "Upgrade kyverno",
+      })
+      await waitFor(() => expect(upgrade).toBeEnabled())
+      fireEvent.click(upgrade)
+      expect(
+        screen.getByRole("dialog", { name: /Upgrade Kyverno/i })
+      ).toBeInTheDocument()
+      fireEvent.change(screen.getByLabelText(/Chart Version/i), {
+        target: { value: "3.5.0" },
+      })
+      fireEvent.click(
+        screen.getByRole("button", { name: /Submit & Open Git PR Proposal/i })
+      )
+      await waitFor(() => {
+        expect(api.upgradeManagementAddon).toHaveBeenCalledWith("kyverno", {
+          version: "3.5.0",
+          values: {},
+        })
+        expect(
+          screen.getByText(
+            "Opened Upgrade PR #500 (keel/mgmt/upgrade-kyverno) for management add-on kyverno"
+          )
+        ).toBeInTheDocument()
+      })
+      expect(
+        screen.queryByRole("dialog", { name: /Upgrade Kyverno/i })
+      ).toBeNull()
+      expect(
+        screen.getByRole("link", { name: "View on Forge" })
+      ).toHaveAttribute("href", "https://forge.example/pr/500")
+
+      const rollback = screen.getByRole("button", { name: "Rollback kyverno" })
+      fireEvent.click(rollback)
+      fireEvent.click(await screen.findByRole("button", { name: "Cancel" }))
+      expect(api.rollbackManagementAddon).not.toHaveBeenCalled()
+
+      fireEvent.click(rollback)
+      expect(
+        await screen.findByRole("alertdialog", { name: /Roll back kyverno/i })
+      ).toBeInTheDocument()
+      fireEvent.click(screen.getByRole("button", { name: "Open Rollback PR" }))
+      await waitFor(() => {
+        expect(api.rollbackManagementAddon).toHaveBeenCalledWith("kyverno")
+        expect(
+          screen.getByText(
+            "Opened Rollback PR #501 (keel/mgmt/rollback-kyverno) for management add-on kyverno"
+          )
+        ).toBeInTheDocument()
+      })
+      expect(
+        screen.getByRole("link", { name: "View on Forge" })
+      ).toHaveAttribute("href", "https://forge.example/pr/501")
+
+      fireEvent.click(rollback)
+      fireEvent.click(
+        await screen.findByRole("button", { name: "Open Rollback PR" })
+      )
+      expect(await screen.findByRole("alert")).toHaveTextContent(
+        "No previous revision found to roll back to"
+      )
+    })
+
+    it("keeps the upgrade form open when a releases refresh fails", async () => {
+      mockData([], [addons[0]])
+      vi.mocked(api.getCoreAddons).mockResolvedValue([
+        coreAddon("kyverno", { name: "Kyverno" }),
+      ])
+      renderWithAuthz(<TopologyView />)
+      const upgrade = await screen.findByRole("button", {
+        name: "Upgrade kyverno",
+      })
+      await waitFor(() => expect(upgrade).toBeEnabled())
+      fireEvent.click(upgrade)
+      fireEvent.change(screen.getByLabelText(/Chart Version/i), {
+        target: { value: "9.9.9" },
+      })
+
+      vi.mocked(api.getReleases).mockRejectedValue(new Error("boom"))
+      // The modal hides the page from the a11y tree; click the refresh control directly.
+      fireEvent.click(screen.getByText("Refresh Map"))
+      await waitFor(() =>
+        expect(screen.queryByTestId("management-addons-group")).toBeNull()
+      )
+      expect(
+        screen.getByRole("dialog", { name: /Upgrade Kyverno/i })
+      ).toBeInTheDocument()
+      expect(screen.getByLabelText(/Chart Version/i)).toHaveValue("9.9.9")
+      expect(api.getCoreAddons).toHaveBeenCalledTimes(1)
+    })
+
+    it("lists add-ons for an admin scoped to a tenant via ?tenant=management", async () => {
+      vi.mocked(api.getStacksWithMeta).mockResolvedValue({ stacks: [] })
+      vi.mocked(api.getReleases).mockImplementation(async (tenant) =>
+        tenant === "management" ? [addons[0]] : [release]
+      )
+      renderWithAuthz(<TopologyView selectedTenant="acme" />)
+      const group = await screen.findByTestId("management-addons-group")
+      expect(
+        within(group).getByTestId("core-addon-kyverno")
+      ).toBeInTheDocument()
+      expect(api.getReleases).toHaveBeenCalledWith("acme")
+      expect(api.getReleases).toHaveBeenCalledWith("management")
+      expect(
+        screen.getByRole("button", { name: "Delete release podinfo" })
+      ).toBeInTheDocument()
+    })
+
+    it("does not request management add-ons for non-admins scoped to a tenant", async () => {
+      renderWithAuthz(<TopologyView selectedTenant="acme" />, TENANT_MEMBER)
+      await screen.findByRole("button", { name: "Inspect release podinfo" })
+      expect(api.getReleases).toHaveBeenCalledWith("acme")
+      expect(api.getReleases).not.toHaveBeenCalledWith("management")
+    })
+
+    it("refreshes add-on status from the SSE stream", async () => {
+      mockData([], [addonRelease("kyverno", { status: "Reconciling" })])
+      renderWithAuthz(<TopologyView />)
+      expect(
+        await screen.findByTestId("core-addon-status-kyverno")
+      ).toHaveTextContent("Reconciling")
+      vi.mocked(api.getReleases).mockResolvedValue([addonRelease("kyverno")])
+      act(() => {
+        stream!.onEvent({
+          kind: "HelmRelease",
+          namespace: "flux-system",
+          name: "kyverno",
+          status: "Ready",
+          message: "Helm upgrade succeeded",
+          timestamp: new Date().toISOString(),
+        })
+      })
+      await waitFor(
+        () =>
+          expect(
+            screen.getByTestId("core-addon-status-kyverno")
+          ).toHaveTextContent("Ready"),
+        { timeout: 4000 }
+      )
+    })
+
+    it("never shows the group to non-admins", async () => {
+      mockData([], [release, addons[0]])
+      renderWithAuthz(<TopologyView />, TENANT_MEMBER)
+      await screen.findByRole("button", { name: "Inspect release podinfo" })
+      expect(screen.queryByTestId("management-addons-group")).toBeNull()
+      expect(screen.queryByText("kyverno")).toBeNull()
+      expect(api.getCoreAddons).not.toHaveBeenCalled()
+    })
+
+    it("shows demo add-ons including optional forgejo and keel-server", () => {
+      window.history.replaceState(null, "", "/?demo=true")
+      renderWithAuthz(<TopologyView />)
+      const group = screen.getByTestId("management-addons-group")
+      for (const id of ["flux2", "rauthy", "forgejo", "keel-server"]) {
+        expect(
+          within(group).getByTestId(`core-addon-${id}`)
+        ).toBeInTheDocument()
+      }
+      expect(within(group).getByTestId("core-addon-rauthy")).toHaveTextContent(
+        "v0.37.2"
+      )
+      expect(api.getCoreAddons).not.toHaveBeenCalled()
+    })
   })
 })

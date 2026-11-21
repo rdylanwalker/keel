@@ -5,6 +5,7 @@ import {
   PreviewReport,
   Proposal,
   ProviderRegistryEntry,
+  ReleaseSummary,
   StackSummary,
   TenantSummary,
 } from "../types/api"
@@ -423,23 +424,124 @@ export const DEFAULT_PROVIDERS: ProviderRegistryEntry[] = [
   },
 ]
 
+/** Demo-only management add-ons: one protected Flux object per `catalog/core` id. */
+const DEMO_MANAGEMENT_ADDONS: Array<{
+  id: string
+  kind: "HelmRelease" | "Kustomization"
+  chart: string
+  version: string
+  status: string
+}> = [
+  {
+    id: "flux2",
+    kind: "HelmRelease",
+    chart: "flux2",
+    version: "2.20.0",
+    status: "Ready",
+  },
+  {
+    id: "s3-state-backend",
+    kind: "HelmRelease",
+    chart: "seaweedfs",
+    version: "4.54.0",
+    status: "Ready",
+  },
+  {
+    id: "kyverno",
+    kind: "HelmRelease",
+    chart: "kyverno",
+    version: "3.10.0",
+    status: "Ready",
+  },
+  {
+    id: "cert-manager",
+    kind: "HelmRelease",
+    chart: "cert-manager",
+    version: "v1.21.3",
+    status: "Ready",
+  },
+  {
+    id: "rauthy",
+    kind: "Kustomization",
+    chart: "rauthy",
+    version: "0.37.2",
+    status: "Ready",
+  },
+  {
+    id: "envoy-gateway",
+    kind: "HelmRelease",
+    chart: "gateway-helm",
+    version: "v1.10.0",
+    status: "Ready",
+  },
+  {
+    id: "prometheus",
+    kind: "HelmRelease",
+    chart: "prometheus",
+    version: "29.48.0",
+    status: "Ready",
+  },
+  {
+    id: "flagger",
+    kind: "HelmRelease",
+    chart: "flagger",
+    version: "1.45.0",
+    status: "Ready",
+  },
+  {
+    id: "pulumi-kubernetes-operator",
+    kind: "HelmRelease",
+    chart: "pulumi-kubernetes-operator",
+    version: "2.10.1",
+    status: "Ready",
+  },
+  // Optional add-ons (`--with-forge`, `--with-keel-server`).
+  {
+    id: "forgejo",
+    kind: "HelmRelease",
+    chart: "forgejo",
+    version: "17.3.3",
+    status: "Ready",
+  },
+  {
+    id: "keel-server",
+    kind: "Kustomization",
+    chart: "keel-server",
+    version: "0.7.0",
+    status: "Ready",
+  },
+]
+
 /** Demo-only live add-on statuses (same shape as `GET /api/v1/management/addons`). */
-export const DEMO_MANAGEMENT_ADDON_STATUSES: ManagementAddonStatus[] = [
-  "s3-state-backend",
-  "kyverno",
-  "cert-manager",
-  "rauthy",
-  "envoy-gateway",
-  "prometheus",
-  "flagger",
-  "pulumi-kubernetes-operator",
-].map((id) => ({
-  id,
-  name: id,
-  namespace: "keel-system",
-  status: "Ready",
-  tracked: true,
-}))
+export const DEMO_MANAGEMENT_ADDON_STATUSES: ManagementAddonStatus[] =
+  DEMO_MANAGEMENT_ADDONS.map((a) => ({
+    id: a.id,
+    name: a.id,
+    namespace: "flux-system",
+    kind: a.kind,
+    chart: a.chart,
+    desiredVersion: a.version,
+    status: a.status,
+    tracked: true,
+  }))
+
+/** Demo-only management add-on releases (admin view of `GET /api/v1/releases`). */
+export const DEMO_MANAGEMENT_ADDON_RELEASES: ReleaseSummary[] =
+  DEMO_MANAGEMENT_ADDONS.map((a) => ({
+    name: a.id,
+    namespace: "flux-system",
+    tenant: "management",
+    type: a.kind === "HelmRelease" ? "helm" : "kustomize",
+    runtime: a.kind === "HelmRelease" ? "helm" : "kustomize",
+    chart: a.chart,
+    version: a.version,
+    status: a.status,
+    managementAddon: true,
+    protected: true,
+    catalogId: a.id,
+    addonKind: a.kind,
+    desiredVersion: a.version,
+  }))
 
 export const DEFAULT_CORE_ADDONS: CatalogItem[] = [
   {
@@ -523,6 +625,51 @@ export const DEFAULT_CORE_ADDONS: CatalogItem[] = [
     category: "Management Addons",
     chart: "pulumi-kubernetes-operator",
     version: "2.10.1",
+    schema: { type: "object", properties: {} },
+  },
+  {
+    id: "flux2",
+    name: "Flux CD",
+    description:
+      "GitOps engine that reconciles the management plane and every tenant from Git, running in multi-tenancy lockdown",
+    type: "app",
+    category: "Management Addons",
+    chart: "flux2",
+    version: "2.20.0",
+    schema: {
+      type: "object",
+      properties: {
+        logLevel: {
+          type: "string",
+          title: "Log Level",
+          enum: ["debug", "info", "error"],
+          default: "info",
+        },
+      },
+    },
+  },
+  {
+    id: "forgejo",
+    name: "Forgejo Git Forge",
+    description:
+      "Optional in-cluster Forgejo hosting the management GitOps repository and pull requests",
+    type: "app",
+    category: "Management Addons",
+    chart: "forgejo",
+    version: "17.3.3",
+    serviceUrl: "https://forgejo.keel.local:8888",
+    schema: { type: "object", properties: {} },
+  },
+  {
+    id: "keel-server",
+    name: "Keel Control Plane Server",
+    description:
+      "Optional in-cluster keel-server (REST/SSE API and web portal) managed by Flux",
+    type: "app",
+    category: "Management Addons",
+    chart: "keel-server",
+    version: "0.7.0",
+    serviceUrl: "https://keel.keel.local:8888",
     schema: { type: "object", properties: {} },
   },
 ]

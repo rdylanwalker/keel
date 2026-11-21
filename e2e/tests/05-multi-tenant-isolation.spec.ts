@@ -232,6 +232,7 @@ test.describe('05 - Multi-Tenant Namespace & Secret Isolation Guards', () => {
 
     await openTab(page, 'Topology Map');
     await expect(page.getByTestId('management-plane-strip')).toHaveCount(0);
+    await expect(page.getByTestId('management-addons-group')).toHaveCount(0);
     await expect(page.locator('main')).not.toContainText(tenantB);
   });
 
@@ -259,6 +260,9 @@ test.describe('05 - Multi-Tenant Namespace & Secret Isolation Guards', () => {
     await uiLogin(page, USERS.admin);
     await expect(page.locator('header').getByText('Admin', { exact: true })).toBeVisible();
     await expect(page.getByTestId('management-plane-strip')).toBeVisible();
+    await expect(
+      page.getByTestId('management-addons-group').getByTestId('core-addon-s3-state-backend'),
+    ).toBeVisible();
     await expect(page.locator('#header-tenant-select option', { hasText: tenantB })).toHaveCount(1);
   });
 });

@@ -454,8 +454,9 @@ spec:
   );
 
   // Image-based plain-manifest add-on: one Flux Kustomization whose version is spec.images[].newTag.
-  fs.writeFileSync(
-    path.join(coreAddonsDir, 'rauthy.yaml'),
+  // Seeded at 0.37.1 and bumped to 0.37.2 in a second commit so the GUI rollback has a target.
+  const rauthyAddonPath = path.join(coreAddonsDir, 'rauthy.yaml');
+  const rauthyAddon = (tag) =>
     `apiVersion: kustomize.toolkit.fluxcd.io/v1
 kind: Kustomization
 metadata:
@@ -474,9 +475,9 @@ spec:
     name: flux-system
   images:
     - name: ghcr.io/sebadob/rauthy
-      newTag: "0.37.2"
-`,
-  );
+      newTag: "${tag}"
+`;
+  fs.writeFileSync(rauthyAddonPath, rauthyAddon('0.37.1'));
 
   fs.writeFileSync(
     path.join(s3CatalogDir, 'catalog.yaml'),
@@ -495,17 +496,26 @@ spec:
   progressiveDelivery:
     flaggerSupported: false
     defaultCanary: false
+  # Only resource sizing / scheduling is mutable for s3-state-backend through the management
+  # API allowlist (keel_core::management_addon_mutable_values); S3 auth/endpoints are locked.
   schema:
     type: object
     properties:
-      s3EnableAuth:
-        type: boolean
-        title: Enable S3 Auth
-        default: true
-      masterDataSize:
-        type: string
-        title: Master PVC Data Size
-        default: 1Gi
+      master:
+        type: object
+        title: Master Server
+        properties:
+          resources:
+            type: object
+            title: Resources
+            properties:
+              limits:
+                type: object
+                properties:
+                  memory:
+                    type: string
+                    title: Memory Limit
+                    default: 512Mi
 `,
   );
 
@@ -557,6 +567,21 @@ spec:
       'commit',
       '-m',
       'chore: seed test repository',
+    ],
+    { cwd: workDir },
+  );
+  fs.writeFileSync(rauthyAddonPath, rauthyAddon('0.37.2'));
+  spawnSync('git', ['add', rauthyAddonPath], { cwd: workDir });
+  spawnSync(
+    'git',
+    [
+      '-c',
+      'user.name=Keel Seed',
+      '-c',
+      'user.email=seed@keel.local',
+      'commit',
+      '-m',
+      'chore: bump rauthy to 0.37.2',
     ],
     { cwd: workDir },
   );

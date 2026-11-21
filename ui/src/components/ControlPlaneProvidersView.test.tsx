@@ -5,17 +5,13 @@ import * as api from "../lib/api"
 import { ApiError } from "../lib/errors"
 import { buildAuthz } from "../lib/authz"
 import { renderWithAuthz } from "../test/render"
-import { CatalogItem } from "../types/api"
 
 vi.mock("../lib/api", () => ({
   getStacksWithMeta: vi.fn(),
   getProviders: vi.fn(),
   getProposals: vi.fn().mockResolvedValue([]),
-  getCoreAddons: vi.fn().mockResolvedValue([]),
   getManagementAddons: vi.fn(),
   toggleProvider: vi.fn(),
-  rollbackManagementAddon: vi.fn(),
-  upgradeManagementAddon: vi.fn(),
 }))
 
 const TENANT_USER = buildAuthz({
@@ -24,20 +20,6 @@ const TENANT_USER = buildAuthz({
   groups: ["acme"],
   isAdmin: false,
 })
-
-function addon(id: string, extra: Partial<CatalogItem> = {}): CatalogItem {
-  return {
-    id,
-    name: id,
-    description: `${id} addon`,
-    type: "app",
-    category: "Management Addons",
-    chart: id,
-    version: "1.0.0",
-    schema: { type: "object", properties: {} },
-    ...extra,
-  }
-}
 
 describe("ControlPlaneProvidersView component", () => {
   beforeEach(() => {
@@ -50,7 +32,6 @@ describe("ControlPlaneProvidersView component", () => {
     })
     vi.mocked(api.getProviders).mockResolvedValue([])
     vi.mocked(api.getProposals).mockResolvedValue([])
-    vi.mocked(api.getCoreAddons).mockResolvedValue([])
     vi.mocked(api.getManagementAddons).mockResolvedValue({
       addons: [],
       liveStatusAvailable: true,
@@ -267,45 +248,21 @@ describe("ControlPlaneProvidersView component", () => {
     expect(
       screen.queryByText("Management Plane Base Addons")
     ).not.toBeInTheDocument()
-    expect(api.getCoreAddons).not.toHaveBeenCalled()
     expect(api.getManagementAddons).not.toHaveBeenCalled()
     expect(api.getProposals).not.toHaveBeenCalled()
   })
 
-  it("maps add-on status by namespace/name and never by chart name", async () => {
-    vi.mocked(api.getCoreAddons).mockResolvedValueOnce([
-      addon("kyverno"),
-      addon("flagger", { version: "1.40.0" }),
-      addon("prometheus"),
-      addon("cert-manager", { version: "v1.21.3" }),
-      addon("rauthy", {
-        serviceUrl: "https://idp.keel.local:8888/auth/v1/admin",
-      }),
-    ])
+  it("derives health from add-on statuses and no longer lists add-on cards", async () => {
+    const onNavigateToTopology = vi.fn()
     vi.mocked(api.getManagementAddons).mockResolvedValueOnce({
       liveStatusAvailable: true,
       addons: [
         {
           id: "kyverno",
           name: "kyverno",
-          namespace: "keel-system",
-          chart: "kyverno",
-          desiredVersion: "3.3.4",
+          namespace: "flux-system",
           status: "Ready",
           tracked: true,
-        },
-        {
-          id: "prometheus",
-          name: "prometheus",
-          namespace: "keel-system",
-          status: "Reconciling",
-          tracked: true,
-        },
-        {
-          id: "flagger",
-          name: "flagger",
-          namespace: "keel-system",
-          tracked: false,
         },
         {
           id: "extra-addon",
@@ -317,56 +274,46 @@ describe("ControlPlaneProvidersView component", () => {
       ],
     })
 
-    renderWithAuthz(<ControlPlaneProvidersView />)
+    renderWithAuthz(
+      <ControlPlaneProvidersView onNavigateToTopology={onNavigateToTopology} />
+    )
 
     await waitFor(() => {
-      expect(screen.getByTestId("core-addon-kyverno")).toBeInTheDocument()
+      expect(screen.getByTestId("management-health")).toHaveTextContent(
+        "Degraded"
+      )
     })
-    expect(screen.getByTestId("core-addon-status-kyverno")).toHaveTextContent(
-      "Ready"
-    )
-    expect(
-      within(screen.getByTestId("core-addon-kyverno")).getByText("v3.3.4")
-    ).toBeInTheDocument()
-    expect(
-      screen.getByTestId("core-addon-status-prometheus")
-    ).toHaveTextContent("Reconciling")
-    expect(screen.getByTestId("core-addon-status-flagger")).toHaveTextContent(
-      "Not tracked (installed by bootstrap)"
-    )
-    // absent from endpoint entirely
-    expect(screen.getByTestId("core-addon-status-rauthy")).toHaveTextContent(
-      "Not tracked (installed by bootstrap)"
-    )
-    expect(
-      screen.getByTestId("core-addon-status-extra-addon")
-    ).toHaveTextContent("Failed")
-    expect(screen.getByText("v1.21.3")).toBeInTheDocument()
-    expect(screen.queryByText("vv1.21.3")).not.toBeInTheDocument()
-    expect(
-      screen.getByRole("link", {
-        name: "https://idp.keel.local:8888/auth/v1/admin",
-      })
-    ).toHaveAttribute("href", "https://idp.keel.local:8888/auth/v1/admin")
-    expect(screen.getAllByText("Protected")).toHaveLength(6)
-    // Health is derived from real statuses, never assumed
-    expect(screen.getByTestId("management-health")).toHaveTextContent(
-      "Degraded"
-    )
     expect(screen.queryByText("Healthy")).not.toBeInTheDocument()
+    // Add-ons moved to the Topology Map "Management Plane" group.
+    expect(
+      screen.queryByText("Management Plane Base Addons")
+    ).not.toBeInTheDocument()
+    expect(screen.queryByTestId("core-addon-kyverno")).not.toBeInTheDocument()
+    expect(
+      screen.queryByRole("button", { name: /Upgrade|Rollback/i })
+    ).not.toBeInTheDocument()
+    fireEvent.click(
+      screen.getByRole("button", { name: /Manage add-ons in Topology Map/i })
+    )
+    expect(onNavigateToTopology).toHaveBeenCalled()
   })
 
   it("derives Healthy only when all tracked add-ons are ready", async () => {
-    vi.mocked(api.getCoreAddons).mockResolvedValueOnce([addon("kyverno")])
     vi.mocked(api.getManagementAddons).mockResolvedValueOnce({
       liveStatusAvailable: true,
       addons: [
         {
           id: "kyverno",
           name: "kyverno",
-          namespace: "keel-system",
+          namespace: "flux-system",
           status: "Ready",
           tracked: true,
+        },
+        {
+          id: "flagger",
+          name: "flagger",
+          namespace: "flux-system",
+          tracked: false,
         },
       ],
     })
@@ -379,15 +326,12 @@ describe("ControlPlaneProvidersView component", () => {
   })
 
   it("reports unknown health when status endpoint is unavailable or offline", async () => {
-    vi.mocked(api.getCoreAddons).mockResolvedValue([addon("kyverno")])
     vi.mocked(api.getManagementAddons).mockRejectedValueOnce(
       new ApiError(404, "not found")
     )
     renderWithAuthz(<ControlPlaneProvidersView />)
     await waitFor(() => {
-      expect(screen.getByTestId("core-addon-status-kyverno")).toHaveTextContent(
-        "Not tracked (installed by bootstrap)"
-      )
+      expect(api.getManagementAddons).toHaveBeenCalled()
     })
     expect(screen.getByTestId("management-health")).toHaveTextContent(
       "Status unknown"
@@ -405,81 +349,12 @@ describe("ControlPlaneProvidersView component", () => {
     })
   })
 
-  it("opens the upgrade modal for a management add-on", async () => {
-    vi.mocked(api.getCoreAddons).mockResolvedValueOnce([
-      addon("kyverno", { name: "Kyverno" }),
-    ])
-    renderWithAuthz(<ControlPlaneProvidersView />)
-    fireEvent.click(
-      await screen.findByRole("button", { name: /Upgrade \/ Configure/i })
-    )
-    expect(
-      screen.getByRole("dialog", { name: /Upgrade Kyverno/i })
-    ).toBeInTheDocument()
-  })
-
-  it("confirms before opening a rollback PR and reports failures", async () => {
-    vi.mocked(api.getCoreAddons).mockResolvedValueOnce([
-      addon("kyverno"),
-      addon("flagger"),
-    ])
-    vi.mocked(api.rollbackManagementAddon)
-      .mockResolvedValueOnce({
-        id: "501",
-        title: "Rollback kyverno",
-        branch: "keel/mgmt/rollback-kyverno",
-        author: "admin",
-        tenant: "keel-system",
-        status: "open",
-        createdAt: "now",
-      })
-      .mockRejectedValueOnce(
-        new ApiError(400, "No previous revision found to roll back to")
-      )
-
-    renderWithAuthz(<ControlPlaneProvidersView />)
-    await waitFor(() => {
-      expect(screen.getByTestId("core-addon-flagger")).toBeInTheDocument()
-    })
-
-    const rollbackBtns = screen.getAllByRole("button", {
-      name: /Rollback PR/i,
-    })
-
-    // Cancel does nothing
-    fireEvent.click(rollbackBtns[0])
-    fireEvent.click(await screen.findByRole("button", { name: "Cancel" }))
-    expect(api.rollbackManagementAddon).not.toHaveBeenCalled()
-
-    fireEvent.click(rollbackBtns[0])
-    expect(
-      await screen.findByRole("alertdialog", { name: /Roll back kyverno/i })
-    ).toBeInTheDocument()
-    fireEvent.click(screen.getByRole("button", { name: "Open Rollback PR" }))
-    await waitFor(() => {
-      expect(api.rollbackManagementAddon).toHaveBeenCalledWith("kyverno")
-      expect(
-        screen.getByText("PR #501 opened on branch keel/mgmt/rollback-kyverno")
-      ).toBeInTheDocument()
-    })
-
-    fireEvent.click(rollbackBtns[1])
-    fireEvent.click(
-      await screen.findByRole("button", { name: "Open Rollback PR" })
-    )
-    await waitFor(() => {
-      expect(screen.getByRole("alert")).toHaveTextContent(
-        "No previous revision found to roll back to"
-      )
-    })
-  })
-
   it("renders demo fixtures without any live API calls in demo mode", async () => {
     window.history.replaceState({}, "", "/?demo=true")
     renderWithAuthz(<ControlPlaneProvidersView />)
 
     expect(screen.getByText("Proxmox VE Cluster")).toBeInTheDocument()
-    expect(screen.getByTestId("core-addon-kyverno")).toBeInTheDocument()
+    expect(screen.queryByTestId("core-addon-kyverno")).not.toBeInTheDocument()
     expect(screen.getByTestId("management-health")).toHaveTextContent("Healthy")
     fireEvent.click(screen.getByRole("button", { name: /Refresh/i }))
     expect(api.getProviders).not.toHaveBeenCalled()

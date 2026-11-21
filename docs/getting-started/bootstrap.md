@@ -221,7 +221,7 @@ To run the server inside the cluster instead, see [Running keel-server In-Cluste
 
 ### Web UI
 
-Open `http://127.0.0.1:8080`, click **Sign in with OIDC**, and sign in with the Rauthy admin username and password printed by `keel bootstrap init`, or with your external OIDC account. Manage users and groups in the Rauthy Admin UI (`https://idp.keel.local:8888/auth/v1/admin`), which is linked from **Control Plane & Providers → Management Plane Base Addons**.
+Open `http://127.0.0.1:8080`, click **Sign in with OIDC**, and sign in with the Rauthy admin username and password printed by `keel bootstrap init`, or with your external OIDC account. Manage users and groups in the Rauthy Admin UI (`https://idp.keel.local:8888/auth/v1/admin`), which is linked from the `rauthy` card in **Topology Map → Deployed Application Releases → Management Plane**.
 
 Tenant access comes from IdP groups named `tenant-<id>` (member) and `tenant-<id>-admin` (admin). Cluster admin comes from `keel-admins`. See [Security & Tenancy](../operations/security-and-tenancy.md#identity--authorization).
 

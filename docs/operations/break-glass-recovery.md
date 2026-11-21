@@ -108,7 +108,7 @@ for d in $(kubectl -n flux-system get deployments -o name); do
 done
 ```
 
-If a rollout stays stuck, revert the version with `POST /api/v1/management/addons/flux2/rollback`. That call opens a PR that restores the previous `flux2` HelmRelease revision. Once the PR merges, the still-running old controllers apply it. If applying an upgrade fails outright, Flux rolls the release back itself (`upgrade.remediation.strategy: rollback`).
+If a rollout stays stuck, revert the version with **Rollback** on the `flux2` card (**Topology Map → Deployed Application Releases → Management Plane**) or `POST /api/v1/management/addons/flux2/rollback`. That call opens a PR that restores the previous `flux2` HelmRelease revision. Once the PR merges, the still-running old controllers apply it. If applying an upgrade fails outright, Flux rolls the release back itself (`upgrade.remediation.strategy: rollback`).
 
 **No install remediation.** Flux's install remediation is `helm uninstall`. On the `flux2` release that would delete every Flux controller, including the helm-controller running the uninstall. So `flux2` sets no `install.remediation`. If an install fails, for example while Flux re-adopts the release after its Helm release Secrets were lost, the release stays failed for an operator to fix.
 

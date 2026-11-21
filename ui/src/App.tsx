@@ -421,6 +421,7 @@ export const App: React.FC = () => {
                     authenticated={authStatus.authenticated}
                     onNavigateToCatalog={() => navigateToTab("catalog")}
                     onNavigateToPreview={() => openPreview()}
+                    onNavigateToTopology={() => navigateToTab("topology")}
                   />
                 )}
               </React.Suspense>

@@ -242,31 +242,54 @@ test.describe('06 - Full Localhost GUI GitOps Workflow', () => {
     await page.getByTestId('confirm-delete-catalog-item-e2e-raw-manifest').click();
     await expectProposalOpened();
 
-    // 7. Verify Control Plane & Providers 4th sidebar tab & base addon upgrade workflow
+    // 7. Control Plane & Providers keeps cluster health + providers; add-ons live in the topology.
     await page.getByRole('button', { name: /Control Plane & Providers/i }).click();
     await expect(page.getByText('Management Control Plane Cluster')).toBeVisible();
     await expect(page.getByText('Enabled Provider Mesh')).toBeVisible();
-    await expect(page.getByRole('heading', { name: 'Management Plane Base Addons' })).toBeVisible();
-    await expect(page.getByText('s3-state-backend').first()).toBeVisible();
-    await expect(page.getByTestId('core-addon-rauthy')).toBeVisible();
-    // Rauthy is an image-based Flux Kustomization add-on: its version is the pinned image tag.
-    await expect(page.getByTestId('core-addon-rauthy').getByText('v0.37.2')).toBeVisible();
-    await expect(
-      page
-        .getByTestId('core-addon-rauthy')
-        .getByRole('link', { name: 'https://idp.keel.local:8888/auth/v1/admin' }),
-    ).toBeVisible();
-    await expect(page.getByText('Protected').first()).toBeVisible();
+    await expect(page.getByText('Management Plane Base Addons')).toHaveCount(0);
+    await expect(page.getByTestId('core-addon-rauthy')).toHaveCount(0);
+    await page.getByRole('button', { name: /Manage add-ons in Topology Map/i }).click();
 
-    await page
+    // 8. Management Plane group in Topology Map -> Deployed Application Releases.
+    const releasesSection = page.getByTestId('topology-releases-section');
+    const addons = releasesSection.getByTestId('management-addons-group');
+    await expect(addons.getByRole('heading', { name: 'Management Plane' })).toBeVisible();
+    const rauthy = addons.getByTestId('core-addon-rauthy');
+    await expect(rauthy).toBeVisible();
+    // Rauthy is an image-based Flux Kustomization add-on: its version is the pinned image tag.
+    await expect(rauthy.getByText('v0.37.2')).toBeVisible();
+    await expect(rauthy.getByText('flux-system/rauthy · Kustomization')).toBeVisible();
+    await expect(
+      rauthy.getByRole('link', { name: 'https://idp.keel.local:8888/auth/v1/admin' }),
+    ).toBeVisible();
+    await expect(rauthy.getByText('Protected')).toBeVisible();
+    // Protected add-ons offer no tenant edit/delete actions.
+    await expect(addons.getByRole('button', { name: /Delete|Edit/ })).toHaveCount(0);
+    await expect(
+      releasesSection.getByRole('button', { name: /Delete release (rauthy|s3-state-backend)/ }),
+    ).toHaveCount(0);
+    await expect(rauthy.getByRole('button', { name: 'Diagnostics for rauthy' })).toBeEnabled();
+    await expect(rauthy.getByRole('button', { name: 'Reconcile rauthy' })).toBeEnabled();
+    await expect(rauthy.getByRole('button', { name: 'Rollback rauthy' })).toBeEnabled();
+
+    await addons
       .getByTestId('core-addon-s3-state-backend')
-      .getByRole('button', { name: /Upgrade \/ Configure/i })
+      .getByRole('button', { name: 'Upgrade s3-state-backend' })
       .click();
     await expect(page.getByRole('button', { name: /Sync Upstream Schema/i })).toBeVisible();
     await page.getByRole('button', { name: /Submit & Open Git PR Proposal/i }).click();
-    await expect(page.getByText(/opened on branch/i)).toBeVisible({
-      timeout: 10000,
-    });
+    await expect(
+      releasesSection.getByText(/Opened Upgrade PR #\S+ .* for management add-on s3-state-backend/),
+    ).toBeVisible({ timeout: 10000 });
+
+    // Roll rauthy back to its previous Git revision (seeded 0.37.1 -> 0.37.2) through a reviewed PR.
+    await rauthy.getByRole('button', { name: 'Rollback rauthy' }).click();
+    const rollbackDialog = page.getByRole('alertdialog', { name: /Roll back rauthy/i });
+    await expect(rollbackDialog).toBeVisible();
+    await rollbackDialog.getByRole('button', { name: 'Open Rollback PR' }).click();
+    await expect(
+      releasesSection.getByText(/Opened Rollback PR #\S+ .* for management add-on rauthy/),
+    ).toBeVisible({ timeout: 10000 });
 
     expect(cspViolations, cspViolations.join('\n')).toEqual([]);
     expect(await domCspViolations()).toEqual([]);

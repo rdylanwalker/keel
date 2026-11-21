@@ -1,36 +1,26 @@
 import React, { useCallback, useEffect, useState } from "react"
-import { AlertTriangle, Cloud, Package, RefreshCw, Server } from "lucide-react"
+import { AlertTriangle, Cloud, RefreshCw, Server } from "lucide-react"
 
+import { ManagementAddonStatus, ProviderRegistryEntry } from "../types/api"
 import {
-  CatalogItem,
-  ManagementAddonStatus,
-  ProviderRegistryEntry,
-} from "../types/api"
-import {
-  getCoreAddons,
   getManagementAddons,
   getProposals,
   getProviders,
   getStacksWithMeta,
-  rollbackManagementAddon,
   toggleProvider,
 } from "../lib/api"
 import { errorMessage, visibleLoadError } from "../lib/errors"
 import { formatForgeProvider, isDemoMode } from "../lib/utils"
 import { useAuthz } from "../lib/authz-context"
 import {
-  DEFAULT_CORE_ADDONS,
   DEFAULT_PROVIDERS,
   DEMO_MANAGEMENT_ADDON_STATUSES,
 } from "../lib/demoFixtures"
-import { DeployInstanceModal } from "./DeployInstanceModal"
 import { PrNotificationBanner } from "./PrNotificationBanner"
 import { Badge } from "./ui/badge"
 import { Button } from "./ui/button"
 import { PageHeader } from "./ui/page-header"
-import { ConfirmDialog } from "./ui/confirm-dialog"
 import { ProviderCard } from "./providers/ProviderCard"
-import { ManagementAddonCard } from "./providers/ManagementAddonCard"
 import {
   deriveManagementHealth,
   extractPendingProviderPrs,
@@ -47,7 +37,6 @@ interface LoadResult {
   error: string | null
   clusterMeta?: ClusterMeta
   providers?: ProviderRegistryEntry[]
-  coreAddons?: CatalogItem[]
   addonStatuses?: ManagementAddonStatus[] | null
   liveStatusAvailable?: boolean
   pendingProviderPrs?: Record<string, { id: string; branch: string }>
@@ -57,7 +46,8 @@ const LOAD_ERROR = "Failed to load control plane & provider state"
 
 /**
  * Loads providers (all users) and, for cluster admins only, management-plane data:
- * core add-on catalog entries, live add-on HelmRelease status, and pending toggle PRs.
+ * live add-on Flux status (for the health summary) and pending provider toggle PRs.
+ * Management add-ons themselves are listed and upgraded from the Topology Map.
  * Never throws; failures are reported through `error`.
  */
 async function loadProvidersState(isAdmin: boolean): Promise<LoadResult> {
@@ -78,12 +68,10 @@ async function loadProvidersState(isAdmin: boolean): Promise<LoadResult> {
         : undefined,
     }
     if (isAdmin) {
-      const [coreAddons, statuses, proposals] = await Promise.all([
-        getCoreAddons().catch(() => [] as CatalogItem[]),
+      const [statuses, proposals] = await Promise.all([
         getManagementAddons().catch(() => null),
         getProposals().catch(() => []),
       ])
-      result.coreAddons = coreAddons ?? []
       result.addonStatuses = statuses ? statuses.addons : null
       result.liveStatusAvailable = statuses?.liveStatusAvailable ?? false
       result.pendingProviderPrs = extractPendingProviderPrs(proposals ?? [])
@@ -107,20 +95,24 @@ const HEALTH_STYLES: Record<
 export interface ControlPlaneProvidersViewProps {
   onNavigateToCatalog?: () => void
   onNavigateToPreview?: () => void
+  /** Opens the Topology Map, where management add-ons are upgraded and rolled back. */
+  onNavigateToTopology?: () => void
   authenticated?: boolean
 }
 
 export const ControlPlaneProvidersView: React.FC<
   ControlPlaneProvidersViewProps
-> = ({ onNavigateToCatalog, onNavigateToPreview, authenticated = true }) => {
+> = ({
+  onNavigateToCatalog,
+  onNavigateToPreview,
+  onNavigateToTopology,
+  authenticated = true,
+}) => {
   const { isAdmin } = useAuthz()
   const demo = isDemoMode()
   const [clusterMeta, setClusterMeta] = useState<ClusterMeta>({})
   const [providers, setProviders] = useState<ProviderRegistryEntry[]>(() =>
     demo ? DEFAULT_PROVIDERS : []
-  )
-  const [coreAddons, setCoreAddons] = useState<CatalogItem[]>(() =>
-    demo ? DEFAULT_CORE_ADDONS : []
   )
   const [addonStatuses, setAddonStatuses] = useState<
     ManagementAddonStatus[] | null
@@ -131,11 +123,6 @@ export const ControlPlaneProvidersView: React.FC<
   >({})
   const [loading, setLoading] = useState(() => authenticated && !demo)
   const [togglingId, setTogglingId] = useState<string | null>(null)
-  const [rollingBackId, setRollingBackId] = useState<string | null>(null)
-  const [confirmRollbackId, setConfirmRollbackId] = useState<string | null>(
-    null
-  )
-  const [selectedAddon, setSelectedAddon] = useState<CatalogItem | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [prNotification, setPrNotification] = useState<{
     id: string
@@ -147,7 +134,6 @@ export const ControlPlaneProvidersView: React.FC<
     setError(result.error)
     if (result.clusterMeta) setClusterMeta(result.clusterMeta)
     if (result.providers) setProviders(result.providers)
-    if (result.coreAddons) setCoreAddons(result.coreAddons)
     if (result.addonStatuses !== undefined) {
       setAddonStatuses(result.addonStatuses)
       setLiveStatusAvailable(Boolean(result.liveStatusAvailable))
@@ -201,31 +187,7 @@ export const ControlPlaneProvidersView: React.FC<
     }
   }
 
-  const handleRollbackAddon = async (id: string) => {
-    setRollingBackId(id)
-    setError(null)
-    try {
-      const proposal = await rollbackManagementAddon(id)
-      setPrNotification({
-        id: proposal.id,
-        branch: proposal.branch || "main",
-        prUrl: proposal.prUrl,
-      })
-    } catch (err) {
-      setError(errorMessage(err, `Failed to create rollback PR for ${id}`))
-    } finally {
-      setRollingBackId(null)
-    }
-  }
-
   const health = deriveManagementHealth(addonStatuses, liveStatusAvailable)
-  const statusById = new Map(
-    (addonStatuses ?? []).map((s) => [s.id, s] as const)
-  )
-  const catalogIds = new Set(coreAddons.map((a) => a.id))
-  const statusOnlyAddons = (addonStatuses ?? []).filter(
-    (s) => !catalogIds.has(s.id)
-  )
 
   return (
     <div className="space-y-6">
@@ -234,7 +196,7 @@ export const ControlPlaneProvidersView: React.FC<
         title="Control Plane & Providers"
         description={
           isAdmin
-            ? "Inspect the protected management cluster core and enable or disable infrastructure providers"
+            ? "Check management cluster health and enable or disable infrastructure providers"
             : "Infrastructure providers available to your tenants"
         }
         actions={
@@ -317,6 +279,15 @@ export const ControlPlaneProvidersView: React.FC<
                   ({health.detail})
                 </span>
               )}
+              {onNavigateToTopology && (
+                <button
+                  type="button"
+                  onClick={onNavigateToTopology}
+                  className="text-[11px] font-medium text-indigo-400 hover:text-indigo-300 px-2 py-1 cursor-pointer"
+                >
+                  Manage add-ons in Topology Map &rarr;
+                </button>
+              )}
             </div>
           </div>
         </div>
@@ -351,93 +322,6 @@ export const ControlPlaneProvidersView: React.FC<
           </div>
         )}
       </div>
-
-      {/* Management Plane Base Addons (cluster admins only) */}
-      {isAdmin && (
-        <div className="space-y-3">
-          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-1">
-            <h3 className="text-sm font-semibold text-slate-300 uppercase tracking-wider flex items-center gap-2">
-              <Package
-                className="h-4 w-4 text-emerald-400"
-                aria-hidden="true"
-              />{" "}
-              Management Plane Base Addons
-            </h3>
-            <span className="text-[11px] text-slate-500">
-              Protected core HelmReleases (PR-driven upgrades &amp; rollbacks)
-            </span>
-          </div>
-
-          {coreAddons.length === 0 && statusOnlyAddons.length === 0 ? (
-            <div className="bg-slate-900 border border-slate-800 rounded-xl p-6 text-center text-xs text-slate-400">
-              No management plane base addons found.
-            </div>
-          ) : (
-            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-              {coreAddons.map((addon) => (
-                <ManagementAddonCard
-                  key={addon.id}
-                  id={addon.id}
-                  addon={addon}
-                  status={statusById.get(addon.id)}
-                  canManage={isAdmin}
-                  rollingBack={rollingBackId === addon.id}
-                  onUpgrade={setSelectedAddon}
-                  onRollback={setConfirmRollbackId}
-                />
-              ))}
-              {statusOnlyAddons.map((status) => (
-                <ManagementAddonCard
-                  key={`${status.namespace}/${status.id}`}
-                  id={status.id}
-                  status={status}
-                  canManage={isAdmin}
-                  rollingBack={rollingBackId === status.id}
-                  onRollback={setConfirmRollbackId}
-                />
-              ))}
-            </div>
-          )}
-        </div>
-      )}
-
-      <ConfirmDialog
-        open={confirmRollbackId !== null}
-        onOpenChange={(open) => {
-          if (!open) setConfirmRollbackId(null)
-        }}
-        title={`Roll back ${confirmRollbackId ?? ""}?`}
-        description="This opens a pull request reverting the management add-on manifest to its previous Git revision. Nothing changes until the PR is reviewed and merged."
-        confirmLabel="Open Rollback PR"
-        onConfirm={() => {
-          const id = confirmRollbackId
-          setConfirmRollbackId(null)
-          if (id) void handleRollbackAddon(id)
-        }}
-      />
-
-      {isAdmin && (
-        <DeployInstanceModal
-          isOpen={Boolean(selectedAddon)}
-          onClose={() => setSelectedAddon(null)}
-          catalogItem={selectedAddon}
-          managementAddon={selectedAddon}
-          tenant="keel-system"
-          onProposalCreated={(proposal) => {
-            setPrNotification({
-              id: proposal.id,
-              branch: proposal.branch || "main",
-              prUrl: proposal.prUrl,
-            })
-          }}
-          onCatalogItemUpdated={(updated) => {
-            setCoreAddons((prev) =>
-              prev.map((a) => (a.id === updated.id ? updated : a))
-            )
-            setSelectedAddon(updated)
-          }}
-        />
-      )}
     </div>
   )
 }

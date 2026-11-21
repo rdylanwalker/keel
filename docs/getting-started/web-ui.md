@@ -6,10 +6,10 @@
 
 | Tab (hash route) | Purpose |
 | :--- | :--- |
-| **Topology** (`#topology`) | Live management, workload, and cloud stacks and app releases. Status overlays come from Flux and PKO through the SSE stream, with polling only while SSE is disconnected. Includes the reconciliation event timeline, Flagger canary gauges, and the Edit / Delete / Reconcile / SSH actions. |
+| **Topology** (`#topology`) | Live management, workload, and cloud stacks and app releases. Status overlays come from Flux and PKO through the SSE stream, with polling only while SSE is disconnected. Includes the reconciliation event timeline, Flagger canary gauges, and the Edit / Delete / Reconcile / SSH actions. For cluster admins, **Deployed Application Releases** starts with a **Management Plane** group: the protected management add-ons (Flux, Kyverno, Rauthy, and optional Forgejo / in-cluster keel-server) with live status, desired version, and Diagnostics / Reconcile / Upgrade / Rollback. The group stays visible when a tenant is selected in the header. Upgrade (version plus a values form built from the add-on's `catalog/core` schema) and Rollback open PRs; an add-on defined by more than one Flux object shows a conflict warning and both stay disabled. Add-ons can't be edited or deleted like tenant releases. |
 | **Catalog & Form Wizard** (`#catalog`, `#catalog/<cluster\|vm\|service\|app>`) | Browse the catalog, deploy items through schema-driven forms, and author catalog entries. |
 | **PR & Preview Inspector** (`#preview`, `#preview/<pr-id>`) | Open, merged, closed, and all PRs, with the merge-base Git diff, the preview report (source badge and run status), and Merge / Reject / Reopen. |
-| **Control Plane & Providers** (`#providers`) | Provider enablement and management add-on upgrade and rollback, each opened as a PR, plus add-on status. |
+| **Control Plane & Providers** (`#providers`) | Provider enablement (opened as a PR) and, for cluster admins, the management cluster health summary derived from add-on status, with a link to the add-ons in the Topology Map. |
 
 Deep links, such as `#preview/42`, are kept across the OIDC login round-trip.
 
