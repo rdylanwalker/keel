@@ -1,0 +1,32 @@
+name: Setup sops & age
+description: Install pinned, checksum-verified sops and age/age-keygen (needed by keel-server for per-tenant SOPS keys and by the SOPS round-trip tests).
+runs:
+  using: composite
+  steps:
+    - name: Install sops & age (pinned, checksum-verified)
+      shell: bash
+      env:
+        # renovate: datasource=github-releases depName=getsops/sops
+        SOPS_VERSION: v3.13.3
+        SOPS_SHA256: e5bec3346a873ae91d871550f3e698c1aad962aff462a080e40f25fde17fef6b
+        # renovate: datasource=github-releases depName=FiloSottile/age
+        AGE_VERSION: v1.3.2
+        AGE_SHA256: cbe24006683f8eb669266162894b9a522a1af52f2665fbc63a4bb032ed26ac10
+      run: |
+        set -euo pipefail
+        mkdir -p "$HOME/.local/bin"
+        curl -fsSLo /tmp/sops "https://github.com/getsops/sops/releases/download/${SOPS_VERSION}/sops-${SOPS_VERSION}.linux.amd64"
+        echo "${SOPS_SHA256}  /tmp/sops" | sha256sum -c -
+        install -m 0755 /tmp/sops "$HOME/.local/bin/sops"
+        curl -fsSLo /tmp/age.tar.gz "https://github.com/FiloSottile/age/releases/download/${AGE_VERSION}/age-${AGE_VERSION}-linux-amd64.tar.gz"
+        echo "${AGE_SHA256}  /tmp/age.tar.gz" | sha256sum -c -
+        tar -xzf /tmp/age.tar.gz -C /tmp
+        install -m 0755 /tmp/age/age /tmp/age/age-keygen "$HOME/.local/bin/"
+        rm -rf /tmp/sops /tmp/age /tmp/age.tar.gz
+        echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+    - name: Verify sops & age
+      shell: bash
+      run: |
+        "$HOME/.local/bin/sops" --version
+        "$HOME/.local/bin/age" --version
+        "$HOME/.local/bin/age-keygen" --version
