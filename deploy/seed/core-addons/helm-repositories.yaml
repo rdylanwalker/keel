@@ -80,3 +80,16 @@ metadata:
 spec:
   interval: 30m
   url: https://charts.jetstack.io
+---
+# Flux itself (`flux2.yaml`): fluxcd-community chart, the same OCI source Stage 0 installs from.
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: HelmRepository
+metadata:
+  name: fluxcd-community
+  namespace: flux-system
+  labels:
+    app.kubernetes.io/managed-by: keel
+spec:
+  type: oci
+  interval: 30m
+  url: oci://ghcr.io/fluxcd-community/charts

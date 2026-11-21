@@ -1,0 +1,83 @@
+# Flux CD self-management (`SDD.md` §2.1, §2.2, `NFR-SEC-02`, `NFR-REL-01`).
+# Adopts the Stage 0 `flux2` release installed by `deploy/bootstrap/control-plane/Pulumi.yaml` in
+# place: same release name (`flux2`), release namespace (`flux-system`), chart version and values
+# (`flux_helmreleases_adopt_stage0_releases_in_place`). From then on Flux upgrades and rolls back
+# its own controllers from Git (management API PRs or direct commits).
+#
+# Self-upgrade safety: helm-controller upgrades its own Deployment, so `helm upgrade --wait` would
+# be interrupted when the new helm-controller pod becomes Ready and the old (running) one gets
+# SIGTERM, leaving the release `pending-upgrade`; the new controller would then mark it failed and
+# roll a healthy upgrade back, which changes the helm-controller image again (a loop). Hence
+# `disableWait`: the upgrade only applies the manifests and records `deployed` within seconds,
+# before the rollout replaces the old pod. Readiness is gated by the controller rollouts
+# themselves: every Flux controller Deployment uses RollingUpdate (`maxUnavailable: 0`), so a broken
+# new controller never replaces the running one, which keeps reconciling. Rolling back is then a
+# Git revert (management API rollback PR) that the still-running old controllers apply.
+# `upgrade.remediation` still rolls back an upgrade whose apply fails. If helm-controller itself
+# is down, recover with the Helm CLI or `keel bootstrap recover`
+# (docs/operations/break-glass-recovery.md).
+#
+# No install remediation: Flux's install remediation is `helm uninstall`, which on this release
+# would delete every Flux controller (including the helm-controller doing it). A failed install
+# (e.g. re-adoption after lost Helm release Secrets) is left in place for an operator.
+#
+# Locked values: the multitenancy lockdown is the tenant isolation boundary. The management API
+# only lets PRs change `logLevel` and controller sizing/scheduling
+# (`keel_core::management_addon_mutable_values("flux2")`); everything else must be edited in Git.
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: flux2
+  namespace: flux-system
+  annotations:
+    # Never garbage-collected if the document is dropped from Git: uninstalling this release
+    # removes the Flux controllers themselves (`NFR-REL-01`).
+    kustomize.toolkit.fluxcd.io/prune: disabled
+  labels:
+    app.kubernetes.io/managed-by: keel
+    keel.io/protect: "true"
+spec:
+  interval: 10m
+  releaseName: flux2
+  targetNamespace: flux-system
+  storageNamespace: flux-system
+  # Multi-tenancy lockdown: platform releases live in `flux-system` and impersonate the
+  # privileged `helm-controller` SA (never the permissionless `default`).
+  serviceAccountName: helm-controller
+  chart:
+    spec:
+      chart: flux2
+      version: "2.20.0"
+      sourceRef:
+        kind: HelmRepository
+        name: fluxcd-community
+        namespace: flux-system
+  # The chart ships its CRDs as templates (not `crds/`), so they follow the release on every
+  # upgrade and rollback; `crds.annotations` below keeps them on uninstall.
+  install:
+    # Same self-interruption hazard as upgrades; no `remediation` (would uninstall Flux, see above).
+    disableWait: true
+  upgrade:
+    # See "Self-upgrade safety" above: never wait on the rollout of the controller doing the upgrade.
+    disableWait: true
+    timeout: 10m
+    remediation:
+      retries: 3
+      remediateLastFailure: true
+      strategy: rollback
+  rollback:
+    disableWait: true
+    timeout: 10m
+  values:
+    # Multi-tenancy lockdown (NFR-SEC-02): adds `--no-cross-namespace-refs=true` and
+    # `--default-service-account=default` to kustomize/helm controllers. Identical to Stage 0.
+    multitenancy:
+      enabled: true
+      defaultServiceAccount: default
+      # Controllers keep cluster-admin so they can impersonate the platform/tenant SAs.
+      privileged: true
+    # Flux CRDs survive a `helm uninstall` of this release, so every Flux object (and the
+    # workloads it manages) outlives an accidental uninstall and is re-adopted on reinstall.
+    crds:
+      annotations:
+        helm.sh/resource-policy: keep

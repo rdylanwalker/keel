@@ -1395,6 +1395,68 @@ spec:
         assert!(matches!(err, ServerError::BadRequest(_)), "{err:?}");
     }
 
+    /// The seed `flux2` HelmRelease bootstrap writes to `core-addons/flux2.yaml`.
+    const SEED_FLUX2: &str = include_str!("../../../../deploy/seed/core-addons/flux2.yaml");
+
+    #[tokio::test]
+    async fn flux2_self_upgrade_and_rollback_round_trip_through_the_api() {
+        let (_tmp, state, workdir) = git_state().await;
+        let path = workdir.join(MANAGEMENT_CORE_ADDONS_DIR).join("flux2.yaml");
+        tokio::fs::write(&path, SEED_FLUX2).await.unwrap();
+        commit_and_push(&state.git_runner, &workdir, "chore: add flux2").await;
+
+        // A PR cannot weaken the multitenancy lockdown or the CRD retention policy.
+        for values in [
+            serde_json::json!({"multitenancy": {"enabled": false}}),
+            serde_json::json!({"multitenancy": {"defaultServiceAccount": "helm-controller"}}),
+            serde_json::json!({"crds": {"annotations": {"helm.sh/resource-policy": "delete"}}}),
+        ] {
+            let err = upgrade(&state, "flux2", Some("2.21.0"), values.clone())
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, ServerError::Core(keel_core::CoreError::Validation(_))),
+                "{values}: {err:?}"
+            );
+        }
+
+        // An allowlisted upgrade (version + log level) keeps every locked value and the
+        // protect label; merging it then rolling back restores the seed release verbatim.
+        let resp = upgrade(
+            &state,
+            "flux2",
+            Some("2.21.0"),
+            serde_json::json!({"logLevel": "debug"}),
+        )
+        .await
+        .unwrap();
+        let upgraded = read_on_branch(&state, &workdir, &resp.branch, "flux2.yaml").await;
+        let doc: Value = serde_yml::from_str(&upgraded).unwrap();
+        assert_eq!(doc.pointer("/spec/chart/spec/version").unwrap(), "2.21.0");
+        assert_eq!(doc.pointer("/spec/values/logLevel").unwrap(), "debug");
+        assert_eq!(
+            doc.pointer("/spec/values/multitenancy/enabled").unwrap(),
+            true
+        );
+        assert_eq!(
+            doc.pointer("/metadata/labels/keel.io~1protect").unwrap(),
+            "true"
+        );
+        assert_eq!(
+            doc.pointer("/spec/upgrade/remediation/strategy").unwrap(),
+            "rollback"
+        );
+        tokio::fs::write(&path, &upgraded).await.unwrap();
+        commit_and_push(&state.git_runner, &workdir, "chore: merge flux2 upgrade").await;
+
+        let (_, Json(resp)) =
+            rollback_management_addon(admin(), State(state.clone()), AxumPath("flux2".to_string()))
+                .await
+                .unwrap();
+        let restored = read_on_branch(&state, &workdir, &resp.branch, "flux2.yaml").await;
+        assert_eq!(restored, SEED_FLUX2);
+    }
+
     #[tokio::test]
     async fn rollback_cannot_restore_changed_locked_values() {
         let (_tmp, state, workdir) = git_state().await;

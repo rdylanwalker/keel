@@ -122,7 +122,7 @@ By default, `keel bootstrap init` installs the core control-plane components ont
 
 - **Namespaces:** `flux-system`, `keel-system`, `keel-previews`
 - **SeaweedFS (`s3-state-backend`, chart `4.54.0`):** In-cluster S3-compatible state backend in `keel-system`, with the versioned `pulumi-state` bucket. Tenants get scoped identities limited to `tenants/<id>/*`, never the admin keys.
-- **Flux CD (`flux2`, chart `2.20.0`):** GitOps source, kustomize, and helm controllers in `flux-system`, with the multitenancy lockdown enabled (`--no-cross-namespace-refs=true`, default ServiceAccount impersonation)
+- **Flux CD (`flux2`, chart `2.20.0`):** GitOps source, kustomize, and helm controllers in `flux-system`, with the multitenancy lockdown enabled (`--no-cross-namespace-refs=true`, default ServiceAccount impersonation). After Stage 0, the protected `flux-system/flux2` HelmRelease in `clusters/management/core-addons/flux2.yaml` adopts this release, so Flux upgrades and rolls back itself from Git
 - **Kyverno (chart `3.10.0`):** A single admission controller release in `keel-system`, plus Keel's seed policies (including `local-kind-docker-socket-exception` and `keel-docker-proxy` in `flux-system` when `--local-dev-docker-socket-exception` is passed)
 - **Pulumi Kubernetes Operator (PKO v2, chart `2.10.1`):** Infrastructure operator in `keel-system` plus the `management-cluster-core` `Stack`
 - **Envoy Gateway (`envoy-gateway`):** Gateway API controller in `keel-system` with `GatewayClass` `keel-envoy` and `Gateway` `keel-ingress` (HTTP ports `80` and `8888`)

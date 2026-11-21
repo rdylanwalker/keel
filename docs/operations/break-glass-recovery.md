@@ -94,6 +94,54 @@ Recovering onto a **new** cluster: add `--kubeconfig <file>` and `--context <ctx
 
 When you are done, remove `/tmp/keel-passphrase` and stop the port-forward.
 
+## Flux Self-Upgrade Failures
+
+After Stage 0, Flux manages itself. The protected `flux-system/flux2` HelmRelease (`clusters/management/core-addons/flux2.yaml`) adopts the Stage 0 `flux2` release, so a Flux upgrade is an ordinary management add-on PR. Such a PR can change only the chart version, `logLevel`, and controller sizing and scheduling. The multitenancy lockdown and CRD retention values are locked.
+
+**Why the release does not wait.** helm-controller upgrades its own Deployment. With `helm upgrade --wait`, the old helm-controller pod would get SIGTERM as soon as the new pod is Ready, while it was still waiting on the other controllers. That leaves the release `pending-upgrade`, and the new controller would then roll a healthy upgrade back, in a loop. So `install`, `upgrade` and `rollback` all set `disableWait: true`. The upgrade applies the manifests and records the release as `deployed` within seconds, before the rollout replaces the old pod.
+
+**Readiness and rollback.** The controller rollouts are the readiness gate. Every Flux controller Deployment uses RollingUpdate with `maxUnavailable: 0`, so a broken new controller never replaces the running one, and the old controllers keep reconciling. After a Flux upgrade, check the rollouts:
+
+```bash
+for d in $(kubectl -n flux-system get deployments -o name); do
+  kubectl -n flux-system rollout status "$d" --timeout=10m
+done
+```
+
+If a rollout stays stuck, revert the version with `POST /api/v1/management/addons/flux2/rollback`. That call opens a PR that restores the previous `flux2` HelmRelease revision. Once the PR merges, the still-running old controllers apply it. If applying an upgrade fails outright, Flux rolls the release back itself (`upgrade.remediation.strategy: rollback`).
+
+**No install remediation.** Flux's install remediation is `helm uninstall`. On the `flux2` release that would delete every Flux controller, including the helm-controller running the uninstall. So `flux2` sets no `install.remediation`. If an install fails, for example while Flux re-adopts the release after its Helm release Secrets were lost, the release stays failed for an operator to fix.
+
+**helm-controller is down.** If no helm-controller is left to remediate, Flux cannot repair itself:
+
+- **Release still installed** (for example a broken upgrade that was never rolled back). Suspend the HelmRelease first. Otherwise the restored helm-controller sees drift from the bad version that is still in Git and upgrades to it again. Then roll back with the Helm CLI, revert the version in Git, and resume:
+
+  ```bash
+  kubectl -n flux-system patch helmrelease flux2 --type merge -p '{"spec":{"suspend":true}}'
+  helm -n flux-system history flux2
+  helm -n flux-system rollback flux2 <last-good-revision> --wait
+  # Revert the version in Git (POST /api/v1/management/addons/flux2/rollback) and merge the PR.
+  kubectl -n flux-system patch helmrelease flux2 --type merge -p '{"spec":{"suspend":false}}'
+  ```
+
+  Running `helm rollback --wait` by hand is safe here because the Helm CLI, not helm-controller, does the waiting.
+
+- **Release missing** (for example after an uninstall). Run `keel bootstrap recover` for the control-plane stack, as described in the [Runbook](#runbook). Recovery reinstalls Flux from the Stage 0 inputs (`--stack stage0-control-plane-<cluster>`), and Flux then adopts the release again from Git. Because of `ignoreChanges`, recovery never touches an installed `flux2` release.
+
+Flux CRDs carry `helm.sh/resource-policy: keep`, so an uninstall leaves every Flux object, and the workloads it manages, in place.
+
+**Deleting a protected Flux object.** The `protect-control-plane` Kyverno policy denies `DELETE` of any `flux-system` HelmRelease or Kustomization labelled `keel.io/protect: "true"`. These objects are applied from Git by the `core-addons` (or `flux-system`) Kustomization, which puts the label back on its next reconcile. A label removed by hand therefore does not last. To delete such an object deliberately:
+
+1. Suspend the parent Kustomization, or remove the label in Git instead:
+
+   ```bash
+   kubectl -n flux-system patch kustomization core-addons --type merge -p '{"spec":{"suspend":true}}'
+   ```
+
+2. Remove the label: `kubectl -n flux-system label helmrelease <name> keel.io/protect-`.
+3. Delete the object.
+4. Drop the object from Git, then resume the parent Kustomization (`"suspend":false`).
+
 ## Auth Phase During Recovery
 
 While the control plane is in the `BreakGlass` auth phase, cluster-admin is granted **only** to the identities listed in `KEEL_BREAK_GLASS_ADMINS` on `keel-server`. This is a comma-separated list of OIDC `sub` or `email` values and defaults to `admin@keel.local`. Other users keep their normal group-based permissions. Sessions are bound to the phase they were issued under, so every session issued during break-glass becomes invalid when the phase changes.

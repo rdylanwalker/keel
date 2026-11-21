@@ -137,7 +137,7 @@ pub fn management_addon_mutable_values(id: &str) -> Option<&'static [&'static st
         // could override it, so only sizing/scheduling is allowlisted.
         "flux2" => Some(&[
             "/logLevel",
-            "/helmController|imageAutomationController|imageReflectionController|kustomizeController|notificationController|sourceController/resources|tolerations|nodeSelector|affinity|priorityClassName",
+            "/helmController|imageAutomationController|imageReflectionController|kustomizeController|notificationController|sourceController|sourceWatcher/resources|tolerations|nodeSelector|affinity|priorityClassName",
         ]),
         // Kyverno admission enforcement: CRDs, features/featuresOverride, container extraArgs,
         // webhook and resource-filter configuration all decide what is enforced.
@@ -816,6 +816,39 @@ mod tests {
         let err = apply_management_addon_upgrade(id, &mut doc, None, &values)
             .expect_err(&format!("{values} must be rejected for {id}"));
         assert!(err.to_string().contains(needle), "{err}");
+    }
+
+    #[test]
+    fn flux2_crd_retention_is_locked_and_source_watcher_is_sizable() {
+        let mut flux = flux2_release();
+        flux["spec"]["values"]["crds"] =
+            json!({"annotations": {"helm.sh/resource-policy": "keep"}});
+        // Dropping `helm.sh/resource-policy: keep` would let an uninstall delete every Flux CRD.
+        assert_rejected(
+            "flux2",
+            &flux,
+            json!({"crds": {"annotations": {"helm.sh/resource-policy": "delete"}}}),
+            "/crds/annotations",
+        );
+        assert_rejected(
+            "flux2",
+            &flux,
+            json!({"installCRDs": false}),
+            "/installCRDs",
+        );
+        assert_rejected(
+            "flux2",
+            &flux,
+            json!({"sourceWatcher": {"container": {"additionalArgs": ["--x"]}}}),
+            "/sourceWatcher/container/additionalArgs",
+        );
+        apply_management_addon_upgrade(
+            "flux2",
+            &mut flux,
+            None,
+            &json!({"sourceWatcher": {"resources": {"requests": {"cpu": "50m"}}}}),
+        )
+        .unwrap();
     }
 
     #[test]

@@ -657,6 +657,9 @@ const SEED_CORE_ADDON_HELM_REPOSITORIES_YAML: &str =
 const SEED_CORE_ADDON_S3_SEAWEEDFS_YAML: &str =
     include_str!("../../../../deploy/seed/core-addons/s3-seaweedfs.yaml");
 const SEED_CORE_ADDON_PKO_YAML: &str = include_str!("../../../../deploy/seed/core-addons/pko.yaml");
+/// Flux self-management: protected `flux-system/flux2` HelmRelease adopting the Stage 0 release.
+const SEED_CORE_ADDON_FLUX2_YAML: &str =
+    include_str!("../../../../deploy/seed/core-addons/flux2.yaml");
 const SEED_CORE_ADDON_KYVERNO_YAML: &str =
     include_str!("../../../../deploy/seed/core-addons/kyverno.yaml");
 const SEED_CORE_ADDON_ENVOY_GATEWAY_YAML: &str =
@@ -695,6 +698,8 @@ const CORE_CATALOG_S3_STATE_BACKEND_YAML: &str =
     include_str!("../../../../deploy/catalog/core/s3-state-backend/catalog.yaml");
 const CORE_CATALOG_KYVERNO_YAML: &str =
     include_str!("../../../../deploy/catalog/core/kyverno/catalog.yaml");
+const CORE_CATALOG_FLUX2_YAML: &str =
+    include_str!("../../../../deploy/catalog/core/flux2/catalog.yaml");
 const CORE_CATALOG_CERT_MANAGER_YAML: &str =
     include_str!("../../../../deploy/catalog/core/cert-manager/catalog.yaml");
 const CORE_CATALOG_RAUTHY_YAML: &str =
@@ -866,6 +871,7 @@ fn seed_core_addon_files(
             "helm-repositories.yaml",
             SEED_CORE_ADDON_HELM_REPOSITORIES_YAML.to_string(),
         ),
+        ("flux2.yaml", SEED_CORE_ADDON_FLUX2_YAML.to_string()),
         (
             "s3-seaweedfs.yaml",
             SEED_CORE_ADDON_S3_SEAWEEDFS_YAML.to_string(),
@@ -914,6 +920,7 @@ fn seed_core_catalog_files(artifacts: &SeedControlPlaneArtifacts) -> Vec<(String
             "s3-state-backend",
             CORE_CATALOG_S3_STATE_BACKEND_YAML.to_string(),
         ),
+        ("flux2", CORE_CATALOG_FLUX2_YAML.to_string()),
         ("kyverno", CORE_CATALOG_KYVERNO_YAML.to_string()),
         ("cert-manager", CORE_CATALOG_CERT_MANAGER_YAML.to_string()),
         ("envoy-gateway", CORE_CATALOG_ENVOY_GATEWAY_YAML.to_string()),
@@ -1692,6 +1699,7 @@ mod security_hardening_tests {
     fn flux_helmreleases_adopt_stage0_releases_in_place() {
         let program: Value = serde_yml::from_str(CONTROL_PLANE_PULUMI_YAML).unwrap();
         for (resource, file) in [
+            ("flux2", SEED_CORE_ADDON_FLUX2_YAML),
             ("kyverno", SEED_CORE_ADDON_KYVERNO_YAML),
             ("pulumiKubernetesOperator", SEED_CORE_ADDON_PKO_YAML),
             ("s3StateBackend", SEED_CORE_ADDON_S3_SEAWEEDFS_YAML),
@@ -1817,6 +1825,7 @@ mod security_hardening_tests {
                 .expect("seed HelmRelease version")
         };
         for (id, catalog, seed) in [
+            ("flux2", CORE_CATALOG_FLUX2_YAML, SEED_CORE_ADDON_FLUX2_YAML),
             (
                 "kyverno",
                 include_str!("../../../../deploy/catalog/core/kyverno/catalog.yaml"),
@@ -2120,8 +2129,89 @@ mod security_hardening_tests {
                 assert_eq!(doc["spec"]["serviceAccountName"], expected, "{path} {kind}");
             }
         }
-        // 7 HelmReleases + the Rauthy Kustomization.
-        assert_eq!(seen, 8);
+        // 8 HelmReleases (incl. Flux itself) + the Rauthy Kustomization.
+        assert_eq!(seen, 9);
+    }
+
+    #[test]
+    fn flux2_helmrelease_self_manages_with_remediation_and_locked_multitenancy() {
+        let hr: Value = serde_yml::from_str(SEED_CORE_ADDON_FLUX2_YAML).unwrap();
+        assert_eq!(hr["kind"], "HelmRelease");
+        assert_eq!(hr["metadata"]["name"], "flux2");
+        assert_eq!(hr["metadata"]["labels"]["keel.io/protect"], "true");
+        // Dropping the document from Git must never uninstall Flux.
+        assert_eq!(
+            hr["metadata"]["annotations"]["kustomize.toolkit.fluxcd.io/prune"],
+            "disabled"
+        );
+        assert_eq!(hr["spec"]["targetNamespace"], "flux-system");
+        assert_eq!(hr["spec"]["storageNamespace"], "flux-system");
+        let upgrade = &hr["spec"]["upgrade"];
+        assert_eq!(upgrade["remediation"]["strategy"], "rollback");
+        assert_eq!(upgrade["remediation"]["remediateLastFailure"], true);
+        assert!(upgrade["remediation"]["retries"].as_u64().unwrap() >= 1);
+        // helm-controller upgrades itself: waiting on its own rollout would be interrupted by
+        // the pod replacement and rolled back, so every action applies without waiting.
+        for action in ["install", "upgrade", "rollback"] {
+            assert_eq!(hr["spec"][action]["disableWait"], true, "{action}");
+        }
+        // Install remediation is `helm uninstall`, which would delete Flux itself.
+        let install = &hr["spec"]["install"];
+        assert!(
+            install.get("remediation").is_none()
+                || install["remediation"]["retries"].as_u64().unwrap_or(0) == 0,
+            "flux2 install remediation must never uninstall Flux"
+        );
+        let values = &hr["spec"]["values"];
+        assert_eq!(values["multitenancy"]["enabled"], true);
+        assert_eq!(values["multitenancy"]["defaultServiceAccount"], "default");
+        assert_eq!(
+            values["crds"]["annotations"]["helm.sh/resource-policy"],
+            "keep"
+        );
+        // The OCI source is the one Stage 0 installs from.
+        let source = &hr["spec"]["chart"]["spec"]["sourceRef"];
+        let repo = yaml_docs(SEED_CORE_ADDON_HELM_REPOSITORIES_YAML)
+            .into_iter()
+            .find(|d| d["metadata"]["name"] == source["name"])
+            .expect("flux2 HelmRepository");
+        assert_eq!(repo["metadata"]["namespace"], "flux-system");
+        assert_eq!(repo["spec"]["type"], "oci");
+        let program: Value = serde_yml::from_str(CONTROL_PLANE_PULUMI_YAML).unwrap();
+        assert_eq!(
+            program["resources"]["flux2"]["properties"]["chart"],
+            format!(
+                "{}/{}",
+                repo["spec"]["url"].as_str().unwrap(),
+                hr["spec"]["chart"]["spec"]["chart"].as_str().unwrap()
+            )
+            .as_str()
+        );
+
+        // The catalog form only offers values the management API may change: multitenancy (and
+        // every other security setting) is never exposed.
+        let catalog: Value = serde_yml::from_str(CORE_CATALOG_FLUX2_YAML).unwrap();
+        assert_eq!(
+            catalog["metadata"]["category"],
+            keel_core::MANAGEMENT_CORE_CATEGORY
+        );
+        let props = catalog["spec"]["schema"]["properties"].as_object().unwrap();
+        assert!(!props.is_empty());
+        assert!(!props.contains_key("multitenancy"));
+        let defaults: serde_json::Map<String, Value> = props
+            .iter()
+            .map(|(k, v)| (k.clone(), v["default"].clone()))
+            .collect();
+        assert!(
+            keel_core::disallowed_value_changes(
+                "flux2",
+                &serde_json::json!({}),
+                &Value::Object(defaults)
+            )
+            .is_empty(),
+            "catalog schema exposes a locked flux2 value"
+        );
+        keel_core::parse_catalog_application(CORE_CATALOG_FLUX2_YAML).unwrap();
     }
 
     #[tokio::test]
@@ -2258,6 +2348,7 @@ mod security_hardening_tests {
     fn stage0_pulumi_does_not_revert_flux_managed_addons() {
         let program: Value = serde_yml::from_str(CONTROL_PLANE_PULUMI_YAML).unwrap();
         for name in [
+            "flux2",
             "kyverno",
             "pulumiKubernetesOperator",
             "s3StateBackend",

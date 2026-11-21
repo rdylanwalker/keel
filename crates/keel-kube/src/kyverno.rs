@@ -218,6 +218,14 @@ pub fn build_protect_control_plane_policy() -> Value {
                         "!(((has(request.namespace) ? request.namespace : '') == '{FLUX_SYSTEM_NAMESPACE}' || (has(request.namespace) ? request.namespace : '') == '{KEEL_SYSTEM_NAMESPACE}') && has(request.userInfo) && has(request.userInfo.username) && (request.userInfo.username.startsWith('system:serviceaccount:{KEEL_PREVIEWS_NAMESPACE}:') || request.userInfo.username.startsWith('system:serviceaccount:tenant-')))"
                     ),
                     "message": "Tenant and preview ServiceAccounts are strictly prohibited from mutating control-plane namespaces."
+                },
+                {
+                    // Deleting the protected `flux2` HelmRelease would `helm uninstall` Flux itself;
+                    // deleting a protected add-on HelmRelease/Kustomization uninstalls that add-on.
+                    "expression": format!(
+                        "!(request.operation == 'DELETE' && (has(request.namespace) ? request.namespace : '') == '{FLUX_SYSTEM_NAMESPACE}' && ((request.kind.group == 'helm.toolkit.fluxcd.io' && request.kind.kind == 'HelmRelease') || (request.kind.group == 'kustomize.toolkit.fluxcd.io' && request.kind.kind == 'Kustomization')) && has(oldObject.metadata.labels) && 'keel.io/protect' in oldObject.metadata.labels && oldObject.metadata.labels['keel.io/protect'] == 'true')"
+                    ),
+                    "message": "Protected control-plane Flux objects (`keel.io/protect: \"true\"`, e.g. the `flux2` HelmRelease whose deletion would uninstall Flux) cannot be deleted; break-glass: suspend the parent Kustomization (e.g. `core-addons`) or remove the label in Git, then remove the `keel.io/protect` label and delete."
                 }
             ]
         }
@@ -756,6 +764,35 @@ mod tests {
                 "unguarded request.namespace in policy {}",
                 doc["metadata"]["name"]
             );
+        }
+    }
+
+    #[test]
+    fn protect_control_plane_policy_matches_seed_and_guards_protected_flux_objects() {
+        let seed: Value = serde_yml::from_str(include_str!(
+            "../../../deploy/seed/kyverno-policies/protect-control-plane.yaml"
+        ))
+        .unwrap();
+        let generated = build_protect_control_plane_policy();
+        assert_eq!(
+            seed["spec"]["validations"],
+            generated["spec"]["validations"]
+        );
+        let flux_guard = generated["spec"]["validations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["expression"].as_str().unwrap())
+            .find(|e| e.contains("helm.toolkit.fluxcd.io"))
+            .expect("protected Flux object deletion guard");
+        for needle in [
+            "request.operation == 'DELETE'",
+            "== 'flux-system'",
+            "request.kind.kind == 'HelmRelease'",
+            "request.kind.kind == 'Kustomization'",
+            "oldObject.metadata.labels['keel.io/protect'] == 'true'",
+        ] {
+            assert!(flux_guard.contains(needle), "{needle}");
         }
     }
 

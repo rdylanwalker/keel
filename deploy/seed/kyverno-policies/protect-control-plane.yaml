@@ -29,3 +29,6 @@ spec:
     - expression: >-
         !(((has(request.namespace) ? request.namespace : '') == 'flux-system' || (has(request.namespace) ? request.namespace : '') == 'keel-system') && has(request.userInfo) && has(request.userInfo.username) && (request.userInfo.username.startsWith('system:serviceaccount:keel-previews:') || request.userInfo.username.startsWith('system:serviceaccount:tenant-')))
       message: "Tenant and preview ServiceAccounts are strictly prohibited from mutating control-plane namespaces."
+    - expression: >-
+        !(request.operation == 'DELETE' && (has(request.namespace) ? request.namespace : '') == 'flux-system' && ((request.kind.group == 'helm.toolkit.fluxcd.io' && request.kind.kind == 'HelmRelease') || (request.kind.group == 'kustomize.toolkit.fluxcd.io' && request.kind.kind == 'Kustomization')) && has(oldObject.metadata.labels) && 'keel.io/protect' in oldObject.metadata.labels && oldObject.metadata.labels['keel.io/protect'] == 'true')
+      message: 'Protected control-plane Flux objects (`keel.io/protect: "true"`, e.g. the `flux2` HelmRelease whose deletion would uninstall Flux) cannot be deleted; break-glass: suspend the parent Kustomization (e.g. `core-addons`) or remove the label in Git, then remove the `keel.io/protect` label and delete.'

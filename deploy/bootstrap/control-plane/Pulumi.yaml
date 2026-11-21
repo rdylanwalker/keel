@@ -99,9 +99,23 @@ resources:
       stringData:
         age.agekey: ${sopsAgeKey}
 
+  # Flux adopts this release in place through the seed `flux2` HelmRelease
+  # (`deploy/seed/core-addons/flux2.yaml`: same release name, namespace, version and values) and
+  # from then on upgrades / rolls back itself from Git. Keep them in lockstep.
   flux2:
     type: kubernetes:helm.sh/v3:Release
     options:
+      # Flux owns the release after the in-place handoff (seed HelmRelease); re-runs
+      # (`keel bootstrap recover`) must not revert Flux-applied upgrades, so every
+      # chart-affecting input is ignored (see the header note).
+      ignoreChanges:
+        - chart
+        - version
+        - values
+        - repositoryOpts
+        - timeout
+        - waitForJobs
+        - createNamespace
       protect: true
       provider: ${k8sProvider}
       dependsOn:
@@ -131,6 +145,11 @@ resources:
           defaultServiceAccount: default
           # Controllers keep cluster-admin so they can impersonate the SAs above.
           privileged: true
+        # Flux CRDs survive a `helm uninstall` of this release, so every Flux object (and the
+        # workloads it manages) outlives an accidental uninstall and is re-adopted on reinstall.
+        crds:
+          annotations:
+            helm.sh/resource-policy: keep
 
   # Single Kyverno install in `keel-system`, release `kyverno`, pinned to a chart whose bundled
   # CRDs serve `policies.kyverno.io/v1` (ValidatingPolicy / GeneratingPolicy / PolicyException,

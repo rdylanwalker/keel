@@ -1,0 +1,32 @@
+# Flux CD Core Addon Catalog Application (`SDD.md` §2.1, §2.2, `NFR-SEC-02`)
+# Reconciled by the protected `flux-system/flux2` HelmRelease (`core-addons/flux2.yaml`), so Flux
+# upgrades and rolls back its own controllers. The schema only exposes knobs the management API
+# allows to change (`keel_core::management_addon_mutable_values("flux2")`); the multitenancy
+# lockdown, CRDs, RBAC and controller args are locked and never offered here.
+apiVersion: keel.io/v1alpha1
+kind: CatalogApplication
+metadata:
+  id: flux2
+  name: Flux CD
+  description: GitOps engine (source, kustomize, helm, notification and image controllers) that reconciles the management plane and every tenant from Git, running in multi-tenancy lockdown.
+  category: management-core
+  runtime: helm
+spec:
+  upstream:
+    chart: oci://ghcr.io/fluxcd-community/charts/flux2
+    repoURL: oci://ghcr.io/fluxcd-community/charts/flux2
+    version: "2.20.0"
+  progressiveDelivery:
+    flaggerSupported: false
+    defaultCanary: false
+  schema:
+    type: object
+    properties:
+      logLevel:
+        type: string
+        title: Controller Log Level
+        default: info
+        enum:
+          - debug
+          - info
+          - error
