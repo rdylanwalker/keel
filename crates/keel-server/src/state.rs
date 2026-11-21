@@ -9,38 +9,18 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use keel_core::{AuthPhase, OidcConfig};
+use keel_core::{AuthPhase, OidcConfig, split_yaml_documents};
 use keel_git::{ForgeProvider, GitRunner, LocalGitProvider};
 use keel_kube::{
     InMemorySecretStore, LiveResourceStatus, LiveStatusSource, SecretStateStore, StackDiagnostics,
     TelemetryMux,
 };
-use keel_pko::{PreviewReport, PreviewResourceCandidate, PreviewStack};
+use keel_pko::{GcPlan, PreviewReport, PreviewResourceCandidate, PreviewStack};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::{Mutex, RwLock};
 
 use crate::error::ServerError;
-
-/// Splits a multi-document YAML stream on `---` document markers.
-fn split_yaml_documents(content: &str) -> Vec<String> {
-    let mut docs = Vec::new();
-    let mut current = String::new();
-    for line in content.lines() {
-        if line.trim() == "---" {
-            if !current.trim().is_empty() {
-                docs.push(std::mem::take(&mut current));
-            }
-        } else {
-            current.push_str(line);
-            current.push('\n');
-        }
-    }
-    if !current.trim().is_empty() {
-        docs.push(current);
-    }
-    docs
-}
 
 /// Summary of a PKO v2 `Stack` resource returned by `GET /api/v1/stacks`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -197,6 +177,26 @@ pub trait ClusterStateProvider: Send + Sync {
 
     async fn stack_outputs(&self, _namespace: &str, _name: &str) -> HashMap<String, String> {
         HashMap::new()
+    }
+
+    async fn execute_preview_gc(&self, _plan: &GcPlan) -> Result<usize, ServerError> {
+        Ok(0)
+    }
+
+    async fn apply_cluster_policy(
+        &self,
+        _name: &str,
+        _policy_doc: &Value,
+    ) -> Result<(), ServerError> {
+        Ok(())
+    }
+
+    async fn delete_tenant_stack(
+        &self,
+        _namespace: &str,
+        _name: &str,
+    ) -> Result<bool, ServerError> {
+        Ok(false)
     }
 }
 
@@ -682,27 +682,6 @@ impl ClusterStateProvider for KubeClusterStateProvider {
             .list_stacks(tenant, None)
             .await
             .unwrap_or_default();
-        // Deduplicate paired HelmRelease + Canary manifests into a single ReleaseSummary with `canary = true`
-        let canary_keys: std::collections::HashSet<(String, String)> = releases
-            .iter()
-            .filter(|r| r.canary)
-            .map(|r| (r.namespace.clone(), r.name.clone()))
-            .collect();
-        let has_paired_hr: std::collections::HashSet<(String, String)> = releases
-            .iter()
-            .filter(|r| !r.canary && canary_keys.contains(&(r.namespace.clone(), r.name.clone())))
-            .map(|r| (r.namespace.clone(), r.name.clone()))
-            .collect();
-        releases.retain(|r| {
-            !(r.canary && has_paired_hr.contains(&(r.namespace.clone(), r.name.clone())))
-        });
-        for rel in &mut releases {
-            if canary_keys.contains(&(rel.namespace.clone(), rel.name.clone())) {
-                rel.canary = true;
-            }
-        }
-        let mut seen = std::collections::HashSet::new();
-        releases.retain(|r| seen.insert((r.namespace.clone(), r.name.clone())));
 
         let live_stacks = self.live.stack_statuses().await;
         let live = self.live.release_status_details().await;
@@ -837,6 +816,53 @@ impl ClusterStateProvider for KubeClusterStateProvider {
 
     async fn stack_outputs(&self, namespace: &str, name: &str) -> HashMap<String, String> {
         self.live.stack_outputs(namespace, name).await
+    }
+
+    async fn execute_preview_gc(&self, plan: &GcPlan) -> Result<usize, ServerError> {
+        let mut deleted = 0usize;
+        for target in &plan.targets {
+            if self
+                .live
+                .delete_dynamic_resource(
+                    &target.api_version,
+                    target.kind.kind_str(),
+                    &target.namespace,
+                    &target.name,
+                )
+                .await
+                .map_err(|e| {
+                    ServerError::Internal(format!(
+                        "Failed to garbage-collect preview resource {}/{}: {e}",
+                        target.namespace, target.name
+                    ))
+                })?
+            {
+                deleted += 1;
+            }
+        }
+        Ok(deleted)
+    }
+
+    async fn apply_cluster_policy(
+        &self,
+        name: &str,
+        policy_doc: &Value,
+    ) -> Result<(), ServerError> {
+        self.live
+            .apply_cluster_policy(name, policy_doc)
+            .await
+            .map_err(|e| {
+                ServerError::Internal(format!(
+                    "Failed to apply Kyverno ClusterPolicy '{name}': {e}"
+                ))
+            })
+    }
+
+    async fn delete_tenant_stack(&self, namespace: &str, name: &str) -> Result<bool, ServerError> {
+        self.live
+            .delete_dynamic_resource("pulumi.com/v1", "Stack", namespace, name)
+            .await
+            .map_err(ServerError::Kube)
     }
 }
 

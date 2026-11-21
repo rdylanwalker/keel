@@ -5,12 +5,13 @@ use std::time::Duration;
 
 use axum::extract::ws::{Message, WebSocket};
 use futures::StreamExt;
-use keel_core::StackSshInfoResponse;
+use keel_core::{
+    StackSshInfoResponse, clean_candidate_ssh_host, clean_candidate_ssh_user,
+    is_private_or_internal_ssh_host,
+};
 use russh::keys::{PrivateKeyWithHashAlg, decode_secret_key};
 use russh::{ChannelMsg, client};
 use serde::{Deserialize, Serialize};
-
-use crate::routes::{clean_candidate_ssh_host, clean_candidate_ssh_user};
 
 /// Providers that do not expose an SSH-accessible VM/node endpoint.
 const NON_SSH_PROVIDERS: &[&str] = &[
@@ -154,6 +155,23 @@ pub(crate) async fn handle_stack_ssh_ws(
                     }) => {
                         if let Some(h) = host.as_deref() {
                             if let Some(cleaned) = clean_candidate_ssh_host(h) {
+                                if cleaned != ssh_info.ssh_host
+                                    && is_private_or_internal_ssh_host(&cleaned)
+                                {
+                                    let _ = send_ws_json(
+                                        &mut socket,
+                                        &SshWsServerMessage::Error {
+                                            message: "Refusing SSH host override targeting private, loopback, or cluster-internal address".to_string(),
+                                        },
+                                    )
+                                    .await;
+                                    let _ = send_ws_json(
+                                        &mut socket,
+                                        &SshWsServerMessage::Disconnected,
+                                    )
+                                    .await;
+                                    return;
+                                }
                                 active_host = cleaned;
                             } else {
                                 let _ = send_ws_json(
@@ -889,6 +907,16 @@ mod tests {
         ws.send_text(r#"{"type":"connect","host":"bad host!!"}"#)
             .await;
         assert!(ws.recv_text().await.contains("Invalid SSH host"));
+        assert!(ws.recv_text().await.contains("disconnected"));
+
+        let mut ws = MiniWsClient::connect(addr, "/ws").await;
+        ws.send_text(r#"{"type":"connect","host":"169.254.169.254"}"#)
+            .await;
+        assert!(
+            ws.recv_text()
+                .await
+                .contains("Refusing SSH host override targeting private")
+        );
         assert!(ws.recv_text().await.contains("disconnected"));
 
         let mut ws = MiniWsClient::connect(addr, "/ws").await;

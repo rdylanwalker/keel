@@ -15,7 +15,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::Utc;
 use jsonwebtoken::jwk::JwkSet;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
-use keel_core::{AuthPhase, EnvelopeCrypto};
+use keel_core::{AuthPhase, EnvelopeCrypto, percent_encode};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -516,8 +516,8 @@ pub async fn oidc_login(
     let prompt_param = if force_reauth { "&prompt=login" } else { "" };
     let auth_url = format!(
         "{authorization_endpoint}{sep}response_type=code&client_id={}&redirect_uri={}&scope={scopes}&state={state_nonce}&code_challenge={code_challenge}&code_challenge_method=S256{prompt_param}",
-        url_encode_component(&oidc.client_id),
-        url_encode_component(&redirect_uri),
+        percent_encode(&oidc.client_id),
+        percent_encode(&redirect_uri),
     );
 
     let location = HeaderValue::from_str(&auth_url)
@@ -876,6 +876,19 @@ pub(crate) async fn csrf_origin_guard(
                 .and_then(|v| v.to_str().ok())
                 .map(str::trim);
 
+            let sec_fetch_site = headers
+                .get("sec-fetch-site")
+                .and_then(|v| v.to_str().ok())
+                .map(str::trim);
+            if let Some(site) = sec_fetch_site
+                && !site.eq_ignore_ascii_case("same-origin")
+                && !site.eq_ignore_ascii_case("none")
+            {
+                return Err(ServerError::Forbidden(
+                    "Cross-site request rejected by CSRF guard".to_string(),
+                ));
+            }
+
             if let Some(origin_raw) = origin_hdr {
                 let origin_url = Url::parse(origin_raw)
                     .map_err(|_| ServerError::Forbidden("Invalid Origin header".to_string()))?;
@@ -910,19 +923,6 @@ fn url_matches_host(url: &Url, host_hdr: Option<&str>) -> bool {
         None => url_host.to_string(),
     };
     authority.eq_ignore_ascii_case(expected_host)
-}
-
-fn url_encode_component(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    for byte in input.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(byte as char);
-            }
-            _ => out.push_str(&format!("%{byte:02X}")),
-        }
-    }
-    out
 }
 
 #[cfg(test)]
@@ -1245,6 +1245,21 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+
+        // Cross-site Sec-Fetch-Site header without Origin/Referer -> 403
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/mutate")
+                    .header("host", "keel.local")
+                    .header("sec-fetch-site", "cross-site")
+                    .header(COOKIE, format!("{SESSION_COOKIE_NAME}=tok"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 
         // Bearer token bypasses cookie CSRF guard -> 200
         let resp = app
