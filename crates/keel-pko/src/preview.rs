@@ -39,12 +39,19 @@ impl ChangeOp {
 }
 
 /// Parsed diff for an individual Pulumi resource.
+///
+/// Serialized camelCase on the wire (`resourceType`, `changedFields`) like the rest of the API;
+/// snake_case is still accepted on input for reports persisted by older servers (report
+/// `ConfigMap`s).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ResourceDiff {
     pub urn: String,
+    #[serde(alias = "resource_type")]
     pub resource_type: String,
     pub name: String,
     pub op: ChangeOp,
+    #[serde(default, alias = "changed_fields")]
     pub changed_fields: Vec<String>,
 }
 
@@ -87,11 +94,29 @@ impl PreviewSummary {
     }
 }
 
-/// Structured Pulumi preview report consumed by Forge PR comments, CLI, and React GUI.
+/// Origin of a [`PreviewReport`]: an actual PKO/Pulumi preview run, or a control-plane
+/// simulation synthesized from the proposed manifests/Git diff (no `pulumi preview` executed).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PreviewSource {
+    Pko,
+    /// Default so reports of unknown provenance are never presented as real PKO output.
+    #[default]
+    Synthesized,
+}
+
+/// Structured Pulumi preview report consumed by Forge PR comments, CLI, and React GUI
+/// (camelCase on the wire).
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PreviewReport {
     pub resources: Vec<ResourceDiff>,
     pub summary: PreviewSummary,
+    #[serde(default)]
+    pub source: PreviewSource,
+    /// Status of the ephemeral PKO preview run (absent for legacy/offline reports).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<crate::run::PreviewRunStatus>,
 }
 
 /// Parses raw `pulumi preview --json` output (standard JSON object, PKO `Stack` status JSON,
@@ -224,6 +249,22 @@ pub fn format_markdown_report(report: &PreviewReport, pr_id: &str) -> String {
     out.push_str(&format!(
         "### Keel Infrastructure Preview — {display_pr}\n\n"
     ));
+    if let Some(run) = &report.run {
+        out.push_str(&format!(
+            "**PKO preview:** {}",
+            sanitize_md_inline(run.phase.label())
+        ));
+        if let Some(stack) = &run.stack {
+            out.push_str(&format!(" (`{}`)", sanitize_md_cell(stack)));
+        }
+        if let Some(commit) = &run.commit {
+            out.push_str(&format!(" @ `{}`", sanitize_md_cell(commit)));
+        }
+        if let Some(msg) = &run.message {
+            out.push_str(&format!(" — {}", sanitize_md_inline(msg)));
+        }
+        out.push_str("\n\n");
+    }
 
     out.push_str(&format!(
         "**Summary:** `+ {} Create` | `~ {} Update` | `- {} Delete` | `! {} Replace` | `= {} Same`",
@@ -320,7 +361,12 @@ fn build_report_from_steps(
         }
     }
 
-    Ok(PreviewReport { resources, summary })
+    Ok(PreviewReport {
+        resources,
+        summary,
+        source: PreviewSource::Pko,
+        run: None,
+    })
 }
 
 fn ingest_step(
@@ -549,12 +595,34 @@ fn format_pr_label(pr_id: &str) -> String {
     } else if trimmed.chars().all(|c| c.is_ascii_digit()) {
         format!("PR #{trimmed}")
     } else {
-        format!("PR {trimmed}")
+        format!("PR {}", sanitize_md_inline(trimmed))
     }
 }
 
+/// Escapes text rendered inside a backtick code span in a GFM table cell: backticks would close
+/// the span (markdown injection, OPEN-28), pipes would split the cell, newlines break the row.
 fn sanitize_md_cell(input: &str) -> String {
-    input.replace('|', "\\|").replace(['\r', '\n'], " ")
+    input
+        .replace('`', "'")
+        .replace('|', "\\|")
+        .replace(['\r', '\n'], " ")
+}
+
+/// Escapes free text rendered as plain inline Markdown (no code span): neutralizes emphasis,
+/// links, HTML and code-span delimiters so forge-/PKO-supplied messages render literally.
+fn sanitize_md_inline(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for c in input.chars() {
+        match c {
+            '\r' | '\n' => out.push(' '),
+            '\\' | '`' | '*' | '_' | '[' | ']' | '<' | '>' | '|' | '#' | '!' | '~' => {
+                out.push('\\');
+                out.push(c);
+            }
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -799,6 +867,7 @@ mod tests {
                 same: 1,
                 ..PreviewSummary::default()
             },
+            ..PreviewReport::default()
         };
         let noop_md = format_markdown_report(&noop_report, "#99");
         assert!(noop_md.contains("PR #99"));
@@ -875,5 +944,82 @@ mod tests {
         let merged = parse_preview_json(transitions).expect("merge transitions");
         assert_eq!(merged.summary.drift, 2);
         assert_eq!(merged.summary.replace, 1);
+    }
+
+    #[test]
+    fn markdown_cells_neutralize_backtick_injection() {
+        let report = PreviewReport {
+            resources: vec![ResourceDiff {
+                urn: "urn:pulumi:s::p::k:v:T::x".to_string(),
+                resource_type: "k:v:T".to_string(),
+                name: "evil` [click](https://evil.example) `".to_string(),
+                op: ChangeOp::Create,
+                changed_fields: vec!["a`b|c\nd".to_string()],
+            }],
+            summary: PreviewSummary {
+                create: 1,
+                ..PreviewSummary::default()
+            },
+            run: Some(crate::run::PreviewRunStatus {
+                phase: crate::run::PreviewPhase::Failed,
+                message: Some("**boom** <img src=x> [l](u)".to_string()),
+                stack: Some("keel-previews/preview-stack-pr-1".to_string()),
+                commit: Some("ab`c".to_string()),
+                update: None,
+            }),
+            ..PreviewReport::default()
+        };
+        let md = format_markdown_report(&report, "1` <b>");
+        let table_row = md.lines().find(|l| l.starts_with("| `+ Create`")).unwrap();
+        // Exactly the 6 backticks wrapping op/type/name plus 2 for the single field: no injected spans.
+        assert_eq!(table_row.matches('`').count(), 8);
+        assert!(table_row.contains("evil' [click](https://evil.example) '"));
+        assert!(table_row.contains("`a'b\\|c d`"));
+        assert!(md.contains("**PKO preview:** Failed"));
+        assert!(md.contains("\\*\\*boom\\*\\* \\<img src=x\\> \\[l\\](u)"));
+        assert!(md.contains("@ `ab'c`"));
+        assert!(md.contains("PR 1\\` \\<b\\>"));
+    }
+
+    #[test]
+    fn report_wire_format_is_camel_case_and_accepts_legacy_snake_case() {
+        let report = PreviewReport {
+            resources: vec![ResourceDiff {
+                urn: "urn:pulumi:s::p::aws:ec2/instance:Instance::vm".to_string(),
+                resource_type: "aws:ec2/instance:Instance".to_string(),
+                name: "vm".to_string(),
+                op: ChangeOp::Update,
+                changed_fields: vec!["tags".to_string()],
+            }],
+            ..PreviewReport::default()
+        };
+        let wire = serde_json::to_value(&report).unwrap();
+        assert_eq!(
+            wire["resources"][0]["resourceType"],
+            "aws:ec2/instance:Instance"
+        );
+        assert_eq!(wire["resources"][0]["changedFields"][0], "tags");
+        assert!(wire["resources"][0].get("resource_type").is_none());
+        assert!(wire["resources"][0].get("changed_fields").is_none());
+        assert_eq!(
+            serde_json::from_value::<PreviewReport>(wire).unwrap(),
+            report
+        );
+
+        let legacy = serde_json::json!({
+            "resources": [{
+                "urn": "urn:pulumi:s::p::aws:ec2/instance:Instance::vm",
+                "resource_type": "aws:ec2/instance:Instance",
+                "name": "vm",
+                "op": "update",
+                "changed_fields": ["tags"]
+            }],
+            "summary": { "create": 0, "update": 0, "delete": 0, "replace": 0, "same": 0, "drift": 0 },
+            "source": "synthesized"
+        });
+        assert_eq!(
+            serde_json::from_value::<PreviewReport>(legacy).unwrap(),
+            report
+        );
     }
 }
