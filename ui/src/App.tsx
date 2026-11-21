@@ -509,7 +509,7 @@ export const App: React.FC = () => {
               )}
               {activeTab === "catalog" && (
                 <CatalogWizardView
-                  selectedTenant={activeSelectedTenant || undefined}
+                  selectedTenant={activeSelectedTenant}
                   onNavigateToPreview={() => navigateToTab("preview")}
                 />
               )}

@@ -93,6 +93,9 @@ interface RawCatalogEntry {
     runtime?: string
     provider?: string
     defaultEngine?: "flux" | "pulumi"
+    protected?: boolean
+    tenant?: string
+    resourceKind?: "vm" | "cluster" | "service"
   }
   spec?: {
     upstream?: {
@@ -149,6 +152,8 @@ function mapCatalogApplication(app: RawCatalogEntry): CatalogItem {
     serviceUrl: app.spec?.serviceUrl,
     schema: app.spec?.schema ?? { type: "object", properties: {} },
     uiSchema: app.spec?.uiSchema,
+    protected: Boolean(app.metadata?.protected),
+    tenant: app.metadata?.tenant,
   }
 }
 
@@ -181,6 +186,9 @@ export async function getCatalog(): Promise<CatalogItem[]> {
     pulumiYaml: raw.pulumiYaml?.[bp.metadata?.id ?? ""],
     schema: bp.spec?.schema ?? { type: "object", properties: {} },
     uiSchema: bp.spec?.uiSchema,
+    protected: Boolean(bp.metadata?.protected),
+    tenant: bp.metadata?.tenant,
+    resourceKind: bp.metadata?.resourceKind,
   }))
   const bundles: CatalogItem[] = (raw.bundles ?? []).map((b) => ({
     id: b.metadata?.id ?? "unknown-bundle",
@@ -196,6 +204,8 @@ export async function getCatalog(): Promise<CatalogItem[]> {
     bundleItems: b.spec?.items ?? [],
     schema: b.spec?.schema ?? { type: "object", properties: {} },
     uiSchema: b.spec?.uiSchema,
+    protected: Boolean(b.metadata?.protected),
+    tenant: b.metadata?.tenant,
   }))
   return [...bundles, ...blueprints, ...apps]
 }
@@ -843,4 +853,27 @@ export function createEventSourceStream(
     es.onerror = onError
   }
   return es
+}
+
+export async function deleteCatalogItem(
+  kind: "app" | "infra" | "infrastructure" | "bundle" | string,
+  id: string
+): Promise<Proposal> {
+  const normalizedKind =
+    kind === "infrastructure" || kind === "infra"
+      ? "infra"
+      : kind === "bundle"
+        ? "bundle"
+        : "app"
+  const res = await fetch(
+    `/api/v1/catalog/${encodeURIComponent(normalizedKind)}/${encodeURIComponent(id)}`,
+    {
+      method: "DELETE",
+      headers: getHeaders(),
+    }
+  )
+  const raw = await handleResponse<
+    RawProposal | { proposal: RawProposal; branch?: string }
+  >(res)
+  return unwrapProposalResponse(raw)
 }

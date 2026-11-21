@@ -164,7 +164,7 @@ describe("StackInspectorModal component", () => {
     render(
       <StackInspectorModal
         namespace="tenant-acme"
-        name="prod-cluster"
+        name="prod-vm"
         kind="stack"
         onClose={onClose}
         onOpenSsh={onOpenSsh}

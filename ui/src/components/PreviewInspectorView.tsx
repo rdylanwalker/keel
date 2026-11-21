@@ -45,6 +45,7 @@ export const PreviewInspectorView: React.FC<PreviewInspectorViewProps> = ({
   )
   const [loadingPRs, setLoadingPRs] = useState(false)
   const [loadingPreview, setLoadingPreview] = useState(false)
+  const [searchQuery, setSearchQuery] = useState("")
   const [merging, setMerging] = useState(false)
   const [rejecting, setRejecting] = useState(false)
   const [reopening, setReopening] = useState(false)
@@ -320,63 +321,101 @@ export const PreviewInspectorView: React.FC<PreviewInspectorViewProps> = ({
             ))}
           </div>
 
+          <div className="mb-4">
+            <input
+              type="text"
+              placeholder="Search pull requests..."
+              aria-label="Search pull requests"
+              data-testid="pr-search-input"
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              className="w-full px-3 py-2 bg-slate-900 border border-slate-800 rounded-lg text-xs text-slate-100 placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+            />
+          </div>
+
           <div
             data-testid="pr-list"
             className="space-y-3 flex-1 min-h-0 max-h-160 lg:max-h-none overflow-y-auto pr-1"
           >
-            {proposals.map((pr) => {
-              const isSelected = selectedPR?.id === pr.id
-              return (
-                <div
-                  key={pr.id}
-                  onClick={() => handleSelectPR(pr)}
-                  role="button"
-                  tabIndex={0}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter" || e.key === " ") {
-                      handleSelectPR(pr)
-                    }
-                  }}
-                  className={`p-4 rounded-xl border text-left cursor-pointer transition-all ${
-                    isSelected
-                      ? "bg-indigo-950/30 border-indigo-500/50 shadow-lg shadow-indigo-950/40"
-                      : "bg-slate-900 border-slate-800 hover:border-slate-700 hover:bg-slate-800/40"
-                  }`}
-                >
-                  <div className="flex items-center justify-between mb-1">
-                    <span className="text-xs font-bold text-white flex items-center gap-1.5">
-                      <GitPullRequest className="h-3.5 w-3.5 text-indigo-400" />
-                      PR #{pr.id}
-                    </span>
-                    <span
-                      className={`text-[10px] font-mono px-2 py-0.5 rounded-full font-medium ${
-                        pr.status === "merged"
-                          ? "bg-purple-500/10 text-purple-400 border border-purple-500/20"
-                          : pr.status === "closed"
-                            ? "bg-amber-500/10 text-amber-400 border border-amber-500/20"
-                            : "bg-emerald-500/10 text-emerald-400 border border-emerald-500/20"
-                      }`}
-                    >
-                      {pr.status}
-                    </span>
-                  </div>
+            {proposals
+              .filter((pr) => {
+                const q = searchQuery.toLowerCase()
+                return (
+                  pr.title.toLowerCase().includes(q) ||
+                  pr.id.toLowerCase().includes(q) ||
+                  pr.branch.toLowerCase().includes(q) ||
+                  pr.author.toLowerCase().includes(q) ||
+                  pr.tenant.toLowerCase().includes(q)
+                )
+              })
+              .map((pr) => {
+                const isSelected = selectedPR?.id === pr.id
+                return (
+                  <div
+                    key={pr.id}
+                    onClick={() => handleSelectPR(pr)}
+                    role="button"
+                    tabIndex={0}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" || e.key === " ") {
+                        handleSelectPR(pr)
+                      }
+                    }}
+                    className={`p-4 rounded-xl border text-left cursor-pointer transition-all ${
+                      isSelected
+                        ? "bg-indigo-950/30 border-indigo-500/50 shadow-lg shadow-indigo-950/40"
+                        : "bg-slate-900 border-slate-800 hover:border-slate-700 hover:bg-slate-800/40"
+                    }`}
+                  >
+                    <div className="flex items-center justify-between mb-1">
+                      <span className="text-xs font-bold text-white flex items-center gap-1.5">
+                        <GitPullRequest className="h-3.5 w-3.5 text-indigo-400" />
+                        PR #{pr.id}
+                      </span>
+                      <span
+                        className={`text-[10px] font-mono px-2 py-0.5 rounded-full font-medium ${
+                          pr.status === "merged"
+                            ? "bg-purple-500/10 text-purple-400 border border-purple-500/20"
+                            : pr.status === "closed"
+                              ? "bg-amber-500/10 text-amber-400 border border-amber-500/20"
+                              : "bg-emerald-500/10 text-emerald-400 border border-emerald-500/20"
+                        }`}
+                      >
+                        {pr.status}
+                      </span>
+                    </div>
 
-                  <p className="text-xs font-medium text-slate-200 line-clamp-2 mb-2">
-                    {pr.title}
-                  </p>
+                    <p className="text-xs font-medium text-slate-200 line-clamp-2 mb-2">
+                      {pr.title}
+                    </p>
 
-                  <div className="flex items-center justify-between text-[10px] font-mono text-slate-500">
-                    <span>{pr.tenant}</span>
-                    <span>{pr.createdAt}</span>
+                    <div className="flex items-center justify-between text-[10px] font-mono text-slate-500">
+                      <span>{pr.tenant}</span>
+                      <span>{pr.createdAt}</span>
+                    </div>
                   </div>
-                </div>
-              )
-            })}
+                )
+              })}
             {proposals.length === 0 && (
               <div className="p-4 rounded-xl bg-slate-900 border border-slate-800 text-xs text-slate-500 text-center">
                 No open proposals found — create a proposal from the Catalog.
               </div>
             )}
+            {proposals.length > 0 &&
+              proposals.filter((pr) => {
+                const q = searchQuery.toLowerCase()
+                return (
+                  pr.title.toLowerCase().includes(q) ||
+                  pr.id.toLowerCase().includes(q) ||
+                  pr.branch.toLowerCase().includes(q) ||
+                  pr.author.toLowerCase().includes(q) ||
+                  pr.tenant.toLowerCase().includes(q)
+                )
+              }).length === 0 && (
+                <div className="p-4 rounded-xl bg-slate-900 border border-slate-800 text-xs text-slate-500 text-center">
+                  No pull requests matching your search.
+                </div>
+              )}
           </div>
         </div>
 

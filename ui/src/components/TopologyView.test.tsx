@@ -154,7 +154,7 @@ describe("TopologyView component", () => {
     // Filter with no matching stacks
     fireEvent.change(filterInput, { target: { value: "hetzner" } })
     expect(
-      screen.getByText("No stacks matching your filter.")
+      screen.getByText("No virtual machines matching your filter.")
     ).toBeInTheDocument()
   })
 
@@ -621,9 +621,11 @@ describe("TopologyView component", () => {
       screen.getByRole("button", { name: "Auto: Off" })
     ).toBeInTheDocument()
 
-    fireEvent.click(screen.getByRole("button", { name: "+ Deploy Stack" }))
+    fireEvent.click(screen.getByRole("button", { name: "+ Deploy Cluster" }))
+    fireEvent.click(screen.getByRole("button", { name: "+ Deploy VM" }))
+    fireEvent.click(screen.getByRole("button", { name: "+ Deploy Service" }))
     fireEvent.click(screen.getByRole("button", { name: "+ Deploy App" }))
-    expect(onNavigateToCatalog).toHaveBeenCalledTimes(2)
+    expect(onNavigateToCatalog).toHaveBeenCalledTimes(4)
 
     // Inspect stack modal open & close
     fireEvent.click(
@@ -769,10 +771,10 @@ describe("TopologyView component", () => {
 
     render(<TopologyView />)
 
-    const mgmtSshBtn = await screen.findByTestId(
+    const mgmtSshBtn = screen.queryByTestId(
       "stack-ssh-btn-management-cluster-core"
     )
-    expect(mgmtSshBtn).toBeDisabled()
+    expect(mgmtSshBtn).toBeNull()
 
     const sshBtn = await screen.findByTestId("stack-ssh-btn-live-proxmox-stack")
     expect(sshBtn).toBeEnabled()
@@ -847,5 +849,61 @@ describe("TopologyView component", () => {
       )
       expect(api.getStacksWithMeta).toHaveBeenCalledTimes(2)
     })
+  })
+
+  it("renders the 3 infrastructure sections and correctly places the SSH connect button only on virtual machines", async () => {
+    const splitStacks = [
+      {
+        id: "s1",
+        name: "management-cluster-core",
+        tenant: "system",
+        provider: "kind",
+        type: "management",
+        status: "synced",
+        namespace: "flux-system",
+      },
+      {
+        id: "s2",
+        name: "live-proxmox-stack",
+        tenant: "tenant-a",
+        provider: "proxmox",
+        type: "workload",
+        status: "synced",
+      },
+      {
+        id: "s3",
+        name: "postgres-managed",
+        tenant: "tenant-b",
+        provider: "kubernetes",
+        type: "workload",
+        status: "synced",
+      },
+    ]
+    vi.mocked(api.getStacksWithMeta).mockResolvedValue({
+      stacks: splitStacks as import("../types/api").StackSummary[],
+    })
+
+    render(<TopologyView />)
+
+    await waitFor(() => {
+      // 3 Sections
+      expect(
+        screen.getByTestId("topology-clusters-section")
+      ).toBeInTheDocument()
+      expect(screen.getByTestId("topology-vms-section")).toBeInTheDocument()
+      expect(
+        screen.getByTestId("topology-services-section")
+      ).toBeInTheDocument()
+    })
+
+    // VM Section has SSH button
+    const sshBtn = screen.getByTestId("stack-ssh-btn-live-proxmox-stack")
+    expect(sshBtn).toBeInTheDocument()
+
+    // Cluster / Service sections should NOT render an SSH button in their DataTable columns
+    expect(
+      screen.queryByTestId("stack-ssh-btn-management-cluster-core")
+    ).toBeNull()
+    expect(screen.queryByTestId("stack-ssh-btn-postgres-managed")).toBeNull()
   })
 })

@@ -32,6 +32,7 @@ import {
   getStacks,
   getTenants,
   updateCatalogItem,
+  deleteCatalogItem,
 } from "../lib/api"
 import { isDemoMode } from "../lib/utils"
 import {
@@ -74,6 +75,9 @@ export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
     isDemoMode() ? DEFAULT_CATALOG : []
   )
   const [searchQuery, setSearchQuery] = useState("")
+  const [deletingCatalogId, setDeletingCatalogId] = useState<string | null>(
+    null
+  )
   const [deployModalItem, setDeployModalItem] = useState<CatalogItem | null>(
     null
   )
@@ -83,11 +87,16 @@ export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
   const [isDeployEditMode, setIsDeployEditMode] = useState(false)
 
   const [tenant, setTenant] = useState(selectedTenant || "default")
+  const [tenantFilter, setTenantFilter] = useState(selectedTenant || "all")
   const [prevSelectedTenant, setPrevSelectedTenant] = useState(selectedTenant)
   if (selectedTenant !== prevSelectedTenant) {
     setPrevSelectedTenant(selectedTenant)
-    if (selectedTenant) {
+    if (selectedTenant && selectedTenant !== "all") {
       setTenant(selectedTenant)
+      setTenantFilter(selectedTenant)
+    } else {
+      setTenant("all")
+      setTenantFilter("all")
     }
   }
   const [stacks, setStacks] = useState<StackSummary[]>([])
@@ -140,7 +149,9 @@ export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
         if (items && items.length > 0) {
           setTenants(items)
           setTenant((prev) =>
-            items.some((t) => t.id === prev) ? prev : items[0].id
+            prev === "all" || items.some((t) => t.id === prev)
+              ? prev
+              : items[0].id
           )
         } else {
           setTenants(
@@ -264,12 +275,21 @@ export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
     setError(null)
   }
 
-  const filteredCatalog = catalog.filter(
-    (item) =>
+  const filteredCatalog = catalog.filter((item) => {
+    if (
+      tenantFilter &&
+      tenantFilter !== "all" &&
+      item.tenant &&
+      item.tenant !== tenantFilter
+    ) {
+      return false
+    }
+    return (
       item.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
       item.description.toLowerCase().includes(searchQuery.toLowerCase()) ||
       item.category.toLowerCase().includes(searchQuery.toLowerCase())
-  )
+    )
+  })
 
   const handleCreateTenant = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -399,6 +419,9 @@ export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
       pulumiRuntime: item.pulumiRuntime || "yaml",
       entrypoint: item.entrypoint || "Pulumi.yaml",
       protectByDefault: !!item.protectByDefault,
+      protected: Boolean(item.protected),
+      tenant: item.tenant || "",
+      resourceKind: item.resourceKind,
       terraformProvider: "",
       pulumiYaml: item.pulumiYaml || "",
       items: item.bundleItems
@@ -442,12 +465,32 @@ export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
 
     try {
       const isEditing = Boolean(editingCatalogItem)
+
+      const protectedChanged =
+        isEditing &&
+        Boolean(appForm.protected) !== Boolean(editingCatalogItem?.protected)
+      const tenantChanged =
+        isEditing &&
+        (appForm.tenant?.trim() || "") !== (editingCatalogItem?.tenant || "")
+
+      const basePayloadFields = {
+        ...(appForm.protected || protectedChanged
+          ? { protected: Boolean(appForm.protected) }
+          : {}),
+        ...(appForm.tenant?.trim()
+          ? { tenant: appForm.tenant.trim() }
+          : tenantChanged
+            ? { tenant: "" }
+            : {}),
+      }
+
       const payload: CreateCatalogItemPayload = isBundle
         ? {
             kind: "bundle",
             id: appForm.id.trim(),
             name: appForm.name.trim(),
             category: appForm.category.trim() || "Platform",
+            ...basePayloadFields,
             description: isEditing
               ? (appForm.description?.trim() ?? "")
               : appForm.description?.trim() || undefined,
@@ -474,6 +517,10 @@ export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
               id: appForm.id.trim(),
               name: appForm.name.trim(),
               category: appForm.category.trim() || "Infrastructure",
+              ...basePayloadFields,
+              ...(appForm.resourceKind
+                ? { resourceKind: appForm.resourceKind }
+                : {}),
               ...(isEditing
                 ? { description: appForm.description?.trim() ?? "" }
                 : appForm.description?.trim()
@@ -494,6 +541,7 @@ export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
               id: appForm.id.trim(),
               name: appForm.name.trim(),
               category: appForm.category.trim() || "Applications",
+              ...basePayloadFields,
               ...(isEditing
                 ? { description: appForm.description?.trim() ?? "" }
                 : appForm.description?.trim()
@@ -559,6 +607,15 @@ export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
               pulumiRuntime: payload.pulumiRuntime,
               entrypoint: payload.entrypoint,
               protectByDefault: payload.protectByDefault,
+              ...(payload.protected !== undefined
+                ? { protected: payload.protected }
+                : {}),
+              ...(payload.tenant !== undefined
+                ? { tenant: payload.tenant }
+                : {}),
+              ...(payload.resourceKind
+                ? { resourceKind: payload.resourceKind }
+                : {}),
               ...(payload.pulumiYaml ? { pulumiYaml: payload.pulumiYaml } : {}),
               items: payload.items,
               schema: payload.schema,
@@ -657,9 +714,14 @@ export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
           <select
             id="tenant-select-catalog"
             value={tenant}
-            onChange={(e) => setTenant(e.target.value)}
+            onChange={(e) => {
+              const nextVal = e.target.value
+              setTenant(nextVal)
+              setTenantFilter(nextVal)
+            }}
             className="bg-slate-950 border border-slate-800 text-xs text-slate-200 rounded-lg px-3 py-1.5 focus:outline-none focus:ring-1 focus:ring-indigo-500 font-mono"
           >
+            <option value="all">All Tenants</option>
             {tenants.map((t) => (
               <option key={t.id} value={t.id}>
                 {t.id}
@@ -670,14 +732,19 @@ export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
           <button
             type="button"
             onClick={() => handleDeleteTenant(tenant)}
-            disabled={tenant === "default" || tenantLoading}
+            disabled={
+              tenant === "default" ||
+              tenant === "all" ||
+              !tenant ||
+              tenantLoading
+            }
             title={
-              tenant === "default"
+              tenant === "default" || tenant === "all"
                 ? "The default tenant is protected and cannot be removed"
                 : `Propose removal of tenant ${tenant}`
             }
             aria-label={
-              tenant === "default"
+              tenant === "default" || tenant === "all"
                 ? "Remove tenant (disabled for protected default tenant)"
                 : `Remove tenant ${tenant}`
             }
@@ -848,10 +915,31 @@ export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
           >
             <div className="space-y-2.5">
               <div className="flex items-start justify-between gap-2">
-                <span className="text-sm font-bold text-white flex items-center gap-2">
-                  <Box className="h-4 w-4 text-indigo-400 shrink-0" />
-                  <span>{item.name}</span>
-                </span>
+                <div className="flex flex-col gap-1">
+                  <span className="text-sm font-bold text-white flex items-center gap-2">
+                    <Box className="h-4 w-4 text-indigo-400 shrink-0" />
+                    <span>{item.name}</span>
+                  </span>
+                  <div className="flex items-center gap-2 mt-1">
+                    {item.protected && (
+                      <span
+                        data-testid={`catalog-protected-badge-${item.id}`}
+                        className="text-[9px] uppercase font-bold px-1.5 py-0.5 rounded bg-amber-900/30 text-amber-500 border border-amber-900/50"
+                      >
+                        Protected
+                      </span>
+                    )}
+                    {item.tenant ? (
+                      <span className="text-[9px] uppercase font-bold px-1.5 py-0.5 rounded bg-slate-800 text-slate-400 border border-slate-700">
+                        Tenant: {item.tenant}
+                      </span>
+                    ) : (
+                      <span className="text-[9px] uppercase font-bold px-1.5 py-0.5 rounded bg-indigo-900/30 text-indigo-400 border border-indigo-900/50">
+                        Global
+                      </span>
+                    )}
+                  </div>
+                </div>
                 <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-slate-800 text-slate-400 shrink-0">
                   {item.type === "bundle"
                     ? "bundle"
@@ -876,24 +964,59 @@ export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
               </div>
             </div>
 
-            <div className="flex items-center justify-end gap-2 pt-3 border-t border-slate-800/80">
+            <div className="flex items-center justify-between gap-2 pt-3 border-t border-slate-800/80">
               <button
                 type="button"
-                onClick={() => openEditCatalogModal(item)}
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition-colors cursor-pointer"
-                title="Edit catalog item definition via Git PR"
+                data-testid={`delete-catalog-item-${item.id}`}
+                aria-label={`Delete catalog item ${item.name}`}
+                title={
+                  item.protected
+                    ? "Protected catalog item — disable protection in Edit to delete"
+                    : "Delete catalog item via Git PR"
+                }
+                disabled={
+                  Boolean(item.protected) || deletingCatalogId === item.id
+                }
+                onClick={async () => {
+                  if (item.protected || deletingCatalogId === item.id) return
+                  setDeletingCatalogId(item.id)
+                  try {
+                    const proposal = await deleteCatalogItem(item.type, item.id)
+                    setCreatedProposal(proposal)
+                    setCatalog((prev) => prev.filter((c) => c.id !== item.id))
+                  } catch (err) {
+                    setError(
+                      err instanceof Error
+                        ? err.message
+                        : "Failed to delete catalog item"
+                    )
+                  } finally {
+                    setDeletingCatalogId(null)
+                  }
+                }}
+                className="inline-flex items-center justify-center p-1.5 rounded text-slate-400 hover:text-red-400 hover:bg-slate-800 disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
               >
-                <Pencil className="h-3.5 w-3.5" />
-                <span>Edit</span>
+                <Trash2 className="h-4 w-4" />
               </button>
-              <button
-                type="button"
-                onClick={() => openDeployModal(item)}
-                className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg text-xs font-semibold bg-indigo-600 hover:bg-indigo-500 text-white transition-colors shadow-sm shadow-indigo-600/20 cursor-pointer"
-              >
-                <Plus className="h-3.5 w-3.5" />
-                <span>Create</span>
-              </button>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => openEditCatalogModal(item)}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition-colors cursor-pointer"
+                  title="Edit catalog item definition via Git PR"
+                >
+                  <Pencil className="h-3.5 w-3.5" />
+                  <span>Edit</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => openDeployModal(item)}
+                  className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg text-xs font-semibold bg-indigo-600 hover:bg-indigo-500 text-white transition-colors shadow-sm shadow-indigo-600/20 cursor-pointer"
+                >
+                  <Plus className="h-3.5 w-3.5" />
+                  <span>Create</span>
+                </button>
+              </div>
             </div>
           </div>
         ))}
@@ -916,9 +1039,15 @@ export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
           setIsDeployEditMode(false)
         }}
         catalogItem={deployModalItem}
-        tenant={tenant}
+        tenant={
+          deployModalItem?.tenant ||
+          (tenant && tenant !== "all" ? tenant : tenants[0]?.id || "default")
+        }
         tenants={tenants}
-        onTenantChange={setTenant}
+        onTenantChange={(nextTenant) => {
+          setTenant(nextTenant)
+          setTenantFilter(nextTenant)
+        }}
         stacks={stacks}
         releases={releases}
         initialConfig={deployInitialConfig}
@@ -957,6 +1086,7 @@ export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
         catalog={catalog}
         appForm={appForm}
         setAppForm={setAppForm}
+        tenants={tenants}
         schemaJsonText={schemaJsonText}
         setSchemaJsonText={setSchemaJsonText}
         schemaFields={schemaFields}

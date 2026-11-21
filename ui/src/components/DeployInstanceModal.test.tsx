@@ -527,4 +527,79 @@ describe("DeployInstanceModal component", () => {
     fireEvent.click(screen.getByRole("button", { name: /Sync Upstream/i }))
     expect(await screen.findByText("Schema fetch failed")).toBeInTheDocument()
   })
+
+  it("filters stacks in Target Cluster dropdown to only include 'cluster' resource kinds", async () => {
+    const mixedStacks = [
+      {
+        id: "kind-stack",
+        name: "dev-kind",
+        tenant: "acme",
+        provider: "kind",
+        type: "workload",
+        status: "synced",
+      },
+      {
+        id: "aws-eks",
+        name: "aws-eks-cluster",
+        tenant: "acme",
+        provider: "aws",
+        type: "cloud",
+        status: "synced",
+      },
+      {
+        id: "vm-stack",
+        name: "aws-vm",
+        tenant: "acme",
+        provider: "aws",
+        type: "workload",
+        status: "synced",
+      },
+      {
+        id: "service-stack",
+        name: "postgres-managed",
+        tenant: "acme",
+        provider: "kubernetes",
+        type: "workload",
+        status: "synced",
+      },
+      {
+        id: "mgmt-stack",
+        name: "management-cluster-core",
+        tenant: "system",
+        provider: "kind",
+        type: "management",
+        status: "synced",
+      },
+    ]
+
+    render(
+      <DeployInstanceModal
+        isOpen={true}
+        onClose={vi.fn()}
+        catalogItem={sampleAppItem}
+        tenant="acme"
+        stacks={mixedStacks as import("../types/api").StackSummary[]}
+      />
+    )
+
+    const clusterSelect = screen.getByLabelText(/Target Cluster/i)
+    fireEvent.click(clusterSelect)
+
+    // Should include:
+    expect(
+      screen.getByRole("option", { name: /dev-kind/i })
+    ).toBeInTheDocument()
+    expect(
+      screen.getByRole("option", { name: /aws-eks-cluster/i })
+    ).toBeInTheDocument()
+
+    // Should exclude:
+    expect(screen.queryByRole("option", { name: /aws-vm/i })).toBeNull()
+    expect(
+      screen.queryByRole("option", { name: /postgres-managed/i })
+    ).toBeNull()
+    expect(
+      screen.queryByRole("option", { name: /management-cluster-core/i })
+    ).toBeNull()
+  })
 })

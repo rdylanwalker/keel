@@ -24,7 +24,11 @@ import {
   reconcileRelease,
   reconcileStack,
 } from "../lib/api"
-import { isDemoMode, isStackSshSupported } from "../lib/utils"
+import {
+  isDemoMode,
+  isStackSshSupported,
+  classifyStackResourceKind,
+} from "../lib/utils"
 import {
   BOOTSTRAP_MANAGEMENT_STACK,
   DEFAULT_EVENTS,
@@ -367,12 +371,12 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
 
   const normalizeStatus = (status?: string) => (status ?? "").toLowerCase()
 
-  const stackColumns = useMemo<DataTableColumnDef<StackSummary>[]>(
-    () => [
+  const createStackColumns = (headerName: string, includeSsh: boolean) =>
+    [
       {
         accessorKey: "name",
-        header: "Stack Name",
-        cell: ({ row }) => (
+        header: headerName,
+        cell: ({ row }: { row: { original: StackSummary } }) => (
           <span className="font-semibold text-slate-100">
             {row.original.name}
           </span>
@@ -381,15 +385,15 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
       {
         accessorKey: "tenant",
         header: "Tenant",
-        cell: ({ row }) => (
+        cell: ({ row }: { row: { original: StackSummary } }) => (
           <span className="text-indigo-400">{row.original.tenant}</span>
         ),
       },
       {
         accessorKey: "provider",
         header: "Provider",
-        cell: ({ row }) => (
-          <span className="uppercase text-slate-400">
+        cell: ({ row }: { row: { original: StackSummary } }) => (
+          <span className="uppercase tracking-wider font-mono text-[10px]">
             {row.original.provider}
           </span>
         ),
@@ -397,45 +401,43 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
       {
         accessorKey: "type",
         header: "Type",
-        cell: ({ row }) => (
-          <span className="capitalize text-slate-400">
-            {row.original.type || "workload"}
-          </span>
-        ),
-      },
-      {
-        id: "bundle",
-        accessorFn: (row) =>
-          row.bundle
-            ? `${row.bundle}${row.bundleItem ? `/${row.bundleItem}` : ""}`
-            : "",
-        header: "Bundle",
-        cell: ({ row }) => (
-          <BundleBadge
-            bundle={row.original.bundle}
-            bundleItem={row.original.bundleItem}
-            fallback={<span className="text-slate-600">—</span>}
-          />
-        ),
-      },
-      {
-        accessorKey: "resourceCount",
-        header: "Resources",
-        cell: ({ row }) => (
-          <span className="font-bold text-slate-200">
-            {row.original.resourceCount ?? "—"}
-          </span>
+        cell: ({ row }: { row: { original: StackSummary } }) => (
+          <span className="text-slate-300 capitalize">{row.original.type}</span>
         ),
       },
       {
         accessorKey: "status",
         header: "Status",
-        cell: ({ row }) => <StatusBadge status={row.original.status} />,
+        cell: ({ row }: { row: { original: StackSummary } }) => (
+          <StatusBadge status={row.original.status} />
+        ),
+      },
+      {
+        accessorKey: "resourceCount",
+        header: "Resources",
+        cell: ({ row }: { row: { original: StackSummary } }) => (
+          <span className="font-mono text-slate-300">
+            {row.original.resourceCount ?? "-"}
+          </span>
+        ),
+      },
+      {
+        accessorKey: "bundle",
+        header: "Bundle",
+        cell: ({ row }: { row: { original: StackSummary } }) => {
+          if (!row.original.bundle) return null
+          return (
+            <BundleBadge
+              bundle={row.original.bundle}
+              bundleItem={row.original.bundleItem}
+            />
+          )
+        },
       },
       {
         accessorKey: "lastSynced",
         header: "Last Synced",
-        cell: ({ row }) => (
+        cell: ({ row }: { row: { original: StackSummary } }) => (
           <span
             className="text-slate-400 whitespace-nowrap"
             title={row.original.lastSynced || undefined}
@@ -446,10 +448,8 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
       },
       {
         id: "actions",
-        header: "Actions",
-        enableSorting: false,
-        meta: { align: "right" },
-        cell: ({ row }) => {
+        header: "",
+        cell: ({ row }: { row: { original: StackSummary } }) => {
           const stack = row.original
           const ns =
             stack.namespace ||
@@ -461,7 +461,7 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
           const isProtected =
             stack.name === "management-cluster-core" ||
             stack.namespace === "flux-system"
-          const sshSupported = isStackSshSupported(stack)
+          const sshSupported = includeSsh ? isStackSshSupported(stack) : false
           return (
             <div className="inline-flex items-center justify-end gap-1.5">
               {onEditStack && (
@@ -476,28 +476,30 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
                   <Pencil className="h-3.5 w-3.5" />
                 </button>
               )}
-              <button
-                type="button"
-                data-testid={`stack-ssh-btn-${stack.name}`}
-                disabled={!sshSupported}
-                title={
-                  sshSupported
-                    ? "SSH Connect"
-                    : "SSH is not supported for this infrastructure"
-                }
-                aria-label={`SSH connect to stack ${stack.name}`}
-                onClick={() =>
-                  setSshStack({
-                    stackName: stack.name,
-                    namespace: ns,
-                    tenant: stack.tenant || "default",
-                    provider: stack.provider,
-                  })
-                }
-                className="p-1.5 rounded-md bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
-              >
-                <Terminal className="h-3.5 w-3.5" />
-              </button>
+              {includeSsh && (
+                <button
+                  type="button"
+                  data-testid={`stack-ssh-btn-${stack.name}`}
+                  disabled={!sshSupported}
+                  title={
+                    sshSupported
+                      ? "SSH Connect"
+                      : "SSH is not supported for this infrastructure"
+                  }
+                  aria-label={`SSH connect to stack ${stack.name}`}
+                  onClick={() =>
+                    setSshStack({
+                      stackName: stack.name,
+                      namespace: ns,
+                      tenant: stack.tenant || "default",
+                      provider: stack.provider,
+                    })
+                  }
+                  className="p-1.5 rounded-md bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+                >
+                  <Terminal className="h-3.5 w-3.5" />
+                </button>
+              )}
               <button
                 type="button"
                 title="Inspect"
@@ -550,7 +552,20 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
           )
         },
       },
-    ],
+    ] as DataTableColumnDef<StackSummary>[]
+
+  const stackColumns = useMemo<DataTableColumnDef<StackSummary>[]>(
+    () => createStackColumns("Cluster Name", false),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [onEditStack, reconcilingStackKey, deletingKey]
+  )
+  const vmStackColumns = useMemo<DataTableColumnDef<StackSummary>[]>(
+    () => createStackColumns("Stack Name", true),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [onEditStack, reconcilingStackKey, deletingKey]
+  )
+  const serviceStackColumns = useMemo<DataTableColumnDef<StackSummary>[]>(
+    () => createStackColumns("Service Name", false),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [onEditStack, reconcilingStackKey, deletingKey]
   )
@@ -775,6 +790,19 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
       ? events
       : events.filter((e) => e.kind === eventFilterKind)
 
+  const clusterStacks = useMemo(
+    () => stacks.filter((s) => classifyStackResourceKind(s) === "cluster"),
+    [stacks]
+  )
+  const vmStacks = useMemo(
+    () => stacks.filter((s) => classifyStackResourceKind(s) === "vm"),
+    [stacks]
+  )
+  const serviceStacks = useMemo(
+    () => stacks.filter((s) => classifyStackResourceKind(s) === "service"),
+    [stacks]
+  )
+
   return (
     <div className="space-y-6">
       {/* Overview header stats */}
@@ -927,8 +955,11 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
       {/* Active Flagger Canary Progressive Delivery Section (promoted when active) */}
       <CanaryTrafficSection canaries={canaries} />
 
-      {/* Provisioned Stacks Table */}
-      <div className="bg-slate-900 border border-slate-800 rounded-2xl overflow-hidden space-y-4 p-6">
+      {/* Kubernetes Clusters */}
+      <div
+        data-testid="topology-clusters-section"
+        className="bg-slate-900 border border-slate-800 rounded-2xl overflow-hidden space-y-4 p-6"
+      >
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
           <div>
             <h3 className="text-base font-semibold text-white flex items-center gap-2">
@@ -936,7 +967,7 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
               Provisioned Stacks &amp; Workload Clusters
             </h3>
             <p className="text-xs text-slate-400">
-              Live Pulumi/OpenTofu stacks managed by PKO v2
+              Management & workload Kubernetes clusters managed by PKO v2
             </p>
           </div>
 
@@ -946,29 +977,101 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
               onClick={onNavigateToCatalog}
               className="px-3 py-1.5 rounded-lg text-xs font-medium bg-indigo-600/20 hover:bg-indigo-600/30 text-indigo-300 border border-indigo-500/30 transition-colors cursor-pointer self-start sm:self-auto"
             >
-              + Deploy Stack
+              + Deploy Cluster
             </button>
           )}
         </div>
 
         <DataTable
-          data={stacks}
+          data={clusterStacks}
           columns={stackColumns}
-          filterPlaceholder="Filter stacks by name, tenant, provider, status..."
-          emptyMessage="No stacks provisioned yet — authenticate and create a proposal from the Catalog."
-          noResultsMessage="No stacks matching your filter."
+          filterPlaceholder="Filter clusters by name, tenant, provider, status..."
+          emptyMessage="No Kubernetes clusters provisioned yet — authenticate and create a proposal from the Catalog."
+          noResultsMessage="No clusters matching your filter."
           getRowId={(row) => row.id || `${row.namespace}-${row.name}`}
         />
         {stackBanner && (
           <PrNotificationBanner
             message={stackBanner.message}
             prId={stackBanner.prId}
-            prUrl={stackBanner.prUrl}
-            onNavigateToPreview={onNavigateToPreview}
             onDismiss={() => setStackBanner(null)}
-            className="rounded-none rounded-b-2xl border-x-0 border-b-0 px-6"
           />
         )}
+      </div>
+
+      {/* Virtual Machines */}
+      <div
+        data-testid="topology-vms-section"
+        className="bg-slate-900 border border-slate-800 rounded-2xl overflow-hidden space-y-4 p-6"
+      >
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+          <div>
+            <h3 className="text-base font-semibold text-white flex items-center gap-2">
+              <Activity className="h-5 w-5 text-indigo-400" />
+              Virtual Machines
+            </h3>
+            <p className="text-xs text-slate-400">
+              Cloud & hypervisor virtual machines with interactive SSH access
+            </p>
+          </div>
+
+          {onNavigateToCatalog && (
+            <button
+              type="button"
+              onClick={onNavigateToCatalog}
+              className="px-3 py-1.5 rounded-lg text-xs font-medium bg-indigo-600/20 hover:bg-indigo-600/30 text-indigo-300 border border-indigo-500/30 transition-colors cursor-pointer self-start sm:self-auto"
+            >
+              + Deploy VM
+            </button>
+          )}
+        </div>
+
+        <DataTable
+          data={vmStacks}
+          columns={vmStackColumns}
+          filterPlaceholder="Filter stacks by name, tenant, provider, status..."
+          emptyMessage="No virtual machines provisioned yet."
+          noResultsMessage="No virtual machines matching your filter."
+          getRowId={(row) => row.id || `${row.namespace}-${row.name}`}
+        />
+      </div>
+
+      {/* Managed Services & Config */}
+      <div
+        data-testid="topology-services-section"
+        className="bg-slate-900 border border-slate-800 rounded-2xl overflow-hidden space-y-4 p-6"
+      >
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+          <div>
+            <h3 className="text-base font-semibold text-white flex items-center gap-2">
+              <Activity className="h-5 w-5 text-indigo-400" />
+              Managed Services &amp; Config
+            </h3>
+            <p className="text-xs text-slate-400">
+              Cloud databases, network infrastructure, and cluster configuration
+              stacks
+            </p>
+          </div>
+
+          {onNavigateToCatalog && (
+            <button
+              type="button"
+              onClick={onNavigateToCatalog}
+              className="px-3 py-1.5 rounded-lg text-xs font-medium bg-indigo-600/20 hover:bg-indigo-600/30 text-indigo-300 border border-indigo-500/30 transition-colors cursor-pointer self-start sm:self-auto"
+            >
+              + Deploy Service
+            </button>
+          )}
+        </div>
+
+        <DataTable
+          data={serviceStacks}
+          columns={serviceStackColumns}
+          filterPlaceholder="Filter services by name, tenant, provider, status..."
+          emptyMessage="No managed services provisioned yet."
+          noResultsMessage="No managed services matching your filter."
+          getRowId={(row) => row.id || `${row.namespace}-${row.name}`}
+        />
       </div>
 
       {/* Deployed Application Releases (Flux Helm / Kustomize) */}

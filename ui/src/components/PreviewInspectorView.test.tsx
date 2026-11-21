@@ -426,4 +426,68 @@ describe("PreviewInspectorView component", () => {
       )
     })
   })
+
+  it("filters PRs via client-side search query by title, branch, ID, tenant, or author", async () => {
+    const multiPRs: Proposal[] = [
+      {
+        ...mockProposals[0],
+        id: "101",
+        title: "Deploy Redis Cache",
+        branch: "branch-redis",
+        tenant: "tenant-a",
+        author: "alice",
+      },
+      {
+        ...mockProposals[0],
+        id: "102",
+        title: "Scale Kafka",
+        branch: "branch-kafka",
+        tenant: "tenant-b",
+        author: "bob",
+      },
+      {
+        ...mockProposals[0],
+        id: "103",
+        title: "Update Postgres",
+        branch: "branch-pg",
+        tenant: "tenant-a",
+        author: "charlie",
+      },
+    ]
+    vi.mocked(api.getProposals).mockResolvedValue(multiPRs)
+    vi.mocked(api.getProposalPreview).mockResolvedValue(mockPreview)
+
+    render(<PreviewInspectorView />)
+
+    await waitFor(() => {
+      expect(screen.getByText("Deploy Redis Cache")).toBeInTheDocument()
+      expect(screen.getByText("Scale Kafka")).toBeInTheDocument()
+      expect(screen.getByText("Update Postgres")).toBeInTheDocument()
+    })
+
+    const searchInput = screen.getByTestId("pr-search-input")
+
+    // Filter by title
+    fireEvent.change(searchInput, { target: { value: "redis" } })
+    expect(screen.getByText("Deploy Redis Cache")).toBeInTheDocument()
+    expect(screen.queryByText("Scale Kafka")).toBeNull()
+
+    // Filter by tenant
+    fireEvent.change(searchInput, { target: { value: "tenant-a" } })
+    expect(screen.getByText("Deploy Redis Cache")).toBeInTheDocument()
+    expect(screen.getByText("Update Postgres")).toBeInTheDocument()
+    expect(screen.queryByText("Scale Kafka")).toBeNull()
+
+    // Filter by ID
+    fireEvent.change(searchInput, { target: { value: "102" } })
+    expect(screen.getByText("Scale Kafka")).toBeInTheDocument()
+    expect(screen.queryByText("Update Postgres")).toBeNull()
+
+    // Empty search state
+    fireEvent.change(searchInput, { target: { value: "non-existent-xyz" } })
+    expect(
+      screen.getByText("No pull requests matching your search.")
+    ).toBeInTheDocument()
+    expect(screen.queryByText("Scale Kafka")).toBeNull()
+  })
 })

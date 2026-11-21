@@ -43,8 +43,9 @@ test.describe('06 - Full Localhost GUI GitOps Workflow', () => {
       timeout: 10000,
     });
 
-    // Merge the create-tenant PR in PR & Preview Inspector
     await page.getByRole('button', { name: /PR & Preview Inspector/i }).click();
+    await expect(page.getByTestId('pr-search-input')).toBeVisible();
+    await page.getByTestId('pr-search-input').fill('tenant e2e-team');
     await expect(page.getByRole('heading', { name: /create tenant e2e-team/i })).toBeVisible({
       timeout: 10000,
     });
@@ -100,16 +101,17 @@ test.describe('06 - Full Localhost GUI GitOps Workflow', () => {
     await page.getByRole('button', { name: /Topology Map/i }).click();
     await page.getByRole('button', { name: /Refresh Map/i }).click();
     await expect(page.getByText('Cluster & Workload Topology')).toBeVisible();
+    await expect(page.getByTestId('topology-clusters-section')).toBeVisible();
+    await expect(page.getByTestId('topology-vms-section')).toBeVisible();
+    await expect(page.getByTestId('topology-services-section')).toBeVisible();
     await expect(page.getByText('Management Control Plane')).toBeVisible();
     await expect(page.getByText('management-cluster-core', { exact: true })).toBeVisible();
     await expect(page.getByText('e2e-team').first()).toBeVisible({ timeout: 10000 });
     await expect(page.getByText(/Live Reconciler Event Stream/i)).toBeVisible();
     await expect(page.getByText(/podinfo/i).first()).toBeVisible({ timeout: 10000 });
 
-    // 6b. Verify SSH button is disabled for kind / non-VM stacks
-    const mgmtSshButton = page.getByTestId('stack-ssh-btn-management-cluster-core');
-    await expect(mgmtSshButton).toBeVisible();
-    await expect(mgmtSshButton).toBeDisabled();
+    // 6b. Verify SSH button is disabled for kind / non-VM stacks and missing from cluster stacks
+    await expect(page.getByTestId('stack-ssh-btn-management-cluster-core')).toHaveCount(0);
 
     // If an SSH-capable VM stack is present, verify its modal & opt-in browser terminal
     const enabledSshButton = page
@@ -128,15 +130,70 @@ test.describe('06 - Full Localhost GUI GitOps Workflow', () => {
       await page.getByTestId('vm-ssh-modal-close-btn').click();
     }
 
-    // 6c. Author & deploy a Raw Kubernetes Manifest / Template catalog entry
+    // 6c. Author & deploy a Raw Kubernetes Manifest / Template catalog entry, test protection toggle & delete
     await page.getByRole('button', { name: /Catalog & Form Wizard/i }).click();
     await page.getByRole('button', { name: /Add Catalog Item/i }).click();
     await page.locator('#app-id').fill('e2e-raw-manifest');
     await page.locator('#app-name').fill('E2E Raw Manifest App');
     await page.locator('#app-runtime').selectOption('manifest');
     await expect(page.getByTestId('catalog-manifests-yaml-input')).toBeVisible();
+
+    // Toggle protection on
+    await page.getByTestId('catalog-protected-checkbox').check();
+
     await page.getByTestId('extract-manifest-vars-btn').first().click();
     await page.getByRole('button', { name: /Submit App PR Proposal/i }).click();
+    await expect(page.getByText(/Git PR Proposal Successfully Opened!/i)).toBeVisible({
+      timeout: 10000,
+    });
+
+    // Merge the app creation PR
+    await page.getByRole('button', { name: /PR & Preview Inspector/i }).click();
+    await expect(page.getByRole('heading', { name: /e2e-raw-manifest/i })).toBeVisible({
+      timeout: 10000,
+    });
+    await page.getByTestId('pr-search-input').fill('e2e-raw-manifest');
+    await expect(page.getByTestId('pr-list').getByText(/e2e-raw-manifest/i)).toBeVisible();
+    await page.getByRole('button', { name: /Merge PR/i }).click();
+    await expect(page.getByText(/merged cleanly/i)).toBeVisible({ timeout: 10000 });
+
+    // Now go back to Catalog, verify it's protected, unprotect it, and delete it!
+    await page.getByRole('button', { name: /Catalog & Form Wizard/i }).click();
+    await expect(page.getByTestId('catalog-protected-badge-e2e-raw-manifest')).toBeVisible({
+      timeout: 10000,
+    });
+    await expect(page.getByTestId('delete-catalog-item-e2e-raw-manifest')).toBeDisabled();
+
+    // Edit item to unprotect it
+    await page
+      .getByTestId('catalog-list')
+      .locator('.p-5', { hasText: 'E2E Raw Manifest App' })
+      .getByRole('button', { name: 'Edit' })
+      .click();
+    await page.getByTestId('catalog-protected-checkbox').uncheck();
+    await page.getByRole('button', { name: /Submit Update PR/i }).click();
+    await expect(page.getByText(/Git PR Proposal Successfully Opened!/i)).toBeVisible({
+      timeout: 10000,
+    });
+
+    // Merge the unprotect PR
+    await page.getByRole('button', { name: /PR & Preview Inspector/i }).click();
+    await expect(page.getByRole('heading', { name: /update app e2e-raw-manifest/i })).toBeVisible({
+      timeout: 10000,
+    });
+    await page.getByTestId('pr-search-input').fill('update app e2e-raw-manifest');
+    await page
+      .getByRole('button', { name: /Merge PR/i })
+      .first()
+      .click();
+    await expect(page.getByText(/merged cleanly/i)).toBeVisible({ timeout: 10000 });
+
+    // Finally delete it
+    await page.getByRole('button', { name: /Catalog & Form Wizard/i }).click();
+    await expect(page.getByTestId('delete-catalog-item-e2e-raw-manifest')).toBeEnabled({
+      timeout: 10000,
+    });
+    await page.getByTestId('delete-catalog-item-e2e-raw-manifest').click();
     await expect(page.getByText(/Git PR Proposal Successfully Opened!/i)).toBeVisible({
       timeout: 10000,
     });

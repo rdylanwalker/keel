@@ -38,6 +38,7 @@ export interface CatalogItemModalProps {
   setShowSchemaEditor: React.Dispatch<React.SetStateAction<boolean>>
   appLoading: boolean
   appError: string | null
+  tenants: import("../types/api").TenantSummary[]
   onSubmit: (e: React.FormEvent) => void
   onExtractManifestVars: () => void
   onClose: () => void
@@ -58,6 +59,7 @@ export const CatalogItemModal: React.FC<CatalogItemModalProps> = ({
   setShowSchemaEditor,
   appLoading,
   appError,
+  tenants,
   onSubmit,
   onExtractManifestVars,
   onClose,
@@ -227,6 +229,56 @@ export const CatalogItemModal: React.FC<CatalogItemModalProps> = ({
                   }
                   className="w-full px-3 py-2 bg-slate-950 border border-slate-800 rounded-lg text-xs text-slate-100 placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
                 />
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              <div>
+                <label
+                  htmlFor="catalog-tenant-scope"
+                  className="block text-xs text-slate-300 font-medium mb-1"
+                >
+                  Tenant Visibility
+                </label>
+                <select
+                  id="catalog-tenant-scope"
+                  value={appForm.tenant || ""}
+                  onChange={(e) =>
+                    setAppForm((prev) => ({
+                      ...prev,
+                      tenant: e.target.value,
+                    }))
+                  }
+                  className="w-full px-3 py-2 bg-slate-950 border border-slate-800 rounded-lg text-xs text-slate-100 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                >
+                  <option value="">All Tenants (Global)</option>
+                  {tenants.map((t) => (
+                    <option key={t.id} value={t.id}>
+                      {t.id}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <div className="flex flex-col justify-end pb-2">
+                <label className="flex items-center gap-2 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    id="catalog-protected"
+                    data-testid="catalog-protected-checkbox"
+                    checked={Boolean(appForm.protected)}
+                    onChange={(e) =>
+                      setAppForm((prev) => ({
+                        ...prev,
+                        protected: e.target.checked,
+                      }))
+                    }
+                    className="w-4 h-4 bg-slate-950 border border-slate-800 rounded text-indigo-600 focus:ring-indigo-500 focus:ring-offset-slate-900 cursor-pointer"
+                  />
+                  <span className="text-xs text-slate-300 font-medium select-none">
+                    Protect Catalog Entry (Block Deletion)
+                  </span>
+                </label>
               </div>
             </div>
 
@@ -529,6 +581,34 @@ export const CatalogItemModal: React.FC<CatalogItemModalProps> = ({
             {appForm.kind === "infra" && (
               <>
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                  <div>
+                    <label
+                      htmlFor="infra-resource-kind"
+                      className="block text-xs text-slate-300 font-medium mb-1"
+                    >
+                      Infrastructure Resource Kind *
+                    </label>
+                    <select
+                      id="infra-resource-kind"
+                      data-testid="infra-resource-kind-select"
+                      value={appForm.resourceKind || "cluster"}
+                      onChange={(e) =>
+                        setAppForm((prev) => ({
+                          ...prev,
+                          resourceKind: e.target
+                            .value as import("../types/api").InfraResourceKind,
+                        }))
+                      }
+                      className="w-full px-3 py-2 bg-slate-950 border border-slate-800 rounded-lg text-xs text-slate-100 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                    >
+                      <option value="vm">Virtual Machine (SSH Enabled)</option>
+                      <option value="cluster">
+                        Kubernetes Cluster (App Deployment Target)
+                      </option>
+                      <option value="service">Managed Service / Config</option>
+                    </select>
+                  </div>
+
                   <div>
                     <label
                       htmlFor="app-category"

@@ -12,12 +12,17 @@ export interface ProviderRegistryEntry {
   description?: string
 }
 
+export type InfraResourceKind = "vm" | "cluster" | "service"
+
 export interface CreateCatalogItemPayload {
   kind?: "app" | "infra" | "bundle"
   id: string
   name: string
   category: string
   description?: string
+  protected?: boolean
+  tenant?: string
+  resourceKind?: InfraResourceKind
   runtime?: "helm" | "kustomize" | "manifest"
   manifestsYaml?: string
   defaultEngine?: "flux" | "pulumi"
@@ -73,6 +78,9 @@ export interface CatalogItem {
   schema: RJSFSchema
   uiSchema?: Record<string, unknown>
   defaultValues?: Record<string, unknown>
+  protected?: boolean
+  tenant?: string
+  resourceKind?: InfraResourceKind
 }
 
 export interface Proposal {
@@ -128,6 +136,8 @@ export interface StackSummary {
   lastSynced?: string
   bundle?: string
   bundleItem?: string
+  resourceKind?: InfraResourceKind
+  catalogId?: string
 }
 
 export interface ResourceCondition {

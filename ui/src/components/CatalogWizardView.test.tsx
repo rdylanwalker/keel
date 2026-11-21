@@ -25,6 +25,7 @@ vi.mock("../lib/api", () => ({
   deleteTenant: vi.fn(),
   createCatalogApp: vi.fn(),
   updateCatalogItem: vi.fn(),
+  deleteCatalogItem: vi.fn(),
 }))
 
 const mockCatalog: CatalogItem[] = [
@@ -1674,5 +1675,145 @@ spec:
         })
       )
     })
+  })
+
+  it("filters out catalog items that don't match active tenant and displays protection/tenant badges, and allows deleting unprotected items", async () => {
+    const multiTenantCatalog: CatalogItem[] = [
+      { ...mockCatalog[0], id: "global-app", name: "Global App", tenant: "" },
+      {
+        ...mockCatalog[0],
+        id: "acme-app",
+        name: "Acme App",
+        tenant: "acme",
+        protected: true,
+      },
+      {
+        ...mockCatalog[0],
+        id: "stark-app",
+        name: "Stark App",
+        tenant: "stark",
+      },
+    ]
+    vi.mocked(api.getCatalog).mockResolvedValue(multiTenantCatalog)
+    vi.mocked(api.getTenants).mockResolvedValue([
+      { id: "default", namespace: "tenant-default" },
+      { id: "acme", namespace: "tenant-acme" },
+      { id: "stark", namespace: "tenant-stark" },
+    ])
+    vi.mocked(api.deleteCatalogItem).mockResolvedValue({
+      id: "999",
+      title: "Delete Global App",
+      branch: "delete-branch",
+      author: "user",
+      tenant: "default",
+      status: "open",
+      createdAt: "just now",
+    })
+
+    render(<CatalogWizardView selectedTenant="acme" />)
+
+    await waitFor(() => {
+      const list = screen.getByTestId("catalog-list")
+      expect(within(list).getByText("Global App")).toBeInTheDocument()
+      expect(within(list).getByText("Acme App")).toBeInTheDocument()
+      expect(within(list).queryByText("Stark App")).toBeNull()
+    })
+
+    // Check badges
+    const list = screen.getByTestId("catalog-list")
+    expect(within(list).getByText("Global")).toBeInTheDocument()
+    expect(within(list).getByText("Tenant: acme")).toBeInTheDocument()
+    expect(
+      within(list).getByTestId("catalog-protected-badge-acme-app")
+    ).toBeInTheDocument()
+
+    // Check delete buttons
+    const deleteAcmeAppBtn = screen.getByTestId("delete-catalog-item-acme-app")
+    expect(deleteAcmeAppBtn).toBeDisabled()
+
+    const deleteGlobalAppBtn = screen.getByTestId(
+      "delete-catalog-item-global-app"
+    )
+    expect(deleteGlobalAppBtn).toBeEnabled()
+
+    // Delete item
+    fireEvent.click(deleteGlobalAppBtn)
+
+    await waitFor(() => {
+      expect(api.deleteCatalogItem).toHaveBeenCalledWith("app", "global-app")
+      expect(
+        within(screen.getByTestId("catalog-list")).queryByText("Global App")
+      ).toBeNull()
+    })
+  })
+
+  it("shows all catalog items across all tenants when All Tenants is selected (global admin view)", async () => {
+    const multiTenantCatalog: CatalogItem[] = [
+      { ...mockCatalog[0], id: "global-app", name: "Global App" },
+      {
+        ...mockCatalog[0],
+        id: "acme-app",
+        name: "Acme App",
+        tenant: "acme",
+        protected: true,
+      },
+      {
+        ...mockCatalog[0],
+        id: "stark-app",
+        name: "Stark App",
+        tenant: "stark",
+      },
+    ]
+    vi.mocked(api.getCatalog).mockResolvedValue(multiTenantCatalog)
+    vi.mocked(api.getTenants).mockResolvedValue([
+      { id: "default", namespace: "tenant-default" },
+      { id: "acme", namespace: "tenant-acme" },
+      { id: "stark", namespace: "tenant-stark" },
+    ])
+
+    const { rerender } = render(<CatalogWizardView selectedTenant="" />)
+
+    // When All Tenants (selectedTenant="") is active, all 3 items are visible
+    await waitFor(() => {
+      const list = screen.getByTestId("catalog-list")
+      expect(within(list).getByText("Global App")).toBeInTheDocument()
+      expect(within(list).getByText("Acme App")).toBeInTheDocument()
+      expect(within(list).getByText("Stark App")).toBeInTheDocument()
+    })
+
+    // Switching header tenant to "acme" narrows to Global + Acme
+    rerender(<CatalogWizardView selectedTenant="acme" />)
+    await waitFor(() => {
+      const list = screen.getByTestId("catalog-list")
+      expect(within(list).getByText("Global App")).toBeInTheDocument()
+      expect(within(list).getByText("Acme App")).toBeInTheDocument()
+      expect(within(list).queryByText("Stark App")).toBeNull()
+    })
+
+    // Switching back to "All Tenants" either via header prop or Target Tenant dropdown shows all items again
+    rerender(<CatalogWizardView selectedTenant="" />)
+    await waitFor(() => {
+      const list = screen.getByTestId("catalog-list")
+      expect(within(list).getByText("Global App")).toBeInTheDocument()
+      expect(within(list).getByText("Acme App")).toBeInTheDocument()
+      expect(within(list).getByText("Stark App")).toBeInTheDocument()
+    })
+
+    const targetSelect = screen.getByLabelText(/Target Tenant:/i)
+    fireEvent.change(targetSelect, { target: { value: "stark" } })
+    expect(
+      within(screen.getByTestId("catalog-list")).queryByText("Acme App")
+    ).toBeNull()
+    expect(
+      within(screen.getByTestId("catalog-list")).getByText("Stark App")
+    ).toBeInTheDocument()
+
+    fireEvent.change(targetSelect, { target: { value: "all" } })
+    expect(
+      within(screen.getByTestId("catalog-list")).getByText("Acme App")
+    ).toBeInTheDocument()
+    expect(
+      within(screen.getByTestId("catalog-list")).getByText("Stark App")
+    ).toBeInTheDocument()
   })
 })

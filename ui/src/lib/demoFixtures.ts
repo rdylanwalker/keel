@@ -56,6 +56,7 @@ export const DEFAULT_CATALOG: CatalogItem[] = [
     type: "app",
     category: "Applications",
     version: "1.4.0",
+    protected: false,
     schema: {
       title: "Web Service Blueprint",
       type: "object",
@@ -106,6 +107,8 @@ export const DEFAULT_CATALOG: CatalogItem[] = [
     category: "Infrastructure",
     version: "2.1.0",
     provider: "proxmox",
+    protected: true,
+    resourceKind: "vm",
     schema: {
       title: "Proxmox VM Pool Blueprint",
       type: "object",
@@ -157,6 +160,8 @@ export const DEFAULT_CATALOG: CatalogItem[] = [
     type: "app",
     category: "Databases",
     version: "15.4.0",
+    protected: false,
+    tenant: "acme",
     schema: {
       title: "PostgreSQL Database Blueprint",
       type: "object",
@@ -244,6 +249,7 @@ export const BOOTSTRAP_MANAGEMENT_STACK: StackSummary = {
   status: "synced",
   resourceCount: 24,
   lastSynced: "2 minutes ago",
+  resourceKind: "cluster",
 }
 
 export const DEFAULT_STACKS: StackSummary[] = [
@@ -257,6 +263,7 @@ export const DEFAULT_STACKS: StackSummary[] = [
     status: "synced",
     resourceCount: 18,
     lastSynced: "5 minutes ago",
+    resourceKind: "cluster",
   },
   {
     id: "stack-aws-01",
@@ -267,6 +274,7 @@ export const DEFAULT_STACKS: StackSummary[] = [
     status: "reconciling",
     resourceCount: 42,
     lastSynced: "1 minute ago",
+    resourceKind: "cluster",
   },
   {
     id: "stack-hetzner-01",
@@ -277,6 +285,18 @@ export const DEFAULT_STACKS: StackSummary[] = [
     status: "drift",
     resourceCount: 12,
     lastSynced: "12 minutes ago",
+    resourceKind: "vm",
+  },
+  {
+    id: "stack-postgres-managed",
+    name: "postgres-managed",
+    tenant: "tenant-acme",
+    provider: "kubernetes",
+    type: "workload",
+    status: "synced",
+    resourceCount: 5,
+    lastSynced: "1 minute ago",
+    resourceKind: "service",
   },
 ]
 

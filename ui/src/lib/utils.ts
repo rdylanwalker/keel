@@ -42,26 +42,81 @@ const NON_SSH_PROVIDERS = new Set([
   "kubeconfig",
 ])
 
-export function isStackSshSupported(stack: {
+export function classifyStackResourceKind(stack: {
   name?: string
+  namespace?: string
   provider?: string
   type?: string
+  resourceKind?: string
+  catalogId?: string
+}): "vm" | "cluster" | "service" {
+  if (
+    stack.resourceKind === "vm" ||
+    stack.resourceKind === "cluster" ||
+    stack.resourceKind === "service"
+  ) {
+    return stack.resourceKind
+  }
+
+  const name = (stack.name || "").toLowerCase()
+  const provider = (stack.provider || "").toLowerCase()
+  const catalogId = (stack.catalogId || "").toLowerCase()
+
+  if (
+    name === "management-cluster-core" ||
+    stack.namespace === "flux-system" ||
+    stack.type === "management" ||
+    provider === "kind" ||
+    catalogId.includes("cluster") ||
+    catalogId.includes("eks") ||
+    catalogId.includes("gke") ||
+    catalogId.includes("aks") ||
+    catalogId.includes("k3s") ||
+    name.includes("cluster") ||
+    name.includes("eks") ||
+    name.includes("gke") ||
+    name.includes("aks") ||
+    name.includes("k3s")
+  ) {
+    return "cluster"
+  }
+
+  if (
+    provider === "kubernetes" ||
+    provider === "k8s" ||
+    provider === "helm" ||
+    provider === "manifest" ||
+    provider === "kustomize" ||
+    provider === "flux" ||
+    provider === "pulumi-k8s" ||
+    provider === "cloudflare" ||
+    name === "postgres-managed" ||
+    name === "canary-gateway-config" ||
+    name.includes("postgres") ||
+    name.includes("db") ||
+    name.includes("gateway") ||
+    name.endsWith("-net") ||
+    name === "net"
+  ) {
+    return "service"
+  }
+
+  return "vm"
+}
+
+export function isStackSshSupported(stack: {
+  name?: string
+  namespace?: string
+  provider?: string
+  type?: string
+  resourceKind?: string
+  catalogId?: string
 }): boolean {
   const provider = (stack.provider || "").trim().toLowerCase()
   if (NON_SSH_PROVIDERS.has(provider)) {
     return false
   }
-  const name = (stack.name || "").trim().toLowerCase()
-  if (
-    (name === "management-cluster-core" || stack.type === "management") &&
-    !provider
-  ) {
-    return false
-  }
-  if (name === "postgres-managed" || name === "canary-gateway-config") {
-    return false
-  }
-  return true
+  return classifyStackResourceKind(stack) === "vm"
 }
 
 export function cn(...inputs: ClassValue[]) {

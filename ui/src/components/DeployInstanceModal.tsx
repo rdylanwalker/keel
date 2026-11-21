@@ -31,7 +31,7 @@ import {
   upgradeManagementAddon,
 } from "../lib/api"
 import { extractSchemaDefaults } from "../lib/schemaBuilder"
-import { jsonToYaml } from "../lib/utils"
+import { jsonToYaml, classifyStackResourceKind } from "../lib/utils"
 
 const RjsfAddButton: React.FC<IconButtonProps> = ({
   onClick,
@@ -195,6 +195,12 @@ const DeployInstanceModalBody: React.FC<DeployInstanceModalProps> = ({
       baseValues
     )
   })
+  const clusterStacks = stacks.filter(
+    (s) =>
+      classifyStackResourceKind(s) === "cluster" &&
+      s.name !== "management-cluster-core"
+  )
+
   const [instanceName, setInstanceName] = useState<string>(
     () => initialConfig?.name ?? resolvedCatalogItem?.id ?? ""
   )
@@ -203,14 +209,14 @@ const DeployInstanceModalBody: React.FC<DeployInstanceModalProps> = ({
   )
   const [targetCluster, setTargetCluster] = useState<string>(() => {
     if (!initialConfig?.targetCluster) return ""
-    const matchesStack = stacks.some(
+    const matchesStack = clusterStacks.some(
       (s) => `${s.name}-kubeconfig` === initialConfig.targetCluster
     )
     return matchesStack ? initialConfig.targetCluster : "__custom__"
   })
   const [customClusterSecret, setCustomClusterSecret] = useState<string>(() => {
     if (!initialConfig?.targetCluster) return ""
-    const matchesStack = stacks.some(
+    const matchesStack = clusterStacks.some(
       (s) => `${s.name}-kubeconfig` === initialConfig.targetCluster
     )
     return matchesStack ? "" : initialConfig.targetCluster
@@ -542,7 +548,7 @@ const DeployInstanceModalBody: React.FC<DeployInstanceModalProps> = ({
                 className="w-full bg-slate-950 border border-slate-800 text-xs text-slate-200 rounded-lg px-3 py-1.5 focus:outline-none focus:ring-1 focus:ring-indigo-500 font-mono"
               >
                 <option value="">Management Cluster (local)</option>
-                {stacks.map((s) => (
+                {clusterStacks.map((s) => (
                   <option key={s.id} value={`${s.name}-kubeconfig`}>
                     {s.name} ({s.tenant})
                   </option>
