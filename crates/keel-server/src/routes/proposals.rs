@@ -582,9 +582,10 @@ pub async fn create_proposal(
                 let keypair = SopsManager::new()
                         .generate_age_keypair()
                         .await
-                        .map_err(|_| {
-                            ServerError::BadRequest(format!(
-                                "Tenant '{}' has no SOPS age key configured; cannot encrypt secret fields",
+                        .map_err(|err| {
+                            tracing::warn!(tenant = %req.tenant, error = %err, "Could not generate tenant SOPS age key");
+                            ServerError::ServiceUnavailable(format!(
+                                "Tenant '{}' has no SOPS age key configured and one could not be generated ({err}); install `age-keygen` and `sops` on the keel-server host",
                                 req.tenant
                             ))
                         })?;
@@ -1860,9 +1861,10 @@ async fn create_bundle_proposal(
                     let keypair = SopsManager::new()
                         .generate_age_keypair()
                         .await
-                        .map_err(|_| {
-                            ServerError::BadRequest(format!(
-                                "Tenant '{}' has no SOPS age key configured; cannot encrypt secret fields",
+                        .map_err(|err| {
+                            tracing::warn!(tenant = %req.tenant, error = %err, "Could not generate tenant SOPS age key");
+                            ServerError::ServiceUnavailable(format!(
+                                "Tenant '{}' has no SOPS age key configured and one could not be generated ({err}); install `age-keygen` and `sops` on the keel-server host",
                                 req.tenant
                             ))
                         })?;

@@ -259,18 +259,25 @@ pub async fn create_tenant(
     let rbac_yaml = TenantManifestBundle::synthesize(&TenantIsolationConfig::new(&req.id))?
         .to_multi_doc_yaml()?;
 
-    if let Ok(keypair) = SopsManager::new().generate_age_keypair().await {
-        let age_key = TenantAgeKey::new(keypair.public_key.clone(), keypair.secret_key());
-        if let Err(err) = state
-            .secret_store
-            .store_tenant_age_key(&req.id, &age_key)
-            .await
-        {
-            tracing::debug!(
-                tenant = %req.id,
-                error = %err,
-                "Deferred storing tenant SOPS age key until tenant namespace exists in cluster"
-            );
+    match SopsManager::new().generate_age_keypair().await {
+        Err(err) => tracing::warn!(
+            tenant = %req.id,
+            error = %err,
+            "Could not generate tenant SOPS age key (is `age-keygen` installed?); secret fields for this tenant are rejected until a key exists"
+        ),
+        Ok(keypair) => {
+            let age_key = TenantAgeKey::new(keypair.public_key.clone(), keypair.secret_key());
+            if let Err(err) = state
+                .secret_store
+                .store_tenant_age_key(&req.id, &age_key)
+                .await
+            {
+                tracing::debug!(
+                    tenant = %req.id,
+                    error = %err,
+                    "Deferred storing tenant SOPS age key until tenant namespace exists in cluster"
+                );
+            }
         }
     }
 

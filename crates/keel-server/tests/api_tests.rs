@@ -3400,10 +3400,11 @@ spec:
     let status = res.status();
     let body_bytes = res.into_body().collect().await.unwrap().to_bytes();
     let body_str = String::from_utf8_lossy(&body_bytes);
-    if status == StatusCode::BAD_REQUEST {
+    // Without `age-keygen` on the host the server reports a misconfiguration (503) that names it.
+    if status == StatusCode::SERVICE_UNAVAILABLE {
         assert!(
-            body_str.contains("has no SOPS age key configured"),
-            "unexpected 400 body: {body_str}"
+            body_str.contains("has no SOPS age key configured") && body_str.contains("age-keygen"),
+            "unexpected 503 body: {body_str}"
         );
         return;
     }
