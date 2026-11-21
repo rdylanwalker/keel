@@ -1325,35 +1325,6 @@ pub fn synthesize_flux_manifest_app_kustomizations(
     ))
 }
 
-/// Synthesizes the `<name>-config` Flux `Kustomization` of a Helm app with secret fields (YAML).
-///
-/// It applies `<app_dir>/config/` (the SOPS-encrypted `<name>-secrets` `Secret`, one key per
-/// secret values fragment) in `tenant-<id>` of the **management** cluster, decrypting with the
-/// tenant `sops-age` Secret. The app's `HelmRelease` reads the fragments through
-/// `spec.valuesFrom`, which helm-controller resolves in the `HelmRelease` namespace (also for
-/// remote `kubeConfig` targets), so the Secret never leaves the management cluster.
-pub fn synthesize_helm_app_secrets_kustomization_yaml(
-    tenant_id: &str,
-    name: &str,
-    source_name: &str,
-    app_dir: &str,
-    extra_labels: &BTreeMap<String, String>,
-) -> Result<String, KubeError> {
-    let app_dir = app_dir.trim_start_matches("./").trim_end_matches('/');
-    let mut config = FluxKustomizationSpecInput::new(
-        tenant_id,
-        manifest_app_config_kustomization_name(name),
-        source_name,
-        format!("./{app_dir}/{MANIFEST_APP_CONFIG_DIR}"),
-    );
-    config.extra_labels = extra_labels.clone();
-    config
-        .extra_labels
-        .insert("keel.io/config-for".to_string(), name.to_string());
-    config.decryption_secret_name = Some(crate::TENANT_SOPS_AGE_SECRET_NAME.to_string());
-    synthesize_flux_kustomization_yaml(&config)
-}
-
 /// Label Envoy Gateway puts on the proxy pods of a Gateway (`keel-ingress`).
 pub const ENVOY_OWNING_GATEWAY_LABEL: &str = "gateway.envoyproxy.io/owning-gateway-name";
 
@@ -2246,30 +2217,7 @@ mod tests {
     }
 
     #[test]
-    fn helm_app_secrets_kustomization_and_network_policy() {
-        let labels = BTreeMap::from([("keel.io/catalog-id".to_string(), "forgejo".to_string())]);
-        let yaml = synthesize_helm_app_secrets_kustomization_yaml(
-            "acme",
-            "git",
-            "keel-gitops",
-            "./tenants/acme/apps/git/",
-            &labels,
-        )
-        .unwrap();
-        let k: Value = serde_yml::from_str(&yaml).unwrap();
-        assert_eq!(k["metadata"]["name"], "git-config");
-        assert_eq!(k["metadata"]["namespace"], "tenant-acme");
-        assert_eq!(k["metadata"]["labels"]["keel.io/config-for"], "git");
-        assert_eq!(k["metadata"]["labels"]["keel.io/catalog-id"], "forgejo");
-        assert_eq!(k["spec"]["path"], "./tenants/acme/apps/git/config");
-        assert_eq!(k["spec"]["targetNamespace"], "tenant-acme");
-        assert_eq!(k["spec"]["decryption"]["provider"], "sops");
-        assert_eq!(
-            k["spec"]["decryption"]["secretRef"]["name"],
-            crate::TENANT_SOPS_AGE_SECRET_NAME
-        );
-        assert!(k["spec"].get("kubeConfig").is_none());
-
+    fn helm_app_network_policy() {
         let full = keel_core::HelmNetworkPolicySpec {
             gateway_ingress_ports: vec![3000, 8333],
             namespace_ingress_ports: vec![8333],

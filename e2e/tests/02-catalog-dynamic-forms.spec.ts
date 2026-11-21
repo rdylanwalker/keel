@@ -97,21 +97,23 @@ test.describe('02 - Catalog Dynamic Forms & PR Proposal Generation', () => {
 
     const files = branchFiles(created.branch);
     const dir = `tenants/acme/apps/${name}`;
-    // Helm secret fields: one SOPS-encrypted values fragment per field in `config/`, applied by
-    // the `<name>-config` Flux Kustomization and merged through `HelmRelease.spec.valuesFrom`.
-    expect(files).toContain(`${dir}/config/secrets.enc.yaml`);
-    expect(files).toContain(`${dir}/config-kustomization.yaml`);
-    expect(files).not.toContain(`${dir}/secrets.enc.yaml`);
+    // Helm secret fields: one SOPS-encrypted values fragment per field in the root
+    // `secrets.enc.yaml` Secret, listed in `tenants/kustomization.yaml` (applied by the root
+    // `keel-tenants` Kustomization for any tenant) and merged through `HelmRelease.spec.valuesFrom`.
+    // No tenant-namespace `<name>-config` Kustomization: `acme` has no tenant GitRepository.
+    expect(files).toContain(`${dir}/secrets.enc.yaml`);
+    expect(files).not.toContain(`${dir}/config/secrets.enc.yaml`);
+    expect(files).not.toContain(`${dir}/config-kustomization.yaml`);
     expect(files).toContain(`${dir}/values.yaml`);
-    expect(showFile(created.branch, 'tenants/kustomization.yaml')).toContain(
-      `acme/apps/${name}/config-kustomization.yaml`,
-    );
+    const tenantsKustomization = showFile(created.branch, 'tenants/kustomization.yaml');
+    expect(tenantsKustomization).toContain(`acme/apps/${name}/secrets.enc.yaml`);
+    expect(tenantsKustomization).not.toContain(`acme/apps/${name}/config-kustomization.yaml`);
 
     // Plaintext secret appears nowhere in the branch tree or its commit message.
     expect(treeContains(created.branch, secret)).toBe(false);
     expect(git(['log', '-1', '--format=%B', created.branch])).not.toContain(secret);
 
-    const enc = showFile(created.branch, `${dir}/config/secrets.enc.yaml`);
+    const enc = showFile(created.branch, `${dir}/secrets.enc.yaml`);
     expect(enc).toMatch(/adminPassword: ENC\[AES256_GCM,/);
     expect(enc).toContain('sops:');
     expect(enc).toMatch(/recipient: age1/);

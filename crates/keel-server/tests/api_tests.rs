@@ -690,18 +690,21 @@ async fn test_proposal_create_preview_merge_and_stacks_releases() {
             .await
             .unwrap();
         // Helm app secret fields: a SOPS-encrypted `<instance>-secrets` Secret (one values
-        // fragment per field) applied by `<instance>-config` and merged via `valuesFrom`.
+        // fragment per field) applied by the root tenants Kustomization and merged via
+        // `valuesFrom`.
         let app_dir = fixture
             .state
             .repo_workdir
             .join("tenants/acme/apps/grafana-secret-test");
-        let enc_yaml = tokio::fs::read_to_string(app_dir.join("config/secrets.enc.yaml"))
+        let enc_yaml = tokio::fs::read_to_string(app_dir.join("secrets.enc.yaml"))
             .await
             .unwrap();
         assert!(enc_yaml.contains("ENC[AES256_GCM,"));
+        assert!(enc_yaml.contains("kind: Secret"));
         assert!(enc_yaml.contains("adminPassword:"));
         assert!(!enc_yaml.contains("super-secret-password"));
-        assert!(!app_dir.join("secrets.enc.yaml").exists());
+        assert!(!app_dir.join("config").exists());
+        assert!(!app_dir.join("config-kustomization.yaml").exists());
         let hr: Value = serde_yml::from_str(
             &tokio::fs::read_to_string(app_dir.join("helmrelease.yaml"))
                 .await
@@ -717,14 +720,6 @@ async fn test_proposal_create_preview_merge_and_stacks_releases() {
             }])
         );
         assert!(!hr.to_string().contains("super-secret-password"));
-        let config_k: Value = serde_yml::from_str(
-            &tokio::fs::read_to_string(app_dir.join("config-kustomization.yaml"))
-                .await
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(config_k["metadata"]["name"], "grafana-secret-test-config");
-        assert_eq!(config_k["spec"]["decryption"]["provider"], "sops");
         let tenants_k = tokio::fs::read_to_string(
             fixture
                 .state
@@ -733,7 +728,8 @@ async fn test_proposal_create_preview_merge_and_stacks_releases() {
         )
         .await
         .unwrap();
-        assert!(tenants_k.contains("acme/apps/grafana-secret-test/config-kustomization.yaml"));
+        assert!(tenants_k.contains("acme/apps/grafana-secret-test/secrets.enc.yaml"));
+        assert!(!tenants_k.contains("acme/apps/grafana-secret-test/config-kustomization.yaml"));
         fixture
             .state
             .git_runner
@@ -7697,7 +7693,10 @@ async fn test_forgejo_catalog_app_renders_helm_release_with_encrypted_secrets() 
     for secret in [FORGEJO_ADMIN_PASSWORD, FORGEJO_OIDC_SECRET] {
         assert!(!committed.contains(secret), "secret committed in plaintext");
     }
-    assert!(!dir.join("secrets.enc.yaml").exists());
+    // No tenant-namespace `<name>-config` Kustomization (only `tenant-default` has a tenant
+    // GitRepository): the root tenants Kustomization applies the Secret.
+    assert!(!dir.join("config").exists());
+    assert!(!dir.join("config-kustomization.yaml").exists());
 
     let repo = read_yaml(&dir.join("helm-repository.yaml"));
     assert_eq!(repo["spec"]["type"], "oci");
@@ -7746,7 +7745,7 @@ async fn test_forgejo_catalog_app_renders_helm_release_with_encrypted_secrets() 
     assert!(form_values.get("podSecurityContext").is_none());
     assert!(form_values["httpRoute"].get("parentRefs").is_none());
 
-    let stored = std::fs::read_to_string(dir.join("config/secrets.enc.yaml")).unwrap();
+    let stored = std::fs::read_to_string(dir.join("secrets.enc.yaml")).unwrap();
     assert_eq!(
         sops_secret_keys(&stored),
         vec!["gitea.admin.password", "gitea.oauth"]
@@ -7769,15 +7768,6 @@ async fn test_forgejo_catalog_app_renders_helm_release_with_encrypted_secrets() 
     let oauth: Value =
         serde_yml::from_str(secret["stringData"]["gitea.oauth"].as_str().unwrap()).unwrap();
     assert_eq!(oauth["gitea"]["oauth"][0]["secret"], FORGEJO_OIDC_SECRET);
-
-    let config_k = read_yaml(&dir.join("config-kustomization.yaml"));
-    assert_eq!(config_k["metadata"]["name"], "git-config");
-    assert_eq!(config_k["spec"]["path"], "./tenants/acme/apps/git/config");
-    assert_eq!(config_k["spec"]["decryption"]["provider"], "sops");
-    assert_eq!(
-        read_yaml(&dir.join("config/kustomization.yaml"))["resources"],
-        json!(["secrets.enc.yaml"])
-    );
 
     let np = read_yaml(&dir.join("networkpolicy.yaml"));
     assert_eq!(np["metadata"]["name"], "allow-git-app");
@@ -7820,7 +7810,7 @@ async fn test_forgejo_catalog_app_renders_helm_release_with_encrypted_secrets() 
         "helmrelease.yaml",
         "helm-repository.yaml",
         "networkpolicy.yaml",
-        "config-kustomization.yaml",
+        "secrets.enc.yaml",
     ] {
         let entry = format!("acme/apps/git/{file}");
         assert!(resources.contains(&entry), "{entry} missing: {resources:?}");
@@ -7866,7 +7856,7 @@ async fn test_forgejo_catalog_app_renders_helm_release_with_encrypted_secrets() 
     assert_eq!(status, StatusCode::CREATED, "{body}");
     checkout_proposal_branch(&fixture, &body).await;
     assert_eq!(
-        std::fs::read_to_string(dir.join("config/secrets.enc.yaml")).unwrap(),
+        std::fs::read_to_string(dir.join("secrets.enc.yaml")).unwrap(),
         stored
     );
     let hr = read_yaml(&dir.join("helmrelease.yaml"));
@@ -8241,12 +8231,17 @@ async fn test_seaweedfs_catalog_app_renders_helm_release() {
         "workload-kubeconfig"
     );
     assert_eq!(hr["spec"]["valuesFrom"].as_array().unwrap().len(), 2);
-    assert!(edge.join("config/secrets.enc.yaml").exists());
+    // The Secret stays on the management cluster (helm-controller resolves `valuesFrom` in the
+    // HelmRelease namespace), applied by the root tenants Kustomization.
+    assert!(edge.join("secrets.enc.yaml").exists());
+    assert!(!edge.join("config-kustomization.yaml").exists());
+    let resources = tenants_kustomization_resources(&fixture);
     assert!(
-        !tenants_kustomization_resources(&fixture)
+        !resources
             .iter()
             .any(|r| r == "acme/apps/s3-edge/networkpolicy.yaml")
     );
+    assert!(resources.contains(&"acme/apps/s3-edge/secrets.enc.yaml".to_string()));
     fixture
         .state
         .git_runner
@@ -8255,11 +8250,12 @@ async fn test_seaweedfs_catalog_app_renders_helm_release() {
         .unwrap();
 }
 
-/// Bundle Helm items get the same secret layout as single Helm apps: the item's
-/// `<bundle>-<item>-config` Kustomization is registered in `tenants/kustomization.yaml`, the
-/// NetworkPolicy is applied with the item, and no legacy encrypted-values file is written.
+/// Bundle Helm items get the same secret layout as single Helm apps: the item's SOPS
+/// `secrets.enc.yaml` Secret is registered directly in `tenants/kustomization.yaml` (decrypted by
+/// the root `keel-tenants` Kustomization, not the item Kustomization), no `<item>-config`
+/// Kustomization is generated, and the NetworkPolicy is applied with the item.
 #[tokio::test]
-async fn test_bundle_helm_item_uses_secret_config_layout() {
+async fn test_bundle_helm_item_registers_secret_in_tenants_kustomization() {
     let fixture = setup_fixture().await;
     let cookie = login_and_get_cookie(&fixture).await;
     seed_builtin_helm_catalog(&fixture, "seaweedfs", SEAWEEDFS_APP_CATALOG).await;
@@ -8302,7 +8298,10 @@ spec:
         .state
         .repo_workdir
         .join("tenants/acme/bundles/storage-stack/s3");
-    assert!(!dir.join("secrets.enc.yaml").exists());
+    let stored = std::fs::read_to_string(dir.join("secrets.enc.yaml")).unwrap();
+    assert!(stored.contains("kind: Secret") && stored.contains("ENC[AES256_GCM,"));
+    assert!(!dir.join("config").exists());
+    assert!(!dir.join("config-kustomization.yaml").exists());
     assert!(!read_tree(&dir).contains(SEAWEEDFS_SECRET_KEY));
     let hr = read_yaml(&dir.join("helmrelease.yaml"));
     assert_eq!(
@@ -8313,22 +8312,253 @@ spec:
         hr["spec"]["values"]["global"]["seaweedfs"]["createClusterRole"],
         false
     );
-    assert_eq!(
-        read_yaml(&dir.join("config-kustomization.yaml"))["metadata"]["name"],
-        "storage-stack-s3-config"
-    );
     let item_k = read_yaml(&dir.join("kustomization.yaml"));
+    let item_resources = item_k["resources"].as_array().unwrap();
     assert!(
-        item_k["resources"]
-            .as_array()
-            .unwrap()
-            .contains(&json!("networkpolicy.yaml")),
+        item_resources.contains(&json!("networkpolicy.yaml")),
         "{item_k}"
     );
     assert!(
-        tenants_kustomization_resources(&fixture)
-            .contains(&"acme/bundles/storage-stack/s3/config-kustomization.yaml".to_string())
+        !item_resources.contains(&json!("secrets.enc.yaml")),
+        "{item_k}"
     );
+    let resources = tenants_kustomization_resources(&fixture);
+    assert!(resources.contains(&"acme/bundles/storage-stack/s3/secrets.enc.yaml".to_string()));
+    assert!(
+        !resources
+            .iter()
+            .any(|r| r.ends_with("config-kustomization.yaml"))
+    );
+}
+
+/// Regression (live E2E): a Helm app with secret fields in a tenant without a tenant
+/// `GitRepository` (only `tenant-default` gets `tenants/default/git-repository.yaml` at
+/// bootstrap). A tenant-namespace `<name>-config` Kustomization would never resolve its source, so
+/// the HelmRelease's `valuesFrom` Secret would never exist. The Secret is listed directly in
+/// `tenants/kustomization.yaml` (root `keel-tenants`, cluster SOPS key) and no tenant Flux
+/// Kustomization is generated. A partial secret edit merges into the stored root Secret.
+#[tokio::test]
+async fn test_helm_app_secrets_in_non_default_tenant_use_root_tenants_kustomization() {
+    let fixture = setup_fixture().await;
+    let cookie = login_and_get_cookie(&fixture).await;
+    seed_builtin_helm_catalog(&fixture, "forgejo", FORGEJO_APP_CATALOG).await;
+    let workdir = fixture.state.repo_workdir.clone();
+    assert!(!workdir.join("tenants/acme/git-repository.yaml").exists());
+    let dir = workdir.join("tenants/acme/apps/git");
+
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "forgejo", "name": "git",
+                "values": forgejo_values("git.acme.example") }),
+    )
+    .await;
+    if sops_unavailable(status, &body) {
+        return;
+    }
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    checkout_proposal_branch(&fixture, &body).await;
+
+    let flux_kustomizations: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|f| f.ends_with("-kustomization.yaml"))
+        .collect();
+    assert!(flux_kustomizations.is_empty(), "{flux_kustomizations:?}");
+    assert!(!dir.join("config").exists());
+    let stored = std::fs::read_to_string(dir.join("secrets.enc.yaml")).unwrap();
+    let doc: Value = serde_yml::from_str(&stored).unwrap();
+    assert_eq!(doc["kind"], "Secret");
+    assert_eq!(doc["metadata"]["name"], "git-secrets");
+    assert_eq!(doc["metadata"]["namespace"], "tenant-acme");
+    let resources = tenants_kustomization_resources(&fixture);
+    for file in ["helmrelease.yaml", "secrets.enc.yaml"] {
+        let entry = format!("acme/apps/git/{file}");
+        assert!(resources.contains(&entry), "{entry} missing: {resources:?}");
+    }
+    assert!(
+        !resources.iter().any(|r| r.ends_with("-kustomization.yaml")),
+        "{resources:?}"
+    );
+
+    // Edit re-entering only the admin password: the stored OIDC secret is kept (decrypted from
+    // the root Secret, merged and re-encrypted).
+    merge_proposal_and_sync(&fixture, &cookie, &body).await;
+    let mut edit = forgejo_values("git.acme.example");
+    edit["gitea"]["admin"]["password"] = json!("Rotated-Admin#Passw0rd!");
+    edit["gitea"]["oauth"] = json!([]);
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "forgejo", "name": "git", "values": edit }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    checkout_proposal_branch(&fixture, &body).await;
+    let rotated = std::fs::read_to_string(dir.join("secrets.enc.yaml")).unwrap();
+    assert_ne!(rotated, stored);
+    assert_eq!(
+        sops_secret_keys(&rotated),
+        vec!["gitea.admin.password", "gitea.oauth"]
+    );
+    let secret = decrypt_tenant_secret(&fixture, &rotated).await;
+    let admin: Value = serde_yml::from_str(
+        secret["stringData"]["gitea.admin.password"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        admin["gitea"]["admin"]["password"],
+        "Rotated-Admin#Passw0rd!"
+    );
+    let oauth: Value =
+        serde_yml::from_str(secret["stringData"]["gitea.oauth"].as_str().unwrap()).unwrap();
+    assert_eq!(oauth["gitea"]["oauth"][0]["secret"], FORGEJO_OIDC_SECRET);
+    assert_eq!(
+        read_yaml(&dir.join("helmrelease.yaml"))["spec"]["valuesFrom"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+/// A Helm app committed with the former `<name>-config` layout (`config-kustomization.yaml` +
+/// `config/secrets.enc.yaml`) moves back to the root layout on its next Edit: the stored Secret
+/// is read from `config/` and kept, written to the root `secrets.enc.yaml`, and the config
+/// directory, `config-kustomization.yaml` and its tenants entry are removed.
+#[tokio::test]
+async fn test_helm_app_edit_migrates_config_layout_to_root_secret() {
+    let fixture = setup_fixture().await;
+    let cookie = login_and_get_cookie(&fixture).await;
+    seed_builtin_helm_catalog(&fixture, "forgejo", FORGEJO_APP_CATALOG).await;
+    let workdir = fixture.state.repo_workdir.clone();
+    let dir = workdir.join("tenants/acme/apps/git");
+
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "forgejo", "name": "git",
+                "values": forgejo_values("git.acme.example") }),
+    )
+    .await;
+    if sops_unavailable(status, &body) {
+        return;
+    }
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    merge_proposal_and_sync(&fixture, &cookie, &body).await;
+    let stored = std::fs::read_to_string(dir.join("secrets.enc.yaml")).unwrap();
+
+    // Rewrite main into the former layout.
+    std::fs::create_dir_all(dir.join("config")).unwrap();
+    let mv = std::process::Command::new("git")
+        .args([
+            "mv",
+            "tenants/acme/apps/git/secrets.enc.yaml",
+            "tenants/acme/apps/git/config/secrets.enc.yaml",
+        ])
+        .current_dir(&workdir)
+        .status()
+        .unwrap();
+    assert!(mv.success());
+    let mut resources: Vec<String> = tenants_kustomization_resources(&fixture)
+        .into_iter()
+        .filter(|r| r != "acme/apps/git/secrets.enc.yaml")
+        .collect();
+    resources.push("acme/apps/git/config-kustomization.yaml".to_string());
+    let tenants_k = serde_yml::to_string(&json!({
+        "apiVersion": "kustomize.config.k8s.io/v1beta1",
+        "kind": "Kustomization",
+        "resources": resources,
+    }))
+    .unwrap();
+    let config_fk = r#"apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: git-config
+  namespace: tenant-acme
+  labels:
+    keel.io/tenant: acme
+    keel.io/config-for: git
+spec:
+  interval: 2m
+  path: ./tenants/acme/apps/git/config
+  prune: true
+  sourceRef:
+    kind: GitRepository
+    name: keel-gitops
+    namespace: tenant-acme
+  decryption:
+    provider: sops
+    secretRef:
+      name: sops-age
+"#;
+    commit_to_main(
+        &fixture,
+        &[
+            ("tenants/kustomization.yaml", tenants_k.as_str()),
+            ("tenants/acme/apps/git/config-kustomization.yaml", config_fk),
+            (
+                "tenants/acme/apps/git/config/kustomization.yaml",
+                "apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\nresources:\n  - secrets.enc.yaml\n",
+            ),
+        ],
+        "feat(acme): git (config layout)",
+    )
+    .await;
+    assert!(!dir.join("secrets.enc.yaml").exists());
+
+    // Edit without re-entering the secrets: the stored Secret is kept verbatim.
+    let mut edit = forgejo_values("git.acme.example");
+    edit["gitea"]["admin"]
+        .as_object_mut()
+        .unwrap()
+        .remove("password");
+    edit["gitea"]["oauth"] = json!([]);
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "forgejo", "name": "git", "values": edit }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    checkout_proposal_branch(&fixture, &body).await;
+    assert_eq!(
+        std::fs::read_to_string(dir.join("secrets.enc.yaml")).unwrap(),
+        stored
+    );
+    assert!(!dir.join("config").exists());
+    assert!(!dir.join("config-kustomization.yaml").exists());
+    assert_eq!(
+        read_yaml(&dir.join("helmrelease.yaml"))["spec"]["valuesFrom"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    let resources = tenants_kustomization_resources(&fixture);
+    assert!(resources.contains(&"acme/apps/git/secrets.enc.yaml".to_string()));
+    assert!(
+        !resources
+            .iter()
+            .any(|r| r.starts_with("acme/apps/git/config")),
+        "{resources:?}"
+    );
+    // The removals are part of the proposal commit.
+    let out = std::process::Command::new("git")
+        .args(["show", "--name-status", "--format=", "HEAD"])
+        .current_dir(&workdir)
+        .output()
+        .unwrap();
+    let changes = String::from_utf8_lossy(&out.stdout);
+    for removed in [
+        "tenants/acme/apps/git/config-kustomization.yaml",
+        "tenants/acme/apps/git/config/kustomization.yaml",
+    ] {
+        assert!(changes.contains(&format!("D\t{removed}")), "{changes}");
+    }
 }
 
 const KYVERNO_APP_CATALOG: &str = include_str!("../../../deploy/catalog/apps/kyverno/catalog.yaml");

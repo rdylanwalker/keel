@@ -855,15 +855,17 @@ async fn ensure_route_hostnames_unclaimed(
 }
 
 /// Flux `Kustomization` names an instance (or bundle item) named `name` may create in its tenant:
-/// the app `Kustomization` (`<name>`), a manifest app's substitution sources (`<name>-config`)
-/// and a remote canary (`<name>-canary`). Reserved regardless of the current engine/canary
-/// variant, so a later edit can never collide either.
-fn reserved_flux_kustomization_names(name: &str) -> [String; 3] {
-    [
-        name.to_string(),
-        keel_kube::manifest_app_config_kustomization_name(name),
-        format!("{name}-canary"),
-    ]
+/// the app `Kustomization` (`<name>`), a manifest app's substitution sources (`<name>-config`,
+/// only when `manifest_config` — Helm apps never create one) and a remote canary
+/// (`<name>-canary`). Reserved regardless of the current engine/canary variant, so a later edit
+/// can never collide either.
+fn reserved_flux_kustomization_names(name: &str, manifest_config: bool) -> Vec<String> {
+    let mut names = vec![name.to_string()];
+    if manifest_config {
+        names.push(keel_kube::manifest_app_config_kustomization_name(name));
+    }
+    names.push(format!("{name}-canary"));
+    names
 }
 
 /// Rejects a **new** instance (or bundle item resource) `name` whose derived Flux `Kustomization`
@@ -876,6 +878,7 @@ async fn ensure_no_derived_name_sibling(
     tenant: &str,
     own_rel_dir: &str,
     name: &str,
+    manifest_config: bool,
 ) -> Result<(), ServerError> {
     let mut candidates: Vec<String> = ["-config", "-canary"]
         .iter()
@@ -883,7 +886,11 @@ async fn ensure_no_derived_name_sibling(
         .filter(|base| !base.is_empty())
         .map(str::to_string)
         .collect();
-    candidates.extend(reserved_flux_kustomization_names(name).into_iter().skip(1));
+    candidates.extend(
+        reserved_flux_kustomization_names(name, manifest_config)
+            .into_iter()
+            .skip(1),
+    );
     for candidate in candidates {
         for subdir in ["apps", "infra"] {
             if let Some(found) =
@@ -1042,32 +1049,38 @@ struct StoredManifestAppSecret {
     keys: std::collections::BTreeSet<String>,
 }
 
-/// Reads the committed secret of the Flux manifest app in `rel_dir`: `config/secrets.enc.yaml`,
-/// or the pre-split `secrets.enc.yaml` (the same `Secret`, applied by the app `Kustomization`).
+/// Reads the committed `<name>-secrets` `Secret` of the Flux manifest app or Helm app in
+/// `rel_dir`: `config/secrets.enc.yaml` (a manifest app's substitution sources, or a Helm app
+/// written with the former `<name>-config` layout) or the root `secrets.enc.yaml` (a Helm app, or
+/// a pre-split manifest app; the same `Secret`).
 async fn read_stored_manifest_app_secret(
     repo_workdir: &Path,
     rel_dir: &str,
 ) -> Option<StoredManifestAppSecret> {
     let dir = repo_workdir.join(rel_dir);
-    let mut candidates = vec![
-        dir.join(keel_kube::MANIFEST_APP_CONFIG_DIR)
-            .join("secrets.enc.yaml"),
-    ];
-    // A Helm app's root `secrets.enc.yaml` holds encrypted values, never a `Secret`.
-    if tokio::fs::try_exists(dir.join("manifests.yaml"))
+    let is_manifest_app = tokio::fs::try_exists(dir.join("manifests.yaml"))
         .await
-        .unwrap_or(false)
-    {
-        candidates.push(dir.join("secrets.enc.yaml"));
-    }
-    for path in candidates {
+        .unwrap_or(false);
+    let candidates = [
+        (
+            dir.join(keel_kube::MANIFEST_APP_CONFIG_DIR)
+                .join("secrets.enc.yaml"),
+            false,
+        ),
+        // A legacy Helm app's root `secrets.enc.yaml` holds encrypted values (no `Secret`); a
+        // current one is a `Secret` whose `kind` stays plaintext (`encrypt_k8s_secret_yaml`).
+        (dir.join("secrets.enc.yaml"), !is_manifest_app),
+    ];
+    for (path, require_secret_kind) in candidates {
         let Ok(ciphertext) = read_contained_to_string(repo_workdir, &path).await else {
             continue;
         };
         let Ok(doc) = serde_yml::from_str::<Value>(&ciphertext) else {
             continue;
         };
-        if doc.get("sops").is_none() {
+        if doc.get("sops").is_none()
+            || (require_secret_kind && doc.get("kind").and_then(Value::as_str) != Some("Secret"))
+        {
             continue;
         }
         let keys: std::collections::BTreeSet<String> = ["stringData", "data"]
@@ -1341,8 +1354,11 @@ async fn ensure_tenant_route_hostnames_allowed(
 
 /// File (relative to the app directory) of the Keel-generated `NetworkPolicy` of a Helm app.
 const HELM_APP_NETWORK_POLICY_FILE: &str = "networkpolicy.yaml";
-/// File (relative to the app directory) of a Helm app's `<name>-config` Flux `Kustomization`.
-const HELM_APP_CONFIG_KUSTOMIZATION_FILE: &str = "config-kustomization.yaml";
+/// File (relative to the app directory) of a Helm app's SOPS-encrypted `<name>-secrets` `Secret`.
+const HELM_APP_SECRETS_FILE: &str = "secrets.enc.yaml";
+/// Former (`<name>-config` Kustomization) layout of a Helm app's secrets, removed on Edit: the
+/// tenant-namespace Kustomization needs a tenant `GitRepository`, which only `tenant-default` has.
+const LEGACY_HELM_APP_CONFIG_LAYOUT: [&str; 2] = ["config-kustomization.yaml", "config"];
 
 /// Inputs for [`prepare_helm_app_extras`].
 struct HelmAppExtrasInput<'a> {
@@ -1359,26 +1375,27 @@ struct HelmAppExtrasInput<'a> {
     remote: bool,
     /// `spec.targetNamespace` of the `HelmRelease`, when set.
     target_namespace: Option<&'a str>,
-    extra_labels: std::collections::BTreeMap<String, String>,
 }
 
 /// Keel-generated companions of a Helm app (`runtime: helm`, `SDD.md` §5.1):
 ///
 /// ```text
-/// <app_dir>/config-kustomization.yaml   Kustomization <name>-config (management cluster, SOPS)
-/// <app_dir>/config/kustomization.yaml   secrets.enc.yaml
-/// <app_dir>/config/secrets.enc.yaml     Secret <name>-secrets: one values fragment per secret field
-/// <app_dir>/networkpolicy.yaml          NetworkPolicy allow-<name>-app (spec.networkPolicy, local only)
+/// <app_dir>/secrets.enc.yaml     Secret <name>-secrets: one values fragment per secret field
+/// <app_dir>/networkpolicy.yaml    NetworkPolicy allow-<name>-app (spec.networkPolicy, local only)
 /// ```
+///
+/// The `Secret` is listed directly in `tenants/kustomization.yaml`, so the root `keel-tenants`
+/// Kustomization (management cluster, SOPS decryption with the cluster key, which every tenant
+/// secret is also encrypted to) applies it for any tenant, also for bundle items.
 struct HelmAppExtras {
     /// `(relative path, contents)`, parents before children.
     files: Vec<(String, String)>,
     /// Files applied with the `HelmRelease` (tenants / bundle item `kustomization.yaml`).
     resources: Vec<&'static str>,
-    /// Flux `Kustomization` files registered in `tenants/kustomization.yaml`.
-    kustomizations: Vec<&'static str>,
-    /// Relative paths of other variants (and the legacy, never-applied root
-    /// `secrets.enc.yaml` of encrypted values) removed when present.
+    /// Files registered directly in `tenants/kustomization.yaml` (applied by `keel-tenants`).
+    tenant_resources: Vec<&'static str>,
+    /// Relative paths of other variants (the former `config/` layout, and a root
+    /// `secrets.enc.yaml` once no secret is stored) removed when present.
     stale: Vec<&'static str>,
     /// `spec.valuesFrom` entries (one per stored secret fragment).
     values_from: Vec<HelmValuesSecretRef>,
@@ -1527,8 +1544,8 @@ async fn prepare_helm_app_extras(
     let mut extras = HelmAppExtras {
         files: Vec::new(),
         resources: Vec::new(),
-        kustomizations: Vec::new(),
-        stale: vec!["secrets.enc.yaml"],
+        tenant_resources: Vec::new(),
+        stale: LEGACY_HELM_APP_CONFIG_LAYOUT.to_vec(),
         values_from: Vec::new(),
         route_hostnames,
         release_values,
@@ -1552,32 +1569,10 @@ async fn prepare_helm_app_extras(
     .await?;
     match resolved {
         Some((ciphertext, keys)) => {
-            let config_dir = keel_kube::MANIFEST_APP_CONFIG_DIR;
             extras
                 .files
-                .push((format!("{config_dir}/secrets.enc.yaml"), ciphertext));
-            extras.files.push((
-                format!("{config_dir}/kustomization.yaml"),
-                kustomize_resources_yaml(&["secrets.enc.yaml"])?,
-            ));
-            let mut labels = input.extra_labels.clone();
-            labels.insert(
-                "keel.io/catalog-id".to_string(),
-                input.app.metadata.id.clone(),
-            );
-            extras.files.push((
-                HELM_APP_CONFIG_KUSTOMIZATION_FILE.to_string(),
-                keel_kube::synthesize_helm_app_secrets_kustomization_yaml(
-                    input.tenant,
-                    input.name,
-                    "keel-gitops",
-                    input.app_dir,
-                    &labels,
-                )?,
-            ));
-            extras
-                .kustomizations
-                .push(HELM_APP_CONFIG_KUSTOMIZATION_FILE);
+                .push((HELM_APP_SECRETS_FILE.to_string(), ciphertext));
+            extras.tenant_resources.push(HELM_APP_SECRETS_FILE);
             extras.values_from = keys
                 .into_iter()
                 .map(|key| HelmValuesSecretRef {
@@ -1588,10 +1583,7 @@ async fn prepare_helm_app_extras(
                 })
                 .collect();
         }
-        None => extras.stale.extend([
-            keel_kube::MANIFEST_APP_CONFIG_DIR,
-            HELM_APP_CONFIG_KUSTOMIZATION_FILE,
-        ]),
+        None => extras.stale.push(HELM_APP_SECRETS_FILE),
     }
 
     // Tenant namespaces on the management cluster are `default-deny-all`. Remote workload
@@ -1774,12 +1766,16 @@ pub async fn create_proposal(
         .as_ref()
         .map(|r| r.rel_dir.clone())
         .unwrap_or_else(|| format!("tenants/{}/{subdir}/{instance_name}", req.tenant));
+    // Helm apps (`HelmRelease` path): secrets, routes and NetworkPolicy via `HelmAppExtras`.
+    // Their secrets are applied by the root tenants Kustomization: no `<name>-config`.
+    let is_helm_app = is_app && manifest_engine.is_none();
     if resolved_dir.is_none() {
         ensure_no_derived_name_sibling(
             &state.repo_workdir,
             &req.tenant,
             &own_rel_dir,
             &instance_name,
+            !is_helm_app,
         )
         .await?;
     }
@@ -1787,11 +1783,9 @@ pub async fn create_proposal(
         &state.repo_workdir,
         &req.tenant,
         &own_rel_dir,
-        &reserved_flux_kustomization_names(&instance_name),
+        &reserved_flux_kustomization_names(&instance_name, !is_helm_app),
     )
     .await?;
-    // Helm apps (`HelmRelease` path): secrets, routes and NetworkPolicy via `HelmAppExtras`.
-    let is_helm_app = is_app && manifest_engine.is_none();
     // Edit: secret fields left blank keep the committed values (the UI never receives them).
     let stored_manifest_secret = if manifest_engine == Some(ManifestEngine::Flux) || is_helm_app {
         read_stored_manifest_app_secret(&state.repo_workdir, &own_rel_dir).await
@@ -1888,11 +1882,6 @@ pub async fn create_proposal(
 
     let helm_extras = match &manifest {
         CatalogManifest::Application(app) if is_helm_app => {
-            let mut extra_labels = std::collections::BTreeMap::new();
-            if let Some((ref bundle_name, ref item_id)) = bundle_item {
-                extra_labels.insert("keel.io/bundle".to_string(), bundle_name.clone());
-                extra_labels.insert("keel.io/bundle-item".to_string(), item_id.clone());
-            }
             let target_namespace = req
                 .target_namespace
                 .as_deref()
@@ -1911,7 +1900,6 @@ pub async fn create_proposal(
                         stored_secret: stored_manifest_secret.as_ref(),
                         remote: remote_target_cluster(req.target_cluster.as_deref()).is_some(),
                         target_namespace,
-                        extra_labels,
                     },
                 )
                 .await?,
@@ -2471,7 +2459,7 @@ pub async fn create_proposal(
 
         let mut extra_kustomize_resources: Vec<String> = Vec::new();
         let mut bundle_item_kustomize_resources: Vec<String> = vec![manifest_filename.to_string()];
-        let mut helm_extra_flux_kustomizations: Vec<String> = Vec::new();
+        let mut helm_tenant_resources: Vec<String> = Vec::new();
 
         if let Some(eng) = manifest_engine {
             if let Some(ref rendered_manifests) = rendered_manifest_template_yaml {
@@ -2552,10 +2540,10 @@ pub async fn create_proposal(
                     bundle_item_kustomize_resources.push((*file).to_string());
                     extra_kustomize_resources.push(format!("{rel_dir_in_tenants}/{file}"));
                 }
-                // Flux `Kustomization`s are always registered in `tenants/kustomization.yaml`
-                // (also for bundle items, like a manifest app's `config-kustomization.yaml`).
-                for file in &extras.kustomizations {
-                    helm_extra_flux_kustomizations.push(format!("{rel_dir_in_tenants}/{file}"));
+                // Always registered in `tenants/kustomization.yaml` (also for bundle items):
+                // the SOPS `Secret` needs `keel-tenants`' decryption.
+                for file in &extras.tenant_resources {
+                    helm_tenant_resources.push(format!("{rel_dir_in_tenants}/{file}"));
                 }
             }
             let repo_url = app.spec.upstream.repo_url.trim();
@@ -2750,7 +2738,7 @@ pub async fn create_proposal(
             }
         }
         let rel_dir_in_tenants = rel_dir.strip_prefix("tenants/").unwrap_or(&rel_dir);
-        for fk_rel in helm_extra_flux_kustomizations {
+        for fk_rel in helm_tenant_resources {
             if !resources.contains(&fk_rel) {
                 resources.push(fk_rel);
             }
@@ -3147,7 +3135,9 @@ async fn create_bundle_proposal(
     // Every Flux Kustomization the bundle may create must be unique within the tenant.
     let mut reserved_names: Vec<String> = Vec::new();
     for item in &bundle.spec.items {
-        for name in reserved_flux_kustomization_names(&format!("{instance_name}-{}", item.id)) {
+        // Items are resolved later; conservatively reserve the manifest-app names for all.
+        for name in reserved_flux_kustomization_names(&format!("{instance_name}-{}", item.id), true)
+        {
             if reserved_names.contains(&name) {
                 return Err(ServerError::BadRequest(format!(
                     "Bundle '{}' items derive the same Flux Kustomization name '{name}' (item ids must not differ only by a '-config'/'-canary' suffix)",
@@ -3174,6 +3164,7 @@ async fn create_bundle_proposal(
                 &req.tenant,
                 &bundle_rel_dir,
                 &format!("{instance_name}-{}", item.id),
+                true,
             )
             .await?;
         }
@@ -3194,8 +3185,9 @@ async fn create_bundle_proposal(
         primary_yaml: String,
         extra_files: Vec<(String, String)>,
         flux_kustomization_yaml: String,
-        /// Additional Flux `Kustomization` files (relative to the item directory) registered in
-        /// `tenants/kustomization.yaml` (a manifest app's `config-kustomization.yaml`).
+        /// Additional files (relative to the item directory) registered in
+        /// `tenants/kustomization.yaml` (a manifest app's `config-kustomization.yaml`, a Helm
+        /// app's `secrets.enc.yaml`).
         extra_kustomizations: Vec<&'static str>,
         /// Item-relative files/directories of other variants removed on update.
         stale: Vec<&'static str>,
@@ -3244,7 +3236,7 @@ async fn create_bundle_proposal(
 
         let partitioned = partition_values_by_schema(sub_schema, &item_values)?;
         let values_yaml = render_helm_values_yaml(&partitioned.normal_values)?;
-        let mut helm_item_kustomizations: Vec<&'static str> = Vec::new();
+        let mut helm_item_tenant_resources: Vec<&'static str> = Vec::new();
         let mut bundle_labels = std::collections::BTreeMap::new();
         bundle_labels.insert("keel.io/bundle".to_string(), instance_name.clone());
         bundle_labels.insert("keel.io/bundle-item".to_string(), item.id.clone());
@@ -3410,7 +3402,6 @@ async fn create_bundle_proposal(
                             stored_secret: stored_item_secrets.get(&item.id),
                             remote: item_kube_config.is_some(),
                             target_namespace: item_target_namespace.as_deref(),
-                            extra_labels: bundle_labels.clone(),
                         },
                     )
                     .await?;
@@ -3465,7 +3456,7 @@ async fn create_bundle_proposal(
                     let mut extras = helm_extras.files.clone();
                     let mut item_k_res = vec![primary_filename.clone()];
                     item_k_res.extend(helm_extras.resources.iter().map(|f| (*f).to_string()));
-                    helm_item_kustomizations = helm_extras.kustomizations.clone();
+                    helm_item_tenant_resources = helm_extras.tenant_resources.clone();
                     let repo_url = app.spec.upstream.repo_url.trim();
                     if !repo_url.is_empty() {
                         let mut repo_spec = serde_json::json!({
@@ -3764,7 +3755,7 @@ async fn create_bundle_proposal(
         let extra_kustomizations = if manifest_app_kustomization.is_some() {
             vec![FLUX_MANIFEST_APP_KUSTOMIZATION_FILES[0]]
         } else {
-            helm_item_kustomizations
+            helm_item_tenant_resources
         };
         let flux_kustomization_yaml = if let Some(app_fk) = manifest_app_kustomization {
             app_fk
@@ -5140,12 +5131,13 @@ mod tests {
     #[tokio::test]
     async fn derived_kustomization_names_and_sibling_guard() {
         assert_eq!(
-            reserved_flux_kustomization_names("web"),
-            [
-                "web".to_string(),
-                "web-config".to_string(),
-                "web-canary".to_string()
-            ]
+            reserved_flux_kustomization_names("web", true),
+            ["web", "web-config", "web-canary"]
+        );
+        // Helm apps never create a `<name>-config` Kustomization.
+        assert_eq!(
+            reserved_flux_kustomization_names("web", false),
+            ["web", "web-canary"]
         );
         let repo = tempfile::tempdir().unwrap();
         for dir in ["tenants/acme/apps/web", "tenants/acme/apps/api-canary"] {
@@ -5159,6 +5151,7 @@ mod tests {
                     "acme",
                     &format!("tenants/acme/apps/{name}"),
                     name,
+                    true,
                 )
                 .await
             }
@@ -5171,6 +5164,19 @@ mod tests {
         // Unrelated names (including catalog ids ending in `-config`) are fine.
         assert!(check("canary-gateway-config").await.is_ok());
         assert!(check("webapp").await.is_ok());
+        // A Helm app does not reserve `<name>-config`: `db-config` existing is fine for `db`.
+        std::fs::create_dir_all(repo.path().join("tenants/acme/apps/db-config")).unwrap();
+        let root = repo.path().to_path_buf();
+        assert!(
+            ensure_no_derived_name_sibling(&root, "acme", "tenants/acme/apps/db", "db", false)
+                .await
+                .is_ok()
+        );
+        assert!(
+            ensure_no_derived_name_sibling(&root, "acme", "tenants/acme/apps/db", "db", true)
+                .await
+                .is_err()
+        );
         // Other tenants never conflict.
         let root = repo.path().to_path_buf();
         assert!(
@@ -5178,7 +5184,8 @@ mod tests {
                 &root,
                 "other",
                 "tenants/other/apps/web-config",
-                "web-config"
+                "web-config",
+                true
             )
             .await
             .is_ok()
