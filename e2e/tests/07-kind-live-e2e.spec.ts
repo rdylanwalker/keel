@@ -60,6 +60,58 @@ function tryCmd(bin: string, args: string[]): { ok: boolean; stdout: string } {
   }
 }
 
+/** Origin header for cookie-authenticated mutations (the server's CSRF guard requires it). */
+const SAME_ORIGIN = { Origin: new URL(BASE_URL).origin };
+
+/** Mirrors `keel_core::keel_config_dir()` ($KEEL_CONFIG_DIR, $XDG_CONFIG_HOME/keel, ~/.config/keel). */
+function keelConfigDir(): string {
+  if (process.env.KEEL_CONFIG_DIR) return process.env.KEEL_CONFIG_DIR;
+  if (process.env.XDG_CONFIG_HOME) return path.join(process.env.XDG_CONFIG_HOME, 'keel');
+  return path.join(os.homedir(), '.config', 'keel');
+}
+
+/** Runs a long command, streaming its output while also capturing it (stdout + stderr). */
+function runCmdTee(bin: string, args: string[], env?: NodeJS.ProcessEnv): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(bin, args, {
+      env: { ...process.env, ...env },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let out = '';
+    child.stdout.on('data', (d: Buffer) => {
+      out += d.toString();
+      process.stdout.write(d);
+    });
+    child.stderr.on('data', (d: Buffer) => {
+      out += d.toString();
+      process.stderr.write(d);
+    });
+    child.on('error', reject);
+    child.on('close', (code) =>
+      code === 0 ? resolve(out) : reject(new Error(`${bin} ${args[0]} exited with ${code}`)),
+    );
+  });
+}
+
+/** Runs a command and returns exit status plus combined stdout/stderr (never throws). */
+function runCmdAll(
+  bin: string,
+  args: string[],
+  env?: NodeJS.ProcessEnv,
+): { ok: boolean; out: string } {
+  try {
+    const out = execFileSync(bin, args, {
+      encoding: 'utf-8',
+      env: { ...process.env, ...env },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    return { ok: true, out };
+  } catch (err) {
+    const e = err as { stdout?: string; stderr?: string };
+    return { ok: false, out: `${e.stdout ?? ''}${e.stderr ?? ''}` };
+  }
+}
+
 async function isServerUp(url: string): Promise<boolean> {
   try {
     const res = await fetch(`${url}/api/v1/auth/status`);
@@ -76,36 +128,41 @@ async function waitForK8sReady(
   timeoutMs = 300_000,
 ): Promise<void> {
   const start = Date.now();
-  const deadline = start + timeoutMs;
   let lastLog = 0;
-
-  while (Date.now() < deadline) {
-    const res = tryCmd('kubectl', [
-      'get',
-      kind,
-      name,
-      '-n',
-      namespace,
-      '-o',
-      'jsonpath={.status.conditions[?(@.type=="Ready")].status}|{.status.conditions[?(@.type=="Ready")].reason}|{.status.conditions[?(@.type=="Ready")].message}',
-    ]);
-    const [status = '', reason = '', message = ''] = res.stdout.split('|');
-    if (res.ok && status === 'True') {
-      const elapsed = Math.round((Date.now() - start) / 1000);
-      logStep(`Ready: ${kind}/${name} (${namespace}) in ${elapsed}s`);
-      return;
-    }
-    const now = Date.now();
-    if (now - lastLog >= 15_000) {
-      const elapsed = Math.round((now - start) / 1000);
-      const maxSec = Math.round(timeoutMs / 1000);
-      const detail = reason && message ? `${reason}: ${message}` : reason || message || 'pending';
-      logStep(
-        `Waiting: ${kind}/${name} (${namespace}) Ready=${status || 'Unknown'} (${detail}) [${elapsed}s/${maxSec}s]`,
-      );
-      lastLog = now;
-    }
-    await new Promise((r) => setTimeout(r, 5000));
+  try {
+    await expect
+      .poll(
+        () => {
+          const res = tryCmd('kubectl', [
+            'get',
+            kind,
+            name,
+            '-n',
+            namespace,
+            '-o',
+            'jsonpath={.status.conditions[?(@.type=="Ready")].status}|{.status.conditions[?(@.type=="Ready")].reason}|{.status.conditions[?(@.type=="Ready")].message}',
+          ]);
+          const [status = '', reason = '', message = ''] = res.stdout.split('|');
+          const now = Date.now();
+          if (now - lastLog >= 15_000) {
+            const elapsed = Math.round((now - start) / 1000);
+            const maxSec = Math.round(timeoutMs / 1000);
+            const detail =
+              reason && message ? `${reason}: ${message}` : reason || message || 'pending';
+            logStep(
+              `Waiting: ${kind}/${name} (${namespace}) Ready=${status || 'Unknown'} (${detail}) [${elapsed}s/${maxSec}s]`,
+            );
+            lastLog = now;
+          }
+          return res.ok ? status : '';
+        },
+        { timeout: timeoutMs, intervals: [5_000] },
+      )
+      .toBe('True');
+    logStep(`Ready: ${kind}/${name} (${namespace}) in ${Math.round((Date.now() - start) / 1000)}s`);
+    return;
+  } catch {
+    // fall through to diagnostics below
   }
   const desc = tryCmd('kubectl', ['describe', kind, name, '-n', namespace]);
   if (desc.stdout) {
@@ -159,15 +216,18 @@ async function waitForK8sReady(
 }
 
 async function waitForNamespace(name: string, timeoutMs = 120_000): Promise<void> {
-  const start = Date.now();
-  const deadline = start + timeoutMs;
-  while (Date.now() < deadline) {
-    const res = tryCmd('kubectl', ['get', 'namespace', name, '-o', 'jsonpath={.status.phase}']);
-    if (res.ok && res.stdout === 'Active') {
-      logStep(`Namespace ${name} is Active`);
-      return;
-    }
-    await new Promise((r) => setTimeout(r, 3000));
+  try {
+    await expect
+      .poll(
+        () =>
+          tryCmd('kubectl', ['get', 'namespace', name, '-o', 'jsonpath={.status.phase}']).stdout,
+        { timeout: timeoutMs, intervals: [3_000] },
+      )
+      .toBe('Active');
+    logStep(`Namespace ${name} is Active`);
+    return;
+  } catch {
+    // fall through to diagnostics below
   }
   const fluxDiag = tryCmd('kubectl', [
     'get',
@@ -297,8 +357,8 @@ async function signInViaRauthy(
   await expect(page.getByText('Keel Control Plane')).toBeVisible();
 
   const authRequired = page.getByText('Authentication Required');
-  const mgmtStack = page.getByText('management-cluster-core', { exact: true });
-  await expect(authRequired.or(mgmtStack)).toBeVisible({ timeout: 30_000 });
+  const logout = page.getByRole('button', { name: 'Logout' });
+  await expect(authRequired.or(logout)).toBeVisible({ timeout: 30_000 });
 
   if (await authRequired.isVisible()) {
     await page
@@ -329,9 +389,90 @@ async function signInViaRauthy(
     }
   }
 
-  await expect(page.getByText('management-cluster-core', { exact: true })).toBeVisible({
-    timeout: 30_000,
+  await expect(page.getByRole('button', { name: 'Logout' })).toBeVisible({ timeout: 30_000 });
+}
+
+/**
+ * Drives `keel auth login --no-browser`: reads the printed `/api/v1/auth/cli/login` URL, opens it
+ * in a Playwright page (signing in to Rauthy when prompted), and waits for the CLI to exit 0 after
+ * the loopback callback + code exchange.
+ */
+async function cliLoopbackLogin(
+  context: import('@playwright/test').BrowserContext,
+  env: NodeJS.ProcessEnv,
+  email: string,
+  password: string,
+): Promise<void> {
+  const child = spawn(KEEL_BIN, ['auth', 'login', '--no-browser', '--timeout-secs', '120'], {
+    env: { ...process.env, ...env },
+    stdio: ['ignore', 'pipe', 'pipe'],
   });
+  let output = '';
+  child.stdout.on('data', (d: Buffer) => (output += d.toString()));
+  child.stderr.on('data', (d: Buffer) => (output += d.toString()));
+  const exited = new Promise<number | null>((resolve) => child.on('close', resolve));
+  try {
+    await expect
+      .poll(() => /https?:\/\/\S+\/api\/v1\/auth\/cli\/login\S*/.exec(output)?.[0] ?? '', {
+        timeout: 15_000,
+        message: `keel auth login printed no login URL:\n${output}`,
+      })
+      .not.toBe('');
+    const loginUrl = /https?:\/\/\S+\/api\/v1\/auth\/cli\/login\S*/.exec(output)![0];
+    const loginPage = await context.newPage();
+    // The CLI's RFC 8252 loopback listener (`http://127.0.0.1:<port>/callback`).
+    const loopbackCallback = /^http:\/\/(127\.0\.0\.1|\[::1\]):\d+\/callback/;
+    try {
+      await loginPage.goto(loginUrl, { waitUntil: 'domcontentloaded' }).catch(() => undefined);
+      // With an existing Rauthy session (the GUI already signed in with this browser context)
+      // the IdP completes the flow on its own and redirects straight to the loopback callback;
+      // Rauthy may briefly render its login form before redirecting, so wait for the callback
+      // first and only drive the form when we are still on the IdP afterwards.
+      const autoCompleted = await loginPage
+        .waitForURL(loopbackCallback, { timeout: 8_000 })
+        .then(() => true)
+        .catch(() => false);
+      if (!autoCompleted && !loopbackCallback.test(loginPage.url())) {
+        const emailInput = loginPage
+          .locator('input[type="email"], input[name="email"], input[autocomplete="username"]')
+          .first();
+        await emailInput.fill(email, { timeout: 15_000 });
+        const passwordInput = loginPage
+          .locator('input[type="password"], input[name="password"]')
+          .first();
+        if (!(await passwordInput.isVisible({ timeout: 2_000 }).catch(() => false))) {
+          await loginPage.locator('button[type="submit"]').first().click({ timeout: 10_000 });
+        }
+        if (!loopbackCallback.test(loginPage.url())) {
+          await passwordInput.fill(password, { timeout: 15_000 });
+          await loginPage
+            .locator('button[type="submit"], #submit-login')
+            .first()
+            .click({ timeout: 10_000 });
+        }
+        await loginPage.waitForURL(loopbackCallback, { timeout: 30_000 });
+      }
+      const code = await Promise.race([
+        exited,
+        new Promise<'timeout'>((r) => setTimeout(() => r('timeout'), 90_000)),
+      ]);
+      if (code !== 0) throw new Error(`keel auth login exited with ${code}:\n${output}`);
+    } finally {
+      await loginPage.close();
+    }
+  } finally {
+    if (child.exitCode === null) child.kill();
+  }
+}
+
+/**
+ * Admin credentials: `KEEL_ADMIN_PASSWORD` / `KEEL_ADMIN_USERNAME` env overrides, else the files the
+ * justfile writes after bootstrap (`target/keel-admin-password`, `target/keel-admin-username`) when
+ * reusing a cluster, else the deterministic password passed to a fresh `bootstrap init` below.
+ */
+function readTargetFile(name: string): string {
+  const p = path.resolve(process.cwd(), '../target', name);
+  return fs.existsSync(p) ? fs.readFileSync(p, 'utf-8').trim() : '';
 }
 
 function resolveE2eAdminPassword(): string {
@@ -339,15 +480,18 @@ function resolveE2eAdminPassword(): string {
     return process.env.KEEL_ADMIN_PASSWORD.trim();
   }
   if (process.env.KEEL_E2E_REUSE_CLUSTER !== '0') {
-    const savedPassPath = path.resolve(process.cwd(), '../target/keel-dex-password');
-    if (fs.existsSync(savedPassPath)) {
-      const saved = fs.readFileSync(savedPassPath, 'utf-8').trim();
-      if (saved) {
-        return saved;
-      }
-    }
+    const saved = readTargetFile('keel-admin-password');
+    if (saved) return saved;
   }
   return 'KeelE2eAdminPass123!';
+}
+
+function resolveE2eAdminUsername(): string {
+  return (
+    process.env.KEEL_ADMIN_USERNAME?.trim() ||
+    (process.env.KEEL_E2E_REUSE_CLUSTER !== '0' ? readTargetFile('keel-admin-username') : '') ||
+    'admin@keel.local'
+  );
 }
 
 // Note: `keel bootstrap init --target kind` provisions the `kind` management cluster
@@ -363,6 +507,11 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
   let serveProc: ChildProcess | null = null;
   let tmpRepoDir: string | null = null;
   const adminPassword = resolveE2eAdminPassword();
+  const adminUsername = resolveE2eAdminUsername();
+  /** Captured `keel bootstrap init` output (fresh bootstrap only). */
+  let bootstrapOutput = '';
+  /** Isolated CLI config (credentials.json) shared by the serial CLI steps. */
+  let cliEnv: NodeJS.ProcessEnv = {};
   const acmePassword = process.env.KEEL_ACME_PASSWORD || 'KeelE2eAcmePass123!';
 
   test.beforeAll(async () => {
@@ -378,11 +527,13 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
         logStep('Deleting stale workload kind cluster "workload-dev"...');
         runCmd('kind', ['delete', 'cluster', '--name', 'workload-dev'], undefined, true);
       }
-      fs.rmSync(`/tmp/keel-stage0-pulumi/kind-${MGMT_CLUSTER}`, { recursive: true, force: true });
-      fs.rmSync(`/tmp/keel-stage0-pulumi/control-plane-${MGMT_CLUSTER}`, {
+      // Stage 0 Pulumi state now lives in <config>/stage0/<cluster>/ (escrowed to S3); stale local
+      // state for a deleted cluster would make a fresh bootstrap believe resources still exist.
+      fs.rmSync(path.join(keelConfigDir(), 'stage0', MGMT_CLUSTER), {
         recursive: true,
         force: true,
       });
+      fs.rmSync(path.join(os.tmpdir(), 'keel-stage0-pulumi'), { recursive: true, force: true });
       if (fs.existsSync(DETERMINISTIC_REPO_DIR)) {
         fs.rmSync(DETERMINISTIC_REPO_DIR, { recursive: true, force: true });
       }
@@ -395,25 +546,20 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
       logStep(
         `Bootstrapping fresh kind management cluster "${MGMT_CLUSTER}" via deploy/bootstrap/kind/Pulumi.yaml (repo: ${tmpRepoDir})...`,
       );
-      runCmd(
-        KEEL_BIN,
-        [
-          'bootstrap',
-          'init',
-          '--target',
-          'kind',
-          '--with-forge',
-          '--local-dev-docker-socket-exception',
-          '--cluster-name',
-          MGMT_CLUSTER,
-          '--repo-dir',
-          tmpRepoDir,
-          '--admin-password',
-          adminPassword,
-        ],
-        undefined,
-        true,
-      );
+      bootstrapOutput = await runCmdTee(KEEL_BIN, [
+        'bootstrap',
+        'init',
+        '--target',
+        'kind',
+        '--with-forge',
+        '--local-dev-docker-socket-exception',
+        '--cluster-name',
+        MGMT_CLUSTER,
+        '--repo-dir',
+        tmpRepoDir,
+        '--admin-password',
+        adminPassword,
+      ]);
     } else {
       logStep(`Reusing existing kind management cluster "${MGMT_CLUSTER}"`);
     }
@@ -482,14 +628,13 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
         ['serve', '--bind', `${url.hostname}:${url.port || '8080'}`, '--repo-dir', repoDir],
         { stdio: ['ignore', logFd, logFd], detached: true },
       );
-      const deadline = Date.now() + 30_000;
-      while (Date.now() < deadline) {
-        if (await isServerUp(BASE_URL)) break;
-        await new Promise((r) => setTimeout(r, 1000));
-      }
-      if (!(await isServerUp(BASE_URL))) {
-        throw new Error(`keel serve did not become ready at ${BASE_URL}; check ${SERVE_LOG_PATH}`);
-      }
+      await expect
+        .poll(() => isServerUp(BASE_URL), {
+          timeout: 30_000,
+          intervals: [1_000],
+          message: `keel serve did not become ready at ${BASE_URL}; check ${SERVE_LOG_PATH}`,
+        })
+        .toBe(true);
       logStep(`keel serve is ready at ${BASE_URL}`);
     } else {
       logStep(`Reusing existing keel serve at ${BASE_URL}`);
@@ -559,6 +704,96 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
     }
   });
 
+  test('07.0 - Stage 0 hardening: state escrow, passphrase secret, Kyverno scope, break-glass plan', async () => {
+    await test.step('1. Stage 0 state is escrowed to the in-cluster versioned S3 bucket', async () => {
+      if (bootstrapOutput) {
+        expect(bootstrapOutput).toMatch(
+          new RegExp(`Stage 0 state escrowed to \\S*stage0/${MGMT_CLUSTER}`),
+        );
+      } else {
+        logStep('Reused cluster: bootstrap output not captured; skipping escrow-summary check');
+      }
+      const passphrase = tryCmd('kubectl', [
+        'get',
+        'secret',
+        'keel-stage0-pulumi-passphrase',
+        '-n',
+        'keel-system',
+        '-o',
+        'jsonpath={.metadata.name}',
+      ]);
+      expect(passphrase.ok, 'keel-system/keel-stage0-pulumi-passphrase must exist').toBe(true);
+      expect(passphrase.stdout).toBe('keel-stage0-pulumi-passphrase');
+      // Forgejo admin password is random and stored in-cluster (never a fixed default).
+      const forgejoAdmin = tryCmd('kubectl', [
+        'get',
+        'secret',
+        'keel-forgejo-admin',
+        '-n',
+        'keel-system',
+        '-o',
+        'jsonpath={.data.password}',
+      ]);
+      expect(forgejoAdmin.ok, 'keel-system/keel-forgejo-admin must exist').toBe(true);
+      expect(Buffer.from(forgejoAdmin.stdout, 'base64').toString('utf-8').length).toBeGreaterThan(
+        11,
+      );
+    });
+
+    await test.step('2. Kyverno is installed only in keel-system', async () => {
+      const pods = tryCmd('kubectl', [
+        'get',
+        'pods',
+        '-A',
+        '-o',
+        'jsonpath={range .items[*]}{.metadata.namespace}/{.metadata.name}{"\\n"}{end}',
+      ]).stdout.split('\n');
+      const kyvernoNamespaces = new Set(
+        pods.filter((p) => p.includes('kyverno')).map((p) => p.split('/')[0]),
+      );
+      expect([...kyvernoNamespaces]).toEqual(['keel-system']);
+      const releases = tryCmd('kubectl', [
+        'get',
+        'helmrelease',
+        '-A',
+        '-o',
+        'jsonpath={range .items[*]}{.metadata.namespace}/{.metadata.name}{"\\n"}{end}',
+      ]).stdout.split('\n');
+      for (const r of releases.filter((x) => /kyverno/.test(x))) {
+        expect(r.startsWith('keel-system/'), r).toBe(true);
+      }
+    });
+
+    await test.step('3. `keel bootstrap recover --dry-run` prints the break-glass plan', async () => {
+      const recover = runCmdAll(KEEL_BIN, [
+        'bootstrap',
+        'recover',
+        '--s3-endpoint',
+        'http://127.0.0.1:8333',
+        '--cluster-name',
+        MGMT_CLUSTER,
+        '--dry-run',
+      ]);
+      expect(recover.ok, recover.out).toBe(true);
+      expect(recover.out).toContain('Break-Glass Stage 0 Recovery');
+      expect(recover.out).toContain(`stage0/${MGMT_CLUSTER}/`);
+      expect(recover.out).toMatch(/Plan \(dry run/);
+      expect(recover.out).toContain('pulumi');
+    });
+
+    await test.step('4. `keel tenant migrate-state --tenant default --dry-run` is a safe no-op', async () => {
+      const migrate = runCmdAll(KEEL_BIN, [
+        'tenant',
+        'migrate-state',
+        '--tenant',
+        'default',
+        '--dry-run',
+      ]);
+      expect(migrate.ok, migrate.out).toBe(true);
+      logStep(`tenant migrate-state --dry-run:\n${migrate.out.trim()}`);
+    });
+  });
+
   test('07.1 - CLI standalone app on mgmt -> GUI bundle workload kind cluster -> GUI standalone canary app on workload cluster', async ({
     page,
   }) => {
@@ -570,25 +805,42 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
       logStep('Opening GUI and signing in via Rauthy OIDC...');
       await page.goto('/');
       await expect(page.getByText('Keel Control Plane')).toBeVisible();
-      await signInViaRauthy(page, 'admin@keel.local', adminPassword);
-      logStep('Authenticated and management-cluster-core is visible');
+      await signInViaRauthy(page, adminUsername, adminPassword);
+      // Cluster admins see the management plane strip (rendered only from a real API stack).
+      await expect(page.getByTestId('management-plane-strip')).toBeVisible({ timeout: 30_000 });
+      logStep('Authenticated; management plane strip is visible');
     });
 
-    const cookies = await page.context().cookies(BASE_URL);
-    const sessionCookie = cookies.find((c) => c.name === 'keel_session');
-    const localToken = await page.evaluate(() => localStorage.getItem('keel_token'));
-    const sessionToken = sessionCookie?.value || localToken || '';
-    expect(sessionToken.length).toBeGreaterThan(0);
+    await test.step('1b. CLI: `keel auth login` via RFC 8252 loopback, driven in the browser', async () => {
+      const cliHome = fs.mkdtempSync(path.join(os.tmpdir(), 'keel-e2e-cli-home-'));
+      const configDir = path.join(cliHome, '.config', 'keel');
+      fs.mkdirSync(configDir, { recursive: true });
+      cliEnv = { HOME: cliHome, KEEL_CONFIG_DIR: configDir, KEEL_SERVER: BASE_URL };
 
-    const cliHome = fs.mkdtempSync(path.join(os.tmpdir(), 'keel-e2e-cli-home-'));
-    const credsDir = path.join(cliHome, '.config', 'keel');
-    fs.mkdirSync(credsDir, { recursive: true });
-    fs.writeFileSync(
-      path.join(credsDir, 'credentials.json'),
-      JSON.stringify({ sessions: { [BASE_URL.replace(/\/+$/, '')]: sessionToken } }, null, 2),
-      { mode: 0o600 },
-    );
-    const cliEnv: NodeJS.ProcessEnv = { HOME: cliHome };
+      let loggedIn = false;
+      try {
+        await cliLoopbackLogin(page.context(), cliEnv, adminUsername, adminPassword);
+        const status = runCmdAll(KEEL_BIN, ['auth', 'status'], cliEnv);
+        expect(status.ok, status.out).toBe(true);
+        expect(status.out).toContain(adminUsername);
+        loggedIn = true;
+        logStep('CLI authenticated via loopback login');
+      } catch (err) {
+        logStep(`CLI loopback login failed (${String(err)}); falling back to GUI session cookie`);
+      }
+
+      if (!loggedIn) {
+        // Fallback: reuse the GUI session cookie as the CLI Bearer token.
+        const cookies = await page.context().cookies(BASE_URL);
+        const sessionToken = cookies.find((c) => c.name === 'keel_session')?.value || '';
+        expect(sessionToken.length).toBeGreaterThan(0);
+        fs.writeFileSync(
+          path.join(configDir, 'credentials.json'),
+          JSON.stringify({ sessions: { [BASE_URL.replace(/\/+$/, '')]: sessionToken } }, null, 2),
+          { mode: 0o600 },
+        );
+      }
+    });
 
     await test.step('2. CLI: Deploy standalone podinfo on management cluster', async () => {
       logStep('Running `keel app install` for podinfo on management cluster...');
@@ -731,7 +983,7 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
           .locator('input[type="email"], input[name="email"], input[autocomplete="username"]')
           .first();
         if (await emailInput.isVisible({ timeout: 3_000 }).catch(() => false)) {
-          await emailInput.fill('admin@keel.local');
+          await emailInput.fill(adminUsername);
           const passwordInput = rauthyPage
             .locator('input[type="password"], input[name="password"]')
             .first();
@@ -954,8 +1206,11 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
         timeout: 20_000,
       });
       await expect(page.getByText(workloadAppName).first()).toBeVisible({ timeout: 20_000 });
-      await page.evaluate('window.scrollTo(0, document.body.scrollHeight)');
-      await page.waitForTimeout(1000);
+      await expect(page.getByTestId('topology-stream-status')).toHaveText(/SSE Live Stream/, {
+        timeout: 20_000,
+      });
+      await page.getByText('Live Reconciler Event Stream').scrollIntoViewIfNeeded();
+      await expect(page.getByText('Live Reconciler Event Stream')).toBeInViewport();
       if (RECORD_DEMO) {
         const video = page.video();
         await page.close();
@@ -990,6 +1245,7 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
         expect(releasesDenied.status()).toBe(403);
 
         const proposalDenied = await page.request.post('/api/v1/proposals', {
+          headers: SAME_ORIGIN,
           data: {
             catalogId: 'podinfo',
             name: 'acme-denied-podinfo',
@@ -998,8 +1254,11 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
           },
         });
         expect(proposalDenied.status()).toBe(403);
+        // RBAC denial, not a CSRF rejection.
+        expect((await proposalDenied.json()).error).toMatch(/Access denied for tenant 'default'/);
 
         const createTenantDenied = await page.request.post('/api/v1/tenants', {
+          headers: SAME_ORIGIN,
           data: { id: 'acme-unauthorized' },
         });
         expect(createTenantDenied.status()).toBe(403);
@@ -1057,7 +1316,10 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
           );
           expect(acmePr).toBeTruthy();
 
-          const nonAdminMergeRes = await page.request.post(`/api/v1/proposals/${acmePr!.id}/merge`);
+          const nonAdminMergeRes = await page.request.post(
+            `/api/v1/proposals/${acmePr!.id}/merge`,
+            { headers: SAME_ORIGIN },
+          );
           expect(nonAdminMergeRes.status()).toBe(403);
           logStep(`Confirmed non-admin cannot merge PR #${acmePr!.id} (403 Forbidden)`);
 
@@ -1070,12 +1332,14 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
             );
             expect(otherTenantDenied.status()).toBe(403);
             const createTenantDenied2 = await tenantAdminPage.request.post('/api/v1/tenants', {
+              headers: SAME_ORIGIN,
               data: { id: 'gamma' },
             });
             expect(createTenantDenied2.status()).toBe(403);
 
             const tenantAdminMergeRes = await tenantAdminPage.request.post(
               `/api/v1/proposals/${acmePr!.id}/merge`,
+              { headers: SAME_ORIGIN },
             );
             expect(tenantAdminMergeRes.status()).toBe(200);
             logStep(
@@ -1092,5 +1356,122 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
     } finally {
       await context.close();
     }
+  });
+
+  test('07.3 - Infra proposal runs a real PKO preview Stack in keel-previews; CLI proposal list/show/close GCs it', async ({
+    page,
+  }) => {
+    await signInViaRauthy(page, adminUsername, adminPassword);
+    const instance = `e2e-preview-${Date.now().toString(36)}`;
+    let prId = '';
+
+    await test.step('1. Create an infra (Pulumi-backed) proposal', async () => {
+      const res = await page.request.post('/api/v1/proposals', {
+        headers: SAME_ORIGIN,
+        data: {
+          tenant: 'default',
+          catalogId: 'kind-cluster',
+          kind: 'infra',
+          name: instance,
+          values: { clusterName: instance, kubernetesVersion: 'v1.35.8', workerCount: 0 },
+        },
+      });
+      expect(res.status(), await res.text()).toBe(201);
+      const body = await res.json();
+      prId = body.proposal.id;
+      expect(body.proposal.title).toMatch(new RegExp(`^feat\\(default\\): \\w+ ${instance}$`));
+      // With a live cluster the PKO preview is launched asynchronously: the create response
+      // carries an honest provisional (synthesized) diff while the run is pending/running, or the
+      // PKO result if it already finished. It must never claim "notExecuted" here.
+      expect(['pko', 'synthesized']).toContain(body.report.source);
+      expect(['pending', 'running', 'succeeded']).toContain(body.report.run?.phase);
+      logStep(`Infra proposal PR #${prId} created (preview phase ${body.report.run?.phase})`);
+    });
+
+    await test.step('1b. Preview report converges to the real PKO result', async () => {
+      await expect
+        .poll(
+          async () => {
+            const r = await page.request.get(`/api/v1/proposals/${prId}/preview`);
+            if (!r.ok()) return `http ${r.status()}`;
+            const b = await r.json();
+            const report = b.report ?? b;
+            return `${report.source}/${report.run?.phase}`;
+          },
+          { timeout: 300_000, intervals: [5_000] },
+        )
+        .toBe('pko/succeeded');
+      logStep(`PR #${prId} preview executed by PKO and succeeded`);
+    });
+
+    const previewStacks = () =>
+      tryCmd('kubectl', [
+        'get',
+        'stacks.pulumi.com',
+        '-n',
+        'keel-previews',
+        '-l',
+        `keel.io/pr-id=${prId}`,
+        '-o',
+        'jsonpath={.items[*].metadata.name}',
+      ]).stdout.trim();
+
+    await test.step('2. Ephemeral preview Stack (spec.preview: true) appears in keel-previews', async () => {
+      await expect.poll(previewStacks, { timeout: 120_000, intervals: [3_000] }).not.toBe('');
+      const name = previewStacks().split(/\s+/)[0];
+      const isPreview = tryCmd('kubectl', [
+        'get',
+        'stacks.pulumi.com',
+        name,
+        '-n',
+        'keel-previews',
+        '-o',
+        'jsonpath={.spec.preview}',
+      ]).stdout;
+      expect(isPreview).toBe('true');
+    });
+
+    await test.step('3. GUI: PKO preview badge + SSE "PKO preview" event', async () => {
+      await page.goto(`/#preview/${prId}`);
+      await expect(page.getByTestId('preview-source-badge')).toHaveAttribute('data-source', 'pko', {
+        timeout: 30_000,
+      });
+      await expect(page.getByTestId('preview-run-status')).toHaveAttribute(
+        'data-phase',
+        /pending|running|succeeded|failed/,
+      );
+      await page.goto('/#topology');
+      await expect(page.getByTestId('topology-stream-status')).toHaveText(/SSE Live Stream/, {
+        timeout: 20_000,
+      });
+      // Phase transitions are published as `PKO preview <phase> for PR #<id>`.
+      await expect(
+        page.getByText(new RegExp(`PKO preview \\w+ for PR #${prId}\\b`)).first(),
+      ).toBeVisible({
+        timeout: 300_000,
+      });
+    });
+
+    await test.step('4. CLI: proposal list / show / close', async () => {
+      const list = runCmdAll(KEEL_BIN, ['proposal', 'list', '--output', 'json'], cliEnv);
+      expect(list.ok, list.out).toBe(true);
+      expect(list.out).toContain(`"${prId}"`);
+      const show = runCmdAll(KEEL_BIN, ['proposal', 'show', prId], cliEnv);
+      expect(show.ok, show.out).toBe(true);
+      expect(show.out).toContain(instance);
+      const close = runCmdAll(KEEL_BIN, ['proposal', 'close', prId], cliEnv);
+      expect(close.ok, close.out).toBe(true);
+      const closed = runCmdAll(
+        KEEL_BIN,
+        ['proposal', 'list', '--status', 'closed', '--output', 'json'],
+        cliEnv,
+      );
+      expect(closed.out).toContain(`"${prId}"`);
+    });
+
+    await test.step('5. Preview Stack is garbage-collected after close (60s reconciler)', async () => {
+      await expect.poll(previewStacks, { timeout: 240_000, intervals: [5_000] }).toBe('');
+      logStep(`Preview Stack for PR #${prId} garbage-collected`);
+    });
   });
 });

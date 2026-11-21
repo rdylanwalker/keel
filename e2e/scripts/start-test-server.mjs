@@ -14,6 +14,19 @@ const SERVER_URL = process.env.KEEL_BASE_URL || 'http://127.0.0.1:18080';
 const BIND_ADDR = '127.0.0.1:18080';
 const OIDC_PORT = 18081;
 const OIDC_ISSUER = `http://127.0.0.1:${OIDC_PORT}`;
+/** Well-known file the specs read to locate the seeded bare Git repo (git-level assertions). */
+const HARNESS_STATE_FILE = path.join(os.tmpdir(), 'keel-e2e-harness.json');
+
+/**
+ * Mock IdP users. The username typed into the mock login form selects the profile, so specs can
+ * authenticate as a cluster admin, a tenant member, or a tenant admin (`tenant-<id>[-admin]`).
+ */
+const MOCK_USERS = {
+  'admin@keel.local': { name: 'Keel E2E Admin', groups: ['keel-admins'] },
+  'acme-dev@keel.local': { name: 'Acme Developer', groups: ['tenant-acme'] },
+  'acme-admin@keel.local': { name: 'Acme Tenant Admin', groups: ['tenant-acme-admin'] },
+  'default-dev@keel.local': { name: 'Default Developer', groups: ['tenant-default'] },
+};
 
 function escapeHtml(str) {
   return String(str)
@@ -59,10 +72,12 @@ function startMockOidcServer() {
         url.searchParams.get('redirect_uri') || `${SERVER_URL}/api/v1/auth/callback`;
       const state = url.searchParams.get('state') || '';
       const prompt = url.searchParams.get('prompt') || '';
-      const hasSsoCookie = (req.headers.cookie || '').includes('mock_idp_sso=1');
-      if (hasSsoCookie && prompt !== 'login') {
+      const nonce = url.searchParams.get('nonce') || '';
+      const ssoMatch = /(?:^|;\s*)mock_idp_sso=([^;]+)/.exec(req.headers.cookie || '');
+      const ssoUser = ssoMatch ? decodeURIComponent(ssoMatch[1]) : '';
+      if (ssoUser && MOCK_USERS[ssoUser] && prompt !== 'login') {
         const target = new URL(redirectUri);
-        target.searchParams.set('code', 'e2e-mock-code');
+        target.searchParams.set('code', encodeCode(ssoUser, nonce));
         target.searchParams.set('state', state);
         res.writeHead(302, { Location: target.toString() });
         res.end();
@@ -76,6 +91,7 @@ function startMockOidcServer() {
     <form method="POST" action="/auth">
       <input type="hidden" name="redirect_uri" value="${escapeHtml(redirectUri)}" />
       <input type="hidden" name="state" value="${escapeHtml(state)}" />
+      <input type="hidden" name="nonce" value="${escapeHtml(nonce)}" />
       <label>Username <input name="username" type="text" required /></label>
       <label>Password <input name="password" type="password" required /></label>
       <button type="submit">Sign In</button>
@@ -93,48 +109,80 @@ function startMockOidcServer() {
         const params = new URLSearchParams(body);
         const redirectUri = params.get('redirect_uri') || `${SERVER_URL}/api/v1/auth/callback`;
         const state = params.get('state') || '';
+        const nonce = params.get('nonce') || '';
+        const username = (params.get('username') || '').trim().toLowerCase();
+        if (!MOCK_USERS[username]) {
+          res.writeHead(401, { 'Content-Type': 'text/html' });
+          res.end('<!doctype html><html><body><h1>Invalid credentials</h1></body></html>');
+          return;
+        }
         const target = new URL(redirectUri);
-        target.searchParams.set('code', 'e2e-mock-code');
+        target.searchParams.set('code', encodeCode(username, nonce));
         target.searchParams.set('state', state);
         res.writeHead(302, {
           Location: target.toString(),
-          'Set-Cookie': 'mock_idp_sso=1; Path=/; HttpOnly',
+          'Set-Cookie': `mock_idp_sso=${encodeURIComponent(username)}; Path=/; HttpOnly`,
         });
         res.end();
       });
       return;
     }
     if (req.method === 'POST' && url.pathname === '/token') {
-      const now = Math.floor(Date.now() / 1000);
-      const header = b64url({ alg: 'RS256', typ: 'JWT', kid: 'e2e-key-1' });
-      const payload = b64url({
-        iss: OIDC_ISSUER,
-        aud: 'keel-server',
-        iat: now,
-        exp: now + 3600,
-        sub: 'admin@keel.local',
-        email: 'admin@keel.local',
-        name: 'Keel E2E Admin',
-        groups: ['keel-admins'],
+      let body = '';
+      req.on('data', (chunk) => {
+        body += chunk.toString();
       });
-      const signingInput = `${header}.${payload}`;
-      const signature = crypto
-        .sign('RSA-SHA256', Buffer.from(signingInput), privateKey)
-        .toString('base64url');
-      const signedJwt = `${signingInput}.${signature}`;
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(
-        JSON.stringify({
-          id_token: signedJwt,
-          access_token: signedJwt,
-          token_type: 'Bearer',
-        }),
-      );
+      req.on('end', () => issueToken(res, new URLSearchParams(body).get('code') || ''));
       return;
     }
     res.writeHead(404);
     res.end('Not found');
   });
+
+  function encodeCode(username, nonce) {
+    return Buffer.from(JSON.stringify({ u: username, n: nonce })).toString('base64url');
+  }
+
+  function issueToken(res, code) {
+    let decoded;
+    try {
+      decoded = JSON.parse(Buffer.from(code, 'base64url').toString('utf8'));
+    } catch {
+      decoded = null;
+    }
+    const profile = decoded && MOCK_USERS[decoded.u];
+    if (!profile) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'invalid_grant' }));
+      return;
+    }
+    const now = Math.floor(Date.now() / 1000);
+    const header = b64url({ alg: 'RS256', typ: 'JWT', kid: 'e2e-key-1' });
+    const payload = b64url({
+      iss: OIDC_ISSUER,
+      aud: 'keel-server',
+      iat: now,
+      exp: now + 3600,
+      sub: decoded.u,
+      email: decoded.u,
+      name: profile.name,
+      groups: profile.groups,
+      ...(decoded.n ? { nonce: decoded.n } : {}),
+    });
+    const signingInput = `${header}.${payload}`;
+    const signature = crypto
+      .sign('RSA-SHA256', Buffer.from(signingInput), privateKey)
+      .toString('base64url');
+    const signedJwt = `${signingInput}.${signature}`;
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(
+      JSON.stringify({
+        id_token: signedJwt,
+        access_token: signedJwt,
+        token_type: 'Bearer',
+      }),
+    );
+  }
 
   return new Promise((resolve) => {
     server.listen(OIDC_PORT, '127.0.0.1', () => resolve(server));
@@ -214,6 +262,7 @@ async function main() {
   const kindCatalogDir = path.join(workDir, 'catalog', 'infra', 'kind-cluster');
   const podinfoCatalogDir = path.join(workDir, 'catalog', 'apps', 'podinfo');
   const s3CatalogDir = path.join(workDir, 'catalog', 'core', 's3-state-backend');
+  const staticSiteCatalogDir = path.join(workDir, 'catalog', 'apps', 'static-site');
   const rauthyCatalogDir = path.join(workDir, 'catalog', 'core', 'rauthy');
   const coreAddonsDir = path.join(workDir, 'clusters', 'management', 'core-addons');
   const tenantAcmeInfra = path.join(workDir, 'tenants', 'acme', 'infra', 'net');
@@ -223,6 +272,7 @@ async function main() {
   fs.mkdirSync(kindCatalogDir, { recursive: true });
   fs.mkdirSync(podinfoCatalogDir, { recursive: true });
   fs.mkdirSync(s3CatalogDir, { recursive: true });
+  fs.mkdirSync(staticSiteCatalogDir, { recursive: true });
   fs.mkdirSync(rauthyCatalogDir, { recursive: true });
   fs.mkdirSync(coreAddonsDir, { recursive: true });
   fs.mkdirSync(tenantAcmeInfra, { recursive: true });
@@ -324,8 +374,22 @@ spec:
     properties:
       replicas:
         type: integer
+        title: Replica Count
         minimum: 1
+        maximum: 10
         default: 2
+      ingress:
+        type: object
+        title: Ingress
+        properties:
+          enabled:
+            type: boolean
+            title: Enable Ingress
+            default: false
+          host:
+            type: string
+            title: Ingress Hostname
+            pattern: "^[a-z0-9.-]+$"
       backendUrl:
         type: string
         title: Backend Service URL
@@ -334,6 +398,34 @@ spec:
         title: Admin Secret Password
         format: password
         writeOnly: true
+`,
+  );
+
+  fs.writeFileSync(
+    path.join(staticSiteCatalogDir, 'catalog.yaml'),
+    `apiVersion: keel.io/v1alpha1
+kind: CatalogApplication
+metadata:
+  id: static-site
+  name: Static Site
+  description: Stateless nginx site without progressive delivery support
+  category: apps
+  runtime: helm
+spec:
+  upstream:
+    repoURL: https://charts.bitnami.com/bitnami
+    chart: nginx
+    version: "18.2.0"
+  progressiveDelivery:
+    flaggerSupported: false
+    defaultCanary: false
+  schema:
+    type: object
+    properties:
+      replicaCount:
+        type: integer
+        title: Replicas
+        default: 1
 `,
   );
 
@@ -450,11 +542,20 @@ spec:
   const oidcServer = await startMockOidcServer();
   const binPath = findKeelBinary();
 
+  const isolatedEnv = { ...process.env, KUBECONFIG: path.join(tmpDir, 'no-kubeconfig') };
+  delete isolatedEnv.KUBERNETES_SERVICE_HOST;
+  delete isolatedEnv.KUBERNETES_SERVICE_PORT;
+
   console.log(`Starting keel serve on ${BIND_ADDR}...`);
   const serverProc = spawn(
     binPath,
     ['serve', '--bind', BIND_ADDR, '--repo-dir', workDir, '--bare-repo', bareRepo],
-    { stdio: ['ignore', 'pipe', 'inherit'] },
+    {
+      stdio: ['ignore', 'pipe', 'inherit'],
+      // Isolate the mocked suite from any developer kubeconfig / live kind cluster: the server
+      // must run in "no cluster connected" mode (synthesized previews, git-derived state).
+      env: isolatedEnv,
+    },
   );
 
   serverProc.stdout.on('data', (chunk) => {
@@ -467,12 +568,25 @@ spec:
       serverProc.kill();
     }
   });
+  // Never leave an orphaned `keel serve` behind without its mock IdP (a reused orphan would
+  // break every login in the next run).
+  for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
+    process.on(sig, () => process.exit(0));
+  }
+  serverProc.on('exit', (code) => {
+    console.error(`keel serve exited with code ${code}`);
+    process.exit(code ?? 1);
+  });
 
   const ready = await waitForServer(SERVER_URL);
   if (!ready) {
     serverProc.kill();
     throw new Error(`Keel server failed to start at ${SERVER_URL}`);
   }
+  fs.writeFileSync(
+    HARNESS_STATE_FILE,
+    JSON.stringify({ serverUrl: SERVER_URL, oidcIssuer: OIDC_ISSUER, bareRepo, workDir }, null, 2),
+  );
   console.log(`Keel test server running at ${SERVER_URL}`);
 }
 

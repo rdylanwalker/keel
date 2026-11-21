@@ -1,5 +1,7 @@
 import { expect, test } from '@playwright/test';
 
+import { USERS } from './support/harness.js';
+
 test.describe('06 - Full Localhost GUI GitOps Workflow', () => {
   test('06.1 - OIDC PKCE login -> GUI auth -> create tenant -> create kind cluster -> install app -> verify status', async ({
     page,
@@ -9,6 +11,43 @@ test.describe('06 - Full Localhost GUI GitOps Workflow', () => {
       browserName !== 'chromium',
       'Full mutating GitOps workflow runs once per server instance',
     );
+    // The server ships a strict CSP; any violation (inline script, cross-origin load) fails the run.
+    const cspViolations: string[] = [];
+    page.on('console', (msg) => {
+      if (msg.type() === 'error' && /Content Security Policy/i.test(msg.text())) {
+        cspViolations.push(msg.text());
+      }
+    });
+
+    await page.addInitScript(() => {
+      const w = window as unknown as { __cspViolations: string[] };
+      w.__cspViolations = [];
+      document.addEventListener('securitypolicyviolation', (e) => {
+        w.__cspViolations.push(`${e.violatedDirective} ${e.blockedURI}`);
+      });
+    });
+    const domCspViolations = () =>
+      page.evaluate(
+        () => (window as unknown as { __cspViolations?: string[] }).__cspViolations ?? [],
+      );
+
+    /** Waits for the PR-opened notice; on failure surfaces CSP violations (e.g. eval-based validators). */
+    const expectProposalOpened = async () => {
+      try {
+        await expect(page.getByText(/Git PR Proposal Successfully Opened!/i)).toBeVisible({
+          timeout: 10000,
+        });
+      } catch (err) {
+        const violations = [...(await domCspViolations()), ...cspViolations];
+        if (violations.length > 0) {
+          throw new Error(`CSP violations blocked the form: ${violations.join('; ')}`, {
+            cause: err,
+          });
+        }
+        throw err;
+      }
+    };
+
     // 1. Open GUI in unauthenticated mode and verify OIDC sign-in gate hides cluster data
     await page.goto('/');
     await expect(page.getByText('Keel Control Plane')).toBeVisible();
@@ -21,7 +60,7 @@ test.describe('06 - Full Localhost GUI GitOps Workflow', () => {
       .first()
       .click();
     await expect(page.getByText('Dex Login')).toBeVisible();
-    await page.getByLabel(/Username/i).fill('admin@keel.local');
+    await page.getByLabel(/Username/i).fill(USERS.admin.username);
     await page.getByLabel(/Password/i).fill('e2e-password');
     await page.getByRole('button', { name: /Sign In/i }).click();
 
@@ -39,9 +78,7 @@ test.describe('06 - Full Localhost GUI GitOps Workflow', () => {
     await page.getByRole('button', { name: /New Tenant/i }).click();
     await page.getByLabel(/Tenant ID/i).fill('e2e-team');
     await page.getByRole('button', { name: /Create Tenant PR/i }).click();
-    await expect(page.getByText(/Git PR Proposal Successfully Opened!/i)).toBeVisible({
-      timeout: 10000,
-    });
+    await expectProposalOpened();
 
     await page.getByRole('button', { name: /PR & Preview Inspector/i }).click();
     await expect(page.getByTestId('pr-search-input')).toBeVisible();
@@ -60,15 +97,19 @@ test.describe('06 - Full Localhost GUI GitOps Workflow', () => {
     });
     await tenantSelect.selectOption('e2e-team');
 
-    await page.getByTestId('catalog-list').getByRole('button', { name: 'Create' }).first().click();
+    await page
+      .getByTestId('catalog-list')
+      .locator('.p-5', { hasText: 'Local kind Cluster' })
+      .getByRole('button', { name: 'Create' })
+      .click();
     await page.getByRole('button', { name: /Submit & Open Git PR Proposal/i }).click();
-    await expect(page.getByText(/Git PR Proposal Successfully Opened!/i)).toBeVisible({
-      timeout: 10000,
-    });
+    await expectProposalOpened();
 
     // Inspect PKO v2 preview diff & merge the kind-cluster PR
     await page.getByRole('button', { name: /PR & Preview Inspector/i }).click();
-    await expect(page.getByRole('heading', { name: /Local kind Cluster/i })).toBeVisible({
+    await expect(
+      page.getByRole('heading', { name: /feat\(e2e-team\): \w+ kind-cluster/i }),
+    ).toBeVisible({
       timeout: 10000,
     });
     await expect(page.getByText(/Resource Diff Tree/i)).toBeVisible({ timeout: 10000 });
@@ -78,7 +119,11 @@ test.describe('06 - Full Localhost GUI GitOps Workflow', () => {
     // 5. Install application (`podinfo`) into `e2e-team`
     await page.getByRole('button', { name: /Catalog & Form Wizard/i }).click();
     await page.locator('#tenant-select-catalog').selectOption('e2e-team');
-    await page.getByTestId('catalog-list').getByRole('button', { name: 'Create' }).nth(1).click();
+    await page
+      .getByTestId('catalog-list')
+      .locator('.p-5', { hasText: 'Podinfo App' })
+      .getByRole('button', { name: 'Create' })
+      .click();
 
     const backendUrlInput = page.getByLabel(/Backend Service URL/i);
     if (await backendUrlInput.isVisible()) {
@@ -86,12 +131,12 @@ test.describe('06 - Full Localhost GUI GitOps Workflow', () => {
     }
 
     await page.getByRole('button', { name: /Submit & Open Git PR Proposal/i }).click();
-    await expect(page.getByText(/Git PR Proposal Successfully Opened!/i)).toBeVisible({
-      timeout: 10000,
-    });
+    await expectProposalOpened();
 
     await page.getByRole('button', { name: /PR & Preview Inspector/i }).click();
-    await expect(page.getByRole('heading', { name: /Podinfo App/i })).toBeVisible({
+    await expect(
+      page.getByRole('heading', { name: /feat\(e2e-team\): deploy podinfo/i }),
+    ).toBeVisible({
       timeout: 10000,
     });
     await page.getByRole('button', { name: /Merge PR/i }).click();
@@ -125,7 +170,9 @@ test.describe('06 - Full Localhost GUI GitOps Workflow', () => {
       // Interactive terminal must NOT be active by default before user clicks Launch
       await expect(page.getByTestId('browser-ssh-terminal')).toHaveCount(0);
       await page.getByTestId('launch-browser-terminal-btn').click();
+      // wterm (DOM-rendered) initializes asynchronously: wait for rendered text, not just the node.
       await expect(page.getByTestId('browser-ssh-terminal')).toBeVisible({ timeout: 10000 });
+      await expect(page.getByTestId('browser-ssh-terminal')).not.toBeEmpty({ timeout: 10000 });
       await page.getByTestId('disconnect-browser-terminal-btn').click();
       await page.getByTestId('vm-ssh-modal-close-btn').click();
     }
@@ -143,9 +190,7 @@ test.describe('06 - Full Localhost GUI GitOps Workflow', () => {
 
     await page.getByTestId('extract-manifest-vars-btn').first().click();
     await page.getByRole('button', { name: /Submit App PR Proposal/i }).click();
-    await expect(page.getByText(/Git PR Proposal Successfully Opened!/i)).toBeVisible({
-      timeout: 10000,
-    });
+    await expectProposalOpened();
 
     // Merge the app creation PR
     await page.getByRole('button', { name: /PR & Preview Inspector/i }).click();
@@ -172,9 +217,7 @@ test.describe('06 - Full Localhost GUI GitOps Workflow', () => {
       .click();
     await page.getByTestId('catalog-protected-checkbox').uncheck();
     await page.getByRole('button', { name: /Submit Update PR/i }).click();
-    await expect(page.getByText(/Git PR Proposal Successfully Opened!/i)).toBeVisible({
-      timeout: 10000,
-    });
+    await expectProposalOpened();
 
     // Merge the unprotect PR
     await page.getByRole('button', { name: /PR & Preview Inspector/i }).click();
@@ -194,9 +237,10 @@ test.describe('06 - Full Localhost GUI GitOps Workflow', () => {
       timeout: 10000,
     });
     await page.getByTestId('delete-catalog-item-e2e-raw-manifest').click();
-    await expect(page.getByText(/Git PR Proposal Successfully Opened!/i)).toBeVisible({
-      timeout: 10000,
-    });
+    // Deletion is confirmed in a Radix alertdialog before any PR is opened.
+    await expect(page.getByRole('alertdialog')).toBeVisible();
+    await page.getByTestId('confirm-delete-catalog-item-e2e-raw-manifest').click();
+    await expectProposalOpened();
 
     // 7. Verify Control Plane & Providers 4th sidebar tab & base addon upgrade workflow
     await page.getByRole('button', { name: /Control Plane & Providers/i }).click();
@@ -221,5 +265,8 @@ test.describe('06 - Full Localhost GUI GitOps Workflow', () => {
     await expect(page.getByText(/opened on branch/i)).toBeVisible({
       timeout: 10000,
     });
+
+    expect(cspViolations, cspViolations.join('\n')).toEqual([]);
+    expect(await domCspViolations()).toEqual([]);
   });
 });

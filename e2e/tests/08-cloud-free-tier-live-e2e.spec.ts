@@ -238,6 +238,23 @@ function withGitPrLock<T>(fn: () => Promise<T>): Promise<T> {
   return next;
 }
 
+/** Origin header for cookie-authenticated mutations (the server's CSRF guard requires it). */
+const SAME_ORIGIN = { Origin: new URL(BASE_URL).origin };
+
+/** Polls `check` until it returns true (expect.poll, fixed interval); returns false on timeout. */
+async function pollUntil(
+  check: () => boolean | Promise<boolean>,
+  timeoutMs: number,
+  intervalMs: number,
+): Promise<boolean> {
+  try {
+    await expect.poll(check, { timeout: timeoutMs, intervals: [intervalMs] }).toBe(true);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function waitForStackReady(
   name: string,
   namespace: string,
@@ -245,74 +262,80 @@ async function waitForStackReady(
   timeoutMs = PROVISION_TIMEOUT_MS,
 ): Promise<void> {
   const start = Date.now();
-  const deadline = start + timeoutMs;
   const timeoutSec = Math.round(timeoutMs / 1000);
   let lastLog = 0;
+  let stalledError: Error | null = null;
 
   triggerFluxReconcile();
 
-  while (Date.now() < deadline) {
-    const res = tryCmd('kubectl', [
-      'get',
-      'stack.pulumi.com',
-      name,
-      '-n',
-      namespace,
-      '-o',
-      'jsonpath={.status.conditions[?(@.type=="Ready")].status}|{.status.conditions[?(@.type=="Ready")].reason}|{.status.conditions[?(@.type=="Ready")].message}|{.status.conditions[?(@.type=="Stalled")].status}|{.status.lastUpdate.message}',
-    ]);
+  const done = await pollUntil(
+    async () => {
+      const res = tryCmd('kubectl', [
+        'get',
+        'stack.pulumi.com',
+        name,
+        '-n',
+        namespace,
+        '-o',
+        'jsonpath={.status.conditions[?(@.type=="Ready")].status}|{.status.conditions[?(@.type=="Ready")].reason}|{.status.conditions[?(@.type=="Ready")].message}|{.status.conditions[?(@.type=="Stalled")].status}|{.status.lastUpdate.message}',
+      ]);
 
-    if (res.ok) {
-      const [status, reason, message, stalled, lastUpdateMsg] = res.stdout.split('|');
-      if (status === 'True') {
+      if (res.ok) {
+        const [status, reason, message, stalled, lastUpdateMsg] = res.stdout.split('|');
+        if (status === 'True') {
+          const elapsed = Math.round((Date.now() - start) / 1000);
+          logStep(`PKO v2 Stack ${namespace}/${name} is Ready (${elapsed}s)!`, provider);
+          return true;
+        }
+        if (stalled === 'True') {
+          const podLogs = tryCmd('kubectl', [
+            'logs',
+            `${name}-workspace-0`,
+            '-n',
+            namespace,
+            '--tail=30',
+          ]);
+          const detail = [lastUpdateMsg, podLogs.ok ? podLogs.stdout : '']
+            .filter(Boolean)
+            .join('\n--- workspace pod logs ---\n');
+          const errMsg = `PKO v2 Stack ${namespace}/${name} stalled (${reason}: ${message})\n${detail}`;
+          logStep(errMsg, provider);
+          stalledError = new Error(`[${provider}] ${errMsg}`);
+          return true;
+        }
+        if (Date.now() - lastLog > 15_000) {
+          const elapsed = Math.round((Date.now() - start) / 1000);
+          logStep(
+            `Waiting for PKO v2 Stack ${namespace}/${name} (${elapsed}s/${timeoutSec}s): status=${status || 'Pending'} reason=${reason || '-'} ${message || ''}`,
+            provider,
+          );
+          lastLog = Date.now();
+        }
+      } else if (Date.now() - lastLog > 15_000) {
         const elapsed = Math.round((Date.now() - start) / 1000);
-        logStep(`PKO v2 Stack ${namespace}/${name} is Ready (${elapsed}s)!`, provider);
-        return;
-      }
-      if (stalled === 'True') {
-        const podLogs = tryCmd('kubectl', [
-          'logs',
-          `${name}-workspace-0`,
+        const ks = tryCmd('kubectl', [
+          'get',
+          'kustomization',
+          'keel-tenants',
           '-n',
-          namespace,
-          '--tail=30',
+          'flux-system',
+          '-o',
+          'jsonpath={.status.conditions[?(@.type=="Ready")].status}:{.status.conditions[?(@.type=="Ready")].message}',
         ]);
-        const detail = [lastUpdateMsg, podLogs.ok ? podLogs.stdout : '']
-          .filter(Boolean)
-          .join('\n--- workspace pod logs ---\n');
-        const errMsg = `PKO v2 Stack ${namespace}/${name} stalled (${reason}: ${message})\n${detail}`;
-        logStep(errMsg, provider);
-        throw new Error(`[${provider}] ${errMsg}`);
-      }
-      if (Date.now() - lastLog > 15_000) {
-        const elapsed = Math.round((Date.now() - start) / 1000);
+        const ksInfo = ks.ok && ks.stdout ? ` (keel-tenants=${ks.stdout})` : '';
         logStep(
-          `Waiting for PKO v2 Stack ${namespace}/${name} (${elapsed}s/${timeoutSec}s): status=${status || 'Pending'} reason=${reason || '-'} ${message || ''}`,
+          `Waiting for Flux to create PKO v2 Stack ${namespace}/${name} (${elapsed}s/${timeoutSec}s)${ksInfo}...`,
           provider,
         );
         lastLog = Date.now();
       }
-    } else if (Date.now() - lastLog > 15_000) {
-      const elapsed = Math.round((Date.now() - start) / 1000);
-      const ks = tryCmd('kubectl', [
-        'get',
-        'kustomization',
-        'keel-tenants',
-        '-n',
-        'flux-system',
-        '-o',
-        'jsonpath={.status.conditions[?(@.type=="Ready")].status}:{.status.conditions[?(@.type=="Ready")].message}',
-      ]);
-      const ksInfo = ks.ok && ks.stdout ? ` (keel-tenants=${ks.stdout})` : '';
-      logStep(
-        `Waiting for Flux to create PKO v2 Stack ${namespace}/${name} (${elapsed}s/${timeoutSec}s)${ksInfo}...`,
-        provider,
-      );
-      lastLog = Date.now();
-    }
-
-    await new Promise((r) => setTimeout(r, 5000));
-  }
+      return false;
+    },
+    timeoutMs,
+    5_000,
+  );
+  if (stalledError) throw stalledError;
+  if (done) return;
 
   throw new Error(
     `[${provider}] Timed out after ${timeoutSec}s waiting for PKO v2 Stack ${namespace}/${name} to become Ready`,
@@ -334,7 +357,7 @@ async function deleteAndConfirmStage1StackRemoved(
   logStep(`Requesting deletion of Stage 1 stack ${namespace}/${stackName}...`, provider);
   const deletedPr = await withGitPrLock(async () => {
     const delRes = await request
-      .delete(`${BASE_URL}/api/v1/stacks/${namespace}/${stackName}`)
+      .delete(`${BASE_URL}/api/v1/stacks/${namespace}/${stackName}`, { headers: SAME_ORIGIN })
       .catch(() => null);
     if (!delRes || !delRes.ok()) {
       return false;
@@ -347,7 +370,9 @@ async function deleteAndConfirmStage1StackRemoved(
     const delPrId = delJson?.proposal?.id ?? delJson?.id;
     if (delPrId !== undefined) {
       logStep(`Merging deletion PR #${delPrId} for ${namespace}/${stackName}...`, provider);
-      const mergeRes = await request.post(`${BASE_URL}/api/v1/proposals/${delPrId}/merge`);
+      const mergeRes = await request.post(`${BASE_URL}/api/v1/proposals/${delPrId}/merge`, {
+        headers: SAME_ORIGIN,
+      });
       expect(mergeRes.ok()).toBe(true);
       triggerFluxReconcile();
     }
@@ -364,34 +389,36 @@ async function deleteAndConfirmStage1StackRemoved(
     provider,
   );
   const apiStart = Date.now();
-  const apiDeadline = apiStart + API_DELETE_TIMEOUT_MS;
   let apiLastLog = 0;
-  let removedFromApi = false;
-  while (Date.now() < apiDeadline) {
-    const stacksRes = await request.get(`${BASE_URL}/api/v1/stacks`);
-    if (stacksRes.ok()) {
-      const body = (await stacksRes.json()) as {
-        stacks?: Array<{ name?: string; namespace?: string; tenant?: string }>;
-      };
-      const stacks = Array.isArray(body) ? body : (body.stacks ?? []);
-      const stillExists = stacks.some(
-        (s) => s.name === stackName && (s.namespace === namespace || s.tenant === tenant),
-      );
-      if (!stillExists) {
-        removedFromApi = true;
-        break;
+  const done = await pollUntil(
+    async () => {
+      const stacksRes = await request.get(`${BASE_URL}/api/v1/stacks`);
+      if (stacksRes.ok()) {
+        const body = (await stacksRes.json()) as {
+          stacks?: Array<{ name?: string; namespace?: string; tenant?: string }>;
+        };
+        const stacks = Array.isArray(body) ? body : (body.stacks ?? []);
+        const stillExists = stacks.some(
+          (s) => s.name === stackName && (s.namespace === namespace || s.tenant === tenant),
+        );
+        if (!stillExists) {
+          return true;
+        }
       }
-    }
-    if (Date.now() - apiLastLog > 15_000) {
-      const elapsed = Math.round((Date.now() - apiStart) / 1000);
-      logStep(
-        `Still waiting for ${namespace}/${stackName} removal from Keel API (${elapsed}s/${apiTimeoutSec}s)...`,
-        provider,
-      );
-      apiLastLog = Date.now();
-    }
-    await new Promise((r) => setTimeout(r, 3000));
-  }
+      if (Date.now() - apiLastLog > 15_000) {
+        const elapsed = Math.round((Date.now() - apiStart) / 1000);
+        logStep(
+          `Still waiting for ${namespace}/${stackName} removal from Keel API (${elapsed}s/${apiTimeoutSec}s)...`,
+          provider,
+        );
+        apiLastLog = Date.now();
+      }
+      return false;
+    },
+    API_DELETE_TIMEOUT_MS,
+    3_000,
+  );
+  const removedFromApi = done;
   expect(
     removedFromApi,
     `[${provider}] Timed out after ${apiTimeoutSec}s waiting for stack ${namespace}/${stackName} to be removed from /api/v1/stacks`,
@@ -407,25 +434,27 @@ async function deleteAndConfirmStage1StackRemoved(
       provider,
     );
     const k8sStart = Date.now();
-    const k8sDeadline = k8sStart + K8S_FINALIZER_TIMEOUT_MS;
     let k8sLastLog = 0;
-    let removedFromK8s = false;
-    while (Date.now() < k8sDeadline) {
-      const getRes = tryCmd('kubectl', ['get', 'stack.pulumi.com', stackName, '-n', namespace]);
-      if (!getRes.ok) {
-        removedFromK8s = true;
-        break;
-      }
-      if (Date.now() - k8sLastLog > 15_000) {
-        const elapsed = Math.round((Date.now() - k8sStart) / 1000);
-        logStep(
-          `Waiting for PKO v2 Stack ${namespace}/${stackName} cloud teardown (${elapsed}s/${k8sTimeoutSec}s)...`,
-          provider,
-        );
-        k8sLastLog = Date.now();
-      }
-      await new Promise((r) => setTimeout(r, 5000));
-    }
+    const done = await pollUntil(
+      async () => {
+        const getRes = tryCmd('kubectl', ['get', 'stack.pulumi.com', stackName, '-n', namespace]);
+        if (!getRes.ok) {
+          return true;
+        }
+        if (Date.now() - k8sLastLog > 15_000) {
+          const elapsed = Math.round((Date.now() - k8sStart) / 1000);
+          logStep(
+            `Waiting for PKO v2 Stack ${namespace}/${stackName} cloud teardown (${elapsed}s/${k8sTimeoutSec}s)...`,
+            provider,
+          );
+          k8sLastLog = Date.now();
+        }
+        return false;
+      },
+      K8S_FINALIZER_TIMEOUT_MS,
+      5_000,
+    );
+    const removedFromK8s = done;
     expect(
       removedFromK8s,
       `[${provider}] Timed out after ${k8sTimeoutSec}s waiting for PKO v2 Stack ${namespace}/${stackName} finalizer to finish cloud teardown`,
@@ -595,7 +624,8 @@ function resolveE2eAdminPassword(): string {
     return process.env.KEEL_ADMIN_PASSWORD.trim();
   }
   if (process.env.KEEL_E2E_REUSE_CLUSTER !== '0') {
-    const savedPassPath = path.resolve(process.cwd(), '../target/keel-dex-password');
+    // Written by the justfile after bootstrap (alongside target/keel-admin-username).
+    const savedPassPath = path.resolve(process.cwd(), '../target/keel-admin-password');
     if (fs.existsSync(savedPassPath)) {
       const saved = fs.readFileSync(savedPassPath, 'utf-8').trim();
       if (saved) {
@@ -756,14 +786,13 @@ test.describe('08.1 - Multi-Cloud Free-Tier Stage 1 Live E2E (kind Management Cl
         ['serve', '--bind', `${url.hostname}:${url.port || '8080'}`, '--repo-dir', repoDir],
         { stdio: ['ignore', logFd, logFd], detached: true },
       );
-      const deadline = Date.now() + 30_000;
-      while (Date.now() < deadline) {
-        if (await isServerUp(BASE_URL)) break;
-        await new Promise((r) => setTimeout(r, 1000));
-      }
-      if (!(await isServerUp(BASE_URL))) {
-        throw new Error(`keel serve did not become ready at ${BASE_URL}; check ${SERVE_LOG_PATH}`);
-      }
+      await expect
+        .poll(() => isServerUp(BASE_URL), {
+          timeout: 30_000,
+          intervals: [1_000],
+          message: `keel serve did not become ready at ${BASE_URL}; check ${SERVE_LOG_PATH}`,
+        })
+        .toBe(true);
       logStep(`keel serve is ready at ${BASE_URL}`);
     } else {
       logStep(`Reusing existing keel serve at ${BASE_URL}`);
@@ -862,6 +891,7 @@ test.describe('08.1 - Multi-Cloud Free-Tier Stage 1 Live E2E (kind Management Cl
         Object.entries(values).map(([k, v]) => [k, v === '${stackName}' ? stackName : v]),
       );
       const createRes = await request.post(`${BASE_URL}/api/v1/proposals`, {
+        headers: SAME_ORIGIN,
         data: {
           catalogId,
           name: stackName,
@@ -890,38 +920,52 @@ test.describe('08.1 - Multi-Cloud Free-Tier Stage 1 Live E2E (kind Management Cl
         provider,
       );
       const prevStart = Date.now();
-      const prevDeadline = prevStart + PREVIEW_TIMEOUT_MS;
       let prevLastLog = 0;
-      let previewReady = false;
-      while (Date.now() < prevDeadline) {
-        const prevRes = await request.get(`${BASE_URL}/api/v1/proposals/${prId}/preview`);
-        if (prevRes.ok()) {
-          const body = await prevRes.text();
-          if (body.includes('+ Create') || body.includes('create') || body.includes('preview')) {
-            previewReady = true;
-            break;
+      const done = await pollUntil(
+        async () => {
+          const prevRes = await request.get(`${BASE_URL}/api/v1/proposals/${prId}/preview`);
+          if (prevRes.ok()) {
+            const body = await prevRes.text();
+            if (body.includes('+ Create') || body.includes('create') || body.includes('preview')) {
+              return true;
+            }
           }
-        }
-        if (Date.now() - prevLastLog > 15_000) {
-          const elapsed = Math.round((Date.now() - prevStart) / 1000);
-          logStep(
-            `Still waiting for preview #${prId} (${elapsed}s/${previewTimeoutSec}s)...`,
-            provider,
-          );
-          prevLastLog = Date.now();
-        }
-        await new Promise((r) => setTimeout(r, 5000));
-      }
+          if (Date.now() - prevLastLog > 15_000) {
+            const elapsed = Math.round((Date.now() - prevStart) / 1000);
+            logStep(
+              `Still waiting for preview #${prId} (${elapsed}s/${previewTimeoutSec}s)...`,
+              provider,
+            );
+            prevLastLog = Date.now();
+          }
+          return false;
+        },
+        PREVIEW_TIMEOUT_MS,
+        5_000,
+      );
+      const previewReady = done;
       expect(
         previewReady,
         `[${provider}] Timed out after ${previewTimeoutSec}s waiting for preview #${prId}`,
       ).toBe(true);
 
       logStep(`Merging proposal #${prId}...`, provider);
-      let mergeRes = await request.post(`${BASE_URL}/api/v1/proposals/${prId}/merge`);
-      for (let attempt = 1; attempt <= 4 && mergeRes.status() === 409; attempt++) {
-        await new Promise((r) => setTimeout(r, 2000));
-        mergeRes = await request.post(`${BASE_URL}/api/v1/proposals/${prId}/merge`);
+      let mergeRes = await request.post(`${BASE_URL}/api/v1/proposals/${prId}/merge`, {
+        headers: SAME_ORIGIN,
+      });
+      if (mergeRes.status() === 409) {
+        // Transient conflict (concurrent PR merges): retry with polling instead of fixed sleeps.
+        await expect
+          .poll(
+            async () => {
+              mergeRes = await request.post(`${BASE_URL}/api/v1/proposals/${prId}/merge`, {
+                headers: SAME_ORIGIN,
+              });
+              return mergeRes.status();
+            },
+            { timeout: 10_000, intervals: [2_000] },
+          )
+          .not.toBe(409);
       }
       expect(mergeRes.ok(), `[${provider}] Merge failed: ${await mergeRes.text()}`).toBe(true);
       stackMerged = true;
@@ -930,7 +974,9 @@ test.describe('08.1 - Multi-Cloud Free-Tier Stage 1 Live E2E (kind Management Cl
     } catch (err) {
       if (!stackMerged && prId !== undefined) {
         logStep(`Closing unmerged proposal #${prId}; skipping stack delete.`, provider);
-        await request.post(`${BASE_URL}/api/v1/proposals/${prId}/reject`).catch(() => null);
+        await request
+          .post(`${BASE_URL}/api/v1/proposals/${prId}/reject`, { headers: SAME_ORIGIN })
+          .catch(() => null);
       }
       await context.close();
       throw err;
@@ -1078,7 +1124,7 @@ test.describe('08.1 - Multi-Cloud Free-Tier Stage 1 Live E2E (kind Management Cl
             logStep(`Enabling provider "${spec.provider}" via Keel API...`, spec.provider);
             const toggleRes = await setupPage.request.put(
               `${BASE_URL}/api/v1/providers/${spec.provider}`,
-              { data: { enabled: true } },
+              { headers: SAME_ORIGIN, data: { enabled: true } },
             );
             expect(
               toggleRes.ok(),
@@ -1091,6 +1137,7 @@ test.describe('08.1 - Multi-Cloud Free-Tier Stage 1 Live E2E (kind Management Cl
             if (togglePrId !== undefined) {
               const mergeRes = await setupPage.request.post(
                 `${BASE_URL}/api/v1/proposals/${togglePrId}/merge`,
+                { headers: SAME_ORIGIN },
               );
               expect(mergeRes.ok()).toBe(true);
             }

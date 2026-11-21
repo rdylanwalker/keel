@@ -25,7 +25,11 @@ export default defineConfig({
   use: {
     baseURL,
     ignoreHTTPSErrors: true,
-    trace: 'on-first-retry',
+    // Bounded per-action/navigation timeouts: a stuck locator fails fast with a useful error
+    // instead of silently consuming the whole (20 min live) test timeout.
+    actionTimeout: isLive ? 30_000 : 10_000,
+    navigationTimeout: isLive ? 60_000 : 15_000,
+    trace: isLive ? 'retain-on-failure' : 'on-first-retry',
     screenshot: 'only-on-failure',
   },
   projects: [

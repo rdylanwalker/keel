@@ -1,5 +1,3 @@
-import { Buffer } from 'node:buffer';
-import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -29,67 +27,21 @@ const PAGES = [
   { id: 'providers', label: 'Control Plane & Providers', filename: 'providers.png' },
 ];
 
-function tryKubectl(args) {
-  try {
-    return execFileSync('kubectl', args, {
-      encoding: 'utf-8',
-      stdio: ['ignore', 'pipe', 'ignore'],
-    }).trim();
-  } catch {
-    return '';
-  }
+function readTargetFile(name) {
+  const file = path.join(REPO_ROOT, 'target', name);
+  return fs.existsSync(file) ? fs.readFileSync(file, 'utf-8').trim() : '';
 }
 
+/** Admin login: `KEEL_ADMIN_EMAIL` env, else `target/keel-admin-username` (written by the justfile). */
 function resolveAdminEmail() {
-  if (process.env.KEEL_ADMIN_EMAIL) {
-    return process.env.KEEL_ADMIN_EMAIL;
-  }
-  const b64 = tryKubectl([
-    'get',
-    'secret',
-    '-n',
-    'keel-system',
-    'dex-config',
-    '-o',
-    'jsonpath={.data.config\\.yaml}',
-  ]);
-  if (b64) {
-    const decoded = Buffer.from(b64, 'base64').toString('utf-8');
-    const match = decoded.match(/email:\s*(\S+)/);
-    if (match?.[1]) {
-      return match[1];
-    }
-  }
-  return 'admin@keel.local';
+  return (
+    process.env.KEEL_ADMIN_EMAIL || readTargetFile('keel-admin-username') || 'admin@keel.local'
+  );
 }
 
+/** Admin password: `KEEL_ADMIN_PASSWORD` env, else `target/keel-admin-password` (justfile). */
 function resolveAdminPassword() {
-  if (process.env.KEEL_ADMIN_PASSWORD) {
-    return process.env.KEEL_ADMIN_PASSWORD;
-  }
-  const passwordFile = path.join(REPO_ROOT, 'target/keel-dex-password');
-  if (fs.existsSync(passwordFile)) {
-    const fromFile = fs.readFileSync(passwordFile, 'utf-8').trim();
-    if (fromFile) {
-      return fromFile;
-    }
-  }
-  const b64 = tryKubectl([
-    'get',
-    'secret',
-    '-n',
-    'keel-system',
-    'dex-admin',
-    '-o',
-    'jsonpath={.data.password}',
-  ]);
-  if (b64) {
-    const decoded = Buffer.from(b64, 'base64').toString('utf-8').trim();
-    if (decoded) {
-      return decoded;
-    }
-  }
-  return '';
+  return process.env.KEEL_ADMIN_PASSWORD || readTargetFile('keel-admin-password');
 }
 
 async function login(page) {
@@ -119,18 +71,28 @@ async function login(page) {
   const adminPassword = resolveAdminPassword();
   if (!adminPassword) {
     throw new Error(
-      'Unable to resolve Dex admin password. Set KEEL_ADMIN_PASSWORD, or run `just dex-reset-password` first.',
+      'Unable to resolve the admin password. Set KEEL_ADMIN_PASSWORD, or bootstrap via the justfile so target/keel-admin-password exists.',
     );
   }
 
-  console.log(`Signing in via Dex OIDC as ${adminEmail}...`);
+  console.log(`Signing in via OIDC (Rauthy) as ${adminEmail}...`);
   await oidcBtn.click();
 
-  const loginInput = page.locator('input[name="login"], input#login').first();
+  const loginInput = page
+    .locator(
+      'input[type="email"], input[name="email"], input[name="login"], input#login, input[autocomplete="username"]',
+    )
+    .first();
   await loginInput.waitFor({ state: 'visible', timeout: 20_000 });
   await loginInput.fill(adminEmail);
 
-  const passwordInput = page.locator('input[name="password"], input#password').first();
+  const passwordInput = page
+    .locator('input[type="password"], input[name="password"], input#password')
+    .first();
+  if (!(await passwordInput.isVisible().catch(() => false))) {
+    await page.locator('button[type="submit"]').first().click();
+  }
+  await passwordInput.waitFor({ state: 'visible', timeout: 10_000 });
   await passwordInput.fill(adminPassword);
 
   const submitBtn = page.locator('button[type="submit"], #submit-login').first();
