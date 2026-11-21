@@ -253,6 +253,8 @@ pub struct SeedControlPlaneArtifacts {
     pub ingress: Stage0Ingress,
     /// `--with-forge`: the in-cluster Forgejo is installed and managed as a Flux add-on.
     pub with_forge: bool,
+    /// `--with-keel-server`: keel-server runs in-cluster as the Flux-managed `keel-server` add-on.
+    pub with_keel_server: bool,
 }
 
 impl std::fmt::Debug for SeedControlPlaneArtifacts {
@@ -264,6 +266,7 @@ impl std::fmt::Debug for SeedControlPlaneArtifacts {
             .field("admin_password_generated", &self.admin_password_generated)
             .field("ingress", &self.ingress)
             .field("with_forge", &self.with_forge)
+            .field("with_keel_server", &self.with_keel_server)
             .field(
                 "rauthy_secret",
                 &self
@@ -610,6 +613,7 @@ pub async fn synthesize_seed_control_plane_with_ingress(
         sops_age_keyfile,
         ingress,
         with_forge: cfg.with_forge,
+        with_keel_server: cfg.with_keel_server,
     })
 }
 
@@ -694,6 +698,29 @@ const SEED_ADDON_RAUTHY_HTTPROUTE_YAML: &str =
     include_str!("../../../../deploy/seed/addons/rauthy/httproute.yaml");
 /// Repository-relative directory of the Rauthy plain-manifest add-on.
 const RAUTHY_ADDON_DIR: &str = "clusters/management/addons/rauthy";
+
+/// Optional in-cluster keel-server (`--with-keel-server`): Flux Kustomization `flux-system/keel-server`
+/// pinning [`KEEL_SERVER_IMAGE`] to [`KEEL_SERVER_IMAGE_TAG`].
+const SEED_CORE_ADDON_KEEL_SERVER_YAML: &str =
+    include_str!("../../../../deploy/seed/core-addons/keel-server.yaml");
+/// keel-server RBAC and Deployment/Service, shared verbatim with the manual
+/// `kubectl apply -k deploy/bootstrap/keel-server` bundle.
+const KEEL_SERVER_RBAC_YAML: &str =
+    include_str!("../../../../deploy/bootstrap/keel-server/rbac.yaml");
+const KEEL_SERVER_DEPLOYMENT_YAML: &str =
+    include_str!("../../../../deploy/bootstrap/keel-server/deployment.yaml");
+/// `${KEEL_HOST}` template of the keel-server HTTPRoute (see [`render_keel_server_httproute`]).
+const SEED_ADDON_KEEL_SERVER_HTTPROUTE_YAML: &str =
+    include_str!("../../../../deploy/seed/addons/keel-server/httproute.yaml");
+const CORE_CATALOG_KEEL_SERVER_YAML: &str =
+    include_str!("../../../../deploy/catalog/core/keel-server/catalog.yaml");
+/// Repository-relative directory of the keel-server plain-manifest add-on.
+const KEEL_SERVER_ADDON_DIR: &str = "clusters/management/addons/keel-server";
+/// Release image of `keel` / `keel-server` (`.github/workflows/release.yml`, job `image`).
+pub(crate) const KEEL_SERVER_IMAGE: &str = "ghcr.io/rdylanwalker/keel";
+/// Image tag the release workflow publishes for this build: the `{{version}}` semver tag (no `v`
+/// prefix), i.e. the workspace crate version that semantic-release sets. Never `latest`.
+pub(crate) const KEEL_SERVER_IMAGE_TAG: &str = env!("CARGO_PKG_VERSION");
 
 /// `clusters/management/flux-system/kustomization.yaml`.
 const SEED_FLUX_SYSTEM_KUSTOMIZATION_YAML: &str =
@@ -833,9 +860,14 @@ pub(crate) fn render_seed_forgejo_helmrelease(ingress: &Stage0Ingress) -> Result
 }
 
 /// Renders `clusters/management/core-addons/kustomization.yaml`, listing `rauthy.yaml` only when
-/// the built-in Rauthy IdP is enabled and `forgejo.yaml` only with `--with-forge` (exactly the
-/// files [`seed_core_addon_files`] writes).
-fn render_seed_core_addons_kustomization(with_rauthy: bool, with_forge: bool) -> String {
+/// the built-in Rauthy IdP is enabled, `forgejo.yaml` only with `--with-forge` and
+/// `keel-server.yaml` only with `--with-keel-server` (exactly the files [`seed_core_addon_files`]
+/// writes).
+fn render_seed_core_addons_kustomization(
+    with_rauthy: bool,
+    with_forge: bool,
+    with_keel_server: bool,
+) -> String {
     let mut out = SEED_CORE_ADDON_KUSTOMIZATION_YAML.to_string();
     if !with_rauthy {
         out = out.replace("  - rauthy.yaml\n", "");
@@ -843,7 +875,228 @@ fn render_seed_core_addons_kustomization(with_rauthy: bool, with_forge: bool) ->
     if !with_forge {
         out = out.replace("  - forgejo.yaml\n", "");
     }
+    if !with_keel_server {
+        out = out.replace("  - keel-server.yaml\n", "");
+    }
     out
+}
+
+/// Validates the Git remote an in-cluster keel-server (`--with-keel-server`) clones on start
+/// (`KEEL_GIT_URL`): it must be reachable from pods (HTTP(S), not a host path or SSH, since the
+/// Deployment only carries an HTTPS token) and must not embed credentials (`keel serve` rejects
+/// them; the token comes from `keel-system/forge-token`).
+pub(crate) fn validate_keel_server_git_url(raw: &str) -> Result<(), CliError> {
+    let invalid = |why: &str| {
+        CliError::Validation(format!(
+            "--with-keel-server needs a cluster-reachable HTTP(S) Git remote: {why} \
+             (use --with-forge or --git-url https://...)"
+        ))
+    };
+    let parsed = url::Url::parse(raw.trim()).map_err(|_| invalid("not a URL"))?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        return Err(invalid("scheme must be http or https"));
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(invalid(
+            "the URL must not embed credentials (pass --git-token / KEEL_GIT_TOKEN instead)",
+        ));
+    }
+    Ok(())
+}
+
+/// Validates `--with-keel-server` against the Git mode before anything is provisioned.
+pub(crate) fn validate_keel_server_args(args: &BootstrapInitArgs) -> Result<(), CliError> {
+    if !args.with_keel_server {
+        return Ok(());
+    }
+    if args.repo_dir.is_none() {
+        // The add-on only reaches Git through the seed push of `--repo-dir`; without it Flux
+        // never creates `flux-system/keel-server`.
+        return Err(CliError::Validation(
+            "--with-keel-server needs --repo-dir: the keel-server add-on is delivered through \
+             the seeded GitOps repository"
+                .to_string(),
+        ));
+    }
+    match args.git_url.as_deref() {
+        // The in-cluster server would clone the external remote with the Forgejo admin username
+        // and the in-cluster Forgejo token (`keel-system/forge-token`): reject the mismatch.
+        Some(_) if args.with_forge => Err(CliError::Validation(
+            "--with-keel-server cannot combine --with-forge and --git-url: the in-cluster \
+             server's credentials would belong to Forgejo while its remote is the external \
+             --git-url; pass only one of them"
+                .to_string(),
+        )),
+        Some(url) => validate_keel_server_git_url(url),
+        None if args.with_forge => Ok(()),
+        None => Err(CliError::Validation(
+            "--with-keel-server needs a cluster-reachable Git remote: pass --with-forge or \
+             --git-url https://... (a local --repo-dir cannot be cloned from a pod)"
+                .to_string(),
+        )),
+    }
+}
+
+/// Where the in-cluster keel-server's `keel-system/forge-token` Secret comes from at Stage 0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KeelServerTokenSource {
+    /// `--with-keel-server` is off: no Secret is needed.
+    NotRequired,
+    /// `--with-forge` provisioning writes the in-cluster Forgejo token.
+    Forgejo,
+    /// The external `--git-url` remote's `--git-token` (the same token the seed push uses).
+    GitToken,
+    /// Nothing creates it (`--skip-core-install` or no `--git-token`); the operator must.
+    Missing,
+}
+
+/// Decides how `keel-system/forge-token` is created for `--with-keel-server` (pure, so every
+/// flag combination is unit-tested). Assumes [`validate_keel_server_args`] passed.
+pub(crate) fn keel_server_token_source(args: &BootstrapInitArgs) -> KeelServerTokenSource {
+    if !args.with_keel_server {
+        return KeelServerTokenSource::NotRequired;
+    }
+    if args.skip_core_install {
+        return KeelServerTokenSource::Missing;
+    }
+    if args.with_forge {
+        // `--with-forge` + `--git-url` is rejected by validation; never hand the external remote
+        // the Forgejo token.
+        return if args.git_url.is_none() {
+            KeelServerTokenSource::Forgejo
+        } else {
+            KeelServerTokenSource::Missing
+        };
+    }
+    if args
+        .git_token
+        .as_deref()
+        .is_some_and(|t| !t.trim().is_empty())
+    {
+        KeelServerTokenSource::GitToken
+    } else {
+        KeelServerTokenSource::Missing
+    }
+}
+
+/// HTTPS username paired with `KEEL_GIT_TOKEN` for the in-cluster keel-server: the Stage 0 Forgejo
+/// admin with `--with-forge`, otherwise `git` (the same username the seed push uses).
+fn keel_server_git_username(artifacts: &SeedControlPlaneArtifacts) -> &'static str {
+    if artifacts.with_forge {
+        forge::FORGEJO_ADMIN_USERNAME
+    } else {
+        "git"
+    }
+}
+
+/// Renders `clusters/management/addons/keel-server/kustomization.yaml`: the shared RBAC +
+/// Deployment, the ingress HTTPRoute and the `keel-server-config` ConfigMap (Git remote + HTTPS
+/// username; never secrets). Serialized with `serde_yml`, so the user-supplied Git URL can never
+/// inject YAML. No `images:` override: the Flux Kustomization `spec.images` is the single version
+/// source.
+fn render_keel_server_addon_kustomization(
+    artifacts: &SeedControlPlaneArtifacts,
+) -> Result<String, CliError> {
+    let repo_url = artifacts.keel_config.forge.repo_url.trim();
+    validate_keel_server_git_url(repo_url)?;
+    let doc = serde_json::json!({
+        "apiVersion": "kustomize.config.k8s.io/v1beta1",
+        "kind": "Kustomization",
+        "resources": ["rbac.yaml", "deployment.yaml", "httproute.yaml"],
+        "configMapGenerator": [{
+            "name": "keel-server-config",
+            "namespace": KEEL_SYSTEM_NAMESPACE,
+            "options": {
+                "labels": {
+                    "app.kubernetes.io/name": "keel-server",
+                    "app.kubernetes.io/managed-by": "keel",
+                },
+            },
+            "literals": [
+                format!("KEEL_GIT_URL={repo_url}"),
+                format!("KEEL_GIT_USERNAME={}", keel_server_git_username(artifacts)),
+            ],
+        }],
+    });
+    Ok(format!(
+        "# keel-server plain manifests (`keel bootstrap init --with-keel-server`, `SDD.md` §6.3),\n\
+         # reconciled by the Flux Kustomization `flux-system/keel-server`\n\
+         # (`clusters/management/core-addons/keel-server.yaml`), which pins the image tag through\n\
+         # `spec.images[].newTag`. `KEEL_GIT_TOKEN` comes from the `keel-system/forge-token` Secret,\n\
+         # which is never stored in Git.\n{}",
+        serde_yml::to_string(&doc)?
+    ))
+}
+
+/// Renders the keel-server HTTPRoute (`addons/keel-server/httproute.yaml`) for the portal host
+/// `keel.<domain>` derived from `--oidc-public-url` (both `keel-ingress` HTTPS listeners).
+pub(crate) fn render_keel_server_httproute(ingress: &Stage0Ingress) -> Result<String, CliError> {
+    render_manifest(
+        SEED_ADDON_KEEL_SERVER_HTTPROUTE_YAML,
+        &[("KEEL_HOST", ingress.keel_host.as_str())],
+    )
+}
+
+/// Files of the keel-server plain-manifest add-on (`clusters/management/addons/keel-server/`).
+fn keel_server_addon_files(
+    artifacts: &SeedControlPlaneArtifacts,
+) -> Result<Vec<(String, String)>, CliError> {
+    Ok([
+        (
+            "kustomization.yaml",
+            render_keel_server_addon_kustomization(artifacts)?,
+        ),
+        ("rbac.yaml", KEEL_SERVER_RBAC_YAML.to_string()),
+        ("deployment.yaml", KEEL_SERVER_DEPLOYMENT_YAML.to_string()),
+        (
+            "httproute.yaml",
+            render_keel_server_httproute(&artifacts.ingress)?,
+        ),
+    ]
+    .into_iter()
+    .map(|(name, contents)| (format!("{KEEL_SERVER_ADDON_DIR}/{name}"), contents))
+    .collect())
+}
+
+/// Post-bootstrap notes for `--with-keel-server`: where the server is reachable and which
+/// out-of-Git prerequisites (never written to Git) still have to be created.
+pub(crate) fn keel_server_addon_notes(
+    artifacts: &SeedControlPlaneArtifacts,
+    forge_token_created: bool,
+) -> Vec<String> {
+    if !artifacts.with_keel_server {
+        return Vec::new();
+    }
+    let ingress = &artifacts.ingress;
+    let mut notes = vec![format!(
+        "keel-server runs in-cluster as the Flux add-on `flux-system/keel-server` \
+         ({KEEL_SERVER_IMAGE}:{KEEL_SERVER_IMAGE_TAG}): open {} (make `{}` resolve to the ingress) \
+         or `kubectl -n {KEEL_SYSTEM_NAMESPACE} port-forward svc/keel-server 8080:8080`",
+        ingress.keel_origin(),
+        ingress.keel_host
+    )];
+    if !forge_token_created {
+        notes.push(format!(
+            "keel-server needs the `{KEEL_SYSTEM_NAMESPACE}/{FORGE_TOKEN_SECRET_NAME}` Secret (key \
+             `token`: a forge token with repository write and pull-request access); it is never \
+             stored in Git. Create it before the Deployment can start, e.g. \
+             `kubectl -n {KEEL_SYSTEM_NAMESPACE} create secret generic {FORGE_TOKEN_SECRET_NAME} \
+             --from-file=token=<path-to-token-file>`"
+        ));
+    }
+    if artifacts.rauthy_config.is_none()
+        && let Some(oidc) = artifacts.keel_config.oidc.as_ref()
+    {
+        notes.push(format!(
+            "register `{}/api/v1/auth/callback` (and the port-forward origin \
+             `http://127.0.0.1:8080/api/v1/auth/callback`) as redirect URIs of OIDC client `{}` \
+             at {}",
+            ingress.keel_origin(),
+            oidc.client_id,
+            oidc.issuer_url
+        ));
+    }
+    notes
 }
 
 /// Management-plane files written to `clusters/management/{flux-system,core-addons,addons}/`.
@@ -878,10 +1131,17 @@ fn seed_management_files(
         ),
         (
             format!("{core}/kustomization.yaml"),
-            render_seed_core_addons_kustomization(with_rauthy, artifacts.with_forge),
+            render_seed_core_addons_kustomization(
+                with_rauthy,
+                artifacts.with_forge,
+                artifacts.with_keel_server,
+            ),
         ),
     ];
     files.extend(seed_core_addon_files(artifacts)?);
+    if artifacts.with_keel_server {
+        files.extend(keel_server_addon_files(artifacts)?);
+    }
     if with_rauthy {
         for (name, contents) in [
             (
@@ -948,6 +1208,12 @@ fn seed_core_addon_files(
             render_seed_forgejo_helmrelease(&artifacts.ingress)?,
         ));
     }
+    if artifacts.with_keel_server {
+        files.push((
+            "keel-server.yaml",
+            SEED_CORE_ADDON_KEEL_SERVER_YAML.to_string(),
+        ));
+    }
     Ok(files
         .into_iter()
         .map(|(name, contents)| {
@@ -960,7 +1226,7 @@ fn seed_core_addon_files(
 }
 
 /// `catalog/core/<id>/catalog.yaml` files; Rauthy only when the built-in Rauthy IdP is enabled,
-/// Forgejo only with `--with-forge`.
+/// Forgejo only with `--with-forge`, keel-server only with `--with-keel-server`.
 fn seed_core_catalog_files(artifacts: &SeedControlPlaneArtifacts) -> Vec<(String, String)> {
     let mut files = vec![
         (
@@ -993,6 +1259,16 @@ fn seed_core_catalog_files(artifacts: &SeedControlPlaneArtifacts) -> Vec<(String
             CORE_CATALOG_FORGEJO_YAML.replace(
                 &Stage0Ingress::default().forgejo_origin(),
                 &artifacts.ingress.forgejo_origin(),
+            ),
+        ));
+    }
+    if artifacts.with_keel_server {
+        // The portal link follows `--oidc-public-url` (`https://keel.<domain>[:port]`).
+        files.push((
+            "keel-server",
+            CORE_CATALOG_KEEL_SERVER_YAML.replace(
+                &Stage0Ingress::default().keel_origin(),
+                &artifacts.ingress.keel_origin(),
             ),
         ));
     }
@@ -1369,6 +1645,7 @@ pub async fn execute_bootstrap_init_with_target(
 ) -> Result<BootstrapInitOutcome, CliError> {
     let cfg = args.to_bootstrap_config();
     cfg.validate()?;
+    validate_keel_server_args(args)?;
     let ingress = match args.oidc_public_url.as_deref() {
         Some(url) => Stage0Ingress::from_public_url(url)?,
         None => Stage0Ingress::default(),
@@ -1465,6 +1742,20 @@ pub async fn execute_bootstrap_init_with_target(
             )
             .await?,
         );
+    }
+
+    // `--with-forge` creates `keel-system/forge-token` while provisioning Forgejo (below). With an
+    // external `--git-url`, the in-cluster keel-server gets the `--git-token` the seed push uses;
+    // the token goes to the cluster only, never to Git.
+    let keel_server_token = keel_server_token_source(args);
+    if keel_server_token == KeelServerTokenSource::GitToken
+        && let Some(token) = args
+            .git_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+    {
+        forge::apply_forge_token_secret(kube_target, token).await?;
     }
 
     let mut _forgejo_pf: Option<TempPortForward> = None;
@@ -1596,6 +1887,21 @@ pub async fn execute_bootstrap_init_with_target(
         }
     }
 
+    if seed_repo.is_some() {
+        notes.extend(keel_server_addon_notes(
+            &artifacts,
+            matches!(
+                keel_server_token,
+                KeelServerTokenSource::Forgejo | KeelServerTokenSource::GitToken
+            ),
+        ));
+    } else if artifacts.with_keel_server {
+        notes.push(
+            "keel-server add-on was NOT seeded (no --repo-dir); Flux will not deploy it"
+                .to_string(),
+        );
+    }
+
     let mut output = format_bootstrap_init_summary(&connection, &artifacts, seed_repo.as_ref());
     for note in &notes {
         output.push_str(&format!("\nNote: {note}\n"));
@@ -1691,6 +1997,12 @@ fn format_bootstrap_init_summary(
         out.push_str(&format!("OIDC Issuer:     {}\n", oidc.issuer_url));
     }
     out.push_str("Portal URL:      http://127.0.0.1:8080\n");
+    if artifacts.with_keel_server {
+        out.push_str(&format!(
+            "In-Cluster API:  {} (Flux add-on flux-system/keel-server, {KEEL_SERVER_IMAGE}:{KEEL_SERVER_IMAGE_TAG})\n",
+            ingress.keel_origin()
+        ));
+    }
     out
 }
 
@@ -1968,6 +2280,527 @@ mod security_hardening_tests {
         );
     }
 
+    /// The in-cluster keel-server image is pinned to the release tag of this build everywhere
+    /// it appears (Flux `spec.images`, catalog, Deployment, manual bundle), never `latest`.
+    #[test]
+    fn keel_server_rbac_limits_exec_and_control_plane_writes() {
+        let docs: Vec<Value> = KEEL_SERVER_RBAC_YAML
+            .split("\n---\n")
+            .map(|d| serde_yml::from_str(d).unwrap())
+            .collect();
+        let role = |ns: &str| {
+            docs.iter()
+                .find(|d| d["kind"] == "Role" && d["metadata"]["namespace"] == ns)
+                .unwrap_or_else(|| panic!("Role in {ns}"))["rules"]
+                .as_array()
+                .unwrap()
+                .clone()
+        };
+        fn has<'a>(rules: &'a [Value], group: &str, resource: &str) -> Option<&'a Value> {
+            rules.iter().find(|r| {
+                r["apiGroups"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|g| g == group)
+                    && r["resources"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|x| x == resource)
+            })
+        }
+        let keel_system = role(KEEL_SYSTEM_NAMESPACE);
+        let exec = has(&keel_system, "", "pods/exec").expect("pods/exec rule");
+        assert_eq!(
+            exec["resourceNames"],
+            serde_json::json!([keel_kube::s3_identity::SEAWEEDFS_FILER_POD])
+        );
+        // Core HelmReleases live in flux-system; no write access to keel-system HelmReleases.
+        assert!(has(&keel_system, "helm.toolkit.fluxcd.io", "helmreleases").is_none());
+        let flux = role("flux-system");
+        for (group, resource) in [
+            ("kustomize.toolkit.fluxcd.io", "kustomizations"),
+            ("helm.toolkit.fluxcd.io", "helmreleases"),
+            ("source.toolkit.fluxcd.io", "gitrepositories"),
+        ] {
+            let rule = has(&flux, group, resource).expect(resource);
+            assert!(
+                rule["verbs"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|v| ["get", "list", "watch", "patch"].contains(&v.as_str().unwrap())),
+                "{resource}: {rule}"
+            );
+        }
+    }
+
+    #[test]
+    fn keel_server_image_is_pinned_to_the_crate_release_tag() {
+        let tag = env!("CARGO_PKG_VERSION");
+        assert_eq!(KEEL_SERVER_IMAGE_TAG, tag);
+        keel_core::validate_management_addon_version(tag).unwrap();
+        let pinned = format!("{KEEL_SERVER_IMAGE}:{tag}");
+
+        let ks: Value = serde_yml::from_str(SEED_CORE_ADDON_KEEL_SERVER_YAML).unwrap();
+        let images = ks["spec"]["images"].as_array().unwrap();
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0]["name"], KEEL_SERVER_IMAGE);
+        assert_eq!(images[0]["newTag"], tag, "Flux newTag drift");
+        assert!(images[0].get("digest").is_none());
+
+        let catalog: Value = serde_yml::from_str(CORE_CATALOG_KEEL_SERVER_YAML).unwrap();
+        assert_eq!(catalog["spec"]["upstream"]["image"], KEEL_SERVER_IMAGE);
+        assert_eq!(catalog["spec"]["upstream"]["version"], tag, "catalog drift");
+
+        let deployment = yaml_docs(KEEL_SERVER_DEPLOYMENT_YAML)
+            .into_iter()
+            .find(|d| d["kind"] == "Deployment")
+            .unwrap();
+        assert_eq!(
+            deployment["spec"]["template"]["spec"]["containers"][0]["image"],
+            pinned.as_str(),
+            "deploy/bootstrap/keel-server Deployment image drift"
+        );
+        let bundle: Value = serde_yml::from_str(include_str!(
+            "../../../../deploy/bootstrap/keel-server/kustomization.yaml"
+        ))
+        .unwrap();
+        assert_eq!(bundle["images"][0]["name"], KEEL_SERVER_IMAGE);
+        assert_eq!(bundle["images"][0]["newTag"], tag, "manual bundle drift");
+        for raw in [
+            KEEL_SERVER_DEPLOYMENT_YAML,
+            SEED_CORE_ADDON_KEEL_SERVER_YAML,
+            CORE_CATALOG_KEEL_SERVER_YAML,
+        ] {
+            assert!(!raw.contains(":latest") && !raw.contains("newTag: latest"));
+        }
+
+        // The tag format is the one the release workflow publishes (`{{version}}`, no `v`), and
+        // semantic-release bumps every pinned file together with the crate version.
+        let release = include_str!("../../../../.github/workflows/release.yml");
+        assert!(release.contains("image=ghcr.io/${OWNER,,}/keel"));
+        assert!(release.contains("type=semver,pattern={{version}}"));
+        let releaserc: Value =
+            serde_json::from_str(include_str!("../../../../.releaserc.json")).unwrap();
+        let plugins = releaserc["plugins"].as_array().unwrap();
+        let prepare = plugins
+            .iter()
+            .find(|p| p[0] == "@semantic-release/exec")
+            .and_then(|p| p[1]["prepareCmd"].as_str())
+            .unwrap();
+        let assets = plugins
+            .iter()
+            .find(|p| p[0] == "@semantic-release/git")
+            .map(|p| p[1]["assets"].clone())
+            .unwrap();
+        for pinned_file in [
+            "deploy/bootstrap/keel-server/kustomization.yaml",
+            "deploy/bootstrap/keel-server/deployment.yaml",
+            "deploy/seed/core-addons/keel-server.yaml",
+            "deploy/catalog/core/keel-server/catalog.yaml",
+        ] {
+            assert!(prepare.contains(pinned_file), "{pinned_file} not bumped");
+            assert!(
+                assets.as_array().unwrap().iter().any(|a| a == pinned_file),
+                "{pinned_file} not committed by semantic-release"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn seed_files_include_keel_server_only_with_flag() {
+        for with_keel_server in [false, true] {
+            let cfg = BootstrapConfig {
+                with_keel_server,
+                ..BootstrapConfig::new(keel_core::BootstrapTargetKind::Kubeconfig)
+            };
+            let a = artifacts_for(cfg, "https://idp.corp.example:9443").await;
+            assert_eq!(a.with_keel_server, with_keel_server);
+            let files = seed_management_files(&a).unwrap();
+            let core = keel_core::MANAGEMENT_CORE_ADDONS_DIR;
+            let listed = kustomize_resources(file(&files, &format!("{core}/kustomization.yaml")));
+            assert_eq!(listed, files_in(&files, core));
+            assert_eq!(listed.contains("keel-server.yaml"), with_keel_server);
+            let catalogs = seed_core_catalog_files(&a);
+            let catalog = catalogs
+                .iter()
+                .find(|(p, _)| p == "catalog/core/keel-server/catalog.yaml");
+            assert_eq!(catalog.is_some(), with_keel_server);
+            if !with_keel_server {
+                assert!(files.iter().all(|(p, _)| !p.contains("keel-server")));
+                continue;
+            }
+
+            // One Flux Kustomization named after the catalog id, reconciling the add-on dir.
+            let (_, catalog) = catalog.unwrap();
+            let app = keel_core::parse_catalog_application(catalog).unwrap();
+            assert_eq!(app.metadata.id, "keel-server");
+            let catalog_doc: Value = serde_yml::from_str(catalog).unwrap();
+            assert_eq!(
+                catalog_doc["metadata"]["category"],
+                keel_core::MANAGEMENT_CORE_CATEGORY
+            );
+            assert_eq!(
+                catalog_doc["spec"]["serviceUrl"],
+                "https://keel.corp.example:9443"
+            );
+            let ks: Value =
+                serde_yml::from_str(file(&files, &format!("{core}/keel-server.yaml"))).unwrap();
+            assert_eq!(ks["kind"], "Kustomization");
+            assert_eq!(ks["metadata"]["name"], app.metadata.id.as_str());
+            assert_eq!(ks["metadata"]["namespace"], "flux-system");
+            assert_eq!(ks["metadata"]["labels"]["keel.io/protect"], "true");
+            assert_eq!(
+                ks["spec"]["path"],
+                format!("./{KEEL_SERVER_ADDON_DIR}").as_str()
+            );
+            assert_eq!(ks["spec"]["sourceRef"]["name"], "flux-system");
+            // A targetNamespace would rewrite the keel-previews / flux-system Roles into
+            // keel-system: the bundle names every namespace explicitly instead.
+            assert!(ks["spec"].get("targetNamespace").is_none());
+            let mut doc = ks.clone();
+            keel_core::validate_management_addon_document("keel-server", &doc).unwrap();
+            keel_core::apply_management_addon_upgrade(
+                "keel-server",
+                &mut doc,
+                Some("9.9.9"),
+                &json!({}),
+            )
+            .unwrap();
+            assert_eq!(doc["spec"]["images"][0]["newTag"], "9.9.9");
+
+            // Add-on directory: exactly the resources its kustomization lists.
+            let addon_kustomization: Value = serde_yml::from_str(file(
+                &files,
+                &format!("{KEEL_SERVER_ADDON_DIR}/kustomization.yaml"),
+            ))
+            .unwrap();
+            let resources = kustomize_resources(file(
+                &files,
+                &format!("{KEEL_SERVER_ADDON_DIR}/kustomization.yaml"),
+            ));
+            assert_eq!(resources, files_in(&files, KEEL_SERVER_ADDON_DIR));
+            assert_eq!(
+                resources,
+                ["deployment.yaml", "httproute.yaml", "rbac.yaml"]
+                    .map(String::from)
+                    .into()
+            );
+            // The Flux Kustomization is the single version source.
+            assert!(addon_kustomization.get("images").is_none());
+            let generator = &addon_kustomization["configMapGenerator"][0];
+            assert_eq!(generator["name"], "keel-server-config");
+            assert_eq!(generator["namespace"], "keel-system");
+            assert_eq!(
+                generator["literals"],
+                json!([
+                    "KEEL_GIT_URL=https://git.example.org/keel/gitops.git",
+                    "KEEL_GIT_USERNAME=git"
+                ])
+            );
+
+            let route = yaml_docs(file(
+                &files,
+                &format!("{KEEL_SERVER_ADDON_DIR}/httproute.yaml"),
+            ));
+            assert_eq!(route[0]["spec"]["hostnames"], json!(["keel.corp.example"]));
+            assert_eq!(
+                route[0]["spec"]["rules"][0]["backendRefs"][0]["name"],
+                "keel-server"
+            );
+
+            let cluster_scoped = ["ClusterRole", "ClusterRoleBinding"];
+            for (path, contents) in files
+                .iter()
+                .filter(|(p, _)| p.starts_with(&format!("{KEEL_SERVER_ADDON_DIR}/")))
+            {
+                assert!(
+                    !contents.contains("${"),
+                    "{path} has unrendered placeholders"
+                );
+                assert!(!contents.contains(":latest"), "{path}");
+                if path.ends_with("/kustomization.yaml") {
+                    continue;
+                }
+                for doc in yaml_docs(contents) {
+                    let kind = doc["kind"].as_str().unwrap();
+                    // Secrets never go to Git (`NFR-SEC-05`).
+                    assert_ne!(kind, "Secret", "{path}");
+                    if cluster_scoped.contains(&kind) {
+                        continue;
+                    }
+                    let ns = doc["metadata"]["namespace"].as_str();
+                    assert!(ns.is_some(), "{path} {kind} has no explicit namespace");
+                    // Tenant bindings are owned by `keel-tenants` (`tenants/<id>/rbac.yaml`).
+                    assert!(!ns.unwrap().starts_with("tenant-"), "{path} {kind}");
+                }
+            }
+        }
+
+        // `--with-forge`: the in-cluster Forgejo remote and its admin user.
+        let cfg = BootstrapConfig {
+            with_forge: true,
+            with_keel_server: true,
+            ..BootstrapConfig::new(keel_core::BootstrapTargetKind::Kubeconfig)
+        };
+        let a = synthesize_seed_control_plane(&cfg, None).await.unwrap();
+        let files = seed_management_files(&a).unwrap();
+        let addon: Value = serde_yml::from_str(file(
+            &files,
+            &format!("{KEEL_SERVER_ADDON_DIR}/kustomization.yaml"),
+        ))
+        .unwrap();
+        assert_eq!(
+            addon["configMapGenerator"][0]["literals"],
+            json!([
+                "KEEL_GIT_URL=http://forgejo-http.keel-system.svc.cluster.local:3000/keel/infra-gitops.git",
+                "KEEL_GIT_USERNAME=keel"
+            ])
+        );
+
+        // A host-path remote can never be cloned by the pod.
+        let cfg = BootstrapConfig {
+            with_keel_server: true,
+            ..BootstrapConfig::new(keel_core::BootstrapTargetKind::Kubeconfig)
+        };
+        let a = synthesize_seed_control_plane(&cfg, Some("/tmp/keel-gitops.git"))
+            .await
+            .unwrap();
+        assert!(seed_management_files(&a).is_err());
+    }
+
+    #[test]
+    fn keel_server_git_remote_must_be_cluster_reachable_https() {
+        let parse = |extra: &[&str]| {
+            let mut argv = vec!["keel", "bootstrap", "init", "--target", "kind"];
+            argv.extend_from_slice(extra);
+            match <crate::cli::Cli as clap::Parser>::try_parse_from(argv)
+                .unwrap()
+                .command
+            {
+                crate::cli::Commands::Bootstrap(crate::cli::BootstrapArgs {
+                    command: crate::cli::BootstrapCommands::Init(args),
+                }) => args,
+                other => panic!("unexpected command: {other:?}"),
+            }
+        };
+        // Without the flag nothing is required.
+        validate_keel_server_args(&parse(&["--repo-dir", "/tmp/gitops"])).unwrap();
+        // A local repository is not reachable from pods.
+        let err =
+            validate_keel_server_args(&parse(&["--with-keel-server", "--repo-dir", "/tmp/x"]))
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("--with-forge"), "{err}");
+        validate_keel_server_args(&parse(&[
+            "--with-keel-server",
+            "--with-forge",
+            "--repo-dir",
+            "/tmp/x",
+        ]))
+        .unwrap();
+        validate_keel_server_args(&parse(&[
+            "--with-keel-server",
+            "--git-url",
+            "https://github.com/acme/infra-gitops.git",
+            "--repo-dir",
+            "/tmp/x",
+        ]))
+        .unwrap();
+        // Without --repo-dir nothing reaches Git, so Flux never deploys the add-on.
+        for extra in [
+            &["--with-forge"][..],
+            &["--git-url", "https://github.com/acme/infra-gitops.git"][..],
+        ] {
+            let mut argv = vec!["--with-keel-server"];
+            argv.extend_from_slice(extra);
+            let err = validate_keel_server_args(&parse(&argv))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("--repo-dir"), "{err}");
+        }
+        // Forgejo credentials must never be paired with an external remote.
+        let err = validate_keel_server_args(&parse(&[
+            "--with-keel-server",
+            "--with-forge",
+            "--git-url",
+            "https://github.com/acme/infra-gitops.git",
+            "--repo-dir",
+            "/tmp/x",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("--with-forge and --git-url"), "{err}");
+        for bad in [
+            "git@github.com:acme/infra-gitops.git",
+            "ssh://git@github.com/acme/infra-gitops.git",
+            "file:///srv/git/infra-gitops.git",
+            "https://user:token@github.com/acme/infra-gitops.git",
+            "https://x-access-token@github.com/acme/infra-gitops.git",
+            "/srv/git/infra-gitops.git",
+        ] {
+            assert!(
+                validate_keel_server_args(&parse(&[
+                    "--with-keel-server",
+                    "--repo-dir",
+                    "/tmp/x",
+                    "--git-url",
+                    bad
+                ]))
+                .is_err(),
+                "{bad} accepted"
+            );
+            assert!(validate_keel_server_git_url(bad).is_err(), "{bad} accepted");
+        }
+    }
+
+    #[test]
+    fn keel_server_token_source_covers_every_git_mode() {
+        let parse = |extra: &[&str]| {
+            let mut argv = vec!["keel", "bootstrap", "init", "--target", "kind"];
+            argv.extend_from_slice(extra);
+            match <crate::cli::Cli as clap::Parser>::try_parse_from(argv)
+                .unwrap()
+                .command
+            {
+                crate::cli::Commands::Bootstrap(crate::cli::BootstrapArgs {
+                    command: crate::cli::BootstrapCommands::Init(args),
+                }) => args,
+                other => panic!("unexpected command: {other:?}"),
+            }
+        };
+        let url = "https://github.com/acme/infra-gitops.git";
+        let cases: &[(&[&str], KeelServerTokenSource)] = &[
+            (&["--with-forge"], KeelServerTokenSource::NotRequired),
+            (
+                &["--with-keel-server", "--with-forge"],
+                KeelServerTokenSource::Forgejo,
+            ),
+            (
+                &["--with-keel-server", "--git-url", url, "--git-token", "t0k"],
+                KeelServerTokenSource::GitToken,
+            ),
+            (
+                &["--with-keel-server", "--git-url", url, "--git-token", "  "],
+                KeelServerTokenSource::Missing,
+            ),
+            (
+                &["--with-keel-server", "--git-url", url],
+                KeelServerTokenSource::Missing,
+            ),
+            (
+                &[
+                    "--with-keel-server",
+                    "--git-url",
+                    url,
+                    "--git-token",
+                    "t0k",
+                    "--skip-core-install",
+                ],
+                KeelServerTokenSource::Missing,
+            ),
+            (
+                &["--with-keel-server", "--with-forge", "--skip-core-install"],
+                KeelServerTokenSource::Missing,
+            ),
+            // Rejected by validation; never pair the Forgejo token with an external remote.
+            (
+                &["--with-keel-server", "--with-forge", "--git-url", url],
+                KeelServerTokenSource::Missing,
+            ),
+        ];
+        for (argv, expected) in cases {
+            let mut args = parse(argv);
+            if !argv.contains(&"--git-token") {
+                // Ignore an ambient `KEEL_GIT_TOKEN`.
+                args.git_token = None;
+            }
+            assert_eq!(keel_server_token_source(&args), *expected, "{argv:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn keel_server_git_url_is_serialized_not_interpolated() {
+        let url = "https://git.example.org/keel/gitops.git#main: x";
+        let cfg = BootstrapConfig {
+            with_keel_server: true,
+            ..BootstrapConfig::new(keel_core::BootstrapTargetKind::Kubeconfig)
+        };
+        let a = synthesize_seed_control_plane(&cfg, Some(url))
+            .await
+            .unwrap();
+        let rendered = render_keel_server_addon_kustomization(&a).unwrap();
+        let doc: Value = serde_yml::from_str(&rendered).unwrap();
+        assert_eq!(
+            doc["configMapGenerator"][0]["literals"][0],
+            format!("KEEL_GIT_URL={url}").as_str()
+        );
+        assert_eq!(doc.as_object().unwrap().len(), 4, "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn keel_server_notes_list_out_of_git_prerequisites() {
+        let off = synthesize_seed_control_plane(
+            &BootstrapConfig::new(keel_core::BootstrapTargetKind::Kubeconfig),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(keel_server_addon_notes(&off, false).is_empty());
+
+        let cfg = BootstrapConfig {
+            with_keel_server: true,
+            ..BootstrapConfig::new(keel_core::BootstrapTargetKind::Kubeconfig)
+        };
+        let a = synthesize_seed_control_plane(&cfg, None).await.unwrap();
+        let notes = keel_server_addon_notes(&a, true);
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("https://keel.keel.local:8888"));
+        assert!(notes[0].contains(&format!("{KEEL_SERVER_IMAGE}:{KEEL_SERVER_IMAGE_TAG}")));
+        let notes = keel_server_addon_notes(&a, false);
+        assert_eq!(notes.len(), 2);
+        assert!(notes[1].contains("keel-system/forge-token"));
+        assert!(notes[1].contains("--from-file=token="));
+        assert!(notes.iter().all(|n| !n.contains(&a.admin_password)));
+
+        // External IdP: the in-cluster origin must be registered as a redirect URI.
+        let cfg = BootstrapConfig {
+            with_keel_server: true,
+            oidc_issuer: Some("https://login.example.org".to_string()),
+            ..BootstrapConfig::new(keel_core::BootstrapTargetKind::Kubeconfig)
+        };
+        let a = synthesize_seed_control_plane(&cfg, None).await.unwrap();
+        let notes = keel_server_addon_notes(&a, true);
+        assert_eq!(notes.len(), 2);
+        assert!(notes[1].contains("https://keel.keel.local:8888/api/v1/auth/callback"));
+        assert!(notes[1].contains("https://login.example.org"));
+    }
+
+    #[test]
+    fn forge_token_secret_stays_in_keel_system() {
+        let doc: Value =
+            serde_yml::from_str(&forge::render_forge_token_secret_yaml("s3cr3t").unwrap()).unwrap();
+        assert_eq!(doc["kind"], "Secret");
+        assert_eq!(doc["metadata"]["namespace"], KEEL_SYSTEM_NAMESPACE);
+        assert_eq!(doc["metadata"]["name"], FORGE_TOKEN_SECRET_NAME);
+        assert_eq!(doc["stringData"]["token"], "s3cr3t");
+        // The in-cluster Deployment reads exactly this Secret/key.
+        let deployment = yaml_docs(KEEL_SERVER_DEPLOYMENT_YAML)
+            .into_iter()
+            .find(|d| d["kind"] == "Deployment")
+            .unwrap();
+        let env = deployment["spec"]["template"]["spec"]["containers"][0]["env"]
+            .as_array()
+            .unwrap();
+        let token = env.iter().find(|e| e["name"] == "KEEL_GIT_TOKEN").unwrap();
+        assert_eq!(
+            token["valueFrom"]["secretKeyRef"],
+            json!({"name": FORGE_TOKEN_SECRET_NAME, "key": "token"})
+        );
+    }
+
     fn yaml_docs(yaml: &str) -> Vec<Value> {
         yaml.split("\n---\n")
             .filter(|d| {
@@ -2021,6 +2854,7 @@ mod security_hardening_tests {
     async fn seed_management_files_reconcile_with_rauthy() {
         let cfg = BootstrapConfig {
             with_forge: true,
+            with_keel_server: true,
             ..BootstrapConfig::new(keel_core::BootstrapTargetKind::Kubeconfig)
         };
         let a = artifacts_for(cfg, "https://idp.corp.example:9443").await;
@@ -2035,7 +2869,8 @@ mod security_hardening_tests {
         assert!(listed.contains("kyverno-policies.yaml"));
         assert!(listed.contains("rauthy.yaml"));
         assert!(listed.contains("forgejo.yaml"));
-        // ... and the static seed kustomization (rauthy + forge enabled) is that very list.
+        assert!(listed.contains("keel-server.yaml"));
+        // ... and the static seed kustomization (every optional add-on enabled) is that very list.
         assert_eq!(
             kustomize_resources(SEED_CORE_ADDON_KUSTOMIZATION_YAML),
             listed
@@ -2176,9 +3011,12 @@ mod security_hardening_tests {
     async fn core_addon_flux_objects_impersonate_privileged_reconcilers() {
         // Flux runs with `--default-service-account=default`: a core add-on Flux object without
         // `serviceAccountName` would impersonate a permissionless SA and never become Ready.
-        for with_forge in [false, true] {
+        for (with_forge, with_keel_server) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
             let cfg = BootstrapConfig {
                 with_forge,
+                with_keel_server,
                 ..BootstrapConfig::new(keel_core::BootstrapTargetKind::Kubeconfig)
             };
             let a = artifacts_for(cfg, DEFAULT_OIDC_PUBLIC_URL).await;
@@ -2208,8 +3046,12 @@ mod security_hardening_tests {
                     assert_eq!(doc["spec"]["serviceAccountName"], expected, "{path} {kind}");
                 }
             }
-            // 8 HelmReleases (incl. Flux itself) + the Rauthy Kustomization (+ Forgejo).
-            assert_eq!(seen, if with_forge { 10 } else { 9 });
+            // 8 HelmReleases (incl. Flux itself) + the Rauthy Kustomization (+ Forgejo)
+            // (+ the keel-server Kustomization).
+            assert_eq!(
+                seen,
+                9 + usize::from(with_forge) + usize::from(with_keel_server)
+            );
         }
     }
 

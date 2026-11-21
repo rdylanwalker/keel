@@ -131,6 +131,12 @@ pub struct BootstrapInitArgs {
     #[arg(long, default_value_t = false)]
     pub with_forge: bool,
 
+    /// Run keel-server in-cluster as a Flux-managed add-on (`clusters/management/addons/keel-server`,
+    /// image pinned to this CLI's release); requires `--repo-dir` plus either `--with-forge` or an
+    /// HTTP(S) `--git-url` (not both)
+    #[arg(long, default_value_t = false)]
+    pub with_keel_server: bool,
+
     /// External OIDC issuer URL (disables in-cluster Rauthy OIDC deployment when provided)
     #[arg(long)]
     pub oidc_issuer: Option<String>,
@@ -198,6 +204,7 @@ impl BootstrapInitArgs {
             kubeconfig: self.kubeconfig.clone(),
             context: self.context.clone(),
             with_forge: self.with_forge,
+            with_keel_server: self.with_keel_server,
             with_oidc: self.oidc_issuer.is_none() && self.oidc_provider != OidcProviderArg::None,
             oidc_issuer: self.oidc_issuer.clone(),
             oidc_client_id: self.oidc_client_id.clone(),
@@ -816,6 +823,8 @@ mod tests {
                     assert!(args.region.is_none());
                     assert!(args.distro.is_none());
                     assert!(!args.with_forge);
+                    assert!(!args.with_keel_server);
+                    assert!(!args.to_bootstrap_config().with_keel_server);
                     assert!(args.oidc_issuer.is_none());
                     assert!(args.oidc_client_id.is_none());
                     assert!(args.admin_username.is_none());
@@ -851,6 +860,7 @@ mod tests {
             "--distro",
             "talos",
             "--with-forge",
+            "--with-keel-server",
             "--oidc-issuer",
             "https://idp.example.com",
             "--oidc-client-id",
@@ -881,6 +891,8 @@ mod tests {
         assert_eq!(args.region.as_deref(), Some("us-east-1"));
         assert_eq!(args.distro, Some(BootstrapDistro::Talos));
         assert!(args.with_forge);
+        assert!(args.with_keel_server);
+        assert!(args.to_bootstrap_config().with_keel_server);
         assert_eq!(args.oidc_issuer.as_deref(), Some("https://idp.example.com"));
         assert_eq!(args.oidc_client_id.as_deref(), Some("keel-custom"));
         assert_eq!(args.admin_username.as_deref(), Some("ops@example.com"));

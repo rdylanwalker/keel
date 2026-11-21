@@ -226,6 +226,16 @@ pub fn build_protect_control_plane_policy() -> Value {
                         "!(request.operation == 'DELETE' && (has(request.namespace) ? request.namespace : '') == '{FLUX_SYSTEM_NAMESPACE}' && ((request.kind.group == 'helm.toolkit.fluxcd.io' && request.kind.kind == 'HelmRelease') || (request.kind.group == 'kustomize.toolkit.fluxcd.io' && request.kind.kind == 'Kustomization')) && has(oldObject.metadata.labels) && 'keel.io/protect' in oldObject.metadata.labels && oldObject.metadata.labels['keel.io/protect'] == 'true')"
                     ),
                     "message": "Protected control-plane Flux objects (`keel.io/protect: \"true\"`, e.g. the `flux2` HelmRelease whose deletion would uninstall Flux) cannot be deleted; break-glass: suspend the parent Kustomization (e.g. `core-addons`) or remove the label in Git, then remove the `keel.io/protect` label and delete."
+                },
+                {
+                    // The keel-server SA may patch control-plane Flux objects / Stacks only to
+                    // request reconciliation: a spec change (e.g. `spec.patches`, `spec.path` or a
+                    // GitRepository URL) would be applied by the cluster-admin
+                    // `kustomize-controller` (privilege escalation, NFR-SEC-04).
+                    "expression": format!(
+                        "!(request.operation == 'UPDATE' && ((has(request.namespace) ? request.namespace : '') == '{FLUX_SYSTEM_NAMESPACE}' || (has(request.namespace) ? request.namespace : '') == '{KEEL_SYSTEM_NAMESPACE}') && has(request.userInfo) && has(request.userInfo.username) && request.userInfo.username == 'system:serviceaccount:{KEEL_SYSTEM_NAMESPACE}:keel-server' && ((request.kind.group == 'kustomize.toolkit.fluxcd.io' && request.kind.kind == 'Kustomization') || (request.kind.group == 'helm.toolkit.fluxcd.io' && request.kind.kind == 'HelmRelease') || request.kind.group == 'source.toolkit.fluxcd.io' || (request.kind.group == 'pulumi.com' && request.kind.kind == 'Stack')) && !((has(object.spec) ? object.spec : {{}}) == (has(oldObject.spec) ? oldObject.spec : {{}}) && (has(object.metadata.labels) ? object.metadata.labels : {{}}) == (has(oldObject.metadata.labels) ? oldObject.metadata.labels : {{}}) && (has(object.metadata.finalizers) ? object.metadata.finalizers : []) == (has(oldObject.metadata.finalizers) ? oldObject.metadata.finalizers : []) && (has(object.metadata.annotations) ? object.metadata.annotations : {{}}).all(k, k == 'reconcile.fluxcd.io/requestedAt' || k == 'pulumi.com/reconcile-request' || (has(oldObject.metadata.annotations) && k in oldObject.metadata.annotations && oldObject.metadata.annotations[k] == object.metadata.annotations[k])) && (has(oldObject.metadata.annotations) ? oldObject.metadata.annotations : {{}}).all(k, k == 'reconcile.fluxcd.io/requestedAt' || k == 'pulumi.com/reconcile-request' || (has(object.metadata.annotations) && k in object.metadata.annotations))))"
+                    ),
+                    "message": "keel-server may only request reconciliation (`reconcile.fluxcd.io/requestedAt` / `pulumi.com/reconcile-request` annotations) on control-plane Flux objects and Stacks; spec, label, finalizer and other annotation changes must go through a GitOps PR."
                 }
             ]
         }
@@ -793,6 +803,30 @@ mod tests {
             "oldObject.metadata.labels['keel.io/protect'] == 'true'",
         ] {
             assert!(flux_guard.contains(needle), "{needle}");
+        }
+        // The keel-server SA may only request reconciliation on control-plane Flux objects.
+        let server_guard = generated["spec"]["validations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["expression"].as_str().unwrap())
+            .find(|e| e.contains("system:serviceaccount:keel-system:keel-server"))
+            .expect("keel-server Flux object patch guard");
+        for needle in [
+            "request.operation == 'UPDATE'",
+            "== 'flux-system'",
+            "== 'keel-system'",
+            "request.kind.kind == 'Kustomization'",
+            "request.kind.kind == 'HelmRelease'",
+            "request.kind.group == 'source.toolkit.fluxcd.io'",
+            "request.kind.kind == 'Stack'",
+            "(has(object.spec) ? object.spec : {}) == (has(oldObject.spec) ? oldObject.spec : {})",
+            "object.metadata.labels",
+            "object.metadata.finalizers",
+            "k == 'reconcile.fluxcd.io/requestedAt'",
+            "k == 'pulumi.com/reconcile-request'",
+        ] {
+            assert!(server_guard.contains(needle), "{needle}");
         }
     }
 

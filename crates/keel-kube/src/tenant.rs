@@ -1584,11 +1584,22 @@ mod tests {
 
         // Must match the static tenant-default binding shipped with keel-server.
         let shipped = include_str!("../../../deploy/bootstrap/keel-server/rbac.yaml");
-        let shipped_rb: Value = shipped
-            .split("\n---\n")
-            .map(|d| serde_yml::from_str::<Value>(d).unwrap())
-            .find(|d| d["kind"] == "RoleBinding" && d["metadata"]["namespace"] == "tenant-default")
-            .expect("tenant-default keel-server RoleBinding");
+        let shipped_rb: Value = serde_yml::from_str(include_str!(
+            "../../../deploy/bootstrap/keel-server/tenant-default-rolebinding.yaml"
+        ))
+        .unwrap();
+        assert_eq!(shipped_rb["kind"], "RoleBinding");
+        assert_eq!(shipped_rb["metadata"]["namespace"], "tenant-default");
+        // The shared bundle never binds a tenant itself (the tenant RBAC bundle owns those).
+        assert!(
+            shipped
+                .split("\n---\n")
+                .map(|d| serde_yml::from_str::<Value>(d).unwrap())
+                .all(|d| d["kind"] != "RoleBinding"
+                    || !d["metadata"]["namespace"]
+                        .as_str()
+                        .is_some_and(|ns| ns.starts_with("tenant-")))
+        );
         let generated =
             serde_json::to_value(build_keel_server_tenant_role_binding("default").unwrap())
                 .unwrap();

@@ -154,6 +154,10 @@ pub struct BootstrapConfig {
     pub context: Option<String>,
     #[serde(default)]
     pub with_forge: bool,
+    /// Run `keel-server` in-cluster as the Flux-managed `keel-server` core add-on
+    /// (`--with-keel-server`, default `false`). Needs a cluster-reachable HTTP(S) Git remote.
+    #[serde(default)]
+    pub with_keel_server: bool,
     /// Deploy in-cluster Rauthy OIDC provider during Stage 0 (default `true`; skipped when `oidc_issuer` is set or `--oidc-provider none`).
     #[serde(default = "default_true")]
     pub with_oidc: bool,
@@ -192,6 +196,7 @@ impl std::fmt::Debug for BootstrapConfig {
             .field("kubeconfig", &self.kubeconfig)
             .field("context", &self.context)
             .field("with_forge", &self.with_forge)
+            .field("with_keel_server", &self.with_keel_server)
             .field("with_oidc", &self.with_oidc)
             .field("oidc_issuer", &self.oidc_issuer)
             .field("oidc_client_id", &self.oidc_client_id)
@@ -229,6 +234,7 @@ impl BootstrapConfig {
             kubeconfig: None,
             context: None,
             with_forge: false,
+            with_keel_server: false,
             with_oidc: true,
             oidc_issuer: None,
             oidc_client_id: None,
@@ -2127,7 +2133,16 @@ mod tests {
         assert_eq!(cfg.target, BootstrapTargetKind::Kind);
         assert_eq!(cfg.cluster_name, "keel-mgmt");
         assert!(!cfg.local_dev_docker_socket_exception);
+        assert!(!cfg.with_keel_server, "in-cluster keel-server is opt-in");
         assert!(cfg.validate().is_ok());
+
+        // `withKeelServer` is optional on input and round-trips.
+        let parsed: BootstrapConfig = serde_json::from_str(r#"{"target":"kind"}"#).unwrap();
+        assert!(!parsed.with_keel_server);
+        let parsed: BootstrapConfig =
+            serde_json::from_str(r#"{"target":"kind","withKeelServer":true}"#).unwrap();
+        assert!(parsed.with_keel_server);
+        assert!(format!("{parsed:?}").contains("with_keel_server: true"));
 
         // Allowed on kind when explicitly opted in
         cfg.local_dev_docker_socket_exception = true;

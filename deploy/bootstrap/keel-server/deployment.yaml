@@ -27,9 +27,11 @@ spec:
           type: RuntimeDefault
       containers:
         - name: keel-server
-          # Release image (ENTRYPOINT `keel`, nonroot UID 65532, ships git/openssh/sops/age).
-          # Override the tag/registry via `images:` in kustomization.yaml.
-          image: ghcr.io/rdylanwalker/keel:latest
+          # Release image (ENTRYPOINT `keel`, nonroot UID 65532, ships git/openssh/sops/age), pinned
+          # to the release matching this checkout (the workspace crate version; bumped by
+          # semantic-release), never the `latest` tag. Override the tag/registry via `images:` in
+          # kustomization.yaml, or `spec.images` of the `flux-system/keel-server` Flux Kustomization.
+          image: ghcr.io/rdylanwalker/keel:0.8.0
           args:
             - serve
             - --bind

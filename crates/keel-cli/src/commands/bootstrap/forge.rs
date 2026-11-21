@@ -28,6 +28,32 @@ pub(crate) const FORGEJO_ADMIN_SECRET_NAME: &str = "keel-forgejo-admin";
 /// Stage 0 Forgejo admin username.
 pub(crate) const FORGEJO_ADMIN_USERNAME: &str = "keel";
 
+/// `keel-system/forge-token` Secret (key `token`) read by `keel serve` (laptop fallback and the
+/// in-cluster `keel-server` Deployment's `KEEL_GIT_TOKEN`). Applied to the cluster only, never
+/// written to Git.
+pub(crate) fn render_forge_token_secret_yaml(token: &str) -> Result<String, CliError> {
+    let secret_doc = json!({
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": {
+            "name": FORGE_TOKEN_SECRET_NAME,
+            "namespace": KEEL_SYSTEM_NAMESPACE,
+            "labels": { "app.kubernetes.io/managed-by": "keel" },
+        },
+        "type": "Opaque",
+        "stringData": { "token": token },
+    });
+    Ok(serde_yml::to_string(&secret_doc)?)
+}
+
+/// Applies [`render_forge_token_secret_yaml`].
+pub(crate) async fn apply_forge_token_secret(
+    target: KubeTarget<'_>,
+    token: &str,
+) -> Result<(), CliError> {
+    target.apply(&render_forge_token_secret_yaml(token)?).await
+}
+
 /// Resolves the Stage 0 Forgejo admin password: `KEEL_FORGEJO_ADMIN_PASSWORD`, else the existing
 /// `keel-system/keel-forgejo-admin` Secret (stable across re-runs), else a freshly generated one.
 pub(crate) async fn resolve_forgejo_admin_password(target: KubeTarget<'_>) -> Zeroizing<String> {
@@ -146,14 +172,7 @@ pub(crate) async fn provision_in_cluster_forgejo(
             )
             .await?,
     );
-    let secret_doc = json!({
-        "apiVersion": "v1",
-        "kind": "Secret",
-        "metadata": { "name": FORGE_TOKEN_SECRET_NAME, "namespace": KEEL_SYSTEM_NAMESPACE },
-        "type": "Opaque",
-        "stringData": { "token": token.as_str() },
-    });
-    target.apply(&serde_yml::to_string(&secret_doc)?).await?;
+    apply_forge_token_secret(target, token.as_str()).await?;
     // API access is verified by the caller *after* the seed push: Forgejo answers 404 for
     // pull-request listings on a repository that has no commits yet.
 

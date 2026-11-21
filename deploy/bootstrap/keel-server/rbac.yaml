@@ -4,8 +4,10 @@
 # re-applies (`restrict-pulumi-providers`). Namespaced write access is granted only in
 # `keel-system`, `keel-previews` and `flux-system`. Tenant namespaces are dynamic, so per-tenant
 # access is a RoleBinding (`keel-server`) to the `keel-server-tenant` ClusterRole created in each
-# `tenant-<id>` namespace (tenant-default included below; the tenant RBAC bundle must add the same
-# binding for new tenants).
+# `tenant-<id>` namespace. Every tenant RBAC bundle (`tenants/<id>/rbac.yaml`, reconciled by the
+# `keel-tenants` Flux Kustomization) carries that binding; the `tenant-default` copy for manual
+# `kubectl apply -k` installs lives in `tenant-default-rolebinding.yaml`, which the Flux-managed
+# `keel-server` add-on omits so the binding has exactly one Flux owner (`keel-tenants`).
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -100,22 +102,6 @@ rules:
     verbs: ["get", "list", "watch", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: keel-server
-  namespace: tenant-default
-  labels:
-    app.kubernetes.io/managed-by: keel
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
-  name: keel-server-tenant
-subjects:
-  - kind: ServiceAccount
-    name: keel-server
-    namespace: keel-system
----
-apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
   name: keel-server
@@ -134,16 +120,15 @@ rules:
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list", "watch"]
+  # Exec only into the SeaweedFS filer (`keel_kube::s3_identity::SEAWEEDFS_FILER_POD`), never
+  # into Rauthy, Forgejo or other control-plane pods.
   - apiGroups: [""]
     resources: ["pods/exec"]
+    resourceNames: ["s3-state-backend-seaweedfs-filer-0"]
     verbs: ["create", "get"]
   - apiGroups: ["apps"]
     resources: ["statefulsets"]
     verbs: ["get", "list"]
-  # Management add-on upgrade / rollback.
-  - apiGroups: ["helm.toolkit.fluxcd.io"]
-    resources: ["helmreleases"]
-    verbs: ["get", "list", "watch", "patch", "update"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -211,9 +196,16 @@ metadata:
   labels:
     app.kubernetes.io/managed-by: keel
 rules:
-  # Reconcile requests on platform Kustomizations / sources and management-core Stack.
+  # Reconcile requests on platform Kustomizations / HelmReleases / sources and the
+  # management-core Stack. Management add-on upgrades and rollbacks go through Git PRs, never
+  # through these objects. The Kyverno `protect-control-plane` policy limits these patches to the
+  # `reconcile.fluxcd.io/requestedAt` / `pulumi.com/reconcile-request` annotations: a spec change
+  # here would be applied by the cluster-admin `kustomize-controller`.
   - apiGroups: ["kustomize.toolkit.fluxcd.io"]
     resources: ["kustomizations"]
+    verbs: ["get", "list", "watch", "patch"]
+  - apiGroups: ["helm.toolkit.fluxcd.io"]
+    resources: ["helmreleases"]
     verbs: ["get", "list", "watch", "patch"]
   - apiGroups: ["source.toolkit.fluxcd.io"]
     resources: ["gitrepositories"]

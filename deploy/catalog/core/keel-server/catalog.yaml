@@ -1,0 +1,28 @@
+# keel-server Core Addon Catalog Application (`SDD.md` §2.1, §2.2, §6.3)
+# Optional: only written to `catalog/core/` by `keel bootstrap init --with-keel-server`. Image-based
+# plain-manifest (kustomize) add-on reconciled by the protected Flux Kustomization
+# `flux-system/keel-server` (`clusters/management/core-addons/keel-server.yaml`).
+# `upstream.version` is the `ghcr.io/rdylanwalker/keel` release tag (`spec.images[].newTag`), kept
+# in lockstep with the workspace crate version by semantic-release. Upgrades are version-only: the
+# RBAC, Git remote and secret references are edited in Git directly.
+# `serviceUrl` follows `--oidc-public-url` (`https://keel.<domain>[:port]`).
+apiVersion: keel.io/v1alpha1
+kind: CatalogApplication
+metadata:
+  id: keel-server
+  name: Keel Control Plane Server
+  description: In-cluster keel-server (REST/SSE API and web portal) running with least-privilege RBAC in keel-system, managed by Flux.
+  category: management-core
+  runtime: kustomize
+spec:
+  upstream:
+    image: ghcr.io/rdylanwalker/keel
+    version: "0.8.0"
+  progressiveDelivery:
+    flaggerSupported: false
+    defaultCanary: false
+  serviceUrl: https://keel.keel.local:8888
+  schema:
+    type: object
+    properties: {}
+    additionalProperties: false

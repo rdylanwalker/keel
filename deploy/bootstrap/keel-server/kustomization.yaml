@@ -1,11 +1,21 @@
 # In-cluster `keel serve` (OPEN-26, `SDD.md` §6.3): least-privilege RBAC + restricted Deployment.
-# Apply with `kubectl apply -k deploy/bootstrap/keel-server` after Stage 0. Uses the released
-# `ghcr.io/rdylanwalker/keel` image; pin a version or mirror with
-# `kustomize edit set image ghcr.io/rdylanwalker/keel=<registry>/keel:<tag>`.
+#
+# Two ways to run it:
+# - Flux-managed (recommended): `keel bootstrap init --with-keel-server` writes `rbac.yaml` and
+#   `deployment.yaml` to `clusters/management/addons/keel-server/` with a rendered
+#   `keel-server-config` and an ingress HTTPRoute, reconciled by the protected
+#   `flux-system/keel-server` Flux Kustomization (`catalog/core/keel-server`).
+# - Manual: `kubectl apply -k deploy/bootstrap/keel-server` after Stage 0.
+#
+# The `ghcr.io/rdylanwalker/keel` image is pinned to the release matching this checkout (the
+# workspace crate version, bumped by semantic-release together with `deployment.yaml`); never
+# `latest`. Pin another release or mirror with
+# `kustomize edit set image ghcr.io/rdylanwalker/keel=<registry>/keel:<version>`.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
   - rbac.yaml
+  - tenant-default-rolebinding.yaml
   - deployment.yaml
 # Server configuration consumed via `envFrom` (hash-suffixed, so edits roll the Deployment).
 # Point `KEEL_GIT_URL` at an external forge with a kustomize overlay, e.g.
@@ -23,4 +33,4 @@ configMapGenerator:
       - KEEL_GIT_USERNAME=keel
 images:
   - name: ghcr.io/rdylanwalker/keel
-    newTag: latest
+    newTag: "0.8.0"

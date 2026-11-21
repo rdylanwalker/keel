@@ -81,6 +81,7 @@ keel auth status
 | `--kubeconfig <FILE>`, `--context <CTX>` | Existing cluster to use (`--target kubeconfig`). |
 | `--proxmox-url <URL>`, `--region <R>`, `--distro <k3s\|talos>` | Settings for provider targets. |
 | `--with-forge` | Deploys an in-cluster Forgejo during Stage 0. |
+| `--with-keel-server` | Runs `keel-server` in the cluster as the Flux-managed `keel-server` add-on, with the image pinned to this CLI's release. Needs `--repo-dir` plus either `--with-forge` or an HTTP(S) `--git-url` (not both). See [Running keel-server In-Cluster](../operations/in-cluster-server.md). |
 | `--git-url <URL>`, `--forge-type <local\|github\|gitlab\|forgejo\|gitea>`, `--forge-api-url <URL>`, `--git-token <T>` / `KEEL_GIT_TOKEN` | External Git repository and forge. |
 | `--oidc-provider <rauthy\|none>` | In-cluster IdP to deploy. Default `rauthy`. |
 | `--oidc-issuer <URL>`, `--oidc-client-id <ID>` | Use an external OIDC issuer instead. This disables in-cluster Rauthy. |

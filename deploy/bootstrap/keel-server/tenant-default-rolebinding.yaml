@@ -1,0 +1,19 @@
+# `keel-server` access to the Stage 0 `tenant-default` namespace (`ClusterRole/keel-server-tenant`).
+# Only part of the manual `kubectl apply -k deploy/bootstrap/keel-server` install: in a Keel GitOps
+# repository the identical binding is already in `tenants/default/rbac.yaml` (owned by the
+# `keel-tenants` Flux Kustomization), so the Flux-managed `keel-server` add-on does not ship it.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: keel-server
+  namespace: tenant-default
+  labels:
+    app.kubernetes.io/managed-by: keel
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: keel-server-tenant
+subjects:
+  - kind: ServiceAccount
+    name: keel-server
+    namespace: keel-system
