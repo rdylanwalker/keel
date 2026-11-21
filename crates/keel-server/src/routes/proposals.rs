@@ -7,9 +7,10 @@ use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::StatusCode;
 use keel_core::{
     AppRuntime, BundleItemKind, CatalogApplication, CatalogBundle, CatalogManifest,
-    KEEL_PREVIEWS_NAMESPACE, ManifestEngine, SopsManager, partition_values_by_schema,
-    render_helm_values_yaml, render_manifest_template, tenant_namespace, validate_dns_label,
-    validate_k8s_manifests_yaml, validate_schema_values, verify_rendered_manifest_structure,
+    KEEL_PREVIEWS_NAMESPACE, ManifestEngine, SopsManager, gateway_route_hostnames,
+    partition_values_by_schema, platform_reserved_hostnames, render_helm_values_yaml,
+    render_manifest_template, tenant_namespace, validate_dns_label, validate_k8s_manifests_yaml,
+    validate_route_hostnames, validate_schema_values, verify_rendered_manifest_structure,
 };
 use keel_git::{
     PullRequestComment, PullRequestInfo, PullRequestState, parse_proposal_branch_tenant,
@@ -18,10 +19,11 @@ use keel_git::{
 use keel_kube::{
     FlaggerCanarySpecInput, FluxDependencyRef, FluxHealthCheckRef, FluxKustomizationSpecInput,
     FluxSubstituteReference, GITHUB_TOKEN_SECRET_NAME, HelmChartSourceKind, HelmChartSourceRef,
-    HelmReleaseSpecInput, HelmValuesSecretRef, RemoteKubeConfigRef, TenantAgeKey,
-    generate_flux_kustomization_manifest, synthesize_canary_gateway_network_policy_yaml,
-    synthesize_flagger_canary_yaml, synthesize_flux_kustomization_yaml,
-    synthesize_helm_release_yaml, synthesize_remote_target_namespace_yaml,
+    HelmReleaseSpecInput, HelmValuesSecretRef, RemoteKubeConfigRef, TENANT_SOPS_AGE_SECRET_NAME,
+    TenantAgeKey, generate_flux_kustomization_manifest,
+    synthesize_canary_gateway_network_policy_yaml, synthesize_flagger_canary_yaml,
+    synthesize_flux_kustomization_yaml, synthesize_helm_release_yaml,
+    synthesize_remote_target_namespace_yaml,
 };
 use keel_pko::{
     ChangeOp, EphemeralPreviewParams, GcPlan, PkoStack, PreviewReport, PreviewResourceCandidate,
@@ -476,6 +478,63 @@ fn build_values_configmap_manifest_yaml(
         .map_err(|e| ServerError::Internal(format!("failed to serialize values ConfigMap: {e}")))
 }
 
+/// Rejects route hostnames already claimed by another committed manifest app (any tenant) under
+/// `tenants/`. `own_rel_dir` (the instance being created/edited) is skipped. Reads the checked-out
+/// default branch; open PRs are not considered, the Kyverno `restrict-tenant-route-hostnames`
+/// policy still guards platform hosts at admission.
+async fn ensure_route_hostnames_unclaimed(
+    repo_workdir: &Path,
+    own_rel_dir: &str,
+    route_hostnames: &[String],
+) -> Result<(), ServerError> {
+    let tenants_root = repo_workdir.join("tenants");
+    let own_dir = repo_workdir.join(own_rel_dir);
+    let mut stack = vec![tenants_root.clone()];
+    while let Some(dir) = stack.pop() {
+        let Ok(mut entries) = tokio::fs::read_dir(&dir).await else {
+            continue;
+        };
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let path = entry.path();
+            let Ok(file_type) = entry.file_type().await else {
+                continue;
+            };
+            if file_type.is_dir() {
+                if path != own_dir {
+                    stack.push(path);
+                }
+                continue;
+            }
+            if !file_type.is_file() || entry.file_name() != "manifests.yaml" {
+                continue;
+            }
+            let Ok(contents) = tokio::fs::read_to_string(&path).await else {
+                continue;
+            };
+            let Ok(docs) = validate_k8s_manifests_yaml(&contents) else {
+                continue;
+            };
+            let claimed = gateway_route_hostnames(&docs);
+            if let Some(host) = route_hostnames.iter().find(|h| {
+                claimed.iter().any(|c| {
+                    keel_core::route_hostname_matches(h, c)
+                        || keel_core::route_hostname_matches(c, h)
+                })
+            }) {
+                let owner = path
+                    .parent()
+                    .and_then(|p| p.strip_prefix(repo_workdir).ok())
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default();
+                return Err(ServerError::Conflict(format!(
+                    "Route hostname '{host}' is already claimed by '{owner}'; choose another hostname"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn load_catalog_app_raw_manifests(repo_workdir: &Path, app: &CatalogApplication) -> String {
     let app_dir = repo_workdir.join("catalog/apps").join(&app.metadata.id);
     let default_path = app_dir.join("manifests.yaml");
@@ -579,6 +638,32 @@ pub async fn create_proposal(
     validate_dns_label(&action_label, "action")?;
     validate_schema_values(schema, &req.values)?;
     let partitioned = partition_values_by_schema(schema, &req.values)?;
+    let has_secret_fields = partitioned
+        .secret_values
+        .as_object()
+        .is_some_and(|o| !o.is_empty());
+    if has_secret_fields && let Some(engine) = manifest_engine {
+        // Secret fields reach a manifest template only through Flux `postBuild` substitution from
+        // the SOPS-decrypted `<instance>-secrets` Secret, which Flux reads from the Kustomization's
+        // own namespace on the management cluster. Fail closed before encrypting or committing.
+        if engine == ManifestEngine::Pulumi {
+            return Err(ServerError::BadRequest(format!(
+                "Catalog application '{}' has secret fields, which the Pulumi engine cannot pass into its manifest template; use the flux engine",
+                req.catalog_id
+            )));
+        }
+        let remote = req
+            .target_cluster
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|t| !t.is_empty() && t != "local");
+        if remote {
+            return Err(ServerError::BadRequest(format!(
+                "Catalog application '{}' has secret fields, which can only be substituted on the management cluster; remote targetCluster deployments are not supported",
+                req.catalog_id
+            )));
+        }
+    }
     let values_yaml = render_helm_values_yaml(&partitioned.normal_values)?;
     let plaintext_secrets_yaml = match partitioned.secret_values.as_object() {
         Some(obj) if !obj.is_empty() => Some(render_helm_values_yaml(&partitioned.secret_values)?),
@@ -670,7 +755,22 @@ pub async fn create_proposal(
             }
             // Fail closed before anything is committed: rendered values must not add documents
             // or change resource kinds relative to the catalog-authored template.
-            verify_rendered_manifest_structure(&raw_manifests, &rendered)?;
+            let rendered_docs = verify_rendered_manifest_structure(&raw_manifests, &rendered)?;
+            // Tenant routes attach to the shared `keel-ingress` listeners: never let them claim a
+            // platform host (IdP issuer, keel-server, Forgejo) or another workload's hostname.
+            let route_hostnames = gateway_route_hostnames(&rendered_docs);
+            if !route_hostnames.is_empty() {
+                let reserved = {
+                    let oidc = state.oidc_config.read().await;
+                    platform_reserved_hostnames(
+                        oidc.iter()
+                            .flat_map(|c| [c.issuer_url.as_str(), c.redirect_url.as_str()]),
+                    )
+                };
+                validate_route_hostnames(&route_hostnames, &reserved)?;
+                ensure_route_hostnames_unclaimed(&state.repo_workdir, &rel_dir, &route_hostnames)
+                    .await?;
+            }
             rendered_manifest_template_yaml = Some(rendered.clone());
 
             let remote_kc = req
@@ -730,6 +830,13 @@ pub async fn create_proposal(
                     }
                     fk_input.kube_config = remote_kc.clone();
                     fk_input.target_namespace = remote_ns.clone();
+                    // `secrets.enc.yaml` (the `<instance>-secrets` Secret) is applied by this
+                    // Kustomization, so it must decrypt with the tenant `age` key; secret values
+                    // then reach the manifests only through `postBuild.substituteFrom`.
+                    if encrypted_infra_k8s_secret_yaml.is_some() {
+                        fk_input.decryption_secret_name =
+                            Some(TENANT_SOPS_AGE_SECRET_NAME.to_string());
+                    }
                     fk_input.post_build_substitute_from = vec![
                         FluxSubstituteReference {
                             kind: "ConfigMap".to_string(),

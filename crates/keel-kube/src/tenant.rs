@@ -972,6 +972,11 @@ pub struct FluxKustomizationSpecInput {
     pub post_build_substitute: BTreeMap<String, String>,
     #[serde(default)]
     pub post_build_substitute_from: Vec<FluxSubstituteReference>,
+    /// Same-namespace Secret holding the tenant SOPS `age` key (`*.agekey`). When set, the
+    /// Kustomization decrypts SOPS-encrypted resources (e.g. a manifest app's `secrets.enc.yaml`)
+    /// with `spec.decryption` (`provider: sops`) before applying them.
+    #[serde(default)]
+    pub decryption_secret_name: Option<String>,
 }
 
 impl FluxKustomizationSpecInput {
@@ -997,6 +1002,7 @@ impl FluxKustomizationSpecInput {
             extra_labels: BTreeMap::new(),
             post_build_substitute: BTreeMap::new(),
             post_build_substitute_from: Vec::new(),
+            decryption_secret_name: None,
         }
     }
 }
@@ -1104,6 +1110,17 @@ pub fn synthesize_flux_kustomization(
             }));
         }
         spec.insert("healthChecks".to_string(), Value::Array(checks));
+    }
+
+    if let Some(secret_name) = &input.decryption_secret_name {
+        validate_resource_name("decryption_secret_name", secret_name)?;
+        spec.insert(
+            "decryption".to_string(),
+            json!({
+                "provider": "sops",
+                "secretRef": { "name": secret_name },
+            }),
+        );
     }
 
     if !input.post_build_substitute.is_empty() || !input.post_build_substitute_from.is_empty() {
@@ -1461,10 +1478,47 @@ pub fn build_tenant_reconciler_rbac() -> [Value; 3] {
     [service_account, cluster_role, binding]
 }
 
-/// Serializes [`build_tenant_reconciler_rbac`] into multi-document YAML.
+/// Name of the `ClusterRole` aggregated into `ClusterRole/admin` that lets tenant
+/// `ServiceAccount`s (bound to `admin` in `tenant-<id>`) manage Gateway API routes.
+pub const TENANT_GATEWAY_ROUTES_CLUSTER_ROLE: &str = "keel-tenant-gateway-routes";
+
+/// Synthesizes `ClusterRole/keel-tenant-gateway-routes`, aggregated into the built-in
+/// `ClusterRole/admin` (`rbac.authorization.k8s.io/aggregate-to-admin`).
+///
+/// Neither the Gateway API CRDs nor Envoy Gateway aggregate route permissions into `admin`, so
+/// without it a tenant Flux `Kustomization` (impersonating `tenant-<id>-sa`) cannot apply a
+/// manifest app's `HTTPRoute`. Only `httproutes`/`grpcroutes` are granted (never
+/// `referencegrants`, which would open cross-namespace backend references); the Kyverno
+/// `restrict-tenant-route-hostnames` policy keeps tenant routes off reserved platform hosts.
+pub fn build_tenant_gateway_routes_cluster_role() -> Value {
+    json!({
+        "apiVersion": "rbac.authorization.k8s.io/v1",
+        "kind": "ClusterRole",
+        "metadata": {
+            "name": TENANT_GATEWAY_ROUTES_CLUSTER_ROLE,
+            "labels": {
+                "app.kubernetes.io/managed-by": "keel",
+                "app.kubernetes.io/part-of": "keel-control-plane",
+                "rbac.authorization.k8s.io/aggregate-to-admin": "true"
+            }
+        },
+        "rules": [{
+            "apiGroups": ["gateway.networking.k8s.io"],
+            "resources": ["httproutes", "grpcroutes"],
+            "verbs": ["get", "list", "watch", "create", "update", "patch", "delete"]
+        }]
+    })
+}
+
+/// Serializes [`build_tenant_reconciler_rbac`] plus
+/// [`build_tenant_gateway_routes_cluster_role`] into multi-document YAML.
 pub fn build_tenant_reconciler_rbac_yaml() -> Result<String, KubeError> {
     let mut docs = Vec::new();
-    for doc in build_tenant_reconciler_rbac() {
+    let reconciler = build_tenant_reconciler_rbac();
+    for doc in reconciler
+        .iter()
+        .chain(std::iter::once(&build_tenant_gateway_routes_cluster_role()))
+    {
         let mut s = serde_yml::to_string(&doc)?;
         if !s.ends_with('\n') {
             s.push('\n');
@@ -1623,7 +1677,10 @@ mod tests {
         let [_, role, _] = build_tenant_reconciler_rbac();
         let seed_role = docs
             .iter()
-            .find(|d| d["kind"] == "ClusterRole")
+            .find(|d| {
+                d["kind"] == "ClusterRole"
+                    && d["metadata"]["name"] == TENANT_RECONCILER_SERVICE_ACCOUNT
+            })
             .expect("seed ClusterRole");
         assert_eq!(seed_role["rules"], role["rules"]);
     }
@@ -1714,7 +1771,29 @@ mod tests {
         assert_eq!(binding["subjects"][0]["namespace"], "flux-system");
 
         let yaml = build_tenant_reconciler_rbac_yaml().unwrap();
-        assert_eq!(yaml.matches("\n---\n").count(), 2);
+        assert_eq!(yaml.matches("\n---\n").count(), 3);
+    }
+
+    #[test]
+    fn tenant_gateway_routes_role_aggregates_into_admin_and_matches_seed() {
+        let role = build_tenant_gateway_routes_cluster_role();
+        assert_eq!(
+            role["metadata"]["labels"]["rbac.authorization.k8s.io/aggregate-to-admin"],
+            "true"
+        );
+        let rules = role["rules"].as_array().unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0]["apiGroups"], json!(["gateway.networking.k8s.io"]));
+        assert_eq!(rules[0]["resources"], json!(["httproutes", "grpcroutes"]));
+
+        let seed = include_str!("../../../deploy/seed/flux-system/tenant-reconciler-rbac.yaml");
+        let seed_role = seed
+            .split("\n---\n")
+            .map(|d| serde_yml::from_str::<Value>(d).unwrap())
+            .find(|d| d["metadata"]["name"] == TENANT_GATEWAY_ROUTES_CLUSTER_ROLE)
+            .expect("seed keel-tenant-gateway-routes ClusterRole");
+        assert_eq!(seed_role["metadata"]["labels"], role["metadata"]["labels"]);
+        assert_eq!(seed_role["rules"], role["rules"]);
     }
 
     #[test]
@@ -2065,5 +2144,30 @@ mod tests {
         assert_eq!(sub_from[1]["kind"], "Secret");
         assert_eq!(sub_from[1]["name"], "raw-nginx-secrets");
         assert_eq!(sub_from[1]["optional"], true);
+    }
+
+    #[test]
+    fn flux_kustomization_decryption_is_opt_in_and_same_namespace() {
+        let mut input = FluxKustomizationSpecInput::new(
+            "default",
+            "rauthy",
+            "keel-gitops",
+            "./tenants/default/apps/rauthy",
+        );
+        let doc = synthesize_flux_kustomization(&input).unwrap();
+        assert!(doc["spec"].get("decryption").is_none());
+
+        input.decryption_secret_name = Some("sops-age".to_string());
+        let doc = synthesize_flux_kustomization(&input).unwrap();
+        assert_eq!(doc["spec"]["decryption"]["provider"], "sops");
+        assert_eq!(doc["spec"]["decryption"]["secretRef"]["name"], "sops-age");
+        assert!(
+            doc["spec"]["decryption"]["secretRef"]
+                .get("namespace")
+                .is_none()
+        );
+
+        input.decryption_secret_name = Some("Bad_Name".to_string());
+        assert!(synthesize_flux_kustomization(&input).is_err());
     }
 }

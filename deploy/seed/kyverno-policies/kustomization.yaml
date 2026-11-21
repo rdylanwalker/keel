@@ -11,3 +11,4 @@ resources:
   - protect-control-plane.yaml
   - restrict-pulumi-providers.yaml
   - restrict-tenant-reconciler.yaml
+  - restrict-tenant-route-hostnames.yaml

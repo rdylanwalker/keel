@@ -85,3 +85,20 @@ subjects:
   - kind: ServiceAccount
     name: keel-tenant-reconciler
     namespace: flux-system
+---
+# Aggregated into the built-in ClusterRole/admin so tenant ServiceAccounts (`tenant-<id>-sa`,
+# bound to `admin` in `tenant-<id>`) can apply a manifest app's Gateway API routes. Never grants
+# `referencegrants`; Kyverno `restrict-tenant-route-hostnames` keeps routes off platform hosts.
+# Mirrors `keel_kube::tenant::build_tenant_gateway_routes_cluster_role()`.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: keel-tenant-gateway-routes
+  labels:
+    app.kubernetes.io/managed-by: keel
+    app.kubernetes.io/part-of: keel-control-plane
+    rbac.authorization.k8s.io/aggregate-to-admin: "true"
+rules:
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources: ["httproutes", "grpcroutes"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]

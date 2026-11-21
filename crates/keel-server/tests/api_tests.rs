@@ -5775,3 +5775,256 @@ spec:
     assert!(body_str.contains("escapes"), "{body_str}");
     assert!(!body_str.contains("outside-secret-marker"));
 }
+
+/// The built-in self-service Rauthy app (`deploy/catalog/apps/rauthy`) proposes through the Flux
+/// manifest path: secrets only reach Git SOPS-encrypted, and the tenant Kustomization decrypts them.
+#[tokio::test]
+async fn test_rauthy_catalog_app_proposal_keeps_secrets_out_of_git() {
+    let fixture = setup_fixture().await;
+    let cookie = login_and_get_cookie(&fixture).await;
+    let app = build_router(fixture.state.clone());
+
+    seed_rauthy_catalog(&fixture).await;
+    let git = &fixture.state.git_runner;
+    let workdir = &fixture.state.repo_workdir;
+
+    let secrets = [
+        ("encKey", "q2Vz7mU0ZcV1x7pYb7Yk2r9mD0aH3sW5tL8nQ4eR6fA="),
+        ("hiqliteSecretRaft", "raftSecretSampleValue-0123456789"),
+        ("hiqliteSecretApi", "apiSecretSampleValue-9876543210"),
+        ("adminPassword", "Sample-Admin#Passw0rd!"),
+    ];
+    let mut values = json!({
+        "hostname": "auth.acme.example",
+        "publicPortSuffix": ":8888",
+        "adminEmail": "ops@acme.example",
+        "logLevel": "info",
+        "storageSize": "1Gi",
+        "encKeyId": "acme1",
+    });
+    for (k, v) in secrets {
+        values[k] = json!(v);
+    }
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/proposals")
+                .header(COOKIE, &cookie)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({ "tenant": "acme", "catalogId": "rauthy", "values": values })
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = res.status();
+    let body_bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let body_str = String::from_utf8_lossy(&body_bytes);
+    if status == StatusCode::SERVICE_UNAVAILABLE {
+        // No `sops`/`age-keygen` on this host; CI sets KEEL_REQUIRE_SOPS=1 to forbid skipping.
+        assert!(
+            std::env::var_os("KEEL_REQUIRE_SOPS").is_none(),
+            "KEEL_REQUIRE_SOPS is set but the proposal could not encrypt: {body_str}"
+        );
+        return;
+    }
+    assert_eq!(status, StatusCode::CREATED, "{body_str}");
+    let body: Value = serde_json::from_slice(&body_bytes).unwrap();
+    git.checkout_branch(workdir, body["branch"].as_str().unwrap())
+        .await
+        .unwrap();
+
+    let dir = workdir.join("tenants/acme/apps/rauthy");
+    let read = |name: &str| std::fs::read_to_string(dir.join(name)).unwrap();
+    let mut committed = String::new();
+    for entry in std::fs::read_dir(&dir).unwrap() {
+        committed.push_str(&std::fs::read_to_string(entry.unwrap().path()).unwrap());
+    }
+    for (field, value) in secrets {
+        assert!(!committed.contains(value), "{field} committed in plaintext");
+    }
+
+    let manifests = read("manifests.yaml");
+    assert!(manifests.contains("${encKey}"));
+    assert!(manifests.contains("${adminPassword}"));
+    assert!(manifests.contains("auth.acme.example:8888"));
+    assert!(read("secrets.enc.yaml").contains("ENC[AES256_GCM,"));
+    let kustomization: Value = serde_yml::from_str(&read("kustomization.yaml")).unwrap();
+    assert!(
+        kustomization["resources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r == "secrets.enc.yaml")
+    );
+
+    let fk: Value = serde_yml::from_str(&read("flux-kustomization.yaml")).unwrap();
+    assert_eq!(fk["spec"]["targetNamespace"], "tenant-acme");
+    assert_eq!(fk["spec"]["decryption"]["provider"], "sops");
+    assert_eq!(fk["spec"]["decryption"]["secretRef"]["name"], "sops-age");
+    let sub_from = fk["spec"]["postBuild"]["substituteFrom"]
+        .as_array()
+        .unwrap();
+    assert!(
+        sub_from
+            .iter()
+            .any(|s| s["kind"] == "Secret" && s["name"] == "rauthy-secrets")
+    );
+
+    git.checkout_branch(workdir, "main").await.unwrap();
+}
+
+/// Commits the built-in self-service Rauthy catalog app to `main` of the fixture repository.
+async fn seed_rauthy_catalog(fixture: &TestFixture) {
+    let app_dir = fixture.state.repo_workdir.join("catalog/apps/rauthy");
+    tokio::fs::create_dir_all(&app_dir).await.unwrap();
+    tokio::fs::write(
+        app_dir.join("catalog.yaml"),
+        include_str!("../../../deploy/catalog/apps/rauthy/catalog.yaml"),
+    )
+    .await
+    .unwrap();
+    tokio::fs::write(
+        app_dir.join("manifests.yaml"),
+        include_str!("../../../deploy/catalog/apps/rauthy/manifests.yaml"),
+    )
+    .await
+    .unwrap();
+    let git = &fixture.state.git_runner;
+    let workdir = &fixture.state.repo_workdir;
+    git.add(
+        workdir,
+        [
+            "catalog/apps/rauthy/catalog.yaml",
+            "catalog/apps/rauthy/manifests.yaml",
+        ],
+    )
+    .await
+    .unwrap();
+    git.commit(
+        workdir,
+        "feat(catalog): add rauthy",
+        &CommitAuthor::new("Keel Seed", "seed@keel.local"),
+    )
+    .await
+    .unwrap();
+    git.push(workdir, "origin", "HEAD:refs/heads/main")
+        .await
+        .unwrap();
+}
+
+/// `POST /api/v1/proposals` returning `(status, body)`.
+async fn post_proposal(fixture: &TestFixture, cookie: &str, body: Value) -> (StatusCode, String) {
+    let res = build_router(fixture.state.clone())
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/proposals")
+                .header(COOKIE, cookie)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = res.status();
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    (status, String::from_utf8_lossy(&bytes).into_owned())
+}
+
+fn rauthy_values(hostname: &str) -> Value {
+    json!({
+        "hostname": hostname,
+        "publicPortSuffix": ":8888",
+        "adminEmail": "ops@acme.example",
+        "encKeyId": "acme1",
+        "encKey": "q2Vz7mU0ZcV1x7pYb7Yk2r9mD0aH3sW5tL8nQ4eR6fA=",
+        "hiqliteSecretRaft": "raftSecretSampleValue-0123456789",
+        "hiqliteSecretApi": "apiSecretSampleValue-9876543210",
+        "adminPassword": "Sample-Admin#Passw0rd!",
+    })
+}
+
+/// Secret fields only work through Flux substitution on the management cluster, and tenant routes
+/// may never claim platform hosts or another app's hostname. All are rejected before any commit.
+#[tokio::test]
+async fn test_rauthy_catalog_app_rejects_unsupported_engine_target_and_hostnames() {
+    let fixture = setup_fixture().await;
+    let cookie = login_and_get_cookie(&fixture).await;
+    seed_rauthy_catalog(&fixture).await;
+    let git = &fixture.state.git_runner;
+    let workdir = &fixture.state.repo_workdir;
+
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "rauthy", "actionEngine": "pulumi",
+                "values": rauthy_values("auth-acme.keel.local") }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("Pulumi engine"), "{body}");
+
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "rauthy", "targetCluster": "edge",
+                "values": rauthy_values("auth-acme.keel.local") }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("management cluster"), "{body}");
+
+    // Platform hosts (default Stage 0 hosts) are reserved.
+    for host in ["idp.keel.local", "keel.keel.local", "forgejo.keel.local"] {
+        let (status, body) = post_proposal(
+            &fixture,
+            &cookie,
+            json!({ "tenant": "acme", "catalogId": "rauthy", "values": rauthy_values(host) }),
+        )
+        .await;
+        if status == StatusCode::SERVICE_UNAVAILABLE {
+            assert!(
+                std::env::var_os("KEEL_REQUIRE_SOPS").is_none(),
+                "KEEL_REQUIRE_SOPS is set but the proposal could not encrypt: {body}"
+            );
+            return;
+        }
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{host}: {body}");
+        assert!(body.contains("reserved platform host"), "{body}");
+    }
+
+    // A hostname already routed by another tenant's app is rejected (409).
+    let other = workdir.join("tenants/other/apps/web");
+    tokio::fs::create_dir_all(&other).await.unwrap();
+    tokio::fs::write(
+        other.join("manifests.yaml"),
+        "apiVersion: gateway.networking.k8s.io/v1\nkind: HTTPRoute\nmetadata:\n  name: web\nspec:\n  hostnames:\n    - auth-acme.keel.local\n",
+    )
+    .await
+    .unwrap();
+    git.add(workdir, ["tenants/other/apps/web/manifests.yaml"])
+        .await
+        .unwrap();
+    git.commit(
+        workdir,
+        "feat(other): web",
+        &CommitAuthor::new("Keel Seed", "seed@keel.local"),
+    )
+    .await
+    .unwrap();
+    let head_before = git.rev_parse(workdir, "HEAD").await.unwrap();
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "rauthy",
+                "values": rauthy_values("auth-acme.keel.local") }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body.contains("tenants/other/apps/web"), "{body}");
+    assert_eq!(git.rev_parse(workdir, "HEAD").await.unwrap(), head_before);
+}

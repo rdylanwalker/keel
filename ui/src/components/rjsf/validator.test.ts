@@ -93,6 +93,76 @@ describe("InterpretingValidator (eval-free rjsf validator)", () => {
     ).toBe(true)
   })
 
+  it("validates the self-service Rauthy catalog app secrets and patterns", () => {
+    const rauthy = catalogSchema("apps/rauthy")
+    const valid = {
+      hostname: "auth-acme.keel.local",
+      publicPortSuffix: ":8888",
+      adminEmail: "admin@keel.local",
+      logLevel: "info",
+      storageSize: "1Gi",
+      encKeyId: "keel1",
+      encKey: "q2Vz7mU0ZcV1x7pYb7Yk2r9mD0aH3sW5tL8nQ4eR6fA=",
+      hiqliteSecretRaft: "raftSecretSampleValue-0123456789",
+      hiqliteSecretApi: "apiSecretSampleValue-9876543210",
+      adminPassword: "Sample-Admin#Passw0rd!",
+    }
+    expect(validator.validateFormData(valid, rauthy).errors).toEqual([])
+
+    const bad = validator.validateFormData(
+      {
+        ...valid,
+        encKey: "not-base64",
+        hiqliteSecretRaft: "short",
+        adminPassword: 'has "quotes" and spaces',
+        publicPortSuffix: "8888",
+      },
+      rauthy
+    )
+    expect(bad.errors.map((e) => `${e.property}:${e.name}`).sort()).toEqual([
+      ".adminPassword:pattern",
+      ".encKey:pattern",
+      ".hiqliteSecretRaft:pattern",
+      ".publicPortSuffix:pattern",
+    ])
+
+    // `$` would be re-substituted by Flux postBuild in the decrypted Secret.
+    const dollar = validator.validateFormData(
+      { ...valid, adminPassword: "has-${dollar}-1234567" },
+      rauthy
+    )
+    expect(dollar.errors.map((e) => `${e.property}:${e.name}`)).toEqual([
+      ".adminPassword:pattern",
+    ])
+
+    // Secrets are never defaulted: an empty form reports every secret as missing.
+    const missing = validator.validateFormData({}, rauthy).errors
+    expect(
+      byName(missing, "required").map((e) => e.params.missingProperty)
+    ).toEqual(
+      expect.arrayContaining([
+        "hostname",
+        "encKey",
+        "hiqliteSecretRaft",
+        "hiqliteSecretApi",
+        "adminPassword",
+      ])
+    )
+    for (const field of [
+      "encKey",
+      "hiqliteSecretRaft",
+      "hiqliteSecretApi",
+      "adminPassword",
+    ]) {
+      const prop = rauthy.properties![field] as RJSFSchema
+      expect(prop.format).toBe("password")
+      expect(prop.default).toBeUndefined()
+    }
+    // No shared default hostname: two tenants with defaults would collide on the Gateway.
+    expect((rauthy.properties!.hostname as RJSFSchema).default).toBeUndefined()
+    expect((rauthy.properties!.adminForceMfa as RJSFSchema).default).toBe(false)
+  })
+
   it("produces AJV-compatible required errors with titles, errorSchema and friendly text", () => {
     const schema: RJSFSchema = {
       type: "object",

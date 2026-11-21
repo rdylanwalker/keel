@@ -1,0 +1,277 @@
+# Self-service Rauthy OIDC provider (tenant namespace; restricted PSS). Non-secret `${...}` values
+# are rendered by Keel at proposal time. Secret placeholders (`${encKey}`, `${hiqliteSecretRaft}`,
+# `${hiqliteSecretApi}`, `${adminPassword}`) are never rendered into Git: Flux fills them in from the
+# SOPS-decrypted `<instance>-secrets` Secret (`postBuild.substituteFrom`). On the very first
+# reconcile that Secret does not exist yet, so Rauthy fails fast on an empty ENC_KEYS and recovers
+# after a later reconcile plus a container restart (can take up to ~10 minutes; see the docs).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rauthy-config
+  labels:
+    app.kubernetes.io/name: rauthy
+data:
+  config.toml: |
+    [access]
+    cookie_mode = 'secure'
+
+    [cluster]
+    node_id = 1
+    nodes = ['1 127.0.0.1:8100 127.0.0.1:8200']
+
+    [database]
+    hiqlite = true
+
+    [mfa]
+    admin_force_mfa = ${adminForceMfa:=false}
+
+    [server]
+    listen_address = '0.0.0.0'
+    port_http = 8080
+    scheme = 'http'
+    proxy_mode = true
+    trusted_proxies = ['10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16', '127.0.0.0/8', '100.64.0.0/10']
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: rauthy-env
+  labels:
+    app.kubernetes.io/name: rauthy
+type: Opaque
+stringData:
+  ENC_KEYS: "${encKeyId}/${encKey}"
+  HQL_SECRET_RAFT: "${hiqliteSecretRaft}"
+  HQL_SECRET_API: "${hiqliteSecretApi}"
+  BOOTSTRAP_ADMIN_PASSWORD_PLAIN: "${adminPassword}"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rauthy
+  labels:
+    app.kubernetes.io/name: rauthy
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: rauthy
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+      protocol: TCP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rauthy-headless
+  labels:
+    app.kubernetes.io/name: rauthy
+spec:
+  type: ClusterIP
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: rauthy
+  ports:
+    - name: hiqlite-raft
+      port: 8100
+      targetPort: 8100
+      protocol: TCP
+    - name: hiqlite-api
+      port: 8200
+      targetPort: 8200
+      protocol: TCP
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: rauthy
+  labels:
+    app.kubernetes.io/name: rauthy
+spec:
+  serviceName: rauthy-headless
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: rauthy
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: rauthy
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: rauthy
+          image: ghcr.io/sebadob/rauthy:0.37.2
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            capabilities:
+              drop:
+                - ALL
+            seccompProfile:
+              type: RuntimeDefault
+          env:
+            - name: PUB_URL
+              value: ${hostname}${publicPortSuffix:=}
+            - name: RP_ID
+              value: ${hostname}
+            - name: RP_ORIGIN
+              value: https://${hostname}${publicPortSuffix:=}
+            - name: LOG_LEVEL
+              value: ${logLevel:=info}
+            - name: ENC_KEY_ACTIVE
+              value: ${encKeyId}
+            - name: BOOTSTRAP_ADMIN_EMAIL
+              value: ${adminEmail}
+            - name: ENC_KEYS
+              valueFrom:
+                secretKeyRef:
+                  name: rauthy-env
+                  key: ENC_KEYS
+            - name: HQL_SECRET_RAFT
+              valueFrom:
+                secretKeyRef:
+                  name: rauthy-env
+                  key: HQL_SECRET_RAFT
+            - name: HQL_SECRET_API
+              valueFrom:
+                secretKeyRef:
+                  name: rauthy-env
+                  key: HQL_SECRET_API
+            - name: BOOTSTRAP_ADMIN_PASSWORD_PLAIN
+              valueFrom:
+                secretKeyRef:
+                  name: rauthy-env
+                  key: BOOTSTRAP_ADMIN_PASSWORD_PLAIN
+          ports:
+            - containerPort: 8080
+              name: http
+            - containerPort: 8100
+              name: hiqlite-raft
+            - containerPort: 8200
+              name: hiqlite-api
+          volumeMounts:
+            - name: rauthy-data
+              mountPath: /app/data
+            - name: rauthy-config
+              mountPath: /app/config.toml
+              subPath: config.toml
+              readOnly: true
+          startupProbe:
+            httpGet:
+              scheme: HTTP
+              port: 8080
+              path: /auth/v1/health
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            failureThreshold: 30
+          readinessProbe:
+            httpGet:
+              scheme: HTTP
+              port: 8200
+              path: /ready
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            failureThreshold: 5
+          livenessProbe:
+            httpGet:
+              scheme: HTTP
+              port: 8080
+              path: /auth/v1/health
+            initialDelaySeconds: 10
+            periodSeconds: 20
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+      volumes:
+        - name: rauthy-config
+          configMap:
+            name: rauthy-config
+            items:
+              - key: config.toml
+                path: config.toml
+  volumeClaimTemplates:
+    - metadata:
+        name: rauthy-data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: ${storageSize:=1Gi}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-rauthy-ingress
+  labels:
+    app.kubernetes.io/name: rauthy
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: rauthy
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Envoy Gateway proxies (`keel-ingress`) run in `keel-system`.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: keel-system
+      ports:
+        - protocol: TCP
+          port: 8080
+  egress:
+    # Cluster DNS only; Hiqlite raft/API traffic stays on the pod loopback (single node).
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: rauthy
+  labels:
+    app.kubernetes.io/name: rauthy
+spec:
+  parentRefs:
+    - name: keel-ingress
+      namespace: keel-system
+      sectionName: https-local
+    - name: keel-ingress
+      namespace: keel-system
+      sectionName: https
+  hostnames:
+    - ${hostname}
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        - name: rauthy
+          port: 8080

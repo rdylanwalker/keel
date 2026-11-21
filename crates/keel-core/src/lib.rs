@@ -22,12 +22,14 @@ pub use bootstrap::{
     validate_kubeconfig_yaml, write_private_file,
 };
 pub use catalog::{
-    PartitionedValues, PreparedHelmValues, SchemaFieldError, extract_manifest_variables,
-    extract_secret_field_paths, is_secret_schema_node, parse_catalog, parse_catalog_application,
-    parse_catalog_blueprint, parse_catalog_bundle, partition_values_by_schema, prepare_helm_values,
-    render_helm_values_yaml, render_manifest_template, replace_yaml_document, split_yaml_documents,
-    validate_k8s_manifests_yaml, validate_schema_values, verify_rendered_manifest_structure,
-    yaml_leading_comments,
+    DEFAULT_PLATFORM_BASE_DOMAIN, GATEWAY_ROUTE_KINDS, PLATFORM_HOST_LABELS, PartitionedValues,
+    PreparedHelmValues, SchemaFieldError, extract_manifest_variables, extract_secret_field_paths,
+    gateway_route_hostnames, is_secret_schema_node, parse_catalog, parse_catalog_application,
+    parse_catalog_blueprint, parse_catalog_bundle, partition_values_by_schema,
+    platform_reserved_hostnames, prepare_helm_values, render_helm_values_yaml,
+    render_manifest_template, replace_yaml_document, route_hostname_matches, split_yaml_documents,
+    validate_k8s_manifests_yaml, validate_route_hostnames, validate_schema_values,
+    verify_rendered_manifest_structure, yaml_leading_comments,
 };
 pub use crypto::{
     AES_256_KEY_LEN, AES_GCM_NONCE_LEN, AES_GCM_TAG_LEN, AgeKeyPair, EnvelopeCrypto, SopsConfig,

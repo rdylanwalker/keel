@@ -16,6 +16,19 @@ catalog/
         └── catalog.yaml    # CatalogBundle (keel.io/v1alpha1)
 ```
 
+## Built-in Starter Applications
+
+On a fresh repository, `keel bootstrap init` seeds these self-service apps into `catalog/apps/`. Any tenant can install them from **Catalog & Form Wizard**:
+
+| ID | Name | Runtime | Notes |
+| :--- | :--- | :--- | :--- |
+| `podinfo` | Podinfo Microservice | `helm` | Canary-capable demo app (Flagger + Envoy Gateway) |
+| `cert-manager` | cert-manager | `helm` | For workload clusters |
+| `dex` | Dex OIDC Provider | `helm` | Tenant-owned Dex |
+| `rauthy` | Rauthy OIDC Provider | `manifest` (Flux) | Tenant-owned single-node Rauthy. Four required secret fields are SOPS-encrypted per tenant. Exposed through an `HTTPRoute` on the shared `keel-ingress` Gateway ([walkthrough](../getting-started/things-to-try.md#8-deploy-a-self-service-rauthy-oidc-provider-rauthy)) |
+
+The tenant `rauthy` app is separate from Keel's own IdP. `catalog/core/rauthy` describes the protected management-plane Rauthy in `keel-system`. Admins manage it from the Topology Map, and it never appears in the tenant catalog. Both entries pin the same `ghcr.io/sebadob/rauthy` image tag and are bumped together.
+
 ## How Provider Blueprints Work
 
 Enabling a provider on the **Control Plane & Providers** tab updates `providers/registry.yaml`. That registry acts as an allowlist:
@@ -192,7 +205,8 @@ In the Web UI (**Catalog & Form Wizard → + Add Catalog Item → Application �
 
 ### SOPS Secret Partitioning
 Properties marked `"writeOnly": true` or `"format": "password"` are automatically partitioned from non-secret variables:
-- In the **Flux engine path**, non-secret variables are written to `values-configmap.yaml` (`kind: ConfigMap`), while secret variables are encrypted with the tenant's `age` key into `secrets.enc.yaml` (`kind: Secret`).
+- In the **Flux engine path**, non-secret variables are written to `values-configmap.yaml` (`kind: ConfigMap`), while secret variables are encrypted with the tenant's `age` key into `secrets.enc.yaml` (`kind: Secret`, `<instance>-secrets`). When secrets are present, the app's Flux `Kustomization` sets `spec.decryption` (`provider: sops`, tenant `sops-age` Secret), so the Secret is decrypted in-cluster. Leave secret placeholders (`${secretField}`) in the template: Flux substitutes them at reconcile time, so they never appear in Git. Because the Secret is created by the same reconcile, the first reconcile substitutes empty strings; a later reconcile fills in the values, and pods that read them as environment variables need a restart (up to about 10 minutes in total without manual intervention). Secret fields in manifest templates are supported only by the Flux engine on the management cluster: Keel rejects `engine: pulumi` and remote `targetCluster` proposals for such apps. Plaintext secret values must not contain `${`, since Flux also substitutes the decrypted Secret.
+- **Route hostnames:** a manifest app's `HTTPRoute`/`GRPCRoute` hostnames must be concrete at proposal time, must not be (or wildcard-cover) a platform host (`idp.`/`keel.`/`forgejo.` under the Keel domain or the configured IdP host), and must not already be routed by another committed app. The Kyverno policy `restrict-tenant-route-hostnames` enforces the platform-host rule at admission. Tenant ServiceAccounts get `httproutes`/`grpcroutes` through `ClusterRole/keel-tenant-gateway-routes` (aggregated into `admin`).
 - In the **Pulumi engine path**, secret variables are encrypted into `secrets.enc.yaml` and bound via `Stack.spec.envRefs`.
 
 ### Choosing Between Execution Engines (`Flux` vs. `Pulumi`)

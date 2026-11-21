@@ -25,6 +25,7 @@ pub const POLICY_SYNC_TENANT_SECRETS: &str = "sync-tenant-secrets";
 /// Retired RBAC (`ClusterRole` + `ClusterRoleBinding`) used by [`POLICY_SYNC_TENANT_SECRETS`].
 pub const RETIRED_SYNC_TENANT_SECRETS_RBAC: &str = "keel-kyverno-tenant-secret-sync";
 pub const POLICY_RESTRICT_TENANT_RECONCILER: &str = "restrict-tenant-reconciler";
+pub const POLICY_RESTRICT_TENANT_ROUTE_HOSTNAMES: &str = "restrict-tenant-route-hostnames";
 pub const EXCEPTION_LOCAL_KIND_DOCKER_SOCKET: &str = "local-kind-docker-socket-exception";
 
 pub const RULE_DISALLOW_PRIVILEGED: &str = "disallow-privileged";
@@ -92,6 +93,16 @@ pub struct KyvernoPolicyConfig {
     pub local_dev_docker_socket_exception: bool,
     /// Customization options when `local_dev_docker_socket_exception` is `true`.
     pub docker_socket_exception: DockerSocketExceptionConfig,
+    /// Platform hostnames (IdP issuer, keel-server, Forgejo) tenant Gateway API routes may never
+    /// claim, exactly or through a wildcard (`restrict-tenant-route-hostnames`).
+    pub reserved_route_hostnames: Vec<String>,
+}
+
+/// Default reserved platform hostnames (`idp|keel|forgejo.keel.local`).
+pub fn default_reserved_route_hostnames() -> Vec<String> {
+    keel_core::platform_reserved_hostnames(std::iter::empty())
+        .into_iter()
+        .collect()
 }
 
 impl Default for KyvernoPolicyConfig {
@@ -100,6 +111,7 @@ impl Default for KyvernoPolicyConfig {
             allowed_providers: default_allowed_pulumi_providers(),
             local_dev_docker_socket_exception: false,
             docker_socket_exception: DockerSocketExceptionConfig::default(),
+            reserved_route_hostnames: default_reserved_route_hostnames(),
         }
     }
 }
@@ -510,6 +522,102 @@ pub fn build_restrict_tenant_reconciler_policy() -> Value {
     })
 }
 
+/// Generates `ValidatingPolicy/restrict-tenant-route-hostnames` (`policies.kyverno.io/v1`).
+///
+/// Tenant `HTTPRoute`/`GRPCRoute`/`TLSRoute`s attach to the shared `keel-system/keel-ingress`
+/// listeners (`allowedRoutes.namespaces.from: All`). Gateway API breaks exact-hostname ties by
+/// creation time, so a tenant route on a platform host (e.g. the IdP issuer) could take over that
+/// host when the platform route is re-created. This policy denies, in `tenant-*` namespaces, any
+/// route hostname equal to a reserved platform host or a wildcard (`*.<suffix>`) covering one.
+/// The deny list is precomputed (no CEL string extensions needed). Fails closed.
+pub fn build_restrict_tenant_route_hostnames_policy<S: AsRef<str>>(
+    reserved_hostnames: &[S],
+) -> Result<Value, KubeError> {
+    let mut denied = std::collections::BTreeSet::new();
+    for raw in reserved_hostnames {
+        let host = raw.as_ref().trim().to_ascii_lowercase();
+        let valid = !host.is_empty()
+            && host.len() <= 253
+            && host.split('.').all(|label| {
+                !label.is_empty()
+                    && label.len() <= 63
+                    && label
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+                    && !label.starts_with('-')
+                    && !label.ends_with('-')
+            });
+        if !valid {
+            return Err(KubeError::InvalidInput(format!(
+                "invalid reserved route hostname `{host}`"
+            )));
+        }
+        let mut rest = host.as_str();
+        while let Some((_, suffix)) = rest.split_once('.') {
+            denied.insert(format!("*.{suffix}"));
+            rest = suffix;
+        }
+        denied.insert(host);
+    }
+    let denied_list = denied
+        .iter()
+        .map(|h| format!("'{h}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Ok(json!({
+        "apiVersion": "policies.kyverno.io/v1",
+        "kind": "ValidatingPolicy",
+        "metadata": {
+            "name": POLICY_RESTRICT_TENANT_ROUTE_HOSTNAMES,
+            "labels": {
+                "app.kubernetes.io/managed-by": "keel",
+                "keel.io/policy-tier": "tenant-isolation"
+            }
+        },
+        "spec": {
+            "validationActions": ["Deny"],
+            "failurePolicy": "Fail",
+            "evaluation": {
+                "background": {
+                    "enabled": false
+                }
+            },
+            "matchConstraints": {
+                "resourceRules": [
+                    {
+                        "apiGroups": ["gateway.networking.k8s.io"],
+                        "apiVersions": ["*"],
+                        "operations": ["CREATE", "UPDATE"],
+                        "resources": ["httproutes", "grpcroutes", "tlsroutes"]
+                    }
+                ]
+            },
+            "matchConditions": [
+                {
+                    "name": "tenant-namespace",
+                    "expression": "(has(request.namespace) ? request.namespace : '').startsWith('tenant-')"
+                }
+            ],
+            "variables": [
+                {
+                    "name": "deniedHostnames",
+                    "expression": format!("[{denied_list}]")
+                },
+                {
+                    "name": "hostnames",
+                    "expression": "has(object.spec.hostnames) ? object.spec.hostnames : []"
+                }
+            ],
+            "validations": [
+                {
+                    "expression": "variables.hostnames.all(h, !(h in variables.deniedHostnames))",
+                    "message": "Tenant routes may not claim reserved platform hostnames (IdP, keel-server, Forgejo) or wildcards covering them."
+                }
+            ]
+        }
+    }))
+}
+
 /// Generated bundle of baseline Kyverno `ValidatingPolicy` manifests and optional local-dev `PolicyException`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct KyvernoManifestBundle {
@@ -528,7 +636,10 @@ impl KyvernoManifestBundle {
             build_restrict_pulumi_providers_policy(&config.allowed_providers)?,
         ];
 
-        let supporting_manifests = vec![build_restrict_tenant_reconciler_policy()];
+        let supporting_manifests = vec![
+            build_restrict_tenant_reconciler_policy(),
+            build_restrict_tenant_route_hostnames_policy(&config.reserved_route_hostnames)?,
+        ];
 
         let policy_exception = if config.local_dev_docker_socket_exception {
             Some(build_local_kind_docker_socket_exception(
@@ -581,9 +692,9 @@ mod tests {
 
         let bundle = KyvernoManifestBundle::generate(&cfg).unwrap();
         assert_eq!(bundle.cluster_policies.len(), 3);
-        assert_eq!(bundle.supporting_manifests.len(), 1);
+        assert_eq!(bundle.supporting_manifests.len(), 2);
         assert!(bundle.policy_exception.is_none());
-        assert_eq!(bundle.all_manifests().len(), 4);
+        assert_eq!(bundle.all_manifests().len(), 5);
         assert!(
             !bundle
                 .to_multi_doc_yaml()
@@ -626,7 +737,7 @@ mod tests {
         };
 
         let bundle = KyvernoManifestBundle::generate(&cfg).unwrap();
-        assert_eq!(bundle.all_manifests().len(), 5);
+        assert_eq!(bundle.all_manifests().len(), 6);
 
         let exc = bundle
             .policy_exception
@@ -750,8 +861,13 @@ mod tests {
             build_protect_control_plane_policy(),
             build_restrict_pulumi_providers_policy(&["kubernetes".to_string()]).unwrap(),
             build_restrict_tenant_reconciler_policy(),
+            build_restrict_tenant_route_hostnames_policy(&default_reserved_route_hostnames())
+                .unwrap(),
         ];
         for seed in [
+            include_str!(
+                "../../../deploy/seed/kyverno-policies/restrict-tenant-route-hostnames.yaml"
+            ),
             include_str!("../../../deploy/seed/kyverno-policies/restrict-pulumi-providers.yaml"),
             include_str!(
                 "../../../deploy/seed/kyverno-policies/disallow-privileged-containers.yaml"
@@ -892,7 +1008,7 @@ mod tests {
             }
         }
         let docs: Vec<&str> = yaml.split("\n---\n").collect();
-        assert_eq!(docs.len(), 5);
+        assert_eq!(docs.len(), 6);
         for doc in docs {
             let parsed: serde_json::Value =
                 serde_yml::from_str(doc).expect("each Kyverno multi-doc YAML part must parse");
@@ -918,5 +1034,44 @@ mod tests {
         assert!(expr.contains("\"proxmox\""));
         // Even with nothing enabled, the policy is valid and keeps `kubernetes`.
         assert!(build_restrict_pulumi_providers_policy_for_registry(&empty).is_ok());
+    }
+
+    #[test]
+    fn restrict_tenant_route_hostnames_policy_denies_platform_hosts_and_matches_seed() {
+        let policy = build_restrict_tenant_route_hostnames_policy(&[
+            "idp.corp.example",
+            "keel.corp.example",
+        ])
+        .unwrap();
+        let denied = policy["spec"]["variables"][0]["expression"]
+            .as_str()
+            .unwrap();
+        for host in [
+            "'idp.corp.example'",
+            "'keel.corp.example'",
+            "'*.corp.example'",
+            "'*.example'",
+        ] {
+            assert!(denied.contains(host), "{host} in {denied}");
+        }
+        assert!(!denied.contains("'corp.example'"));
+        assert_eq!(policy["spec"]["failurePolicy"], "Fail");
+        assert_eq!(
+            policy["spec"]["matchConstraints"]["resourceRules"][0]["resources"],
+            json!(["httproutes", "grpcroutes", "tlsroutes"])
+        );
+        // CEL-injection guard: only DNS hostnames are accepted.
+        assert!(build_restrict_tenant_route_hostnames_policy(&["x' || true || '"]).is_err());
+        assert!(build_restrict_tenant_route_hostnames_policy(&["Bad_Host"]).is_err());
+
+        let seed: Value = serde_yml::from_str(include_str!(
+            "../../../deploy/seed/kyverno-policies/restrict-tenant-route-hostnames.yaml"
+        ))
+        .unwrap();
+        let generated =
+            build_restrict_tenant_route_hostnames_policy(&default_reserved_route_hostnames())
+                .unwrap();
+        assert_eq!(seed["spec"], generated["spec"]);
+        assert_eq!(seed["metadata"], generated["metadata"]);
     }
 }

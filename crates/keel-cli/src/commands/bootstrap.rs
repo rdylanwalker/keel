@@ -182,6 +182,9 @@ pub(crate) fn render_manifest(template: &str, vars: &[(&str, &str)]) -> Result<S
 pub struct KyvernoPolicyGenerator {
     pub allowed_providers: Vec<String>,
     pub local_dev_docker_socket_exception: bool,
+    /// Platform hosts tenant Gateway API routes may never claim
+    /// (`restrict-tenant-route-hostnames`); defaults to the `keel.local` hosts.
+    pub reserved_route_hostnames: Vec<String>,
 }
 
 impl KyvernoPolicyGenerator {
@@ -191,7 +194,21 @@ impl KyvernoPolicyGenerator {
         Self {
             allowed_providers,
             local_dev_docker_socket_exception,
+            reserved_route_hostnames: keel_kube::kyverno::default_reserved_route_hostnames(),
         }
+    }
+
+    /// Reserves the Stage 0 platform hosts (IdP, keel-server, Forgejo) of `ingress`, in addition
+    /// to the default `keel.local` hosts, against tenant route hostnames.
+    pub fn with_reserved_ingress_hosts(mut self, ingress: &Stage0Ingress) -> Self {
+        let mut reserved = keel_core::platform_reserved_hostnames([ingress.idp_origin.as_str()]);
+        reserved.extend([
+            ingress.idp_host.clone(),
+            ingress.keel_host.clone(),
+            ingress.forgejo_host.clone(),
+        ]);
+        self.reserved_route_hostnames = reserved.into_iter().collect();
+        self
     }
 
     /// Creates a generator seeded with the Day-1 default allowed Pulumi providers (`keel_kube::kyverno`).
@@ -210,6 +227,7 @@ impl KyvernoPolicyGenerator {
             allowed_providers: self.allowed_providers.clone(),
             local_dev_docker_socket_exception: self.local_dev_docker_socket_exception,
             docker_socket_exception: DockerSocketExceptionConfig::default(),
+            reserved_route_hostnames: self.reserved_route_hostnames.clone(),
         };
         Ok(KyvernoManifestBundle::generate(&cfg)?)
     }
@@ -435,7 +453,8 @@ pub async fn synthesize_seed_control_plane_with_ingress(
 
     // Kyverno admission policies + explicit local-dev Docker socket PolicyException guard
     let kyverno_gen =
-        KyvernoPolicyGenerator::new(enabled_provider_ids, cfg.local_dev_docker_socket_exception);
+        KyvernoPolicyGenerator::new(enabled_provider_ids, cfg.local_dev_docker_socket_exception)
+            .with_reserved_ingress_hosts(&ingress);
     let kyverno_bundle = kyverno_gen.generate()?;
 
     // Protected anti-lockout `management-cluster-core` PKO v2 Stack (`protect: true`)
@@ -746,6 +765,12 @@ const CORE_CATALOG_FORGEJO_YAML: &str =
 const STARTER_DEX_APP_YAML: &str = include_str!("../../../../deploy/catalog/apps/dex/catalog.yaml");
 const STARTER_CERT_MANAGER_APP_YAML: &str =
     include_str!("../../../../deploy/catalog/apps/cert-manager/catalog.yaml");
+/// Self-service tenant Rauthy IdP (`runtime: manifest`), distinct from Keel's own management
+/// Rauthy ([`CORE_CATALOG_RAUTHY_YAML`]); both pin the same `ghcr.io/sebadob/rauthy` tag.
+const STARTER_RAUTHY_APP_YAML: &str =
+    include_str!("../../../../deploy/catalog/apps/rauthy/catalog.yaml");
+const STARTER_RAUTHY_APP_MANIFESTS_YAML: &str =
+    include_str!("../../../../deploy/catalog/apps/rauthy/manifests.yaml");
 const CORE_CATALOG_ENVOY_GATEWAY_YAML: &str =
     include_str!("../../../../deploy/catalog/core/envoy-gateway/catalog.yaml");
 const CORE_CATALOG_PROMETHEUS_YAML: &str =
@@ -1451,6 +1476,14 @@ async fn initialize_seed_git_repo_with_push(
         files_to_write.push((
             "catalog/apps/cert-manager/catalog.yaml".to_string(),
             STARTER_CERT_MANAGER_APP_YAML.to_string(),
+        ));
+        files_to_write.push((
+            "catalog/apps/rauthy/catalog.yaml".to_string(),
+            STARTER_RAUTHY_APP_YAML.to_string(),
+        ));
+        files_to_write.push((
+            "catalog/apps/rauthy/manifests.yaml".to_string(),
+            STARTER_RAUTHY_APP_MANIFESTS_YAML.to_string(),
         ));
     }
 
@@ -2929,6 +2962,25 @@ mod security_hardening_tests {
         assert_eq!(&cm[1..], &local_ca[..]);
         assert_eq!(cm[4]["spec"]["dnsNames"][1], "idp.corp.example");
 
+        // Tenant routes may never claim the configured platform hosts (Kyverno, fail closed).
+        let policies = yaml_docs(file(&files, &format!("{core}/kyverno-policies.yaml")));
+        let hostnames_policy = policies
+            .iter()
+            .find(|p| p["metadata"]["name"] == "restrict-tenant-route-hostnames")
+            .expect("restrict-tenant-route-hostnames policy");
+        let denied = hostnames_policy["spec"]["variables"][0]["expression"]
+            .as_str()
+            .unwrap();
+        for host in [
+            "'idp.corp.example'",
+            "'keel.corp.example'",
+            "'forgejo.corp.example'",
+            "'*.corp.example'",
+            "'idp.keel.local'",
+        ] {
+            assert!(denied.contains(host), "{host} missing from {denied}");
+        }
+
         // No Secret (e.g. `rauthy-config`) and no unrendered placeholder ever reaches Git.
         for (path, contents) in &files {
             assert!(
@@ -3405,6 +3457,21 @@ mod security_hardening_tests {
                 .any(|p| p == "catalog/apps/dex/catalog.yaml")
         );
         keel_core::parse_catalog_application(STARTER_DEX_APP_YAML).unwrap();
+        // Self-service tenant Rauthy (catalog + manifest template) is seeded alongside.
+        for path in [
+            "catalog/apps/rauthy/catalog.yaml",
+            "catalog/apps/rauthy/manifests.yaml",
+        ] {
+            assert!(
+                res.written_files.iter().any(|p| p == path),
+                "{path} not seeded"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(res.repo_dir.join("catalog/apps/rauthy/manifests.yaml"))
+                .unwrap(),
+            STARTER_RAUTHY_APP_MANIFESTS_YAML
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -3650,5 +3717,395 @@ mod security_hardening_tests {
             a.keel_config.oidc.unwrap().issuer_url,
             "https://idp.corp.example:9443/auth/v1"
         );
+    }
+}
+
+/// Self-service tenant Rauthy catalog app (`deploy/catalog/apps/rauthy`).
+#[cfg(test)]
+mod tenant_rauthy_app_tests {
+    use super::*;
+
+    use serde_json::{Value, json};
+
+    const SECRET_FIELDS: [&str; 4] = [
+        "encKey",
+        "hiqliteSecretRaft",
+        "hiqliteSecretApi",
+        "adminPassword",
+    ];
+    const SAMPLE_ENC_KEY: &str = "q2Vz7mU0ZcV1x7pYb7Yk2r9mD0aH3sW5tL8nQ4eR6fA=";
+    const SAMPLE_RAFT: &str = "raftSecretSampleValue-0123456789";
+    const SAMPLE_API: &str = "apiSecretSampleValue-9876543210";
+    const SAMPLE_ADMIN_PASSWORD: &str = "Sample-Admin#Passw0rd!";
+
+    fn sample_values() -> Value {
+        json!({
+            "hostname": "auth.acme.example",
+            "publicPortSuffix": "",
+            "adminEmail": "ops@acme.example",
+            "logLevel": "warn",
+            "storageSize": "2Gi",
+            "encKeyId": "acme1",
+            "encKey": SAMPLE_ENC_KEY,
+            "hiqliteSecretRaft": SAMPLE_RAFT,
+            "hiqliteSecretApi": SAMPLE_API,
+            "adminPassword": SAMPLE_ADMIN_PASSWORD,
+        })
+    }
+
+    fn app() -> keel_core::CatalogApplication {
+        keel_core::parse_catalog_application(STARTER_RAUTHY_APP_YAML).unwrap()
+    }
+
+    /// Renders the template exactly like `POST /api/v1/proposals` (Flux engine): only the
+    /// non-secret partition is substituted at proposal time.
+    fn render(values: &Value) -> (String, Value, Vec<Value>) {
+        let app = app();
+        keel_core::validate_schema_values(&app.spec.schema, values).unwrap();
+        let partitioned = keel_core::partition_values_by_schema(&app.spec.schema, values).unwrap();
+        let rendered = keel_core::render_manifest_template(
+            STARTER_RAUTHY_APP_MANIFESTS_YAML,
+            &partitioned.normal_values,
+        )
+        .unwrap();
+        let docs = keel_core::verify_rendered_manifest_structure(
+            STARTER_RAUTHY_APP_MANIFESTS_YAML,
+            &rendered,
+        )
+        .unwrap();
+        (rendered, partitioned.secret_values, docs)
+    }
+
+    fn doc<'a>(docs: &'a [Value], kind: &str) -> &'a Value {
+        docs.iter()
+            .find(|d| d["kind"] == kind)
+            .unwrap_or_else(|| panic!("{kind} missing"))
+    }
+
+    fn container_env(docs: &[Value]) -> Vec<Value> {
+        doc(docs, "StatefulSet")["spec"]["template"]["spec"]["containers"][0]["env"]
+            .as_array()
+            .unwrap()
+            .clone()
+    }
+
+    fn env_value(env: &[Value], name: &str) -> String {
+        env.iter().find(|e| e["name"] == name).unwrap()["value"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    #[test]
+    fn catalog_entry_is_self_service_manifest_app_pinned_to_core_version() {
+        let app = app();
+        assert_eq!(app.metadata.id, "rauthy");
+        assert_eq!(app.metadata.name, "Rauthy OIDC Provider");
+        assert_eq!(app.metadata.category, "security-identity");
+        assert_eq!(app.metadata.runtime, keel_core::AppRuntime::Manifest);
+        assert_eq!(
+            app.spec.default_engine,
+            Some(keel_core::ManifestEngine::Flux)
+        );
+        assert_eq!(
+            app.spec.upstream.repo_url,
+            "https://github.com/sebadob/rauthy"
+        );
+        assert!(app.spec.upstream.image.is_none());
+        assert!(!app.spec.progressive_delivery.flagger_supported);
+        // Hiqlite raft membership is config-driven: replicas are never exposed.
+        let props = app.spec.schema["properties"].as_object().unwrap();
+        assert!(props.keys().all(|k| !k.to_lowercase().contains("replica")));
+
+        // Bump the tenant app together with Keel's own Rauthy (catalog/core) and its image tag.
+        let core = keel_core::parse_catalog_application(CORE_CATALOG_RAUTHY_YAML).unwrap();
+        let core_version = core.spec.upstream.version.clone().unwrap();
+        assert_eq!(
+            app.spec.upstream.version.as_deref(),
+            Some(core_version.as_str()),
+            "catalog/apps/rauthy version drifts from catalog/core/rauthy"
+        );
+        let image = format!("{}:{core_version}", core.spec.upstream.image.unwrap());
+        let (_, _, docs) = render(&sample_values());
+        assert_eq!(
+            doc(&docs, "StatefulSet")["spec"]["template"]["spec"]["containers"][0]["image"],
+            image.as_str()
+        );
+    }
+
+    #[test]
+    fn secret_fields_are_password_write_only_and_never_defaulted() {
+        let app = app();
+        let props = &app.spec.schema["properties"];
+        let required: Vec<&str> = app.spec.schema["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        for field in SECRET_FIELDS {
+            assert_eq!(props[field]["format"], "password", "{field}");
+            assert_eq!(props[field]["writeOnly"], true, "{field}");
+            assert!(props[field].get("default").is_none(), "{field} defaulted");
+            assert!(required.contains(&field), "{field} not required");
+        }
+        let partitioned =
+            keel_core::partition_values_by_schema(&app.spec.schema, &sample_values()).unwrap();
+        assert_eq!(
+            partitioned.secret_values.as_object().unwrap().len(),
+            SECRET_FIELDS.len()
+        );
+        for field in SECRET_FIELDS {
+            assert!(partitioned.normal_values.get(field).is_none(), "{field}");
+        }
+    }
+
+    #[test]
+    fn schema_rejects_values_that_would_break_flux_substitution() {
+        let schema = app().spec.schema;
+        let reject = |field: &str, value: &str| {
+            let mut v = sample_values();
+            v[field] = json!(value);
+            assert!(
+                keel_core::validate_schema_values(&schema, &v).is_err(),
+                "{field}={value:?} accepted"
+            );
+        };
+        reject("adminPassword", "has\"quote-1234567");
+        reject("adminPassword", "has\\backslash-1234567");
+        reject("adminPassword", "has space-1234567890");
+        reject("adminPassword", "short");
+        // Flux postBuild also substitutes the decrypted `<instance>-secrets` Secret.
+        reject("adminPassword", "has${dollar}-1234567");
+        reject("adminPassword", "has$dollar-12345678");
+        reject("encKey", "not-base64");
+        reject("hiqliteSecretRaft", "tooshort");
+        reject("hiqliteSecretApi", "contains\"quote-123456");
+        reject("encKeyId", "bad/id");
+        reject("storageSize", "1Ti");
+        reject("publicPortSuffix", "8888");
+        let mut missing = sample_values();
+        missing.as_object_mut().unwrap().remove("encKey");
+        assert!(keel_core::validate_schema_values(&schema, &missing).is_err());
+    }
+
+    #[test]
+    fn rendered_manifests_never_contain_plaintext_secrets() {
+        let (rendered, secrets, docs) = render(&sample_values());
+        for (field, value) in [
+            ("encKey", SAMPLE_ENC_KEY),
+            ("hiqliteSecretRaft", SAMPLE_RAFT),
+            ("hiqliteSecretApi", SAMPLE_API),
+            ("adminPassword", SAMPLE_ADMIN_PASSWORD),
+        ] {
+            assert_eq!(secrets[field], value);
+            assert!(!rendered.contains(value), "{field} leaked into manifests");
+            // Left for Flux `postBuild.substituteFrom` (`<instance>-secrets`).
+            assert!(rendered.contains(&format!("${{{field}}}")), "{field}");
+        }
+        let secret = doc(&docs, "Secret");
+        assert_eq!(secret["metadata"]["name"], "rauthy-env");
+        assert_eq!(secret["stringData"]["ENC_KEYS"], "acme1/${encKey}");
+        assert_eq!(
+            secret["stringData"]["BOOTSTRAP_ADMIN_PASSWORD_PLAIN"],
+            "${adminPassword}"
+        );
+        // No secret value is ever inlined into the pod spec.
+        let env = container_env(&docs);
+        for name in [
+            "ENC_KEYS",
+            "HQL_SECRET_RAFT",
+            "HQL_SECRET_API",
+            "BOOTSTRAP_ADMIN_PASSWORD_PLAIN",
+        ] {
+            let e = env.iter().find(|e| e["name"] == name).unwrap();
+            assert!(e.get("value").is_none(), "{name}");
+            assert_eq!(e["valueFrom"]["secretKeyRef"]["name"], "rauthy-env");
+        }
+    }
+
+    #[test]
+    fn rendered_manifests_apply_form_values() {
+        let (_, _, docs) = render(&sample_values());
+        let env = container_env(&docs);
+        assert_eq!(env_value(&env, "PUB_URL"), "auth.acme.example");
+        assert_eq!(env_value(&env, "RP_ID"), "auth.acme.example");
+        assert_eq!(env_value(&env, "RP_ORIGIN"), "https://auth.acme.example");
+        assert_eq!(env_value(&env, "LOG_LEVEL"), "warn");
+        assert_eq!(env_value(&env, "ENC_KEY_ACTIVE"), "acme1");
+        assert_eq!(env_value(&env, "BOOTSTRAP_ADMIN_EMAIL"), "ops@acme.example");
+        assert_eq!(
+            doc(&docs, "StatefulSet")["spec"]["volumeClaimTemplates"][0]["spec"]["resources"]["requests"]
+                ["storage"],
+            "2Gi"
+        );
+        assert_eq!(
+            doc(&docs, "HTTPRoute")["spec"]["hostnames"][0],
+            "auth.acme.example"
+        );
+
+        // Local kind default: the port suffix flows into the issuer and the WebAuthn origin.
+        let mut local = sample_values();
+        local["publicPortSuffix"] = json!(":8888");
+        let (_, _, docs) = render(&local);
+        let env = container_env(&docs);
+        assert_eq!(env_value(&env, "PUB_URL"), "auth.acme.example:8888");
+        assert_eq!(
+            env_value(&env, "RP_ORIGIN"),
+            "https://auth.acme.example:8888"
+        );
+    }
+
+    #[test]
+    fn rendered_manifests_are_tenant_namespaced_and_restricted_pss() {
+        let (_, _, docs) = render(&sample_values());
+        let kinds: Vec<&str> = docs.iter().filter_map(|d| d["kind"].as_str()).collect();
+        assert_eq!(
+            kinds,
+            [
+                "ConfigMap",
+                "Secret",
+                "Service",
+                "Service",
+                "StatefulSet",
+                "NetworkPolicy",
+                "HTTPRoute"
+            ]
+        );
+        for d in &docs {
+            // Flux `targetNamespace` pins every (namespaced) object into `tenant-<id>`.
+            assert!(d["metadata"].get("namespace").is_none(), "{}", d["kind"]);
+            // Must not collide with the Keel-generated `<instance>-values` ConfigMap and
+            // `<instance>-secrets` Secret of the default instance name.
+            let name = d["metadata"]["name"].as_str().unwrap();
+            assert!(
+                name != "rauthy-values" && name != "rauthy-secrets",
+                "{name}"
+            );
+        }
+
+        let sts = doc(&docs, "StatefulSet");
+        assert_eq!(sts["spec"]["replicas"], 1);
+        let pod = &sts["spec"]["template"]["spec"];
+        assert_eq!(pod["securityContext"]["runAsNonRoot"], true);
+        assert_eq!(
+            pod["securityContext"]["seccompProfile"]["type"],
+            "RuntimeDefault"
+        );
+        assert_eq!(pod["automountServiceAccountToken"], false);
+        for key in ["hostNetwork", "hostPID", "hostIPC", "initContainers"] {
+            assert!(pod.get(key).is_none(), "{key}");
+        }
+        for v in pod["volumes"].as_array().unwrap() {
+            assert!(v.get("hostPath").is_none());
+        }
+        for c in pod["containers"].as_array().unwrap() {
+            let sc = &c["securityContext"];
+            assert_eq!(sc["allowPrivilegeEscalation"], false);
+            assert_eq!(sc["runAsNonRoot"], true);
+            assert_eq!(sc["capabilities"]["drop"], json!(["ALL"]));
+            assert_eq!(sc["seccompProfile"]["type"], "RuntimeDefault");
+            assert!(sc.get("privileged").is_none());
+            assert!(c["resources"]["limits"]["cpu"].is_string());
+            assert!(c["resources"]["limits"]["memory"].is_string());
+            for p in c["ports"].as_array().unwrap() {
+                assert!(p.get("hostPort").is_none());
+            }
+            // Probes mirror the management Rauthy seed.
+            assert_eq!(c["startupProbe"]["httpGet"]["path"], "/auth/v1/health");
+            assert_eq!(c["startupProbe"]["httpGet"]["port"], 8080);
+            assert_eq!(c["readinessProbe"]["httpGet"]["path"], "/ready");
+            assert_eq!(c["readinessProbe"]["httpGet"]["port"], 8200);
+        }
+        assert_eq!(
+            sts["spec"]["volumeClaimTemplates"][0]["metadata"]["name"],
+            "rauthy-data"
+        );
+
+        // Exposed only through the shared `keel-ingress` Gateway HTTPS listeners.
+        let route = doc(&docs, "HTTPRoute");
+        for parent in route["spec"]["parentRefs"].as_array().unwrap() {
+            assert_eq!(parent["name"], "keel-ingress");
+            assert_eq!(parent["namespace"], "keel-system");
+        }
+        assert_eq!(
+            route["spec"]["rules"][0]["backendRefs"][0]["name"],
+            "rauthy"
+        );
+        let np = doc(&docs, "NetworkPolicy");
+        assert_eq!(
+            np["spec"]["ingress"][0]["from"][0]["namespaceSelector"]["matchLabels"]["kubernetes.io/metadata.name"],
+            "keel-system"
+        );
+        assert_eq!(np["spec"]["ingress"][0]["ports"][0]["port"], 8080);
+    }
+
+    fn config_toml(docs: &[Value]) -> String {
+        doc(docs, "ConfigMap")["data"]["config.toml"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    #[test]
+    fn admin_mfa_is_opt_in_like_the_stage0_rauthy() {
+        let app = app();
+        assert_eq!(
+            app.spec.schema["properties"]["adminForceMfa"]["default"],
+            false
+        );
+        // Omitted (API without the field) and the form default both render `false`.
+        let mut omitted = sample_values();
+        omitted.as_object_mut().unwrap().remove("adminForceMfa");
+        let (_, _, docs) = render(&omitted);
+        assert!(config_toml(&docs).contains("[mfa]\nadmin_force_mfa = false\n"));
+        let mut forced = sample_values();
+        forced["adminForceMfa"] = json!(true);
+        let (_, _, docs) = render(&forced);
+        assert!(config_toml(&docs).contains("[mfa]\nadmin_force_mfa = true\n"));
+        let mut bad = sample_values();
+        bad["adminForceMfa"] = json!("false; x = 1");
+        assert!(keel_core::validate_schema_values(&app.spec.schema, &bad).is_err());
+    }
+
+    #[test]
+    fn trusted_proxies_cover_the_stage0_rauthy_list() {
+        let (_, _, docs) = render(&sample_values());
+        let toml = config_toml(&docs);
+        // Same CIDRs as the Stage 0 Rauthy `config.toml` (kubelet probes arrive over loopback /
+        // node bridges), plus CGNAT ranges some providers use for pod/node networks.
+        for cidr in [
+            "'10.0.0.0/8'",
+            "'172.16.0.0/12'",
+            "'192.168.0.0/16'",
+            "'127.0.0.0/8'",
+            "'100.64.0.0/10'",
+        ] {
+            assert!(toml.contains(cidr), "{cidr} missing from trusted_proxies");
+        }
+        assert!(toml.contains("proxy_mode = true"));
+    }
+
+    #[test]
+    fn hostname_is_required_without_a_shared_default() {
+        let app = app();
+        assert!(
+            app.spec.schema["properties"]["hostname"]
+                .get("default")
+                .is_none(),
+            "a shared default hostname collides across tenants"
+        );
+        let mut missing = sample_values();
+        missing.as_object_mut().unwrap().remove("hostname");
+        assert!(keel_core::validate_schema_values(&app.spec.schema, &missing).is_err());
+        // Platform hosts are rejected before anything is committed.
+        let reserved = keel_core::platform_reserved_hostnames(std::iter::empty());
+        for host in ["idp.keel.local", "keel.keel.local", "forgejo.keel.local"] {
+            let mut v = sample_values();
+            v["hostname"] = json!(host);
+            let (_, _, docs) = render(&v);
+            let hosts = keel_core::gateway_route_hostnames(&docs);
+            assert!(keel_core::validate_route_hostnames(&hosts, &reserved).is_err());
+        }
     }
 }

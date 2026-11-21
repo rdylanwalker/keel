@@ -372,3 +372,71 @@ keel infra ssh aws-vm --tenant dev-team --exec
 # Launch with custom SSH identity file and port
 keel infra ssh aws-vm --tenant dev-team -i ~/.ssh/id_ed25519 --port 22 --exec
 ```
+
+---
+
+## 8. Deploy a Self-Service Rauthy OIDC Provider (`rauthy`)
+
+Tenants can run their own [Rauthy](https://github.com/sebadob/rauthy) identity provider from the catalog, for example to give their applications OIDC login without touching Keel's IdP. Two Rauthy entries exist, and they are different things:
+
+| Entry | Where it appears | Purpose |
+| :--- | :--- | :--- |
+| `catalog/core/rauthy` | **Topology Map → Management Plane add-ons** (admins only) | Keel's own IdP in `keel-system` (Stage 0); version-only upgrades through reviewed PRs |
+| `catalog/apps/rauthy` | **Catalog & Form Wizard** (any tenant) | A tenant-owned Rauthy in `tenant-<id>`, installed and edited like any other catalog app |
+
+Both pin the same `ghcr.io/sebadob/rauthy` image tag. The tenant app is a single-node Rauthy (Hiqlite storage on a PersistentVolumeClaim). Replicas are not configurable because Hiqlite raft membership is configuration-driven.
+
+### Step 1: Generate the Secrets
+
+The form needs four secret values. Keel never generates or defaults them:
+
+```bash
+openssl rand -base64 32   # Encryption Key (exactly 32 bytes, base64)
+openssl rand -base64 48   # Hiqlite Raft Secret
+openssl rand -base64 48   # Hiqlite API Secret (must differ from the raft secret)
+```
+
+Choose a **Bootstrap Admin Password** of 14 to 128 characters without whitespace, double quotes, backslashes or `$` (Flux substitution would rewrite `${...}` in it). Rauthy applies the bootstrap admin email and password only on its very first start (empty database). Change the password in the Rauthy Admin UI afterwards. Keep the encryption key: Rauthy encrypts data at rest with it, so it must stay the same on every Edit.
+
+### Step 2: Deploy via the Web Portal or CLI
+
+1. In **Catalog & Form Wizard**, select your tenant and choose **Rauthy OIDC Provider** (`rauthy`).
+2. Fill in a **Public Hostname** unique to your tenant (no default; for example `auth-dev-team.keel.local`), **Public HTTPS Port Suffix** (`:8888` for the local `kind` Gateway, empty when served on port 443), **Bootstrap Admin Email**, and the four secrets from Step 1. Keel rejects platform hosts (`idp.`, `keel.`, `forgejo.` under the Keel domain, and the configured IdP host) and hostnames another app already routes; the Kyverno policy `restrict-tenant-route-hostnames` enforces the platform-host rule at admission too. Keep the **Flux CD** engine (the default): Keel rejects the Pulumi engine and remote target clusters for this app, because its secret fields are substituted by Flux on the management cluster only.
+3. Click **Submit & Open Git PR Proposal**, review the PR, and merge it.
+
+```bash
+cat <<'EOF' > rauthy-values.yaml
+hostname: auth-dev-team.keel.local
+publicPortSuffix: ":8888"
+adminEmail: admin@keel.local
+encKeyId: keel1
+encKey: "<openssl rand -base64 32>"
+hiqliteSecretRaft: "<openssl rand -base64 48>"
+hiqliteSecretApi: "<openssl rand -base64 48>"
+adminPassword: "<14+ character password>"
+EOF
+
+keel app install \
+  --app rauthy \
+  --tenant dev-team \
+  --values-file ./rauthy-values.yaml \
+  --server http://127.0.0.1:8080
+```
+
+### How the Secrets Reach Rauthy
+
+1. Keel partitions the four `format: password` fields out of the form values and encrypts them with SOPS and the tenant's `age` key into `tenants/<tenant>/apps/rauthy/secrets.enc.yaml` (the `rauthy-secrets` Secret). Git never holds the plaintext. The committed `manifests.yaml` keeps only `${encKey}`-style placeholders.
+2. The tenant Flux `Kustomization` decrypts `secrets.enc.yaml` with the tenant `sops-age` Secret (`spec.decryption`) and substitutes the values into the in-cluster `rauthy-env` Secret through `postBuild.substituteFrom`. The container reads them as environment variables (`ENC_KEYS`, `HQL_SECRET_RAFT`, `HQL_SECRET_API`, `BOOTSTRAP_ADMIN_PASSWORD_PLAIN`).
+3. On the very first reconcile the decrypted Secret does not exist yet, so Rauthy exits on an empty `ENC_KEYS` and crash-loops. The Kustomization waits for its 2-minute timeout, retries after another 2 minutes with the real values, and the container only picks them up on its next restart (CrashLoopBackOff delays restarts by up to 5 minutes), so the first start can take up to about 10 minutes. To skip the wait, once `rauthy-secrets` exists run `flux reconcile kustomization rauthy -n tenant-<id>` and then `kubectl -n tenant-<id> delete pod rauthy-0`. Secret changes made later through **Edit** take effect after the pod restarts (`kubectl -n tenant-<id> rollout restart statefulset/rauthy`).
+
+Only one `rauthy` instance per tenant namespace is supported, because the template uses fixed resource names (`rauthy`, `rauthy-config`, `rauthy-env`, `rauthy-headless`).
+
+### Step 3: Verify
+
+The app is exposed through an `HTTPRoute` on the shared `keel-ingress` Gateway (HTTPS listeners) and a NetworkPolicy that admits only the Envoy proxies in `keel-system`. Add `127.0.0.1 auth-dev-team.keel.local` to your `hosts` file (the Stage 0 wildcard certificate covers `*.keel.local`), then:
+
+```bash
+curl -k https://auth-dev-team.keel.local:8888/auth/v1/.well-known/openid-configuration
+```
+
+The `issuer` must be `https://auth-dev-team.keel.local:8888/auth/v1`. Sign in to `https://auth-dev-team.keel.local:8888/auth/v1/admin` with the bootstrap admin. **Require MFA for Admins** (`adminForceMfa`) is off by default, like Keel's own Rauthy, because browsers refuse passkeys on the untrusted local CA. Once you serve Rauthy with a browser-trusted certificate, register a passkey in the Admin UI and then set **Require MFA for Admins** through **Edit**. The pod has egress only to cluster DNS. Allow more egress with your own NetworkPolicy if Rauthy must reach SMTP or upstream identity providers.

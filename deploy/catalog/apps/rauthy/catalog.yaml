@@ -1,0 +1,146 @@
+# Self-Service Rauthy OIDC Identity Provider (`SDD.md` §5.1, `NFR-SEC-03`, `NFR-SEC-05`)
+#
+# Tenant-installable Rauthy (raw manifest template `manifests.yaml`, Flux engine). This is NOT
+# Keel's own IdP: the management-plane Rauthy (`catalog/core/rauthy`) is managed from the Topology
+# Map. `upstream.version` is the `ghcr.io/sebadob/rauthy` image tag and must stay equal to
+# `catalog/core/rauthy` (bump both together; enforced by a keel-cli test).
+#
+# Secret fields (`format: password`) are never defaulted: Keel partitions them out of plaintext
+# values, SOPS-encrypts them with the tenant `age` key into `secrets.enc.yaml`
+# (`<instance>-secrets`), and Flux substitutes them into the in-cluster `rauthy-env` Secret via
+# `postBuild.substituteFrom`. Git only ever holds `${...}` placeholders and SOPS ciphertext.
+#
+# Single replica only: Hiqlite raft membership is configuration-driven, so replicas are not exposed.
+# Flux engine on the management cluster only: Keel rejects `engine: pulumi` and remote
+# `targetCluster` proposals for apps with secret fields. The HTTPRoute hostname has no default
+# (it must be unique per tenant); Keel and the Kyverno `restrict-tenant-route-hostnames` policy
+# reject platform hosts (IdP, keel-server, Forgejo), and Keel rejects hostnames already routed by
+# another app.
+apiVersion: keel.io/v1alpha1
+kind: CatalogApplication
+metadata:
+  id: rauthy
+  name: Rauthy OIDC Provider
+  description: Self-service Rauthy OpenID Connect identity provider (single node, Hiqlite storage) with Admin UI, exposed on the shared keel-ingress Gateway.
+  category: security-identity
+  runtime: manifest
+spec:
+  defaultEngine: flux
+  upstream:
+    repoURL: https://github.com/sebadob/rauthy
+    path: ./manifests.yaml
+    version: "0.37.2"
+  progressiveDelivery:
+    flaggerSupported: false
+    defaultCanary: false
+  schema:
+    type: object
+    required:
+      - hostname
+      - adminEmail
+      - encKeyId
+      - encKey
+      - hiqliteSecretRaft
+      - hiqliteSecretApi
+      - adminPassword
+    properties:
+      hostname:
+        type: string
+        title: Public Hostname
+        description: Unique DNS name routed by the keel-ingress Gateway HTTPRoute (e.g. auth-<tenant>.keel.local); also Rauthy's issuer host (https://<hostname>[port]/auth/v1). Platform hosts (idp., keel., forgejo.) and hostnames already used by another app are rejected.
+        format: hostname
+      publicPortSuffix:
+        type: string
+        title: Public HTTPS Port Suffix
+        description: Appended to the hostname in the issuer and WebAuthn origin. ':8888' for the local kind Gateway; empty when served on 443.
+        pattern: "^(:[0-9]{1,5})?$"
+        default: ":8888"
+      adminEmail:
+        type: string
+        title: Bootstrap Admin Email
+        description: Initial rauthy_admin account (created on first start only).
+        format: email
+        default: admin@keel.local
+      logLevel:
+        type: string
+        title: Log Level
+        enum:
+          - error
+          - warn
+          - info
+          - debug
+          - trace
+        default: info
+      adminForceMfa:
+        type: boolean
+        title: Require MFA for Admins
+        description: Force rauthy_admin accounts to register a passkey before using the Admin UI (needs a browser-trusted certificate). Off by default so the bootstrap admin can sign in on the local kind CA; enable it after registering a passkey.
+        default: false
+      storageSize:
+        type: string
+        title: Data Volume Size
+        description: PersistentVolumeClaim size for the Hiqlite database (/app/data).
+        pattern: "^[1-9][0-9]*(Mi|Gi)$"
+        default: 1Gi
+      encKeyId:
+        type: string
+        title: Encryption Key ID
+        description: Identifier of the active encryption key (ENC_KEY_ACTIVE), 2-20 alphanumeric characters. Not secret.
+        pattern: "^[a-zA-Z0-9]{2,20}$"
+        default: keel1
+      encKey:
+        type: string
+        title: Encryption Key (base64, 32 bytes)
+        description: "Generate with: openssl rand -base64 32. Never change it after the first start without key rotation; data at rest is encrypted with it."
+        format: password
+        writeOnly: true
+        pattern: "^[A-Za-z0-9+/]{43}=$"
+      hiqliteSecretRaft:
+        type: string
+        title: Hiqlite Raft Secret
+        description: "16-128 characters [A-Za-z0-9+/=_.-]. Generate with: openssl rand -base64 48"
+        format: password
+        writeOnly: true
+        pattern: "^[A-Za-z0-9+/=_.-]{16,128}$"
+      hiqliteSecretApi:
+        type: string
+        title: Hiqlite API Secret
+        description: "16-128 characters [A-Za-z0-9+/=_.-], different from the raft secret. Generate with: openssl rand -base64 48"
+        format: password
+        writeOnly: true
+        pattern: "^[A-Za-z0-9+/=_.-]{16,128}$"
+      adminPassword:
+        type: string
+        title: Bootstrap Admin Password
+        description: 14-128 characters without whitespace, double quotes, backslashes or '$'. Only applied on the very first start (empty database).
+        format: password
+        writeOnly: true
+        pattern: '^[^"\\\s$]{14,128}$'
+  uiSchema:
+    ui:order:
+      - hostname
+      - publicPortSuffix
+      - adminEmail
+      - adminPassword
+      - logLevel
+      - adminForceMfa
+      - storageSize
+      - encKeyId
+      - encKey
+      - hiqliteSecretRaft
+      - hiqliteSecretApi
+    hostname:
+      ui:placeholder: "auth-<tenant>.keel.local"
+      ui:help: "Exposed on the shared keel-ingress Gateway (HTTPS listeners); add a DNS / hosts entry pointing at the Gateway."
+    encKey:
+      ui:widget: password
+      ui:help: "Encrypted via SOPS + per-tenant age key before committing to Git (never stored in plaintext). Re-enter the same value on every Edit."
+    hiqliteSecretRaft:
+      ui:widget: password
+      ui:help: "Encrypted via SOPS + per-tenant age key before committing to Git."
+    hiqliteSecretApi:
+      ui:widget: password
+      ui:help: "Encrypted via SOPS + per-tenant age key before committing to Git."
+    adminPassword:
+      ui:widget: password
+      ui:help: "Encrypted via SOPS + per-tenant age key before committing to Git. Change it in the Rauthy Admin UI after the first login."

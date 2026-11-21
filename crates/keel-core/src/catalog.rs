@@ -775,6 +775,121 @@ pub fn verify_rendered_manifest_structure(
     Ok(rendered_docs)
 }
 
+/// Gateway API route kinds whose `spec.hostnames` claim traffic on a shared `Gateway` listener.
+pub const GATEWAY_ROUTE_KINDS: &[&str] = &["HTTPRoute", "GRPCRoute", "TLSRoute"];
+
+/// Default local base domain used by Stage 0 when no `--oidc-public-url` is given
+/// (`idp.keel.local`, `keel.keel.local`, `forgejo.keel.local`).
+pub const DEFAULT_PLATFORM_BASE_DOMAIN: &str = "keel.local";
+
+/// Host labels Stage 0 publishes under the platform base domain on the shared `keel-ingress`
+/// Gateway (`<label>.<base-domain>`): the built-in IdP, keel-server and Forgejo.
+pub const PLATFORM_HOST_LABELS: &[&str] = &["idp", "keel", "forgejo"];
+
+/// Extracts the lower-cased `spec.hostnames` of every Gateway API route document
+/// ([`GATEWAY_ROUTE_KINDS`], `gateway.networking.k8s.io/*`) in `docs`.
+pub fn gateway_route_hostnames(docs: &[Value]) -> Vec<String> {
+    let mut hosts = Vec::new();
+    for doc in docs {
+        let is_route = doc
+            .get("apiVersion")
+            .and_then(Value::as_str)
+            .is_some_and(|v| v.starts_with("gateway.networking.k8s.io/"))
+            && doc
+                .get("kind")
+                .and_then(Value::as_str)
+                .is_some_and(|k| GATEWAY_ROUTE_KINDS.contains(&k));
+        if !is_route {
+            continue;
+        }
+        if let Some(list) = doc
+            .get("spec")
+            .and_then(|s| s.get("hostnames"))
+            .and_then(Value::as_array)
+        {
+            hosts.extend(
+                list.iter()
+                    .filter_map(Value::as_str)
+                    .map(|h| h.trim().to_ascii_lowercase()),
+            );
+        }
+    }
+    hosts
+}
+
+/// Host of an absolute URL (`https://user@host:port/path` → `host`), lower-cased.
+fn url_host(url: &str) -> Option<String> {
+    let rest = url.trim().split_once("://").map_or(url.trim(), |(_, r)| r);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let host_port = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let host = host_port.split(':').next().unwrap_or_default().trim();
+    (!host.is_empty()).then(|| host.to_ascii_lowercase())
+}
+
+/// Hostnames tenant routes must never claim on the shared Gateway: the platform hosts derived
+/// from [`DEFAULT_PLATFORM_BASE_DOMAIN`] plus, for every platform URL given (OIDC issuer, Keel
+/// redirect URL, ...), its host and `<label>.<base-domain>` for each [`PLATFORM_HOST_LABELS`]
+/// entry (base domain = the host minus its first label, as Stage 0 derives it).
+pub fn platform_reserved_hostnames<'a>(
+    platform_urls: impl IntoIterator<Item = &'a str>,
+) -> BTreeSet<String> {
+    let mut bases = BTreeSet::from([DEFAULT_PLATFORM_BASE_DOMAIN.to_string()]);
+    let mut reserved = BTreeSet::new();
+    for url in platform_urls {
+        let Some(host) = url_host(url) else {
+            continue;
+        };
+        if let Some((_, base)) = host.split_once('.')
+            && base.contains('.')
+        {
+            bases.insert(base.to_string());
+        }
+        reserved.insert(host);
+    }
+    for base in &bases {
+        for label in PLATFORM_HOST_LABELS {
+            reserved.insert(format!("{label}.{base}"));
+        }
+    }
+    reserved
+}
+
+/// Whether a route hostname (exact or `*.` wildcard) would match `host`.
+pub fn route_hostname_matches(route_hostname: &str, host: &str) -> bool {
+    let route_hostname = route_hostname.trim().to_ascii_lowercase();
+    let host = host.trim().to_ascii_lowercase();
+    match route_hostname.strip_prefix('*') {
+        Some(suffix) if suffix.starts_with('.') => {
+            host.ends_with(suffix) && host.len() > suffix.len()
+        }
+        _ => route_hostname == host,
+    }
+}
+
+/// Fails closed when any rendered route hostname is unresolved (still a `${...}` placeholder),
+/// empty, or matches a `reserved` platform host (exactly or through a wildcard).
+pub fn validate_route_hostnames(
+    route_hostnames: &[String],
+    reserved: &BTreeSet<String>,
+) -> Result<(), CoreError> {
+    for hostname in route_hostnames {
+        if hostname.is_empty() || hostname.contains("${") {
+            return Err(CoreError::Validation(format!(
+                "Route hostname '{hostname}' must be a concrete DNS name at proposal time"
+            )));
+        }
+        if let Some(host) = reserved
+            .iter()
+            .find(|r| route_hostname_matches(hostname, r))
+        {
+            return Err(CoreError::Validation(format!(
+                "Route hostname '{hostname}' claims the reserved platform host '{host}'; choose another hostname"
+            )));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -1647,5 +1762,70 @@ spec:
         assert_eq!(app.spec.schema["properties"], json!({}));
         assert!(validate_schema_values(&app.spec.schema, &json!({"replicas": 3})).is_err());
         assert!(validate_schema_values(&app.spec.schema, &json!({})).is_ok());
+    }
+
+    #[test]
+    fn platform_reserved_hostnames_cover_defaults_and_configured_urls() {
+        let reserved = platform_reserved_hostnames([
+            "https://auth.corp.example:8443/auth/v1",
+            "https://keel.corp.example/api/v1/auth/callback",
+            "not a url",
+        ]);
+        for host in [
+            "idp.keel.local",
+            "keel.keel.local",
+            "forgejo.keel.local",
+            "auth.corp.example",
+            "idp.corp.example",
+            "keel.corp.example",
+            "forgejo.corp.example",
+        ] {
+            assert!(reserved.contains(host), "{host} should be reserved");
+        }
+        assert!(!reserved.contains("corp.example"));
+    }
+
+    #[test]
+    fn route_hostname_validation_rejects_platform_hosts_and_wildcards() {
+        let reserved = platform_reserved_hostnames(["https://idp.keel.local:8888/auth/v1"]);
+        assert!(validate_route_hostnames(&["rauthy-acme.keel.local".into()], &reserved).is_ok());
+        for bad in [
+            "idp.keel.local",
+            "keel.keel.local",
+            "forgejo.keel.local",
+            "*.keel.local",
+            "${hostname}",
+            "",
+        ] {
+            assert!(
+                validate_route_hostnames(&[bad.to_string()], &reserved).is_err(),
+                "{bad} should be rejected"
+            );
+        }
+        assert!(route_hostname_matches("*.keel.local", "idp.keel.local"));
+        assert!(!route_hostname_matches("*.keel.local", "keel.local"));
+        assert!(!route_hostname_matches(
+            "*.idp.keel.local",
+            "idp.keel.local"
+        ));
+    }
+
+    #[test]
+    fn gateway_route_hostnames_only_reads_gateway_routes() {
+        let docs = vec![
+            json!({"apiVersion": "gateway.networking.k8s.io/v1", "kind": "HTTPRoute",
+                   "spec": {"hostnames": ["Auth.Example.ORG"]}}),
+            json!({"apiVersion": "gateway.networking.k8s.io/v1", "kind": "GRPCRoute",
+                   "spec": {"hostnames": ["grpc.example.org"]}}),
+            json!({"apiVersion": "v1", "kind": "Service", "spec": {"hostnames": ["x"]}}),
+            json!({"apiVersion": "gateway.networking.k8s.io/v1", "kind": "HTTPRoute", "spec": {}}),
+        ];
+        assert_eq!(
+            gateway_route_hostnames(&docs),
+            vec![
+                "auth.example.org".to_string(),
+                "grpc.example.org".to_string()
+            ]
+        );
     }
 }
