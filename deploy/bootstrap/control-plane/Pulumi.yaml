@@ -264,6 +264,7 @@ resources:
     properties:
       name: s3-state-backend
       chart: seaweedfs
+      # renovate: datasource=helm depName=seaweedfs registryUrl=https://seaweedfs.github.io/seaweedfs/helm
       version: "4.54.0"
       repositoryOpts:
         repo: https://seaweedfs.github.io/seaweedfs/helm
@@ -321,7 +322,8 @@ resources:
     properties:
       name: envoy-gateway
       chart: oci://docker.io/envoyproxy/gateway-helm
-      version: v1.10.0
+      # renovate: datasource=docker depName=docker.io/envoyproxy/gateway-helm
+      version: "v1.10.0"
       namespace: keel-system
       createNamespace: true
       waitForJobs: true
@@ -347,6 +349,7 @@ resources:
     properties:
       name: prometheus
       chart: prometheus
+      # renovate: datasource=helm depName=prometheus registryUrl=https://prometheus-community.github.io/helm-charts
       version: "29.48.0"
       repositoryOpts:
         repo: https://prometheus-community.github.io/helm-charts
@@ -390,6 +393,7 @@ resources:
     properties:
       name: flagger
       chart: flagger
+      # renovate: datasource=helm depName=flagger registryUrl=https://flagger.app
       version: "1.45.0"
       repositoryOpts:
         repo: https://flagger.app
@@ -423,7 +427,8 @@ resources:
     properties:
       name: cert-manager
       chart: cert-manager
-      version: v1.21.3
+      # renovate: datasource=helm depName=cert-manager registryUrl=https://charts.jetstack.io
+      version: "v1.21.3"
       repositoryOpts:
         repo: https://charts.jetstack.io
       namespace: keel-system

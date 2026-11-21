@@ -52,6 +52,7 @@ resources:
       name: forgejo
       chart: oci://code.forgejo.org/forgejo-helm/forgejo
       # Pinned (latest stable at time of pinning via `helm show chart`); Renovate bumps it.
+      # renovate: datasource=docker depName=code.forgejo.org/forgejo-helm/forgejo
       version: "17.3.3"
       namespace: keel-system
       createNamespace: true

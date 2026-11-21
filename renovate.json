@@ -154,6 +154,90 @@
       "automerge": false
     },
     {
+      "description": "Management add-on chart envoy-gateway and its catalog/apps twin: one PR bumps catalog/core, catalog/apps, the seed HelmRelease and the Stage 0 Pulumi release together (keel-cli drift tests); reviewed manually because the management plane runs it",
+      "matchManagers": [
+        "custom.regex"
+      ],
+      "matchFileNames": [
+        "deploy/**"
+      ],
+      "matchDepNames": [
+        "docker.io/envoyproxy/gateway-helm"
+      ],
+      "groupName": "envoy-gateway-chart",
+      "automerge": false
+    },
+    {
+      "description": "Management add-on chart flagger and its catalog/apps twin: one PR bumps catalog/core, catalog/apps, the seed HelmRelease and the Stage 0 Pulumi release together (keel-cli drift tests); reviewed manually because the management plane runs it",
+      "matchManagers": [
+        "custom.regex"
+      ],
+      "matchFileNames": [
+        "deploy/**"
+      ],
+      "matchDepNames": [
+        "flagger"
+      ],
+      "groupName": "flagger-chart",
+      "automerge": false
+    },
+    {
+      "description": "Management add-on chart prometheus and its catalog/apps twin: one PR bumps catalog/core, catalog/apps, the seed HelmRelease and the Stage 0 Pulumi release together (keel-cli drift tests); reviewed manually because the management plane runs it",
+      "matchManagers": [
+        "custom.regex"
+      ],
+      "matchFileNames": [
+        "deploy/**"
+      ],
+      "matchDepNames": [
+        "prometheus"
+      ],
+      "groupName": "prometheus-chart",
+      "automerge": false
+    },
+    {
+      "description": "Management add-on chart cert-manager and its catalog/apps twin: one PR bumps catalog/core, catalog/apps, the seed HelmRelease and the Stage 0 Pulumi release together (keel-cli drift tests); reviewed manually because the management plane runs it",
+      "matchManagers": [
+        "custom.regex"
+      ],
+      "matchFileNames": [
+        "deploy/**"
+      ],
+      "matchDepNames": [
+        "cert-manager"
+      ],
+      "groupName": "cert-manager-chart",
+      "automerge": false
+    },
+    {
+      "description": "Management add-on chart forgejo and its catalog/apps twin: one PR bumps catalog/core, catalog/apps, the seed HelmRelease and the Stage 0 Pulumi release together (keel-cli drift tests); reviewed manually because the management plane runs it",
+      "matchManagers": [
+        "custom.regex"
+      ],
+      "matchFileNames": [
+        "deploy/**"
+      ],
+      "matchDepNames": [
+        "code.forgejo.org/forgejo-helm/forgejo"
+      ],
+      "groupName": "forgejo-chart",
+      "automerge": false
+    },
+    {
+      "description": "Management add-on chart seaweedfs (catalog/core/s3-state-backend) and its catalog/apps/seaweedfs twin: one PR bumps catalog/core, catalog/apps, the seed HelmRelease and the Stage 0 Pulumi release together (keel-cli drift tests); reviewed manually because the management plane runs it",
+      "matchManagers": [
+        "custom.regex"
+      ],
+      "matchFileNames": [
+        "deploy/**"
+      ],
+      "matchDepNames": [
+        "seaweedfs"
+      ],
+      "groupName": "seaweedfs-chart",
+      "automerge": false
+    },
+    {
       "description": "Pinned semantic-release toolchain (release/package.json + package-lock.json)",
       "matchManagers": [
         "npm"

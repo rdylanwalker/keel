@@ -11,6 +11,7 @@ spec:
   upstream:
     chart: oci://docker.io/envoyproxy/gateway-helm
     repoURL: oci://docker.io/envoyproxy/gateway-helm
+    # renovate: datasource=docker depName=docker.io/envoyproxy/gateway-helm
     version: "v1.10.0"
   progressiveDelivery:
     flaggerSupported: false

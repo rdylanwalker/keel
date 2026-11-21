@@ -11,11 +11,16 @@ spec:
   upstream:
     chart: gateway-helm
     repoURL: oci://docker.io/envoyproxy
-    version: "v1.3.0"
+    # renovate: datasource=docker depName=docker.io/envoyproxy/gateway-helm
+    version: "v1.10.0"
   # The chart installs cluster-scoped resources (Gateway API + Envoy Gateway CRDs and a ClusterRole/Binding), so
   # it may only target a remote workload cluster (the management cluster runs catalog/core/envoy-gateway).
   placement:
     scope: cluster
+  # The chart ships its Gateway API + Envoy Gateway CRDs in `crds/`: replace them on upgrade like the seed HelmRelease
+  # (`deploy/seed/core-addons/envoy-gateway.yaml`), so a version bump also updates the CRDs (Flux's default skips
+  # them on upgrade).
+  crdPolicy: CreateReplace
   progressiveDelivery:
     flaggerSupported: false
     defaultCanary: false

@@ -23,6 +23,7 @@ spec:
   chart:
     spec:
       chart: flagger
+      # renovate: datasource=helm depName=flagger registryUrl=https://flagger.app
       version: "1.45.0"
       sourceRef:
         kind: HelmRepository

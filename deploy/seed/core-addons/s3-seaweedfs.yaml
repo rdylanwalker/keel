@@ -20,6 +20,7 @@ spec:
   chart:
     spec:
       chart: seaweedfs
+      # renovate: datasource=helm depName=seaweedfs registryUrl=https://seaweedfs.github.io/seaweedfs/helm
       version: "4.54.0"
       sourceRef:
         kind: HelmRepository

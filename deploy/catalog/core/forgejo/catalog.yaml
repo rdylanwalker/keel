@@ -18,6 +18,7 @@ spec:
   upstream:
     chart: oci://code.forgejo.org/forgejo-helm/forgejo
     repoURL: oci://code.forgejo.org/forgejo-helm/forgejo
+    # renovate: datasource=docker depName=code.forgejo.org/forgejo-helm/forgejo
     version: "17.3.3"
   progressiveDelivery:
     flaggerSupported: false

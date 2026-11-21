@@ -4421,53 +4421,147 @@ mod workload_operator_app_tests {
         ]
     }
 
+    /// Every Helm management add-on with a self-service twin:
+    /// `(app id, catalog/apps, catalog/core, seed core-addon, Stage 0 Pulumi program)`.
+    fn helm_chart_twins() -> [(
+        &'static str,
+        &'static str,
+        &'static str,
+        &'static str,
+        &'static str,
+    ); 9] {
+        [
+            (
+                "kyverno",
+                STARTER_KYVERNO_APP_YAML,
+                CORE_CATALOG_KYVERNO_YAML,
+                SEED_CORE_ADDON_KYVERNO_YAML,
+                state::CONTROL_PLANE_PULUMI_YAML,
+            ),
+            (
+                "pulumi-kubernetes-operator",
+                STARTER_PKO_APP_YAML,
+                CORE_CATALOG_PKO_YAML,
+                SEED_CORE_ADDON_PKO_YAML,
+                state::CONTROL_PLANE_PULUMI_YAML,
+            ),
+            (
+                "flux2",
+                STARTER_FLUX2_APP_YAML,
+                CORE_CATALOG_FLUX2_YAML,
+                SEED_CORE_ADDON_FLUX2_YAML,
+                state::CONTROL_PLANE_PULUMI_YAML,
+            ),
+            (
+                "envoy-gateway",
+                include_str!("../../../../deploy/catalog/apps/envoy-gateway/catalog.yaml"),
+                CORE_CATALOG_ENVOY_GATEWAY_YAML,
+                SEED_CORE_ADDON_ENVOY_GATEWAY_YAML,
+                state::CONTROL_PLANE_PULUMI_YAML,
+            ),
+            (
+                "flagger",
+                include_str!("../../../../deploy/catalog/apps/flagger/catalog.yaml"),
+                CORE_CATALOG_FLAGGER_YAML,
+                SEED_CORE_ADDON_FLAGGER_YAML,
+                state::CONTROL_PLANE_PULUMI_YAML,
+            ),
+            (
+                "prometheus",
+                include_str!("../../../../deploy/catalog/apps/prometheus/catalog.yaml"),
+                CORE_CATALOG_PROMETHEUS_YAML,
+                SEED_CORE_ADDON_PROMETHEUS_YAML,
+                state::CONTROL_PLANE_PULUMI_YAML,
+            ),
+            (
+                "cert-manager",
+                STARTER_CERT_MANAGER_APP_YAML,
+                CORE_CATALOG_CERT_MANAGER_YAML,
+                SEED_CORE_ADDON_CERT_MANAGER_YAML,
+                state::CONTROL_PLANE_PULUMI_YAML,
+            ),
+            (
+                "forgejo",
+                STARTER_FORGEJO_APP_YAML,
+                CORE_CATALOG_FORGEJO_YAML,
+                SEED_CORE_ADDON_FORGEJO_YAML,
+                state::CONTROL_PLANE_FORGEJO_PULUMI_YAML,
+            ),
+            (
+                "seaweedfs",
+                STARTER_SEAWEEDFS_APP_YAML,
+                CORE_CATALOG_S3_STATE_BACKEND_YAML,
+                SEED_CORE_ADDON_S3_SEAWEEDFS_YAML,
+                state::CONTROL_PLANE_PULUMI_YAML,
+            ),
+        ]
+    }
+
     /// Number of `version: "<version>"` lines directly preceded by the Renovate annotation of
-    /// `dep_name` (the `renovate.json` custom regex manager bumps exactly those lines).
-    fn renovate_annotated_versions(raw: &str, dep_name: &str, version: &str) -> usize {
+    /// `dep_name` (the `renovate.json` custom regex manager bumps exactly those lines). Helm
+    /// repositories need `datasource=helm` plus their `registryUrl`; OCI charts `datasource=docker`.
+    fn renovate_annotated_versions(
+        raw: &str,
+        dep_name: &str,
+        registry_url: Option<&str>,
+        version: &str,
+    ) -> usize {
         let lines: Vec<&str> = raw.lines().map(str::trim).collect();
         lines
             .windows(2)
             .filter(|pair| {
+                let fields: Vec<&str> = pair[0].split_whitespace().collect();
+                let has = |f: &str| fields.contains(&f);
+                let registry_ok = match registry_url {
+                    Some(url) => {
+                        has("datasource=helm")
+                            && fields.iter().any(|f| {
+                                f.strip_prefix("registryUrl=")
+                                    .is_some_and(|u| u.trim_end_matches('/') == url)
+                            })
+                    }
+                    None => {
+                        has("datasource=docker")
+                            && !fields.iter().any(|f| f.starts_with("registryUrl="))
+                    }
+                };
                 pair[0].starts_with("# renovate: datasource=")
-                    && pair[0]
-                        .split_whitespace()
-                        .any(|f| f == format!("depName={dep_name}"))
+                    && has(&format!("depName={dep_name}"))
+                    && registry_ok
                     && pair[1] == format!("version: \"{version}\"")
             })
             .count()
     }
 
-    /// Renovate bumps all four pins of each operator chart in one PR (`renovate.json`): every
-    /// pin carries the annotation, so a bump can never update only some of them.
+    /// Renovate bumps all four pins of each management Helm chart in one PR (`renovate.json`):
+    /// every pin carries the annotation, so a bump can never update only some of them.
     #[test]
-    fn workload_operator_chart_pins_are_renovate_annotated() {
+    fn management_helm_chart_pins_are_renovate_annotated() {
         let renovate: Value =
             serde_json::from_str(include_str!("../../../../renovate.json")).unwrap();
-        for (id, app_raw, core_raw, seed_raw, _) in operator_twins() {
+        for (id, app_raw, core_raw, seed_raw, program_raw) in helm_chart_twins() {
             let app = keel_core::parse_catalog_application(app_raw).unwrap();
+            assert_eq!(app.metadata.id, id);
+            assert_eq!(app.metadata.runtime, keel_core::AppRuntime::Helm, "{id}");
             let version = app.spec.upstream.version.clone().unwrap();
             let repo = app.spec.upstream.repo_url.trim_end_matches('/');
             let chart = app.spec.upstream.chart.clone().unwrap();
-            let dep_name = match repo.strip_prefix("oci://") {
-                Some(registry) => format!("{registry}/{chart}"),
-                None => chart,
+            let (dep_name, registry_url) = match repo.strip_prefix("oci://") {
+                Some(registry) => (format!("{registry}/{chart}"), None),
+                None => (chart, Some(repo)),
             };
             for (file, raw) in [
                 ("catalog/apps", app_raw),
                 ("catalog/core", core_raw),
                 ("seed core-addon", seed_raw),
+                ("Stage 0 Pulumi program", program_raw),
             ] {
                 assert_eq!(
-                    renovate_annotated_versions(raw, &dep_name, &version),
+                    renovate_annotated_versions(raw, &dep_name, registry_url, &version),
                     1,
-                    "{id}: {file} version pin lacks the Renovate annotation"
+                    "{id}: {file} version pin {version} lacks the Renovate annotation"
                 );
             }
-            assert_eq!(
-                renovate_annotated_versions(state::CONTROL_PLANE_PULUMI_YAML, &dep_name, &version),
-                1,
-                "{id}: Stage 0 Pulumi version pin lacks the Renovate annotation"
-            );
             // One grouped, manually reviewed PR per chart.
             let rule = renovate["packageRules"]
                 .as_array()
@@ -4476,7 +4570,90 @@ mod workload_operator_app_tests {
                 .find(|r| r["matchDepNames"] == serde_json::json!([dep_name]))
                 .unwrap_or_else(|| panic!("{id}: no renovate packageRule"));
             assert_eq!(rule["automerge"], false, "{id}");
-            assert!(rule["groupName"].is_string(), "{id}");
+            assert_eq!(rule["groupName"], format!("{id}-chart"), "{id}");
+            assert_eq!(rule["matchManagers"], serde_json::json!(["custom.regex"]));
+        }
+    }
+
+    /// Twins of charts shipping their CRDs in `crds/` replace them on upgrade like the seed
+    /// HelmRelease, so bumping the shared version also updates existing installs' CRDs.
+    #[test]
+    fn helm_twins_reuse_the_seed_crd_policy() {
+        for (id, app_raw, _, seed_raw, _) in helm_chart_twins() {
+            let app = yaml(app_raw);
+            let seed = seed_helm_release(seed_raw);
+            let policy = &app["spec"]["crdPolicy"];
+            if [
+                "envoy-gateway",
+                "flagger",
+                "kyverno",
+                "pulumi-kubernetes-operator",
+            ]
+            .contains(&id)
+            {
+                assert_eq!(policy, "CreateReplace", "{id}");
+            }
+            if !policy.is_null() {
+                assert_eq!(policy, &seed["spec"]["install"]["crds"], "{id}: install");
+                assert_eq!(policy, &seed["spec"]["upgrade"]["crds"], "{id}: upgrade");
+            }
+        }
+    }
+
+    /// Every management add-on (`deploy/catalog/core/<id>`) has a self-service twin in
+    /// `deploy/catalog/apps/` pinned to the same upstream version (chart version or image tag).
+    /// The mapping is explicit: a new core entry fails here until its twin is listed.
+    #[test]
+    fn every_core_catalog_app_pins_the_same_version_as_its_self_service_twin() {
+        const TWINS: [(&str, &str); 11] = [
+            ("cert-manager", "cert-manager"),
+            ("envoy-gateway", "envoy-gateway"),
+            ("flagger", "flagger"),
+            ("flux2", "flux2"),
+            ("forgejo", "forgejo"),
+            ("keel-server", "keel-server"),
+            ("kyverno", "kyverno"),
+            ("prometheus", "prometheus"),
+            ("pulumi-kubernetes-operator", "pulumi-kubernetes-operator"),
+            ("rauthy", "rauthy"),
+            ("s3-state-backend", "seaweedfs"),
+        ];
+        let catalog = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy/catalog");
+        let mut core_ids: Vec<String> = std::fs::read_dir(catalog.join("core"))
+            .unwrap()
+            .map(|e| e.unwrap())
+            .filter(|e| e.path().join("catalog.yaml").is_file())
+            .map(|e| e.file_name().into_string().unwrap())
+            .collect();
+        core_ids.sort();
+        let mapped: Vec<&str> = TWINS.iter().map(|(core, _)| *core).collect();
+        assert_eq!(
+            core_ids, mapped,
+            "every deploy/catalog/core/<id> needs an explicit self-service twin mapping"
+        );
+        let read = |dir: &str, id: &str| -> Value {
+            let path = catalog.join(dir).join(id).join("catalog.yaml");
+            let raw = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            serde_yml::from_str(&raw).unwrap()
+        };
+        for (core_id, app_id) in TWINS {
+            let core = read("core", core_id);
+            let app = read("apps", app_id);
+            assert_eq!(core["metadata"]["id"], core_id);
+            assert_eq!(app["metadata"]["id"], app_id);
+            // Helm add-ons have Helm twins (same chart); image-based Kustomize add-ons (Rauthy,
+            // keel-server) have manifest twins pinning the same image tag.
+            if core["metadata"]["runtime"] == "helm" {
+                assert_eq!(app["metadata"]["runtime"], "helm", "{app_id}: runtime");
+            }
+            let version = core["spec"]["upstream"]["version"]
+                .as_str()
+                .unwrap_or_else(|| panic!("catalog/core/{core_id} has no upstream version"));
+            assert_eq!(
+                app["spec"]["upstream"]["version"], version,
+                "catalog/apps/{app_id} version drifts from catalog/core/{core_id}"
+            );
         }
     }
 

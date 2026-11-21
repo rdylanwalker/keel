@@ -11,6 +11,7 @@ spec:
   upstream:
     chart: cert-manager
     repoURL: https://charts.jetstack.io
+    # renovate: datasource=helm depName=cert-manager registryUrl=https://charts.jetstack.io
     version: "v1.21.3"
   # The chart installs cluster-scoped resources (6 CRDs, ClusterRoles/Bindings and admission webhooks), so
   # it may only target a remote workload cluster (the management cluster runs catalog/core/cert-manager).

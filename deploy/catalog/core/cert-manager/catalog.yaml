@@ -11,6 +11,7 @@ spec:
   upstream:
     chart: cert-manager
     repoURL: https://charts.jetstack.io
+    # renovate: datasource=helm depName=cert-manager registryUrl=https://charts.jetstack.io
     version: "v1.21.3"
   progressiveDelivery:
     flaggerSupported: false

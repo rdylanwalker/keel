@@ -11,11 +11,16 @@ spec:
   upstream:
     chart: flagger
     repoURL: https://flagger.app
-    version: "1.40.0"
+    # renovate: datasource=helm depName=flagger registryUrl=https://flagger.app
+    version: "1.45.0"
   # The chart installs cluster-scoped resources (Canary/MetricTemplate/AlertProvider CRDs and a ClusterRole/Binding), so
   # it may only target a remote workload cluster (the management cluster runs catalog/core/flagger).
   placement:
     scope: cluster
+  # The chart ships its Canary/MetricTemplate/AlertProvider CRDs in `crds/`: replace them on upgrade like the seed HelmRelease
+  # (`deploy/seed/core-addons/flagger.yaml`), so a version bump also updates the CRDs (Flux's default skips
+  # them on upgrade).
+  crdPolicy: CreateReplace
   progressiveDelivery:
     flaggerSupported: false
     defaultCanary: false
