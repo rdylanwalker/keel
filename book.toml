@@ -10,9 +10,4 @@ build-dir = "book"
 [output.html]
 default-theme = "navy"
 preferred-dark-theme = "navy"
-additional-js = ["mermaid.min.js", "mermaid-init.js"]
-
-[preprocessor]
-
-[preprocessor.mermaid]
-command = "mdbook-mermaid"
+additional-js = ["mermaid-init.js"]

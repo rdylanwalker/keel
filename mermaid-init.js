@@ -1,39 +1,74 @@
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+// Client-side Mermaid rendering for the Keel mdBook site.
+//
+// mdBook renders fenced ```mermaid blocks as <pre><code class="language-mermaid">.
+// This script swaps each block for a <pre class="mermaid"> node holding the
+// diagram source, then renders it with the vendored Mermaid build using a theme
+// that matches the active mdBook theme. Switching mdBook themes re-renders.
+//
+// Mermaid is large (~5 MB), so it is loaded lazily from docs/assets/js/ only on
+// pages that actually contain a diagram.
 
 (() => {
     const darkThemes = ['ayu', 'navy', 'coal'];
-    const lightThemes = ['light', 'rust'];
+    const html = document.documentElement;
 
-    const classList = document.getElementsByTagName('html')[0].classList;
+    const mermaidTheme = () =>
+        darkThemes.some((theme) => html.classList.contains(theme)) ? 'dark' : 'default';
 
-    let lastThemeWasLight = true;
-    for (const cssClass of classList) {
-        if (darkThemes.includes(cssClass)) {
-            lastThemeWasLight = false;
-            break;
+    const nodes = [];
+    for (const code of document.querySelectorAll('pre > code.language-mermaid')) {
+        const pre = code.parentElement;
+        const diagram = document.createElement('pre');
+        diagram.className = 'mermaid';
+        diagram.dataset.source = code.textContent;
+        diagram.textContent = code.textContent;
+        pre.replaceWith(diagram);
+        nodes.push(diagram);
+    }
+    if (nodes.length === 0) {
+        return;
+    }
+
+    const root = typeof path_to_root === 'string' ? path_to_root : '';
+    const loadMermaid = () =>
+        new Promise((resolve, reject) => {
+            if (window.mermaid) {
+                resolve();
+                return;
+            }
+            const script = document.createElement('script');
+            script.src = `${root}assets/js/mermaid.min.js`;
+            script.onload = () => resolve();
+            script.onerror = () => reject(new Error(`failed to load ${script.src}`));
+            document.head.appendChild(script);
+        });
+
+    let renderedTheme = null;
+    const render = async () => {
+        const theme = mermaidTheme();
+        if (theme === renderedTheme) {
+            return;
         }
-    }
+        renderedTheme = theme;
+        for (const node of nodes) {
+            node.removeAttribute('data-processed');
+            node.textContent = node.dataset.source;
+        }
+        mermaid.initialize({ startOnLoad: false, theme, securityLevel: 'strict' });
+        try {
+            await mermaid.run({ nodes });
+        } catch (err) {
+            console.error('Mermaid rendering failed', err);
+        }
+    };
 
-    const theme = lastThemeWasLight ? 'default' : 'dark';
-    mermaid.initialize({ startOnLoad: true, theme });
-
-    // Simplest way to make mermaid re-render the diagrams in the new theme is via refreshing the page
-
-    for (const darkTheme of darkThemes) {
-        document.getElementById('mdbook-theme-' + darkTheme).addEventListener('click', () => {
-            if (lastThemeWasLight) {
-                window.location.reload();
-            }
-        });
-    }
-
-    for (const lightTheme of lightThemes) {
-        document.getElementById('mdbook-theme-' + lightTheme).addEventListener('click', () => {
-            if (!lastThemeWasLight) {
-                window.location.reload();
-            }
-        });
-    }
+    loadMermaid()
+        .then(() => {
+            render();
+            new MutationObserver(render).observe(html, {
+                attributes: true,
+                attributeFilter: ['class'],
+            });
+        })
+        .catch((err) => console.error('Mermaid could not be loaded', err));
 })();

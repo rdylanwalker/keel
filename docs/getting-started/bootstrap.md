@@ -121,13 +121,13 @@ keel bootstrap init \
 By default, `keel bootstrap init` installs the core control-plane components onto the target cluster using `kubectl` and `helm`:
 
 - **Namespaces:** `flux-system`, `keel-system`, `keel-previews`
-- **SeaweedFS (`s3-state-backend`):** In-cluster S3-compatible state backend in `keel-system` with the `pulumi-state` bucket and synced `keel-s3-credentials` Secret
-- **Flux CD (`flux2`):** GitOps source, kustomize, and helm controllers in `flux-system`
-- **Kyverno:** Admission controller in `kyverno` plus Keel's seed policies (including `local-kind-docker-socket-exception` and `keel-docker-proxy` in `flux-system` when `--local-dev-docker-socket-exception` is passed)
-- **Pulumi Kubernetes Operator (PKO v2):** Infrastructure operator in `keel-system` plus the `management-cluster-core` `Stack`
+- **SeaweedFS (`s3-state-backend`, chart `4.54.0`):** In-cluster S3-compatible state backend in `keel-system`, with the versioned `pulumi-state` bucket. Tenants get scoped identities limited to `tenants/<id>/*`, never the admin keys.
+- **Flux CD (`flux2`, chart `2.20.0`):** GitOps source, kustomize, and helm controllers in `flux-system`, with the multitenancy lockdown enabled (`--no-cross-namespace-refs=true`, default ServiceAccount impersonation)
+- **Kyverno (chart `3.10.0`):** A single admission controller release in `keel-system`, plus Keel's seed policies (including `local-kind-docker-socket-exception` and `keel-docker-proxy` in `flux-system` when `--local-dev-docker-socket-exception` is passed)
+- **Pulumi Kubernetes Operator (PKO v2, chart `2.10.1`):** Infrastructure operator in `keel-system` plus the `management-cluster-core` `Stack`
 - **Envoy Gateway (`envoy-gateway`):** Gateway API controller in `keel-system` with `GatewayClass` `keel-envoy` and `Gateway` `keel-ingress` (HTTP ports `80` and `8888`)
 - **Prometheus (`prometheus`) & Flagger (`flagger`):** Telemetry (`http://prometheus.keel-system:9090`) and progressive canary delivery controller (`meshProvider: gatewayapi:v1`) in `keel-system`
-- **Rauthy (`rauthy`):** Lightweight Rust in-cluster OIDC identity provider in `keel-system` with built-in Admin UI (`http://idp.keel.local:8888/auth/v1/admin`) seeded with `keel-system/rauthy-config`, `keel-admins` + `tenant-default` groups, `keel-server` PKCE client, and initial admin credentials (configured with `restricted` PSS `securityContext`; skipped if `--oidc-issuer` or `--oidc-provider none` is supplied)
+- **Rauthy (`rauthy`):** Lightweight Rust in-cluster OIDC identity provider in `keel-system` with built-in Admin UI (`https://idp.keel.local:8888/auth/v1/admin`) seeded with `keel-system/rauthy-config`, `keel-admins` + `tenant-default` groups, `keel-server` PKCE client, and initial admin credentials (configured with `restricted` PSS `securityContext`; skipped if `--oidc-issuer` or `--oidc-provider none` is supplied)
 
 To initialize only the cluster and GitOps repository without installing the core controllers onto the cluster, pass `--skip-core-install`:
 
@@ -148,72 +148,95 @@ keel bootstrap init \
 - `--admin-username` / `--admin-password` — Customizes the initial admin account seeded into in-cluster Rauthy (`keel-system/rauthy-config`) and added to `keel-admins`. When omitted, `keel bootstrap init` generates a random password and prints it in the bootstrap summary.
 - `--oidc-provider <rauthy|none>` — Selects the Stage 0 in-cluster OIDC provider (defaults to `rauthy`; pass `none` to skip in-cluster IdP installation).
 - `--oidc-issuer <URL>` / `--oidc-client-id <ID>` — Connects an external OIDC provider instead of installing in-cluster Rauthy.
+- `--oidc-public-url <URL>`: the public HTTPS URL of in-cluster Rauthy. The default is `https://idp.keel.local:8888`. The OIDC issuer becomes `<url>/auth/v1`, and the Forgejo and portal hosts are derived from the parent domain (`forgejo.<domain>`, `keel.<domain>`). Ingress uses a self-signed CA (`keel-system/keel-wildcard-tls`), which `keel serve` trusts automatically. Your browser will warn about it unless you import that CA.
+- `KEEL_TENANT_GIT_TOKEN` (environment): a read-only token for `tenant-default`'s Flux `GitRepository` when you use an external forge. The operator `--git-token` is never shared with tenants.
+- `KEEL_FORGEJO_ADMIN_PASSWORD` (environment): overrides the generated Forgejo admin password, which is stored in `keel-system/keel-forgejo-admin`.
 
-## 2. Start the Control Plane Server
 
-```bash
-# Ensure idp.keel.local resolves to localhost for Envoy Gateway (:8888) OIDC routing
-# Add `127.0.0.1 idp.keel.local` to /etc/hosts (or C:\Windows\System32\drivers\etc\hosts on Windows)
-keel serve --bind 127.0.0.1:8080 --repo-dir ./keel-gitops
-```
+### Stage 0 State, Passphrase & Escrow
 
-When a Kubernetes cluster is reachable via `KUBECONFIG` (or in-cluster config), `keel serve` automatically:
-- Queries live **Flux CD** (`Kustomization`, `HelmRelease`) and **PKO v2** (`Stack`) CRD conditions to display `Synced`, `Ready`, `Reconciling`, or `Error` statuses in the UI and CLI (falling back to `Pending` when offline).
-- Opens background `kubectl port-forward` tunnels to in-cluster **Forgejo** (`--with-forge`, preferring `127.0.0.1:3000` or falling back to an ephemeral port) and **Envoy Gateway** (`keel-ingress`, preferring `127.0.0.1:8888` for Rauthy `http://idp.keel.local:8888`) when running on `localhost`.
-- Rewrites Forgejo PR `html_url` links (**Forge Link** / **View PR on Forge**) to the active local port-forwarded URL.
+Stage 0 is a set of Pulumi stacks named `stage0-<program>-<cluster>`, for example `stage0-kind-keel-mgmt` and `stage0-control-plane-keel-mgmt`. Their state is durable and kept per cluster:
 
-When running locally without an active cluster (e.g. `just serve` or `just serve-demo`), `keel serve` prints:
+- `~/.config/keel/stage0/<cluster>/state/`: the local Pulumi backend.
+- `~/.config/keel/stage0/<cluster>/programs/<program>/`: the materialized programs and encrypted stack config.
+- `~/.config/keel/stage0/<cluster>/pulumi-passphrase`: a generated passphrase (`0600`). It is also stored in `keel-system/keel-stage0-pulumi-passphrase`.
+
+The root directory is `$KEEL_CONFIG_DIR`, or `$XDG_CONFIG_HOME/keel`, or `~/.config/keel`. Set `PULUMI_CONFIG_PASSPHRASE` to supply your own passphrase.
+
+When the in-cluster SeaweedFS is used, Stage 0 also escrows every stack to `s3://pulumi-state/stage0/<cluster>/`. It turns on bucket versioning, or falls back to timestamped snapshots if the backend rejects versioning. The first run prints a one-time notice: **copy the passphrase into your vault.** Without it, the S3 escrow can't be decrypted if both this workstation and the cluster are lost. See [Break-Glass Recovery](../operations/break-glass-recovery.md).
+
+Stage 0 core resources carry `protect: true`. To tear the stack down deliberately with Pulumi, you first need `pulumi state unprotect --all`. Deleting the cluster skips this.
+
+## 2. Configure Local DNS
+
+The Stage 0 ingress (Envoy Gateway `keel-ingress`, port `8888`) serves Rauthy and, with `--with-forge`, Forgejo over HTTPS. Add both hosts to `/etc/hosts`, or `C:\Windows\System32\drivers\etc\hosts` on Windows:
 
 ```text
-Keel Control Plane listening on http://127.0.0.1:8080
+127.0.0.1 idp.keel.local forgejo.keel.local
 ```
+
+The `forgejo.keel.local` entry is needed so PR links printed by the CLI and shown in the GUI resolve. Inside `kind`, Stage 0 adds CoreDNS rewrites so pods reach the same hostnames.
+
+## 3. Start the Control Plane Server
+
+```bash
+keel serve --repo-dir ./keel-gitops    # binds 127.0.0.1:8080 by default
+```
+
+When a Kubernetes cluster is reachable (through `KUBECONFIG` or in-cluster config), `keel serve`:
+
+- overlays live **Flux CD** (`Kustomization`, `HelmRelease`) and **PKO v2** (`Stack`) conditions as `Synced`, `Ready`, `Reconciling`, or `Error`. It shows `Pending` while it is offline.
+- opens background `kubectl port-forward` tunnels to **Forgejo** (`--with-forge`, `127.0.0.1:3000` or an ephemeral port) and **Envoy Gateway** (`keel-ingress`, `127.0.0.1:8888` for `https://idp.keel.local:8888`) when it runs on localhost.
+- trusts the Stage 0 ingress CA from `keel-system/keel-wildcard-tls` for its OIDC calls.
+- re-applies the Kyverno `restrict-pulumi-providers` policy from `providers/registry.yaml`. Pulumi's built-in providers, including `kubernetes`, are always allowed.
+- starts the preview reconciler, which garbage-collects previews of merged or closed PRs every 60 s.
+
+To run the server inside the cluster instead, see [Running keel-server In-Cluster](../operations/in-cluster-server.md).
 
 ### Development Shortcuts (`just`)
 
-- `just serve` — Starts `keel serve` with a clean temporary local Git repository.
-- `just serve-demo` — Starts `keel serve` pre-seeded with `deploy/catalog/` blueprints and providers (open `http://127.0.0.1:8080/?demo=true` for an unauthenticated UI preview).
+- `just serve`: starts `keel serve` against a clean temporary local Git repository.
+- `just serve-demo`: rebuilds the UI with `VITE_ENABLE_DEMO=true` and starts `keel serve` with `deploy/catalog/` pre-seeded. Open `http://127.0.0.1:8080/?demo=true` for an unauthenticated preview with a **DEMO DATA** banner. Run `just build-ui` afterwards to restore a production bundle. Production bundles ignore `?demo=true`.
 
-## 3. Authenticate
+## 4. Authenticate
 
 ### Web UI
 
-- **With OIDC (default after `keel bootstrap init`):** Open `http://127.0.0.1:8080`, click **Sign in with OIDC**, and log in with the Rauthy admin username/password printed by `keel bootstrap init` (or your external OIDC account). To manage users and groups, open the Rauthy Admin UI link (`http://idp.keel.local:8888/auth/v1/admin`) from the **Service** box on the **Rauthy OIDC Provider** card under **Control Plane & Providers → Management Plane Base Addons**.
-- **UI Preview Mode (`just serve-demo`):** Open `http://127.0.0.1:8080/?demo=true` to explore the UI with pre-seeded demo data without an OIDC provider.
+Open `http://127.0.0.1:8080`, click **Sign in with OIDC**, and sign in with the Rauthy admin username and password printed by `keel bootstrap init`, or with your external OIDC account. Manage users and groups in the Rauthy Admin UI (`https://idp.keel.local:8888/auth/v1/admin`), which is linked from **Control Plane & Providers → Management Plane Base Addons**.
+
+Tenant access comes from IdP groups named `tenant-<id>` (member) and `tenant-<id>-admin` (admin). Cluster admin comes from `keel-admins`. See [Security & Tenancy](../operations/security-and-tenancy.md#identity--authorization).
 
 ### CLI
 
-Authenticate the CLI via OIDC Authorization Code + PKCE:
+`keel auth login` uses the RFC 8252 loopback flow. The CLI listens on `127.0.0.1:<random>`, opens your browser, and stores a 1-hour Bearer token (`0600`) in the Keel config directory:
 
 ```bash
-keel auth login --server http://127.0.0.1:8080
+keel auth login --server http://127.0.0.1:8080   # --no-browser prints the URL instead
+keel auth status
+export KEEL_SERVER=http://127.0.0.1:8080          # then omit --server
 ```
 
-## 4. WSL2 + Windows Browser Notes
+## 5. WSL2 + Windows Browser Notes
 
-When running `kind` and `keel serve` inside **WSL2** while opening the GUI in a **Windows** browser:
+When `kind` and `keel serve` run inside **WSL2** and you open the GUI in a **Windows** browser:
 
-- **Keel UI & Forge Links Work Without Custom Ports:** Open `http://localhost:8080` or `http://127.0.0.1:8080` in Windows. `keel-server` derives the OIDC `redirect_uri` from the incoming `Host` header and sets `keel_pkce` with `SameSite=Lax` (and omits `Secure` on loopback HTTP) so the PKCE cookie survives the redirect back from Rauthy (`http://idp.keel.local:8888`). Stick to the same host (`localhost` or `127.0.0.1`) you started on, and add `127.0.0.1 idp.keel.local` to `C:\Windows\System32\drivers\etc\hosts`.
-- **Direct Forgejo Access:** Clicking **Forge Link** / **View PR on Forge** opens Forgejo on `127.0.0.1:<port>` (forwarded automatically by `keel serve`). You can sign in directly with the Stage 0 Forgejo admin credentials (`keel` / `keel-admin-dev`).
-- **Optional — Forgejo OIDC SSO (`forgejo.keel.local:8888`):** Forgejo's `openidConnect` integration (`go-oidc`) requires a single OIDC `issuer` URL reachable by **both** your Windows browser and the Forgejo pod inside `kind`. To enable **Sign in with dex** on Forgejo:
-  1. Port-forward the Envoy Gateway service in `keel-system` to `8888`:
-     ```bash
-     kubectl -n keel-system port-forward svc/<envoy-keel-system-keel-ingress-svc> 8888:8888
-     ```
-  2. Add CoreDNS `rewrite name` entries inside `kind` (`kube-system/coredns`) pointing `dex.keel.local` and `forgejo.keel.local` to `<envoy-svc>.keel-system.svc.cluster.local`.
-  3. Add the hostnames to the **Windows** `hosts` file from an **Administrator PowerShell**:
-     ```powershell
-     Add-Content -Path C:\Windows\System32\drivers\etc\hosts -Value "`n127.0.0.1 dex.keel.local forgejo.keel.local"
-     ```
-  4. Configure Dex (`keel-system/dex-config`) with `issuer: http://dex.keel.local:8888/dex` and a `forgejo` client (`redirectURIs: http://forgejo.keel.local:8888/user/oauth2/dex/callback`), set `gitea.config.server.ROOT_URL=http://forgejo.keel.local:8888/` on the `forgejo` Helm release, and register the provider in Forgejo (`forgejo admin auth add-oauth --name dex --provider openidConnect ...`).
-  5. Note that the Stage 0 Forgejo Helm release uses `persistence.enabled=false` (ephemeral SQLite), so upgrading or restarting the Forgejo pod resets its database and requires re-registering the OAuth source and `keel/infra-gitops` repository.
+- Open `http://localhost:8080` or `http://127.0.0.1:8080`, and keep using whichever host you started on. `keel-server` derives the OIDC `redirect_uri` from the request `Host` and sets `keel_pkce` with `SameSite=Lax` (without `Secure` on loopback HTTP), so the PKCE cookie survives the redirect back from Rauthy.
+- Add `127.0.0.1 idp.keel.local forgejo.keel.local` to `C:\Windows\System32\drivers\etc\hosts` from an Administrator shell.
+- **Forgejo access:** **View PR on Forge** opens Forgejo through the port-forward. When both `--with-forge` and in-cluster Rauthy are used, Stage 0 registers a Forgejo OAuth source named `rauthy`, so **Sign in with rauthy** works at `https://forgejo.keel.local:8888`. You can also sign in as the Stage 0 admin user `keel`:
+  ```bash
+  kubectl -n keel-system get secret keel-forgejo-admin -o jsonpath='{.data.password}' | base64 -d
+  ```
+- The Stage 0 Forgejo release uses `persistence.enabled=false` (ephemeral SQLite). Restarting the Forgejo pod resets its database.
 
-## 5. Break-Glass Recovery
+## 6. Break-Glass Recovery
 
-If the management cluster or Git forge becomes unreachable, recover the control-plane stack directly from versioned S3 state:
+If the management cluster's add-ons or the Git forge are broken, re-apply the escrowed Stage 0 state directly from S3:
 
 ```bash
-keel bootstrap recover \
-  --s3-endpoint https://s3.infra.local \
-  --bucket pulumi-state \
-  --stack management-cluster-core
+kubectl -n keel-system port-forward svc/s3-state-backend-seaweedfs-s3 8333:8333 &
+export AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=...   # from keel-system/s3-state-backend-seaweedfs-s3-secret
+keel bootstrap recover --s3-endpoint http://127.0.0.1:8333 --cluster-name keel-mgmt --dry-run
+keel bootstrap recover --s3-endpoint http://127.0.0.1:8333 --cluster-name keel-mgmt
 ```
+
+The full runbook is in [Break-Glass Recovery](../operations/break-glass-recovery.md).

@@ -16,7 +16,7 @@
 1. **Provider-Agnostic Stage 0 Bootstrapping:** Keel does not require Proxmox VE or any specific hypervisor to start. Stage 0 supports local `kind` clusters, pre-existing `kubeconfig` clusters (`k3s`, `Talos`, managed K8s), Proxmox VE, and public clouds behind a unified `BootstrapTarget` interface.
 2. **Out-of-the-Box Upstream Fidelity:** Upstream Kubernetes manifests, Helm charts, and Kustomize overlays must run with zero structural modification. Portal metadata, form schemas, and ingress/progressive-delivery wrappers live in thin sidecar definitions (`catalog.yaml` with `apiVersion: keel.io/v1alpha1`, used strictly as a Git-stored schema rather than a cluster-installed CRD).
 3. **CNCF & Open-Source First:** Prefer graduated/incubating CNCF projects (**Flux CD**, **Envoy Gateway**, **Flagger**, **Kyverno**, **Prometheus**, **OpenTelemetry**) and high-momentum open-source tools (**Pulumi / PKO v2**, **SOPS + age**, **Forgejo/Gitea**).
-4. **Simplicity & Stateless Control Plane:** Avoid custom Kubernetes operators/CRDs (such as Crossplane XRDs) for infrastructure modeling—use Pulumi's native YAML/HCL runtimes and dynamic OpenTofu/Terraform provider bridge (`pulumi package add terraform-provider`) executed by PKO v2. Keep `keel-server` **stateless** with zero embedded or external databases (no SQLite or Postgres); store runtime state (bootstrap tokens, OIDC signing keys, encrypted user Git credentials) natively in Kubernetes `Secret`s and read desired/live state from Git, Forge APIs, and `kube-rs` CRD caches.
+4. **Simplicity & Stateless Control Plane:** Avoid custom Kubernetes operators/CRDs (such as Crossplane XRDs) for infrastructure modeling—use Pulumi's native YAML/HCL runtimes and dynamic OpenTofu/Terraform provider bridge (`pulumi package add terraform-provider`) executed by PKO v2. Keep `keel-server` **stateless** with zero embedded or external databases (no SQLite or Postgres); store runtime state (session/OIDC signing keys, encrypted user Git credentials) natively in Kubernetes `Secret`s and read desired/live state from Git, Forge APIs, and `kube-rs` CRD caches.
 5. **Control Plane vs. Workload Plane Isolation:** In multi-cluster deployments, the seed management cluster hosts strictly control-plane services while tenant applications, databases, and workload clusters run on separately provisioned infrastructure (targeted by Flux via `spec.kubeConfig.secretRef`) to prevent self-mutation lockouts. In single-cluster or local `kind` development mode, tenant workloads may run in isolated `tenant-<tenant-id>` namespaces on the seed cluster guarded by `NetworkPolicy`, `ResourceQuota`, and Kyverno policies.
 6. **Latest Compatible Dependency Baseline:** At project initialization, all Rust crates, npm packages, GitHub Actions, container images, and Flux/PKO release manifests must resolve to their **latest compatible stable versions**, maintained continuously via weekly automated **Renovate** updates with auto-merge.
 
@@ -31,7 +31,7 @@ flowchart TB
 
     subgraph ControlPlane["Management Cluster (kind / Existing K8s / Proxmox / Cloud)"]
         API["keel-server (axum + kube-rs)<br/>Direct git CLI + ForgeProvider + SSE Telemetry"]
-        S3["S3 State Backend (Garage / MinIO / Cloud S3)<br/>Versioned Pulumi State"]
+        S3["S3 State Backend (SeaweedFS / Cloud S3)<br/>Versioned Pulumi State"]
         FORGE["Git Forge (Forgejo / Gitea / GitHub / GitLab)<br/>Desired State + PR Previews"]
         OIDC["OIDC Provider (Rauthy / External OIDC)"]
         FLUX["Flux CD Controllers<br/>(source / kustomize / helm / notification)"]
@@ -78,14 +78,15 @@ Because PKO v2 and Flux require a running Kubernetes cluster, Stage 0 executes d
 
 #### Seed Control-Plane Installation (Identical Across All Targets)
 Once the seed cluster API is reachable, `keel bootstrap init` performs the exact same installation sequence regardless of target:
-1. Runs `deploy/bootstrap/control-plane/Pulumi.yaml` to install **Garage/MinIO S3** (or binds the cloud provider's S3-compatible bucket), **Flux CD**, **PKO v2**, **Kyverno**, **Envoy Gateway**, **Prometheus**, **Flagger**, **Rauthy** (Apache-2.0 lightweight Rust in-cluster OIDC provider with Admin UI for users, groups, and clients, unless `--oidc-issuer` or `--oidc-provider none` is passed), and optional in-cluster **Forgejo/Gitea**, handing management over in-place to Flux CD (`deploy/seed/core-addons/`).
+1. Runs `deploy/bootstrap/control-plane/Pulumi.yaml` to install **SeaweedFS S3** (or binds the cloud provider's S3-compatible bucket), **Flux CD**, **PKO v2**, **Kyverno**, **Envoy Gateway**, **Prometheus**, **Flagger**, **Rauthy** (Apache-2.0 lightweight Rust in-cluster OIDC provider with Admin UI for users, groups, and clients, unless `--oidc-issuer` or `--oidc-provider none` is passed), and optional in-cluster **Forgejo/Gitea**, handing management over in-place to Flux CD (`deploy/seed/core-addons/`).
 2. Generates a root **`age` keypair**, injects the private key into `flux-system/sops-age`, and writes `.sops.yaml` into the seed Git repository.
-3. For `kind`, `proxmox`, and cloud targets, uploads the Stage 0 Pulumi state to `s3://pulumi-state` and imports it into a Flux-managed PKO `Stack` CR (`management-cluster-core`) with `protect: true` enabled.
-4. Provisions the initial Rauthy admin user (`--admin-username` / `--admin-password`, or auto-generated credentials printed once to stdout) into `keel-admins` + `rauthy_admin`, configures the `keel-server` OIDC PKCE client (`groups` scope) in `keel-system/rauthy-config`, exposes Rauthy via Envoy Gateway (`http://idp.keel.local:8888`), and exposes the portal on `http://localhost:8080`.
+3. Keeps durable Stage 0 Pulumi state per cluster under `~/.config/keel/stage0/<cluster>/` (`$KEEL_CONFIG_DIR` or `$XDG_CONFIG_HOME/keel` override): `state/` (local `file://` backend), `programs/<program>/` (materialized `Pulumi.yaml` + encrypted stack config), and a generated `pulumi-passphrase` (`0600`, also stored in `keel-system/keel-stage0-pulumi-passphrase`; a one-time notice instructs the operator to escrow it). Stage 0 stacks are named `stage0-<program>-<cluster>`. When the in-cluster SeaweedFS backend is used, every Stage 0 stack is escrowed to `s3://pulumi-state/stage0/<cluster>/` (checkpoints, programs/config, `manifest.json`) with bucket versioning enabled, falling back to timestamped snapshots (`stage0/<cluster>/snapshots/<stack>/<ts>.json`) when versioning is unavailable. Core Stage 0 resources (namespaces, SOPS `age` key, Flux, Kyverno, PKO, S3 backend) carry `protect: true`; the Flux-managed `management-cluster-core` PKO `Stack` is also `protect: true`.
+4. Provisions the initial Rauthy admin user (`--admin-username` / `--admin-password`, or auto-generated credentials printed once to stdout) into `keel-admins` + `rauthy_admin`, configures the `keel-server` OIDC PKCE client (`groups` scope) in `keel-system/rauthy-config`, and exposes Rauthy via Envoy Gateway over HTTPS with a self-signed Stage 0 CA (`keel-system/keel-wildcard-tls`) at `--oidc-public-url` (default `https://idp.keel.local:8888`; issuer `<url>/auth/v1`; Forgejo at `forgejo.<domain>`). With `--with-forge` + Rauthy, a Forgejo OAuth source `rauthy` is registered (secret passed over `kubectl exec` stdin) and the Forgejo admin password is random (or `KEEL_FORGEJO_ADMIN_PASSWORD`) and stored in `keel-system/keel-forgejo-admin`, which the Forgejo chart consumes via `gitea.admin.existingSecret`. The portal is served by `keel serve` (default `http://127.0.0.1:8080`).
+5. Purges any control-plane credentials found in `tenant-*` namespaces, provisions `tenant-default`'s scoped S3 identity and read-only Git credential (`KEEL_TENANT_GIT_TOKEN` for external forges), and migrates `tenant-default` state under `tenants/default/`.
 
 #### NAT / Firewall & Ephemeral Local Cluster Resilience
 * **Outbound Pull-Polling:** Flux `GitRepository` resources default to outbound polling (`interval: 1m`) alongside optional webhook receivers, ensuring local `kind` and home `k3s` management clusters behind NAT/firewalls reconcile external GitHub/GitLab repositories without requiring inbound public ports.
-* **Rapid `kind` Recreation:** When paired with an external Git repository and external S3 backend (note: in-cluster `--with-forge` or in-cluster Garage/MinIO inside `kind` is ephemeral with the cluster), deleting and recreating a local `kind` cluster via `keel bootstrap init --target kind` against the same Git repository and S3 backend restores the full control plane in under 60 seconds.
+* **Rapid `kind` Recreation:** When paired with an external Git repository and external S3 backend (note: in-cluster `--with-forge` or in-cluster SeaweedFS inside `kind` is ephemeral with the cluster), deleting and recreating a local `kind` cluster via `keel bootstrap init --target kind` against the same Git repository and S3 backend restores the full control plane in under 60 seconds.
 
 ### 2.2 Stage 1: Self-Hosted Pivot & Anti-Lockout Guardrails
 Once the management cluster is healthy:
@@ -93,10 +94,10 @@ Once the management cluster is healthy:
 2. **Control-Plane Protection & Base Addon Self-Mutation Guardrails:**
    * **Protection Labeling:** Control-plane PKO `Stack` (`management-cluster-core`) and management-plane base addon resources (`rauthy`, `envoy-gateway`, `flagger`, `kyverno`, `pulumi-kubernetes-operator`, `prometheus`, `s3-state-backend`) carry the `keel.io/protect: "true"` label.
    * **No-Prune Seed Sync:** The `core-addons` Flux `Kustomization` operates with `prune: false` (`deploy/seed/flux-system/gotk-sync.yaml`) ensuring that removing a base addon manifest from Git never uninstalls live control-plane base addons.
-   * **Kyverno Admission Deletion Guard:** The `protect-control-plane` Kyverno `ValidatingPolicy` denies `DELETE` operations on protected `Stack` and `HelmRelease` resources in `flux-system`, `keel-system`, and `kyverno` namespaces via standard admission.
+   * **Kyverno Admission Deletion Guard:** The `protect-control-plane` Kyverno `ValidatingPolicy` denies `DELETE` of `management-cluster-core` and of any PKO `Stack` labelled `keel.io/protect: "true"`, and denies any mutation in `flux-system`/`keel-system` by tenant (`tenant-*`) or `keel-previews` ServiceAccounts. The API's `force-delete` refuses `keel.io/protect` stacks as well.
    * **Automated Upgrade Rollback:** Every base addon `HelmRelease` configures `spec.upgrade` with `timeout: 5m` and `remediation.strategy: rollback` (`retries: 1`), automatically reverting failed release upgrades in-cluster.
    * **Revert PR Generation:** If an attempted base addon mutation fails preview validation or health checks, Keel GUI/CLI automatically generates a revert PR to restore the known-good Git state.
-3. **Break-Glass Recovery:** If an operator ever damages the management cluster or in-cluster Git forge, `keel bootstrap recover --s3-endpoint <url>` pulls the versioned Pulumi state directly from S3 and executes a local recovery reconciliation.
+3. **Break-Glass Recovery:** If an operator ever damages the management cluster or in-cluster Git forge, `keel bootstrap recover --s3-endpoint <url>` reads the escrowed Stage 0 state from `s3://<bucket>/stage0/<cluster>/` (optionally restoring `--state-version` / `--snapshot`), re-materializes each program and encrypted config, and executes `pulumi refresh` + `pulumi up` (default: the `control-plane*` stacks; `--stack stage0-<program>-<cluster>` to select; `--dry-run` / `--list-versions` for inspection). The passphrase comes from `--passphrase-file`, `PULUMI_CONFIG_PASSPHRASE`, or the local file; S3 keys from `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`. All secrets travel via env/stdin, never argv.
 
 ### 2.3 Bootstrap & Handover Sequence
 
@@ -185,7 +186,7 @@ infra-gitops/
 ```
 
 ### 3.2 Direct `git` CLI Execution & `ForgeProvider` Trait
-* **Pure `git` Engine (`keel-git`):** All cloning, fetching, branch creation (`git checkout -b keel/<tenant>/<action>-<timestamp>`), staging, signing, and pushing execute via `tokio::process::Command::new("git")` using argument arrays (zero shell interpolation). User-supplied SSH private keys (`ed25519`/`rsa`) or HTTPS credentials are injected ephemerally per command via `GIT_SSH_COMMAND` or a temporary `GIT_ASKPASS` helper pipe.
+* **Pure `git` Engine (`keel-git`):** All cloning, fetching, branch creation (`git checkout -b keel/<tenant>/<action>-<timestamp>`), staging, signing, and pushing execute via `tokio::process::Command::new("git")` using argument arrays (zero shell interpolation). User-supplied SSH private keys (`ed25519`/`rsa`) or HTTPS credentials are injected ephemerally per command. SSH keys go into an ephemeral temp key file referenced by `GIT_SSH_COMMAND` (`StrictHostKeyChecking=yes` with supplied `known_hosts`, otherwise `accept-new`), and the file is removed after the command. HTTPS credentials are injected as an `http.extraHeader: Authorization: Basic ...` through the `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_0`/`GIT_CONFIG_VALUE_0` environment variables, so they never reach argv, `.git/config`, or the remote URL, and they are redacted from error output.
 * **Minimal `ForgeProvider` Trait:** Because PRs/MRs are forge-specific APIs, a compact Rust trait isolates forge interactions:
 
 ```rust
@@ -195,10 +196,21 @@ pub trait ForgeProvider: Send + Sync {
     async fn get_pull_request(&self, pr_id: &str) -> Result<PullRequestInfo, ForgeError>;
     async fn post_preview_comment(&self, pr_id: &str, markdown_report: &str) -> Result<(), ForgeError>;
     async fn list_open_pull_requests(&self, tenant: Option<&str>) -> Result<Vec<PullRequestInfo>, ForgeError>;
+    async fn list_pull_requests(&self, tenant: Option<&str>, state: Option<PullRequestState>) -> Result<Vec<PullRequestInfo>, ForgeError>;
+    /// `expected_head_sha` pins the merge to the reviewed/verified commit; the forge must refuse
+    /// if the PR head moved (Gitea/Forgejo `head_commit_id`, GitHub/GitLab `sha`, local head check).
+    async fn merge_pull_request(&self, pr_id: &str, expected_head_sha: Option<&str>) -> Result<PullRequestInfo, ForgeError>;
+    async fn close_pull_request(&self, pr_id: &str) -> Result<PullRequestInfo, ForgeError>;
     async fn reopen_pull_request(&self, pr_id: &str) -> Result<PullRequestInfo, ForgeError>;
+    /// Ensures the configured repository exists (creating it with the requested visibility);
+    /// used by Stage 0 instead of ad-hoc forge REST calls.
+    async fn ensure_repository(&self, private: bool) -> Result<RepositoryEnsureOutcome, ForgeError>;
 }
 ```
-* **Supported Implementations:** `ForgejoGiteaProvider` (REST v1), `GitHubProvider` (REST v3), `GitLabProvider` (REST v4), and `LocalGitProvider` (emulates PRs via `proposal/*` branches with GUI diff inspection and fast-forward merge for offline/air-gapped repos).
+* **SHA-Pinned Merges:** `POST /api/v1/proposals/{id}/merge` resolves the PR branch head (`git rev-parse origin/<branch>`) exactly once, runs tenant-admin path-scope verification against `origin/main...<sha>` (rejecting `..` traversal, absolute paths, and backslashes), and passes that SHA to `merge_pull_request` so a push between verification and merge is rejected by the forge.
+* **Preview Provenance:** `PreviewReport.source` is `pko` for reports parsed from a real `pulumi preview` run and `synthesized` for control-plane simulations derived from proposed manifests/Git diffs; synthesized reports are labelled "Simulated diff — PKO preview not executed" in PR comments and the GUI, and carry no policy verdict.
+* **Supported Implementations:** `ForgejoGiteaProvider` (REST v1), `GitHubProvider` (REST v3), `GitLabProvider` (REST v4), and `LocalGitProvider` (emulates PRs via `proposal/*` branches with GUI diff inspection and fast-forward merge for offline/air-gapped repos; proposal metadata (`.keel/proposals/<pr_id>.json`: state, comments, transitions) is committed to a dedicated `keel-proposals` metadata branch in the bare repository, without touching the proposal branch head or `main`).
+* **Merge-base diffs:** Proposal diffs use `main...head` (merge-base) for open/closed PRs, so stale PRs never show unrelated or reversed changes.
 
 ---
 
@@ -211,12 +223,15 @@ pub trait ForgeProvider: Send + Sync {
 
 ### 4.2 Ephemeral PR Preview Workflow (PKO v2 Preview Mode)
 To guarantee operators see exact infrastructure blast radius before merging any PR:
-1. When a proposal branch (`keel/<tenant>/<action>-<timestamp>`) is pushed and a PR is opened, the Rust control plane creates two short-lived CRs in the isolated `keel-previews` namespace:
-   * A Flux `GitRepository` pinned to `spec.ref.branch: keel/<tenant>/<action>-<timestamp>`.
-   * A PKO v2 `Stack` CR configured with `spec.preview: true` and a read-only IAM/Proxmox/Cloud preview ServiceAccount.
-2. PKO executes `pulumi preview --json` inside an isolated workspace pod and writes structured resource diffs (`create`, `update`, `delete`, `replace`, `drift`) to the `Stack` status and object store.
-3. The Rust backend parses the preview JSON, posts a formatted summary comment back to the PR on the Git forge, and streams the interactive diff tree to both the **React GUI PR Drawer** and **`keel preview status <pr-id>` CLI**.
-4. When the PR is merged or closed (detected via forge webhook or background poll), the Rust controller deletes the ephemeral `GitRepository` and preview `Stack` CRs.
+1. When a proposal branch (`keel/<tenant>/<action>-<timestamp>`) is pushed and a PR is opened for a **Pulumi-backed** change (infra blueprint, or raw-manifest app with `engine: pulumi`), `keel-server` (`keel_server::preview_lifecycle::launch_pko_preview`, `keel_kube::preview_runner`) server-side-applies into `keel-previews`:
+   * A Flux `GitRepository` pinned to the proposal commit.
+   * A PKO v2 `Stack` with `spec.preview: true`, running as the read-only `keel-previews/keel-preview-readonly` ServiceAccount (TokenReview + `view`, no Secrets), using the tenant state backend with the tenant's **scoped** SeaweedFS identity and **read-only** Git credential mirrored into `keel-previews` (`keel-preview-s3-<tenant>`, `keel-preview-git-<tenant>`). The preview backend is always pinned to the tenant prefix `s3://<bucket>/tenants/<tenant>` (existing and brand-new stacks alike; `keel_pko::tenant_scoped_preview_backend`, re-checked before launch). Cloud provider credentials referenced by the tenant `Stack`'s `envRefs`/`secretsRef` are copied **exactly** (only referenced Secrets and keys; PR-proposed `<instance>-secrets` values for new stacks) into per-preview Secrets `keel-preview-<pr>-<name>` labelled `keel.io/pr-id`/`keel.io/tenant` and owned by the preview `Stack` (GC'd with it), and the preview refs are rewritten to them (`EphemeralPreviewParams::inherit_tenant_credentials`, `PreviewCluster::copy_preview_secrets`); the preview ServiceAccount still cannot read Secrets via the API. If prerequisites are missing (no cluster, no scoped identity), the preview is not executed, and admin keys are never substituted.
+2. Keel immediately posts a **provisional** PR comment synthesized from the proposed manifests (`source: synthesized`, "Provisional diff — PKO preview running").
+3. PKO runs `pulumi preview` in a workspace pod. PKO v2 persists no per-resource step data for previews, so Keel maps `Stack` conditions + the `auto.pulumi.com/v1alpha1` `Update` (`spec.type: preview`) to `run.phase` (`pending|running|succeeded|failed|notExecuted`) and parses the resource plan from the workspace pod's `pulumi` container log (last 4000 lines) (`keel_pko::run::{map_pko_preview_status, parse_pulumi_console_preview}`).
+4. The finished report (`source: pko`) is persisted in a `ConfigMap` owned by the preview `Stack` (`report.json`, plus a `keel.io/preview-reported-commit` annotation), posted as a follow-up PR comment (Markdown cells escaped), streamed over SSE, and served by `GET /api/v1/proposals/{id}/preview` and `keel preview status`.
+5. A reconciler (`spawn_preview_reconciler`, every 60 s with jitter) diffs live preview objects against forge PR states. It garbage-collects previews of merged/closed PRs and re-publishes finished runs. Because it holds no in-memory state, it is restart-safe and replica-safe (`NFR-REL-02`). Merge/close through the API also deletes the preview immediately.
+6. **Flux-only changes** (Helm/Kustomize apps, `engine: flux`) have no Pulumi program; their report is synthesized from the proposed manifests with `run.phase: notExecuted` and labelled "Simulated diff — PKO preview not executed" (no policy verdict).
+7. **Known limitations:** the report only covers what PKO prints in the workspace log (last 4000 lines); a referenced provider Secret/key missing from the tenant namespace makes the preview `notExecuted`.
 
 ```mermaid
 sequenceDiagram
@@ -233,15 +248,17 @@ sequenceDiagram
     API->>API: Validate JSONSchema + Encrypt Secrets (SOPS/age)
     API->>Git: git push branch keel/<tenant>/<action>-<ts> + Open PR #42
     API->>K8S: Create Ephemeral GitRepository + PKO Stack (preview: true)
-    K8S->>PKO: Launch Workspace Pod
+    API->>Git: Post provisional (synthesized) comment on PR #42
+    K8S->>PKO: Launch Workspace Pod (read-only SA, tenant-scoped creds)
     PKO->>Cloud: Read live state (no mutations)
-    PKO-->>K8S: Emit structured Pulumi Preview JSON
-    K8S-->>API: Stream Preview Report via kube-rs Watch
-    API->>Git: Post Preview Diff Comment on PR #42
+    PKO-->>K8S: Update status + pulumi preview log
+    K8S-->>API: Stack/Update status + workspace log (kube-rs)
+    API->>K8S: Persist report ConfigMap
+    API->>Git: Post real PKO preview comment on PR #42
     API-->>UI: Render Diff (+Create / ~Update / -Delete) & PR Link
     User->>Git: Review & Approve/Merge PR #42
     Git->>K8S: Poll / Webhook -> Flux reconciles main branch
-    API->>K8S: Garbage-collect ephemeral preview CRs
+    API->>K8S: Garbage-collect ephemeral preview CRs (60 s reconciler)
 ```
 
 ---
@@ -371,7 +388,7 @@ spec:
 
 * **Auto-Extract Schema Tokens:** In the Web UI Catalog Wizard, pasting or editing raw Kubernetes YAML allows clicking **"Auto-Extract Variables to Schema"**, which scans for `${var_name}` and `${var_name:=default}` tokens and dynamically generates `spec.schema.properties` (with defaults and required flags) so operators avoid hand-crafting JSON Schema.
 * **Dual Execution Engines (`actionEngine: "flux" | "pulumi"`):** Operators select the actioning engine either as a catalog default (`spec.defaultEngine`) or at deploy time in the UI Deploy Modal or CLI (`keel app install --engine flux|pulumi`):
-  1. **Flux CD Engine (`flux`):** Synthesizes `tenants/<tenant>/apps/<instance>/manifests.yaml`, non-secret substitution values into `values-configmap.yaml` (`kind: ConfigMap`), SOPS+`age`-encrypted secret fields into `secrets.enc.yaml` (`kind: Secret`), and `flux-kustomization.yaml` (`kustomize.toolkit.fluxcd.io/v1` `Kustomization` with `spec.serviceAccountName: tenant-<tenant>` and `spec.postBuild.substituteFrom` referencing the `ConfigMap` and `Secret`).
+  1. **Flux CD Engine (`flux`):** Synthesizes `tenants/<tenant>/apps/<instance>/manifests.yaml`, non-secret substitution values into `values-configmap.yaml` (`kind: ConfigMap`), SOPS+`age`-encrypted secret fields into `secrets.enc.yaml` (`kind: Secret`), and `flux-kustomization.yaml` (`kustomize.toolkit.fluxcd.io/v1` `Kustomization` with `spec.serviceAccountName: tenant-<tenant>-sa` and `spec.postBuild.substituteFrom` referencing the `ConfigMap` and `Secret`).
   2. **Pulumi PKO v2 Engine (`pulumi`):** Synthesizes `tenants/<tenant>/apps/<instance>/Pulumi.yaml` wrapping the rendered Kubernetes YAML in a `kubernetes:yaml/v2:ConfigGroup` program alongside a PKO v2 `Stack` (`stack.yaml`). On PR creation, Keel triggers an ephemeral PKO preview (`spec.preview: true`) in `keel-previews`, streaming exact resource-level diffs (`+ Create`, `~ Update`, `- Delete`) to the UI and CLI before merge.
 
 * **Dynamic Form Rendering:** The React frontend feeds `spec.schema` and `spec.uiSchema` directly into **`@rjsf/core` (`react-jsonschema-form`)** mapped to **Shadcn UI** widgets (`Input`, `Select`, `Switch`, `Slider`, `SecretInput`). Form submission serializes directly into an unmodified Helm `values.yaml` override.
@@ -399,21 +416,40 @@ stateDiagram-v2
     BreakGlass --> OidcActive: Control Plane Restored
 ```
 
+**Session & authorization rules (`NFR-SEC`):**
+* **Phase-bound sessions:** every `keel_session` / Bearer session token records the `authPhase` it was issued under (issued-at = `exp - 3600`). Requests whose session phase differs from the server's current phase are rejected with `401`, so any phase transition invalidates all outstanding sessions.
+* **Break-glass admin:** during `BreakGlass`, cluster-admin is granted **only** to the allowlisted break-glass identity — `KEEL_BREAK_GLASS_ADMINS` (comma-separated OIDC `sub`/`email`, case-insensitive), defaulting to the Stage 0 bootstrap admin `admin@keel.local`. Other users keep their normal group-derived privileges. Outside break-glass, admin requires the `keel-admins` group.
+* **Group → tenant mapping:** only explicit IdP groups grant tenant access: `tenant-<id>` (member) and `tenant-<id>-admin` (tenant admin). Bare `<id>` / `<id>-admin` groups are ignored; tenant ids ending in `-admin` are rejected at creation to avoid group-name collisions.
+* **OIDC hardening:** the authorization request carries PKCE `S256`, `state`, and a random `nonce`, all sealed in the `AES-256-GCM` `keel_pkce` cookie; the callback requires the `id_token` `nonce` claim to match.
+* **CSRF:** cookie-authenticated `POST`/`PUT`/`PATCH`/`DELETE` must carry a same-origin `Origin`, `Referer`, or `Sec-Fetch-Site: same-origin|none`; requests with none of these are rejected. Cookie-authenticated WebSocket upgrades require a same-origin `Origin`. `Authorization: Bearer` (CLI) requests are exempt.
+
+**CLI loopback login (RFC 8252 + PKCE, `keel auth login`):**
+1. CLI generates `code_verifier` (43–128 chars `[A-Za-z0-9-._~]`), `code_challenge = BASE64URL(SHA256(code_verifier))`, and a random `state` (8–256 URL-safe chars); it listens on `http://127.0.0.1:<port>/callback` (or `http://[::1]:<port>/callback`, any non-zero port, path exactly `/callback`).
+2. CLI opens the browser at `GET /api/v1/auth/cli/login?redirect_uri=<loopback>&state=<state>&code_challenge=<challenge>&code_challenge_method=S256[&prompt=login]`. The server validates the inputs (`400` otherwise) and runs the normal server-side OIDC flow (the IdP always redirects to the server's own `/api/v1/auth/callback`; no IdP client changes needed).
+3. After verifying the `id_token`, the server issues **no browser cookie** and responds `302` to `<loopback>?code=<one-time-code>&state=<state>`. The code is an `AES-256-GCM` sealed, 60-second, single-use (per-replica replay cache) token bound to the `code_challenge` and loopback URI.
+4. CLI verifies `state`, then `POST /api/v1/auth/cli/exchange` with JSON `{"code","codeVerifier","redirectUri"}` (no cookie). Response `200`: `{"sessionToken","tokenType":"Bearer","expiresAt":<unix-seconds>,"sub","email"?,"phase","isAdmin"}`; any mismatch/expiry/replay returns `401 {"error":"Invalid or expired CLI login code"}`. The CLI sends `Authorization: Bearer <sessionToken>` thereafter (1 h TTL, phase-bound).
+
 ### 6.2 Multi-Tenant Isolation Model
-* **Tenant Boundary:** Each tenant (`tenants/<tenant-id>/`) maps 1:1 to a dedicated Kubernetes `Namespace` (`tenant-<tenant-id>`) on the management cluster (holding the tenant's Flux `Kustomization`/`HelmRelease`, PKO `Stack`, `ServiceAccount`, `ResourceQuota`, and default-deny `NetworkPolicy`). In multi-cluster mode, tenant `Kustomization` and `HelmRelease` resources target provisioned workload clusters via `spec.kubeConfig.secretRef` stored inside `tenant-<tenant-id>`.
-* **Flux Multi-Tenancy Lockdown:** Flux `kustomize-controller` and `helm-controller` execute with `--no-cross-namespace-refs=true` and `spec.serviceAccountName` enforced on every tenant `Kustomization` and `HelmRelease`, preventing a tenant from reading secrets or `GitRepository` sources in `flux-system` or sibling tenant namespaces.
+* **Tenant Boundary:** Each tenant (`tenants/<tenant-id>/`) maps 1:1 to a dedicated Kubernetes `Namespace` (`tenant-<tenant-id>`) on the management cluster (holding the tenant's Flux `Kustomization`/`HelmRelease`, PKO `Stack`, `ServiceAccount`, `ResourceQuota`, and default-deny `NetworkPolicy`). In multi-cluster mode, tenant `Kustomization` and `HelmRelease` resources target provisioned workload clusters via `spec.kubeConfig.secretRef` stored inside `tenant-<tenant-id>`. Flux impersonates the tenant `ServiceAccount` (`system:serviceaccount:tenant-<tenant-id>:tenant-<tenant-id>-sa`) for both local and remote reconciliation; for remote targets the impersonation is evaluated by the workload cluster's API server. Every cluster blueprint (`kind-cluster`, `aws-eks-cluster`, `gcp-gke-cluster`, `azure-aks-cluster`) therefore creates, on the cluster it provisions, the `keel-tenant-flux` `ClusterRoleBinding` granting `cluster-admin` to that identity (the tenant owns the workload cluster outright), and writes a kubeconfig `Secret` with inline credentials only: managed-cloud blueprints mint a `kube-system/keel-flux` `ServiceAccount` token bound to `cluster-admin` because Flux controllers cannot run `exec` credential plugins. A bring-your-own workload-cluster kubeconfig must grant the same: inline credentials allowed to impersonate `ServiceAccount`s, plus RBAC for `tenant-<tenant-id>/tenant-<tenant-id>-sa` on the target cluster.
+* **Flux Multi-Tenancy Lockdown:** Flux `kustomize-controller` and `helm-controller` execute with `--no-cross-namespace-refs=true` and `spec.serviceAccountName` enforced on every tenant `Kustomization` and `HelmRelease`, preventing a tenant from reading secrets or `GitRepository` sources in `flux-system` or sibling tenant namespaces. The root `tenants-root` Kustomization (applying `tenants/`) does **not** run as cluster-admin `kustomize-controller`; it impersonates the confined `flux-system/keel-tenant-reconciler` `ServiceAccount` (`deploy/seed/flux-system/tenant-reconciler-rbac.yaml`, mirrored by `keel_kube::tenant::build_tenant_reconciler_rbac`), whose `ClusterRole` covers only the kinds Keel writes under `tenants/` and may only bind `ClusterRole/admin` (namespaced), `ClusterRole/keel-server-tenant` (to `keel-system/keel-server` only), or `ClusterRole/system:auth-delegator`. Every generated tenant bundle (`tenants/<id>/rbac.yaml`) includes the `keel-server` `RoleBinding` to `keel-server-tenant`, giving an in-cluster `keel-server` (`deploy/bootstrap/keel-server/`, least-privilege RBAC with no cluster-wide Secret access) exactly the tenant-scoped access it needs.
 * **Kyverno Policy Enforcement:** Cluster-wide Kyverno policies enforce:
   * `disallow-privileged-containers` and `restricted` Pod Security Standards across all PKO workspace pods and tenant workloads.
   * `restrict-pulumi-providers` verifying that a tenant only instantiates cloud/Proxmox providers explicitly granted to their tenant role.
   * `protect-control-plane` blocking deletion or modification of `management-cluster-core` resources via standard tenant PRs.
-  * `sync-tenant-secrets` (`policies.kyverno.io/v1` `GeneratingPolicy` with `generateExisting` and `synchronize` enabled) automatically cloning and synchronizing `flux-system/keel-s3-credentials` and `flux-system/git-credentials` into every `tenant-*` namespace via scoped `keel-kyverno-tenant-secret-sync` RBAC, preserving Flux `--no-cross-namespace-refs=true`.
+  * `restrict-tenant-reconciler` (`ValidatingPolicy`, `failurePolicy: Fail`) confining every write by `keel-tenant-reconciler` to `tenant-*` namespaces (or `tenant-*` `Namespace` objects), allowing cluster-scoped `ClusterRoleBinding`s only to `system:auth-delegator` for tenant `ServiceAccount`s, and rejecting tenant `RoleBinding`s that reference `ServiceAccount`s from other namespaces.
+  * No policy or controller clones control-plane SeaweedFS admin keys or Git admin tokens into tenant namespaces; `keel bootstrap init` purges any such credentials found in `tenant-*` namespaces.
+* **Least-Privilege Tenant Credentials:** Tenants never receive control-plane credentials (`NFR-SEC-02`, `NFR-SEC-05`):
+  * **Scoped S3 state identity:** Each tenant gets a dedicated SeaweedFS IAM identity `keel-tenant-<id>` limited to `Read`/`Write`/`List` on `<bucket>/tenants/<id>/*`, stored in `tenant-<id>/keel-tenant-s3-credentials` (`accessKey`, `secretKey`, `stateBackendUrl`) and mirrored to `tenant-<id>/keel-s3-credentials` for PKO `Stack.spec.envRefs`. Tenant PKO `Stack`s use the tenant state prefix `s3://<bucket>/tenants/<id>?<query>` (`keel_kube::tenant::tenant_s3_backend_url`); management/core stacks keep the base backend; ephemeral `keel-previews` stacks inherit the tenant backend and use mirrored tenant-scoped credentials (§4.2). Identities are created by `keel bootstrap init` (for `tenant-default`, via `kubectl exec -i` into the SeaweedFS filer) and by `keel-server` (`keel_kube::s3_identity::SeaweedFsTenantS3Provisioner`, kube-rs `pods/exec` with the `weed shell` `s3.configure` script on **stdin**) on tenant creation and lazily on the first tenant Stack proposal once `tenant-<id>` exists. Provisioning is idempotent (existing keys are reused; new keys are persisted create-if-absent with a `keel.io/s3-identity-pending` annotation until SeaweedFS accepts them), and keys never appear in argv, logs, or API responses. If a tenant has no usable scoped identity, `POST /api/v1/proposals` fails closed with `409 Conflict` instead of committing a Stack that cannot reach its backend; admin keys are never substituted.
+  * **Read-only tenant Git credential:** `tenant-<id>/git-credentials` holds a read-only token for the tenant Flux `GitRepository`. With the in-cluster Forgejo, Stage 0 mints a dedicated `read:repository` token; with external forges (`--git-url`/`--git-token`) the operator token is **not** shared and a read-only token must be supplied via `KEEL_TENANT_GIT_TOKEN`.
 
 ### 6.3 Stateless Persistence & Secrets Management (K8s Secrets + SOPS/`age`)
+* **Untrusted workload kubeconfigs:** tenant `*-kubeconfig` Secrets are read only from the owning tenant namespace and rejected if they contain `exec`/`auth-provider` plugins or file-path credentials (`tokenFile`, `client-certificate`, `client-key`, `certificate-authority`); only inline credential data is accepted (`keel_kube::live::validate_untrusted_kubeconfig`).
 * **Zero Database Architecture:** `keel-server` is completely stateless and uses no SQLite, Postgres, or external database. All runtime state lives natively in Kubernetes `Secret`s, Git, and in-memory `kube-rs` CRD caches:
   * **In-Cluster OIDC Provider (Rauthy):** Stage 0 deploys Rauthy (Apache-2.0) with embedded Hiqlite storage and first-boot JSON seeding (`keel-system/rauthy-config`) for immediate username/password login, Admin UI user/group management (`keel-admins`, `tenant-<id>-admin`, `tenant-<id>`), and `keel-server` PKCE client registration.
-  * **OIDC Sessions & PKCE State:** Signed and encrypted using a cluster-managed key `Secret` (`keel-system/session-key`) into stateless `HttpOnly`, `Secure`, `SameSite=Strict` cookies (with short-lived K8s `Secret`s or encrypted state cookies for PKCE verifiers).
+  * **OIDC Sessions & PKCE State:** Signed and encrypted using a cluster-managed key `Secret` (`keel-system/session-key`) into stateless `HttpOnly` cookies: `keel_session` is `SameSite=Strict`; the encrypted `keel_pkce` cookie (verifier, state, nonce) is `SameSite=Lax`, scoped to `/api/v1/auth` so it survives the IdP redirect. `Secure` is set except on loopback HTTP. The CLI uses Bearer tokens instead (§6.1).
   * **User Profile Credentials:** Personal Git SSH keys and Forge Personal Access Tokens stored in user profiles are encrypted with `AES-256-GCM` (backed by a cluster root/KMS `Secret` key) and persisted as Kubernetes `Secret`s in `keel-system` keyed by OIDC `sub`. They are never returned over REST APIs or written to logs.
 * **Per-Tenant Git Encryption Keys (SOPS + `age`):** Onboarding a new tenant generates a dedicated `age` keypair. The public key is registered in `.sops.yaml` scoped to `path_regex: ^tenants/<tenant-id>/.*\.enc\.yaml$`, and the private key is stored as a Kubernetes `Secret` exclusively inside `tenant-<tenant-id>`.
+* **Per-Tenant Pulumi State Encryption:** Every PKO v2 `Stack` workspace sources `PULUMI_CONFIG_PASSPHRASE` via `valueFrom.secretKeyRef` from the namespace-local `Secret` `keel-pulumi-passphrase` (key `passphrase`); a literal or empty passphrase is never synthesized. Each `tenant-<id>` gets its own generated passphrase (≥256-bit CSPRNG, base64url), created idempotently alongside the tenant's scoped S3 identity (`keel bootstrap init` for `tenant-default`, `keel-server` tenant creation and lazy provisioning) and never rotated automatically. Management Stacks use `flux-system/keel-pulumi-passphrase` and `keel-system/keel-pulumi-passphrase`, created at bootstrap. Ephemeral previews receive a per-preview copy (`keel-previews/keel-preview-<pr>-keel-pulumi-passphrase`, ownerReference to the preview `Stack`). Stack proposals for a tenant without a usable passphrase fail closed with `409 Conflict`. `keel tenant migrate-state` reads the tenant passphrase from the cluster and passes it to `pulumi` via the environment only.
 * **Zero Plaintext in Git:** Secret fields marked with `"writeOnly": true` or `"format": "password"` in `catalog.yaml` are encrypted via `sops --encrypt` in the Rust backend before `git add` ever runs.
 
 ---
@@ -428,56 +464,85 @@ crates/
 ├── keel-core/          # Domain models, JSONSchema validator, catalog parser, SOPS wrapper
 ├── keel-git/           # Pure git CLI wrapper (SSH/HTTPS) + ForgeProvider trait & adapters
 ├── keel-pko/           # PKO v2 Stack generator, ephemeral preview manager, diff parser
-├── keel-kube/          # kube-rs watchers, SSE event multiplexer, tenant RBAC, K8s Secret state
+├── keel-kube/          # kube-rs watchers, SSE event multiplexer, tenant RBAC, K8s Secret state, scoped tenant S3 identities
 ├── keel-server/        # Stateless axum HTTP/SSE server, OIDC PKCE auth, embedded static React assets
 └── keel-cli/           # clap CLI entrypoint (bootstrap, auth, infra, app, preview, serve)
 ```
 
 ### 7.2 CLI Command Contract (`keel`)
 
+Global options (every subcommand): `--server <URL>` / `KEEL_SERVER` (default `http://127.0.0.1:8080`), `-v`/`-vv` (full error cause chain; errors are one line by default), `-h`. `-V/--version` is top-level only. `--tenant` always takes a bare tenant id (`default`); a `tenant-` prefix is stripped. The authoritative contract is `keel <cmd> --help`; the user-facing reference is `docs/reference/cli.md`.
+
 | Command | Description | Key Flags |
 | :--- | :--- | :--- |
-| `keel bootstrap init` | Executes Stage 0 seed cluster bootstrap across local `kind`, existing `kubeconfig`, Proxmox VE, or public cloud targets, installing Flux/PKO, S3/`age`, and Rauthy OIDC (or external OIDC). | `--target [kind\|kubeconfig\|proxmox\|aws\|gcp\|azure\|hetzner]`, `--kubeconfig`, `--context`, `--proxmox-url`, `--region`, `--distro [k3s\|talos]`, `--with-forge`, `--oidc-provider [rauthy\|none]`, `--oidc-issuer`, `--admin-username`, `--admin-password` |
-| `keel bootstrap recover` | Break-glass recovery pulling Pulumi state from S3 via `kubeconfig` to repair an unreachable control plane. | `--s3-endpoint`, `--bucket`, `--stack` |
-| `keel auth login` | Authenticates the CLI against `keel-server` via OIDC Authorization Code + PKCE (localhost callback). | `--server` |
-| `keel serve` | Starts the stateless `axum` API server and serves the embedded React + Shadcn SPA. | `--bind 0.0.0.0:8080`, `--config` |
-| `keel infra list` | Lists all PKO `Stack` resources across providers with live drift and sync status. | `--tenant`, `--provider`, `--output [table\|json]` |
-| `keel infra provision` | Validates parameters against blueprint JSONSchema and opens a provisioning PR. | `--blueprint`, `--tenant`, `--values-file` |
-| `keel app install` | Renders Helm, Kustomize, or raw manifest templates from catalog JSONSchema and opens a PR. | `--app`, `--tenant`, `--values-file`, `--canary`, `--engine [flux\|pulumi]` |
-| `keel infra ssh` | Resolves connection info for a provisioned VM stack and optionally connects via SSH. Defaults to printing connection table/command; `--exec` launches an interactive `ssh` session in current terminal via direct `tokio::process::Command::new("ssh")`. | `<stack-name>`, `--tenant <id>`, `--user <user>`, `--port <port>`, `-i <identity-file>`, `--exec`, `--output [table\|json\|command]`, `--server <url>` |
-| `keel preview status` | Fetches and renders the PKO v2 preview diff (`+`/`~`/`-`) for an open PR in the terminal. | `--pr <id>`, `--watch` |
+| `keel bootstrap init` | Stage 0 seed bootstrap across `kind`, existing `kubeconfig`, Proxmox VE, or public cloud targets (§2.1). | `--target [kind\|kubeconfig\|proxmox\|aws\|gcp\|azure\|hetzner]`, `--cluster-name` (default `keel-mgmt`), `--kubeconfig`, `--context`, `--proxmox-url`, `--region`, `--distro [k3s\|talos]`, `--with-forge`, `--git-url`, `--forge-type [local\|github\|gitlab\|forgejo\|gitea]`, `--forge-api-url`, `--git-token`/`KEEL_GIT_TOKEN`, `--oidc-provider [rauthy\|none]`, `--oidc-issuer`, `--oidc-client-id`, `--oidc-public-url` (default `https://idp.keel.local:8888`), `--admin-username`, `--admin-password`/`KEEL_ADMIN_PASSWORD`, `--local-dev-docker-socket-exception`, `--repo-dir`, `--skip-core-install`, `--pulumi-program-dir`; env `KEEL_TENANT_GIT_TOKEN`, `KEEL_FORGEJO_ADMIN_PASSWORD`, `KEEL_CONFIG_DIR` |
+| `keel bootstrap recover` | Break-glass: re-applies escrowed Stage 0 state from S3 (`pulumi refresh` + `up`) (§2.2). | `--s3-endpoint` (required), `--bucket` (`pulumi-state`), `--region` (`us-east-1`), `--cluster-name`, `--stack stage0-<program>-<cluster>` (repeatable), `--kubeconfig`, `--context`, `--passphrase-file`, `--state-version`, `--snapshot`, `--list-versions`, `--skip-refresh`, `--dry-run` |
+| `keel auth login` | RFC 8252 loopback OIDC + PKCE login (§6.1); stores a 1 h Bearer token (`0600`) in `<config>/credentials.json`, keyed by normalized server URL. | `--no-browser`, `--force-prompt`, `--timeout-secs` (default `300`) |
+| `keel auth status` / `keel auth logout` | Show stored session + server-reported identity / remove stored token. | — |
+| `keel serve` | Starts the stateless `axum` API/SSE server and embedded SPA. | `--bind` (default `127.0.0.1:8080`), `--repo-dir`, `--bare-repo`, `--config`, `--git-token`/`KEEL_GIT_TOKEN`, `--git-url`/`KEEL_GIT_URL` + `--git-username`/`KEEL_GIT_USERNAME` (stateless/in-cluster mode: clone `--repo-dir` from the remote when empty, otherwise fetch and sync `main`; token injected ephemerally, never in argv/URL/logs) |
+| `keel proposal list\|show\|merge\|close` | List / inspect / merge (server pins to reviewed head SHA) / close proposals. | `list`: `--tenant`, `--status [open\|merged\|closed\|all]`, `--output [table\|json]`; others: `<PR>`, `--output` |
+| `keel preview status` | Renders the preview diff (`+`/`~`/`-`/`!`) with source (`pko`/`synthesized`) and run phase. | `--pr <id>`, `--watch` |
+| `keel catalog list\|show` | Browse catalog apps, blueprints, bundles / show one entry incl. JSON Schema. | `list`: `--tenant`, `--output`; `show`: `<ID>`, `--output` |
+| `keel app install` | Validates values against the catalog JSON Schema and opens a deployment PR. | `--app`, `--tenant`, `--values-file`, `--canary`, `--engine [flux\|pulumi]` |
+| `keel app list` | Lists deployed releases (Flux `HelmRelease`/`Kustomization`). | `--tenant`, `--output` |
+| `keel infra list` | Lists PKO `Stack`s with live status. | `--tenant`, `--provider`, `--output [table\|json]` |
+| `keel infra provision` | Validates values against a blueprint JSON Schema and opens a provisioning PR. | `--blueprint`, `--tenant`, `--values-file` |
+| `keel infra ssh` | Prints VM SSH connection info or runs `ssh` directly (`tokio::process::Command::new("ssh")`); 404 for unknown / non-VM stacks. | `<stack>`, `--tenant` (default `default`), `--user`, `--port`, `-i`, `--exec`, `--output [table\|json\|command]` |
+| `keel infra force-delete` | Clears finalizers and force-deletes a stuck `Stack` (tenant admin; refuses `keel.io/protect`). | `<stack>`, `--tenant` (default `default`), `--namespace`, `--output` |
+| `keel infra unlock` | Cancels a stale Pulumi state lock and requests reconciliation (tenant admin). | `<stack>`, `--tenant`, `--namespace`, `--output` |
+| `keel tenant migrate-state` | Moves tenant Pulumi state from the bucket root to `tenants/<id>/` (idempotent; bucket-root copies left in place). Direct cluster access via `kubectl` + `pulumi`. | `--tenant`, `--dry-run`, `--kubeconfig`, `--context` |
 
 ### 7.3 REST & Server-Sent Events (SSE) API Surface
 
 | Method | Endpoint | Purpose |
 | :--- | :--- | :--- |
-| `GET` | `/api/v1/auth/login` & `/callback` | OIDC Authorization Code + PKCE login flow (supports browser cookies and CLI localhost callback). |
+| `GET` | `/api/v1/auth/login` & `/callback` | OIDC Authorization Code + PKCE + `nonce` login flow (browser `keel_session` cookie). |
+| `GET` | `/api/v1/auth/cli/login` | CLI loopback login entrypoint (RFC 8252): validates `redirect_uri=http://127.0.0.1:<port>/callback`, `state`, `code_challenge` (S256) and starts OIDC; the callback redirects to the loopback URI with a one-time code (§6.1). |
+| `POST` | `/api/v1/auth/cli/exchange` | Redeems `{code, codeVerifier, redirectUri}` for `{sessionToken, tokenType: "Bearer", expiresAt, sub, phase, isAdmin}` (single-use, 60 s). |
 | `GET` | `/api/v1/auth/status` | Reports current auth phase, OIDC availability, and authenticated session claims. |
 | `POST` | `/api/v1/auth/logout` | Clears the stateless `HttpOnly` `keel_session` and `keel_pkce` cookies (`Max-Age=0`). |
+| `GET` | `/healthz` | Unauthenticated liveness/readiness probe. |
+| `GET` | `/metrics` | Unauthenticated Prometheus metrics. |
 | `GET` | `/api/v1/catalog` | Returns available applications, infrastructure blueprints (filtered by enabled providers), and multi-item bundles. |
 | `POST` | `/api/v1/catalog` | Registers a new `CatalogApplication`, `CatalogInfraBlueprint`, or `CatalogBundle` via a Git PR. |
 | `PUT` | `/api/v1/catalog/{kind}/{id}` | Updates an existing `CatalogApplication`, `CatalogInfraBlueprint`, or `CatalogBundle` via a Git PR (preserving or optionally updating `Pulumi.yaml` for infra). |
-| `POST` | `/api/v1/catalog/fetch-schema` | Fetches or derives a JSON Schema from an upstream Helm chart (`values.schema.json` or `values.yaml`). |
-| `GET` | `/api/v1/proposals` | Lists Pull Requests / proposals across configured `ForgeProvider`s (supports `?status=open\|merged\|closed\|all` and `?tenant=...`). |
-| `POST` | `/api/v1/proposals` | Validates JSONSchema payload, SOPS-encrypts secrets, commits to branch, opens PR, and triggers ephemeral PKO preview. |
-| `GET` | `/api/v1/proposals/{pr_id}/preview` | Returns parsed PKO v2 preview diff tree, resource change counts, drift alerts, and direct Forge PR URL. |
-| `POST` | `/api/v1/proposals/{pr_id}/merge` | Merges an approved PR once PKO preview and policy gates pass (used by `LocalGitProvider` and UI merge action). |
+| `DELETE` | `/api/v1/catalog/{kind}/{id}` | Opens a PR removing a catalog entry (refused for protected entries). |
+| `POST` | `/api/v1/catalog/fetch-schema` | Fetches or derives a JSON Schema from an upstream Helm chart (`values.schema.json` or `values.yaml`). Admin or tenant-admin only; HTTP(S) repos are fetched in-process with DNS resolved once and pinned (private/loopback/link-local/mapped addresses rejected, redirects re-validated per hop), size-capped index/archive/unpacked bytes and no temp files; OCI repos use `helm pull` with a killed-on-timeout child. |
+| `GET` / `POST` | `/api/v1/tenants` | Lists tenants visible to the caller / creates a tenant via PR (cluster admin; ids ending in `-admin` rejected; provisions the scoped S3 identity). |
+| `DELETE` | `/api/v1/tenants/{id}` | Opens a PR removing a tenant (cluster admin; `default` cannot be deleted). |
+| `GET` | `/api/v1/providers` | Lists providers from `providers/registry.yaml` with enablement state. |
+| `PUT` | `/api/v1/providers/{id}` | Enables/disables a provider via PR (cluster admin). On merge, `restrict-pulumi-providers` is regenerated from the registry by one shared helper, and Pulumi built-ins including `kubernetes` are always allowed. |
+| `GET` | `/api/v1/proposals` | Lists Pull Requests / proposals across configured `ForgeProvider`s (supports `?status=open\|merged\|closed\|all` and `?tenant=...`). Forge listings are fully paginated (`Link: rel="next"` / full pages, capped at 40×50 with a warning). Proposal objects are `camelCase` (`sourceBranch`, `headSha`, `mergeCommitSha`, ...). PR titles are Conventional Commits generated server-side (`feat(<tenant>): deploy\|provision\|update <name>`, `chore(<tenant>): delete ...`); a non-conforming client title is moved into the body. |
+| `POST` | `/api/v1/proposals` | Validates JSONSchema payload, SOPS-encrypts secrets, commits to branch, opens PR, and triggers ephemeral PKO preview. Tenant PKO Stacks use the tenant state prefix (`tenants/<id>`) and scoped identity; returns `409` if the tenant has no scoped state credentials. |
+| `GET` | `/api/v1/proposals/{pr_id}/preview` | Returns parsed PKO v2 preview diff tree, resource change counts, drift alerts, and direct Forge PR URL. `gitDiff` is the merge-base diff (`target...head`) for open/closed PRs and the recorded-base / merge-commit first-parent diff for merged PRs; it is read from refs (no checkout) after a debounced (10 s), timeout-bounded fetch into `refs/keel-read/origin/*` outside the global git lock. |
+| `POST` | `/api/v1/proposals/{pr_id}/merge` | Merges an approved PR once PKO preview and policy gates pass (used by `LocalGitProvider` and UI merge action). Live `Stack` deletions are derived from the PR diff (`tenants/<id>/**/stack.yaml` removed between merge-base and the pinned head, `metadata.name`, namespace must equal `tenant-<id>`), never from the title. Create/merge/close/reopen are audit-logged (`target: keel::audit`, user `sub`, tenant, PR id). |
 | `POST` | `/api/v1/proposals/{pr_id}/reject` | Closes/rejects an open PR proposal via `ForgeProvider`. |
 | `POST` | `/api/v1/proposals/{pr_id}/reopen` | Reopens a previously closed PR proposal via `ForgeProvider`. |
 | `GET` | `/api/v1/stacks` | Lists infrastructure stacks across Proxmox, AWS, GCP, Azure, Hetzner, Cloudflare, and custom providers (including `Deleting` stacks). |
-| `GET` | `/api/v1/stacks/{namespace}/{name}/config` & `DELETE /api/v1/stacks/{namespace}/{name}` | Fetches persisted stack config for editing or opens a PR to delete an infrastructure stack. |
+| `GET` | `/api/v1/stacks/{namespace}/{name}/config` | Fetches persisted stack config for editing or opens a PR to delete an infrastructure stack. |
 | `GET` | `/api/v1/stacks/{namespace}/{name}/ssh-info` | Resolves VM SSH connection metadata (`sshHost`, `sshUser`, `sshPort`, provider) and copy-ready CLI/SSH commands from stack output Secret without exposing private keys. |
 | `GET` | `/api/v1/stacks/{namespace}/{name}/ssh/ws` | Opt-in interactive browser SSH terminal over WebSocket bridge using pure-Rust `russh` PTY streaming with saved profile or ephemeral SSH keys. |
-| `POST` | `/api/v1/stacks/{namespace}/{name}/restart` | Triggers a Kubernetes rollout restart on the stack's PKO v2 `Workspace` StatefulSet. |
+| `POST` | `/api/v1/stacks/{namespace}/{name}/restart` | Triggers a Kubernetes rollout restart on the stack's PKO v2 `Workspace` StatefulSet (tenant admin). |
+| `POST` | `/api/v1/stacks/{namespace}/{name}/reconcile` | Annotates the `Stack` with `pulumi.com/reconcile-request` (tenant member). |
+| `POST` | `/api/v1/stacks/{namespace}/{name}/force-delete` | Clears finalizers and deletes a stuck `Stack` (tenant admin; `404` if missing; refuses `keel.io/protect`). |
+| `POST` | `/api/v1/stacks/{namespace}/{name}/unlock` | Cancels a stale Pulumi lock and requests reconciliation (tenant admin). |
+| `GET` | `/api/v1/stacks/{namespace}/{name}/diagnostics` & `/api/v1/releases/{namespace}/{name}/diagnostics` | Conditions, events, and workspace/controller log excerpts for the inspector. |
 | `GET` | `/api/v1/releases` | Lists deployed Helm, Kustomize, and Flagger Canary applications (including `Deleting` releases). |
-| `GET` | `/api/v1/releases/{namespace}/{name}/config` & `DELETE /api/v1/releases/{namespace}/{name}` | Fetches persisted release values for editing or opens a PR to delete a release. |
+| `GET` | `/api/v1/releases/{namespace}/{name}/config` | Fetches persisted release values for editing or opens a PR to delete a release. |
 | `POST` | `/api/v1/releases/{namespace}/{name}/reconcile` | Annotates a Flux `HelmRelease` (or `Kustomization`) with `reconcile.fluxcd.io/requestedAt` to trigger immediate reconciliation. |
 | `GET` | `/api/v1/bundles/{namespace}/{name}/config` | Fetches combined per-item configuration for a deployed `CatalogBundle`. |
 | `GET` | `/api/v1/events/stream` | **SSE stream** pushing real-time `kube-rs` CRD condition transitions (`GitRepository`, `Kustomization`, `HelmRelease`, `Stack`, `Canary`). |
+| `GET` | `/api/v1/management/addons` | Admin-only, read-only management core add-on status: desired `HelmRelease`s from `clusters/management/core-addons/*.yaml` (`keel-system`/`flux-system`) overlaid with live Flux status matched strictly by `(namespace, name)` (never by chart name). Returns `{addons:[{id,name,namespace,chart?,desiredVersion?,status?,tracked,lastSynced?}], liveStatusAvailable}`; `tracked: false` means no live HelmRelease was observed (UI: "Not tracked (installed by bootstrap)"). |
+| `POST` | `/api/v1/management/addons/{id}/upgrade` & `/rollback` | Admin-only: opens a PR that updates (upgrade) or reverts to the previous Git revision (rollback) a core add-on manifest under `clusters/management/core-addons/`. |
+| `DELETE` | `/api/v1/stacks/{namespace}/{name}` & `/api/v1/releases/{namespace}/{name}` | Opens a removal PR (live `Stack` deletion on merge is derived from deleted `stack.yaml` files). |
 | `PUT` | `/api/v1/profile/git-credentials` | Stores `AES-256-GCM`-encrypted SSH keys or Forge PATs in a Kubernetes `Secret` for the authenticated user's Git operations. |
 
+**Cross-cutting API rules:** errors use the envelope `{error, details?, correlationId?}`; 5xx bodies are generic (no git/helm/kube stderr or paths) and carry a `correlationId` matching the server log. Every response carries `Content-Security-Policy: default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; font-src 'self' data:; frame-ancestors 'none'; base-uri 'self'; form-action 'self' <issuer-origin>`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, and `X-Frame-Options: DENY` (`keel_server::security`). Cookie-authenticated mutations and WebSocket upgrades are subject to the same-origin CSRF rules in §6.1.
+
 ### 7.4 React + Shadcn + Tailwind GUI Views
-1. **Cluster & Provider Topology Map & VM SSH Access:** Live health view of the management cluster, provisioned workload clusters, Proxmox nodes, and enabled cloud providers—including `Drifted / Error / Deleting` status tracking, `Type` (`management`/`workload`/`cloud`), managed `Resources` count, `Last Synced` timestamps for both stacks and application releases, Bundle grouping, **+ Deploy Stack** / **+ Deploy App** actions, TanStack table sorting/filtering, PR-driven Edit/Delete/Reconcile actions, deduplicated real-time Flux/PKO reconciliation timeline, Flagger canary traffic-weight gauge + Prometheus error/latency sparklines, and direct **VM SSH Access** (Connection Information modal with copyable `ssh` / `keel infra ssh` commands and an opt-in **"Launch Browser Terminal"** running `@xterm/xterm` over an authenticated WebSocket bridge).
+GUI conventions: Shadcn UI (`ui/components.json`, Radix primitives in `ui/src/components/ui/`) for all dialogs (Escape, focus trap/return, close on hash-route change) and the `@rjsf/core` widget/template registry; role-aware controls mirror server `AuthSession` checks (cluster admin, tenant admin, tenant member) but the server stays authoritative; the UI never fabricates state (the management row/strip renders only from API data); live updates use the SSE CRD stream with backoff polling only while SSE is disconnected; API errors are parsed from the `{error, details?, correlationId?}` envelope (correlation id shown for 5xx); hash routes `#preview/<id>` and `#catalog/<kind>` are deep-linkable and preserved across OIDC login (sessionStorage); `?demo=true` fixture mode is available only in dev builds or builds with `VITE_ENABLE_DEMO=true`, never makes live API calls, and shows a persistent "DEMO DATA" banner.
+
+1. **Cluster & Provider Topology Map & VM SSH Access:** Live health view of the management cluster, provisioned workload clusters, Proxmox nodes, and enabled cloud providers—including `Drifted / Error / Deleting` status tracking, `Type` (`management`/`workload`/`cloud`), managed `Resources` count, `Last Synced` timestamps for both stacks and application releases, Bundle grouping, **+ Deploy Stack** / **+ Deploy App** actions, TanStack table sorting/filtering, PR-driven Edit/Delete/Reconcile actions, deduplicated real-time Flux/PKO reconciliation timeline, Flagger canary traffic-weight gauge + Prometheus error/latency sparklines, and direct **VM SSH Access** (Connection Information modal with copyable `ssh` / `keel infra ssh` commands and an opt-in **"Launch Browser Terminal"** over an authenticated WebSocket bridge, rendered with **wterm** (`@wterm/dom` 0.6, Apache-2.0, Vercel Labs: a small WASM VT core + DOM renderer, ~50 KB gz JS + ~32 KB gz lazily-loaded WASM vs. xterm.js ~89 KB gz; DOM output is selectable, browser-findable, and screen-reader friendly; requires CSP `'wasm-unsafe-eval'`), with the SSH host-key `SHA256:` fingerprint and a verified/unverified badge).
 2. **Self-Service Catalog & Dynamic Form Wizard:** Searchable catalog rendering `catalog.yaml` JSONSchemas via `@rjsf/core` + Shadcn components, supporting creating and editing Apps (Helm, Kustomize, and Raw Kubernetes Manifests with **"Auto-Extract `${var}` Fields"** and Flux vs. Pulumi engine selection), Infrastructure Blueprints (including authoring and editing `Pulumi.yaml` directly from the GUI), and Multi-Item Bundles via Git PRs, complete with live `values.yaml` diff preview before submission.
 3. **PR & PKO Preview Inspector:** Side-by-side view of Open, Merged, Closed, or All Git PRs (with direct external links to Forgejo/Gitea/GitHub/GitLab), resource-level PKO diff trees (`+ Create`, `~ Update`, `- Delete`, `! Replace`), syntax-highlighted unified Git diffs, and policy check status.
 
@@ -489,19 +554,19 @@ crates/
 
 | ID | Requirement | Verification Criteria & Technical Control |
 | :--- | :--- | :--- |
-| **NFR-SEC-01** | **OIDC-First Auth & Session Hardening** | Stage 0 provisions an in-cluster Rauthy OIDC provider (or binds an external OIDC issuer) with seeded admin credentials in `keel-admins`. All API/UI/CLI sessions enforce OIDC Authorization Code + PKCE and `HttpOnly`, `Secure`, `SameSite=Strict` cookies encrypted with `AES-256-GCM`. |
+| **NFR-SEC-01** | **OIDC-First Auth & Session Hardening** | Stage 0 provisions an in-cluster Rauthy OIDC provider (or binds an external OIDC issuer) with seeded admin credentials in `keel-admins`. All API/UI/CLI sessions use OIDC Authorization Code + PKCE (+ `nonce`). Browser sessions use `HttpOnly` `SameSite=Strict` `keel_session` cookies (`Secure` except on loopback HTTP), encrypted with `AES-256-GCM`. CLI sessions use phase-bound Bearer tokens from the RFC 8252 loopback flow. All responses carry a strict CSP and anti-framing headers (§7.3). |
 | **NFR-SEC-02** | **Strict Tenant Blast-Radius Isolation** | Each tenant is confined to `tenants/<tenant>/` and `tenant-<tenant>` namespace. Flux runs with `--no-cross-namespace-refs=true` and tenant `ServiceAccount` impersonation. |
 | **NFR-SEC-03** | **PKO Workspace Pod Sandboxing** | All PKO v2 `Workspace` pods enforce Kubernetes `restricted` Pod Security Standards (non-root UID, `drop: ["ALL"]` capabilities, read-only root filesystem, `RuntimeDefault` seccomp) and RBAC-authenticated workspace gRPC endpoints. |
 | **NFR-SEC-04** | **Admission Policy Guardrails** | Kyverno policies block privileged workloads, enforce resource quotas, restrict permitted Pulumi/OpenTofu providers per tenant, and protect control-plane stacks from non-admin mutation. |
 | **NFR-SEC-05** | **Per-Tenant Secrets Encryption** | All secrets in Git are encrypted via SOPS + `age` using per-tenant public keys. User SSH keys and PATs are encrypted at rest with `AES-256-GCM` and redacted from all logs and API payloads. |
-| **NFR-SEC-06** | **Command Injection & Supply-Chain Defense** | External CLI calls (`git`, `sops`, `pulumi`, `kind`) use `tokio::process::Command` argument vectors exclusively (no shell invocation). Container images are signed with **Cosign** and verified prior to deployment. |
+| **NFR-SEC-06** | **Command Injection & Supply-Chain Defense** | External CLI calls (`git`, `sops`, `pulumi`, `kind`) use `tokio::process::Command` argument vectors exclusively (no shell invocation). Release container images and binaries are **Cosign** keyless-signed (§9.2); verifying image signatures at admission before deployment is a target *(not yet implemented, see §9.5)*. |
 
 ### 8.2 Reliability, Resilience & Anti-Lockout (`NFR-REL`)
 
 | ID | Requirement | Verification Criteria & Technical Control |
 | :--- | :--- | :--- |
-| **NFR-REL-01** | **Control-Plane Anti-Lockout** | Management cluster hosts control-plane components only; core stacks carry `protect: true`; `keel bootstrap recover` restores control-plane state directly from versioned S3 if the cluster or Forge is offline. |
-| **NFR-REL-02** | **Mandatory Pre-Merge Preview** | Every infrastructure/app PR triggers an ephemeral PKO v2 `preview: true` run; merge gates remain blocked in the UI until preview execution completes without policy violations. |
+| **NFR-REL-01** | **Control-Plane Anti-Lockout** | Management cluster hosts control-plane components only; core stacks (and Stage 0 control-plane resources in `deploy/bootstrap/control-plane/Pulumi.yaml`) carry `protect: true`, so intentional Stage 0 teardown via Pulumi requires an explicit `pulumi state unprotect --all` first (or deleting the cluster); `keel bootstrap recover` restores control-plane state directly from versioned S3 if the cluster or Forge is offline. |
+| **NFR-REL-02** | **Mandatory Pre-Merge Preview** | Every Pulumi-backed infrastructure/app PR triggers an ephemeral PKO v2 `preview: true` run in `keel-previews` (§4.2); Flux-only changes receive a clearly labelled synthesized diff. Previews are garbage-collected by a restart-safe 60 s reconciler on PR merge/close. |
 | **NFR-REL-03** | **Automated Canary Rollback** | Flagger + Envoy Gateway automatically rolls back K8s HTTP/gRPC releases if HTTP 5xx exceeds `1%` or p99 latency breaches threshold over 5 Prometheus intervals. |
 | **NFR-REL-04** | **Graceful State Locking & Termination** | PKO workspace pods handle `SIGTERM` with a 10-minute grace period for clean Pulumi state unlocks; S3 bucket versioning preserves point-in-time state snapshots. |
 | **NFR-REL-05** | **Recovery Objectives** | Control-plane **RPO $\le$ 5 minutes** (Git commits + versioned S3 state); full management cluster **RTO $\le$ 15 minutes** from release binary + target provider (or **$\le$ 60 seconds** for local `kind` recreation). |
@@ -568,8 +633,9 @@ flowchart TD
     subgraph RELEASE["release.yml (Pre-Release Gate & Publishing on main)"]
         GATE["workflow_call Gate<br/>needs: [ci, e2e-live]"]
         REL["semantic-release<br/>(Conventional Commits -> SemVer Tag)"]
-        CROSS["Cross-Compile Static Binaries<br/>(Linux amd64/arm64, macOS, Windows)"]
-        PUB["Publish GitHub Release + Signed OCI Image<br/>(Cosign + SBOM + HTML Docs)"]
+        CROSS["Build Release Binaries<br/>(static linux-musl amd64/arm64, macOS arm64, Windows amd64)"]
+        IMG["Build & Push Image<br/>(buildx amd64/arm64 → GHCR, SBOM + provenance, Cosign)"]
+        PUB["Sign & Publish GitHub Release<br/>(binaries + UI + SBOM + docs + SHA256SUMS + Cosign bundles)"]
     end
 
     AUTO["Renovate Auto-Merge<br/>(If Non-Major & All Checks Pass)"]
@@ -580,7 +646,7 @@ flowchart TD
     MAIN --> RELEASE
     RELEASE -->|"workflow_call"| CI
     RELEASE -->|"workflow_call"| E2E_LIVE
-    CI & E2E_LIVE --> GATE --> REL --> CROSS --> PUB
+    CI & E2E_LIVE --> GATE --> REL --> CROSS & IMG --> PUB
 ```
 
 ### 9.2 GitHub Actions Workflows (`.github/workflows/`)
@@ -589,16 +655,26 @@ flowchart TD
    * **Rust Quality:** `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo llvm-cov` enforcing $\ge 80\%$ line coverage.
    * **Frontend & E2E Static Quality:** `prettier --check` (formatting across TypeScript, TSX, JSON, YAML, and Markdown), `eslint` (TypeScript/React/Playwright lint rules), `tsc --noEmit` (strict TypeScript typechecking), and `pnpm --dir ui test:unit --coverage` (`vitest`) enforcing $\ge 80\%$ line coverage.
    * **Mocked Playwright E2E:** Executes headless Chromium Playwright tests (`pnpm --dir e2e test`) verifying catalog wizards, dynamic forms, PR proposals, diff viewer, and UI routes with zero cluster overhead.
-   * **Documentation:** `mdbook build` ensuring the user guide compiles cleanly with zero broken links.
+   * **Documentation:** `mdbook build` ensuring the user guide compiles (link checking is not automated; see §9.5).
+   * **SOPS/age:** installs pinned, checksum-verified `sops` (`v3.13.3`) and `age` (`v1.3.2`) and runs the Rust tests with `KEEL_REQUIRE_SOPS=1`, so the real SOPS round-trip test cannot silently skip.
+   * **Container:** builds the `Dockerfile` (`linux/amd64`, static musl via `cargo-zigbuild`, no push) and smoke-tests `keel --version` and `git --version` in the image, so Dockerfile/musl breakage is caught before a release is tagged.
 2. **`e2e.yml` (Live Cluster & Cloud Verification):**
-   * Callable via `workflow_call` on pushes to `main` and manually via `workflow_dispatch`.
+   * Callable via `workflow_call` and manually via `workflow_dispatch`; the live kind job runs only when the explicit `run_live` input is `true` (`release.yml` passes `run_live: true`).
    * **`e2e-live-kind`:** Spins up an ephemeral `kind` cluster with Flux CD, PKO v2, Kyverno, SeaweedFS, Envoy Gateway, Flagger, Rauthy OIDC, and local Forgejo; executes live end-to-end browser and CLI tests verifying Stage 0 bootstrap, OIDC PKCE login, PR creation, live PKO diff streaming, and progressive canary rollouts.
    * **`e2e-live-cloud` (Optional / Dual-Guard):** Runs `08-cloud-free-tier-live-e2e.spec.ts` against real AWS, Azure, and GCP APIs using cloud VM blueprints (`aws-vm`, `azure-vm`, `gcp-vm`, defaulting to free-tier sizes) when provider toggles (`KEEL_E2E_CLOUD_<PROVIDER>=1` / `KEEL_E2E_CLOUD_ALL=1`) and credentials are configured.
 3. **`release.yml` (Pre-Release Gate & Publishing on `main`):**
-   * Triggered exclusively on `push: branches: [main]`.
+   * Triggered exclusively on `push: branches: [main]`; workflow-level `permissions: {}` with per-job least privilege.
    * Invokes `ci.yml` (Job `ci`) and `e2e.yml` (Job `e2e-live`) via `workflow_call`.
    * The `release` job declares `needs: [ci, e2e-live]`, ensuring releases are strictly gated behind 100% green checks on `main`.
-   * Executes **`semantic-release`** to analyze Conventional Commits (`feat:`, `fix:`, `BREAKING CHANGE:`), synchronously bump versions across `Cargo.toml` and `ui/package.json`, generate `CHANGELOG.md`, cross-compile static binaries (`x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`, `aarch64-apple-darwin`, `x86_64-pc-windows-msvc`), push multi-arch container images to GHCR, attach CycloneDX SBOMs, sign all artifacts with **Cosign**, and publish mdBook documentation to GitHub Pages.
+   * The `release` job installs the pinned toolchain from `release/package.json` + `release/package-lock.json` (`npm ci`) and runs **`semantic-release`** (Conventional Commits → SemVer tag; pre-1.0 `BREAKING CHANGE` maps to a **minor** bump), which bumps `Cargo.toml`/`ui/package.json`, updates only the workspace entries of `Cargo.lock` (`cargo update --workspace`, verified with `cargo metadata --locked`), writes `CHANGELOG.md`, and creates a **draft** GitHub Release.
+   * When a release was cut:
+     * `build-ui` builds the SPA once (`pnpm install --frozen-lockfile`).
+     * `build-binaries` builds `keel` with `--locked` per target: `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl` as **fully static** binaries via `cargo-zigbuild` (static linkage asserted with `file`), plus `aarch64-apple-darwin` and `x86_64-pc-windows-msvc`.
+     * `image` builds the repository `Dockerfile` with buildx for `linux/amd64,linux/arm64`, pushes `ghcr.io/<owner>/keel:<version>` and `:latest` with SBOM and `mode=max` provenance attestations, and **Cosign keyless**-signs the pushed digest (`id-token: write`).
+     * `publish-release` builds the mdBook HTML archive and a CycloneDX source SBOM (`anchore/sbom-action`), writes `keel-image.txt` (image reference with digest) and `SHA256SUMS`, `cosign sign-blob --bundle`s every asset into `<asset>.sigstore.json`, uploads `keel-{linux-amd64,linux-arm64,darwin-arm64}.tar.gz`, `keel-windows-amd64.zip`, `keel-ui.tar.gz`, `keel-docs.tar.gz`, `keel-sbom.cdx.json`, `keel-image.txt`, `SHA256SUMS`, and the bundles, then un-drafts the release. All assets are attached by this one job; any failure leaves the release as a draft.
+   * **Container image (`Dockerfile`):** multi-stage: `ui-build` (Node + pnpm, frozen lockfile) → `rust-build` (static musl `keel` cross-compiled with `cargo-zigbuild` on the build platform, `--locked`) → default `runtime` target on Chainguard `wolfi-base` as UID/GID `65532` with the `git`, `ssh`, `sops`, and `age-keygen` CLIs `keel serve` invokes. `ENTRYPOINT ["/usr/local/bin/keel"]`, default `CMD ["serve","--bind","0.0.0.0:8080"]` (overridable). A binary-only `static` target (`gcr.io/distroless/static:nonroot`) is available for CLI use; it cannot run `keel serve`. `ci.yml` builds and smoke-tests the `linux/amd64` image on every PR.
+   * **Supply-chain pinning:** all actions are pinned to full commit SHAs with `# vX.Y.Z` comments; base images are pinned by digest; release tools (mdbook, cargo-edit, cargo-zigbuild, Zig, Cosign, pnpm) are pinned to exact versions; `.github/actionlint.yaml` configures `actionlint`.
+4. **`docs.yml`:** deploys the mdBook site to GitHub Pages on pushes to `main` touching `docs/**`, `book.toml`, or `mermaid*.js` (and on `workflow_dispatch`).
 
 ### 9.3 `semantic-release` Configuration (`.releaserc.json`)
 
@@ -617,7 +693,7 @@ flowchart TD
     [
       "@semantic-release/exec",
       {
-        "prepareCmd": "cargo set-version ${nextRelease.version} && npm --prefix ui version ${nextRelease.version} --no-git-tag-version && cargo generate-lockfile"
+        "prepareCmd": "cargo set-version ${nextRelease.version} && cargo update --workspace && cargo metadata --locked --format-version 1 > /dev/null && npm --prefix ui version ${nextRelease.version} --no-git-tag-version"
       }
     ],
     [
@@ -630,13 +706,7 @@ flowchart TD
     [
       "@semantic-release/github",
       {
-        "assets": [
-          { "path": "dist/keel-linux-amd64.tar.gz", "label": "Linux amd64 Binary" },
-          { "path": "dist/keel-linux-arm64.tar.gz", "label": "Linux arm64 Binary" },
-          { "path": "dist/keel-darwin-arm64.tar.gz", "label": "macOS Apple Silicon Binary" },
-          { "path": "dist/keel-windows-amd64.zip", "label": "Windows amd64 Binary" },
-          { "path": "dist/sbom.cdx.json", "label": "CycloneDX SBOM" }
-        ]
+        "draftRelease": true
       }
     ]
   ]
@@ -644,7 +714,7 @@ flowchart TD
 ```
 
 ### 9.4 Renovate Configuration (`renovate.json`)
-Configured to run weekly, group ecosystem updates logically to minimize PR noise, and auto-merge compatible updates once unit and Playwright E2E checks pass:
+Configured to run weekly, group ecosystem updates logically to minimize PR noise, and auto-merge compatible updates once unit and Playwright E2E checks pass. `helpers:pinGitHubActionDigests` keeps SHA-pinned actions (and their `# vX.Y.Z` comments) current, `docker:pinDigests` does the same for `Dockerfile` base images, and a regex custom manager updates `# renovate: datasource=... depName=...` annotated tool versions in workflows and the `Dockerfile`:
 
 ```json
 {
@@ -653,9 +723,13 @@ Configured to run weekly, group ecosystem updates logically to minimize PR noise
     "config:recommended",
     ":dependencyDashboard",
     ":semanticCommits",
-    ":enableVulnerabilityAlerts"
+    ":enableVulnerabilityAlerts",
+    "helpers:pinGitHubActionDigests",
+    "docker:pinDigests"
   ],
-  "schedule": ["before 5am on monday"],
+  "schedule": [
+    "before 5am on monday"
+  ],
   "timezone": "UTC",
   "prConcurrentLimit": 5,
   "automerge": true,
@@ -663,68 +737,140 @@ Configured to run weekly, group ecosystem updates logically to minimize PR noise
   "platformAutomerge": true,
   "lockFileMaintenance": {
     "enabled": true,
-    "schedule": ["before 5am on monday"],
+    "schedule": [
+      "before 5am on monday"
+    ],
     "automerge": true
   },
   "packageRules": [
     {
       "description": "Group non-breaking Rust patch updates (>= 0.1.0)",
-      "matchManagers": ["cargo"],
+      "matchManagers": [
+        "cargo"
+      ],
       "groupName": "rust-dependencies",
       "matchCurrentVersion": "!/^0\\.0\\./",
-      "matchUpdateTypes": ["patch"],
+      "matchUpdateTypes": [
+        "patch"
+      ],
       "automerge": true
     },
     {
       "description": "Group non-breaking Rust minor updates (>= 1.0.0)",
-      "matchManagers": ["cargo"],
+      "matchManagers": [
+        "cargo"
+      ],
       "groupName": "rust-dependencies",
       "matchCurrentVersion": "!/^0\\./",
-      "matchUpdateTypes": ["minor"],
+      "matchUpdateTypes": [
+        "minor"
+      ],
       "automerge": true
     },
     {
       "description": "Require manual review for pre-1.0 Rust minor updates and 0.0.x patches (SemVer breaking)",
-      "matchManagers": ["cargo"],
+      "matchManagers": [
+        "cargo"
+      ],
       "matchCurrentVersion": "/^0\\./",
-      "matchUpdateTypes": ["minor"],
+      "matchUpdateTypes": [
+        "minor"
+      ],
       "automerge": false
     },
     {
       "description": "Require manual review for 0.0.x Rust patch updates (SemVer breaking)",
-      "matchManagers": ["cargo"],
+      "matchManagers": [
+        "cargo"
+      ],
       "matchCurrentVersion": "/^0\\.0\\./",
-      "matchUpdateTypes": ["patch"],
+      "matchUpdateTypes": [
+        "patch"
+      ],
       "automerge": false
     },
     {
       "description": "Group tightly coupled Kubernetes Rust crates",
-      "matchManagers": ["cargo"],
-      "matchPackageNames": ["kube", "k8s-openapi"],
+      "matchManagers": [
+        "cargo"
+      ],
+      "matchPackageNames": [
+        "kube",
+        "k8s-openapi"
+      ],
       "groupName": "rust-kube",
       "automerge": false
     },
     {
       "description": "Group React, Shadcn, Tailwind, and Playwright updates",
-      "matchManagers": ["npm"],
+      "matchManagers": [
+        "npm"
+      ],
       "groupName": "frontend-dependencies",
-      "matchUpdateTypes": ["minor", "patch"],
+      "matchUpdateTypes": [
+        "minor",
+        "patch"
+      ],
       "automerge": true
     },
     {
-      "description": "Group GitHub Actions updates",
-      "matchManagers": ["github-actions"],
+      "description": "Group GitHub Actions updates (SHA digests pinned via helpers:pinGitHubActionDigests)",
+      "matchManagers": [
+        "github-actions"
+      ],
       "groupName": "github-actions",
       "automerge": true
     },
     {
+      "description": "Group container base images (Dockerfile digests) and annotated release tooling",
+      "matchManagers": [
+        "dockerfile",
+        "custom.regex"
+      ],
+      "groupName": "release-tooling",
+      "automerge": true
+    },
+    {
+      "description": "Pinned semantic-release toolchain (release/package.json + package-lock.json)",
+      "matchManagers": [
+        "npm"
+      ],
+      "matchFileNames": [
+        "release/package.json"
+      ],
+      "groupName": "release-tooling",
+      "automerge": true
+    },
+    {
       "description": "Require manual review for major breaking dependency upgrades",
-      "matchUpdateTypes": ["major"],
+      "matchUpdateTypes": [
+        "major"
+      ],
       "automerge": false
+    }
+  ],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Pinned tool versions annotated with `# renovate: datasource=... depName=...` in workflows and the Dockerfile",
+      "managerFilePatterns": [
+        "/^\\.github/workflows/[^/]+\\.ya?ml$/",
+        "/(^|/)Dockerfile$/"
+      ],
+      "matchStrings": [
+        "# renovate: datasource=(?<datasource>[a-z-]+?) depName=(?<depName>\\S+?)(?: versioning=(?<versioning>\\S+?))?\\s+(?:ARG )?[A-Z0-9_]+(?:=|: )\"?(?<currentValue>[^\\s\"]+)\"?"
+      ]
     }
   ]
 }
 ```
+
+### 9.5 Known Gaps (Release & Supply Chain)
+Tracked against the target design above; not yet implemented:
+* **No admission-time signature verification:** release images are Cosign-signed, but no Kyverno `verifyImages` policy enforces signatures before deployment (NFR-SEC-06).
+* **Live E2E installers are not pinned:** `e2e.yml` installs `kind`/`kubectl` "latest", Helm via the `main`-branch `get-helm-3` script, Pulumi via `get.pulumi.com`, and an older `sops` without checksum verification.
+* **Zig is bumped manually** (its SHA-256s live in the `Dockerfile`), not by Renovate.
+* **No automated docs link check** in CI.
 
 ---
 
@@ -736,18 +882,23 @@ Configured to run weekly, group ecosystem updates logically to minimize PR noise
 | :--- | :--- | :--- |
 | **`keel-git`** | `cargo test` | Branch creation, commit authorship formatting, SSH key temp-pipe cleanup, command injection prevention, and `ForgeProvider` HTTP serialization mocks (Forgejo, GitHub, GitLab, LocalGit). |
 | **`keel-core`** | `cargo test` | `catalog.yaml` parsing, JSONSchema validation error reporting, SOPS + `age` encryption/decryption round-trips, `BootstrapTarget` config validation, and Helm `values.yaml` rendering. |
-| **`keel-pko`** | `cargo test` | Ephemeral preview CR generation, `pulumi preview --json` diff parser (`create`/`update`/`delete`/`replace`), and preview garbage-collection reconciliation. |
-| **`keel-kube`** | `cargo test` | Tenant namespace/RBAC manifest synthesis, K8s `Secret`-backed state persistence, SSE event serialization, and Kyverno policy compliance checks. |
+| **`keel-pko`** | `cargo test` | Ephemeral preview CR generation, PKO `Stack`/`Update` status → `run.phase` mapping, `pulumi preview` console-log plan parser (`create`/`update`/`delete`/`replace`), Markdown escaping of PR comment cells, and preview GC/refresh planning. |
+| **`keel-kube`** | `cargo test` | Tenant namespace/RBAC manifest synthesis, K8s `Secret`-backed state persistence, idempotent tenant S3 identity provisioning (mocked exec seam), SSE event serialization, and Kyverno policy compliance checks. |
 | **React Forms & UI** | `vitest` + React Testing Library | `@rjsf/core` + Shadcn widget rendering for all JSONSchema types (`string`, `integer`, `boolean`, `array`, `object`, `writeOnly` secrets), validation feedback, and SSE store updates. |
 
 ### 10.2 Playwright End-to-End Test Matrix (`e2e/tests/*.spec.ts`)
-Executed headlessly in GitHub Actions against an isolated test harness (`keel-server` + local Gitea + `kind` cluster with Flux & PKO v2):
+The mocked suite (`pnpm --dir e2e test`) runs headless Chromium against a locally started `keel serve` (`e2e/scripts/start-test-server.mjs`, no cluster). The live suites are opt-in (`KEEL_E2E_LIVE=1`).
 
-1. **`01-bootstrap-and-oidc.spec.ts`:** Verifies Stage 0 login via one-time CLI bootstrap token on a `kind` target, validates rejection of invalid/reused tokens, configures OIDC mock provider via PR, and confirms transition to OIDC PKCE authentication.
-2. **`02-catalog-dynamic-forms.spec.ts`:** Loads a complex `catalog.yaml` with nested JSONSchema properties and `writeOnly` secret fields, validates client-side form constraints, submits the form, and verifies the resulting Git PR contains SOPS-encrypted secrets and unmodified upstream Helm `values.yaml`.
-3. **`03-pko-preview-and-merge.spec.ts`:** Opens an infrastructure provisioning PR (e.g., Proxmox/Cloud VM + companion PostgreSQL), asserts that the ephemeral PKO preview runs, verifies `+ Create` / `~ Update` / `- Delete` diff nodes render in the GUI with a valid link to the Gitea PR, merges the PR, and verifies ephemeral preview CR cleanup.
-4. **`04-canary-lifecycle.spec.ts`:** Deploys a stateless K8s app with Flagger canary enabled, asserts live SSE status transitions (`Progressing` -> `Ready`), and verifies automated rollback behavior upon simulated HTTP 5xx/latency threshold breach.
-5. **`05-multi-tenant-isolation.spec.ts`:** Authenticates as `Tenant-A`, attempts to reference a secret or stack in `Tenant-B`, and verifies rejection at both the API layer and Kyverno admission webhook.
-6. **`06-full-gui-workflow.spec.ts`:** Verifies the complete UI user journey (catalog navigation, dynamic form rendering with `@rjsf/core`, PR proposal creation, diff inspector, and merge).
-7. **`07-kind-live-e2e.spec.ts`:** Executes live end-to-end bootstrap, provision, and deploy flows against real `kind` clusters, Flux, PKO v2, Rauthy, and Forgejo.
-8. **`08-cloud-free-tier-live-e2e.spec.ts`:** Multi-cloud live E2E suite validating Stage 0 cloud bootstrap and Stage 1 PKO v2 provider provisioning across AWS, Azure, and GCP using cloud VM blueprints (`aws-vm`, `azure-vm`, `gcp-vm`, defaulting to free-tier sizes). Governed by the **Dual-Guard Environment Contract** requiring both an explicit toggle (`KEEL_E2E_CLOUD_<PROVIDER>=1` or `KEEL_E2E_CLOUD_ALL=1`) AND valid cloud credentials (`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`, `ARM_CLIENT_ID`/`ARM_CLIENT_SECRET`/`ARM_TENANT_ID`/`ARM_SUBSCRIPTION_ID`, or `GOOGLE_CREDENTIALS`/`GCP_PROJECT`); otherwise cleanly skips. Verifies Stage 0 cloud bootstrap (`--skip-core-install`), Stage 1 PKO v2 preview diff generation, live cloud resource creation, SSH connection metadata resolution (`keel infra ssh`), and guaranteed `pulumi destroy` resource teardown in `finally` blocks.
+| Spec | Current coverage |
+| :--- | :--- |
+| `00-smoke.spec.ts` | Test-server/base-URL reachability and landing-page smoke check. |
+| `01-bootstrap-and-oidc.spec.ts` | OIDC-only authentication (no bootstrap-token login; `POST /api/v1/auth/bootstrap-login` returns `404`/`405`): `/healthz` + `/api/v1/auth/status` report `oidc-active`; protected APIs reject unauthenticated and forged sessions with `401`; `/api/v1/auth/login` starts an Authorization Code + PKCE `S256` + `nonce` + `state` redirect (`keel_pkce` cookie); GUI login through the IdP, then logout clears the session; CLI loopback login (RFC 8252) rejects non-loopback/portless/wrong-path redirect URIs and short `state`, and issues a single-use code bound to the PKCE verifier and redirect URI; IdP groups map to roles (tenant member ≠ admin); the CSRF guard rejects cookie-authenticated cross-site mutations. |
+| `02-catalog-dynamic-forms.spec.ts` | Unauthenticated `401` on catalog/proposal APIs; SPA catalog entrypoint. |
+| `03-pko-preview-and-merge.spec.ts` | Unauthenticated `401` on proposal list/preview/merge/reopen APIs. |
+| `04-canary-lifecycle.spec.ts` | Unauthenticated `401` on releases and SSE; `/metrics` served without auth. |
+| `05-multi-tenant-isolation.spec.ts` | Unauthenticated `401` on stacks/releases/proposals. |
+| `06-full-gui-workflow.spec.ts` | Full GUI journey against the test server (Chromium only): OIDC PKCE login → create tenant → create `kind` cluster → install app → verify status; fails on any CSP violation. |
+| `07-kind-live-e2e.spec.ts` (`test:live`) | Live `kind` bootstrap (Flux, PKO v2, Rauthy, Forgejo), CLI + GUI proposals, previews, merge, workload `kind` cluster, `podinfo` canary. `KEEL_E2E_REUSE_CLUSTER=0` forces a fresh cluster. |
+| `08-cloud-free-tier-live-e2e.spec.ts` (`test:live:cloud`) | AWS/Azure/GCP free-tier VM blueprints, dual-guarded by `KEEL_E2E_CLOUD_<PROVIDER>=1` / `KEEL_E2E_CLOUD_ALL=1` plus credentials. |
+
+**Gaps vs. target:** specs 02–05 only assert authentication boundaries. The intended scenarios (SOPS-encrypted `writeOnly` values in the PR, real PKO preview + GC, canary rollback on SLO breach, cross-tenant rejection at API and Kyverno) are currently exercised only partially by the live suite (07) and unit tests, and should be added as dedicated mocked/live specs.

@@ -19,6 +19,7 @@ Because the `kind` provider is enabled by default in `providers/registry.yaml`, 
 1. Open `http://127.0.0.1:8080` and go to **Catalog & Form Wizard**.
 2. Click **+ New Tenant**, enter `dev-team`, and submit.
 3. Open **PR & Preview Inspector** and merge the generated PR (`tenants/dev-team/rbac.yaml`).
+4. In the Rauthy Admin UI (`https://idp.keel.local:8888/auth/v1/admin`), create the groups `tenant-dev-team` and `tenant-dev-team-admin` and add your users to them. Keel honors only `tenant-<id>` and `tenant-<id>-admin` group names. The Stage 0 admin in `keel-admins` already has access to every tenant.
 
 ### Step 2: Submit the `kind-cluster` Blueprint
 
@@ -145,6 +146,7 @@ You can use the same management cluster to provision cloud infrastructure. This 
    - **Desired Node Count:** `1`
    - **AWS Access Key ID / Secret Access Key:** Your IAM credentials
 3. Submit the PR and inspect the **PKO v2 Diff** in **PR & Preview Inspector** to verify the exact VPC, subnets, and EKS resources before any cloud resources are created.
+   > The ephemeral preview runs in `keel-previews` without your tenant's cloud credentials, which are deliberately not copied there. A cloud preview may therefore end in `failed`, leaving you with the provisional synthesized diff and the Git diff. See [Pre-Merge PKO Previews](previews.md#limitations).
 4. Merge the PR to start provisioning.
 
 ### Step 4: Clean Up Cloud Resources
@@ -169,7 +171,7 @@ GCP's **Always Free** tier includes 1 `e2-micro` VM per month with up to 30 GB `
 
 ### Step 3: Add the `gcp-free-vm` Blueprint in the GUI
 
-You can copy `catalog.yaml` and `Pulumi.yaml` from [Provider Blueprint Examples — Always-Free GCP Compute Engine VM](../catalog/provider-examples.md#always-free-gcp-compute-engine-vm-gcp), or add it directly in the GUI:
+You can copy `catalog.yaml` and `Pulumi.yaml` from [Provider Blueprint Examples: GCP Compute Engine VM](../catalog/provider-examples.md#gcp-compute-engine-vm-gcp-vm), or add it directly in the GUI:
 
 1. In **Catalog & Form Wizard**, click **+ Add Catalog Item** and select **Kind:** `infra`.
 2. Set **ID** to `gcp-free-vm`, **Provider** to `gcp`, **Pulumi Runtime** to `yaml`, **Entrypoint** to `Pulumi.yaml`, and leave **Protect By Default** unchecked.
@@ -353,7 +355,7 @@ Once an infrastructure blueprint containing virtual machines has been provisione
 3. Click the copy button next to `ssh -p 22 <user>@<host>` to paste into your local terminal.
 4. Or click **"Launch Browser Terminal"**:
    - Select your saved profile SSH key (or paste an ephemeral private key).
-   - An in-browser terminal connects over a secure WebSocket bridge (`GET /api/v1/stacks/{ns}/{name}/ssh/ws`), streaming interactive PTY input and output directly in your browser.
+   - An in-browser terminal (wterm) connects over a secure WebSocket bridge (`GET /api/v1/stacks/{ns}/{name}/ssh/ws`), streaming interactive PTY input and output directly in your browser.
 
 ### Step 2: Connect via the Keel CLI (`keel infra ssh`)
 

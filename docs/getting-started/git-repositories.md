@@ -40,6 +40,7 @@ What this does automatically:
 - Infers the forge provider (`github`, `gitlab`, or `forgejo`) from `--git-url` (override with `--forge-type` / `--forge-api-url` for self-hosted instances).
 - Writes `.keel/config.yaml` with `forge.provider`, `forge.repo_url`, and `forge.api_url` (never storing your token in Git).
 - Creates the `flux-system/git-credentials` Kubernetes `Secret` from `KEEL_GIT_TOKEN` (or `--git-token`) and attaches `spec.secretRef` to Flux's `GitRepository`.
+- Does **not** share that operator token with tenants. If the repository is private, export a separate **read-only** token as `KEEL_TENANT_GIT_TOKEN` before `keel bootstrap init`. It is written to `tenant-default/git-credentials` for the tenant `GitRepository`.
 - Commits the Stage 0 seed layout to `main` and pushes to `origin` if reachable.
 
 ### Step 3: Start `keel serve`
@@ -48,7 +49,7 @@ What this does automatically:
 keel serve --bind 127.0.0.1:8080 --repo-dir ./keel-gitops
 ```
 
-`keel serve` reads `KEEL_GIT_TOKEN` (or `--git-token`) and `.keel/config.yaml` to open real Pull Requests via `GitHubProvider`, `GitLabProvider`, or `ForgejoGiteaProvider`.
+`keel serve` reads `KEEL_GIT_TOKEN` (or `--git-token`, or the `keel-system/forge-token` Secret) and `.keel/config.yaml` to open real Pull Requests via `GitHubProvider`, `GitLabProvider`, or `ForgejoGiteaProvider`.
 
 ---
 

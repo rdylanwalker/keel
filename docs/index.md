@@ -28,12 +28,17 @@ flowchart TB
 3. **[Things to Try](getting-started/things-to-try.md)** — Hands-on walkthroughs starting from a local `kind` management cluster (second `kind` cluster, `podinfo` canary rollout, minimal AWS EKS, and custom blueprints).
 4. **[Catalog Overview](catalog/overview.md)** — Understand `CatalogInfraBlueprint` and `CatalogApplication` (`keel.io/v1alpha1`), JSON Schema forms, and SOPS/`age` secret encryption.
 5. **[Provider Blueprint Examples](catalog/provider-examples.md)** — Ready-to-use `catalog.yaml` + `Pulumi.yaml` blueprints for **kind**, **AWS (EKS)**, **GCP (GKE)**, **Azure (AKS)**, **Proxmox VE (k3s)**, **Hetzner Cloud**, and **Cloudflare**.
-6. **[Security, Tenancy & Canary](operations/security-and-tenancy.md)** — Namespace isolation, Kyverno policies, SOPS + `age` encryption, anti-lockout guardrails, and Flagger canary rollouts.
+6. **[Pre-Merge PKO Previews](getting-started/previews.md)**: how real `pulumi preview` runs work, what `source` / `run.phase` mean, and their limitations.
+7. **[Web Portal](getting-started/web-ui.md)**: views, schema-driven forms, role-aware controls, the SSH terminal, and demo mode.
+8. **[Security, Tenancy & Canary](operations/security-and-tenancy.md)**: least-privilege tenant credentials, IdP group mapping, Kyverno policies, SSH host-key verification, and Flagger canary rollouts.
+9. **[Break-Glass Recovery](operations/break-glass-recovery.md)**: the Stage 0 state escrow and the recovery runbook.
+10. **[Running keel-server In-Cluster](operations/in-cluster-server.md)**: the Kustomize bundle and its RBAC.
+11. **[CLI Reference](reference/cli.md)**: every `keel` command and flag.
 
 ## Previewing Docs Locally
 
 ```bash
-cargo install mdbook mdbook-mermaid
+cargo install mdbook
 mdbook serve
 ```
 

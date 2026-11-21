@@ -32,13 +32,23 @@ Building an internal platform usually forces a bad trade-off:
 
 ---
 
+## What Makes Keel Different
+
+* **Provider-agnostic Stage 0.** One `keel bootstrap init` gives you the same seed control plane on `kind`, an existing cluster, Proxmox VE, AWS, GCP, Azure, or Hetzner. It then escrows its own Pulumi state to versioned S3.
+* **Every change is a PR with a real pre-merge preview.** After Stage 0, Keel never commits to `main`. Pulumi-backed changes get an actual `pulumi preview` in an ephemeral PKO v2 `Stack` before merge, and simulated diffs are always labelled as such.
+* **Schema-driven forms for unmodified upstream charts.** A thin `catalog.yaml` JSON Schema becomes a form, and the form becomes a plain `values.yaml`. Upstream charts are never forked.
+* **Strict least-privilege multi-tenancy.** Each tenant gets its own namespace, a scoped S3 state identity, a read-only Git token, Flux impersonation, and Kyverno confinement. Tenants never see control-plane credentials.
+* **Break-glass recovery.** `keel bootstrap recover` re-applies the control plane from escrowed S3 state when Git, the forge, or the API is down.
+
+---
+
 ## Everyday Solutions, Out of the Box
 
 ### 1. Zero-to-Control-Plane in One Command
 Run `keel bootstrap init` from your laptop to stand up an identical seed control plane—complete with **Flux CD**, **Pulumi Kubernetes Operator (PKO v2)**, **SeaweedFS S3**, **SOPS + `age`**, **Rauthy** OIDC (or external OIDC), **Kyverno**, **Envoy Gateway + Flagger**, and optional in-cluster **Forgejo**—whether you start on local `kind`, an existing `kubeconfig`, Proxmox VE, or a public cloud.
 
 ### 2. No More Blind Merges: Pre-Merge Infrastructure Previews
-Outside of initial bootstrap, Keel **never** commits directly to `main`. Every infrastructure or application change opens a Pull Request (`Forgejo/Gitea`, `GitHub`, `GitLab`, or local Git) and spawns an ephemeral PKO v2 `preview: true` stack—streaming exact `+ Create`, `~ Update`, `- Delete`, and `! Replace` resource diffs to both the web portal and CLI before anything touches production.
+Outside of initial bootstrap, Keel **never** commits directly to `main`. Every infrastructure or application change opens a Pull Request (`Forgejo/Gitea`, `GitHub`, `GitLab`, or local Git). Pulumi-backed changes then run a real `pulumi preview` in an ephemeral PKO v2 `preview: true` stack in `keel-previews`, and the `+ Create`, `~ Update`, `- Delete`, and `! Replace` results are posted to the PR, the web portal, and the CLI before anything touches production. Flux-only changes get a diff synthesized from the manifests, which is clearly marked as simulated. See [Pre-Merge PKO Previews](./docs/getting-started/previews.md).
 
 ### 3. Self-Service Forms for Helm, Kustomize & Raw Manifest Templates
 Upstream Helm charts, Kustomize bases, and **raw Kubernetes manifests & parameterized `${var}` YAML templates** work seamlessly without structural forks. Thin `catalog.yaml` sidecars provide JSON Schemas that render dynamically in React (`@rjsf/core` + Shadcn UI) and serialize straight into standard `values.yaml` overrides or Pulumi `Stack` configs. For raw Kubernetes manifests, the Catalog Wizard can **auto-extract `${var}` placeholders** into JSON Schema form fields with a single click and allows choosing between **Flux CD** (`Kustomization` + `postBuild.substituteFrom`) or **Pulumi PKO v2** (`kubernetes:yaml/v2:ConfigGroup` with pre-merge resource diffs) as the actioning engine. Need to deploy a database, DNS record, and app together? Chain them in a **Multi-Item Bundle** directly from the GUI via a Git PR.
@@ -48,13 +58,13 @@ Provision VMs and clusters on **Proxmox VE**, **AWS**, **GCP**, **Azure**, **Het
 
 ### 5. Direct VM SSH Access (Web Portal & CLI)
 Inspect connection details and access provisioned cloud or on-premises VMs with zero friction:
-* **Web Portal:** Click **SSH** on any VM card or stack inspector to open the Connection Info modal with one-click copyable `ssh` commands, or click **"Launch Browser Terminal"** for an opt-in interactive in-browser terminal session (`xterm.js` over an authenticated WebSocket bridge) using decrypted profile or ephemeral SSH keys.
+* **Web Portal:** Click **SSH** on any VM card or stack inspector to open the Connection Info modal with one-click copyable `ssh` commands, or click **"Launch Browser Terminal"** for an opt-in interactive in-browser terminal session (rendered with [wterm](https://wterm.dev), a small WASM terminal core with a selectable, screen-reader-friendly DOM renderer, over an authenticated WebSocket bridge, with SSH host-key fingerprint display) using decrypted profile or ephemeral SSH keys.
 * **Keel CLI:** Run `keel infra ssh <stack>` to print connection metadata and copy-ready `ssh` commands by default (`--output table|command|json`), or add `--exec` to launch an interactive SSH session directly in your terminal via safe direct process execution.
 
 ### 6. Safe Rollouts, Tenant Isolation & Break-Glass Recovery
 * **Progressive Delivery:** Opt-in **Flagger + Envoy Gateway** canary rollouts with Prometheus metric rollback for HTTP/gRPC workloads.
-* **Multi-Tenancy & Secret Hygiene:** Namespace-per-tenant isolation (`tenant-<id>`), per-tenant `age` + SOPS encryption in Git, `AES-256-GCM` credential encryption at rest, and Kyverno `restricted` Pod Security Standards.
-* **Anti-Lockout Protection:** Control-plane stacks carry `protect: true`, and `keel bootstrap recover` restores management state directly from versioned S3 if the cluster or Git forge ever goes down.
+* **Multi-Tenancy & Secret Hygiene:** Namespace-per-tenant isolation (`tenant-<id>`), Flux multitenancy lockdown, per-tenant SeaweedFS identities scoped to `tenants/<id>/`, read-only tenant Git tokens, per-tenant `age` + SOPS encryption in Git, `AES-256-GCM` credential encryption at rest, and Kyverno `restricted` Pod Security Standards. See [Security & Tenancy](./docs/operations/security-and-tenancy.md).
+* **Anti-Lockout Protection:** Control-plane resources carry `protect: true`. Stage 0 state is escrowed to versioned S3, and `keel bootstrap recover` re-applies it if the cluster add-ons or the Git forge go down. See [Break-Glass Recovery](./docs/operations/break-glass-recovery.md).
 
 ---
 
@@ -102,23 +112,35 @@ keel bootstrap init \
 
 Save the **Admin Username** and **Admin Password** printed in the bootstrap summary (or pass `--admin-username` / `--admin-password` / `KEEL_ADMIN_PASSWORD`, or `--oidc-issuer`). Add `--with-forge` if you want an in-cluster Forgejo Git server so Flux CD can pull-poll inside `kind`.
 
+Stage 0 keeps its Pulumi state in `~/.config/keel/stage0/keel-mgmt/` and escrows it to S3. **On the first run it prints a one-time notice about the generated Pulumi passphrase: store that passphrase in your vault.**
+
 ### 3. Start the Control Plane & Authenticate
 
-```bash
-keel serve --bind 127.0.0.1:8080 --repo-dir ./keel-gitops
+Add the Stage 0 ingress hosts to `/etc/hosts` (or `C:\Windows\System32\drivers\etc\hosts` on Windows):
+
+```text
+127.0.0.1 idp.keel.local forgejo.keel.local
 ```
 
-When a cluster is reachable, `keel serve` automatically port-forwards **Envoy Gateway** (`http://idp.keel.local:8888` for Rauthy OIDC, and Forgejo if `--with-forge` was enabled) and prints:
+```bash
+keel serve --repo-dir ./keel-gitops      # binds 127.0.0.1:8080 by default
+```
+
+When a cluster is reachable, `keel serve` automatically port-forwards **Envoy Gateway**, which serves Rauthy at `https://idp.keel.local:8888` (and Forgejo at `https://forgejo.keel.local:8888` with `--with-forge`). The ingress uses a self-signed Stage 0 CA, so expect a browser certificate warning unless you import `ca.crt` from `keel-system/keel-wildcard-tls`. The server prints:
 
 ```text
 Keel Control Plane listening on http://127.0.0.1:8080
 ```
 
-Add `127.0.0.1 idp.keel.local` to `/etc/hosts` (or `C:\Windows\System32\drivers\etc\hosts` on Windows), then log in via CLI or open `http://127.0.0.1:8080` in your browser:
+Open `http://127.0.0.1:8080` in your browser, or log in from the CLI. The CLI opens your browser and receives the result on a `127.0.0.1` loopback callback (RFC 8252):
 
 ```bash
-keel auth login --server http://127.0.0.1:8080
+export KEEL_SERVER=http://127.0.0.1:8080
+keel auth login          # --no-browser prints the URL instead
+keel auth status
 ```
+
+Stage 0 creates the `default` tenant. Access is granted through IdP groups `tenant-<id>` (member) and `tenant-<id>-admin` (admin). The Stage 0 admin is in `keel-admins`.
 
 ### 4. Provision a Workload Cluster & Deploy a Canary App (PR-Driven)
 Every mutation validates inputs against `catalog.yaml` JSON Schemas, encrypts secrets with SOPS + `age`, opens a Pull Request, and triggers a PKO v2 preview:
@@ -133,14 +155,17 @@ EOF
 
 keel infra provision \
   --blueprint kind-cluster \
-  --tenant platform-team \
-  --values-file ./workload-values.yaml \
-  --server http://127.0.0.1:8080
+  --tenant default \
+  --values-file ./workload-values.yaml
 
 # Watch the pre-merge PKO resource diff (+ Create / ~ Update / - Delete)
-keel preview status --pr 1 --watch --server http://127.0.0.1:8080
+keel preview status --pr 1 --watch
 
-# After merging PR #1 in the GUI (PR & Preview Inspector) or via Git, install podinfo with canary delivery:
+# Merge (requires keel-admins or tenant-default-admin; pinned to the reviewed head SHA)
+keel proposal list
+keel proposal merge 1
+
+# Install podinfo with canary delivery:
 cat <<'EOF' > podinfo-values.yaml
 replicaCount: 2
 ingressHost: podinfo.keel.local
@@ -149,24 +174,25 @@ EOF
 
 keel app install \
   --app podinfo \
-  --tenant platform-team \
+  --tenant default \
   --values-file ./podinfo-values.yaml \
-  --canary \
-  --server http://127.0.0.1:8080
+  --canary
 ```
 
 > **Handling Provider Credentials (`writeOnly` Fields):** Non-secret form values are written to `Stack.spec.config`, while fields marked `"writeOnly": true` (such as `GOOGLE_CREDENTIALS`) are encrypted with SOPS + `age` into `secret.enc.yaml` and injected into the PKO v2 workspace pod via `Stack.spec.envRefs`. Enable cloud/hypervisor providers under **Topology → Providers** before provisioning.
 
 ### 5. Break-Glass Recovery & Teardown
 
-* **Recover from S3:**
+* **Recover from S3 (break-glass):**
   ```bash
-  keel bootstrap recover \
-    --s3-endpoint https://s3.infra.local \
-    --bucket pulumi-state \
-    --stack management-cluster-core
+  kubectl -n keel-system port-forward svc/s3-state-backend-seaweedfs-s3 8333:8333 &
+  export AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=...   # from keel-system/s3-state-backend-seaweedfs-s3-secret
+  keel bootstrap recover --s3-endpoint http://127.0.0.1:8333 --cluster-name keel-mgmt --dry-run
+  keel bootstrap recover --s3-endpoint http://127.0.0.1:8333 --cluster-name keel-mgmt
   ```
+  Full runbook: [Break-Glass Recovery](./docs/operations/break-glass-recovery.md).
 * **Teardown Resources (GitOps PR):** Remove the resource directory under `tenants/<tenant-id>/infra/<stack-name>/` or `tenants/<tenant-id>/apps/<release-name>/` and merge the PR. Flux prunes the Kubernetes resources and non-protected PKO v2 `Stack`s run `pulumi destroy` before finalizing.
+* **Stage 0 Teardown Caveat:** Stage 0 control-plane resources carry `protect: true`, so `pulumi destroy` on the Stage 0 stacks fails until you explicitly run `pulumi state unprotect --all` for that stack. Deleting the whole cluster (below) bypasses this.
 * **Teardown Local `kind` Cluster:**
   ```bash
   kind delete cluster --name keel-mgmt
@@ -182,7 +208,7 @@ keel app install \
 flowchart TB
     subgraph Clients["Operator Interfaces"]
         GUI["React + Shadcn + Tailwind GUI<br/>(@rjsf/core JSONSchema Forms)"]
-        CLI["Rust CLI (keel)<br/>(bootstrap / preview / infra / app)"]
+        CLI["Rust CLI (keel)<br/>(bootstrap / auth / proposal / preview / infra / app)"]
     end
 
     subgraph ControlPlane["Management Cluster (kind / Existing K8s / Proxmox / Cloud)"]
@@ -285,6 +311,7 @@ Several great open-source tools solve individual slices of this problem—develo
 ## Documentation & Contributing
 
 * **[Online Documentation (GitHub Pages)](https://rdylanwalker.github.io/keel/):** Rendered mdBook user & operations guide.
+* **[CLI Reference](./docs/reference/cli.md):** Every `keel` command and flag.
 * **[`CONTRIBUTING.md`](./CONTRIBUTING.md):** Local build instructions, prerequisites, quality gates, repository layout, and PR conventions.
 * **[Issue Templates](https://github.com/rdylanwalker/keel/issues/new/choose):** Submit [Feature Requests](https://github.com/rdylanwalker/keel/issues/new?template=feature-request.yml), [Bug Reports](https://github.com/rdylanwalker/keel/issues/new?template=bug-report.yml), [Bootstrap Friction Reports](https://github.com/rdylanwalker/keel/issues/new?template=bootstrap-friction.yml), or [Provider & Catalog Feedback](https://github.com/rdylanwalker/keel/issues/new?template=provider-catalog-feedback.yml).
 * **[Pull Request Template](./.github/pull_request_template.md):** Pre-flight architectural checklist and verification requirements for PR submissions.

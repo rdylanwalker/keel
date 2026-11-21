@@ -26,18 +26,20 @@ Please ensure any logs, manifests, or screenshots redact all secrets and sensiti
 ```text
 keel/
 ├── crates/
-│   ├── keel-core/          # Domain models, BootstrapTarget, JSONSchema validator, catalog, SOPS/age
+│   ├── keel-core/          # Domain models, BootstrapTarget, Stage 0 state paths, JSONSchema, catalog, SOPS/age
 │   ├── keel-git/           # Direct git CLI runner (SSH/HTTPS) & ForgeProvider trait adapters
-│   ├── keel-pko/           # PKO v2 Stack generator, ephemeral PR preview controller, diff parser
-│   ├── keel-kube/          # kube-rs CRD watchers, SSE telemetry stream, tenant RBAC, K8s Secret state
-│   ├── keel-server/        # Stateless axum HTTP/SSE server, OIDC PKCE auth, embedded SPA assets
-│   └── keel-cli/           # clap CLI entrypoint (bootstrap, auth, infra, app, preview, serve)
-├── ui/                     # React + TypeScript + Shadcn UI + Tailwind CSS + @rjsf/core
-├── e2e/                    # Playwright end-to-end test suite & kind/Forgejo test harness
-├── deploy/                 # Stage 0 target templates & seed Flux, PKO v2, Kyverno, Envoy, Flagger manifests
-├── docs/                   # mdBook user & operations documentation
-├── .github/                # Issue templates, PR template, CI, E2E, and release workflows
+│   ├── keel-pko/           # PKO v2 Stack synthesis, ephemeral previews, PKO run mapping, diff parser
+│   ├── keel-kube/          # kube-rs watchers, SSE telemetry, tenant RBAC, preview runner, tenant S3 identities
+│   ├── keel-server/        # Stateless axum HTTP/SSE server, OIDC PKCE auth, preview lifecycle, embedded SPA
+│   └── keel-cli/           # clap CLI (bootstrap, recover, auth, proposal, catalog, app, infra, preview, tenant, serve)
+├── ui/                     # React + TypeScript + Shadcn UI (components/ui) + Tailwind CSS + @rjsf/core + wterm
+├── e2e/                    # Playwright suite (tests/, scripts/start-test-server.mjs, scripts/capture-screenshots.mjs)
+├── deploy/                 # Stage 0 Pulumi programs, bootstrap manifests, in-cluster keel-server bundle, seed add-ons, catalog
+├── docs/                   # mdBook user & operations documentation (book.toml at repo root)
+├── .github/                # Issue templates, PR template, ci.yml, e2e.yml, release.yml, docs.yml, actionlint.yaml
 ├── .releaserc.json         # Automated SemVer release & artifact publishing config
+├── release/                # Pinned semantic-release toolchain (package.json + package-lock.json)
+├── Dockerfile              # Multi-stage image: pnpm UI build -> static musl keel (cargo-zigbuild) -> nonroot runtime
 ├── renovate.json           # Weekly automated dependency updates with auto-merge
 ├── justfile                # Common developer build, lint, test, and server tasks
 ├── SDD.md                  # Full Spec-Driven Development & Non-Functional Requirements
@@ -48,10 +50,12 @@ keel/
 
 ## Prerequisites
 
-* **Rust:** Latest stable toolchain with `clippy`, `rustfmt`, and `cargo-llvm-cov`
+* **Rust:** Latest stable toolchain with `clippy`, `rustfmt`, and [`cargo-llvm-cov`](https://github.com/taiki-e/cargo-llvm-cov) (`cargo install cargo-llvm-cov`; needs the `llvm-tools-preview` component)
 * **Node.js & pnpm:** Node.js `24+` and `pnpm` `12+`
 * **Task Runner (recommended):** [`just`](https://github.com/casey/just)
-* **CLI Tools:** `git`, `sops`, `age`, `pulumi`, `helm`, `kubectl`, `kind`, and `docker`
+* **For unit tests:** `git`, plus **`sops`** and **`age`** on `PATH`. The real SOPS + `age` round-trip test is skipped (with a loud warning) when they are missing, and fails if you set `KEEL_REQUIRE_SOPS=1`, as CI does with `sops` `v3.13.3` and `age` `v1.3.2`. Rust tests never touch your ambient kubeconfig.
+* **For bootstrap and live E2E:** `pulumi`, `helm`, `kubectl`, `kind`, and `docker`
+* **For docs:** `mdbook` (`cargo install mdbook`); Mermaid diagrams render client-side from the vendored `docs/assets/js/mermaid.min.js` (lazy-loaded only on pages with diagrams)
 
 ---
 
@@ -70,11 +74,19 @@ just build
 just serve
 
 # Or build, restart any previous backgrounded serve, and print URLs/credentials
-# (auto-uses ./keel-gitops if present; logs to target/keel-serve.log)
+# (auto-uses ./keel-gitops if present; logs to target/keel-serve.log;
+#  admin credentials are saved to target/keel-admin-username / target/keel-admin-password)
 just build-serve
 
-# Start with a pre-seeded demo catalog
+# Build UI + binary, bootstrap a local kind cluster (--with-forge), and serve in the background
+just build-init-serve
+
+# Start with a pre-seeded demo catalog. This rebuilds the UI with VITE_ENABLE_DEMO=true;
+# open /?demo=true. Run `just build-ui` afterwards to restore a production bundle.
 just serve-demo
+
+# Stop serve, delete the kind management cluster, and remove local GitOps repos
+just down
 ```
 
 Or run the underlying commands directly:
@@ -101,7 +113,7 @@ just docs
 All pull requests and `main` branch pushes are subject to automated verification gates. To provide fast feedback for contributors while ensuring rock-solid release stability, the pipeline is split into fast PR checks and a strict pre-release live cluster gate on `main`:
 
 * **Pull Requests (Fast Quality Gate via `ci.yml`):**
-  PRs run formatting, linting, **at least 80% unit test coverage** (Rust and UI), `mdbook build`, and the **mocked Playwright end-to-end suite** (`pnpm --dir e2e test`). PR checks complete in under 3 minutes without spinning up full Kubernetes clusters or consuming cloud infrastructure resources.
+  PRs run formatting, linting, **at least 80% line coverage** (Rust via `cargo llvm-cov`, UI via `vitest --coverage`; currently about 84% and 96%), the SOPS round-trip test with pinned `sops`/`age`, `mdbook build`, and the **mocked Playwright end-to-end suite** (`pnpm --dir e2e test`). PR checks complete in under 3 minutes without spinning up full Kubernetes clusters or consuming cloud infrastructure resources.
 * **Pushes to `main` (Strict Pre-Release Gate via `release.yml`):**
   Pushes to `main` execute `release.yml`, which orchestrates `ci.yml` and `e2e.yml` via reusable `workflow_call`. The `release` job declares `needs: [ci, e2e-live]`, ensuring `semantic-release` **only** runs if both the fast quality gates and the live `kind` E2E suite (`07-kind-live-e2e.spec.ts`) pass completely.
 
@@ -121,7 +133,8 @@ Or run each ecosystem individually:
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
-cargo llvm-cov --workspace --fail-under-lines 80
+cargo llvm-cov --workspace --fail-under-lines 80   # or: just cov-rust
+cargo llvm-cov --workspace --html                  # browse target/llvm-cov/html/index.html
 ```
 
 #### React + Shadcn + Tailwind Frontend (`ui/`)
@@ -130,7 +143,7 @@ cargo llvm-cov --workspace --fail-under-lines 80
 pnpm --dir ui format:check        # prettier --check
 pnpm --dir ui lint                # eslint
 pnpm --dir ui typecheck           # tsc --noEmit
-pnpm --dir ui test:unit --coverage
+pnpm --dir ui test:unit --coverage # or: just test-ui (>= 80% lines)
 ```
 
 #### Playwright End-to-End Tests (`e2e/`)
@@ -144,9 +157,12 @@ pnpm --dir e2e lint               # eslint
 pnpm --dir e2e typecheck          # tsc --noEmit
 pnpm --dir e2e test               # mocked Playwright suite
 
-# Opt-in live kind E2E (GUI + CLI against real Docker/kind, Flux, PKO, Forgejo, Rauthy)
+# Opt-in live kind E2E (GUI + CLI against real Docker/kind, Flux, PKO, Forgejo, Rauthy).
+# Needs docker, kind, pulumi, helm, kubectl, and a built ui/dist + keel binary (just build).
+# Add `127.0.0.1 idp.keel.local forgejo.keel.local` to /etc/hosts first.
 pnpm --dir e2e test:live                           # reuses existing kind-keel-mgmt if present
 KEEL_E2E_REUSE_CLUSTER=0 pnpm --dir e2e test:live  # bootstraps a fresh kind cluster
+# Clean up afterwards: just down
 
 # Opt-in live cloud E2E (AWS, Azure, GCP Free-Tier tests)
 pnpm --dir e2e test:live:cloud
@@ -296,14 +312,29 @@ just agent-e2e
 * **Conventional Commits Required:** Versioning and GitHub Releases are governed by [Conventional Commits](https://www.conventionalcommits.org/) and `semantic-release`. Every commit message must follow the specification:
   * `feat(<scope>): ...` — new feature (minor version bump)
   * `fix(<scope>): ...` — bug fix (patch version bump)
-  * `feat(<scope>)!: ...` or `BREAKING CHANGE:` footer — breaking change (major version bump)
+  * `feat(<scope>)!: ...` or `BREAKING CHANGE:` footer — breaking change (currently a **minor** bump while Keel is pre-1.0, per `.releaserc.json`)
   * `chore:`, `docs:`, `test:`, `ci:`, `refactor:` — non-release maintenance
-* **Lockfile Hygiene:** Keep `Cargo.lock` and `ui/pnpm-lock.yaml` synchronized whenever modifying dependencies so weekly Renovate PRs auto-merge cleanly.
+* **Lockfile Hygiene:** Keep `Cargo.lock`, `ui/pnpm-lock.yaml`, and `e2e/pnpm-lock.yaml` synchronized whenever modifying dependencies so weekly Renovate PRs auto-merge cleanly.
 * **Tests & Docs:** Include unit tests (`cargo test` / `vitest`) for new logic, update Playwright specs in `e2e/tests/` for user-facing changes, and update [`SDD.md`](./SDD.md) if introducing a new architectural pattern.
 
 ---
 
 ## Releases & Dependency Automation
 
-* **Releases:** Pushes to `main` trigger `release.yml`, which executes `ci.yml` and `e2e.yml` (`e2e-live-kind` + optional cloud E2E) via `workflow_call`. Gated behind `needs: [ci, e2e-live]`, `semantic-release` analyzes Conventional Commits, bumps versions across `Cargo.toml` and `ui/package.json`, generates `CHANGELOG.md`, cross-compiles static binaries (`linux/amd64`, `linux/arm64`, `darwin/arm64`, `windows/amd64`), attaches a CycloneDX SBOM, signs artifacts with **Cosign**, and deploys the mdBook documentation to **GitHub Pages**.
-* **Dependencies:** Initialized with latest compatible stable versions and kept current via **Renovate** running weekly before 05:00 UTC on Mondays with auto-merge enabled for passing non-major updates.
+* **Releases:** Pushes to `main` trigger `release.yml`, which executes `ci.yml` and `e2e.yml` (`e2e-live-kind` + optional cloud E2E) via `workflow_call`. Gated behind `needs: [ci, e2e-live]` (`e2e.yml` runs the live `kind` job because `release.yml` passes `run_live: true`), `semantic-release` (installed with `npm ci` from the pinned `release/package-lock.json`) analyzes Conventional Commits, bumps `Cargo.toml` and `ui/package.json`, refreshes only the workspace entries in `Cargo.lock` (`cargo update --workspace`, then `cargo metadata --locked`), generates `CHANGELOG.md`, and creates a **draft** GitHub Release. Follow-up jobs then:
+  * build `keel` with `--locked`: **static musl** Linux binaries via `cargo-zigbuild` (`x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`; linkage verified with `file`) plus `aarch64-apple-darwin` and `x86_64-pc-windows-msvc`, and the UI archive;
+  * build the `Dockerfile` for `linux/amd64,linux/arm64` with buildx, push `ghcr.io/<owner>/keel:{<version>,latest}` with SBOM + `mode=max` provenance attestations, and **Cosign keyless**-sign the image digest;
+  * build the HTML docs archive and CycloneDX SBOM, write `SHA256SUMS` and `keel-image.txt`, `cosign sign-blob --bundle` every asset (`<asset>.sigstore.json`), upload everything, and un-draft the release. A failure in any job leaves the release as a draft.
+* **Verifying a release:**
+  ```bash
+  ID='^https://github.com/<owner>/keel/.github/workflows/release.yml@refs/heads/main$'
+  ISSUER=https://token.actions.githubusercontent.com
+  cosign verify-blob --bundle keel-linux-amd64.tar.gz.sigstore.json \
+    --certificate-identity-regexp "$ID" --certificate-oidc-issuer "$ISSUER" keel-linux-amd64.tar.gz
+  sha256sum -c SHA256SUMS --ignore-missing
+  cosign verify ghcr.io/<owner>/keel:<version> \
+    --certificate-identity-regexp "$ID" --certificate-oidc-issuer "$ISSUER"
+  ```
+* **Container image:** `docker build -t keel:dev .` builds the default `runtime` target (Chainguard `wolfi-base`, UID `65532`, with the `git`, `ssh`, `sops`, and `age-keygen` CLIs that `keel serve` shells out to). `ENTRYPOINT` is `keel`; the default `CMD` is `serve --bind 0.0.0.0:8080`, so `docker run keel:dev --version` or `docker run keel:dev bootstrap ...` override it. `--target static` produces a binary-only `distroless/static` image, which cannot run `keel serve`. CI (`ci.yml` `container` job) builds and smoke-tests the `linux/amd64` image on every PR.
+* **Supply chain:** Every GitHub Action is pinned to a full commit SHA with a `# vX.Y.Z` comment, every job declares least-privilege `permissions:` (workflow default `{}`), Dockerfile base images are pinned by digest, and release tools (mdbook, cargo-edit, cargo-zigbuild, Zig, Cosign, pnpm) are pinned to exact versions. Lint workflow changes with `actionlint` (`.github/actionlint.yaml` declares the `ubuntu-26.04` runner label). The mdBook site is deployed to **GitHub Pages** by `docs.yml`.
+* **Dependencies:** Initialized with latest compatible stable versions and kept current via **Renovate** running weekly before 05:00 UTC on Mondays with auto-merge enabled for passing non-major updates. `helpers:pinGitHubActionDigests` and `docker:pinDigests` keep action SHAs and base-image digests current; a regex manager updates values annotated with `# renovate: datasource=... depName=...` in workflows and the `Dockerfile`; `release/package.json` is grouped as `release-tooling`. Zig is bumped manually together with its SHA-256s in the `Dockerfile`.
