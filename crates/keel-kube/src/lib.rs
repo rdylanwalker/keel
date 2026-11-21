@@ -49,17 +49,19 @@ pub use telemetry::{
 };
 pub use tenant::{
     FlaggerCanarySpecInput, FluxDependencyRef, FluxHealthCheckRef, FluxKustomizationSpecInput,
-    FluxSubstituteReference, HelmChartSourceKind, HelmChartSourceRef, HelmReleaseSpecInput,
-    HelmValuesSecretRef, KEEL_SERVER_TENANT_CLUSTER_ROLE, RemoteKubeConfigRef,
-    TENANT_NAMESPACE_PREFIX, TenantIsolationConfig, TenantManifestBundle, TenantQuotaSpec,
-    build_keel_server_tenant_role_binding, build_tenant_default_deny_network_policy,
-    build_tenant_namespace, build_tenant_resource_quota, build_tenant_service_account,
-    generate_flux_kustomization_manifest, synthesize_canary_gateway_network_policy,
+    FluxManifestAppInput, FluxSubstituteReference, HelmChartSourceKind, HelmChartSourceRef,
+    HelmReleaseSpecInput, HelmValuesSecretRef, KEEL_SERVER_TENANT_CLUSTER_ROLE,
+    MANIFEST_APP_CONFIG_DIR, RemoteKubeConfigRef, TENANT_NAMESPACE_PREFIX, TenantIsolationConfig,
+    TenantManifestBundle, TenantQuotaSpec, build_keel_server_tenant_role_binding,
+    build_tenant_default_deny_network_policy, build_tenant_namespace, build_tenant_resource_quota,
+    build_tenant_service_account, generate_flux_kustomization_manifest,
+    manifest_app_config_kustomization_name, manifest_app_secrets_name,
+    manifest_app_values_configmap_name, synthesize_canary_gateway_network_policy,
     synthesize_canary_gateway_network_policy_yaml, synthesize_flagger_canary,
     synthesize_flagger_canary_yaml, synthesize_flux_kustomization,
-    synthesize_flux_kustomization_yaml, synthesize_helm_release, synthesize_helm_release_yaml,
-    synthesize_remote_target_namespace, synthesize_remote_target_namespace_yaml, tenant_namespace,
-    validate_tenant_id,
+    synthesize_flux_kustomization_yaml, synthesize_flux_manifest_app_kustomizations,
+    synthesize_helm_release, synthesize_helm_release_yaml, synthesize_remote_target_namespace,
+    synthesize_remote_target_namespace_yaml, tenant_namespace, validate_tenant_id,
 };
 
 #[derive(Debug, thiserror::Error)]

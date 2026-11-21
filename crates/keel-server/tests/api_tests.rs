@@ -3589,6 +3589,7 @@ async fn test_remote_canary_kustomization_creates_target_namespace_first() {
     .unwrap();
     assert_eq!(ns["kind"], "Namespace");
     assert_eq!(ns["metadata"]["name"], "staging-obs");
+    assert_restricted_pss(&ns);
     assert_eq!(
         ns["metadata"]["annotations"]["kustomize.toolkit.fluxcd.io/prune"],
         "disabled"
@@ -5839,10 +5840,7 @@ async fn test_rauthy_catalog_app_proposal_keeps_secrets_out_of_git() {
 
     let dir = workdir.join("tenants/acme/apps/rauthy");
     let read = |name: &str| std::fs::read_to_string(dir.join(name)).unwrap();
-    let mut committed = String::new();
-    for entry in std::fs::read_dir(&dir).unwrap() {
-        committed.push_str(&std::fs::read_to_string(entry.unwrap().path()).unwrap());
-    }
+    let committed = read_tree(&dir);
     for (field, value) in secrets {
         assert!(!committed.contains(value), "{field} committed in plaintext");
     }
@@ -5851,30 +5849,131 @@ async fn test_rauthy_catalog_app_proposal_keeps_secrets_out_of_git() {
     assert!(manifests.contains("${encKey}"));
     assert!(manifests.contains("${adminPassword}"));
     assert!(manifests.contains("auth.acme.example:8888"));
-    assert!(read("secrets.enc.yaml").contains("ENC[AES256_GCM,"));
-    let kustomization: Value = serde_yml::from_str(&read("kustomization.yaml")).unwrap();
+    assert_rauthy_split_layout(&dir, "rauthy", None);
+
+    let tenants_k = std::fs::read_to_string(workdir.join("tenants/kustomization.yaml")).unwrap();
+    assert!(tenants_k.contains("acme/apps/rauthy/config-kustomization.yaml"));
+    assert!(tenants_k.contains("acme/apps/rauthy/flux-kustomization.yaml"));
+
+    git.checkout_branch(workdir, "main").await.unwrap();
+}
+
+/// Concatenates every file below `dir` (recursively).
+fn read_tree(dir: &std::path::Path) -> String {
+    let mut out = String::new();
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            out.push_str(&read_tree(&path));
+        } else {
+            out.push_str(&std::fs::read_to_string(&path).unwrap());
+        }
+    }
+    out
+}
+
+/// Asserts the split Flux manifest-app layout of a Rauthy instance in `dir`: the
+/// `<name>-config` Kustomization applies the SOPS Secret + values ConfigMap on the management
+/// cluster first, and the app Kustomization `dependsOn` it with non-optional substitution.
+/// `remote` = `(kubeconfig secret, target namespace)` of a remote workload cluster.
+fn assert_rauthy_split_layout(dir: &std::path::Path, name: &str, remote: Option<(&str, &str)>) {
+    let read = |file: &str| std::fs::read_to_string(dir.join(file)).unwrap();
+    let yaml = |file: &str| serde_yml::from_str::<Value>(&read(file)).unwrap();
+
+    // Old single-Kustomization layout files are gone.
+    assert!(!dir.join("secrets.enc.yaml").exists());
+    assert!(!dir.join("values-configmap.yaml").exists());
+
+    assert!(read("config/secrets.enc.yaml").contains("ENC[AES256_GCM,"));
+    assert_eq!(
+        yaml("config/kustomization.yaml")["resources"],
+        json!(["values-configmap.yaml", "secrets.enc.yaml"])
+    );
+    let cm = yaml("config/values-configmap.yaml");
+    assert_eq!(cm["metadata"]["name"], format!("{name}-values"));
+    assert_eq!(cm["metadata"]["namespace"], "tenant-acme");
+
+    let config_fk = yaml("config-kustomization.yaml");
+    assert_eq!(config_fk["metadata"]["name"], format!("{name}-config"));
     assert!(
-        kustomization["resources"]
+        config_fk["spec"]["path"]
+            .as_str()
+            .unwrap()
+            .ends_with(&format!(
+                "/{}/config",
+                dir.file_name().unwrap().to_str().unwrap()
+            ))
+    );
+    assert_eq!(config_fk["spec"]["targetNamespace"], "tenant-acme");
+    assert!(config_fk["spec"].get("kubeConfig").is_none());
+    assert_eq!(config_fk["spec"]["decryption"]["provider"], "sops");
+    assert_eq!(
+        config_fk["spec"]["decryption"]["secretRef"]["name"],
+        "sops-age"
+    );
+
+    let fk = yaml("flux-kustomization.yaml");
+    assert_eq!(fk["metadata"]["name"], name);
+    assert!(fk["spec"].get("decryption").is_none());
+    assert!(
+        fk["spec"]["dependsOn"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|r| r == "secrets.enc.yaml")
+            .any(|d| d["name"] == format!("{name}-config") && d["namespace"] == "tenant-acme")
     );
-
-    let fk: Value = serde_yml::from_str(&read("flux-kustomization.yaml")).unwrap();
-    assert_eq!(fk["spec"]["targetNamespace"], "tenant-acme");
-    assert_eq!(fk["spec"]["decryption"]["provider"], "sops");
-    assert_eq!(fk["spec"]["decryption"]["secretRef"]["name"], "sops-age");
     let sub_from = fk["spec"]["postBuild"]["substituteFrom"]
         .as_array()
         .unwrap();
     assert!(
         sub_from
             .iter()
-            .any(|s| s["kind"] == "Secret" && s["name"] == "rauthy-secrets")
+            .any(|s| s["kind"] == "Secret" && s["name"] == format!("{name}-secrets"))
     );
+    assert!(
+        sub_from
+            .iter()
+            .any(|s| s["kind"] == "ConfigMap" && s["name"] == format!("{name}-values"))
+    );
+    assert!(sub_from.iter().all(|s| s["optional"] == false));
 
-    git.checkout_branch(workdir, "main").await.unwrap();
+    let app_k = yaml("kustomization.yaml");
+    match remote {
+        None => {
+            assert_eq!(app_k["resources"], json!(["manifests.yaml"]));
+            assert_eq!(fk["spec"]["targetNamespace"], "tenant-acme");
+            assert!(fk["spec"].get("kubeConfig").is_none());
+            assert!(!dir.join("namespace.yaml").exists());
+        }
+        Some((kubeconfig, target_ns)) => {
+            // The Secret never ships to the workload cluster; the namespace is created first.
+            assert_eq!(
+                app_k["resources"],
+                json!(["namespace.yaml", "manifests.yaml"])
+            );
+            assert_eq!(fk["spec"]["kubeConfig"]["secretRef"]["name"], kubeconfig);
+            assert_eq!(fk["spec"]["targetNamespace"], target_ns);
+            let ns = yaml("namespace.yaml");
+            assert_eq!(ns["kind"], "Namespace");
+            assert_eq!(ns["metadata"]["name"], target_ns);
+            assert_eq!(
+                ns["metadata"]["annotations"]["kustomize.toolkit.fluxcd.io/prune"],
+                "disabled"
+            );
+            assert_restricted_pss(&ns);
+        }
+    }
+}
+
+/// Keel-created workload namespaces enforce the `restricted` Pod Security Standard.
+fn assert_restricted_pss(ns: &Value) {
+    for mode in ["enforce", "audit", "warn"] {
+        assert_eq!(
+            ns["metadata"]["labels"][format!("pod-security.kubernetes.io/{mode}")],
+            "restricted",
+            "{ns}"
+        );
+    }
 }
 
 /// Commits the built-in self-service Rauthy catalog app to `main` of the fixture repository.
@@ -5948,10 +6047,10 @@ fn rauthy_values(hostname: &str) -> Value {
     })
 }
 
-/// Secret fields only work through Flux substitution on the management cluster, and tenant routes
+/// Secret fields only work through Flux substitution (never the Pulumi engine), and tenant routes
 /// may never claim platform hosts or another app's hostname. All are rejected before any commit.
 #[tokio::test]
-async fn test_rauthy_catalog_app_rejects_unsupported_engine_target_and_hostnames() {
+async fn test_rauthy_catalog_app_rejects_unsupported_engine_and_hostnames() {
     let fixture = setup_fixture().await;
     let cookie = login_and_get_cookie(&fixture).await;
     seed_rauthy_catalog(&fixture).await;
@@ -5967,16 +6066,6 @@ async fn test_rauthy_catalog_app_rejects_unsupported_engine_target_and_hostnames
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert!(body.contains("Pulumi engine"), "{body}");
-
-    let (status, body) = post_proposal(
-        &fixture,
-        &cookie,
-        json!({ "tenant": "acme", "catalogId": "rauthy", "targetCluster": "edge",
-                "values": rauthy_values("auth-acme.keel.local") }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-    assert!(body.contains("management cluster"), "{body}");
 
     // Platform hosts (default Stage 0 hosts) are reserved.
     for host in ["idp.keel.local", "keel.keel.local", "forgejo.keel.local"] {
@@ -6027,4 +6116,987 @@ async fn test_rauthy_catalog_app_rejects_unsupported_engine_target_and_hostnames
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert!(body.contains("tenants/other/apps/web"), "{body}");
     assert_eq!(git.rev_parse(workdir, "HEAD").await.unwrap(), head_before);
+}
+
+/// Writes `files` (repo-relative) into the fixture repository and commits them to `main`.
+async fn commit_to_main(fixture: &TestFixture, files: &[(&str, &str)], message: &str) {
+    let git = &fixture.state.git_runner;
+    let workdir = &fixture.state.repo_workdir;
+    for (path, contents) in files {
+        let abs = workdir.join(path);
+        tokio::fs::create_dir_all(abs.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&abs, contents).await.unwrap();
+    }
+    git.add(workdir, files.iter().map(|(p, _)| *p))
+        .await
+        .unwrap();
+    git.commit(
+        workdir,
+        message,
+        &CommitAuthor::new("Keel Seed", "seed@keel.local"),
+    )
+    .await
+    .unwrap();
+    git.push(workdir, "origin", "HEAD:refs/heads/main")
+        .await
+        .unwrap();
+}
+
+/// Returns `true` (and asserts it is allowed) when the host cannot SOPS-encrypt.
+fn sops_unavailable(status: StatusCode, body: &str) -> bool {
+    if status == StatusCode::SERVICE_UNAVAILABLE {
+        assert!(
+            std::env::var_os("KEEL_REQUIRE_SOPS").is_none(),
+            "KEEL_REQUIRE_SOPS is set but the proposal could not encrypt: {body}"
+        );
+        return true;
+    }
+    false
+}
+
+/// Checks out the proposal branch from a `POST /api/v1/proposals` response body.
+async fn checkout_proposal_branch(fixture: &TestFixture, body: &str) {
+    let body: Value = serde_json::from_str(body).unwrap();
+    fixture
+        .state
+        .git_runner
+        .checkout_branch(
+            &fixture.state.repo_workdir,
+            body["branch"].as_str().unwrap(),
+        )
+        .await
+        .unwrap();
+}
+
+fn tenants_kustomization_resources(fixture: &TestFixture) -> Vec<String> {
+    let raw = std::fs::read_to_string(
+        fixture
+            .state
+            .repo_workdir
+            .join("tenants/kustomization.yaml"),
+    )
+    .unwrap();
+    serde_yml::from_str::<Value>(&raw).unwrap()["resources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r.as_str().unwrap().to_string())
+        .collect()
+}
+
+/// Secret substitution happens on the management cluster (`<instance>-config`), so manifest apps
+/// with secret fields can target a remote workload cluster; the Secret itself never ships there.
+#[tokio::test]
+async fn test_manifest_app_with_secrets_targets_remote_cluster() {
+    let fixture = setup_fixture().await;
+    let cookie = login_and_get_cookie(&fixture).await;
+    seed_rauthy_catalog(&fixture).await;
+    let workdir = fixture.state.repo_workdir.clone();
+
+    for (name, target_ns, expected_ns) in [
+        ("rauthy-edge", Some("auth"), "auth"),
+        ("rauthy-edge-default", None, "tenant-acme"),
+    ] {
+        let mut req = json!({ "tenant": "acme", "catalogId": "rauthy", "name": name,
+                              "targetCluster": "edge-kubeconfig",
+                              "values": rauthy_values(&format!("{name}.acme.example")) });
+        if let Some(ns) = target_ns {
+            req["targetNamespace"] = json!(ns);
+        }
+        let (status, body) = post_proposal(&fixture, &cookie, req).await;
+        if sops_unavailable(status, &body) {
+            return;
+        }
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        checkout_proposal_branch(&fixture, &body).await;
+
+        let dir = workdir.join(format!("tenants/acme/apps/{name}"));
+        assert_rauthy_split_layout(&dir, name, Some(("edge-kubeconfig", expected_ns)));
+        let resources = tenants_kustomization_resources(&fixture);
+        for file in ["config-kustomization.yaml", "flux-kustomization.yaml"] {
+            assert!(
+                resources.contains(&format!("acme/apps/{name}/{file}")),
+                "{resources:?}"
+            );
+        }
+        assert!(!resources.iter().any(|r| r.ends_with("secrets.enc.yaml")));
+        fixture
+            .state
+            .git_runner
+            .checkout_branch(&workdir, "main")
+            .await
+            .unwrap();
+    }
+}
+
+/// An app deployed with the pre-split layout (the app Kustomization applied `secrets.enc.yaml` and
+/// `values-configmap.yaml` itself, `optional: true`) is rewritten to the split layout on edit.
+#[tokio::test]
+async fn test_manifest_app_edit_migrates_pre_split_layout() {
+    let fixture = setup_fixture().await;
+    let cookie = login_and_get_cookie(&fixture).await;
+    seed_rauthy_catalog(&fixture).await;
+    let workdir = fixture.state.repo_workdir.clone();
+
+    let mut resources: Vec<String> = if workdir.join("tenants/kustomization.yaml").is_file() {
+        tenants_kustomization_resources(&fixture)
+    } else {
+        Vec::new()
+    };
+    resources.push("acme/apps/rauthy/flux-kustomization.yaml".to_string());
+    let tenants_k = serde_yml::to_string(&json!({
+        "apiVersion": "kustomize.config.k8s.io/v1beta1",
+        "kind": "Kustomization",
+        "resources": resources,
+    }))
+    .unwrap();
+    let old_fk = r#"apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: rauthy
+  namespace: tenant-acme
+spec:
+  interval: 2m
+  path: ./tenants/acme/apps/rauthy
+  prune: true
+  sourceRef:
+    kind: GitRepository
+    name: keel-gitops
+    namespace: tenant-acme
+  decryption:
+    provider: sops
+    secretRef:
+      name: sops-age
+  postBuild:
+    substituteFrom:
+      - kind: ConfigMap
+        name: rauthy-values
+        optional: true
+      - kind: Secret
+        name: rauthy-secrets
+        optional: true
+"#;
+    commit_to_main(
+        &fixture,
+        &[
+            ("tenants/kustomization.yaml", tenants_k.as_str()),
+            ("tenants/acme/apps/rauthy/flux-kustomization.yaml", old_fk),
+            (
+                "tenants/acme/apps/rauthy/kustomization.yaml",
+                "apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\nresources:\n  - manifests.yaml\n  - values-configmap.yaml\n  - secrets.enc.yaml\n",
+            ),
+            (
+                "tenants/acme/apps/rauthy/manifests.yaml",
+                "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: rauthy-config\n",
+            ),
+            (
+                "tenants/acme/apps/rauthy/values-configmap.yaml",
+                "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: rauthy-values\n",
+            ),
+            (
+                "tenants/acme/apps/rauthy/secrets.enc.yaml",
+                "apiVersion: v1\nkind: Secret\nmetadata:\n  name: rauthy-secrets\nsops: {}\n",
+            ),
+            ("tenants/acme/apps/rauthy/values.yaml", "hostname: auth.acme.example\n"),
+        ],
+        "feat(acme): rauthy (pre-split layout)",
+    )
+    .await;
+
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "rauthy",
+                "values": rauthy_values("auth.acme.example") }),
+    )
+    .await;
+    if sops_unavailable(status, &body) {
+        return;
+    }
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let parsed: Value = serde_json::from_str(&body).unwrap();
+    assert!(
+        parsed["proposal"]["title"]
+            .as_str()
+            .unwrap()
+            .contains("update"),
+        "{body}"
+    );
+    checkout_proposal_branch(&fixture, &body).await;
+
+    let dir = workdir.join("tenants/acme/apps/rauthy");
+    assert_rauthy_split_layout(&dir, "rauthy", None);
+    let resources = tenants_kustomization_resources(&fixture);
+    for file in ["config-kustomization.yaml", "flux-kustomization.yaml"] {
+        let entry = format!("acme/apps/rauthy/{file}");
+        assert_eq!(
+            resources.iter().filter(|r| **r == entry).count(),
+            1,
+            "{resources:?}"
+        );
+    }
+    // The removals are part of the proposal commit.
+    let status_out = std::process::Command::new("git")
+        .args(["show", "--name-status", "--format=", "HEAD"])
+        .current_dir(&workdir)
+        .output()
+        .unwrap();
+    let changes = String::from_utf8_lossy(&status_out.stdout);
+    assert!(
+        changes.contains("D\ttenants/acme/apps/rauthy/secrets.enc.yaml"),
+        "{changes}"
+    );
+    assert!(
+        changes.contains("D\ttenants/acme/apps/rauthy/values-configmap.yaml"),
+        "{changes}"
+    );
+}
+
+/// Deleting a manifest app removes its directory and both Kustomizations from the tenant tree.
+#[tokio::test]
+async fn test_deleting_manifest_app_removes_config_and_app_kustomizations() {
+    let fixture = setup_fixture().await;
+    let cookie = login_and_get_cookie(&fixture).await;
+    seed_rauthy_catalog(&fixture).await;
+    let workdir = fixture.state.repo_workdir.clone();
+
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "rauthy",
+                "values": rauthy_values("auth.acme.example") }),
+    )
+    .await;
+    if sops_unavailable(status, &body) {
+        return;
+    }
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let pr_id = serde_json::from_str::<Value>(&body).unwrap()["proposal"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let res = build_router(fixture.state.clone())
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/v1/proposals/{pr_id}/merge"))
+                .header(COOKIE, &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    fixture
+        .state
+        .git_runner
+        .sync_branch_from_remote(&workdir, "origin", "main")
+        .await
+        .unwrap();
+    assert!(
+        tenants_kustomization_resources(&fixture)
+            .contains(&"acme/apps/rauthy/config-kustomization.yaml".to_string())
+    );
+
+    let res = build_router(fixture.state.clone())
+        .oneshot(
+            Request::builder()
+                .method(Method::DELETE)
+                .uri("/api/v1/releases/tenant-acme/rauthy")
+                .header(COOKIE, &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = res.status();
+    let body =
+        String::from_utf8_lossy(&res.into_body().collect().await.unwrap().to_bytes()).into_owned();
+    assert_eq!(status, StatusCode::OK, "{body}");
+    checkout_proposal_branch(&fixture, &body).await;
+    assert!(!workdir.join("tenants/acme/apps/rauthy").exists());
+    let resources = tenants_kustomization_resources(&fixture);
+    assert!(
+        !resources.iter().any(|r| r.starts_with("acme/apps/rauthy/")),
+        "{resources:?}"
+    );
+}
+
+/// A canary bundle item whose HelmRelease targets a remote cluster ships its Flagger Canary and
+/// NetworkPolicy through an `<item>-canary` Kustomization to that cluster, never the local tree.
+#[tokio::test]
+async fn test_bundle_remote_canary_item_applies_canary_on_workload_cluster() {
+    let fixture = setup_fixture().await;
+    let cookie = login_and_get_cookie(&fixture).await;
+    commit_to_main(
+        &fixture,
+        &[(
+            "catalog/bundles/edge-canary/catalog.yaml",
+            r#"apiVersion: keel.io/v1alpha1
+kind: CatalogBundle
+metadata:
+  id: edge-canary
+  name: Edge Canary
+  category: platform
+spec:
+  items:
+    - id: web
+      kind: app
+      catalogRef: grafana
+      canary: true
+      targetNamespace: obs
+  schema:
+    type: object
+"#,
+        )],
+        "feat(catalog): edge-canary bundle",
+    )
+    .await;
+
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "edge-canary", "kind": "bundle",
+                "targetCluster": "edge-kubeconfig", "values": {} }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    checkout_proposal_branch(&fixture, &body).await;
+
+    let dir = fixture
+        .state
+        .repo_workdir
+        .join("tenants/acme/bundles/edge-canary/web");
+    let yaml = |file: &str| {
+        serde_yml::from_str::<Value>(&std::fs::read_to_string(dir.join(file)).unwrap()).unwrap()
+    };
+    assert!(!dir.join("canary.yaml").exists());
+    assert!(!dir.join("networkpolicy-canary.yaml").exists());
+    assert_eq!(
+        yaml("kustomization.yaml")["resources"],
+        json!([
+            "helmrelease-canary.yaml",
+            "helm-repository.yaml",
+            "canary-kustomization.yaml"
+        ])
+    );
+    assert_eq!(
+        yaml("canary/kustomization.yaml")["resources"],
+        json!(["namespace.yaml", "canary.yaml", "networkpolicy-canary.yaml"])
+    );
+    assert_eq!(yaml("canary/namespace.yaml")["metadata"]["name"], "obs");
+    assert_restricted_pss(&yaml("canary/namespace.yaml"));
+    assert_eq!(yaml("canary/canary.yaml")["kind"], "Canary");
+    let fk = yaml("canary-kustomization.yaml");
+    assert_eq!(fk["metadata"]["name"], "edge-canary-web-canary");
+    assert_eq!(fk["metadata"]["labels"]["keel.io/bundle"], "edge-canary");
+    assert_eq!(
+        fk["spec"]["kubeConfig"]["secretRef"]["name"],
+        "edge-kubeconfig"
+    );
+    assert_eq!(fk["spec"]["targetNamespace"], "obs");
+    assert_eq!(
+        fk["spec"]["path"],
+        "./tenants/acme/bundles/edge-canary/web/canary"
+    );
+    let hr = yaml("helmrelease-canary.yaml");
+    assert_eq!(
+        hr["spec"]["kubeConfig"]["secretRef"]["name"],
+        "edge-kubeconfig"
+    );
+}
+
+/// Manifest apps inside bundles use the same split layout (config Kustomization first).
+#[tokio::test]
+async fn test_bundle_manifest_app_item_uses_split_config_layout() {
+    let fixture = setup_fixture().await;
+    let cookie = login_and_get_cookie(&fixture).await;
+    seed_rauthy_catalog(&fixture).await;
+    commit_to_main(
+        &fixture,
+        &[(
+            "catalog/bundles/idp-stack/catalog.yaml",
+            r#"apiVersion: keel.io/v1alpha1
+kind: CatalogBundle
+metadata:
+  id: idp-stack
+  name: IdP Stack
+  category: security-identity
+spec:
+  items:
+    - id: web
+      kind: app
+      catalogRef: grafana
+    - id: idp
+      kind: app
+      catalogRef: rauthy
+      dependsOn:
+        - web
+  schema:
+    type: object
+"#,
+        )],
+        "feat(catalog): idp-stack bundle",
+    )
+    .await;
+
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "idp-stack", "kind": "bundle",
+                "values": { "idp": rauthy_values("idp.acme.example") } }),
+    )
+    .await;
+    if sops_unavailable(status, &body) {
+        return;
+    }
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let parsed: Value = serde_json::from_str(&body).unwrap();
+    assert!(
+        parsed["report"]["resources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["name"] == "idp-stack-idp"
+                && r["resourceType"] == "flux:kustomize.toolkit.fluxcd.io/v1:Kustomization"),
+        "{body}"
+    );
+    checkout_proposal_branch(&fixture, &body).await;
+
+    let dir = fixture
+        .state
+        .repo_workdir
+        .join("tenants/acme/bundles/idp-stack/idp");
+    assert_rauthy_split_layout(&dir, "idp-stack-idp", None);
+    assert!(!dir.join("helmrelease.yaml").exists());
+    let committed = read_tree(&dir);
+    for secret in ["raftSecretSampleValue-0123456789", "Sample-Admin#Passw0rd!"] {
+        assert!(!committed.contains(secret));
+    }
+    let fk: Value =
+        serde_yml::from_str(&std::fs::read_to_string(dir.join("flux-kustomization.yaml")).unwrap())
+            .unwrap();
+    assert_eq!(fk["metadata"]["labels"]["keel.io/bundle"], "idp-stack");
+    // Ready (and so any later item's `dependsOn`) only once the IdP workloads are healthy.
+    assert_eq!(fk["spec"]["wait"], true);
+    let deps: Vec<&str> = fk["spec"]["dependsOn"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(deps, ["idp-stack-web", "idp-stack-idp-config"]);
+    let resources = tenants_kustomization_resources(&fixture);
+    for file in ["config-kustomization.yaml", "flux-kustomization.yaml"] {
+        assert!(
+            resources.contains(&format!("acme/bundles/idp-stack/idp/{file}")),
+            "{resources:?}"
+        );
+    }
+
+    // Editing the merged bundle item through the single-app path keeps the split layout and the
+    // bundle ordering (never self-referencing its own Kustomization).
+    let workdir = fixture.state.repo_workdir.clone();
+    fixture
+        .state
+        .git_runner
+        .checkout_branch(&workdir, "main")
+        .await
+        .unwrap();
+    let pr_id = parsed["proposal"]["id"].as_str().unwrap();
+    let res = build_router(fixture.state.clone())
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/v1/proposals/{pr_id}/merge"))
+                .header(COOKIE, &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    fixture
+        .state
+        .git_runner
+        .sync_branch_from_remote(&workdir, "origin", "main")
+        .await
+        .unwrap();
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "rauthy", "kind": "app", "name": "idp-stack-idp",
+                "values": rauthy_values("idp.acme.example") }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    checkout_proposal_branch(&fixture, &body).await;
+    assert!(!workdir.join("tenants/acme/apps/idp-stack-idp").exists());
+    assert_rauthy_split_layout(&dir, "idp-stack-idp", None);
+    let fk: Value =
+        serde_yml::from_str(&std::fs::read_to_string(dir.join("flux-kustomization.yaml")).unwrap())
+            .unwrap();
+    let deps: Vec<&str> = fk["spec"]["dependsOn"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(deps, ["idp-stack-web", "idp-stack-idp-config"]);
+    assert_eq!(fk["metadata"]["labels"]["keel.io/bundle-item"], "idp");
+    let resources = tenants_kustomization_resources(&fixture);
+    assert!(
+        !resources
+            .iter()
+            .any(|r| r.starts_with("acme/apps/idp-stack-idp")),
+        "{resources:?}"
+    );
+    for file in ["config-kustomization.yaml", "flux-kustomization.yaml"] {
+        let entry = format!("acme/bundles/idp-stack/idp/{file}");
+        assert_eq!(resources.iter().filter(|r| **r == entry).count(), 1);
+    }
+}
+
+/// Merges the proposal in a `POST /api/v1/proposals` response body and syncs `main`.
+async fn merge_proposal_and_sync(fixture: &TestFixture, cookie: &str, body: &str) {
+    let workdir = &fixture.state.repo_workdir;
+    fixture
+        .state
+        .git_runner
+        .checkout_branch(workdir, "main")
+        .await
+        .unwrap();
+    let pr_id = serde_json::from_str::<Value>(body).unwrap()["proposal"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let res = build_router(fixture.state.clone())
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/v1/proposals/{pr_id}/merge"))
+                .header(COOKIE, cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    fixture
+        .state
+        .git_runner
+        .sync_branch_from_remote(workdir, "origin", "main")
+        .await
+        .unwrap();
+}
+
+/// `rauthy_values` without any secret field (an edit leaving every secret blank).
+fn rauthy_values_without_secrets(hostname: &str) -> Value {
+    let mut values = rauthy_values(hostname);
+    let obj = values.as_object_mut().unwrap();
+    for key in [
+        "encKey",
+        "hiqliteSecretRaft",
+        "hiqliteSecretApi",
+        "adminPassword",
+    ] {
+        obj.remove(key);
+    }
+    values
+}
+
+/// `stringData` keys of a SOPS-encrypted Secret (key names stay plaintext).
+fn sops_secret_keys(ciphertext: &str) -> Vec<String> {
+    let doc: Value = serde_yml::from_str(ciphertext).unwrap();
+    doc["stringData"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect()
+}
+
+/// Editing a manifest app without re-entering its secrets (the UI never receives them) keeps the
+/// committed SOPS Secret and its `substituteFrom` source; re-entering only some secrets keeps the
+/// others. Required secret fields are only relaxed when a stored value exists.
+#[tokio::test]
+async fn test_manifest_app_edit_keeps_stored_secrets() {
+    let fixture = setup_fixture().await;
+    let cookie = login_and_get_cookie(&fixture).await;
+    seed_rauthy_catalog(&fixture).await;
+    let workdir = fixture.state.repo_workdir.clone();
+    let secret_path = workdir.join("tenants/acme/apps/rauthy/config/secrets.enc.yaml");
+
+    // A new instance still needs every required secret.
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "rauthy",
+                "values": rauthy_values_without_secrets("auth.acme.example") }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "rauthy",
+                "values": rauthy_values("auth.acme.example") }),
+    )
+    .await;
+    if sops_unavailable(status, &body) {
+        return;
+    }
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    merge_proposal_and_sync(&fixture, &cookie, &body).await;
+    let stored = std::fs::read_to_string(&secret_path).unwrap();
+
+    // Only a non-secret field changes: the ciphertext is committed unchanged.
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "rauthy",
+                "values": rauthy_values_without_secrets("login.acme.example") }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    checkout_proposal_branch(&fixture, &body).await;
+    assert_eq!(std::fs::read_to_string(&secret_path).unwrap(), stored);
+    let dir = workdir.join("tenants/acme/apps/rauthy");
+    assert_rauthy_split_layout(&dir, "rauthy", None);
+    assert!(
+        std::fs::read_to_string(dir.join("manifests.yaml"))
+            .unwrap()
+            .contains("login.acme.example")
+    );
+
+    // One secret re-entered: re-encrypted with every stored key kept.
+    fixture
+        .state
+        .git_runner
+        .checkout_branch(&workdir, "main")
+        .await
+        .unwrap();
+    let mut values = rauthy_values_without_secrets("auth.acme.example");
+    values["adminPassword"] = json!("Rotated-Admin#Passw0rd!");
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "rauthy", "values": values }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    checkout_proposal_branch(&fixture, &body).await;
+    let rotated = std::fs::read_to_string(&secret_path).unwrap();
+    assert_ne!(rotated, stored);
+    assert!(!rotated.contains("Rotated-Admin#Passw0rd!"));
+    assert_eq!(sops_secret_keys(&rotated), sops_secret_keys(&stored));
+    let age_key = fixture
+        .state
+        .secret_store
+        .get_tenant_age_key("acme")
+        .await
+        .unwrap()
+        .unwrap();
+    let plain = keel_core::SopsManager::new()
+        .decrypt_yaml(&age_key.secret_key, &rotated)
+        .await
+        .unwrap();
+    let doc: Value = serde_yml::from_str(&plain).unwrap();
+    assert_eq!(
+        doc["stringData"]["adminPassword"],
+        "Rotated-Admin#Passw0rd!"
+    );
+    assert_eq!(
+        doc["stringData"]["hiqliteSecretRaft"],
+        "raftSecretSampleValue-0123456789"
+    );
+    assert_eq!(doc["metadata"]["name"], "rauthy-secrets");
+}
+
+/// Bundle edits keep a manifest-app item's stored secrets the same way.
+#[tokio::test]
+async fn test_bundle_manifest_app_item_edit_keeps_stored_secrets() {
+    let fixture = setup_fixture().await;
+    let cookie = login_and_get_cookie(&fixture).await;
+    seed_rauthy_catalog(&fixture).await;
+    commit_to_main(
+        &fixture,
+        &[(
+            "catalog/bundles/idp-only/catalog.yaml",
+            r#"apiVersion: keel.io/v1alpha1
+kind: CatalogBundle
+metadata:
+  id: idp-only
+  name: IdP Only
+  category: security-identity
+spec:
+  items:
+    - id: idp
+      kind: app
+      catalogRef: rauthy
+  schema:
+    type: object
+    properties:
+      idp:
+        type: object
+        required: [hostname, encKey, hiqliteSecretRaft, hiqliteSecretApi, adminPassword]
+        properties:
+          hostname:
+            type: string
+          publicPortSuffix:
+            type: string
+          adminEmail:
+            type: string
+          encKeyId:
+            type: string
+          encKey:
+            type: string
+            writeOnly: true
+          hiqliteSecretRaft:
+            type: string
+            writeOnly: true
+          hiqliteSecretApi:
+            type: string
+            writeOnly: true
+          adminPassword:
+            type: string
+            writeOnly: true
+"#,
+        )],
+        "feat(catalog): idp-only bundle",
+    )
+    .await;
+    let workdir = fixture.state.repo_workdir.clone();
+    let secret_path = workdir.join("tenants/acme/bundles/idp-only/idp/config/secrets.enc.yaml");
+
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "idp-only", "kind": "bundle",
+                "values": { "idp": rauthy_values("idp.acme.example") } }),
+    )
+    .await;
+    if sops_unavailable(status, &body) {
+        return;
+    }
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    merge_proposal_and_sync(&fixture, &cookie, &body).await;
+    let stored = std::fs::read_to_string(&secret_path).unwrap();
+
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "idp-only", "kind": "bundle",
+                "values": { "idp": rauthy_values_without_secrets("login.acme.example") } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    checkout_proposal_branch(&fixture, &body).await;
+    assert_eq!(std::fs::read_to_string(&secret_path).unwrap(), stored);
+    let fk: Value = serde_yml::from_str(
+        &std::fs::read_to_string(
+            workdir.join("tenants/acme/bundles/idp-only/idp/flux-kustomization.yaml"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        fk["spec"]["postBuild"]["substituteFrom"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["kind"] == "Secret" && s["name"] == "idp-only-idp-secrets")
+    );
+}
+
+/// Flux Kustomizations derived from instance names (`<name>`, `<name>-config`, `<name>-canary`,
+/// bundle `<bundle>-<item>`) must stay unique per tenant: one tenant's duplicate id would stop
+/// the shared root `tenants/` Kustomization for every tenant.
+#[tokio::test]
+async fn test_derived_flux_kustomization_name_collisions_are_refused() {
+    let fixture = setup_fixture().await;
+    let cookie = login_and_get_cookie(&fixture).await;
+    seed_rauthy_catalog(&fixture).await;
+    let flux_kustomization = |name: &str| {
+        format!(
+            "apiVersion: kustomize.toolkit.fluxcd.io/v1\nkind: Kustomization\nmetadata:\n  name: {name}\n  namespace: tenant-acme\nspec:\n  path: ./x\n"
+        )
+    };
+    let web = flux_kustomization("web");
+    let web_config_of_web = flux_kustomization("web-config");
+    let legacy = flux_kustomization("api-config");
+    let edge_web = flux_kustomization("edge-web");
+    let stack_db = flux_kustomization("stack-db");
+    let stack_db_config = flux_kustomization("stack-db-config");
+    commit_to_main(
+        &fixture,
+        &[
+            // Manifest app `web` (app + `-config` Kustomizations).
+            (
+                "tenants/acme/apps/web/flux-kustomization.yaml",
+                web.as_str(),
+            ),
+            (
+                "tenants/acme/apps/web/config-kustomization.yaml",
+                web_config_of_web.as_str(),
+            ),
+            // A manifest app named `api-config`.
+            (
+                "tenants/acme/apps/api-config/flux-kustomization.yaml",
+                legacy.as_str(),
+            ),
+            // A manifest app named like a bundle item resource.
+            (
+                "tenants/acme/apps/edge-web/flux-kustomization.yaml",
+                edge_web.as_str(),
+            ),
+            // Manifest-app item `db` of bundle `stack`.
+            (
+                "tenants/acme/bundles/stack/db/flux-kustomization.yaml",
+                stack_db.as_str(),
+            ),
+            (
+                "tenants/acme/bundles/stack/db/config-kustomization.yaml",
+                stack_db_config.as_str(),
+            ),
+            (
+                "catalog/bundles/edge-canary/catalog.yaml",
+                r#"apiVersion: keel.io/v1alpha1
+kind: CatalogBundle
+metadata:
+  id: edge-canary
+  name: Edge Canary
+  category: platform
+spec:
+  items:
+    - id: web
+      kind: app
+      catalogRef: grafana
+  schema:
+    type: object
+"#,
+            ),
+        ],
+        "feat(acme): existing instances",
+    )
+    .await;
+    let git = &fixture.state.git_runner;
+    let head_before = git
+        .rev_parse(&fixture.state.repo_workdir, "HEAD")
+        .await
+        .unwrap();
+
+    // `web` exists: a new `web-config` is refused (would duplicate `web-config`).
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "rauthy", "name": "web-config",
+                "values": rauthy_values("w.acme.example") }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body.contains("tenants/acme/apps/web"), "{body}");
+
+    // `api-config` exists: a new `api` (deriving `api-config`) is refused.
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "rauthy", "name": "api",
+                "values": rauthy_values("a.acme.example") }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body.contains("api-config"), "{body}");
+
+    // A bundle item resource name may not reuse an app's Kustomization name, and vice versa.
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "edge-canary", "kind": "bundle",
+                "name": "edge", "values": {} }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body.contains("edge-web"), "{body}");
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "rauthy", "name": "stack-db",
+                "values": rauthy_values("s.acme.example") }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body.contains("tenants/acme/bundles/stack/db"), "{body}");
+
+    assert_eq!(
+        git.rev_parse(&fixture.state.repo_workdir, "HEAD")
+            .await
+            .unwrap(),
+        head_before
+    );
+}
+
+/// Manifest apps have no Canary/bindValues wiring: bundle items requesting them are refused.
+#[tokio::test]
+async fn test_bundle_manifest_app_item_rejects_canary_and_bind_values() {
+    let fixture = setup_fixture().await;
+    let cookie = login_and_get_cookie(&fixture).await;
+    let catalog = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../deploy/catalog/apps/http-echo-manifest/catalog.yaml"),
+    )
+    .unwrap()
+    .replace("id: http-echo-manifest", "id: echo-canary")
+    .replace("flaggerSupported: false", "flaggerSupported: true");
+    let manifests = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../deploy/catalog/apps/http-echo-manifest/manifests.yaml"),
+    )
+    .unwrap();
+    let bundle = |id: &str, extra: &str| {
+        format!(
+            "apiVersion: keel.io/v1alpha1\nkind: CatalogBundle\nmetadata:\n  id: {id}\n  name: {id}\n  category: platform\nspec:\n  items:\n    - id: echo\n      kind: app\n      catalogRef: echo-canary\n{extra}  schema:\n    type: object\n"
+        )
+    };
+    let canary_bundle = bundle("echo-canary-b", "      canary: true\n");
+    let bind_bundle = bundle(
+        "echo-bind-b",
+        "      bindValues:\n        echoText: \"${items.db.outputs.host}\"\n",
+    );
+    commit_to_main(
+        &fixture,
+        &[
+            ("catalog/apps/echo-canary/catalog.yaml", catalog.as_str()),
+            (
+                "catalog/apps/echo-canary/manifests.yaml",
+                manifests.as_str(),
+            ),
+            (
+                "catalog/bundles/echo-canary-b/catalog.yaml",
+                canary_bundle.as_str(),
+            ),
+            (
+                "catalog/bundles/echo-bind-b/catalog.yaml",
+                bind_bundle.as_str(),
+            ),
+        ],
+        "feat(catalog): echo bundles",
+    )
+    .await;
+
+    for (bundle_id, needle) in [("echo-canary-b", "canary"), ("echo-bind-b", "bindValues")] {
+        let (status, body) = post_proposal(
+            &fixture,
+            &cookie,
+            json!({ "tenant": "acme", "catalogId": bundle_id, "kind": "bundle",
+                    "values": { "echo": { "echoText": "hi", "replicas": 1 } } }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bundle_id}: {body}");
+        assert!(body.contains(needle), "{body}");
+        assert!(body.contains("Helm apps"), "{body}");
+    }
 }

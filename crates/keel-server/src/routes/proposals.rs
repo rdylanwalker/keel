@@ -18,9 +18,8 @@ use keel_git::{
 };
 use keel_kube::{
     FlaggerCanarySpecInput, FluxDependencyRef, FluxHealthCheckRef, FluxKustomizationSpecInput,
-    FluxSubstituteReference, GITHUB_TOKEN_SECRET_NAME, HelmChartSourceKind, HelmChartSourceRef,
-    HelmReleaseSpecInput, HelmValuesSecretRef, RemoteKubeConfigRef, TENANT_SOPS_AGE_SECRET_NAME,
-    TenantAgeKey, generate_flux_kustomization_manifest,
+    GITHUB_TOKEN_SECRET_NAME, HelmChartSourceKind, HelmChartSourceRef, HelmReleaseSpecInput,
+    HelmValuesSecretRef, RemoteKubeConfigRef, TenantAgeKey,
     synthesize_canary_gateway_network_policy_yaml, synthesize_flagger_canary_yaml,
     synthesize_flux_kustomization_yaml, synthesize_helm_release_yaml,
     synthesize_remote_target_namespace_yaml,
@@ -478,6 +477,247 @@ fn build_values_configmap_manifest_yaml(
         .map_err(|e| ServerError::Internal(format!("failed to serialize values ConfigMap: {e}")))
 }
 
+/// Serializes a `kustomize.config.k8s.io/v1beta1` `kustomization.yaml` listing `resources`.
+fn kustomize_resources_yaml(resources: &[&str]) -> Result<String, ServerError> {
+    serde_yml::to_string(&json!({
+        "apiVersion": "kustomize.config.k8s.io/v1beta1",
+        "kind": "Kustomization",
+        "resources": resources,
+    }))
+    .map_err(|e| ServerError::Internal(format!("failed to serialize kustomization.yaml: {e}")))
+}
+
+/// Inputs for [`build_flux_manifest_app_files`].
+struct FluxManifestAppLayoutInput<'a> {
+    tenant: &'a str,
+    tenant_ns: &'a str,
+    /// App / app `Kustomization` name (`<instance>` or `<bundle>-<item>`).
+    name: &'a str,
+    /// Repo-relative app directory (`tenants/<t>/apps/<name>` or a bundle item directory).
+    app_dir: &'a str,
+    catalog_id: &'a str,
+    rendered_manifests: &'a str,
+    normal_values: &'a Value,
+    /// SOPS-encrypted `<name>-secrets` `Secret` manifest, when the app has secret fields.
+    encrypted_secret_yaml: Option<&'a str>,
+    kube_config: Option<RemoteKubeConfigRef>,
+    target_namespace: Option<String>,
+    depends_on: Vec<FluxDependencyRef>,
+    extra_labels: std::collections::BTreeMap<String, String>,
+}
+
+/// Committed file layout of a Flux-engine manifest app, relative to its directory.
+#[derive(Debug)]
+struct FluxManifestAppFiles {
+    /// `(relative path, contents)`, parents before children.
+    files: Vec<(String, String)>,
+    /// Relative paths (files or directories) to remove when present: the pre-split layout
+    /// (`values-configmap.yaml` / `secrets.enc.yaml` applied by the app `Kustomization` itself)
+    /// and artifacts of a previous local/remote or secret/no-secret variant.
+    stale: Vec<&'static str>,
+    /// The app `Kustomization` (`flux-kustomization.yaml`) YAML.
+    app_kustomization_yaml: String,
+}
+
+/// File names of the two Flux `Kustomization`s committed for a Flux-engine manifest app.
+const FLUX_MANIFEST_APP_KUSTOMIZATION_FILES: [&str; 2] =
+    ["config-kustomization.yaml", "flux-kustomization.yaml"];
+
+/// Builds the committed layout of a Flux-engine manifest app (`SDD.md` §5.1):
+///
+/// ```text
+/// <app_dir>/config-kustomization.yaml   Kustomization <name>-config (management cluster, SOPS)
+/// <app_dir>/config/kustomization.yaml   values-configmap.yaml [+ secrets.enc.yaml]
+/// <app_dir>/flux-kustomization.yaml     Kustomization <name> (dependsOn <name>-config)
+/// <app_dir>/kustomization.yaml          [namespace.yaml (remote only)] + manifests.yaml
+/// ```
+///
+/// Substitution sources live on the management cluster (where Flux reads `substituteFrom`), so a
+/// remote app never ships the `<name>-secrets` Secret to the workload cluster; only the rendered
+/// manifests (with substituted values) are applied there.
+fn build_flux_manifest_app_files(
+    input: FluxManifestAppLayoutInput<'_>,
+) -> Result<FluxManifestAppFiles, ServerError> {
+    let remote = input.kube_config.is_some();
+    // Remote apps always pin a target namespace (default: the tenant namespace) and create it
+    // first, like remote canaries: nothing else creates it on the workload cluster.
+    let target_namespace = if remote {
+        Some(
+            input
+                .target_namespace
+                .clone()
+                .unwrap_or_else(|| input.tenant_ns.to_string()),
+        )
+    } else {
+        input.target_namespace.clone()
+    };
+    let has_secrets = input.encrypted_secret_yaml.is_some();
+    let (config_k_yaml, app_k_yaml) =
+        keel_kube::synthesize_flux_manifest_app_kustomizations(&keel_kube::FluxManifestAppInput {
+            tenant_id: input.tenant.to_string(),
+            name: input.name.to_string(),
+            source_name: "keel-gitops".to_string(),
+            app_dir: input.app_dir.to_string(),
+            kube_config: input.kube_config.clone(),
+            target_namespace: target_namespace.clone(),
+            has_secrets,
+            depends_on: input.depends_on,
+            extra_labels: input.extra_labels,
+        })?;
+
+    let mut files = Vec::new();
+    let mut app_resources = Vec::new();
+    if let (true, Some(ns)) = (remote, target_namespace.as_deref()) {
+        files.push((
+            "namespace.yaml".to_string(),
+            synthesize_remote_target_namespace_yaml(input.tenant, ns)?,
+        ));
+        app_resources.push("namespace.yaml");
+    }
+    files.push((
+        "manifests.yaml".to_string(),
+        input.rendered_manifests.to_string(),
+    ));
+    app_resources.push("manifests.yaml");
+    files.push((
+        "kustomization.yaml".to_string(),
+        kustomize_resources_yaml(&app_resources)?,
+    ));
+
+    let config_dir = keel_kube::MANIFEST_APP_CONFIG_DIR;
+    let mut config_resources = vec!["values-configmap.yaml"];
+    files.push((
+        format!("{config_dir}/values-configmap.yaml"),
+        build_values_configmap_manifest_yaml(
+            &keel_kube::manifest_app_values_configmap_name(input.name),
+            input.tenant_ns,
+            input.tenant,
+            input.catalog_id,
+            input.normal_values,
+        )?,
+    ));
+    if let Some(enc) = input.encrypted_secret_yaml {
+        files.push((format!("{config_dir}/secrets.enc.yaml"), enc.to_string()));
+        config_resources.push("secrets.enc.yaml");
+    }
+    files.push((
+        format!("{config_dir}/kustomization.yaml"),
+        kustomize_resources_yaml(&config_resources)?,
+    ));
+    files.push((
+        FLUX_MANIFEST_APP_KUSTOMIZATION_FILES[0].to_string(),
+        config_k_yaml,
+    ));
+    files.push((
+        FLUX_MANIFEST_APP_KUSTOMIZATION_FILES[1].to_string(),
+        app_k_yaml.clone(),
+    ));
+
+    let mut stale = vec!["values-configmap.yaml", "secrets.enc.yaml"];
+    if !remote {
+        stale.push("namespace.yaml");
+    }
+    if !has_secrets {
+        stale.push("config/secrets.enc.yaml");
+    }
+    Ok(FluxManifestAppFiles {
+        files,
+        stale,
+        app_kustomization_yaml: app_k_yaml,
+    })
+}
+
+/// Removes each existing `names` entry (file or directory) under `rel_dir` and stages the removal.
+async fn remove_stale_entries(
+    repo_workdir: &Path,
+    rel_dir: &str,
+    names: &[&str],
+    staged_paths: &mut Vec<String>,
+) -> Result<(), ServerError> {
+    let dir = repo_workdir.join(rel_dir);
+    for name in names {
+        let path = dir.join(name);
+        let Ok(meta) = tokio::fs::symlink_metadata(&path).await else {
+            continue;
+        };
+        if meta.is_dir() {
+            tokio::fs::remove_dir_all(&path).await?;
+        } else {
+            tokio::fs::remove_file(&path).await?;
+        }
+        staged_paths.push(format!("{rel_dir}/{name}"));
+    }
+    Ok(())
+}
+
+/// Writes `files` (paths relative to `rel_dir`, creating parent directories) and stages them.
+async fn write_relative_files(
+    repo_workdir: &Path,
+    rel_dir: &str,
+    files: &[(String, String)],
+    staged_paths: &mut Vec<String>,
+) -> Result<(), ServerError> {
+    let dir = repo_workdir.join(rel_dir);
+    for (name, contents) in files {
+        let path = dir.join(name);
+        if let Some(parent) = path.parent() {
+            create_dir_all_contained(repo_workdir, parent).await?;
+        }
+        write_contained(repo_workdir, &path, contents).await?;
+        staged_paths.push(format!("{rel_dir}/{name}"));
+    }
+    Ok(())
+}
+
+/// Remote canary layout (`<dir>/canary/` + `canary-kustomization.yaml`, Kustomization
+/// `<name>-canary` with `kubeConfig`/`targetNamespace`), relative to the app directory. The
+/// Flagger `Canary` and its NetworkPolicy must run next to the HelmRelease's workload on the
+/// remote cluster; the namespace is shipped first so they never race Helm's `createNamespace`.
+#[allow(clippy::too_many_arguments)]
+fn build_remote_canary_files(
+    tenant: &str,
+    name: &str,
+    app_dir: &str,
+    kube_config: &RemoteKubeConfigRef,
+    target_namespace: &str,
+    canary_yaml: String,
+    network_policy_yaml: String,
+    extra_labels: &std::collections::BTreeMap<String, String>,
+) -> Result<Vec<(String, String)>, ServerError> {
+    let mut fk_input = FluxKustomizationSpecInput::new(
+        tenant,
+        format!("{name}-canary"),
+        "keel-gitops",
+        format!("./{app_dir}/canary"),
+    );
+    fk_input.kube_config = Some(kube_config.clone());
+    fk_input.target_namespace = Some(target_namespace.to_string());
+    fk_input.extra_labels = extra_labels.clone();
+    Ok(vec![
+        (
+            "canary/namespace.yaml".to_string(),
+            synthesize_remote_target_namespace_yaml(tenant, target_namespace)?,
+        ),
+        ("canary/canary.yaml".to_string(), canary_yaml),
+        (
+            "canary/networkpolicy-canary.yaml".to_string(),
+            network_policy_yaml,
+        ),
+        (
+            "canary/kustomization.yaml".to_string(),
+            kustomize_resources_yaml(&[
+                "namespace.yaml",
+                "canary.yaml",
+                "networkpolicy-canary.yaml",
+            ])?,
+        ),
+        (
+            "canary-kustomization.yaml".to_string(),
+            synthesize_flux_kustomization_yaml(&fk_input)?,
+        ),
+    ])
+}
+
 /// Rejects route hostnames already claimed by another committed manifest app (any tenant) under
 /// `tenants/`. `own_rel_dir` (the instance being created/edited) is skipped. Reads the checked-out
 /// default branch; open PRs are not considered, the Kyverno `restrict-tenant-route-hostnames`
@@ -535,6 +775,291 @@ async fn ensure_route_hostnames_unclaimed(
     Ok(())
 }
 
+/// Flux `Kustomization` names an instance (or bundle item) named `name` may create in its tenant:
+/// the app `Kustomization` (`<name>`), a manifest app's substitution sources (`<name>-config`)
+/// and a remote canary (`<name>-canary`). Reserved regardless of the current engine/canary
+/// variant, so a later edit can never collide either.
+fn reserved_flux_kustomization_names(name: &str) -> [String; 3] {
+    [
+        name.to_string(),
+        keel_kube::manifest_app_config_kustomization_name(name),
+        format!("{name}-canary"),
+    ]
+}
+
+/// Rejects a **new** instance (or bundle item resource) `name` whose derived Flux `Kustomization`
+/// names can overlap another instance's: `<base>-config` / `<base>-canary` while an instance
+/// `<base>` exists, or `<name>` while an instance `<name>-config` / `<name>-canary` exists. Checked
+/// on instance directories (not only committed `Kustomization`s), so a later engine or canary
+/// switch of either instance can never produce a duplicate id.
+async fn ensure_no_derived_name_sibling(
+    repo_workdir: &Path,
+    tenant: &str,
+    own_rel_dir: &str,
+    name: &str,
+) -> Result<(), ServerError> {
+    let mut candidates: Vec<String> = ["-config", "-canary"]
+        .iter()
+        .filter_map(|suffix| name.strip_suffix(suffix))
+        .filter(|base| !base.is_empty())
+        .map(str::to_string)
+        .collect();
+    candidates.extend(reserved_flux_kustomization_names(name).into_iter().skip(1));
+    for candidate in candidates {
+        for subdir in ["apps", "infra"] {
+            if let Some(found) =
+                resolve_tenant_resource_dir(repo_workdir, tenant, subdir, &candidate).await
+                && found.rel_dir != own_rel_dir
+                && !found.rel_dir.starts_with(&format!("{own_rel_dir}/"))
+            {
+                return Err(ServerError::Conflict(format!(
+                    "Instance name '{name}' would share derived Flux Kustomization names \
+                     ('<name>-config', '<name>-canary') with '{}'; choose another name",
+                    found.rel_dir
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Rejects `names` already used by a committed Flux `Kustomization` of `tenant` outside
+/// `own_rel_dir` (the instance being created/edited). Every tenant tree is built by the single
+/// root `tenants/` Flux `Kustomization`, so a duplicate `Kustomization tenant-<id>/<name>` id would
+/// stop kustomize (and reconciliation) for **all** tenants (`NFR-SEC-02`).
+async fn ensure_flux_kustomization_names_unclaimed(
+    repo_workdir: &Path,
+    tenant: &str,
+    own_rel_dir: &str,
+    names: &[String],
+) -> Result<(), ServerError> {
+    let own_dir = repo_workdir.join(own_rel_dir);
+    let mut stack = vec![repo_workdir.join("tenants").join(tenant)];
+    while let Some(dir) = stack.pop() {
+        let Ok(mut entries) = tokio::fs::read_dir(&dir).await else {
+            continue;
+        };
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let path = entry.path();
+            let Ok(file_type) = entry.file_type().await else {
+                continue;
+            };
+            if file_type.is_dir() {
+                if path != own_dir {
+                    stack.push(path);
+                }
+                continue;
+            }
+            let file_name = entry.file_name();
+            let Some(file_name) = file_name.to_str() else {
+                continue;
+            };
+            // Flux `Kustomization`s are committed as `*-kustomization.yaml` (`flux-`, `config-`,
+            // `canary-`); plain `kustomization.yaml` files are kustomize configs.
+            if !file_type.is_file() || !file_name.ends_with("-kustomization.yaml") {
+                continue;
+            }
+            let Ok(raw) = tokio::fs::read_to_string(&path).await else {
+                continue;
+            };
+            let Ok(doc) = serde_yml::from_str::<Value>(&raw) else {
+                continue;
+            };
+            let is_flux_kustomization = doc.get("kind").and_then(Value::as_str)
+                == Some("Kustomization")
+                && doc
+                    .get("apiVersion")
+                    .and_then(Value::as_str)
+                    .is_some_and(|v| v.starts_with("kustomize.toolkit.fluxcd.io/"));
+            let Some(name) = doc.pointer("/metadata/name").and_then(Value::as_str) else {
+                continue;
+            };
+            if is_flux_kustomization && names.iter().any(|n| n == name) {
+                let owner = path
+                    .strip_prefix(repo_workdir)
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default();
+                return Err(ServerError::Conflict(format!(
+                    "Flux Kustomization '{name}' already exists in tenant '{tenant}' ('{owner}'); \
+                     choose another instance name"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// SOPS-encrypted `<name>-secrets` `Secret` of a committed Flux manifest app.
+struct StoredManifestAppSecret {
+    ciphertext: String,
+    /// `stringData` / `data` keys (SOPS keeps key names in plaintext).
+    keys: std::collections::BTreeSet<String>,
+}
+
+/// Reads the committed secret of the Flux manifest app in `rel_dir`: `config/secrets.enc.yaml`,
+/// or the pre-split `secrets.enc.yaml` (the same `Secret`, applied by the app `Kustomization`).
+async fn read_stored_manifest_app_secret(
+    repo_workdir: &Path,
+    rel_dir: &str,
+) -> Option<StoredManifestAppSecret> {
+    let dir = repo_workdir.join(rel_dir);
+    let mut candidates = vec![
+        dir.join(keel_kube::MANIFEST_APP_CONFIG_DIR)
+            .join("secrets.enc.yaml"),
+    ];
+    // A Helm app's root `secrets.enc.yaml` holds encrypted values, never a `Secret`.
+    if tokio::fs::try_exists(dir.join("manifests.yaml"))
+        .await
+        .unwrap_or(false)
+    {
+        candidates.push(dir.join("secrets.enc.yaml"));
+    }
+    for path in candidates {
+        let Ok(ciphertext) = read_contained_to_string(repo_workdir, &path).await else {
+            continue;
+        };
+        let Ok(doc) = serde_yml::from_str::<Value>(&ciphertext) else {
+            continue;
+        };
+        if doc.get("sops").is_none() {
+            continue;
+        }
+        let keys: std::collections::BTreeSet<String> = ["stringData", "data"]
+            .iter()
+            .filter_map(|field| doc.get(*field).and_then(Value::as_object))
+            .flat_map(|m| m.keys().cloned())
+            .collect();
+        if !keys.is_empty() {
+            return Some(StoredManifestAppSecret { ciphertext, keys });
+        }
+    }
+    None
+}
+
+/// Returns `schema` with every top-level secret property whose value is already stored
+/// (`stored_keys`) removed from `required`: like the UI's edit form, a blank secret field keeps
+/// the stored value. Secret fields without a stored value stay required.
+fn relax_stored_secret_requirements(
+    schema: &Value,
+    stored_keys: &std::collections::BTreeSet<String>,
+) -> Value {
+    let mut out = schema.clone();
+    let props = schema.get("properties").and_then(Value::as_object);
+    if let (Some(props), Some(required)) =
+        (props, out.get_mut("required").and_then(Value::as_array_mut))
+    {
+        required.retain(|key| {
+            let Some(key) = key.as_str() else {
+                return true;
+            };
+            !(stored_keys.contains(key)
+                && props.get(key).is_some_and(keel_core::is_secret_schema_node))
+        });
+    }
+    out
+}
+
+/// Resolves the SOPS-encrypted `<name>-secrets` `Secret` to commit for a Flux manifest app.
+///
+/// * The schema has no secret fields: `None` (any stored secret is removed).
+/// * Nothing stored: a fresh `Secret` of the submitted values (`None` when none were submitted).
+/// * Stored, no secret values submitted (edit): the stored ciphertext, unchanged.
+/// * Stored, every stored key re-submitted: a fresh `Secret` of the submitted values.
+/// * Stored, some keys re-submitted: the stored `Secret` is decrypted with the tenant `age` key,
+///   the submitted keys are overlaid, and the result is re-encrypted.
+#[allow(clippy::too_many_arguments)]
+async fn resolve_manifest_app_secret(
+    state: &AppState,
+    tenant: &str,
+    tenant_ns: &str,
+    secret_name: &str,
+    schema_secret_paths: &[String],
+    secret_values: &Value,
+    stored: Option<&StoredManifestAppSecret>,
+) -> Result<Option<String>, ServerError> {
+    if schema_secret_paths.is_empty() {
+        return Ok(None);
+    }
+    let submitted = render_secret_string_data(secret_values);
+    let mut merged = match stored {
+        None if submitted.is_empty() => return Ok(None),
+        Some(stored) if submitted.is_empty() => return Ok(Some(stored.ciphertext.clone())),
+        Some(stored) if !stored.keys.iter().all(|k| submitted.contains_key(k)) => {
+            decrypt_stored_secret_string_data(state, tenant, &stored.ciphertext).await?
+        }
+        _ => std::collections::BTreeMap::new(),
+    };
+    // Drop stored keys whose field is no longer a secret field of the catalog schema.
+    merged.retain(|key, _| {
+        schema_secret_paths.iter().any(|p| {
+            p == key || p.starts_with(&format!("{key}.")) || p.starts_with(&format!("{key}["))
+        })
+    });
+    merged.extend(submitted);
+    let merged_values = Value::Object(
+        merged
+            .into_iter()
+            .map(|(k, v)| (k, Value::String(v)))
+            .collect(),
+    );
+    let (plain, _) = build_infra_secret_manifest_yaml(secret_name, tenant_ns, &merged_values)?;
+    let recipients = tenant_sops_recipients(state, tenant).await?;
+    Ok(Some(
+        SopsManager::new().encrypt_yaml(&recipients, &plain).await?,
+    ))
+}
+
+/// Decrypts a stored manifest-app `Secret` (encrypted to the tenant `age` key) into its
+/// `stringData` (plus base64-decoded `data`). Never logs or returns the values in errors.
+async fn decrypt_stored_secret_string_data(
+    state: &AppState,
+    tenant: &str,
+    ciphertext: &str,
+) -> Result<std::collections::BTreeMap<String, String>, ServerError> {
+    use base64::Engine as _;
+    let reenter = || {
+        ServerError::Conflict(
+            "The stored secret values could not be decrypted to keep the fields left blank; \
+             re-enter every secret field"
+                .to_string(),
+        )
+    };
+    let age_key = state
+        .secret_store
+        .get_tenant_age_key(tenant)
+        .await?
+        .ok_or_else(reenter)?;
+    let plain = SopsManager::new()
+        .decrypt_yaml(&age_key.secret_key, ciphertext)
+        .await
+        .map_err(|err| {
+            tracing::warn!(tenant = %tenant, error = %err, "Could not decrypt stored manifest app secret");
+            reenter()
+        })?;
+    let doc: Value = serde_yml::from_str(&plain).map_err(|_| reenter())?;
+    let mut out = std::collections::BTreeMap::new();
+    if let Some(data) = doc.get("data").and_then(Value::as_object) {
+        for (key, val) in data {
+            let decoded = val
+                .as_str()
+                .and_then(|s| base64::engine::general_purpose::STANDARD.decode(s).ok())
+                .and_then(|b| String::from_utf8(b).ok())
+                .ok_or_else(reenter)?;
+            out.insert(key.clone(), decoded);
+        }
+    }
+    if let Some(string_data) = doc.get("stringData").and_then(Value::as_object) {
+        for (key, val) in string_data {
+            let rendered = match val {
+                Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            out.insert(key.clone(), rendered);
+        }
+    }
+    Ok(out)
+}
+
 async fn load_catalog_app_raw_manifests(repo_workdir: &Path, app: &CatalogApplication) -> String {
     let app_dir = repo_workdir.join("catalog/apps").join(&app.metadata.id);
     let default_path = app_dir.join("manifests.yaml");
@@ -551,6 +1076,86 @@ async fn load_catalog_app_raw_manifests(repo_workdir: &Path, app: &CatalogApplic
         "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: {}\ndata: {{}}\n",
         app.metadata.id
     )
+}
+
+/// Renders a `runtime: manifest` catalog app's template with `normal_values` for `rel_dir`,
+/// failing closed (before anything is committed) when rendered values add documents or change
+/// kinds, or when a route claims a platform host or another app's hostname.
+async fn render_manifest_app(
+    state: &AppState,
+    app: &CatalogApplication,
+    normal_values: &Value,
+    rel_dir: &str,
+) -> Result<String, ServerError> {
+    let raw_manifests = load_catalog_app_raw_manifests(&state.repo_workdir, app).await;
+    let mut rendered = render_manifest_template(&raw_manifests, normal_values)?;
+    if !rendered.ends_with('\n') {
+        rendered.push('\n');
+    }
+    let rendered_docs = verify_rendered_manifest_structure(&raw_manifests, &rendered)?;
+    // Tenant routes attach to the shared `keel-ingress` listeners: never let them claim a
+    // platform host (IdP issuer, keel-server, Forgejo) or another workload's hostname.
+    let route_hostnames = gateway_route_hostnames(&rendered_docs);
+    if !route_hostnames.is_empty() {
+        let reserved = {
+            let oidc = state.oidc_config.read().await;
+            platform_reserved_hostnames(
+                oidc.iter()
+                    .flat_map(|c| [c.issuer_url.as_str(), c.redirect_url.as_str()]),
+            )
+        };
+        validate_route_hostnames(&route_hostnames, &reserved)?;
+        ensure_route_hostnames_unclaimed(&state.repo_workdir, rel_dir, &route_hostnames).await?;
+    }
+    Ok(rendered)
+}
+
+/// `spec.dependsOn` names of the committed Flux `Kustomization` at `rel_path` (minus the
+/// manifest-app `-config` dependency, which the layout re-adds); empty when absent/unparsable.
+async fn read_flux_depends_on(repo_workdir: &Path, rel_path: &str) -> Vec<FluxDependencyRef> {
+    let Ok(raw) = read_contained_to_string(repo_workdir, &repo_workdir.join(rel_path)).await else {
+        return Vec::new();
+    };
+    let Ok(doc) = serde_yml::from_str::<Value>(&raw) else {
+        return Vec::new();
+    };
+    let own_config = doc
+        .pointer("/metadata/name")
+        .and_then(Value::as_str)
+        .map(keel_kube::manifest_app_config_kustomization_name);
+    doc.pointer("/spec/dependsOn")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|d| d.get("name").and_then(Value::as_str))
+        .filter(|name| own_config.as_deref() != Some(*name))
+        .map(|name| FluxDependencyRef {
+            name: name.to_string(),
+        })
+        .collect()
+}
+
+/// SOPS recipients for `tenant` (its `age` key, generated and stored on first use, plus the
+/// cluster recipient from `.sops.yaml`).
+async fn tenant_sops_recipients(state: &AppState, tenant: &str) -> Result<String, ServerError> {
+    let age_key = match state.secret_store.get_tenant_age_key(tenant).await? {
+        Some(existing) => existing,
+        None => {
+            let keypair = SopsManager::new().generate_age_keypair().await.map_err(|err| {
+                tracing::warn!(tenant = %tenant, error = %err, "Could not generate tenant SOPS age key");
+                ServerError::ServiceUnavailable(format!(
+                    "Tenant '{tenant}' has no SOPS age key configured and one could not be generated ({err}); install `age-keygen` and `sops` on the keel-server host"
+                ))
+            })?;
+            let generated = TenantAgeKey::new(keypair.public_key.clone(), keypair.secret_key());
+            let _ = state
+                .secret_store
+                .store_tenant_age_key(tenant, &generated)
+                .await;
+            generated
+        }
+    };
+    Ok(resolve_sops_recipients(&state.repo_workdir, &age_key.public_key).await)
 }
 
 /// `POST /api/v1/proposals`
@@ -636,33 +1241,68 @@ pub async fn create_proposal(
     };
 
     validate_dns_label(&action_label, "action")?;
-    validate_schema_values(schema, &req.values)?;
+    if let CatalogManifest::Application(app) = &manifest
+        && app.metadata.runtime == AppRuntime::Manifest
+        && req.canary
+    {
+        return Err(ServerError::BadRequest(format!(
+            "Catalog application '{}' is a manifest app; Flagger canary rollouts are only              generated for Helm apps",
+            app.metadata.id
+        )));
+    }
+
+    let subdir = if is_app { "apps" } else { "infra" };
+    let resolved_dir =
+        resolve_tenant_resource_dir(&state.repo_workdir, &req.tenant, subdir, &instance_name).await;
+    let bundle_item = resolved_dir.as_ref().and_then(|r| r.bundle_item.clone());
+    let own_rel_dir = resolved_dir
+        .as_ref()
+        .map(|r| r.rel_dir.clone())
+        .unwrap_or_else(|| format!("tenants/{}/{subdir}/{instance_name}", req.tenant));
+    if resolved_dir.is_none() {
+        ensure_no_derived_name_sibling(
+            &state.repo_workdir,
+            &req.tenant,
+            &own_rel_dir,
+            &instance_name,
+        )
+        .await?;
+    }
+    ensure_flux_kustomization_names_unclaimed(
+        &state.repo_workdir,
+        &req.tenant,
+        &own_rel_dir,
+        &reserved_flux_kustomization_names(&instance_name),
+    )
+    .await?;
+    // Edit: secret fields left blank keep the committed values (the UI never receives them).
+    let stored_manifest_secret = if manifest_engine == Some(ManifestEngine::Flux) {
+        read_stored_manifest_app_secret(&state.repo_workdir, &own_rel_dir).await
+    } else {
+        None
+    };
+    match &stored_manifest_secret {
+        Some(stored) => validate_schema_values(
+            &relax_stored_secret_requirements(schema, &stored.keys),
+            &req.values,
+        )?,
+        None => validate_schema_values(schema, &req.values)?,
+    }
     let partitioned = partition_values_by_schema(schema, &req.values)?;
     let has_secret_fields = partitioned
         .secret_values
         .as_object()
         .is_some_and(|o| !o.is_empty());
-    if has_secret_fields && let Some(engine) = manifest_engine {
-        // Secret fields reach a manifest template only through Flux `postBuild` substitution from
-        // the SOPS-decrypted `<instance>-secrets` Secret, which Flux reads from the Kustomization's
-        // own namespace on the management cluster. Fail closed before encrypting or committing.
-        if engine == ManifestEngine::Pulumi {
-            return Err(ServerError::BadRequest(format!(
-                "Catalog application '{}' has secret fields, which the Pulumi engine cannot pass into its manifest template; use the flux engine",
-                req.catalog_id
-            )));
-        }
-        let remote = req
-            .target_cluster
-            .as_deref()
-            .map(str::trim)
-            .is_some_and(|t| !t.is_empty() && t != "local");
-        if remote {
-            return Err(ServerError::BadRequest(format!(
-                "Catalog application '{}' has secret fields, which can only be substituted on the management cluster; remote targetCluster deployments are not supported",
-                req.catalog_id
-            )));
-        }
+    // Secret fields reach a manifest template only through Flux `postBuild` substitution from the
+    // SOPS-decrypted `<instance>-secrets` Secret, which the `<instance>-config` Kustomization
+    // applies in the tenant namespace of the management cluster (where Flux reads substitution
+    // sources), so remote `targetCluster`s work too. The Pulumi engine has no such path: fail
+    // closed before encrypting or committing.
+    if has_secret_fields && manifest_engine == Some(ManifestEngine::Pulumi) {
+        return Err(ServerError::BadRequest(format!(
+            "Catalog application '{}' has secret fields, which the Pulumi engine cannot pass into its manifest template; use the flux engine",
+            req.catalog_id
+        )));
     }
     let values_yaml = render_helm_values_yaml(&partitioned.normal_values)?;
     let plaintext_secrets_yaml = match partitioned.secret_values.as_object() {
@@ -674,67 +1314,55 @@ pub async fn create_proposal(
     let infra_secret_name = format!("{instance_name}-secrets");
 
     // Encrypt extracted secret fields via SOPS + age before touching Git (`SDD.md` §6.3)
-    let (encrypted_secrets_yaml, encrypted_infra_k8s_secret_yaml, infra_secret_keys) = if let Some(
-        plaintext_secrets,
-    ) =
-        &plaintext_secrets_yaml
-    {
-        let age_key = match state.secret_store.get_tenant_age_key(&req.tenant).await? {
-            Some(existing) => existing,
-            None => {
-                let keypair = SopsManager::new()
-                        .generate_age_keypair()
-                        .await
-                        .map_err(|err| {
-                            tracing::warn!(tenant = %req.tenant, error = %err, "Could not generate tenant SOPS age key");
-                            ServerError::ServiceUnavailable(format!(
-                                "Tenant '{}' has no SOPS age key configured and one could not be generated ({err}); install `age-keygen` and `sops` on the keel-server host",
-                                req.tenant
-                            ))
-                        })?;
-                let generated = TenantAgeKey::new(keypair.public_key.clone(), keypair.secret_key());
-                let _ = state
-                    .secret_store
-                    .store_tenant_age_key(&req.tenant, &generated)
-                    .await;
-                generated
-            }
-        };
-        let sops = SopsManager::new();
-        let sops_recipients =
-            resolve_sops_recipients(&state.repo_workdir, &age_key.public_key).await;
-        let enc_values = sops
-            .encrypt_yaml(&sops_recipients, plaintext_secrets)
-            .await?;
-        let (enc_k8s_secret, keys) = if !is_app || manifest_engine.is_some() {
-            let (plain_k8s_secret, keys) = build_infra_secret_manifest_yaml(
-                &infra_secret_name,
-                &tenant_ns,
-                &partitioned.secret_values,
-            )?;
-            let enc_k8s = sops
-                .encrypt_yaml(&sops_recipients, &plain_k8s_secret)
+    let (encrypted_secrets_yaml, encrypted_infra_k8s_secret_yaml, infra_secret_keys) =
+        // Flux manifest apps commit only the `<instance>-secrets` Secret (resolved below).
+        if let Some(plaintext_secrets) = plaintext_secrets_yaml
+            .as_ref()
+            .filter(|_| manifest_engine != Some(ManifestEngine::Flux))
+        {
+            let sops = SopsManager::new();
+            let sops_recipients = tenant_sops_recipients(&state, &req.tenant).await?;
+            let enc_values = sops
+                .encrypt_yaml(&sops_recipients, plaintext_secrets)
                 .await?;
-            (Some(enc_k8s), keys)
+            let (enc_k8s_secret, keys) = if !is_app || manifest_engine == Some(ManifestEngine::Pulumi) {
+                let (plain_k8s_secret, keys) = build_infra_secret_manifest_yaml(
+                    &infra_secret_name,
+                    &tenant_ns,
+                    &partitioned.secret_values,
+                )?;
+                let enc_k8s = sops
+                    .encrypt_yaml(&sops_recipients, &plain_k8s_secret)
+                    .await?;
+                (Some(enc_k8s), keys)
+            } else {
+                (None, Vec::new())
+            };
+            (Some(enc_values), enc_k8s_secret, keys)
         } else {
-            (None, Vec::new())
+            (None, None, Vec::new())
         };
-        (Some(enc_values), enc_k8s_secret, keys)
+    let encrypted_infra_k8s_secret_yaml = if manifest_engine == Some(ManifestEngine::Flux) {
+        resolve_manifest_app_secret(
+            &state,
+            &req.tenant,
+            &tenant_ns,
+            &infra_secret_name,
+            &partitioned.secret_field_paths,
+            &partitioned.secret_values,
+            stored_manifest_secret.as_ref(),
+        )
+        .await?
     } else {
-        (None, None, Vec::new())
+        encrypted_infra_k8s_secret_yaml
     };
 
     let timestamp = next_unique_branch_timestamp();
     let branch = build_preview_branch(&req.tenant, &action_label, timestamp)?;
 
-    let subdir = if is_app { "apps" } else { "infra" };
-    let resolved_dir =
-        resolve_tenant_resource_dir(&state.repo_workdir, &req.tenant, subdir, &instance_name).await;
-    let bundle_item = resolved_dir.as_ref().and_then(|r| r.bundle_item.clone());
-
     let mut rendered_manifest_template_yaml: Option<String> = None;
     let mut synthesized_manifest_pulumi_yaml: Option<String> = None;
-    let mut values_configmap_yaml: Option<String> = None;
+    let mut flux_manifest_files: Option<FluxManifestAppFiles> = None;
 
     let (
         rel_dir,
@@ -747,30 +1375,8 @@ pub async fn create_proposal(
             let rel_dir = resolved_dir
                 .map(|r| r.rel_dir)
                 .unwrap_or_else(|| format!("tenants/{}/apps/{instance_name}", req.tenant));
-            let raw_manifests = load_catalog_app_raw_manifests(&state.repo_workdir, app).await;
-            let mut rendered =
-                render_manifest_template(&raw_manifests, &partitioned.normal_values)?;
-            if !rendered.ends_with('\n') {
-                rendered.push('\n');
-            }
-            // Fail closed before anything is committed: rendered values must not add documents
-            // or change resource kinds relative to the catalog-authored template.
-            let rendered_docs = verify_rendered_manifest_structure(&raw_manifests, &rendered)?;
-            // Tenant routes attach to the shared `keel-ingress` listeners: never let them claim a
-            // platform host (IdP issuer, keel-server, Forgejo) or another workload's hostname.
-            let route_hostnames = gateway_route_hostnames(&rendered_docs);
-            if !route_hostnames.is_empty() {
-                let reserved = {
-                    let oidc = state.oidc_config.read().await;
-                    platform_reserved_hostnames(
-                        oidc.iter()
-                            .flat_map(|c| [c.issuer_url.as_str(), c.redirect_url.as_str()]),
-                    )
-                };
-                validate_route_hostnames(&route_hostnames, &reserved)?;
-                ensure_route_hostnames_unclaimed(&state.repo_workdir, &rel_dir, &route_hostnames)
-                    .await?;
-            }
+            let rendered =
+                render_manifest_app(&state, app, &partitioned.normal_values, &rel_dir).await?;
             rendered_manifest_template_yaml = Some(rendered.clone());
 
             let remote_kc = req
@@ -798,58 +1404,37 @@ pub async fn create_proposal(
 
             match manifest_engine.unwrap() {
                 ManifestEngine::Flux => {
-                    values_configmap_yaml = Some(build_values_configmap_manifest_yaml(
-                        &format!("{instance_name}-values"),
-                        &tenant_ns,
-                        &req.tenant,
-                        &req.catalog_id,
-                        &partitioned.normal_values,
-                    )?);
-                    let mut fk_input = FluxKustomizationSpecInput::new(
-                        &req.tenant,
-                        &instance_name,
-                        "keel-gitops",
-                        format!("./{rel_dir}"),
-                    );
-                    fk_input
-                        .extra_labels
-                        .insert("keel.io/runtime".to_string(), "manifest".to_string());
-                    fk_input
-                        .extra_labels
-                        .insert("keel.io/engine".to_string(), "flux".to_string());
-                    fk_input
-                        .extra_labels
-                        .insert("keel.io/catalog-id".to_string(), req.catalog_id.clone());
+                    let mut labels = std::collections::BTreeMap::new();
+                    labels.insert("keel.io/runtime".to_string(), "manifest".to_string());
+                    labels.insert("keel.io/engine".to_string(), "flux".to_string());
+                    labels.insert("keel.io/catalog-id".to_string(), req.catalog_id.clone());
+                    let mut depends_on = Vec::new();
                     if let Some((ref bundle_name, ref item_id)) = bundle_item {
-                        fk_input
-                            .extra_labels
-                            .insert("keel.io/bundle".to_string(), bundle_name.clone());
-                        fk_input
-                            .extra_labels
-                            .insert("keel.io/bundle-item".to_string(), item_id.clone());
+                        labels.insert("keel.io/bundle".to_string(), bundle_name.clone());
+                        labels.insert("keel.io/bundle-item".to_string(), item_id.clone());
+                        // Keep the bundle ordering of the item's Kustomization on edit.
+                        depends_on = read_flux_depends_on(
+                            &state.repo_workdir,
+                            &format!("{rel_dir}/flux-kustomization.yaml"),
+                        )
+                        .await;
                     }
-                    fk_input.kube_config = remote_kc.clone();
-                    fk_input.target_namespace = remote_ns.clone();
-                    // `secrets.enc.yaml` (the `<instance>-secrets` Secret) is applied by this
-                    // Kustomization, so it must decrypt with the tenant `age` key; secret values
-                    // then reach the manifests only through `postBuild.substituteFrom`.
-                    if encrypted_infra_k8s_secret_yaml.is_some() {
-                        fk_input.decryption_secret_name =
-                            Some(TENANT_SOPS_AGE_SECRET_NAME.to_string());
-                    }
-                    fk_input.post_build_substitute_from = vec![
-                        FluxSubstituteReference {
-                            kind: "ConfigMap".to_string(),
-                            name: format!("{instance_name}-values"),
-                            optional: true,
-                        },
-                        FluxSubstituteReference {
-                            kind: "Secret".to_string(),
-                            name: format!("{instance_name}-secrets"),
-                            optional: true,
-                        },
-                    ];
-                    let fk_yaml = generate_flux_kustomization_manifest(&fk_input)?;
+                    let files = build_flux_manifest_app_files(FluxManifestAppLayoutInput {
+                        tenant: &req.tenant,
+                        tenant_ns: &tenant_ns,
+                        name: &instance_name,
+                        app_dir: &rel_dir,
+                        catalog_id: &req.catalog_id,
+                        rendered_manifests: &rendered,
+                        normal_values: &partitioned.normal_values,
+                        encrypted_secret_yaml: encrypted_infra_k8s_secret_yaml.as_deref(),
+                        kube_config: remote_kc.clone(),
+                        target_namespace: remote_ns.clone(),
+                        depends_on,
+                        extra_labels: labels,
+                    })?;
+                    let fk_yaml = files.app_kustomization_yaml.clone();
+                    flux_manifest_files = Some(files);
                     (
                         rel_dir,
                         fk_yaml,
@@ -1255,39 +1840,61 @@ pub async fn create_proposal(
         staged_paths.push(format!("{rel_dir}/{manifest_filename}"));
 
         if is_app {
-            let stale_files: &[&str] = match manifest_engine {
-                Some(ManifestEngine::Flux) => &[
+            let remote_canary = req.canary && remote_app_kube_config.is_some();
+            let mut stale_files: Vec<&str> = match manifest_engine {
+                Some(ManifestEngine::Flux) => vec![
                     "helmrelease.yaml",
                     "helmrelease-canary.yaml",
+                    "helm-repository.yaml",
                     "canary.yaml",
                     "networkpolicy-canary.yaml",
+                    "canary",
+                    "canary-kustomization.yaml",
                     "stack.yaml",
                     "Pulumi.yaml",
                     "secret.enc.yaml",
                 ],
-                Some(ManifestEngine::Pulumi) => &[
+                Some(ManifestEngine::Pulumi) => vec![
                     "helmrelease.yaml",
                     "helmrelease-canary.yaml",
+                    "helm-repository.yaml",
                     "canary.yaml",
                     "networkpolicy-canary.yaml",
+                    "canary",
+                    "canary-kustomization.yaml",
                     "flux-kustomization.yaml",
+                    "config-kustomization.yaml",
+                    "config",
+                    "namespace.yaml",
                     "values-configmap.yaml",
                     "secrets.enc.yaml",
                 ],
-                None if req.canary => &["helmrelease.yaml"],
-                None => &[
-                    "helmrelease-canary.yaml",
+                None if remote_canary => vec![
+                    "helmrelease.yaml",
                     "canary.yaml",
                     "networkpolicy-canary.yaml",
                 ],
-            };
-            for stale_file in stale_files {
-                let stale_path = target_dir.join(stale_file);
-                if tokio::fs::try_exists(&stale_path).await.unwrap_or(false) {
-                    tokio::fs::remove_file(&stale_path).await?;
-                    staged_paths.push(format!("{rel_dir}/{stale_file}"));
+                None if req.canary => {
+                    vec!["helmrelease.yaml", "canary", "canary-kustomization.yaml"]
                 }
+                None => vec![
+                    "helmrelease-canary.yaml",
+                    "canary.yaml",
+                    "networkpolicy-canary.yaml",
+                    "canary",
+                    "canary-kustomization.yaml",
+                ],
+            };
+            if let Some(ref files) = flux_manifest_files {
+                stale_files.extend(files.stale.iter().copied());
             }
+            remove_stale_entries(
+                &state.repo_workdir,
+                &rel_dir,
+                &stale_files,
+                &mut staged_paths,
+            )
+            .await?;
         }
 
         let mut extra_kustomize_resources: Vec<String> = Vec::new();
@@ -1305,45 +1912,15 @@ pub async fn create_proposal(
             }
             match eng {
                 ManifestEngine::Flux => {
-                    let mut app_k_resources = vec![
-                        "manifests.yaml".to_string(),
-                        "values-configmap.yaml".to_string(),
-                    ];
-                    if let Some(ref cm_yaml) = values_configmap_yaml {
-                        write_contained(
+                    if let Some(ref files) = flux_manifest_files {
+                        write_relative_files(
                             &state.repo_workdir,
-                            &target_dir.join("values-configmap.yaml"),
-                            cm_yaml,
+                            &rel_dir,
+                            &files.files,
+                            &mut staged_paths,
                         )
                         .await?;
-                        staged_paths.push(format!("{rel_dir}/values-configmap.yaml"));
                     }
-                    if let Some(ref enc_k8s_secret) = encrypted_infra_k8s_secret_yaml {
-                        write_contained(
-                            &state.repo_workdir,
-                            &target_dir.join("secrets.enc.yaml"),
-                            enc_k8s_secret,
-                        )
-                        .await?;
-                        staged_paths.push(format!("{rel_dir}/secrets.enc.yaml"));
-                        app_k_resources.push("secrets.enc.yaml".to_string());
-                    }
-                    let app_k_doc = serde_json::json!({
-                        "apiVersion": "kustomize.config.k8s.io/v1beta1",
-                        "kind": "Kustomization",
-                        "resources": app_k_resources,
-                    });
-                    write_contained(
-                        &state.repo_workdir,
-                        &target_dir.join("kustomization.yaml"),
-                        serde_yml::to_string(&app_k_doc).map_err(|e| {
-                            ServerError::Internal(format!(
-                                "failed to serialize kustomization.yaml: {e}"
-                            ))
-                        })?,
-                    )
-                    .await?;
-                    staged_paths.push(format!("{rel_dir}/kustomization.yaml"));
                 }
                 ManifestEngine::Pulumi => {
                     if let Some(ref pulumi_yaml) = synthesized_manifest_pulumi_yaml {
@@ -1479,68 +2056,18 @@ pub async fn create_proposal(
                     let remote_target_ns = remote_app_target_ns
                         .clone()
                         .unwrap_or_else(|| tenant_ns.clone());
-                    let canary_dir = target_dir.join("canary");
-                    create_dir_all_contained(&state.repo_workdir, &canary_dir).await?;
-                    // On the workload cluster the target namespace is otherwise only created by
-                    // the sibling HelmRelease (`install.createNamespace`); ship it here so the
-                    // canary objects never race Helm (kustomize-controller applies Namespaces
-                    // first). `prune: disabled` + `ssa: IfNotPresent` keep it from deleting or
-                    // fighting the namespace Helm may also create.
-                    write_contained(
-                        &state.repo_workdir,
-                        &canary_dir.join("namespace.yaml"),
-                        synthesize_remote_target_namespace_yaml(&req.tenant, &remote_target_ns)?,
-                    )
-                    .await?;
-                    write_contained(
-                        &state.repo_workdir,
-                        &canary_dir.join("canary.yaml"),
-                        canary_yaml,
-                    )
-                    .await?;
-                    write_contained(
-                        &state.repo_workdir,
-                        &canary_dir.join("networkpolicy-canary.yaml"),
-                        np_yaml,
-                    )
-                    .await?;
-                    let canary_k_doc = serde_json::json!({
-                        "apiVersion": "kustomize.config.k8s.io/v1beta1",
-                        "kind": "Kustomization",
-                        "resources": ["namespace.yaml", "canary.yaml", "networkpolicy-canary.yaml"],
-                    });
-                    let canary_k_yaml = serde_yml::to_string(&canary_k_doc).map_err(|e| {
-                        ServerError::Internal(format!(
-                            "failed to serialize canary/kustomization.yaml: {e}"
-                        ))
-                    })?;
-                    write_contained(
-                        &state.repo_workdir,
-                        &canary_dir.join("kustomization.yaml"),
-                        canary_k_yaml,
-                    )
-                    .await?;
-                    staged_paths.push(format!("{rel_dir}/canary/namespace.yaml"));
-                    staged_paths.push(format!("{rel_dir}/canary/canary.yaml"));
-                    staged_paths.push(format!("{rel_dir}/canary/networkpolicy-canary.yaml"));
-                    staged_paths.push(format!("{rel_dir}/canary/kustomization.yaml"));
-
-                    let mut fk_input = FluxKustomizationSpecInput::new(
+                    let files = build_remote_canary_files(
                         &req.tenant,
-                        format!("{instance_name}-canary"),
-                        "keel-gitops",
-                        format!("./{rel_dir}/canary"),
-                    );
-                    fk_input.kube_config = Some(remote_kc.clone());
-                    fk_input.target_namespace = Some(remote_target_ns);
-                    let fk_yaml = synthesize_flux_kustomization_yaml(&fk_input)?;
-                    write_contained(
-                        &state.repo_workdir,
-                        &target_dir.join("canary-kustomization.yaml"),
-                        fk_yaml,
-                    )
-                    .await?;
-                    staged_paths.push(format!("{rel_dir}/canary-kustomization.yaml"));
+                        &instance_name,
+                        &rel_dir,
+                        remote_kc,
+                        &remote_target_ns,
+                        canary_yaml,
+                        np_yaml,
+                        &canary_input.extra_labels,
+                    )?;
+                    write_relative_files(&state.repo_workdir, &rel_dir, &files, &mut staged_paths)
+                        .await?;
                     bundle_item_kustomize_resources.push("canary-kustomization.yaml".to_string());
                     extra_kustomize_resources.push(format!(
                         "{}/apps/{instance_name}/canary-kustomization.yaml",
@@ -1630,30 +2157,47 @@ pub async fn create_proposal(
                 resources.push(candidate);
             }
         }
-        if let Some((ref bundle_name, ref item_id)) = bundle_item {
-            let item_k_doc = serde_json::json!({
-                "apiVersion": "kustomize.config.k8s.io/v1beta1",
-                "kind": "Kustomization",
-                "resources": bundle_item_kustomize_resources,
-            });
-            write_contained(
-                &state.repo_workdir,
-                &target_dir.join("kustomization.yaml"),
-                serde_yml::to_string(&item_k_doc).map_err(|e| {
-                    ServerError::Internal(format!("failed to serialize kustomization.yaml: {e}"))
-                })?,
-            )
-            .await?;
-            staged_paths.push(format!("{rel_dir}/kustomization.yaml"));
+        let rel_dir_in_tenants = rel_dir.strip_prefix("tenants/").unwrap_or(&rel_dir);
+        if bundle_item.is_some() {
+            if manifest_engine == Some(ManifestEngine::Flux) {
+                // The item directory's `kustomization.yaml` already lists the rendered manifests
+                // (written with the manifest-app layout); register both Kustomizations.
+                for fk_file in FLUX_MANIFEST_APP_KUSTOMIZATION_FILES {
+                    let fk_rel = format!("{rel_dir_in_tenants}/{fk_file}");
+                    if !resources.contains(&fk_rel) {
+                        resources.push(fk_rel);
+                    }
+                }
+            } else {
+                write_contained(
+                    &state.repo_workdir,
+                    &target_dir.join("kustomization.yaml"),
+                    serde_yml::to_string(&json!({
+                        "apiVersion": "kustomize.config.k8s.io/v1beta1",
+                        "kind": "Kustomization",
+                        "resources": bundle_item_kustomize_resources,
+                    }))
+                    .map_err(|e| {
+                        ServerError::Internal(format!(
+                            "failed to serialize kustomization.yaml: {e}"
+                        ))
+                    })?,
+                )
+                .await?;
+                staged_paths.push(format!("{rel_dir}/kustomization.yaml"));
 
-            let fk_rel = format!(
-                "{}/bundles/{bundle_name}/{item_id}/flux-kustomization.yaml",
-                req.tenant
-            );
-            if !resources.contains(&fk_rel) {
-                resources.push(fk_rel);
+                let fk_rel = format!("{rel_dir_in_tenants}/flux-kustomization.yaml");
+                if !resources.contains(&fk_rel) {
+                    resources.push(fk_rel);
+                }
             }
         } else {
+            if manifest_engine == Some(ManifestEngine::Flux) {
+                extra_kustomize_resources.push(format!(
+                    "{rel_dir_in_tenants}/{}",
+                    FLUX_MANIFEST_APP_KUSTOMIZATION_FILES[0]
+                ));
+            }
             let manifest_rel_to_tenants = format!(
                 "{}/{}/{instance_name}/{manifest_filename}",
                 req.tenant,
@@ -1695,6 +2239,12 @@ pub async fn create_proposal(
                 resources.push(manifest_rel_to_tenants);
             }
         }
+        // Drop entries for files of this instance that no longer exist (engine / canary / layout
+        // switches), so the tenants Kustomization never references a removed file.
+        let own_prefix = format!("{rel_dir_in_tenants}/");
+        resources.retain(|r| {
+            !r.starts_with(&own_prefix) || state.repo_workdir.join("tenants").join(r).is_file()
+        });
         create_dir_all_contained(&state.repo_workdir, &state.repo_workdir.join("tenants")).await?;
         write_contained(
             &state.repo_workdir,
@@ -1973,17 +2523,72 @@ async fn create_bundle_proposal(
 
     let action_label = format!("bundle-{}", bundle.metadata.id);
     validate_dns_label(&action_label, "action")?;
-    validate_schema_values(&bundle.spec.schema, &req.values)?;
+    let bundle_rel_dir = format!("tenants/{}/bundles/{instance_name}", req.tenant);
+
+    // Edit: secret fields of committed manifest-app items left blank keep their stored values.
+    let mut stored_item_secrets = std::collections::BTreeMap::new();
+    let mut validation_schema = bundle.spec.schema.clone();
+    for item in &bundle.spec.items {
+        let Some(stored) = read_stored_manifest_app_secret(
+            &state.repo_workdir,
+            &format!("{bundle_rel_dir}/{}", item.id),
+        )
+        .await
+        else {
+            continue;
+        };
+        if let Some(item_schema) = validation_schema
+            .get_mut("properties")
+            .and_then(|p| p.get_mut(&item.id))
+        {
+            *item_schema = relax_stored_secret_requirements(item_schema, &stored.keys);
+        }
+        stored_item_secrets.insert(item.id.clone(), stored);
+    }
+    validate_schema_values(&validation_schema, &req.values)?;
+
+    // Every Flux Kustomization the bundle may create must be unique within the tenant.
+    let mut reserved_names: Vec<String> = Vec::new();
+    for item in &bundle.spec.items {
+        for name in reserved_flux_kustomization_names(&format!("{instance_name}-{}", item.id)) {
+            if reserved_names.contains(&name) {
+                return Err(ServerError::BadRequest(format!(
+                    "Bundle '{}' items derive the same Flux Kustomization name '{name}' (item ids must not differ only by a '-config'/'-canary' suffix)",
+                    bundle.metadata.id
+                )));
+            }
+            reserved_names.push(name);
+        }
+    }
+    ensure_flux_kustomization_names_unclaimed(
+        &state.repo_workdir,
+        &req.tenant,
+        &bundle_rel_dir,
+        &reserved_names,
+    )
+    .await?;
+    if !tokio::fs::try_exists(state.repo_workdir.join(&bundle_rel_dir))
+        .await
+        .unwrap_or(false)
+    {
+        for item in &bundle.spec.items {
+            ensure_no_derived_name_sibling(
+                &state.repo_workdir,
+                &req.tenant,
+                &bundle_rel_dir,
+                &format!("{instance_name}-{}", item.id),
+            )
+            .await?;
+        }
+    }
 
     let ordered_items = bundle.topological_order()?;
     let tenant_ns = tenant_namespace(&req.tenant)?;
     let timestamp = next_unique_branch_timestamp();
     let branch = build_preview_branch(&req.tenant, &action_label, timestamp)?;
-    let bundle_rel_dir = format!("tenants/{}/bundles/{instance_name}", req.tenant);
 
     struct PreparedBundleItem {
         id: String,
-        kind: BundleItemKind,
         depends_on: Vec<String>,
         item_rel_dir: String,
         resource_name: String,
@@ -1993,6 +2598,12 @@ async fn create_bundle_proposal(
         primary_yaml: String,
         extra_files: Vec<(String, String)>,
         flux_kustomization_yaml: String,
+        /// Additional Flux `Kustomization` files (relative to the item directory) registered in
+        /// `tenants/kustomization.yaml` (a manifest app's `config-kustomization.yaml`).
+        extra_kustomizations: Vec<&'static str>,
+        /// Item-relative files/directories of other variants removed on update.
+        stale: Vec<&'static str>,
+        resource_type: &'static str,
     }
 
     let mut item_kinds = std::collections::BTreeMap::new();
@@ -2005,6 +2616,8 @@ async fn create_bundle_proposal(
     }
 
     let mut prepared_items = Vec::with_capacity(ordered_items.len());
+    // Items deployed as manifest apps (no HelmRelease to `dependsOn`); filled in topological order.
+    let mut manifest_app_items = std::collections::HashSet::new();
     for item in ordered_items {
         let item_values = req
             .values
@@ -2042,45 +2655,20 @@ async fn create_bundle_proposal(
             _ => None,
         };
 
-        let encrypted_secrets_yaml = if let Some(plaintext_secrets) = &plaintext_secrets_yaml {
-            let age_key = match state.secret_store.get_tenant_age_key(&req.tenant).await? {
-                Some(existing) => existing,
-                None => {
-                    let keypair = SopsManager::new()
-                        .generate_age_keypair()
-                        .await
-                        .map_err(|err| {
-                            tracing::warn!(tenant = %req.tenant, error = %err, "Could not generate tenant SOPS age key");
-                            ServerError::ServiceUnavailable(format!(
-                                "Tenant '{}' has no SOPS age key configured and one could not be generated ({err}); install `age-keygen` and `sops` on the keel-server host",
-                                req.tenant
-                            ))
-                        })?;
-                    let generated =
-                        TenantAgeKey::new(keypair.public_key.clone(), keypair.secret_key());
-                    let _ = state
-                        .secret_store
-                        .store_tenant_age_key(&req.tenant, &generated)
-                        .await;
-                    generated
-                }
-            };
-            let sops_recipients =
-                resolve_sops_recipients(&state.repo_workdir, &age_key.public_key).await;
-            Some(
-                SopsManager::new()
-                    .encrypt_yaml(&sops_recipients, plaintext_secrets)
-                    .await?,
-            )
-        } else {
-            None
-        };
-
+        let mut encrypted_secrets_yaml = None;
         let mut bundle_labels = std::collections::BTreeMap::new();
         bundle_labels.insert("keel.io/bundle".to_string(), instance_name.clone());
         bundle_labels.insert("keel.io/bundle-item".to_string(), item.id.clone());
 
-        let (primary_filename, primary_yaml, extra_files, health_check) = match ref_manifest {
+        let (
+            primary_filename,
+            primary_yaml,
+            extra_files,
+            health_check,
+            manifest_app_kustomization,
+            stale,
+            resource_type,
+        ) = match ref_manifest {
             CatalogManifest::Application(app) => {
                 if item.canary && !app.spec.progressive_delivery.flagger_supported {
                     return Err(ServerError::BadRequest(format!(
@@ -2088,177 +2676,317 @@ async fn create_bundle_proposal(
                         app.metadata.id
                     )));
                 }
-                let mut hr_input = HelmReleaseSpecInput::new(
-                    &req.tenant,
-                    &item_resource_name,
-                    app.spec
-                        .upstream
-                        .chart
-                        .clone()
-                        .unwrap_or_else(|| app.metadata.id.clone()),
-                    HelmChartSourceRef {
-                        kind: HelmChartSourceKind::HelmRepository,
-                        name: format!("{item_resource_name}-repo"),
-                        namespace: Some(tenant_ns.clone()),
-                    },
-                );
-                hr_input.chart_version = app.spec.upstream.version.clone();
-                hr_input.extra_labels = bundle_labels.clone();
-
-                if let Some(cluster_item) = &item.target_cluster_from {
-                    hr_input.kube_config = Some(RemoteKubeConfigRef::with_key(
+                let item_kube_config = if let Some(cluster_item) = &item.target_cluster_from {
+                    Some(RemoteKubeConfigRef::with_key(
                         format!("{instance_name}-{cluster_item}-kubeconfig"),
                         "kubeconfig",
-                    ));
-                } else if let Some(target) = req
-                    .target_cluster
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty() && *s != "local")
+                    ))
+                } else {
+                    req.target_cluster
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty() && *s != "local")
+                        .map(|target| RemoteKubeConfigRef::with_key(target, "kubeconfig"))
+                };
+                if let Some(target_ns) = &item.target_namespace
+                    && item_kube_config.is_none()
+                    && target_ns != &tenant_ns
                 {
-                    hr_input.kube_config =
-                        Some(RemoteKubeConfigRef::with_key(target, "kubeconfig"));
+                    return Err(ServerError::BadRequest(format!(
+                        "Bundle item '{}' targetNamespace '{target_ns}' requires targetClusterFrom or remote targetCluster",
+                        item.id
+                    )));
                 }
-
-                if let Some(target_ns) = &item.target_namespace {
-                    if hr_input.kube_config.is_none() && target_ns != &tenant_ns {
+                if app.metadata.runtime == AppRuntime::Manifest {
+                    manifest_app_items.insert(item.id.clone());
+                    if app.spec.default_engine == Some(ManifestEngine::Pulumi) {
                         return Err(ServerError::BadRequest(format!(
-                            "Bundle item '{}' targetNamespace '{target_ns}' requires targetClusterFrom or remote targetCluster",
-                            item.id
+                            "Bundle item '{}' references manifest app '{}' whose default engine is pulumi; bundles deploy manifest apps with the flux engine only",
+                            item.id, app.metadata.id
                         )));
                     }
-                    hr_input.target_namespace = Some(target_ns.clone());
-                }
-
-                for dep in &item.depends_on {
-                    if item_kinds.get(dep.as_str()) == Some(&BundleItemKind::App) {
-                        hr_input.depends_on.push(FluxDependencyRef {
-                            name: format!("{instance_name}-{dep}"),
-                        });
-                    } else if !item.bind_values.is_empty() {
-                        hr_input.values_from_secrets.push(HelmValuesSecretRef {
-                            name: format!("{instance_name}-{dep}-outputs"),
-                            values_key: None,
-                            target_path: None,
-                            optional: Some(true),
-                        });
+                    // Neither is wired for manifest apps: fail closed instead of ignoring them.
+                    if item.canary {
+                        return Err(ServerError::BadRequest(format!(
+                            "Bundle item '{}' references manifest app '{}'; Flagger canary rollouts are only generated for Helm apps",
+                            item.id, app.metadata.id
+                        )));
                     }
-                }
-
-                if let Some(obj) = partitioned.normal_values.as_object()
-                    && !obj.is_empty()
-                {
-                    hr_input.values = Some(partitioned.normal_values.clone());
-                }
-
-                let hr_yaml = synthesize_helm_release_yaml(&hr_input)?;
-                let primary_filename = if item.canary {
-                    "helmrelease-canary.yaml".to_string()
-                } else {
-                    "helmrelease.yaml".to_string()
-                };
-                let mut extras = Vec::new();
-                let mut item_k_res = vec![primary_filename.clone()];
-                let repo_url = app.spec.upstream.repo_url.trim();
-                if !repo_url.is_empty() {
-                    let mut repo_spec = serde_json::json!({
-                        "interval": "5m",
-                        "url": repo_url,
-                    });
-                    if repo_url.starts_with("oci://")
-                        && let Some(obj) = repo_spec.as_object_mut()
-                    {
-                        obj.insert("type".to_string(), serde_json::json!("oci"));
+                    if !item.bind_values.is_empty() {
+                        return Err(ServerError::BadRequest(format!(
+                            "Bundle item '{}' references manifest app '{}'; bindValues are only supported for Helm apps",
+                            item.id, app.metadata.id
+                        )));
                     }
-                    let helm_repo_doc = serde_json::json!({
-                        "apiVersion": "source.toolkit.fluxcd.io/v1",
-                        "kind": "HelmRepository",
-                        "metadata": {
-                            "name": format!("{item_resource_name}-repo"),
-                            "namespace": tenant_ns,
-                            "labels": {
-                                "app.kubernetes.io/managed-by": "keel",
-                                "keel.io/tenant": req.tenant,
-                                "keel.io/bundle": instance_name,
-                                "keel.io/bundle-item": item.id,
-                            }
-                        },
-                        "spec": repo_spec,
-                    });
-                    let helm_repo_yaml = serde_yml::to_string(&helm_repo_doc).map_err(|e| {
-                        ServerError::Internal(format!(
-                            "failed to serialize helm-repository.yaml: {e}"
-                        ))
+                    let rendered = render_manifest_app(
+                        &state,
+                        &app,
+                        &partitioned.normal_values,
+                        &item_rel_dir,
+                    )
+                    .await?;
+                    let encrypted_secret = resolve_manifest_app_secret(
+                        &state,
+                        &req.tenant,
+                        &tenant_ns,
+                        &keel_kube::manifest_app_secrets_name(&item_resource_name),
+                        &partitioned.secret_field_paths,
+                        &partitioned.secret_values,
+                        stored_item_secrets.get(&item.id),
+                    )
+                    .await?;
+                    let mut labels = bundle_labels.clone();
+                    labels.insert("keel.io/runtime".to_string(), "manifest".to_string());
+                    labels.insert("keel.io/engine".to_string(), "flux".to_string());
+                    labels.insert("keel.io/catalog-id".to_string(), app.metadata.id.clone());
+                    let files = build_flux_manifest_app_files(FluxManifestAppLayoutInput {
+                        tenant: &req.tenant,
+                        tenant_ns: &tenant_ns,
+                        name: &item_resource_name,
+                        app_dir: &item_rel_dir,
+                        catalog_id: &app.metadata.id,
+                        rendered_manifests: &rendered,
+                        normal_values: &partitioned.normal_values,
+                        encrypted_secret_yaml: encrypted_secret.as_deref(),
+                        kube_config: item_kube_config,
+                        target_namespace: item.target_namespace.clone(),
+                        depends_on: item
+                            .depends_on
+                            .iter()
+                            .map(|dep| FluxDependencyRef {
+                                name: format!("{instance_name}-{dep}"),
+                            })
+                            .collect(),
+                        extra_labels: labels,
                     })?;
-                    extras.push(("helm-repository.yaml".to_string(), helm_repo_yaml));
-                    item_k_res.push("helm-repository.yaml".to_string());
-                }
-
-                if item.canary {
-                    let mut canary_input =
-                        FlaggerCanarySpecInput::new(&req.tenant, &item_resource_name);
-                    let chart_name = app
-                        .spec
-                        .upstream
-                        .chart
-                        .as_deref()
-                        .unwrap_or(&app.metadata.id);
-                    canary_input.service_port = partitioned
-                        .normal_values
-                        .get("service")
-                        .and_then(|s| s.get("port"))
-                        .and_then(|p| p.as_u64())
-                        .and_then(|p| u16::try_from(p).ok())
-                        .filter(|p| *p > 0)
-                        .unwrap_or(if chart_name == "podinfo" { 9898 } else { 80 });
-                    if let Some(host) = partitioned
-                        .normal_values
-                        .get("ingressHost")
-                        .and_then(|v| v.as_str())
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                    {
-                        canary_input.hosts.push(host.to_string());
+                    let mut stale = vec![
+                        "helmrelease.yaml",
+                        "helmrelease-canary.yaml",
+                        "helm-repository.yaml",
+                        "canary.yaml",
+                        "networkpolicy-canary.yaml",
+                        "canary",
+                        "canary-kustomization.yaml",
+                    ];
+                    stale.extend(files.stale.iter().copied());
+                    (
+                        "manifests.yaml".to_string(),
+                        rendered,
+                        files.files,
+                        None,
+                        Some(files.app_kustomization_yaml),
+                        stale,
+                        "flux:kustomize.toolkit.fluxcd.io/v1:Kustomization",
+                    )
+                } else {
+                    if let Some(plaintext_secrets) = &plaintext_secrets_yaml {
+                        let recipients = tenant_sops_recipients(&state, &req.tenant).await?;
+                        encrypted_secrets_yaml = Some(
+                            SopsManager::new()
+                                .encrypt_yaml(&recipients, plaintext_secrets)
+                                .await?,
+                        );
                     }
-                    canary_input.extra_labels = bundle_labels.clone();
-                    let canary_yaml = synthesize_flagger_canary_yaml(&canary_input)?;
-                    extras.push(("canary.yaml".to_string(), canary_yaml));
-                    item_k_res.push("canary.yaml".to_string());
-
-                    let np_yaml = synthesize_canary_gateway_network_policy_yaml(
+                    let mut hr_input = HelmReleaseSpecInput::new(
                         &req.tenant,
                         &item_resource_name,
-                        canary_input.service_port,
-                    )?;
-                    extras.push(("networkpolicy-canary.yaml".to_string(), np_yaml));
-                    item_k_res.push("networkpolicy-canary.yaml".to_string());
+                        app.spec
+                            .upstream
+                            .chart
+                            .clone()
+                            .unwrap_or_else(|| app.metadata.id.clone()),
+                        HelmChartSourceRef {
+                            kind: HelmChartSourceKind::HelmRepository,
+                            name: format!("{item_resource_name}-repo"),
+                            namespace: Some(tenant_ns.clone()),
+                        },
+                    );
+                    hr_input.chart_version = app.spec.upstream.version.clone();
+                    hr_input.extra_labels = bundle_labels.clone();
+                    hr_input.kube_config = item_kube_config;
+                    hr_input.target_namespace = item.target_namespace.clone();
+
+                    for dep in &item.depends_on {
+                        if item_kinds.get(dep.as_str()) == Some(&BundleItemKind::App) {
+                            // A manifest-app dependency has no HelmRelease; the item
+                            // Kustomization's `dependsOn` already orders it.
+                            if manifest_app_items.contains(dep) {
+                                continue;
+                            }
+                            hr_input.depends_on.push(FluxDependencyRef {
+                                name: format!("{instance_name}-{dep}"),
+                            });
+                        } else if !item.bind_values.is_empty() {
+                            hr_input.values_from_secrets.push(HelmValuesSecretRef {
+                                name: format!("{instance_name}-{dep}-outputs"),
+                                values_key: None,
+                                target_path: None,
+                                optional: Some(true),
+                            });
+                        }
+                    }
+
+                    if let Some(obj) = partitioned.normal_values.as_object()
+                        && !obj.is_empty()
+                    {
+                        hr_input.values = Some(partitioned.normal_values.clone());
+                    }
+
+                    let hr_yaml = synthesize_helm_release_yaml(&hr_input)?;
+                    let primary_filename = if item.canary {
+                        "helmrelease-canary.yaml".to_string()
+                    } else {
+                        "helmrelease.yaml".to_string()
+                    };
+                    let mut extras = Vec::new();
+                    let mut item_k_res = vec![primary_filename.clone()];
+                    let repo_url = app.spec.upstream.repo_url.trim();
+                    if !repo_url.is_empty() {
+                        let mut repo_spec = serde_json::json!({
+                            "interval": "5m",
+                            "url": repo_url,
+                        });
+                        if repo_url.starts_with("oci://")
+                            && let Some(obj) = repo_spec.as_object_mut()
+                        {
+                            obj.insert("type".to_string(), serde_json::json!("oci"));
+                        }
+                        let helm_repo_doc = serde_json::json!({
+                            "apiVersion": "source.toolkit.fluxcd.io/v1",
+                            "kind": "HelmRepository",
+                            "metadata": {
+                                "name": format!("{item_resource_name}-repo"),
+                                "namespace": tenant_ns,
+                                "labels": {
+                                    "app.kubernetes.io/managed-by": "keel",
+                                    "keel.io/tenant": req.tenant,
+                                    "keel.io/bundle": instance_name,
+                                    "keel.io/bundle-item": item.id,
+                                }
+                            },
+                            "spec": repo_spec,
+                        });
+                        let helm_repo_yaml = serde_yml::to_string(&helm_repo_doc).map_err(|e| {
+                            ServerError::Internal(format!(
+                                "failed to serialize helm-repository.yaml: {e}"
+                            ))
+                        })?;
+                        extras.push(("helm-repository.yaml".to_string(), helm_repo_yaml));
+                        item_k_res.push("helm-repository.yaml".to_string());
+                    }
+
+                    if item.canary {
+                        let mut canary_input =
+                            FlaggerCanarySpecInput::new(&req.tenant, &item_resource_name);
+                        let chart_name = app
+                            .spec
+                            .upstream
+                            .chart
+                            .as_deref()
+                            .unwrap_or(&app.metadata.id);
+                        canary_input.service_port = partitioned
+                            .normal_values
+                            .get("service")
+                            .and_then(|s| s.get("port"))
+                            .and_then(|p| p.as_u64())
+                            .and_then(|p| u16::try_from(p).ok())
+                            .filter(|p| *p > 0)
+                            .unwrap_or(if chart_name == "podinfo" { 9898 } else { 80 });
+                        if let Some(host) = partitioned
+                            .normal_values
+                            .get("ingressHost")
+                            .and_then(|v| v.as_str())
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                        {
+                            canary_input.hosts.push(host.to_string());
+                        }
+                        canary_input.extra_labels = bundle_labels.clone();
+                        let canary_yaml = synthesize_flagger_canary_yaml(&canary_input)?;
+                        let np_yaml = synthesize_canary_gateway_network_policy_yaml(
+                            &req.tenant,
+                            &item_resource_name,
+                            canary_input.service_port,
+                        )?;
+                        if let Some(remote_kc) = &hr_input.kube_config {
+                            // The Canary must run next to the HelmRelease's workload on the remote
+                            // cluster (never the management cluster): own `<item>-canary`
+                            // Kustomization with kubeConfig/targetNamespace, like single apps.
+                            let remote_target_ns = hr_input
+                                .target_namespace
+                                .clone()
+                                .unwrap_or_else(|| tenant_ns.clone());
+                            extras.extend(build_remote_canary_files(
+                                &req.tenant,
+                                &item_resource_name,
+                                &item_rel_dir,
+                                remote_kc,
+                                &remote_target_ns,
+                                canary_yaml,
+                                np_yaml,
+                                &bundle_labels,
+                            )?);
+                            item_k_res.push("canary-kustomization.yaml".to_string());
+                        } else {
+                            extras.push(("canary.yaml".to_string(), canary_yaml));
+                            item_k_res.push("canary.yaml".to_string());
+                            extras.push(("networkpolicy-canary.yaml".to_string(), np_yaml));
+                            item_k_res.push("networkpolicy-canary.yaml".to_string());
+                        }
+                    }
+
+                    let item_k_doc = serde_json::json!({
+                        "apiVersion": "kustomize.config.k8s.io/v1beta1",
+                        "kind": "Kustomization",
+                        "resources": item_k_res,
+                    });
+                    extras.push((
+                        "kustomization.yaml".to_string(),
+                        serde_yml::to_string(&item_k_doc).map_err(|e| {
+                            ServerError::Internal(format!(
+                                "failed to serialize kustomization.yaml: {e}"
+                            ))
+                        })?,
+                    ));
+
+                    let mut stale = match (item.canary, hr_input.kube_config.is_some()) {
+                        (true, true) => vec![
+                            "helmrelease.yaml",
+                            "canary.yaml",
+                            "networkpolicy-canary.yaml",
+                        ],
+                        (true, false) => {
+                            vec!["helmrelease.yaml", "canary", "canary-kustomization.yaml"]
+                        }
+                        (false, _) => vec![
+                            "helmrelease-canary.yaml",
+                            "canary.yaml",
+                            "networkpolicy-canary.yaml",
+                            "canary",
+                            "canary-kustomization.yaml",
+                        ],
+                    };
+                    stale.extend([
+                        "manifests.yaml",
+                        "namespace.yaml",
+                        "config",
+                        "config-kustomization.yaml",
+                    ]);
+                    (
+                        primary_filename,
+                        hr_yaml,
+                        extras,
+                        Some(FluxHealthCheckRef {
+                            api_version: "helm.toolkit.fluxcd.io/v2".to_string(),
+                            kind: "HelmRelease".to_string(),
+                            name: item_resource_name.clone(),
+                            namespace: Some(tenant_ns.clone()),
+                        }),
+                        None,
+                        stale,
+                        "flux:helm.toolkit.fluxcd.io/v2:HelmRelease",
+                    )
                 }
-
-                let item_k_doc = serde_json::json!({
-                    "apiVersion": "kustomize.config.k8s.io/v1beta1",
-                    "kind": "Kustomization",
-                    "resources": item_k_res,
-                });
-                extras.push((
-                    "kustomization.yaml".to_string(),
-                    serde_yml::to_string(&item_k_doc).map_err(|e| {
-                        ServerError::Internal(format!(
-                            "failed to serialize kustomization.yaml: {e}"
-                        ))
-                    })?,
-                ));
-
-                (
-                    primary_filename,
-                    hr_yaml,
-                    extras,
-                    FluxHealthCheckRef {
-                        api_version: "helm.toolkit.fluxcd.io/v2".to_string(),
-                        kind: "HelmRelease".to_string(),
-                        name: item_resource_name.clone(),
-                        namespace: Some(tenant_ns.clone()),
-                    },
-                )
             }
             CatalogManifest::InfraBlueprint(bp) => {
                 let blueprint_pulumi_path = state
@@ -2397,12 +3125,15 @@ async fn create_bundle_proposal(
                     "stack.yaml".to_string(),
                     stack_yaml,
                     extras,
-                    FluxHealthCheckRef {
+                    Some(FluxHealthCheckRef {
                         api_version: "pulumi.com/v1".to_string(),
                         kind: "Stack".to_string(),
                         name: item_resource_name.clone(),
                         namespace: Some(tenant_ns.clone()),
-                    },
+                    }),
+                    None,
+                    Vec::new(),
+                    "pulumi:pulumi.com/v1:Stack",
                 )
             }
             CatalogManifest::Bundle(_) => {
@@ -2413,26 +3144,34 @@ async fn create_bundle_proposal(
             }
         };
 
-        let mut fk_input = FluxKustomizationSpecInput::new(
-            &req.tenant,
-            &item_resource_name,
-            "keel-gitops",
-            format!("./{item_rel_dir}"),
-        );
-        fk_input.depends_on = item
-            .depends_on
-            .iter()
-            .map(|dep| FluxDependencyRef {
-                name: format!("{instance_name}-{dep}"),
-            })
-            .collect();
-        fk_input.health_checks = vec![health_check];
-        fk_input.extra_labels = bundle_labels;
-        let flux_kustomization_yaml = synthesize_flux_kustomization_yaml(&fk_input)?;
+        let extra_kustomizations = if manifest_app_kustomization.is_some() {
+            vec![FLUX_MANIFEST_APP_KUSTOMIZATION_FILES[0]]
+        } else {
+            Vec::new()
+        };
+        let flux_kustomization_yaml = if let Some(app_fk) = manifest_app_kustomization {
+            app_fk
+        } else {
+            let mut fk_input = FluxKustomizationSpecInput::new(
+                &req.tenant,
+                &item_resource_name,
+                "keel-gitops",
+                format!("./{item_rel_dir}"),
+            );
+            fk_input.depends_on = item
+                .depends_on
+                .iter()
+                .map(|dep| FluxDependencyRef {
+                    name: format!("{instance_name}-{dep}"),
+                })
+                .collect();
+            fk_input.health_checks = health_check.into_iter().collect();
+            fk_input.extra_labels = bundle_labels;
+            synthesize_flux_kustomization_yaml(&fk_input)?
+        };
 
         prepared_items.push(PreparedBundleItem {
             id: item.id.clone(),
-            kind: item.kind,
             depends_on: item.depends_on.clone(),
             item_rel_dir,
             resource_name: item_resource_name,
@@ -2442,6 +3181,9 @@ async fn create_bundle_proposal(
             primary_yaml,
             extra_files,
             flux_kustomization_yaml,
+            extra_kustomizations,
+            stale,
+            resource_type,
         });
     }
 
@@ -2483,29 +3225,20 @@ async fn create_bundle_proposal(
             .await?;
             staged_paths.push(format!("{}/{}", item.item_rel_dir, item.primary_filename));
 
-            if item.kind == BundleItemKind::App {
-                let stale_files: &[&str] = if item.primary_filename == "helmrelease-canary.yaml" {
-                    &["helmrelease.yaml"]
-                } else {
-                    &[
-                        "helmrelease-canary.yaml",
-                        "canary.yaml",
-                        "networkpolicy-canary.yaml",
-                    ]
-                };
-                for stale_file in stale_files {
-                    let stale_path = item_dir.join(stale_file);
-                    if tokio::fs::try_exists(&stale_path).await.unwrap_or(false) {
-                        tokio::fs::remove_file(&stale_path).await?;
-                        staged_paths.push(format!("{}/{stale_file}", item.item_rel_dir));
-                    }
-                }
-            }
-
-            for (fname, content) in &item.extra_files {
-                write_contained(&state.repo_workdir, &item_dir.join(fname), content).await?;
-                staged_paths.push(format!("{}/{fname}", item.item_rel_dir));
-            }
+            remove_stale_entries(
+                &state.repo_workdir,
+                &item.item_rel_dir,
+                &item.stale,
+                &mut staged_paths,
+            )
+            .await?;
+            write_relative_files(
+                &state.repo_workdir,
+                &item.item_rel_dir,
+                &item.extra_files,
+                &mut staged_paths,
+            )
+            .await?;
 
             if let Some(enc_yaml) = &item.encrypted_secrets_yaml {
                 write_contained(
@@ -2524,6 +3257,12 @@ async fn create_bundle_proposal(
             )
             .await?;
             staged_paths.push(format!("{}/flux-kustomization.yaml", item.item_rel_dir));
+            for fk_file in &item.extra_kustomizations {
+                kustomize_additions.push(format!(
+                    "{}/bundles/{instance_name}/{}/{fk_file}",
+                    req.tenant, item.id
+                ));
+            }
             kustomize_additions.push(format!(
                 "{}/bundles/{instance_name}/{}/flux-kustomization.yaml",
                 req.tenant, item.id
@@ -2554,6 +3293,10 @@ async fn create_bundle_proposal(
                 resources.push(res);
             }
         }
+        let bundle_prefix = format!("{}/bundles/{instance_name}/", req.tenant);
+        resources.retain(|r| {
+            !r.starts_with(&bundle_prefix) || state.repo_workdir.join("tenants").join(r).is_file()
+        });
         create_dir_all_contained(&state.repo_workdir, &state.repo_workdir.join("tenants")).await?;
         write_contained(
             &state.repo_workdir,
@@ -2631,10 +3374,7 @@ async fn create_bundle_proposal(
     let resources: Vec<ResourceDiff> = prepared_items
         .iter()
         .map(|item| {
-            let rtype = match item.kind {
-                BundleItemKind::Infra => "pulumi:pulumi.com/v1:Stack",
-                BundleItemKind::App => "flux:helm.toolkit.fluxcd.io/v2:HelmRelease",
-            };
+            let rtype = item.resource_type;
             let mut changed_fields = vec!["spec".to_string()];
             if !item.depends_on.is_empty() {
                 changed_fields.push(format!(
@@ -3751,6 +4491,80 @@ mod tests {
 
     fn files(paths: &[&str]) -> Vec<String> {
         paths.iter().map(|p| (*p).to_string()).collect()
+    }
+
+    #[test]
+    fn stored_secret_fields_are_relaxed_only_when_stored() {
+        let schema = json!({
+            "type": "object",
+            "required": ["hostname", "encKey", "adminPassword"],
+            "properties": {
+                "hostname": { "type": "string" },
+                "encKey": { "type": "string", "writeOnly": true },
+                "adminPassword": { "type": "string", "format": "password" },
+            },
+        });
+        let stored = std::collections::BTreeSet::from([
+            "encKey".to_string(),
+            // Never relaxes a non-secret field, even if a key of that name is stored.
+            "hostname".to_string(),
+        ]);
+        let relaxed = relax_stored_secret_requirements(&schema, &stored);
+        assert_eq!(relaxed["required"], json!(["hostname", "adminPassword"]));
+        assert_eq!(relaxed["properties"], schema["properties"]);
+        let no_required = json!({ "type": "object" });
+        assert_eq!(
+            relax_stored_secret_requirements(&no_required, &stored),
+            no_required
+        );
+    }
+
+    #[tokio::test]
+    async fn derived_kustomization_names_and_sibling_guard() {
+        assert_eq!(
+            reserved_flux_kustomization_names("web"),
+            [
+                "web".to_string(),
+                "web-config".to_string(),
+                "web-canary".to_string()
+            ]
+        );
+        let repo = tempfile::tempdir().unwrap();
+        for dir in ["tenants/acme/apps/web", "tenants/acme/apps/api-canary"] {
+            std::fs::create_dir_all(repo.path().join(dir)).unwrap();
+        }
+        let check = |name: &'static str| {
+            let root = repo.path().to_path_buf();
+            async move {
+                ensure_no_derived_name_sibling(
+                    &root,
+                    "acme",
+                    &format!("tenants/acme/apps/{name}"),
+                    name,
+                )
+                .await
+            }
+        };
+        // `web` exists: `web-config` / `web-canary` would share its derived names.
+        assert!(check("web-config").await.is_err());
+        assert!(check("web-canary").await.is_err());
+        // `api-canary` exists: a new `api` would derive `api-canary`.
+        assert!(check("api").await.is_err());
+        // Unrelated names (including catalog ids ending in `-config`) are fine.
+        assert!(check("canary-gateway-config").await.is_ok());
+        assert!(check("webapp").await.is_ok());
+        // Other tenants never conflict.
+        let root = repo.path().to_path_buf();
+        assert!(
+            ensure_no_derived_name_sibling(
+                &root,
+                "other",
+                "tenants/other/apps/web-config",
+                "web-config"
+            )
+            .await
+            .is_ok()
+        );
     }
 
     #[test]

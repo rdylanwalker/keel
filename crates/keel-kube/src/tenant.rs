@@ -120,27 +120,24 @@ fn tenant_common_labels(tenant_id: &str) -> BTreeMap<String, String> {
     ])
 }
 
+/// `restricted` Pod Security Standards admission labels (`enforce`/`audit`/`warn`) for every
+/// Keel-created tenant workload namespace (`NFR-SEC-03`).
+fn restricted_pod_security_labels() -> [(String, String); 4] {
+    [
+        ("pod-security.kubernetes.io/enforce", "restricted"),
+        ("pod-security.kubernetes.io/enforce-version", "latest"),
+        ("pod-security.kubernetes.io/audit", "restricted"),
+        ("pod-security.kubernetes.io/warn", "restricted"),
+    ]
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+}
+
 /// Generates the tenant `Namespace` (`tenant-<id>`) enforcing Kubernetes `restricted`
 /// Pod Security Standards (`NFR-SEC-02`, `NFR-SEC-03`).
 pub fn build_tenant_namespace(tenant_id: &str) -> Result<Namespace, KubeError> {
     let ns_name = tenant_namespace(tenant_id)?;
     let mut labels = tenant_common_labels(tenant_id);
-    labels.insert(
-        "pod-security.kubernetes.io/enforce".to_string(),
-        "restricted".to_string(),
-    );
-    labels.insert(
-        "pod-security.kubernetes.io/enforce-version".to_string(),
-        "latest".to_string(),
-    );
-    labels.insert(
-        "pod-security.kubernetes.io/audit".to_string(),
-        "restricted".to_string(),
-    );
-    labels.insert(
-        "pod-security.kubernetes.io/warn".to_string(),
-        "restricted".to_string(),
-    );
+    labels.extend(restricted_pod_security_labels());
 
     Ok(Namespace {
         metadata: ObjectMeta {
@@ -900,7 +897,9 @@ pub fn synthesize_canary_gateway_network_policy_yaml(
 /// objects next to a sibling `HelmRelease` would otherwise race Helm's `install.createNamespace`.
 /// kustomize-controller applies `Namespace` objects before namespaced ones, so including this
 /// manifest removes the race. It is annotated `prune: disabled` (never delete a namespace Helm
-/// may also own) and `ssa: IfNotPresent` (never fight an existing namespace). Must not be used on
+/// may also own) and `ssa: IfNotPresent` (never fight an existing namespace). Like
+/// [`build_tenant_namespace`] it enforces the `restricted` Pod Security Standard (`NFR-SEC-03`):
+/// workload clusters carry no guaranteed Kyverno baseline. Must not be used on
 /// management-cluster tenant paths, where the tenant reconciler cannot create namespaces.
 pub fn synthesize_remote_target_namespace(
     tenant_id: &str,
@@ -908,12 +907,14 @@ pub fn synthesize_remote_target_namespace(
 ) -> Result<Value, KubeError> {
     validate_tenant_id(tenant_id)?;
     validate_resource_name("namespace", namespace)?;
+    let mut labels = tenant_common_labels(tenant_id);
+    labels.extend(restricted_pod_security_labels());
     Ok(json!({
         "apiVersion": "v1",
         "kind": "Namespace",
         "metadata": {
             "name": namespace,
-            "labels": tenant_common_labels(tenant_id),
+            "labels": labels,
             "annotations": {
                 "kustomize.toolkit.fluxcd.io/prune": "disabled",
                 "kustomize.toolkit.fluxcd.io/ssa": "IfNotPresent",
@@ -1179,6 +1180,113 @@ pub fn generate_flux_kustomization_manifest(
     input: &FluxKustomizationSpecInput,
 ) -> Result<String, KubeError> {
     synthesize_flux_kustomization_yaml(input)
+}
+
+/// Sub-directory (relative to a manifest app's directory) holding the app's substitution
+/// sources: the values `ConfigMap` and the SOPS-encrypted `<app>-secrets` `Secret`.
+pub const MANIFEST_APP_CONFIG_DIR: &str = "config";
+
+/// Name of the Flux `Kustomization` that applies a manifest app's substitution sources.
+pub fn manifest_app_config_kustomization_name(app_name: &str) -> String {
+    format!("{app_name}-config")
+}
+
+/// Name of a manifest app's non-secret values `ConfigMap` (`postBuild.substituteFrom`).
+pub fn manifest_app_values_configmap_name(app_name: &str) -> String {
+    format!("{app_name}-values")
+}
+
+/// Name of a manifest app's SOPS-decrypted secret values `Secret` (`postBuild.substituteFrom`).
+pub fn manifest_app_secrets_name(app_name: &str) -> String {
+    format!("{app_name}-secrets")
+}
+
+/// Input for [`synthesize_flux_manifest_app_kustomizations`] (a `runtime: manifest` app on the
+/// Flux engine).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FluxManifestAppInput {
+    pub tenant_id: String,
+    /// App (and app `Kustomization`) name; also prefixes the config objects.
+    pub name: String,
+    pub source_name: String,
+    /// Repo-relative app directory (e.g. `tenants/acme/apps/rauthy`), without a leading `./`.
+    pub app_dir: String,
+    /// Remote workload cluster for the app manifests. Never applied to the config `Kustomization`.
+    pub kube_config: Option<RemoteKubeConfigRef>,
+    pub target_namespace: Option<String>,
+    /// `true` when the app has SOPS-encrypted secret values (`config/secrets.enc.yaml`).
+    pub has_secrets: bool,
+    /// Additional app `Kustomization` dependencies (e.g. bundle items).
+    pub depends_on: Vec<FluxDependencyRef>,
+    pub extra_labels: BTreeMap<String, String>,
+}
+
+/// Synthesizes the two Flux `Kustomization`s of a Flux-engine manifest app as YAML:
+/// `(config, app)`.
+///
+/// * `<name>-config` (path `<app_dir>/config`) applies the values `ConfigMap` and the
+///   SOPS-decrypted `<name>-secrets` `Secret` in `tenant-<id>` of the **management** cluster: it
+///   never carries `kubeConfig`, because Flux reads `postBuild.substituteFrom` sources from the
+///   app `Kustomization`'s own namespace on the cluster where kustomize-controller runs.
+/// * `<name>` (path `<app_dir>`) applies the rendered manifests (optionally to a remote cluster)
+///   and `dependsOn` `<name>-config`, so the substitution sources exist before the first build;
+///   `substituteFrom` is therefore `optional: false` (a missing source fails the reconcile instead
+///   of silently rendering empty values).
+pub fn synthesize_flux_manifest_app_kustomizations(
+    input: &FluxManifestAppInput,
+) -> Result<(String, String), KubeError> {
+    let app_dir = input.app_dir.trim_start_matches("./").trim_end_matches('/');
+    let config_name = manifest_app_config_kustomization_name(&input.name);
+
+    let mut config = FluxKustomizationSpecInput::new(
+        &input.tenant_id,
+        &config_name,
+        &input.source_name,
+        format!("./{app_dir}/{MANIFEST_APP_CONFIG_DIR}"),
+    );
+    config.extra_labels = input.extra_labels.clone();
+    config.extra_labels.remove("keel.io/runtime");
+    config.extra_labels.remove("keel.io/engine");
+    config
+        .extra_labels
+        .insert("keel.io/config-for".to_string(), input.name.clone());
+    if input.has_secrets {
+        config.decryption_secret_name = Some(crate::TENANT_SOPS_AGE_SECRET_NAME.to_string());
+    }
+
+    let mut app = FluxKustomizationSpecInput::new(
+        &input.tenant_id,
+        &input.name,
+        &input.source_name,
+        format!("./{app_dir}"),
+    );
+    app.extra_labels = input.extra_labels.clone();
+    app.kube_config = input.kube_config.clone();
+    app.target_namespace = input.target_namespace.clone();
+    app.depends_on = input.depends_on.clone();
+    if !app.depends_on.iter().any(|d| d.name == config_name) {
+        app.depends_on.push(FluxDependencyRef {
+            name: config_name.clone(),
+        });
+    }
+    app.post_build_substitute_from = vec![FluxSubstituteReference {
+        kind: "ConfigMap".to_string(),
+        name: manifest_app_values_configmap_name(&input.name),
+        optional: false,
+    }];
+    if input.has_secrets {
+        app.post_build_substitute_from
+            .push(FluxSubstituteReference {
+                kind: "Secret".to_string(),
+                name: manifest_app_secrets_name(&input.name),
+                optional: false,
+            });
+    }
+
+    Ok((
+        synthesize_flux_kustomization_yaml(&config)?,
+        synthesize_flux_kustomization_yaml(&app)?,
+    ))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1540,6 +1648,19 @@ mod tests {
         assert_eq!(ns["metadata"]["name"], "staging-obs");
         assert!(ns["metadata"].get("namespace").is_none());
         assert_eq!(ns["metadata"]["labels"]["keel.io/tenant"], "default");
+        // Same `restricted` PSS enforcement as the management-cluster tenant namespace.
+        let tenant_ns = build_tenant_namespace("default").unwrap();
+        for (key, value) in tenant_ns.metadata.labels.unwrap() {
+            assert_eq!(ns["metadata"]["labels"][&key], value.as_str(), "{key}");
+        }
+        assert_eq!(
+            ns["metadata"]["labels"]["pod-security.kubernetes.io/enforce"],
+            "restricted"
+        );
+        assert_eq!(
+            ns["metadata"]["labels"]["pod-security.kubernetes.io/enforce-version"],
+            "latest"
+        );
         assert_eq!(
             ns["metadata"]["annotations"]["kustomize.toolkit.fluxcd.io/prune"],
             "disabled"
@@ -2169,5 +2290,102 @@ mod tests {
 
         input.decryption_secret_name = Some("Bad_Name".to_string());
         assert!(synthesize_flux_kustomization(&input).is_err());
+    }
+
+    #[test]
+    fn flux_manifest_app_config_kustomization_orders_substitution_sources_first() {
+        let mut labels = BTreeMap::new();
+        labels.insert("keel.io/runtime".to_string(), "manifest".to_string());
+        labels.insert("keel.io/catalog-id".to_string(), "rauthy".to_string());
+        let input = FluxManifestAppInput {
+            tenant_id: "acme".to_string(),
+            name: "rauthy".to_string(),
+            source_name: "keel-gitops".to_string(),
+            app_dir: "./tenants/acme/apps/rauthy/".to_string(),
+            kube_config: None,
+            target_namespace: None,
+            has_secrets: true,
+            depends_on: vec![FluxDependencyRef {
+                name: "bundle-cluster".to_string(),
+            }],
+            extra_labels: labels,
+        };
+        let (config_yaml, app_yaml) = synthesize_flux_manifest_app_kustomizations(&input).unwrap();
+        let config: Value = serde_yml::from_str(&config_yaml).unwrap();
+        let app: Value = serde_yml::from_str(&app_yaml).unwrap();
+
+        assert_eq!(config["metadata"]["name"], "rauthy-config");
+        assert_eq!(config["spec"]["path"], "./tenants/acme/apps/rauthy/config");
+        assert_eq!(config["spec"]["targetNamespace"], "tenant-acme");
+        assert!(config["spec"].get("kubeConfig").is_none());
+        assert!(config["spec"].get("postBuild").is_none());
+        assert_eq!(
+            config["spec"]["decryption"]["secretRef"]["name"],
+            "sops-age"
+        );
+        assert_eq!(config["metadata"]["labels"]["keel.io/config-for"], "rauthy");
+        assert!(
+            config["metadata"]["labels"]
+                .get("keel.io/runtime")
+                .is_none()
+        );
+
+        assert_eq!(app["metadata"]["name"], "rauthy");
+        assert_eq!(app["spec"]["path"], "./tenants/acme/apps/rauthy");
+        // `wait: true`: Ready (and so any `dependsOn` from later bundle items) only once every
+        // applied workload is healthy; the config sources must be applied first likewise.
+        assert_eq!(app["spec"]["wait"], true);
+        assert_eq!(config["spec"]["wait"], true);
+        assert!(app["spec"].get("decryption").is_none());
+        assert_eq!(app["metadata"]["labels"]["keel.io/runtime"], "manifest");
+        let deps: Vec<&str> = app["spec"]["dependsOn"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(deps, ["bundle-cluster", "rauthy-config"]);
+        let sub_from = app["spec"]["postBuild"]["substituteFrom"]
+            .as_array()
+            .unwrap();
+        assert_eq!(sub_from.len(), 2);
+        assert_eq!(sub_from[0]["kind"], "ConfigMap");
+        assert_eq!(sub_from[0]["name"], "rauthy-values");
+        assert_eq!(sub_from[1]["kind"], "Secret");
+        assert_eq!(sub_from[1]["name"], "rauthy-secrets");
+        assert!(sub_from.iter().all(|s| s["optional"] == false));
+    }
+
+    #[test]
+    fn flux_manifest_app_remote_target_keeps_config_on_management_cluster() {
+        let input = FluxManifestAppInput {
+            tenant_id: "acme".to_string(),
+            name: "web".to_string(),
+            source_name: "keel-gitops".to_string(),
+            app_dir: "tenants/acme/apps/web".to_string(),
+            kube_config: Some(RemoteKubeConfigRef::with_key("edge", "kubeconfig")),
+            target_namespace: Some("apps".to_string()),
+            has_secrets: false,
+            depends_on: Vec::new(),
+            extra_labels: BTreeMap::new(),
+        };
+        let (config_yaml, app_yaml) = synthesize_flux_manifest_app_kustomizations(&input).unwrap();
+        let config: Value = serde_yml::from_str(&config_yaml).unwrap();
+        let app: Value = serde_yml::from_str(&app_yaml).unwrap();
+
+        assert!(config["spec"].get("kubeConfig").is_none());
+        assert_eq!(config["spec"]["targetNamespace"], "tenant-acme");
+        assert!(config["spec"].get("decryption").is_none());
+        assert_eq!(app["spec"]["kubeConfig"]["secretRef"]["name"], "edge");
+        assert_eq!(app["spec"]["targetNamespace"], "apps");
+        assert_eq!(
+            app["spec"]["dependsOn"],
+            json!([{ "name": "web-config", "namespace": "tenant-acme" }])
+        );
+        let sub_from = app["spec"]["postBuild"]["substituteFrom"]
+            .as_array()
+            .unwrap();
+        assert_eq!(sub_from.len(), 1, "no Secret source without secret values");
+        assert_eq!(sub_from[0]["optional"], false);
     }
 }

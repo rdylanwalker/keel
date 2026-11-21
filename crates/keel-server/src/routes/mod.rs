@@ -1483,7 +1483,10 @@ spec:
 
         let flux_app_dir = workdir.join("tenants/default/apps/raw-flux-inst");
         assert!(flux_app_dir.join("manifests.yaml").is_file());
-        assert!(flux_app_dir.join("values-configmap.yaml").is_file());
+        assert!(flux_app_dir.join("config/values-configmap.yaml").is_file());
+        assert!(flux_app_dir.join("config/kustomization.yaml").is_file());
+        assert!(flux_app_dir.join("config-kustomization.yaml").is_file());
+        assert!(!flux_app_dir.join("values-configmap.yaml").exists());
         assert!(flux_app_dir.join("kustomization.yaml").is_file());
         assert!(flux_app_dir.join("flux-kustomization.yaml").is_file());
 

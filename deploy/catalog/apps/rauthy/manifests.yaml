@@ -1,9 +1,8 @@
 # Self-service Rauthy OIDC provider (tenant namespace; restricted PSS). Non-secret `${...}` values
 # are rendered by Keel at proposal time. Secret placeholders (`${encKey}`, `${hiqliteSecretRaft}`,
 # `${hiqliteSecretApi}`, `${adminPassword}`) are never rendered into Git: Flux fills them in from the
-# SOPS-decrypted `<instance>-secrets` Secret (`postBuild.substituteFrom`). On the very first
-# reconcile that Secret does not exist yet, so Rauthy fails fast on an empty ENC_KEYS and recovers
-# after a later reconcile plus a container restart (can take up to ~10 minutes; see the docs).
+# SOPS-decrypted `<instance>-secrets` Secret (`postBuild.substituteFrom`), which the
+# `<instance>-config` Kustomization applies before this one reconciles (`dependsOn`).
 apiVersion: v1
 kind: ConfigMap
 metadata:

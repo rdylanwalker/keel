@@ -305,7 +305,7 @@ Deploy raw Kubernetes YAML templates without packaging a Helm chart, choosing be
    - **Service Port:** `8080`
    - **Echo Message:** `"Hello from Keel Manifest Template!"`
 4. Notice the **Action Engine** selector:
-   - **Flux CD Kustomization (`flux`):** Generates `manifests.yaml`, non-secret substitutions in `values-configmap.yaml`, and a Flux `Kustomization` using `postBuild.substituteFrom`.
+   - **Flux CD Kustomization (`flux`):** Generates `manifests.yaml`, non-secret substitutions in `config/values-configmap.yaml` (applied first by an `<instance>-config` Kustomization), and a Flux `Kustomization` that depends on it and uses `postBuild.substituteFrom`.
    - **Pulumi PKO Stack (`pulumi`):** Generates `Pulumi.yaml` wrapping the rendered manifests in `kubernetes:yaml/v2:ConfigGroup` with a PKO v2 `Stack` and ephemeral PR preview diffing.
 5. Click **Submit & Open Git PR Proposal**.
 6. Inspect the PR in **PR & Preview Inspector** and click **Merge PR**.
@@ -401,7 +401,7 @@ Choose a **Bootstrap Admin Password** of 14 to 128 characters without whitespace
 ### Step 2: Deploy via the Web Portal or CLI
 
 1. In **Catalog & Form Wizard**, select your tenant and choose **Rauthy OIDC Provider** (`rauthy`).
-2. Fill in a **Public Hostname** unique to your tenant (no default; for example `auth-dev-team.keel.local`), **Public HTTPS Port Suffix** (`:8888` for the local `kind` Gateway, empty when served on port 443), **Bootstrap Admin Email**, and the four secrets from Step 1. Keel rejects platform hosts (`idp.`, `keel.`, `forgejo.` under the Keel domain, and the configured IdP host) and hostnames another app already routes; the Kyverno policy `restrict-tenant-route-hostnames` enforces the platform-host rule at admission too. Keep the **Flux CD** engine (the default): Keel rejects the Pulumi engine and remote target clusters for this app, because its secret fields are substituted by Flux on the management cluster only.
+2. Fill in a **Public Hostname** unique to your tenant (no default; for example `auth-dev-team.keel.local`), **Public HTTPS Port Suffix** (`:8888` for the local `kind` Gateway, empty when served on port 443), **Bootstrap Admin Email**, and the four secrets from Step 1. Keel rejects platform hosts (`idp.`, `keel.`, `forgejo.` under the Keel domain, and the configured IdP host) and hostnames another app already routes; the Kyverno policy `restrict-tenant-route-hostnames` enforces the platform-host rule at admission too. Keep the **Flux CD** engine (the default): Keel rejects the Pulumi engine for this app, because only Flux can substitute its secret fields.
 3. Click **Submit & Open Git PR Proposal**, review the PR, and merge it.
 
 ```bash
@@ -425,9 +425,9 @@ keel app install \
 
 ### How the Secrets Reach Rauthy
 
-1. Keel partitions the four `format: password` fields out of the form values and encrypts them with SOPS and the tenant's `age` key into `tenants/<tenant>/apps/rauthy/secrets.enc.yaml` (the `rauthy-secrets` Secret). Git never holds the plaintext. The committed `manifests.yaml` keeps only `${encKey}`-style placeholders.
-2. The tenant Flux `Kustomization` decrypts `secrets.enc.yaml` with the tenant `sops-age` Secret (`spec.decryption`) and substitutes the values into the in-cluster `rauthy-env` Secret through `postBuild.substituteFrom`. The container reads them as environment variables (`ENC_KEYS`, `HQL_SECRET_RAFT`, `HQL_SECRET_API`, `BOOTSTRAP_ADMIN_PASSWORD_PLAIN`).
-3. On the very first reconcile the decrypted Secret does not exist yet, so Rauthy exits on an empty `ENC_KEYS` and crash-loops. The Kustomization waits for its 2-minute timeout, retries after another 2 minutes with the real values, and the container only picks them up on its next restart (CrashLoopBackOff delays restarts by up to 5 minutes), so the first start can take up to about 10 minutes. To skip the wait, once `rauthy-secrets` exists run `flux reconcile kustomization rauthy -n tenant-<id>` and then `kubectl -n tenant-<id> delete pod rauthy-0`. Secret changes made later through **Edit** take effect after the pod restarts (`kubectl -n tenant-<id> rollout restart statefulset/rauthy`).
+1. Keel partitions the four `format: password` fields out of the form values and encrypts them with SOPS and the tenant's `age` key into `tenants/<tenant>/apps/rauthy/config/secrets.enc.yaml` (the `rauthy-secrets` Secret). Git never holds the plaintext. The committed `manifests.yaml` keeps only `${encKey}`-style placeholders.
+2. The `rauthy-config` Flux `Kustomization` decrypts `config/secrets.enc.yaml` with the tenant `sops-age` Secret (`spec.decryption`) and applies it, together with the `rauthy-values` ConfigMap, in the tenant namespace.
+3. The `rauthy` Kustomization depends on `rauthy-config`, so it starts only once the Secret exists. It then substitutes the values into the in-cluster `rauthy-env` Secret through `postBuild.substituteFrom`, and Rauthy starts with them on the first reconcile. The container reads them as environment variables (`ENC_KEYS`, `HQL_SECRET_RAFT`, `HQL_SECRET_API`, `BOOTSTRAP_ADMIN_PASSWORD_PLAIN`). On **Edit**, leave a secret field blank to keep its stored value; secrets you do re-enter take effect after the pod restarts (`kubectl -n tenant-<id> rollout restart statefulset/rauthy`). Leave `encKey` blank unless you mean to replace it: the template configures a single `ENC_KEYS` entry, so data encrypted with the previous key becomes unreadable.
 
 Only one `rauthy` instance per tenant namespace is supported, because the template uses fixed resource names (`rauthy`, `rauthy-config`, `rauthy-env`, `rauthy-headless`).
 

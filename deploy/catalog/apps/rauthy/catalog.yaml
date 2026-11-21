@@ -6,16 +6,18 @@
 # `catalog/core/rauthy` (bump both together; enforced by a keel-cli test).
 #
 # Secret fields (`format: password`) are never defaulted: Keel partitions them out of plaintext
-# values, SOPS-encrypts them with the tenant `age` key into `secrets.enc.yaml`
-# (`<instance>-secrets`), and Flux substitutes them into the in-cluster `rauthy-env` Secret via
-# `postBuild.substituteFrom`. Git only ever holds `${...}` placeholders and SOPS ciphertext.
+# values, SOPS-encrypts them with the tenant `age` key into `config/secrets.enc.yaml`
+# (`<instance>-secrets`, applied first by the `<instance>-config` Kustomization), and Flux
+# substitutes them into the `rauthy-env` Secret via `postBuild.substituteFrom`. Git only ever
+# holds `${...}` placeholders and SOPS ciphertext.
 #
 # Single replica only: Hiqlite raft membership is configuration-driven, so replicas are not exposed.
-# Flux engine on the management cluster only: Keel rejects `engine: pulumi` and remote
-# `targetCluster` proposals for apps with secret fields. The HTTPRoute hostname has no default
-# (it must be unique per tenant); Keel and the Kyverno `restrict-tenant-route-hostnames` policy
-# reject platform hosts (IdP, keel-server, Forgejo), and Keel rejects hostnames already routed by
-# another app.
+# Flux engine only: Keel rejects `engine: pulumi` for apps with secret fields. A remote
+# `targetCluster` needs the `keel-system/keel-ingress` Gateway there for the HTTPRoute, and the
+# substituted secret values land in `rauthy-env` on that cluster. The HTTPRoute hostname has no
+# default (it must be unique per tenant); Keel and the Kyverno `restrict-tenant-route-hostnames`
+# policy reject platform hosts (IdP, keel-server, Forgejo), and Keel rejects hostnames already
+# routed by another app.
 apiVersion: keel.io/v1alpha1
 kind: CatalogApplication
 metadata:

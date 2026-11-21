@@ -505,7 +505,15 @@ pub async fn get_release_config(
         let fk_path = app_dir.join("flux-kustomization.yaml");
         let stack_path = app_dir.join("stack.yaml");
         let manifests_path = app_dir.join("manifests.yaml");
-        let cm_path = app_dir.join("values-configmap.yaml");
+        // Flux manifest apps keep their values ConfigMap under `config/` (pre-split layout: app root).
+        let cm_path = {
+            let split = app_dir.join("config/values-configmap.yaml");
+            if tokio::fs::try_exists(&split).await.unwrap_or(false) {
+                split
+            } else {
+                app_dir.join("values-configmap.yaml")
+            }
+        };
 
         let has_values = tokio::fs::try_exists(&values_path).await.unwrap_or(false);
         let has_canary_hr = tokio::fs::try_exists(&hr_canary_path)
