@@ -1,0 +1,510 @@
+//! Stateless control-plane HTTP/SSE server bootstrap (`keel serve`, `SDD.md` §6.3, §7.2).
+
+use std::future::Future;
+use std::net::SocketAddr;
+use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
+
+use keel_core::{
+    AuthPhase, FLUX_SYSTEM_NAMESPACE, ForgeKind, KEEL_SYSTEM_NAMESPACE, KeelConfig,
+    ProviderRegistry,
+};
+use keel_git::{
+    CommitAuthor, ForgeProvider, ForgejoGiteaProvider, GitCredentials, GitHubProvider,
+    GitLabProvider, GitRunner, LocalGitProvider, parse_remote_repo_url,
+};
+use keel_kube::{
+    InMemorySecretStore, K8sSecretStore, KubeClusterStatusReader, S3_CREDENTIALS_SECRET_NAME,
+    SecretStateStore, TelemetryMux, TenantIsolationConfig, TenantManifestBundle, WatchedCrdKind,
+};
+use keel_pko::{
+    IN_CLUSTER_S3_BACKEND_URL, ManagementCoreStackParams, attach_s3_credentials_env_refs,
+    synthesize_management_core_stack,
+};
+use keel_server::{AppState, KubeClusterStateProvider, RepoClusterStateProvider, build_router};
+
+use crate::cli::ServeArgs;
+
+use super::bootstrap::{
+    FORGE_TOKEN_SECRET_NAME, TempPortForward, default_bare_repo_for_workdir,
+    start_forgejo_port_forward, start_gateway_port_forward,
+};
+use super::{CliError, absolutize_path, is_relative_local_remote};
+
+fn build_forge_provider(
+    keel_cfg: Option<&KeelConfig>,
+    resolved_token: Option<&str>,
+    api_url_override: Option<&str>,
+    bare_repo: &Path,
+) -> Result<Arc<dyn ForgeProvider>, CliError> {
+    let Some(cfg) = keel_cfg else {
+        return Ok(Arc::new(LocalGitProvider::new(bare_repo)));
+    };
+    if cfg.forge.provider == ForgeKind::Local {
+        return Ok(Arc::new(LocalGitProvider::new(bare_repo)));
+    }
+
+    let Some(token) = resolved_token.map(str::trim).filter(|t| !t.is_empty()) else {
+        tracing::warn!(
+            provider = ?cfg.forge.provider,
+            repo_url = %cfg.forge.repo_url,
+            "Remote forge configured in .keel/config.yaml, but no --git-token, KEEL_GIT_TOKEN, or keel-system/forge-token Secret was found; falling back to LocalGitProvider"
+        );
+        return Ok(Arc::new(LocalGitProvider::new(bare_repo)));
+    };
+
+    let slug = parse_remote_repo_url(&cfg.forge.repo_url).map_err(|e| {
+        CliError::Validation(format!(
+            "invalid forge.repo_url '{}': {e}",
+            cfg.forge.repo_url
+        ))
+    })?;
+
+    let effective_api = api_url_override.or(cfg.forge.api_url.as_deref());
+
+    let forge: Arc<dyn ForgeProvider> = match cfg.forge.provider {
+        ForgeKind::GitHub => {
+            let api_base = effective_api
+                .map(|u| u.trim_end_matches('/').to_string())
+                .unwrap_or_else(|| {
+                    if slug.host.eq_ignore_ascii_case("github.com") {
+                        "https://api.github.com".to_string()
+                    } else {
+                        format!("{}/api/v3", slug.origin_url)
+                    }
+                });
+            Arc::new(
+                GitHubProvider::new(api_base, &slug.owner, &slug.repo, token)
+                    .map_err(|e| CliError::Validation(e.to_string()))?,
+            )
+        }
+        ForgeKind::GitLab => {
+            let api_base = effective_api
+                .map(|u| u.trim_end_matches('/').to_string())
+                .unwrap_or_else(|| slug.origin_url.clone());
+            Arc::new(
+                GitLabProvider::new(api_base, &slug.project_path, token)
+                    .map_err(|e| CliError::Validation(e.to_string()))?,
+            )
+        }
+        ForgeKind::Forgejo | ForgeKind::Gitea => {
+            let api_base = effective_api
+                .map(|u| {
+                    let trimmed = u.trim_end_matches('/');
+                    trimmed
+                        .strip_suffix("/api/v1")
+                        .unwrap_or(trimmed)
+                        .to_string()
+                })
+                .unwrap_or_else(|| slug.origin_url.clone());
+            Arc::new(
+                ForgejoGiteaProvider::new(api_base, &slug.owner, &slug.repo, token)
+                    .map_err(|e| CliError::Validation(e.to_string()))?,
+            )
+        }
+        ForgeKind::Local => Arc::new(LocalGitProvider::new(bare_repo)),
+    };
+
+    tracing::info!(
+        provider = ?cfg.forge.provider,
+        repo_url = %cfg.forge.repo_url,
+        "Configured remote ForgeProvider"
+    );
+    Ok(forge)
+}
+
+/// Builds a configured stateless [`AppState`] from [`ServeArgs`] (`SDD.md` §6.3, §7.2).
+pub async fn build_serve_state(args: &ServeArgs) -> Result<(AppState, Option<String>), CliError> {
+    let (state, token, _pf) = build_serve_state_with_forward(args, false).await?;
+    Ok((state, token))
+}
+
+async fn build_serve_state_with_forward(
+    args: &ServeArgs,
+    enable_in_cluster_port_forward: bool,
+) -> Result<(AppState, Option<String>, Vec<TempPortForward>), CliError> {
+    if args.bind.trim().is_empty() || !args.bind.contains(':') {
+        return Err(CliError::Validation(format!(
+            "bind address must be in '<host>:<port>' format, got '{}'",
+            args.bind
+        )));
+    }
+
+    let base_temp = std::env::temp_dir().join(format!("keel-serve-{}", uuid::Uuid::new_v4()));
+    let repo_workdir = match &args.repo_dir {
+        Some(dir) => absolutize_path(dir)?,
+        None => base_temp.join("workdir"),
+    };
+    let bare_repo = match &args.bare_repo {
+        Some(dir) => absolutize_path(dir)?,
+        None => default_bare_repo_for_workdir(&repo_workdir),
+    };
+
+    let git_runner = GitRunner::new();
+    if !bare_repo.join("HEAD").exists() {
+        git_runner.init_bare(&bare_repo).await?;
+    }
+    let bare_str = bare_repo
+        .to_str()
+        .ok_or_else(|| CliError::Validation("bare_repo path must be valid UTF-8".to_string()))?
+        .to_string();
+
+    if !repo_workdir.join(".git").exists() {
+        if let Some(parent) = repo_workdir.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        git_runner.clone(&bare_str, &repo_workdir).await?;
+    } else if bare_repo.join("HEAD").exists()
+        && let Ok(existing_origin) = git_runner.get_remote_url(&repo_workdir, "origin").await
+        && is_relative_local_remote(&existing_origin)
+    {
+        git_runner
+            .set_remote_url(&repo_workdir, "origin", &bare_str)
+            .await?;
+    }
+
+    // Ensure `main` branch exists so proposal branches can cleanly branch off `main`.
+    if !git_runner
+        .ref_exists(&repo_workdir, "refs/heads/main")
+        .await?
+    {
+        let cfg_dir = repo_workdir.join(".keel");
+        tokio::fs::create_dir_all(&cfg_dir).await?;
+        let cfg_path = cfg_dir.join("config.yaml");
+        if !tokio::fs::try_exists(&cfg_path).await.unwrap_or(false) {
+            tokio::fs::write(&cfg_path, KeelConfig::default().to_yaml()?).await?;
+        }
+        let default_tenant_dir = repo_workdir.join("tenants/default");
+        tokio::fs::create_dir_all(&default_tenant_dir).await?;
+        let default_rbac_path = default_tenant_dir.join("rbac.yaml");
+        if !tokio::fs::try_exists(&default_rbac_path)
+            .await
+            .unwrap_or(false)
+        {
+            let rbac_yaml =
+                TenantManifestBundle::synthesize(&TenantIsolationConfig::new("default"))?
+                    .to_multi_doc_yaml()?;
+            tokio::fs::write(&default_rbac_path, rbac_yaml).await?;
+        }
+        let providers_dir = repo_workdir.join("providers");
+        tokio::fs::create_dir_all(&providers_dir).await?;
+        let registry_path = providers_dir.join("registry.yaml");
+        if !tokio::fs::try_exists(&registry_path).await.unwrap_or(false) {
+            tokio::fs::write(&registry_path, ProviderRegistry::default_day1().to_yaml()?).await?;
+        }
+        let mgmt_dir = repo_workdir.join("clusters/management");
+        tokio::fs::create_dir_all(&mgmt_dir).await?;
+        let mgmt_stack_path = mgmt_dir.join("management-stack.yaml");
+        if !tokio::fs::try_exists(&mgmt_stack_path)
+            .await
+            .unwrap_or(false)
+        {
+            let mut mgmt_params = ManagementCoreStackParams::new(
+                IN_CLUSTER_S3_BACKEND_URL,
+                FLUX_SYSTEM_NAMESPACE,
+                "clusters/management",
+            );
+            attach_s3_credentials_env_refs(&mut mgmt_params.env_refs, S3_CREDENTIALS_SECRET_NAME);
+            let mgmt_stack = synthesize_management_core_stack(&mgmt_params)?;
+            tokio::fs::write(&mgmt_stack_path, mgmt_stack.to_yaml()?).await?;
+        }
+        git_runner
+            .add(
+                &repo_workdir,
+                [
+                    ".keel/config.yaml",
+                    "tenants/default/rbac.yaml",
+                    "providers/registry.yaml",
+                    "clusters/management/management-stack.yaml",
+                ],
+            )
+            .await?;
+        let author = CommitAuthor::new("Keel Server", "server@keel.io");
+        git_runner
+            .commit(&repo_workdir, "chore(bootstrap): seed main branch", &author)
+            .await?;
+        git_runner
+            .push(&repo_workdir, "origin", "HEAD:refs/heads/main")
+            .await?;
+    }
+
+    let config_path = args
+        .config
+        .clone()
+        .unwrap_or_else(|| repo_workdir.join(".keel/config.yaml"));
+    let parsed_keel_cfg = if tokio::fs::try_exists(&config_path).await.unwrap_or(false) {
+        let raw = tokio::fs::read_to_string(&config_path).await?;
+        Some(KeelConfig::from_yaml(&raw)?)
+    } else {
+        None
+    };
+
+    let auth_phase = parsed_keel_cfg
+        .as_ref()
+        .map(|c| c.auth_phase)
+        .unwrap_or(AuthPhase::OidcActive);
+    let oidc_cfg = parsed_keel_cfg
+        .as_ref()
+        .and_then(|c| c.oidc.as_ref())
+        .filter(|o| o.enabled)
+        .cloned();
+
+    let telemetry = TelemetryMux::default();
+    let kube_reader = KubeClusterStatusReader::try_default().await.ok();
+    if let Some(ref reader) = kube_reader {
+        tracing::info!("Spawning background kube-rs CRD watchers for SSE telemetry");
+        for kind in WatchedCrdKind::ALL {
+            telemetry.spawn_crd_watcher(reader.client().clone(), kind, None);
+        }
+    }
+
+    let env_token = std::env::var("KEEL_GIT_TOKEN").ok();
+    let mut resolved_token: Option<String> = args
+        .git_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            env_token
+                .as_deref()
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(str::to_string)
+        });
+
+    if resolved_token.is_none()
+        && parsed_keel_cfg
+            .as_ref()
+            .is_some_and(|c| c.forge.provider != ForgeKind::Local)
+        && let Some(ref reader) = kube_reader
+    {
+        resolved_token = reader
+            .read_secret_key(KEEL_SYSTEM_NAMESPACE, FORGE_TOKEN_SECRET_NAME, "token")
+            .await;
+    }
+
+    let mut port_forwards: Vec<TempPortForward> = Vec::new();
+    let mut api_url_override: Option<String> = None;
+    if enable_in_cluster_port_forward
+        && kube_reader.is_some()
+        && let Some(ref cfg) = parsed_keel_cfg
+        && cfg
+            .forge
+            .api_url
+            .as_deref()
+            .is_some_and(|u| u.contains(".svc.cluster.local"))
+        && let Ok(pf) = start_forgejo_port_forward(None, None).await
+    {
+        tracing::info!(
+            local_port = pf.local_port,
+            "Started automatic port-forward to in-cluster Forgejo"
+        );
+        api_url_override = Some(format!("http://127.0.0.1:{}", pf.local_port));
+        if let Ok(slug) = parse_remote_repo_url(&cfg.forge.repo_url) {
+            let local_remote = format!(
+                "http://127.0.0.1:{}/{}/{}.git",
+                pf.local_port, slug.owner, slug.repo
+            );
+            let _ = git_runner
+                .set_remote_url(&repo_workdir, "origin", &local_remote)
+                .await;
+        }
+        port_forwards.push(pf);
+    }
+
+    if enable_in_cluster_port_forward
+        && kube_reader.is_some()
+        && let Some(ref oidc) = oidc_cfg
+        && oidc.issuer_url.contains("idp.keel.local")
+    {
+        match start_gateway_port_forward(None, None).await {
+            Ok(pf) => {
+                tracing::info!(
+                    local_port = pf.local_port,
+                    "Started automatic port-forward to Envoy Gateway (keel-ingress:8888) for Rauthy OIDC"
+                );
+                port_forwards.push(pf);
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "Failed to start automatic port-forward to Envoy Gateway (keel-ingress:8888)");
+            }
+        }
+    }
+
+    let forge = build_forge_provider(
+        parsed_keel_cfg.as_ref(),
+        resolved_token.as_deref(),
+        api_url_override.as_deref(),
+        &bare_repo,
+    )?;
+
+    let git_runner = if let Some(ref tok) = resolved_token
+        && parsed_keel_cfg
+            .as_ref()
+            .is_some_and(|c| c.forge.provider != ForgeKind::Local)
+    {
+        let username = match parsed_keel_cfg.as_ref().map(|c| c.forge.provider) {
+            Some(ForgeKind::Forgejo | ForgeKind::Gitea) => "keel",
+            _ => "git",
+        };
+        git_runner.with_credentials(GitCredentials::HttpsBasic {
+            username: username.to_string(),
+            password_or_token: tok.clone(),
+        })
+    } else {
+        git_runner
+    };
+
+    let secret_store: Arc<dyn SecretStateStore> = if let Some(ref reader) = kube_reader {
+        let k8s_store = K8sSecretStore::new(reader.client().clone());
+        if k8s_store.get_or_create_session_key().await.is_ok() {
+            Arc::new(k8s_store) as Arc<dyn SecretStateStore>
+        } else {
+            Arc::new(InMemorySecretStore::new())
+        }
+    } else {
+        Arc::new(InMemorySecretStore::new())
+    };
+
+    let live_mgmt_backend = if let Some(ref reader) = kube_reader {
+        reader
+            .read_stack_backend(FLUX_SYSTEM_NAMESPACE, "management-cluster-core")
+            .await
+    } else {
+        None
+    };
+    let repo_state_provider = RepoClusterStateProvider::new(&repo_workdir);
+    let mgmt_stack_backend = live_mgmt_backend.or_else(|| {
+        std::fs::read_to_string(repo_workdir.join("clusters/management/management-stack.yaml"))
+            .ok()
+            .and_then(|raw| serde_yml::from_str::<serde_json::Value>(&raw).ok())
+            .and_then(|v| {
+                v.get("spec")
+                    .and_then(|s| s.get("backend"))
+                    .and_then(|b| b.as_str())
+                    .map(str::to_string)
+            })
+    });
+    let mut state = AppState::new(
+        forge,
+        secret_store,
+        telemetry,
+        git_runner,
+        repo_workdir,
+        bare_str,
+        auth_phase,
+    )
+    .with_oidc_config(oidc_cfg);
+    if let Some(backend) = mgmt_stack_backend {
+        state.backend_url = backend;
+    }
+    if state
+        .backend_url
+        .contains("s3-state-backend-seaweedfs-s3.keel-system.svc.cluster.local")
+        || state
+            .secret_store
+            .has_s3_credentials()
+            .await
+            .unwrap_or(false)
+    {
+        state = state.with_s3_credentials_secret(Some(S3_CREDENTIALS_SECRET_NAME.to_string()));
+    }
+
+    if let Some(reader) = kube_reader {
+        tracing::info!("Connected to Kubernetes cluster for live Flux/PKO status reconciliation");
+        if reader.has_docker_proxy_service().await {
+            tracing::info!(
+                "Detected keel-docker-proxy in flux-system; enabling DOCKER_HOST for kind workspaces"
+            );
+            state = state.with_docker_proxy_url(Some(
+                "tcp://keel-docker-proxy.flux-system.svc.cluster.local:2375".to_string(),
+            ));
+        }
+        if let Some(ca_pem) = reader
+            .read_secret_key(KEEL_SYSTEM_NAMESPACE, "keel-wildcard-tls", "ca.crt")
+            .await
+        {
+            state = state.with_oidc_ca_pem(Some(ca_pem.into_bytes()));
+        }
+        state = state.with_state_provider(Arc::new(KubeClusterStateProvider::new(
+            repo_state_provider,
+            Arc::new(reader),
+        )));
+        if let Ok(raw_reg) =
+            tokio::fs::read_to_string(state.repo_workdir.join("providers/registry.yaml")).await
+            && let Ok(registry) = ProviderRegistry::from_yaml(&raw_reg)
+        {
+            let enabled_ids: Vec<String> = registry
+                .providers
+                .into_iter()
+                .filter(|p| p.enabled)
+                .map(|p| p.id)
+                .collect();
+            if let Ok(policy_val) = keel_kube::build_restrict_pulumi_providers_policy(&enabled_ids)
+            {
+                let _ = state
+                    .state_provider
+                    .apply_cluster_policy(
+                        keel_kube::kyverno::POLICY_RESTRICT_PULUMI_PROVIDERS,
+                        &policy_val,
+                    )
+                    .await;
+            }
+        }
+    }
+
+    Ok((state, None, port_forwards))
+}
+
+/// Binds `keel-server` on `args.bind` and runs until `shutdown` resolves.
+pub async fn execute_serve_until<F>(args: &ServeArgs, shutdown: F) -> Result<SocketAddr, CliError>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let (state, _unused, _forge_pf) = build_serve_state_with_forward(args, true).await?;
+    let router = build_router(state);
+    let listener = tokio::net::TcpListener::bind(&args.bind).await?;
+    let local_addr = listener.local_addr()?;
+
+    println!("Keel Control Plane listening on http://{local_addr}");
+    tracing::info!(%local_addr, "Listening for Keel HTTP/SSE connections");
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        shutdown.await;
+        let _ = shutdown_tx.send(true);
+    });
+
+    let mut graceful_rx = shutdown_rx.clone();
+    let mut serve_fut = std::pin::pin!(std::future::IntoFuture::into_future(
+        axum::serve(listener, router).with_graceful_shutdown(async move {
+            let _ = graceful_rx.wait_for(|v| *v).await;
+        })
+    ));
+
+    tokio::select! {
+        res = &mut serve_fut => {
+            res?;
+        }
+        _ = shutdown_rx.wait_for(|v| *v) => {
+            // Bound graceful drain so long-lived SSE streams (`/api/v1/events/stream`)
+            // cannot block Ctrl+C exit indefinitely.
+            if let Ok(res) = tokio::time::timeout(Duration::from_millis(500), serve_fut).await {
+                res?;
+            }
+        }
+    }
+    Ok(local_addr)
+}
+
+/// Runs `keel serve` until `SIGINT` (`Ctrl+C`) is received.
+pub async fn execute_serve(args: &ServeArgs) -> Result<String, CliError> {
+    let addr = execute_serve_until(args, async {
+        let _ = tokio::signal::ctrl_c().await;
+    })
+    .await?;
+    Ok(format!("Keel server on {addr} shut down cleanly."))
+}
