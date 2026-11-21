@@ -252,7 +252,7 @@ describe("ControlPlaneProvidersView component", () => {
     expect(api.getProposals).not.toHaveBeenCalled()
   })
 
-  it("derives health from add-on statuses and no longer lists add-on cards", async () => {
+  it("derives health from add-on statuses and no longer lists add-ons", async () => {
     const onNavigateToTopology = vi.fn()
     vi.mocked(api.getManagementAddons).mockResolvedValueOnce({
       liveStatusAvailable: true,
@@ -284,11 +284,14 @@ describe("ControlPlaneProvidersView component", () => {
       )
     })
     expect(screen.queryByText("Healthy")).not.toBeInTheDocument()
-    // Add-ons moved to the Topology Map "Management Plane" group.
+    // Add-ons are now protected rows in the Topology Map's Deployed Application Releases table.
     expect(
       screen.queryByText("Management Plane Base Addons")
     ).not.toBeInTheDocument()
-    expect(screen.queryByTestId("core-addon-kyverno")).not.toBeInTheDocument()
+    expect(
+      screen.queryByTestId("management-addon-row-kyverno")
+    ).not.toBeInTheDocument()
+    expect(screen.queryByText("Protected")).not.toBeInTheDocument()
     expect(
       screen.queryByRole("button", { name: /Upgrade|Rollback/i })
     ).not.toBeInTheDocument()
@@ -354,7 +357,10 @@ describe("ControlPlaneProvidersView component", () => {
     renderWithAuthz(<ControlPlaneProvidersView />)
 
     expect(screen.getByText("Proxmox VE Cluster")).toBeInTheDocument()
-    expect(screen.queryByTestId("core-addon-kyverno")).not.toBeInTheDocument()
+    expect(
+      screen.queryByTestId("management-addon-row-kyverno")
+    ).not.toBeInTheDocument()
+    expect(screen.queryByText("Protected")).not.toBeInTheDocument()
     expect(screen.getByTestId("management-health")).toHaveTextContent("Healthy")
     fireEvent.click(screen.getByRole("button", { name: /Refresh/i }))
     expect(api.getProviders).not.toHaveBeenCalled()

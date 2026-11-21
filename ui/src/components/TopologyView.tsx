@@ -16,7 +16,7 @@ import {
   reconcileStack,
 } from "../lib/api"
 import { errorMessage } from "../lib/errors"
-import { classifyStackResourceKind } from "../lib/utils"
+import { classifyStackResourceKind, isDemoMode } from "../lib/utils"
 import { useAuthz } from "../lib/authz-context"
 import { CatalogKindFilter } from "../lib/routes"
 import { StackInspectorModal } from "./StackInspectorModal"
@@ -31,12 +31,17 @@ import {
   buildReleaseColumns,
   buildStackColumns,
   isManagementStack,
+  ReleaseRowBusyContext,
+  releaseRowId,
+  releaseRowProps,
+  sortManagementFirst,
   stackNamespace,
 } from "./topology/columns"
 import { TopologySection } from "./topology/TopologySection"
 import { TopologyStats } from "./topology/TopologyStats"
 import { ManagementPlaneStrip } from "./topology/ManagementPlaneStrip"
-import { ManagementAddonsGroup } from "./topology/ManagementAddonsGroup"
+import { ManagementAddonDialogs } from "./topology/ManagementAddonDialogs"
+import { useManagementAddonActions } from "./topology/useManagementAddonActions"
 import { StreamStatus } from "./topology/StreamStatus"
 
 // Load the SSH terminal (wterm WASM core) only when a session is opened.
@@ -199,16 +204,37 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
     []
   )
 
+  const demo = isDemoMode()
+  // Owned here (not by table rows) so an open upgrade form or rollback confirmation survives a
+  // failed or empty releases refresh; catalog/core is fetched once, for authenticated admins.
+  const addonActions = useManagementAddonActions({
+    enabled: authz.isAdmin && authenticated,
+    demo,
+    onProposal: handleAddonProposal,
+    onError: setError,
+  })
+  const {
+    catalogById: addonCatalogById,
+    rollingBackId: addonRollingBackId,
+    openUpgrade: openAddonUpgrade,
+    requestRollback: requestAddonRollback,
+  } = addonActions
+
   const releaseColumns = useMemo(
     () =>
       buildReleaseColumns({
         authz,
         onEdit: onEditRelease,
-        reconcilingKey: reconcilingReleaseKey,
-        deletingKey,
         onInspect: (rel: ReleaseSummary, ns: string) =>
           setInspected({ namespace: ns, name: rel.name, kind: "release" }),
         onReconcile: handleReconcileRelease,
+        management: authz.isAdmin
+          ? {
+              catalogById: addonCatalogById,
+              onUpgrade: openAddonUpgrade,
+              onRollback: requestAddonRollback,
+            }
+          : undefined,
         onDelete: async (rel: ReleaseSummary) => {
           const ns = rel.namespace || "tenant-default"
           setDeletingKey(`release:${ns}/${rel.name}`)
@@ -232,26 +258,28 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
     [
       authz,
       onEditRelease,
-      reconcilingReleaseKey,
-      deletingKey,
       handleReconcileRelease,
+      addonCatalogById,
+      openAddonUpgrade,
+      requestAddonRollback,
       scheduleRefresh,
       setError,
     ]
   )
 
-  // Management add-ons (admin-only from the API) get their own protected group; the tenant
-  // table never shows them, so they can't be edited or deleted like tenant releases.
-  const { managementAddons, tenantReleases } = useMemo(() => {
-    const managementAddons: ReleaseSummary[] = []
-    const tenantReleases: ReleaseSummary[] = []
-    for (const r of releases) {
-      if (r.managementAddon) managementAddons.push(r)
-      else tenantReleases.push(r)
+  // Management add-ons (admin-only from the API) are protected rows of the releases table,
+  // listed first; their actions never include Edit or Delete.
+  const { tableReleases, tenantReleases, hasManagementAddons } = useMemo(() => {
+    const tenantReleases = releases.filter((r) => !r.managementAddon)
+    const tableReleases = authz.isAdmin
+      ? sortManagementFirst(releases)
+      : tenantReleases
+    return {
+      tableReleases,
+      tenantReleases,
+      hasManagementAddons: tableReleases.length > tenantReleases.length,
     }
-    return { managementAddons, tenantReleases }
-  }, [releases])
-  const showManagementAddons = authz.isAdmin && managementAddons.length > 0
+  }, [releases, authz.isAdmin])
 
   const managementStack = stacks.find(isManagementStack)
   const byKind = useMemo(() => {
@@ -283,8 +311,16 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
       </Button>
     ) : undefined
 
-  const rowId = (row: StackSummary | ReleaseSummary) =>
-    row.id || `${row.namespace}-${row.name}`
+  const releaseBusy = useMemo(
+    () => ({
+      reconcilingKey: reconcilingReleaseKey,
+      deletingKey,
+      rollingBackId: addonRollingBackId,
+    }),
+    [reconcilingReleaseKey, deletingKey, addonRollingBackId]
+  )
+
+  const rowId = (row: StackSummary) => row.id || `${row.namespace}-${row.name}`
 
   return (
     <div className="space-y-6">
@@ -406,7 +442,7 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
         icon={<Package className="h-5 w-5 text-emerald-400" />}
         title="Deployed Application Releases"
         subtitle={
-          showManagementAddons
+          hasManagementAddons
             ? "Protected management-plane add-ons and Flux HelmReleases & Kustomizations reconciled across tenant namespaces"
             : "Flux HelmReleases & Kustomizations reconciled across tenant namespaces"
         }
@@ -424,33 +460,27 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
           )
         }
       >
-        {/* Mounted for every admin (even with no add-ons listed) so an open upgrade form or
-            rollback confirmation survives a failed or empty releases refresh. */}
-        {authz.isAdmin && (authenticated || data.streamState === "demo") && (
-          <ManagementAddonsGroup
-            addons={managementAddons}
-            reconcilingKey={reconcilingReleaseKey}
-            onDiagnostics={(rel) =>
-              setInspected({
-                namespace: rel.namespace,
-                name: rel.name,
-                kind: "release",
-              })
+        <ReleaseRowBusyContext.Provider value={releaseBusy}>
+          <DataTable
+            data={tableReleases}
+            columns={releaseColumns}
+            filterPlaceholder={
+              hasManagementAddons
+                ? "Filter releases by name, namespace, chart, status, management..."
+                : "Filter releases by name, namespace, chart, status..."
             }
-            onReconcile={(rel) => void handleReconcileRelease(rel)}
-            onProposal={handleAddonProposal}
-            onError={setError}
+            emptyMessage="No application releases deployed yet — deploy a Helm chart from the Catalog."
+            noResultsMessage="No application releases matching your filter."
+            getRowId={releaseRowId}
+            getRowProps={releaseRowProps}
           />
-        )}
-        <DataTable
-          data={tenantReleases}
-          columns={releaseColumns}
-          filterPlaceholder="Filter releases by name, namespace, chart, status..."
-          emptyMessage="No application releases deployed yet — deploy a Helm chart from the Catalog."
-          noResultsMessage="No application releases matching your filter."
-          getRowId={rowId}
-        />
+        </ReleaseRowBusyContext.Provider>
       </TopologySection>
+
+      {/* Always mounted for admins, independent of the table rows. */}
+      {authz.isAdmin && (authenticated || demo) && (
+        <ManagementAddonDialogs actions={addonActions} />
+      )}
 
       <TelemetryStreamPanel
         filteredEvents={filteredEvents}

@@ -247,35 +247,54 @@ test.describe('06 - Full Localhost GUI GitOps Workflow', () => {
     await expect(page.getByText('Management Control Plane Cluster')).toBeVisible();
     await expect(page.getByText('Enabled Provider Mesh')).toBeVisible();
     await expect(page.getByText('Management Plane Base Addons')).toHaveCount(0);
-    await expect(page.getByTestId('core-addon-rauthy')).toHaveCount(0);
+    await expect(page.getByTestId('management-addon-row-rauthy')).toHaveCount(0);
     await page.getByRole('button', { name: /Manage add-ons in Topology Map/i }).click();
 
-    // 8. Management Plane group in Topology Map -> Deployed Application Releases.
+    // 8. Management add-ons are protected rows of Topology Map -> Deployed Application Releases.
     const releasesSection = page.getByTestId('topology-releases-section');
-    const addons = releasesSection.getByTestId('management-addons-group');
-    await expect(addons.getByRole('heading', { name: 'Management Plane' })).toBeVisible();
-    const rauthy = addons.getByTestId('core-addon-rauthy');
+    await expect(releasesSection.getByTestId('management-addons-group')).toHaveCount(0);
+    await expect(releasesSection.getByRole('table')).toHaveCount(1);
+    const rauthy = releasesSection.getByTestId('management-addon-row-rauthy');
     await expect(rauthy).toBeVisible();
+    // Management rows are listed before tenant releases.
+    await expect(releasesSection.locator('tbody tr').first()).toHaveAttribute(
+      'data-testid',
+      /^management-addon-row-/,
+    );
     // Rauthy is an image-based Flux Kustomization add-on: its version is the pinned image tag.
-    await expect(rauthy.getByText('v0.37.2')).toBeVisible();
-    await expect(rauthy.getByText('flux-system/rauthy · Kustomization')).toBeVisible();
+    await expect(rauthy).toContainText('0.37.2');
+    await expect(rauthy).toContainText('Kustomization');
+    await expect(rauthy).toContainText('flux-system');
     await expect(
       rauthy.getByRole('link', { name: 'https://idp.keel.local:8888/auth/v1/admin' }),
     ).toBeVisible();
     await expect(rauthy.getByText('Protected')).toBeVisible();
-    // Protected add-ons offer no tenant edit/delete actions.
-    await expect(addons.getByRole('button', { name: /Delete|Edit/ })).toHaveCount(0);
+    // Protected add-on rows offer no tenant edit/delete actions.
+    await expect(
+      releasesSection
+        .locator('[data-testid^="management-addon-row-"]')
+        .getByRole('button', { name: /Delete|Edit/ }),
+    ).toHaveCount(0);
     await expect(
       releasesSection.getByRole('button', { name: /Delete release (rauthy|s3-state-backend)/ }),
     ).toHaveCount(0);
-    await expect(rauthy.getByRole('button', { name: 'Diagnostics for rauthy' })).toBeEnabled();
-    await expect(rauthy.getByRole('button', { name: 'Reconcile rauthy' })).toBeEnabled();
-    await expect(rauthy.getByRole('button', { name: 'Rollback rauthy' })).toBeEnabled();
+    await expect(rauthy.getByTestId('management-addon-diagnostics-rauthy')).toBeEnabled();
+    await expect(rauthy.getByTestId('management-addon-reconcile-rauthy')).toBeEnabled();
+    await expect(rauthy.getByTestId('management-addon-rollback-rauthy')).toBeEnabled();
 
-    await addons
-      .getByTestId('core-addon-s3-state-backend')
-      .getByRole('button', { name: 'Upgrade s3-state-backend' })
-      .click();
+    // Filtering the table by "management" keeps only the add-on rows.
+    const filter = releasesSection.getByRole('textbox');
+    await filter.fill('management');
+    await expect(releasesSection.locator('tbody tr').first()).toHaveAttribute(
+      'data-testid',
+      /^management-addon-row-/,
+    );
+    await expect(
+      releasesSection.locator('tbody tr:not([data-testid^="management-addon-row-"])'),
+    ).toHaveCount(0);
+    await filter.fill('');
+
+    await releasesSection.getByTestId('management-addon-upgrade-s3-state-backend').click();
     await expect(page.getByRole('button', { name: /Sync Upstream Schema/i })).toBeVisible();
     await page.getByRole('button', { name: /Submit & Open Git PR Proposal/i }).click();
     await expect(
@@ -283,7 +302,7 @@ test.describe('06 - Full Localhost GUI GitOps Workflow', () => {
     ).toBeVisible({ timeout: 10000 });
 
     // Roll rauthy back to its previous Git revision (seeded 0.37.1 -> 0.37.2) through a reviewed PR.
-    await rauthy.getByRole('button', { name: 'Rollback rauthy' }).click();
+    await releasesSection.getByTestId('management-addon-rollback-rauthy').click();
     const rollbackDialog = page.getByRole('alertdialog', { name: /Roll back rauthy/i });
     await expect(rollbackDialog).toBeVisible();
     await rollbackDialog.getByRole('button', { name: 'Open Rollback PR' }).click();

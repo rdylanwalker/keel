@@ -91,6 +91,13 @@ interface DataTableProps<TData extends RowData> {
   emptyMessage?: string
   noResultsMessage?: string
   getRowId?: (row: TData, index: number) => string
+  /** Extra `className` / `data-testid` for a body row (e.g. to distinguish protected rows). */
+  getRowProps?: (row: TData) => DataTableRowProps | undefined
+}
+
+export interface DataTableRowProps {
+  className?: string
+  "data-testid"?: string
 }
 
 export function DataTable<TData extends RowData>({
@@ -100,6 +107,7 @@ export function DataTable<TData extends RowData>({
   emptyMessage = "No items found.",
   noResultsMessage = "No matching items.",
   getRowId,
+  getRowProps,
 }: DataTableProps<TData>) {
   const [sorting, setSorting] = useState<SortingState>([])
   const [globalFilter, setGlobalFilter] = useState("")
@@ -203,26 +211,30 @@ export function DataTable<TData extends RowData>({
             ))}
           </thead>
           <tbody className="divide-y divide-slate-800/60 font-mono">
-            {rows.map((row) => (
-              <tr
-                key={row.id}
-                className="group hover:bg-slate-800/40 transition-colors"
-              >
-                {row.getAllCells().map((cell) => {
-                  return (
-                    <td
-                      key={cell.id}
-                      className={`py-3 px-2 @md:px-3 whitespace-nowrap align-middle ${columnClasses(cell.column.columnDef.meta, "td")}`}
-                    >
-                      {flexRender(
-                        cell.column.columnDef.cell,
-                        cell.getContext()
-                      )}
-                    </td>
-                  )
-                })}
-              </tr>
-            ))}
+            {rows.map((row) => {
+              const extra = getRowProps?.(row.original)
+              return (
+                <tr
+                  key={row.id}
+                  data-testid={extra?.["data-testid"]}
+                  className={`group hover:bg-slate-800/40 transition-colors ${extra?.className ?? ""}`}
+                >
+                  {row.getAllCells().map((cell) => {
+                    return (
+                      <td
+                        key={cell.id}
+                        className={`py-3 px-2 @md:px-3 whitespace-nowrap align-middle ${columnClasses(cell.column.columnDef.meta, "td")}`}
+                      >
+                        {flexRender(
+                          cell.column.columnDef.cell,
+                          cell.getContext()
+                        )}
+                      </td>
+                    )
+                  })}
+                </tr>
+              )
+            })}
             {rows.length === 0 && (
               <tr>
                 <td

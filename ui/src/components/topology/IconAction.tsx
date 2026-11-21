@@ -19,16 +19,19 @@ export const IconAction: React.FC<{
   title: string
   onClick: () => void
   disabled?: boolean
+  /** In-flight action; exposed as `aria-busy`. */
+  busy?: boolean
   tone: keyof typeof TONES
   testId?: string
   children: React.ReactNode
-}> = ({ label, title, onClick, disabled, tone, testId, children }) => (
+}> = ({ label, title, onClick, disabled, busy, tone, testId, children }) => (
   <button
     type="button"
     aria-label={label}
     title={title}
     data-testid={testId}
     disabled={disabled}
+    aria-busy={busy || undefined}
     onClick={onClick}
     className={cn(
       "p-1 @md:p-1.5 rounded-md border transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-400",

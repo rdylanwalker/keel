@@ -1,13 +1,30 @@
-import { Pencil, RotateCw, Search, Terminal, Trash2 } from "lucide-react"
+import { createContext, useContext } from "react"
+import {
+  AlertTriangle,
+  ExternalLink,
+  Pencil,
+  RotateCcw,
+  RotateCw,
+  Search,
+  ShieldCheck,
+  SlidersHorizontal,
+  Terminal,
+  Trash2,
+} from "lucide-react"
 
-import { ReleaseSummary, StackSummary } from "../../types/api"
+import { CatalogItem, ReleaseSummary, StackSummary } from "../../types/api"
 import { formatLastSynced } from "../../lib/format"
 import { isStackSshSupported } from "../../lib/utils"
 import { Authz } from "../../lib/authz"
 import { BundleBadge } from "../BundleBadge"
-import { DataTableColumnDef } from "../DataTable"
+import { DataTableColumnDef, DataTableRowProps } from "../DataTable"
 import { StatusBadge } from "../StatusBadge"
 import { IconAction } from "./IconAction"
+import { Badge } from "../ui/badge"
+import {
+  MANAGEMENT_ADDON_CONFLICT_HINT,
+  managementAddonId,
+} from "./useManagementAddonActions"
 import { TruncatedText } from "../ui/truncated-text"
 
 export const MANAGEMENT_STACK_NAME = "management-cluster-core"
@@ -244,26 +261,179 @@ function StackActionsCell({
   )
 }
 
+/** Row actions specific to protected management add-on rows (cluster admins only). */
+export interface ManagementRowActions {
+  /** `catalog/core` entries by id; Upgrade is disabled for add-ons without one. */
+  catalogById: ReadonlyMap<string, CatalogItem>
+  onUpgrade: (addon: CatalogItem) => void
+  onRollback: (id: string) => void
+}
+
 export interface ReleaseRowActions {
   authz: Authz
   onEdit?: (namespace: string, name: string) => void
   onInspect: (rel: ReleaseSummary, namespace: string) => void
   onReconcile: (rel: ReleaseSummary) => void
   onDelete: (rel: ReleaseSummary) => void
+  /** Enables the management add-on actions (Diagnostics / Reconcile / Upgrade / Rollback). */
+  management?: ManagementRowActions
+}
+
+/**
+ * In-flight release row actions. Read by the action cells through context (not baked into the
+ * column defs) so starting a reconcile / rollback / delete doesn't rebuild the columns and
+ * re-mount the cells, which would drop keyboard focus returning from a confirmation dialog.
+ */
+export interface ReleaseRowBusyState {
   reconcilingKey: string | null
   deletingKey: string | null
+  rollingBackId: string | null
+}
+
+export const ReleaseRowBusyContext = createContext<ReleaseRowBusyState>({
+  reconcilingKey: null,
+  deletingKey: null,
+  rollingBackId: null,
+})
+
+/** Stable table row id; conflicting add-ons share namespace/name, so include the Flux kind. */
+export function releaseRowId(rel: ReleaseSummary): string {
+  if (rel.managementAddon)
+    return `${rel.namespace}-${rel.name}-${rel.addonKind ?? ""}`
+  return rel.id || `${rel.namespace}-${rel.name}`
+}
+
+/** Text matched by the table filter for a release name cell ("management"/"protected" find add-ons). */
+function releaseNameFilterText(
+  rel: ReleaseSummary,
+  catalogById?: ReadonlyMap<string, CatalogItem>
+): string {
+  if (!rel.managementAddon) return rel.name
+  const display = catalogById?.get(managementAddonId(rel))?.name
+  return [rel.name, display, "management protected", rel.addonKind]
+    .filter(Boolean)
+    .join(" ")
+}
+
+/** Version shown for a release (the desired Git version for management add-ons). */
+function releaseVersion(rel: ReleaseSummary): string {
+  return (rel.managementAddon && rel.desiredVersion) || rel.version || "latest"
+}
+
+/** Row styling and test id distinguishing protected management add-on rows. */
+export function releaseRowProps(
+  rel: ReleaseSummary
+): DataTableRowProps | undefined {
+  if (!rel.managementAddon) return undefined
+  return {
+    "data-testid": `management-addon-row-${managementAddonId(rel)}`,
+    className:
+      "bg-indigo-950/20 shadow-[inset_3px_0_0_0_rgba(129,140,248,0.55)]",
+  }
+}
+
+/** Management add-ons first (tenant releases keep their order); the table's default order. */
+export function sortManagementFirst(
+  releases: ReleaseSummary[]
+): ReleaseSummary[] {
+  return [
+    ...releases.filter((r) => r.managementAddon),
+    ...releases.filter((r) => !r.managementAddon),
+  ]
+}
+
+function ManagementNameCell({
+  rel,
+  addon,
+}: {
+  rel: ReleaseSummary
+  addon?: CatalogItem
+}) {
+  const id = managementAddonId(rel)
+  const displayName = addon?.name && addon.name !== rel.name ? addon.name : null
+  return (
+    <div className="flex min-w-0 flex-col gap-1">
+      <div className="flex min-w-0 items-center gap-1.5">
+        <ShieldCheck
+          className="h-3.5 w-3.5 shrink-0 text-indigo-400"
+          aria-hidden="true"
+        />
+        <TruncatedText
+          text={rel.name}
+          className="font-semibold text-slate-100"
+        />
+      </div>
+      {displayName && (
+        <TruncatedText
+          text={displayName}
+          className="font-sans text-[10px] text-slate-500"
+        />
+      )}
+      {addon?.description && (
+        <span className="sr-only">{addon.description}</span>
+      )}
+      <div className="flex min-w-0 flex-wrap items-center gap-1.5 font-sans">
+        <Badge title="Management-plane add-on (keel.io/protect: true) — changes open reviewed PRs">
+          Protected
+        </Badge>
+        {rel.conflict && (
+          <Badge
+            variant="warning"
+            role="note"
+            data-testid={`management-addon-conflict-${id}`}
+            title={MANAGEMENT_ADDON_CONFLICT_HINT}
+            aria-label={`Conflict: ${MANAGEMENT_ADDON_CONFLICT_HINT}`}
+          >
+            <AlertTriangle className="h-3 w-3" aria-hidden="true" />
+            Conflict
+          </Badge>
+        )}
+        {rel.conflict && rel.addonKind && (
+          <span
+            className="text-[10px] text-slate-500"
+            data-testid={`management-addon-kind-${id}`}
+          >
+            {rel.addonKind}
+          </span>
+        )}
+        {addon?.serviceUrl && (
+          <a
+            href={addon.serviceUrl}
+            target="_blank"
+            rel="noreferrer"
+            aria-label={addon.serviceUrl}
+            title={`Open ${addon.name || id}: ${addon.serviceUrl}`}
+            className="inline-flex items-center gap-1 text-[10px] text-indigo-400 hover:text-indigo-300"
+          >
+            <ExternalLink className="h-3 w-3" aria-hidden="true" />
+            <span className="hidden @3xl:inline">Service</span>
+          </a>
+        )}
+      </div>
+    </div>
+  )
 }
 
 export function buildReleaseColumns(
   actions: ReleaseRowActions
 ): DataTableColumnDef<ReleaseSummary>[] {
+  const catalogById = actions.management?.catalogById
   return [
     {
-      accessorKey: "name",
+      id: "name",
+      accessorFn: (row) => releaseNameFilterText(row, catalogById),
+      sortFn: (a, b) => a.original.name.localeCompare(b.original.name),
       header: "Release Name",
       meta: { grow: true },
       cell: ({ row }) => {
         const rel = row.original
+        if (rel.managementAddon)
+          return (
+            <ManagementNameCell
+              rel={rel}
+              addon={catalogById?.get(managementAddonId(rel))}
+            />
+          )
         return (
           <div className="flex min-w-0 flex-col gap-1">
             <TruncatedText
@@ -312,9 +482,16 @@ export function buildReleaseColumns(
           <span className="sr-only @md:not-sr-only">Status</span>
         </>
       ),
-      cell: ({ row }) => (
-        <StatusBadge status={row.original.status} collapsible />
-      ),
+      cell: ({ row }) =>
+        row.original.managementAddon ? (
+          <span
+            data-testid={`management-addon-status-${managementAddonId(row.original)}`}
+          >
+            <StatusBadge status={row.original.status} collapsible />
+          </span>
+        ) : (
+          <StatusBadge status={row.original.status} collapsible />
+        ),
     },
     {
       accessorKey: "namespace",
@@ -375,26 +552,42 @@ export function buildReleaseColumns(
     },
     {
       id: "version",
-      accessorFn: (row) => row.version || "latest",
+      accessorFn: releaseVersion,
       header: "Version",
       meta: { hideBelow: "lg" },
       cell: ({ row }) => (
-        <TruncatedText
-          text={row.original.version || "latest"}
-          className="max-w-[8rem] text-slate-400"
-        />
+        <span
+          title={
+            row.original.managementAddon
+              ? "Desired version declared in Git"
+              : undefined
+          }
+        >
+          <TruncatedText
+            text={releaseVersion(row.original)}
+            className="max-w-[8rem] text-slate-400"
+          />
+        </span>
       ),
     },
     {
       id: "runtime",
-      accessorFn: (row) => row.runtime || row.type || "helm",
+      // Management add-ons show their Flux object kind (HelmRelease / Kustomization).
+      accessorFn: (row) =>
+        (row.managementAddon && row.addonKind) ||
+        row.runtime ||
+        row.type ||
+        "helm",
       header: "Runtime",
       meta: { hideBelow: "2xl" },
-      cell: ({ row }) => (
-        <span className="uppercase text-slate-400">
-          {row.original.runtime || row.original.type || "helm"}
-        </span>
-      ),
+      cell: ({ row }) =>
+        row.original.managementAddon && row.original.addonKind ? (
+          <span className="text-slate-400">{row.original.addonKind}</span>
+        ) : (
+          <span className="uppercase text-slate-400">
+            {row.original.runtime || row.original.type || "helm"}
+          </span>
+        ),
     },
     {
       accessorKey: "lastSynced",
@@ -414,11 +607,97 @@ export function buildReleaseColumns(
       header: "Actions",
       enableSorting: false,
       meta: { align: "right", sticky: true },
-      cell: ({ row }) => (
-        <ReleaseActionsCell rel={row.original} actions={actions} />
-      ),
+      cell: ({ row }) =>
+        row.original.managementAddon ? (
+          <ManagementActionsCell rel={row.original} actions={actions} />
+        ) : (
+          <ReleaseActionsCell rel={row.original} actions={actions} />
+        ),
     },
   ]
+}
+
+/** Protected management add-on: Diagnostics, Reconcile, PR-driven Upgrade / Rollback; never Edit or Delete. */
+function ManagementActionsCell({
+  rel,
+  actions,
+}: {
+  rel: ReleaseSummary
+  actions: ReleaseRowActions
+}) {
+  const busy = useContext(ReleaseRowBusyContext)
+  const id = managementAddonId(rel)
+  const key = `${rel.namespace}/${rel.name}`
+  const reconciling = busy.reconcilingKey === key
+  const mgmt = actions.management
+  const addon = mgmt?.catalogById.get(id)
+  const conflict = Boolean(rel.conflict)
+  const rollingBack = Boolean(mgmt) && busy.rollingBackId === id
+  return (
+    <div className="inline-flex items-center justify-end gap-1 @md:gap-1.5">
+      <IconAction
+        testId={`management-addon-diagnostics-${id}`}
+        label={`Diagnostics for ${id}`}
+        title="Diagnostics"
+        onClick={() => actions.onInspect(rel, rel.namespace)}
+        tone="indigo-soft"
+      >
+        <Search className="h-3.5 w-3.5" />
+      </IconAction>
+      <IconAction
+        testId={`management-addon-reconcile-${id}`}
+        label={`Reconcile ${id}`}
+        title="Reconcile Now"
+        disabled={reconciling}
+        busy={reconciling}
+        onClick={() => actions.onReconcile(rel)}
+        tone="blue"
+      >
+        <RotateCw
+          className={`h-3.5 w-3.5 ${reconciling ? "animate-spin" : ""}`}
+        />
+      </IconAction>
+      {mgmt && (
+        <>
+          <IconAction
+            testId={`management-addon-upgrade-${id}`}
+            label={`Upgrade ${id}`}
+            title={
+              conflict
+                ? MANAGEMENT_ADDON_CONFLICT_HINT
+                : addon
+                  ? "Upgrade (Open PR: version + values)"
+                  : "No catalog/core entry for this add-on"
+            }
+            disabled={conflict || !addon}
+            onClick={() => addon && mgmt.onUpgrade(addon)}
+            tone="indigo"
+          >
+            <SlidersHorizontal className="h-3.5 w-3.5" />
+          </IconAction>
+          <IconAction
+            testId={`management-addon-rollback-${id}`}
+            label={`Rollback ${id}`}
+            title={
+              conflict
+                ? MANAGEMENT_ADDON_CONFLICT_HINT
+                : rollingBack
+                  ? "Rolling back..."
+                  : "Rollback (Open PR)"
+            }
+            disabled={conflict || rollingBack}
+            busy={rollingBack}
+            onClick={() => mgmt.onRollback(id)}
+            tone="emerald"
+          >
+            <RotateCcw
+              className={`h-3.5 w-3.5 ${rollingBack ? "animate-spin" : ""}`}
+            />
+          </IconAction>
+        </>
+      )}
+    </div>
+  )
 }
 
 function ReleaseActionsCell({
@@ -428,8 +707,11 @@ function ReleaseActionsCell({
   rel: ReleaseSummary
   actions: ReleaseRowActions
 }) {
+  const busy = useContext(ReleaseRowBusyContext)
   const ns = rel.namespace || "tenant-default"
   const key = `${ns}/${rel.name}`
+  const reconciling = busy.reconcilingKey === key
+  const deleting = busy.deletingKey === `release:${key}`
   const canOperate = actions.authz.canAccessTenant(ns)
   const noAccess = "You don't have access to this tenant"
   return (
@@ -456,18 +738,20 @@ function ReleaseActionsCell({
       <IconAction
         label={`Reconcile release ${rel.name}`}
         title={canOperate ? "Reconcile Now" : noAccess}
-        disabled={!canOperate || actions.reconcilingKey === key}
+        disabled={!canOperate || reconciling}
+        busy={reconciling}
         onClick={() => actions.onReconcile(rel)}
         tone="blue"
       >
         <RotateCw
-          className={`h-3.5 w-3.5 ${actions.reconcilingKey === key ? "animate-spin" : ""}`}
+          className={`h-3.5 w-3.5 ${reconciling ? "animate-spin" : ""}`}
         />
       </IconAction>
       <IconAction
         label={`Delete release ${rel.name}`}
         title={canOperate ? "Delete (Open PR)" : noAccess}
-        disabled={!canOperate || actions.deletingKey === `release:${key}`}
+        disabled={!canOperate || deleting}
+        busy={deleting}
         onClick={() => actions.onDelete(rel)}
         tone="red"
       >
