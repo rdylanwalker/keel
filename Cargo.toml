@@ -47,10 +47,8 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "for
 tower-http = { version = "0.7", features = ["cors", "trace", "fs"] }
 futures = "0.3"
 http = "1"
-tokio-stream = "0.1"
 base64 = "0.23"
 hex = "0.4"
-bcrypt = "0.19"
 jsonwebtoken = { version = "12", features = ["rust_crypto"] }
 url = "2.5"
 russh = "0.65"

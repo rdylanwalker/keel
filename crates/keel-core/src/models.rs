@@ -1424,6 +1424,377 @@ pub struct StackSshInfoResponse {
     pub has_saved_ssh_key: bool,
 }
 
+/// Returns the default SSH login user for a cloud/virtualization provider.
+pub fn default_ssh_user_for_provider(provider: &str) -> &'static str {
+    match provider.trim().to_ascii_lowercase().as_str() {
+        "aws" | "proxmox" => "ubuntu",
+        "azure" => "azureuser",
+        "gcp" => "debian",
+        "hetzner" => "root",
+        _ => "ubuntu",
+    }
+}
+
+/// Returns `true` if `host` is `"localhost"`, ends with `".local"`, `".internal"`, or `".cluster.local"`,
+/// or parses as an `IpAddr` that is loopback, unspecified, link-local (`169.254.0.0/16` / `fe80::/10`),
+/// multicast, or broadcast.
+pub fn is_private_or_internal_ssh_host(host: &str) -> bool {
+    let lower = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    if lower.is_empty()
+        || lower == "localhost"
+        || lower.ends_with(".localhost")
+        || lower.ends_with(".local")
+        || lower.ends_with(".internal")
+        || lower.ends_with(".cluster.local")
+    {
+        return true;
+    }
+    if let Ok(ip) = lower.parse::<std::net::IpAddr>() {
+        return match ip {
+            std::net::IpAddr::V4(v4) => {
+                v4.is_loopback()
+                    || v4.is_unspecified()
+                    || v4.is_link_local()
+                    || v4.is_multicast()
+                    || v4.is_broadcast()
+            }
+            std::net::IpAddr::V6(v6) => {
+                if let Some(v4) = v6.to_ipv4_mapped() {
+                    v4.is_loopback()
+                        || v4.is_unspecified()
+                        || v4.is_link_local()
+                        || v4.is_multicast()
+                        || v4.is_broadcast()
+                } else {
+                    v6.is_loopback()
+                        || v6.is_unspecified()
+                        || v6.is_unicast_link_local()
+                        || v6.is_multicast()
+                }
+            }
+        };
+    }
+    false
+}
+
+fn is_loopback_or_link_local(host: &str) -> bool {
+    let lower = host.to_ascii_lowercase();
+    lower == "localhost"
+        || lower == "::1"
+        || lower == "0.0.0.0"
+        || lower.starts_with("127.")
+        || lower.starts_with("169.254.")
+}
+
+fn clean_single_ssh_host(raw: &str) -> Option<String> {
+    let trimmed = raw.trim().trim_matches('"').trim_matches('\'').trim();
+    if trimmed.is_empty()
+        || trimmed.eq_ignore_ascii_case("dhcp")
+        || trimmed.eq_ignore_ascii_case("auto")
+        || trimmed.eq_ignore_ascii_case("none")
+        || trimmed.eq_ignore_ascii_case("null")
+        || trimmed.eq_ignore_ascii_case("undefined")
+        || trimmed.starts_with("${")
+        || trimmed.starts_with('-')
+    {
+        return None;
+    }
+    let host_part = match trimmed.split_once('/') {
+        Some((ip, prefix)) if prefix.chars().all(|c| c.is_ascii_digit()) => {
+            if ip.ends_with(".0") {
+                return None;
+            }
+            ip.trim()
+        }
+        Some(_) => return None,
+        None => trimmed,
+    };
+    if host_part.is_empty()
+        || host_part.contains(char::is_whitespace)
+        || host_part.contains(['[', ']', '{', '}'])
+    {
+        return None;
+    }
+    Some(host_part.to_string())
+}
+
+fn collect_hosts_from_json_value(val: &serde_json::Value, out: &mut Vec<String>) {
+    match val {
+        serde_json::Value::String(s) => {
+            if let Some(cleaned) = clean_single_ssh_host(s) {
+                out.push(cleaned);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_hosts_from_json_value(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn pick_preferred_host(candidates: Vec<String>) -> Option<String> {
+    candidates
+        .iter()
+        .find(|h| !is_loopback_or_link_local(h))
+        .cloned()
+        .or_else(|| candidates.into_iter().next())
+}
+
+/// Sanitizes and extracts a candidate SSH hostname or IP address from a raw string or JSON array string.
+pub fn clean_candidate_ssh_host(raw: &str) -> Option<String> {
+    let trimmed = raw.trim().trim_matches('"').trim_matches('\'').trim();
+    if trimmed.starts_with('[')
+        && let Ok(json_val) = serde_json::from_str::<serde_json::Value>(trimmed)
+    {
+        let mut candidates = Vec::new();
+        collect_hosts_from_json_value(&json_val, &mut candidates);
+        return pick_preferred_host(candidates);
+    }
+    clean_single_ssh_host(trimmed)
+}
+
+fn extract_ssh_host_from_yaml_value(val: &serde_json::Value) -> Option<String> {
+    match val {
+        serde_json::Value::String(s) => clean_candidate_ssh_host(s),
+        serde_json::Value::Array(_) => {
+            let mut candidates = Vec::new();
+            collect_hosts_from_json_value(val, &mut candidates);
+            pick_preferred_host(candidates)
+        }
+        _ => None,
+    }
+}
+
+/// Sanitizes a candidate SSH username, rejecting empty strings, template expressions, flags, or whitespace.
+pub fn clean_candidate_ssh_user(raw: &str) -> Option<String> {
+    let trimmed = raw.trim().trim_matches('"').trim_matches('\'').trim();
+    if trimmed.is_empty()
+        || trimmed.starts_with("${")
+        || trimmed.starts_with('-')
+        || trimmed.contains(char::is_whitespace)
+    {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+fn parse_candidate_ssh_port(val: &serde_json::Value) -> Option<u16> {
+    match val {
+        serde_json::Value::Number(n) => n
+            .as_u64()
+            .and_then(|p| u16::try_from(p).ok())
+            .filter(|p| *p > 0),
+        serde_json::Value::String(s) => s
+            .trim()
+            .trim_matches('"')
+            .parse::<u16>()
+            .ok()
+            .filter(|p| *p > 0),
+        _ => None,
+    }
+}
+
+/// Resolves SSH target connection details (`StackSshInfoResponse`) from live Pulumi outputs
+/// and GitOps manifests (`values.yaml`, `stack.yaml`, `Pulumi.yaml`).
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_ssh_target_from_sources(
+    stack_name: &str,
+    namespace: &str,
+    tenant: &str,
+    provider_override: Option<String>,
+    live_outputs: &std::collections::HashMap<String, String>,
+    values_doc: Option<&serde_json::Value>,
+    stack_doc: Option<&serde_json::Value>,
+    pulumi_doc: Option<&serde_json::Value>,
+    has_saved_ssh_key: bool,
+) -> StackSshInfoResponse {
+    let provider = stack_doc
+        .and_then(|d| {
+            d.pointer("/metadata/labels/keel.io~1provider")
+                .or_else(|| d.pointer("/spec/config/keel:provider"))
+        })
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .or_else(|| provider_override.filter(|p| !p.trim().is_empty()))
+        .unwrap_or_else(|| {
+            let lower = stack_name.to_ascii_lowercase();
+            for candidate in ["proxmox", "aws", "gcp", "azure", "hetzner", "kind"] {
+                if lower.contains(candidate) {
+                    return candidate.to_string();
+                }
+            }
+            "proxmox".to_string()
+        });
+
+    const HOST_KEYS: &[&str] = &[
+        "sshHost",
+        "ssh_host",
+        "externalIp",
+        "externalHostname",
+        "publicIp",
+        "public_ip",
+        "controlPlanePublicIp",
+        "controlPlaneIp",
+        "ipv4Address",
+        "ipv4Addresses",
+        "ipAddress",
+        "ip_address",
+        "hostname",
+        "host",
+        "ip",
+    ];
+    let mut ssh_host: Option<String> = None;
+    for key in HOST_KEYS {
+        if let Some(val) = live_outputs.get(*key)
+            && let Some(cleaned) = clean_candidate_ssh_host(val)
+        {
+            ssh_host = Some(cleaned);
+            break;
+        }
+    }
+    if ssh_host.is_none()
+        && let Some(obj) = values_doc.and_then(serde_json::Value::as_object)
+    {
+        for key in HOST_KEYS {
+            if let Some(val) = obj.get(*key)
+                && let Some(cleaned) = extract_ssh_host_from_yaml_value(val)
+            {
+                ssh_host = Some(cleaned);
+                break;
+            }
+        }
+    }
+    if ssh_host.is_none()
+        && let Some(obj) = stack_doc
+            .and_then(|d| d.pointer("/spec/config"))
+            .and_then(serde_json::Value::as_object)
+    {
+        for key in HOST_KEYS {
+            if let Some(val) = obj.get(*key)
+                && let Some(cleaned) = extract_ssh_host_from_yaml_value(val)
+            {
+                ssh_host = Some(cleaned);
+                break;
+            }
+        }
+    }
+    if ssh_host.is_none()
+        && let Some(obj) = pulumi_doc
+            .and_then(|d| d.get("outputs"))
+            .and_then(serde_json::Value::as_object)
+    {
+        for key in HOST_KEYS {
+            if let Some(val) = obj.get(*key)
+                && let Some(cleaned) = extract_ssh_host_from_yaml_value(val)
+            {
+                ssh_host = Some(cleaned);
+                break;
+            }
+        }
+    }
+    let ssh_host = ssh_host.unwrap_or_else(|| format!("{stack_name}.{tenant}.local"));
+
+    const USER_KEYS: &[&str] = &["sshUser", "ciuser", "username", "user", "adminUsername"];
+    let mut ssh_user: Option<String> = None;
+    for key in USER_KEYS {
+        if let Some(val) = live_outputs.get(*key)
+            && let Some(cleaned) = clean_candidate_ssh_user(val)
+        {
+            ssh_user = Some(cleaned);
+            break;
+        }
+    }
+    if ssh_user.is_none()
+        && let Some(obj) = values_doc.and_then(serde_json::Value::as_object)
+    {
+        for key in USER_KEYS {
+            if let Some(val) = obj.get(*key).and_then(serde_json::Value::as_str)
+                && let Some(cleaned) = clean_candidate_ssh_user(val)
+            {
+                ssh_user = Some(cleaned);
+                break;
+            }
+        }
+    }
+    if ssh_user.is_none()
+        && let Some(obj) = stack_doc
+            .and_then(|d| d.pointer("/spec/config"))
+            .and_then(serde_json::Value::as_object)
+    {
+        for key in USER_KEYS {
+            if let Some(val) = obj.get(*key).and_then(serde_json::Value::as_str)
+                && let Some(cleaned) = clean_candidate_ssh_user(val)
+            {
+                ssh_user = Some(cleaned);
+                break;
+            }
+        }
+    }
+    let ssh_user = ssh_user.unwrap_or_else(|| default_ssh_user_for_provider(&provider).to_string());
+
+    const PORT_KEYS: &[&str] = &["sshPort", "port"];
+    let mut ssh_port: Option<u16> = None;
+    for key in PORT_KEYS {
+        if let Some(val) = live_outputs.get(*key)
+            && let Some(p) = parse_candidate_ssh_port(&serde_json::Value::String(val.clone()))
+        {
+            ssh_port = Some(p);
+            break;
+        }
+    }
+    if ssh_port.is_none()
+        && let Some(obj) = values_doc.and_then(serde_json::Value::as_object)
+    {
+        for key in PORT_KEYS {
+            if let Some(val) = obj.get(*key)
+                && let Some(p) = parse_candidate_ssh_port(val)
+            {
+                ssh_port = Some(p);
+                break;
+            }
+        }
+    }
+    if ssh_port.is_none()
+        && let Some(obj) = stack_doc
+            .and_then(|d| d.pointer("/spec/config"))
+            .and_then(serde_json::Value::as_object)
+    {
+        for key in PORT_KEYS {
+            if let Some(val) = obj.get(*key)
+                && let Some(p) = parse_candidate_ssh_port(val)
+            {
+                ssh_port = Some(p);
+                break;
+            }
+        }
+    }
+    let ssh_port = ssh_port.unwrap_or(22);
+
+    let ssh_command = if ssh_port == 22 {
+        format!("ssh {ssh_user}@{ssh_host}")
+    } else {
+        format!("ssh -p {ssh_port} {ssh_user}@{ssh_host}")
+    };
+    let cli_command = format!("keel infra ssh {stack_name} --tenant {tenant}");
+    let cli_exec_command = format!("keel infra ssh {stack_name} --tenant {tenant} --exec");
+
+    StackSshInfoResponse {
+        stack_name: stack_name.to_string(),
+        namespace: namespace.to_string(),
+        tenant: tenant.to_string(),
+        provider,
+        ssh_host,
+        ssh_user,
+        ssh_port,
+        ssh_command,
+        cli_command,
+        cli_exec_command,
+        has_saved_ssh_key,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1722,5 +2093,70 @@ mod tests {
         let mut helm_app = app;
         helm_app.metadata.runtime = AppRuntime::Helm;
         assert!(helm_app.validate().is_err());
+    }
+
+    #[test]
+    fn test_ssh_target_resolution_and_private_host_detection() {
+        assert!(is_private_or_internal_ssh_host("localhost"));
+        assert!(is_private_or_internal_ssh_host("vm.acme.local"));
+        assert!(is_private_or_internal_ssh_host("db.internal"));
+        assert!(is_private_or_internal_ssh_host(
+            "svc.default.svc.cluster.local"
+        ));
+        assert!(is_private_or_internal_ssh_host("127.0.0.1"));
+        assert!(is_private_or_internal_ssh_host("0.0.0.0"));
+        assert!(is_private_or_internal_ssh_host("169.254.169.254"));
+        assert!(is_private_or_internal_ssh_host("::1"));
+        assert!(is_private_or_internal_ssh_host("fe80::1"));
+        assert!(is_private_or_internal_ssh_host("224.0.0.1"));
+        assert!(is_private_or_internal_ssh_host("255.255.255.255"));
+        assert!(!is_private_or_internal_ssh_host("192.168.1.50"));
+        assert!(!is_private_or_internal_ssh_host("203.0.113.10"));
+
+        assert_eq!(
+            clean_candidate_ssh_host(r#"["127.0.0.1", "10.10.20.55/24"]"#).as_deref(),
+            Some("10.10.20.55")
+        );
+        assert_eq!(clean_candidate_ssh_host("dhcp"), None);
+        assert_eq!(clean_candidate_ssh_host("-oProxyCommand=evil"), None);
+        assert_eq!(
+            clean_candidate_ssh_user("ubuntu"),
+            Some("ubuntu".to_string())
+        );
+        assert_eq!(clean_candidate_ssh_user("-oEvil"), None);
+
+        let mut live_outputs = std::collections::HashMap::new();
+        live_outputs.insert(
+            "ipv4Addresses".to_string(),
+            r#"["127.0.0.1","10.20.30.40"]"#.to_string(),
+        );
+        let values_doc = serde_json::json!({
+            "sshUser": "adminuser",
+            "sshPort": 2222
+        });
+        let stack_doc = serde_json::json!({
+            "metadata": {
+                "labels": {
+                    "keel.io/provider": "hetzner"
+                }
+            }
+        });
+        let info = resolve_ssh_target_from_sources(
+            "web-vm",
+            "tenant-acme",
+            "acme",
+            None,
+            &live_outputs,
+            Some(&values_doc),
+            Some(&stack_doc),
+            None,
+            true,
+        );
+        assert_eq!(info.provider, "hetzner");
+        assert_eq!(info.ssh_host, "10.20.30.40");
+        assert_eq!(info.ssh_user, "adminuser");
+        assert_eq!(info.ssh_port, 2222);
+        assert_eq!(info.ssh_command, "ssh -p 2222 adminuser@10.20.30.40");
+        assert!(info.has_saved_ssh_key);
     }
 }

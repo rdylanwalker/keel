@@ -1153,25 +1153,7 @@ fn validate_repo_dir(dir: &str) -> Result<(), PkoError> {
 }
 
 fn validate_k8s_dns_label(field: &str, value: &str) -> Result<(), PkoError> {
-    if value.is_empty() || value.len() > 63 {
-        return Err(PkoError::Validation(format!(
-            "{field} '{value}' must be 1..=63 characters"
-        )));
-    }
-    let bytes = value.as_bytes();
-    let starts_alnum = bytes[0].is_ascii_lowercase() || bytes[0].is_ascii_digit();
-    let ends_alnum =
-        bytes[bytes.len() - 1].is_ascii_lowercase() || bytes[bytes.len() - 1].is_ascii_digit();
-    let valid_chars = value
-        .chars()
-        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
-
-    if !starts_alnum || !ends_alnum || !valid_chars {
-        return Err(PkoError::Validation(format!(
-            "{field} '{value}' must be a valid RFC 1123 DNS label (lowercase alphanumeric and '-')"
-        )));
-    }
-    Ok(())
+    keel_core::validate_dns_label(value, field).map_err(|e| PkoError::Validation(e.to_string()))
 }
 
 fn validate_k8s_name(field: &str, value: &str) -> Result<(), PkoError> {

@@ -9,7 +9,6 @@ pub mod catalog;
 pub mod crypto;
 pub mod models;
 
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub use bootstrap::{
@@ -20,12 +19,12 @@ pub use catalog::{
     PartitionedValues, PreparedHelmValues, SchemaFieldError, extract_manifest_variables,
     extract_secret_field_paths, is_secret_schema_node, parse_catalog, parse_catalog_application,
     parse_catalog_blueprint, parse_catalog_bundle, partition_values_by_schema, prepare_helm_values,
-    render_helm_values_yaml, render_manifest_template, validate_k8s_manifests_yaml,
-    validate_schema_values,
+    render_helm_values_yaml, render_manifest_template, split_yaml_documents,
+    validate_k8s_manifests_yaml, validate_schema_values,
 };
 pub use crypto::{
-    AgeKeyPair, EnvelopeCrypto, SopsConfig, SopsCreationRule, SopsManager, generate_admin_password,
-    hash_dex_password_bcrypt, sha256_hex,
+    AES_256_KEY_LEN, AES_GCM_NONCE_LEN, AES_GCM_TAG_LEN, AgeKeyPair, EnvelopeCrypto, SopsConfig,
+    SopsCreationRule, SopsManager, generate_admin_password, sha256_hex,
 };
 pub use models::{
     AppRuntime, AuthPhase, BootstrapConfig, BootstrapDistro, BootstrapTargetKind, BundleItemKind,
@@ -36,7 +35,9 @@ pub use models::{
     CompanionInfraHook, DEFAULT_CLUSTER_NAME, DEFAULT_POLL_INTERVAL, ForgeConfig, ForgeKind,
     KeelConfig, ManifestEngine, OidcConfig, ProgressiveDeliverySpec, ProviderEntry,
     ProviderRegistry, ResourceQuotaSpec, S3BackendConfig, StackSshInfoResponse, TenantConfig,
-    UpstreamSource,
+    UpstreamSource, clean_candidate_ssh_host, clean_candidate_ssh_user,
+    default_ssh_user_for_provider, is_private_or_internal_ssh_host,
+    resolve_ssh_target_from_sources,
 };
 
 /// Flux CD controllers namespace (`SDD.md` §1).
@@ -135,24 +136,18 @@ pub fn tenant_namespace(tenant_id: &str) -> Result<String, CoreError> {
     Ok(ns)
 }
 
-/// Core metadata for Keel domain entities.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EntityMeta {
-    pub name: String,
-    pub namespace: String,
-    pub created_at: chrono::DateTime<chrono::Utc>,
-    pub id: uuid::Uuid,
-}
-
-impl EntityMeta {
-    pub fn new(name: impl Into<String>, namespace: impl Into<String>) -> Self {
-        Self {
-            name: name.into(),
-            namespace: namespace.into(),
-            created_at: chrono::Utc::now(),
-            id: uuid::Uuid::new_v4(),
+/// Percent-encodes a string according to RFC 3986 unreserved characters (`A-Z`, `a-z`, `0-9`, `-`, `_`, `.`, `~`).
+pub fn percent_encode(input: &str) -> String {
+    let mut out = String::with_capacity(input.len() + 8);
+    for b in input.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
         }
     }
+    out
 }
 
 #[cfg(test)]
@@ -161,9 +156,7 @@ mod tests {
 
     #[test]
     fn test_entity_meta_and_namespace_helpers() {
-        let meta = EntityMeta::new("test-app", KEEL_SYSTEM_NAMESPACE);
-        assert_eq!(meta.name, "test-app");
-        assert_eq!(meta.namespace, "keel-system");
+        assert_eq!(KEEL_SYSTEM_NAMESPACE, "keel-system");
         assert_eq!(FLUX_SYSTEM_NAMESPACE, "flux-system");
         assert_eq!(KEEL_PREVIEWS_NAMESPACE, "keel-previews");
 
@@ -175,6 +168,11 @@ mod tests {
         // Over 56 chars in tenant_id exceeds 63 chars when prefixed with "tenant-"
         let too_long = "a".repeat(57);
         assert!(tenant_namespace(&too_long).is_err());
+
+        assert_eq!(
+            percent_encode("keel-io/infra gitops"),
+            "keel-io%2Finfra%20gitops"
+        );
     }
 
     #[test]

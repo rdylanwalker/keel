@@ -360,19 +360,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
-name = "bcrypt"
-version = "0.19.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a0cd0bd35a28836d528d2b58ad499bc3c5641d59379421b1be9eeb0c2f2b912a"
-dependencies = [
- "base64 0.23.1",
- "blowfish",
- "getrandom 0.4.3",
- "subtle",
- "zeroize",
-]
-
-[[package]]
 name = "bcrypt-pbkdf"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2072,8 +2059,6 @@ dependencies = [
  "aes-gcm",
  "async-trait",
  "base64 0.23.1",
- "bcrypt",
- "chrono",
  "hex",
  "jsonschema",
  "rand 0.10.4",
@@ -2125,7 +2110,6 @@ dependencies = [
  "sha2",
  "thiserror",
  "tokio",
- "tokio-stream",
  "tracing",
 ]
 
@@ -2168,7 +2152,6 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
- "tokio-stream",
  "tower",
  "tower-http 0.7.1",
  "tracing",
@@ -4263,17 +4246,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c9cc2678c2cdd569ef8215e2afd7954ada2ae20b4fdd2c5fe6139a3b02d105db"
 dependencies = [
  "rustls",
- "tokio",
-]
-
-[[package]]
-name = "tokio-stream"
-version = "0.1.19"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a3d06f0b082ba57c26b79407372e57cf2a1e28124f78e9479fe80322cf53420b"
-dependencies = [
- "futures-core",
- "pin-project-lite",
  "tokio",
 ]
 

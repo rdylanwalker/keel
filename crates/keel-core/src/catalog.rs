@@ -395,15 +395,9 @@ fn is_valid_manifest_var_name(name: &str) -> bool {
     chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-/// Parses single or multi-document Kubernetes YAML, ensuring at least one non-empty document exists
-/// and every non-null document is a mapping with non-empty string `apiVersion`, `kind`, and `metadata.name`.
-pub fn validate_k8s_manifests_yaml(raw_yaml: &str) -> Result<Vec<Value>, CoreError> {
-    if raw_yaml.trim().is_empty() {
-        return Err(CoreError::Validation(
-            "Kubernetes manifests YAML must not be empty".to_string(),
-        ));
-    }
-
+/// Splits single or multi-document YAML on lines matching `---` or `...`,
+/// returning all non-empty document strings.
+pub fn split_yaml_documents(raw_yaml: &str) -> Vec<String> {
     let mut raw_docs = Vec::new();
     let mut current = String::new();
     for line in raw_yaml.lines() {
@@ -420,6 +414,19 @@ pub fn validate_k8s_manifests_yaml(raw_yaml: &str) -> Result<Vec<Value>, CoreErr
     if !current.trim().is_empty() {
         raw_docs.push(current);
     }
+    raw_docs
+}
+
+/// Parses single or multi-document Kubernetes YAML, ensuring at least one non-empty document exists
+/// and every non-null document is a mapping with non-empty string `apiVersion`, `kind`, and `metadata.name`.
+pub fn validate_k8s_manifests_yaml(raw_yaml: &str) -> Result<Vec<Value>, CoreError> {
+    if raw_yaml.trim().is_empty() {
+        return Err(CoreError::Validation(
+            "Kubernetes manifests YAML must not be empty".to_string(),
+        ));
+    }
+
+    let raw_docs = split_yaml_documents(raw_yaml);
 
     let mut docs = Vec::new();
     for (idx, doc_str) in raw_docs.into_iter().enumerate() {

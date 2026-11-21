@@ -1,11 +1,11 @@
-//! Cryptographic primitives (`AES-256-GCM` envelope encryption, SHA-256 hashing,
-//! bcrypt password hashing for Dex) and SOPS + `age` secrets management (`SDD.md` §6.3, `NFR-SEC-05`, `NFR-SEC-06`).
+//! Cryptographic primitives (`AES-256-GCM` envelope encryption, SHA-256 hashing)
+//! and SOPS + `age` secrets management (`SDD.md` §6.3, `NFR-SEC-05`, `NFR-SEC-06`).
 
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
-use aes_gcm::aead::Aead;
+use aes_gcm::aead::{Aead, Payload};
 use aes_gcm::{Aes256Gcm, Key, KeyInit, Nonce};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -41,17 +41,6 @@ pub fn generate_admin_password() -> String {
             CHARSET[idx] as char
         })
         .collect()
-}
-
-/// Hashes a plaintext password using bcrypt for Dex `staticPasswords` (`NFR-SEC-01`).
-pub fn hash_dex_password_bcrypt(password: &str) -> Result<String, CoreError> {
-    if password.trim().is_empty() {
-        return Err(CoreError::Validation(
-            "admin password must not be empty".to_string(),
-        ));
-    }
-    bcrypt::hash(password, bcrypt::DEFAULT_COST)
-        .map_err(|e| CoreError::Crypto(format!("bcrypt hash failed: {e}")))
 }
 
 /// `AES-256-GCM` envelope cipher for encrypting user SSH private keys and Forge PATs at rest (`NFR-SEC-05`).
@@ -107,13 +96,13 @@ impl EnvelopeCrypto {
         rand::random()
     }
 
-    /// Computes SHA-256 hex digest (associated helper convenience).
-    pub fn sha256_hex(data: &[u8]) -> String {
-        sha256_hex(data)
-    }
-
-    /// Encrypts `plaintext` with `AES-256-GCM` using a fresh 96-bit random nonce and returns Base64(`nonce || ciphertext`).
-    pub fn encrypt(&self, plaintext: &[u8]) -> Result<String, CoreError> {
+    /// Encrypts `plaintext` with `AES-256-GCM` and additional authenticated data (`aad`)
+    /// using a fresh 96-bit random nonce, returning `(nonce, ciphertext_with_tag)`.
+    pub fn encrypt_with_aad(
+        &self,
+        plaintext: &[u8],
+        aad: &[u8],
+    ) -> Result<([u8; AES_GCM_NONCE_LEN], Vec<u8>), CoreError> {
         let key: Key<Aes256Gcm> = self.key.into();
         let cipher = Aes256Gcm::new(&key);
         let mut nonce_bytes = [0u8; AES_GCM_NONCE_LEN];
@@ -121,9 +110,49 @@ impl EnvelopeCrypto {
         let nonce = Nonce::from(nonce_bytes);
 
         let ciphertext = cipher
-            .encrypt(&nonce, plaintext)
+            .encrypt(
+                &nonce,
+                Payload {
+                    msg: plaintext,
+                    aad,
+                },
+            )
             .map_err(|_| CoreError::Crypto("AES-256-GCM encryption failed".to_string()))?;
 
+        Ok((nonce_bytes, ciphertext))
+    }
+
+    /// Decrypts `ciphertext` with `AES-256-GCM`, 96-bit `nonce_bytes`, and additional authenticated data (`aad`).
+    pub fn decrypt_with_aad(
+        &self,
+        nonce_bytes: &[u8],
+        ciphertext: &[u8],
+        aad: &[u8],
+    ) -> Result<Vec<u8>, CoreError> {
+        if ciphertext.len() < AES_GCM_TAG_LEN {
+            return Err(CoreError::Crypto(
+                "Ciphertext payload too short to contain AES-GCM authentication tag".to_string(),
+            ));
+        }
+        let key: Key<Aes256Gcm> = self.key.into();
+        let cipher = Aes256Gcm::new(&key);
+        let nonce = Nonce::try_from(nonce_bytes)
+            .map_err(|_| CoreError::Crypto("Invalid AES-GCM nonce length".to_string()))?;
+
+        cipher
+            .decrypt(
+                &nonce,
+                Payload {
+                    msg: ciphertext,
+                    aad,
+                },
+            )
+            .map_err(|_| CoreError::Crypto("AES-256-GCM decryption failed".to_string()))
+    }
+
+    /// Encrypts `plaintext` with `AES-256-GCM` using a fresh 96-bit random nonce and returns Base64(`nonce || ciphertext`).
+    pub fn encrypt(&self, plaintext: &[u8]) -> Result<String, CoreError> {
+        let (nonce_bytes, ciphertext) = self.encrypt_with_aad(plaintext, &[])?;
         let mut combined = Vec::with_capacity(AES_GCM_NONCE_LEN + ciphertext.len());
         combined.extend_from_slice(&nonce_bytes);
         combined.extend_from_slice(&ciphertext);
@@ -144,26 +173,7 @@ impl EnvelopeCrypto {
         }
 
         let (nonce_bytes, ciphertext) = combined.split_at(AES_GCM_NONCE_LEN);
-        let key: Key<Aes256Gcm> = self.key.into();
-        let cipher = Aes256Gcm::new(&key);
-        let nonce = Nonce::try_from(nonce_bytes)
-            .map_err(|_| CoreError::Crypto("Invalid AES-GCM nonce length".to_string()))?;
-
-        cipher
-            .decrypt(&nonce, ciphertext)
-            .map_err(|_| CoreError::Crypto("AES-256-GCM decryption failed".to_string()))
-    }
-
-    /// Encrypts a UTF-8 credential string (SSH private key or PAT) into Base64(`nonce || ciphertext`).
-    pub fn encrypt_str(&self, secret: &str) -> Result<String, CoreError> {
-        self.encrypt(secret.as_bytes())
-    }
-
-    /// Decrypts a Base64(`nonce || ciphertext`) payload into a UTF-8 string.
-    pub fn decrypt_string(&self, encoded: &str) -> Result<String, CoreError> {
-        let bytes = self.decrypt(encoded)?;
-        String::from_utf8(bytes)
-            .map_err(|_| CoreError::Crypto("Decrypted payload is not valid UTF-8".to_string()))
+        self.decrypt_with_aad(nonce_bytes, ciphertext, &[])
     }
 }
 
@@ -266,6 +276,21 @@ impl SopsConfig {
             self.creation_rules.insert(insert_idx, rule);
         }
         Ok(())
+    }
+
+    /// Finds the creation rule whose `path_regex` starts with `^clusters/` (or does not start with `^tenants/`)
+    /// and returns its `.age` public key recipient slice.
+    pub fn cluster_age_recipient(&self) -> Option<&str> {
+        self.creation_rules
+            .iter()
+            .find(|r| r.path_regex.starts_with("^clusters/"))
+            .or_else(|| {
+                self.creation_rules
+                    .iter()
+                    .find(|r| !r.path_regex.starts_with("^tenants/"))
+            })
+            .map(|r| r.age.trim())
+            .filter(|age| !age.is_empty())
     }
 }
 
@@ -634,13 +659,27 @@ mod tests {
         assert!(!dbg.contains(&b64_key));
 
         let ssh_key = "-----BEGIN OPENSSH PRIVATE KEY-----\nsecret-ed25519-key\n-----END OPENSSH PRIVATE KEY-----";
-        let encrypted_1 = crypto.encrypt_str(ssh_key).unwrap();
-        let encrypted_2 = crypto.encrypt_str(ssh_key).unwrap();
+        let encrypted_1 = crypto.encrypt(ssh_key.as_bytes()).unwrap();
+        let encrypted_2 = crypto.encrypt(ssh_key.as_bytes()).unwrap();
         // Random 96-bit nonces ensure distinct ciphertexts for identical plaintexts
         assert_ne!(encrypted_1, encrypted_2);
 
-        let decrypted = crypto.decrypt_string(&encrypted_1).unwrap();
-        assert_eq!(decrypted, ssh_key);
+        let decrypted = crypto.decrypt(&encrypted_1).unwrap();
+        assert_eq!(decrypted, ssh_key.as_bytes());
+
+        // AAD encryption/decryption roundtrip and mismatch detection
+        let (nonce, ct_with_aad) = crypto
+            .encrypt_with_aad(ssh_key.as_bytes(), b"AES-256-GCM")
+            .unwrap();
+        let dec_with_aad = crypto
+            .decrypt_with_aad(&nonce, &ct_with_aad, b"AES-256-GCM")
+            .unwrap();
+        assert_eq!(dec_with_aad, ssh_key.as_bytes());
+        assert!(
+            crypto
+                .decrypt_with_aad(&nonce, &ct_with_aad, b"wrong-aad")
+                .is_err()
+        );
 
         // Wrong key fails authentication
         let wrong_crypto = EnvelopeCrypto::new(EnvelopeCrypto::generate_key());
@@ -662,18 +701,12 @@ mod tests {
 
     #[test]
     fn test_sha256_and_dex_bcrypt_password_hashing() {
-        let digest = EnvelopeCrypto::sha256_hex(b"keel-oidc");
+        let digest = sha256_hex(b"keel-oidc");
         assert_eq!(digest.len(), 64);
 
         let password = generate_admin_password();
         assert_eq!(password.len(), 20);
         assert!(password.chars().all(|c| c.is_ascii_alphanumeric()));
-
-        let hashed = hash_dex_password_bcrypt(&password).unwrap();
-        assert!(hashed.starts_with("$2"));
-        assert!(bcrypt::verify(&password, &hashed).unwrap());
-        assert!(!bcrypt::verify("wrong-password", &hashed).unwrap());
-        assert!(hash_dex_password_bcrypt("   ").is_err());
     }
 
     #[test]
@@ -699,6 +732,7 @@ mod tests {
             parsed.creation_rules[2].path_regex,
             r"^clusters/.*\.enc\.yaml$"
         );
+        assert_eq!(parsed.cluster_age_recipient(), Some(sample_pub.as_str()));
 
         // Upserting a new tenant places it BEFORE the cluster rule, and updating existing works in-place
         parsed.upsert_tenant_rule("gamma", &sample_pub).unwrap();
