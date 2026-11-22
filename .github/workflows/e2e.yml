@@ -27,6 +27,10 @@ permissions: {}
 jobs:
   e2e-mocked:
     name: Playwright E2E Suite (Mocked)
+    # ci.yml's e2e-quality job already runs the mocked suite on every PR and as part of the
+    # release CI gate; only repeat it here on a manual dispatch (in a called workflow
+    # `github.event_name` is the caller's event, so release.yml's `push` skips this job).
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-26.04
     permissions:
       contents: read

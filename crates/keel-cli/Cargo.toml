@@ -35,5 +35,4 @@ hmac.workspace = true
 hex.workspace = true
 k8s-openapi.workspace = true
 tempfile = "3"
-rand.workspace = true
 url.workspace = true

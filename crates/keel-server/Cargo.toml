@@ -10,14 +10,12 @@ keel-git.workspace = true
 keel-pko.workspace = true
 keel-kube.workspace = true
 
-aes-gcm.workspace = true
 async-trait.workspace = true
 axum.workspace = true
 base64.workspace = true
 chrono.workspace = true
 flate2 = "1"
 futures.workspace = true
-hex.workspace = true
 jsonwebtoken.workspace = true
 k8s-openapi.workspace = true
 rand.workspace = true
