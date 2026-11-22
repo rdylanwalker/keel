@@ -1,3 +1,18 @@
+## [0.10.0](https://github.com/rdylanwalker/keel/compare/v0.9.0...v0.10.0) (2026-11-22)
+
+### Features
+
+* **pko:** clone tenant and preview Stack programs with gitSource ([485dd6d](https://github.com/rdylanwalker/keel/commit/485dd6d7ade33ef4a5e2ef92fd1d45f4c6d7a8ae))
+
+### Bug Fixes
+
+* **deploy:** allow slow first image pulls in Stage 0 and live E2E waits ([2590dae](https://github.com/rdylanwalker/keel/commit/2590daef496b7a9080d8954c7b11a85d60a16b81))
+* **deploy:** close source-controller artifacts to tenants and add tenant source policies ([4a80063](https://github.com/rdylanwalker/keel/commit/4a80063dad8ed7c33418589ff6537a8312050acc))
+* **kube:** fail closed when a tenant preview has no tenant Git source ([0c55a55](https://github.com/rdylanwalker/keel/commit/0c55a55a8e611768a80ac7afc73f0665675bc96b))
+* **kube:** let tenant PKO workspaces reach the local-dev Docker proxy ([d958759](https://github.com/rdylanwalker/keel/commit/d95875918b93a5be5baeed07bb0a7886e110a1c3))
+* **pko:** fetch tenant Stack sources over HTTPS with the keel CA trusted ([62aff06](https://github.com/rdylanwalker/keel/commit/62aff06b08abdd45c1cc31c9a5b95455653d4821))
+* **server:** create preview Git credentials before the preview Stack ([b5cec7f](https://github.com/rdylanwalker/keel/commit/b5cec7f43f8ee5811e0bb49b86af41102634fb92))
+
 ## [0.9.0](https://github.com/rdylanwalker/keel/compare/v0.8.0...v0.9.0) (2026-11-22)
 
 ### Features

@@ -335,7 +335,7 @@ spec:
       containers:
         - name: keel-server
           # Pinned to `spec.upstream.version` (bumped by semantic-release with the crate version).
-          image: ghcr.io/rdylanwalker/keel:0.9.0
+          image: ghcr.io/rdylanwalker/keel:0.10.0
           args:
             - serve
             - --bind
