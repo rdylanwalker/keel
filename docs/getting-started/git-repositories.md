@@ -76,6 +76,16 @@ keel serve --bind 127.0.0.1:8080 --repo-dir ./keel-gitops
 
 `keel serve` automatically reads `keel-system/forge-token` and opens a background port-forward to Forgejo when running on `localhost`, so you can immediately submit and merge Pull Requests from the UI or CLI.
 
+### How PKO clones the in-cluster Forgejo
+
+Flux pulls the repository over the plain `http://forgejo-http...` Service URL. The Pulumi Kubernetes Operator only clones `https://` and `ssh://` URLs, so tenant and preview PKO Stacks clone the same repository through the Forgejo HTTPS ingress instead:
+
+- Bootstrap writes `forge.publicUrl` to `.keel/config.yaml`: the Forgejo HTTPS origin derived from `--oidc-public-url` (default `https://forgejo.keel.local:8888`, same host pattern and port as the IdP). `keel serve` reads it at start-up and turns `http://forgejo-http.keel-system.svc.cluster.local:3000/<org>/<repo>.git` into `<publicUrl>/<org>/<repo>.git` for every Stack `projectRepo`.
+- In-cluster pods resolve the Forgejo host to Envoy Gateway through a CoreDNS rewrite that bootstrap applies whenever `--with-forge` is set.
+- The ingress certificate is signed by the self-signed Keel CA. Bootstrap copies the CA's public certificate (`ca.crt` only) into the `keel-ca-bundle` ConfigMap in `keel-system`, `keel-previews` and every existing tenant namespace, and the Kyverno `sync-keel-ca-bundle` policy copies it into tenant namespaces created later. After the CA is renewed, re-run `keel bootstrap init` to refresh every copy. The PKO operator and the Stack workspace pods mount it at `/etc/keel-ca` with `SSL_CERT_DIR=/etc/ssl/certs:/etc/keel-ca`.
+
+If a Pulumi proposal fails with `409` and asks you to set `forge.publicUrl`, the repository's `.keel/config.yaml` predates this setting: add it under `forge:` on `main` (for example `publicUrl: https://forgejo.keel.local:8888`) and restart `keel serve`. Stack URLs on external forges (`https://`, `ssh://`) are used as they are; any other `http://` URL is refused, because PKO cannot clone it.
+
 > **Note:** Inside a local `kind` cluster, in-cluster Forgejo storage is ephemeral if you delete the `kind` cluster. Use an external Git repository (`--git-url`) for durable state.
 
 ---

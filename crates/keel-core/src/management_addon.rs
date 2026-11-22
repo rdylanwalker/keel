@@ -163,6 +163,17 @@ pub fn management_addon_mutable_values(id: &str) -> Option<&'static [&'static st
             "/resources|tolerations|nodeSelector|affinity|topologySpreadConstraints",
             "/persistence/size|storageClass|accessModes|labels",
         ]),
+        // PKO runs every management/tenant Stack. Its operator CA trust (`extraEnv`
+        // `SSL_CERT_DIR`, `extraVolumes`/`extraVolumeMounts` of the public `keel-ca-bundle`),
+        // security contexts, RBAC and service account decide which Git endpoints it trusts and
+        // what it may do, so only replicas (`replicaCount`, the key the chart reads), log
+        // settings, sizing and scheduling are mutable. The `catalog/core` upgrade form schema
+        // exposes only these keys, so its submitted defaults never touch locked values.
+        "pulumi-kubernetes-operator" => Some(&[
+            "/replicaCount",
+            "/controller/logLevel|logFormat",
+            "/resources|tolerations|nodeSelector|affinity|priorityClassName|topologySpreadConstraints",
+        ]),
         _ => None,
     }
 }
@@ -1180,6 +1191,118 @@ mod tests {
             forgejo.pointer("/spec/chart/spec/version").unwrap(),
             "17.4.0"
         );
+    }
+
+    #[test]
+    fn pko_ca_trust_and_security_values_cannot_be_changed() {
+        let doc = helm_release(
+            "pulumi-kubernetes-operator",
+            json!({
+                "replicaCount": 1,
+                "extraEnv": [{"name": "SSL_CERT_DIR", "value": "/etc/ssl/certs:/etc/keel-ca"}],
+                "extraVolumes": [{"name": "keel-ca", "configMap": {"name": "keel-ca-bundle", "optional": true}}],
+                "extraVolumeMounts": [{"name": "keel-ca", "mountPath": "/etc/keel-ca", "readOnly": true}]
+            }),
+        );
+        for (values, needle) in [
+            (json!({"extraEnv": []}), "/extraEnv"),
+            (
+                json!({"extraVolumes": [{"name": "keel-ca", "secret": {"secretName": "keel-ca-secret"}}]}),
+                "/extraVolumes",
+            ),
+            (json!({"extraVolumeMounts": []}), "/extraVolumeMounts"),
+            (
+                json!({"securityContext": {"allowPrivilegeEscalation": true}}),
+                "/securityContext",
+            ),
+        ] {
+            assert_rejected("pulumi-kubernetes-operator", &doc, values, needle);
+        }
+        let mut ok = doc.clone();
+        apply_management_addon_upgrade(
+            "pulumi-kubernetes-operator",
+            &mut ok,
+            None,
+            &json!({
+                "replicaCount": 2,
+                "controller": {"logLevel": "debug"},
+                "resources": {"limits": {"memory": "256Mi"}}
+            }),
+        )
+        .unwrap();
+        assert_eq!(ok.pointer("/spec/values/replicaCount"), Some(&json!(2)));
+    }
+
+    /// Mirrors `extractSchemaDefaults` (`ui/src/lib/schemaBuilder.ts`): fills unset keys with
+    /// schema defaults, recursing into object properties and dropping empty nested mappings.
+    fn extract_schema_defaults(schema: &Value, base: &Value) -> Value {
+        let mut result = base.as_object().cloned().unwrap_or_default();
+        let Some(props) = schema.get("properties").and_then(Value::as_object) else {
+            return Value::Object(result);
+        };
+        for (key, prop) in props {
+            if !result.contains_key(key)
+                && let Some(default) = prop.get("default")
+            {
+                result.insert(key.clone(), default.clone());
+            } else if prop.get("type") == Some(&json!("object")) && prop.get("properties").is_some()
+            {
+                let nested = extract_schema_defaults(
+                    prop,
+                    result
+                        .get(key)
+                        .filter(|v| v.is_object())
+                        .unwrap_or(&Value::Null),
+                );
+                if nested.as_object().is_some_and(|m| !m.is_empty()) {
+                    result.insert(key.clone(), nested);
+                }
+            }
+        }
+        Value::Object(result)
+    }
+
+    #[test]
+    fn pko_upgrade_form_schema_defaults_are_accepted() {
+        let app = crate::parse_catalog_application(include_str!(
+            "../../../deploy/catalog/core/pulumi-kubernetes-operator/catalog.yaml"
+        ))
+        .unwrap();
+        let seed: Value = include_str!("../../../deploy/seed/core-addons/pko.yaml")
+            .split("\n---\n")
+            .map(|d| serde_yml::from_str::<Value>(d).unwrap())
+            .find(|d| d["kind"] == "HelmRelease")
+            .unwrap();
+        let live = seed["spec"]["values"].clone();
+        // Seeded from the live values (edit) and from nothing (no `initialConfig`).
+        for base in [live.clone(), Value::Null] {
+            let form = extract_schema_defaults(&app.spec.schema, &base);
+            let mut merged = live.clone();
+            merge_json_values(&mut merged, &form);
+            assert!(
+                disallowed_value_changes("pulumi-kubernetes-operator", &live, &merged).is_empty(),
+                "{form}"
+            );
+            // Chart-version-only bump: the dialog still submits the form defaults.
+            let mut doc = seed.clone();
+            apply_management_addon_upgrade(
+                "pulumi-kubernetes-operator",
+                &mut doc,
+                Some("2.11.0"),
+                &form,
+            )
+            .unwrap();
+            assert_eq!(doc["spec"]["values"]["extraEnv"], live["extraEnv"]);
+        }
+        // Every key the schema offers is upgradable.
+        let mut doc = seed.clone();
+        apply_management_addon_upgrade(
+            "pulumi-kubernetes-operator",
+            &mut doc,
+            None,
+            &json!({"replicaCount": 2, "controller": {"logLevel": "debug"}}),
+        )
+        .unwrap();
     }
 
     #[test]

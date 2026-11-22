@@ -14,7 +14,7 @@ The pod's `/var/lib/keel` is an `emptyDir`, so the working tree is rebuilt from 
 - If `--repo-dir` is missing or empty, the server clones `<url>` into it. If the remote is empty, it seeds `main` and pushes it.
 - If `--repo-dir` is already a clone (a container restart with the same volume), the server re-points `origin` at `<url>` if needed, fetches it, and hard-syncs `main` to `origin/main`.
 - If `--repo-dir` is a non-empty directory that isn't a clone, the server refuses to start rather than overwrite it.
-- With `--git-url` set, no sibling bare repository is created. Preview and tenant `Stack`s don't use this URL: they clone the tenant's own platform-written Git source (`tenants/<id>/git-repository.yaml`) through PKO `gitSource`.
+- With `--git-url` set, no sibling bare repository is created. Preview and tenant `Stack`s don't use this URL: they clone the tenant's own platform-written Git source (`tenants/<id>/git-repository.yaml`) through PKO `gitSource`. For the in-cluster Forgejo, whose `http://` Service URL PKO cannot clone, the Stacks use the Forgejo HTTPS origin from `forge.publicUrl` in the repository's `.keel/config.yaml` (written by `keel bootstrap init --with-forge`); the server reads it at start-up.
 
 HTTP(S) credentials come only from `KEEL_GIT_TOKEN` (paired with `KEEL_GIT_USERNAME`, default `keel`). Keel passes them to `git` through ephemeral config environment variables, never argv, `.git/config`, or logs. URLs with embedded `user:token@` credentials are rejected.
 

@@ -16,24 +16,27 @@ spec:
   progressiveDelivery:
     flaggerSupported: false
     defaultCanary: false
+  # Only keys the management API accepts for this add-on (`management_addon_mutable_values`):
+  # the upgrade dialog submits every schema default, so a default on a locked key (security
+  # contexts, CA trust volumes/env) would reject every GUI upgrade. `replicaCount` is the key the
+  # 2.x chart reads; its default matches the seed `core-addons/pko.yaml`.
   schema:
     type: object
     properties:
+      replicaCount:
+        type: integer
+        title: Operator Replicas
+        default: 1
+        minimum: 1
+        maximum: 10
       controller:
         type: object
         title: Operator Controller Settings
         properties:
-          replicas:
-            type: integer
-            title: Controller Replicas
-            default: 2
-            minimum: 1
-            maximum: 10
-          securityContext:
-            type: object
-            title: Security Context
-            properties:
-              runAsNonRoot:
-                type: boolean
-                title: Run As Non-Root
-                default: true
+          logLevel:
+            type: string
+            title: Log Level
+            enum:
+              - debug
+              - info
+              - error

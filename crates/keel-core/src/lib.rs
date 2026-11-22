@@ -60,7 +60,7 @@ pub use models::{
     ProgressiveDeliverySpec, ProviderEntry, ProviderRegistry, ResourceQuotaSpec, S3BackendConfig,
     StackSshInfoResponse, TenantConfig, UpstreamSource, clean_candidate_ssh_host,
     clean_candidate_ssh_user, default_ssh_user_for_provider, is_private_or_internal_ssh_host,
-    resolve_ssh_target_from_sources,
+    resolve_ssh_target_from_sources, validate_https_origin,
 };
 
 /// Flux CD controllers namespace (`SDD.md` §1).
@@ -71,6 +71,14 @@ pub const KEEL_SYSTEM_NAMESPACE: &str = "keel-system";
 
 /// Isolated namespace for ephemeral PKO v2 PR preview stacks (`SDD.md` §4.2).
 pub const KEEL_PREVIEWS_NAMESPACE: &str = "keel-previews";
+
+/// ConfigMap (key `ca.crt`) holding only the **public** Keel CA certificate, present in
+/// `keel-system`, `keel-previews` and every `tenant-<id>` namespace so PKO (operator and
+/// workspace pods) trusts the in-cluster Forgejo HTTPS ingress. Never the CA private key.
+pub const KEEL_CA_BUNDLE_CONFIGMAP: &str = "keel-ca-bundle";
+
+/// Key of the PEM certificate in [`KEEL_CA_BUNDLE_CONFIGMAP`].
+pub const KEEL_CA_BUNDLE_KEY: &str = "ca.crt";
 
 /// Unified error type for `keel-core` operations.
 #[derive(Error, Debug)]

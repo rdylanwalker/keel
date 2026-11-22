@@ -55,6 +55,16 @@ pub const PULUMI_PASSPHRASE_SECRET_KEY: &str = "passphrase";
 /// Pulumi passphrase environment variable; only ever injected via `valueFrom.secretKeyRef`.
 pub const PULUMI_CONFIG_PASSPHRASE_ENV: &str = "PULUMI_CONFIG_PASSPHRASE";
 const PULUMI_CONFIG_PASSPHRASE_FILE_ENV: &str = "PULUMI_CONFIG_PASSPHRASE_FILE";
+pub use keel_core::KEEL_CA_BUNDLE_CONFIGMAP;
+/// Workspace volume holding the public Keel CA bundle.
+pub const KEEL_CA_VOLUME_NAME: &str = "keel-ca";
+/// Read-only mount path of [`KEEL_CA_VOLUME_NAME`] in the `fetch` and `pulumi` containers.
+pub const KEEL_CA_MOUNT_PATH: &str = "/etc/keel-ca";
+/// Go/OpenSSL CA directory list: the image's system roots plus the Keel CA bundle.
+pub const KEEL_SSL_CERT_DIR: &str = "/etc/ssl/certs:/etc/keel-ca";
+const SSL_CERT_DIR_ENV: &str = "SSL_CERT_DIR";
+/// PKO v2 workspace init container that clones `projectRepo` (`/share/agent init --git-url`).
+pub const PKO_FETCH_CONTAINER_NAME: &str = "fetch";
 
 /// Standard Kubernetes `metadata` block for synthesized CRs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -338,9 +348,9 @@ impl PkoGitSource {
         self
     }
 
-    /// Validates the source: a network Git URL (`https://`, `http://`, `ssh://` or scp-like
-    /// `user@host:path`, never a local path, `file://` or a git remote helper such as `ext::`),
-    /// exactly one of `branch`/`commit`, a contained `repoDir` and well-formed Secret names.
+    /// Validates the source: a Git URL PKO can clone (`https://`, `ssh://` or scp-like
+    /// `user@host:path`; never `http://`, a local path, `file://` or a git remote helper such as
+    /// `ext::`), exactly one of `branch`/`commit`, a contained `repoDir` and well-formed Secret names.
     pub fn validate(&self) -> Result<(), PkoError> {
         validate_git_source_url(&self.project_repo)?;
         match (&self.branch, &self.commit) {
@@ -387,10 +397,106 @@ pub fn is_ssh_git_url(url: &str) -> bool {
             .is_some_and(|(host, _)| host.contains('@') && !host.contains('/'))
 }
 
-/// Accepts only network Git URLs PKO workspace pods can clone: `https://`, `http://`, `ssh://`
-/// or scp-like `user@host:path`. Rejects local paths, `file://`, git remote helpers (`ext::`,
-/// `fd::`), option-like values and whitespace/control characters.
+/// Accepts only Git URLs PKO v2 can clone (`spec.projectRepo`): `https://`, `ssh://` or scp-like
+/// `user@host:path`. PKO (Pulumi SDK `gitutil.ParseGitRepoURL`) rejects plain `http://`, so an
+/// in-cluster `http://` forge Service URL (fine for Flux) must first be mapped to the forge's
+/// HTTPS origin with [`pko_project_repo_url`]. Rejects local paths, `file://`, git remote helpers
+/// (`ext::`, `fd::`), option-like values, embedded credentials and whitespace/control characters.
 pub fn validate_git_source_url(url: &str) -> Result<(), PkoError> {
+    validate_network_git_url(url, false)
+}
+
+/// Like [`validate_git_source_url`] but also accepts `http://`: the URL schemes a Flux
+/// `GitRepository` may use (e.g. the in-cluster Forgejo Service
+/// [`IN_CLUSTER_FORGEJO_HTTP_HOST`]). Never put such a URL in a PKO Stack as is; map it with
+/// [`pko_project_repo_url`].
+pub fn validate_flux_git_source_url(url: &str) -> Result<(), PkoError> {
+    validate_network_git_url(url, true)
+}
+
+/// Cluster DNS name of the Stage 0 in-cluster Forgejo HTTP Service. Flux `GitRepository`s pull
+/// from it over plain `http://`; PKO Stacks clone the same repository through the Forgejo HTTPS
+/// ingress origin instead (see [`pko_project_repo_url`]).
+pub const IN_CLUSTER_FORGEJO_HTTP_HOST: &str = "forgejo-http.keel-system.svc.cluster.local";
+
+/// `true` when `url` is an `http://` URL of the in-cluster Forgejo Service
+/// (`forgejo-http.keel-system.svc[.cluster.local][:port]`).
+pub fn is_in_cluster_forgejo_http_url(url: &str) -> bool {
+    let Some(rest) = url.trim().strip_prefix("http://") else {
+        return false;
+    };
+    let authority = rest.split('/').next().unwrap_or_default();
+    if authority.contains('@') {
+        return false;
+    }
+    let host = authority
+        .rsplit_once(':')
+        .filter(|(_, port)| port.chars().all(|c| c.is_ascii_digit()))
+        .map_or(authority, |(h, _)| h)
+        .to_ascii_lowercase();
+    host == IN_CLUSTER_FORGEJO_HTTP_HOST || host == "forgejo-http.keel-system.svc"
+}
+
+/// Derives the URL a tenant or preview PKO `Stack` clones (`spec.projectRepo`) from the tenant's
+/// Flux `GitRepository` URL:
+///
+/// * `https://`, `ssh://` and scp-like URLs (external forges) pass through unchanged;
+/// * the in-cluster Forgejo `http://` Service URL (Flux pulls over it; PKO rejects `http`) maps to
+///   the platform-configured Forgejo HTTPS origin (`forge.publicUrl` in `.keel/config.yaml`, e.g.
+///   `https://forgejo.keel.local:8888`, served by Envoy Gateway with the Keel CA) +
+///   `/<org>/<repo>.git`;
+/// * any other `http://` URL fails closed with an actionable error.
+///
+/// `forge_https_origin` is platform configuration, never a tenant-editable value.
+pub fn pko_project_repo_url(
+    flux_url: &str,
+    forge_https_origin: Option<&str>,
+) -> Result<String, PkoError> {
+    validate_flux_git_source_url(flux_url)?;
+    if validate_git_source_url(flux_url).is_ok() {
+        return Ok(flux_url.to_string());
+    }
+    if !is_in_cluster_forgejo_http_url(flux_url) {
+        return Err(PkoError::Validation(format!(
+            "Git source URL '{flux_url}' uses plain http://, which PKO cannot clone (only \
+             https://, ssh:// or user@host:path); point the tenant Flux GitRepository at the \
+             forge's HTTPS or SSH URL"
+        )));
+    }
+    let origin = forge_https_origin
+        .map(|o| o.trim().trim_end_matches('/'))
+        .filter(|o| !o.is_empty())
+        .ok_or_else(|| {
+            PkoError::Validation(format!(
+                "Git source URL '{flux_url}' is the in-cluster Forgejo http:// Service, which PKO \
+                 cannot clone, and no Forgejo HTTPS origin is configured; set `forge.publicUrl` \
+                 (e.g. `https://forgejo.keel.local:8888`) in `.keel/config.yaml` (written by \
+                 `keel bootstrap init --with-forge`) and restart keel-server"
+            ))
+        })?;
+    keel_core::validate_https_origin(origin).map_err(|why| {
+        PkoError::Validation(format!(
+            "forge public URL '{origin}' {why}; expected an https://<host>[:port] origin"
+        ))
+    })?;
+    let authority = origin.trim_start_matches("https://");
+    let path = flux_url
+        .trim()
+        .strip_prefix("http://")
+        .and_then(|rest| rest.split_once('/'))
+        .map(|(_, path)| path)
+        .unwrap_or_default();
+    if path.is_empty() {
+        return Err(PkoError::Validation(format!(
+            "Git source URL '{flux_url}' has no repository path"
+        )));
+    }
+    let url = format!("https://{authority}/{path}");
+    validate_git_source_url(&url)?;
+    Ok(url)
+}
+
+fn validate_network_git_url(url: &str, allow_http: bool) -> Result<(), PkoError> {
     // Never echo embedded credentials (`https://user:token@host/...`) into errors or logs.
     let shown = match url.split_once("://") {
         Some((scheme, rest)) if rest.split('/').next().unwrap_or_default().contains('@') => {
@@ -399,10 +505,14 @@ pub fn validate_git_source_url(url: &str) -> Result<(), PkoError> {
         }
         _ => url.to_string(),
     };
+    let accepted = if allow_http {
+        "https://, http://, ssh:// or user@host:path"
+    } else {
+        "https://, ssh:// or user@host:path; PKO rejects http://"
+    };
     let invalid = |why: &str| {
         Err(PkoError::Validation(format!(
-            "Git source URL '{shown}' {why}; PKO Stacks clone only network Git URLs \
-             (https://, http://, ssh:// or user@host:path)"
+            "Git source URL '{shown}' {why}; only network Git URLs are allowed ({accepted})"
         )))
     };
     if url.is_empty() || url.trim() != url {
@@ -422,6 +532,9 @@ pub fn validate_git_source_url(url: &str) -> Result<(), PkoError> {
     {
         // Credentials belong in the `gitAuth` Secret, never in a committed URL.
         return invalid("embeds credentials");
+    }
+    if !allow_http && lower.starts_with("http://") {
+        return invalid("uses plain http://");
     }
     let host_part = if let Some(rest) = ["https://", "http://", "ssh://"]
         .iter()
@@ -604,6 +717,15 @@ pub struct WorkspaceSecretVolumeSource {
     pub optional: Option<bool>,
 }
 
+/// ConfigMap volume source for mounting namespace-local ConfigMaps into a PKO workspace pod.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceConfigMapVolumeSource {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub optional: Option<bool>,
+}
+
 /// Volume entry on a PKO workspace pod spec.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -611,6 +733,21 @@ pub struct WorkspaceVolume {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret: Option<WorkspaceSecretVolumeSource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_map: Option<WorkspaceConfigMapVolumeSource>,
+}
+
+/// Strategic-merge patch of an init container PKO itself adds to the workspace `StatefulSet`
+/// (`bootstrap`, `fetch`), matched by `name`: only extra `env`/`volumeMounts` are set, image,
+/// command and security context stay PKO's.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceInitContainerPatch {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env: Vec<WorkspaceEnvVar>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub volume_mounts: Vec<WorkspaceVolumeMount>,
 }
 
 /// Resource requests and limits for a PKO workspace container.
@@ -643,6 +780,9 @@ pub struct WorkspaceContainer {
 pub struct WorkspacePodSpec {
     pub termination_grace_period_seconds: u64,
     pub security_context: PodSecurityContext,
+    /// Patches of PKO's own workspace init containers (e.g. `fetch`, which clones `projectRepo`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub init_containers: Vec<WorkspaceInitContainerPatch>,
     pub containers: Vec<WorkspaceContainer>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub volumes: Vec<WorkspaceVolume>,
@@ -690,6 +830,7 @@ impl PkoWorkspaceTemplate {
                                 profile_type: "RuntimeDefault".to_string(),
                             },
                         },
+                        init_containers: Vec::new(),
                         containers: vec![WorkspaceContainer {
                             name: "pulumi".to_string(),
                             env: vec![WorkspaceEnvVar::from_secret(
@@ -777,6 +918,7 @@ impl PkoWorkspaceTemplate {
                 secret_name: secret_name.into(),
                 optional: Some(true),
             }),
+            config_map: None,
         });
         if let Some(container) = self
             .spec
@@ -791,6 +933,71 @@ impl PkoWorkspaceTemplate {
                 mount_path: mount_path.into(),
                 read_only: Some(true),
             });
+        }
+        self
+    }
+}
+
+impl PkoWorkspaceTemplate {
+    /// Makes the workspace trust the platform (Keel) CA in addition to the system roots, so the
+    /// `fetch` init container (go-git clone of `projectRepo`) and the `pulumi` container reach the
+    /// in-cluster Forgejo through its HTTPS ingress (`https://forgejo.<domain>`, signed by the
+    /// self-signed Keel CA):
+    ///
+    /// * volume [`KEEL_CA_VOLUME_NAME`] from the namespace-local **public** CA ConfigMap
+    ///   [`KEEL_CA_BUNDLE_CONFIGMAP`] (key `ca.crt`), `optional: true` so a namespace without it
+    ///   (external forge with a public CA) still starts and simply uses the system roots;
+    /// * mounted read-only at [`KEEL_CA_MOUNT_PATH`] into `fetch` (a strategic-merge patch of PKO's
+    ///   own init container, matched by name) and `pulumi`;
+    /// * `SSL_CERT_DIR=/etc/ssl/certs:/etc/keel-ca` on both (Go reads every PEM in those dirs).
+    ///
+    /// Never mounts `keel-ca-secret` / `keel-wildcard-tls` (they hold private keys). Idempotent.
+    pub fn with_keel_ca_trust(mut self) -> Self {
+        let spec = &mut self.spec.pod_template.spec;
+        if !spec.volumes.iter().any(|v| v.name == KEEL_CA_VOLUME_NAME) {
+            spec.volumes.push(WorkspaceVolume {
+                name: KEEL_CA_VOLUME_NAME.to_string(),
+                secret: None,
+                config_map: Some(WorkspaceConfigMapVolumeSource {
+                    name: KEEL_CA_BUNDLE_CONFIGMAP.to_string(),
+                    optional: Some(true),
+                }),
+            });
+        }
+        let mount = || WorkspaceVolumeMount {
+            name: KEEL_CA_VOLUME_NAME.to_string(),
+            mount_path: KEEL_CA_MOUNT_PATH.to_string(),
+            read_only: Some(true),
+        };
+        let env = || WorkspaceEnvVar::literal(SSL_CERT_DIR_ENV, KEEL_SSL_CERT_DIR);
+        let fetch = match spec
+            .init_containers
+            .iter_mut()
+            .find(|c| c.name == PKO_FETCH_CONTAINER_NAME)
+        {
+            Some(c) => c,
+            None => {
+                spec.init_containers.push(WorkspaceInitContainerPatch {
+                    name: PKO_FETCH_CONTAINER_NAME.to_string(),
+                    env: Vec::new(),
+                    volume_mounts: Vec::new(),
+                });
+                spec.init_containers.last_mut().expect("just pushed")
+            }
+        };
+        fetch.env.retain(|e| e.name != SSL_CERT_DIR_ENV);
+        fetch.env.push(env());
+        fetch
+            .volume_mounts
+            .retain(|m| m.name != KEEL_CA_VOLUME_NAME);
+        fetch.volume_mounts.push(mount());
+        if let Some(pulumi) = spec.containers.iter_mut().find(|c| c.name == "pulumi") {
+            pulumi.env.retain(|e| e.name != SSL_CERT_DIR_ENV);
+            pulumi.env.push(env());
+            pulumi
+                .volume_mounts
+                .retain(|m| m.name != KEEL_CA_VOLUME_NAME);
+            pulumi.volume_mounts.push(mount());
         }
         self
     }
@@ -1494,7 +1701,7 @@ pub fn synthesize_ephemeral_preview(
             env_refs: params.env_refs.clone(),
             secrets_ref: params.secrets_ref.clone(),
             workspace_template: Some({
-                let tpl = PkoWorkspaceTemplate::restricted(&passphrase_copy);
+                let tpl = PkoWorkspaceTemplate::restricted(&passphrase_copy).with_keel_ca_trust();
                 match &params.docker_host {
                     Some(host) => tpl.with_env_var("DOCKER_HOST", host),
                     None => tpl,
@@ -1604,6 +1811,17 @@ pub fn migrate_legacy_flux_source_stack(
     for (key, value) in fields {
         spec.insert(key, value);
     }
+    // The workspace now clones the forge itself (`fetch`): trust the public Keel CA bundle so an
+    // in-cluster Forgejo HTTPS ingress clone verifies (no-op for external public-CA forges).
+    let mut template: serde_json::Value = match spec.get("workspaceTemplate") {
+        Some(v) => serde_json::to_value(v)?,
+        None => serde_json::Value::Null,
+    };
+    add_keel_ca_trust_to_workspace_template(&mut template)?;
+    spec.insert(
+        "workspaceTemplate".to_string(),
+        serde_yml::to_value(&template)?,
+    );
     let out = serde_yml::to_string(&doc)?;
     // The rewritten manifest must still be a well-formed Stack with a complete Git source.
     let parsed = PkoStack::from_yaml(&out)?;
@@ -1613,6 +1831,78 @@ pub fn migrate_legacy_flux_source_stack(
         ));
     }
     Ok(FluxSourceMigration::Migrated(out))
+}
+
+/// Adds the Keel CA trust of [`PkoWorkspaceTemplate::with_keel_ca_trust`] to an untyped
+/// `spec.workspaceTemplate` (`Null` creates one), keeping every other field verbatim. Used when
+/// rewriting Stacks committed by earlier releases.
+pub fn add_keel_ca_trust_to_workspace_template(
+    template: &mut serde_json::Value,
+) -> Result<(), PkoError> {
+    use serde_json::{Value, json};
+    fn obj<'a>(v: &'a mut Value, key: &str, default: Value) -> Result<&'a mut Value, PkoError> {
+        let map = v.as_object_mut().ok_or_else(|| {
+            PkoError::Validation(format!(
+                "workspaceTemplate: parent of `{key}` is not a mapping"
+            ))
+        })?;
+        Ok(map.entry(key.to_string()).or_insert(default))
+    }
+    fn named<'a>(list: &'a mut Value, name: &str) -> Result<&'a mut Value, PkoError> {
+        let items = list.as_array_mut().ok_or_else(|| {
+            PkoError::Validation("workspaceTemplate: container list is not a sequence".to_string())
+        })?;
+        let index = match items.iter().position(|c| c["name"] == name) {
+            Some(i) => i,
+            None => {
+                items.push(json!({ "name": name }));
+                items.len() - 1
+            }
+        };
+        Ok(&mut items[index])
+    }
+    fn upsert(list: &mut Value, item: Value) -> Result<(), PkoError> {
+        let items = list.as_array_mut().ok_or_else(|| {
+            PkoError::Validation("workspaceTemplate: entry list is not a sequence".to_string())
+        })?;
+        items.retain(|i| i["name"] != item["name"]);
+        items.push(item);
+        Ok(())
+    }
+    if template.is_null() {
+        *template = json!({});
+    }
+    let pod = obj(template, "spec", json!({}))?;
+    let pod = obj(pod, "podTemplate", json!({}))?;
+    let pod = obj(pod, "spec", json!({}))?;
+    let typed = PkoWorkspaceTemplate::restricted("unused").with_keel_ca_trust();
+    let typed = serde_json::to_value(&typed.spec.pod_template.spec)?;
+    let volume = typed["volumes"][0].clone();
+    // Templates Keel never wrote (no pod spec yet) get the `restricted` defaults too.
+    for key in ["terminationGracePeriodSeconds", "securityContext"] {
+        obj(pod, key, typed[key].clone())?;
+    }
+    let env = json!({ "name": SSL_CERT_DIR_ENV, "value": KEEL_SSL_CERT_DIR });
+    let mount = json!({
+        "name": KEEL_CA_VOLUME_NAME, "mountPath": KEEL_CA_MOUNT_PATH, "readOnly": true
+    });
+    upsert(obj(pod, "volumes", json!([]))?, volume)?;
+    for (list, name) in [
+        ("initContainers", PKO_FETCH_CONTAINER_NAME),
+        ("containers", "pulumi"),
+    ] {
+        let container = named(obj(pod, list, json!([]))?, name)?;
+        if list == "containers" {
+            obj(
+                container,
+                "securityContext",
+                typed["containers"][0]["securityContext"].clone(),
+            )?;
+        }
+        upsert(obj(container, "env", json!([]))?, env.clone())?;
+        upsert(obj(container, "volumeMounts", json!([]))?, mount.clone())?;
+    }
+    Ok(())
 }
 
 /// Synthesizes a tenant PKO v2 `Stack` CR strictly isolated to `tenant-<tenant>` with optional
@@ -1705,7 +1995,7 @@ pub fn synthesize_tenant_stack(params: &TenantStackParams) -> Result<PkoStack, P
                         );
                     }
                 }
-                tpl
+                tpl.with_keel_ca_trust()
             }),
         },
     })
@@ -2745,12 +3035,23 @@ mod tests {
     fn git_source_urls_must_be_network_git_urls() {
         for ok in [
             "https://forge.example/keel/gitops.git",
-            "http://forgejo-http.keel-system.svc.cluster.local:3000/keel/infra-gitops.git",
+            "https://forgejo.keel.local:8888/keel/infra-gitops.git",
+            "https://[::1]:3000/keel/gitops.git",
             "ssh://git@forge.example:2222/keel/gitops.git",
             "git@github.com:acme/gitops.git",
-            "http://[::1]:3000/keel/gitops.git",
         ] {
             assert!(validate_git_source_url(ok).is_ok(), "{ok}");
+            assert!(validate_flux_git_source_url(ok).is_ok(), "{ok}");
+        }
+        // PKO (Pulumi SDK `gitutil.ParseGitRepoURL`) rejects plain http; Flux accepts it.
+        for http in [
+            "http://forgejo-http.keel-system.svc.cluster.local:3000/keel/infra-gitops.git",
+            "http://[::1]:3000/keel/gitops.git",
+            "HTTP://forge.example/keel/gitops.git",
+        ] {
+            let err = validate_git_source_url(http).unwrap_err().to_string();
+            assert!(err.contains("plain http://"), "{err}");
+            assert!(validate_flux_git_source_url(http).is_ok(), "{http}");
         }
         for (i, bad) in [
             "",
@@ -2799,16 +3100,160 @@ mod tests {
     }
 
     #[test]
+    fn tenant_and_preview_workspaces_trust_the_public_keel_ca_bundle() {
+        let expected_pod_spec_fragment = serde_json::json!({
+            "volumes": [{
+                "name": "keel-ca",
+                "configMap": {"name": "keel-ca-bundle", "optional": true}
+            }],
+            "initContainers": [{
+                "name": "fetch",
+                "env": [{"name": "SSL_CERT_DIR", "value": "/etc/ssl/certs:/etc/keel-ca"}],
+                "volumeMounts": [{"name": "keel-ca", "mountPath": "/etc/keel-ca", "readOnly": true}]
+            }]
+        });
+        let check = |stack: &PkoStack| {
+            let doc = stack.to_json_value().unwrap();
+            let pod = &doc["spec"]["workspaceTemplate"]["spec"]["podTemplate"]["spec"];
+            assert_eq!(pod["volumes"], expected_pod_spec_fragment["volumes"]);
+            assert_eq!(
+                pod["initContainers"],
+                expected_pod_spec_fragment["initContainers"]
+            );
+            let containers = pod["containers"].as_array().unwrap();
+            assert_eq!(containers.len(), 1);
+            let pulumi = &containers[0];
+            assert_eq!(pulumi["name"], "pulumi");
+            assert!(pulumi["env"].as_array().unwrap().contains(
+                &serde_json::json!({"name": "SSL_CERT_DIR", "value": "/etc/ssl/certs:/etc/keel-ca"})
+            ));
+            assert!(pulumi["volumeMounts"].as_array().unwrap().contains(
+                &serde_json::json!({"name": "keel-ca", "mountPath": "/etc/keel-ca", "readOnly": true})
+            ));
+            // Only the public CA ConfigMap; never the CA / wildcard Secrets (private keys).
+            let text = doc.to_string();
+            assert!(!text.contains("keel-ca-secret") && !text.contains("keel-wildcard-tls"));
+            // Round-trips through the typed model.
+            assert_eq!(&PkoStack::from_json_value(doc).unwrap(), stack);
+        };
+        let tenant = synthesize_tenant_stack(&TenantStackParams::new(
+            "acme",
+            "vm",
+            "organization/vm/acme",
+            "s3://pulumi-state/tenants/acme",
+            test_git_source("tenants/acme/infra/vm"),
+        ))
+        .unwrap();
+        check(&tenant);
+        let mut params = base_preview_params("42");
+        params.repo_url = Some("https://forgejo.keel.local:8888/keel/infra-gitops.git".to_string());
+        check(&synthesize_ephemeral_preview(&params).unwrap().stack);
+
+        // Idempotent, and kept alongside other mounts (target kubeconfig Secret volume).
+        let tpl = PkoWorkspaceTemplate::restricted("p")
+            .with_secret_volume("target-kubeconfig", "kc", "/etc/keel/kubeconfig")
+            .with_keel_ca_trust()
+            .with_keel_ca_trust();
+        let pod = &tpl.spec.pod_template.spec;
+        assert_eq!(pod.volumes.len(), 2);
+        assert_eq!(pod.init_containers.len(), 1);
+        assert_eq!(pod.init_containers[0].env.len(), 1);
+        assert_eq!(pod.containers[0].volume_mounts.len(), 2);
+        // The management Stack (fluxSource, operator-side fetch) is untouched.
+        assert!(
+            PkoWorkspaceTemplate::restricted("p")
+                .spec
+                .pod_template
+                .spec
+                .init_containers
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn pko_project_repo_maps_the_in_cluster_forgejo_to_its_https_origin() {
+        let flux = "http://forgejo-http.keel-system.svc.cluster.local:3000/keel/infra-gitops.git";
+        for origin in [
+            "https://forgejo.keel.local:8888",
+            "https://forgejo.keel.local:8888/",
+        ] {
+            assert_eq!(
+                pko_project_repo_url(flux, Some(origin)).unwrap(),
+                "https://forgejo.keel.local:8888/keel/infra-gitops.git"
+            );
+        }
+        assert_eq!(
+            pko_project_repo_url(
+                "http://forgejo-http.keel-system.svc:3000/acme/gitops.git",
+                Some("https://forgejo.example.org")
+            )
+            .unwrap(),
+            "https://forgejo.example.org/acme/gitops.git"
+        );
+        // External forges (https / ssh / scp-like) pass through unchanged.
+        for external in [
+            "https://github.com/acme/gitops.git",
+            "ssh://git@forge.example:2222/acme/gitops.git",
+            "git@github.com:acme/gitops.git",
+        ] {
+            assert_eq!(pko_project_repo_url(external, None).unwrap(), external);
+            assert_eq!(
+                pko_project_repo_url(external, Some("https://forgejo.keel.local:8888")).unwrap(),
+                external
+            );
+        }
+        // No configured origin: fail closed with an actionable message.
+        let err = pko_project_repo_url(flux, None).unwrap_err().to_string();
+        assert!(err.contains("forge.publicUrl"), "{err}");
+        // Any other http URL fails closed (never silently upgraded to https).
+        let err = pko_project_repo_url(
+            "http://gitea.example.org/acme/gitops.git",
+            Some("https://forgejo.keel.local:8888"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("plain http://"), "{err}");
+        for bad_origin in [
+            "http://forgejo.keel.local:8888",
+            "https://forgejo.keel.local/sub",
+            "https://user:pw@forgejo.keel.local",
+            "https://",
+            "forgejo.keel.local",
+        ] {
+            assert!(
+                pko_project_repo_url(flux, Some(bad_origin)).is_err(),
+                "{bad_origin}"
+            );
+        }
+        assert!(
+            pko_project_repo_url(
+                "http://forgejo-http.keel-system.svc.cluster.local:3000",
+                Some("https://forgejo.keel.local:8888")
+            )
+            .is_err(),
+            "no repository path"
+        );
+        assert!(pko_project_repo_url("/tmp/repo.git", Some("https://f.example")).is_err());
+        assert!(is_in_cluster_forgejo_http_url(flux));
+        assert!(!is_in_cluster_forgejo_http_url(
+            "https://forgejo-http.keel-system.svc.cluster.local/keel/x.git"
+        ));
+        assert!(!is_in_cluster_forgejo_http_url(
+            "http://forgejo-http.keel-system.svc.cluster.local.evil.example/keel/x.git"
+        ));
+    }
+
+    #[test]
     fn tenant_stacks_clone_their_git_source_and_management_keeps_flux_source() {
         let source = PkoGitSource::branch(
-            "http://forgejo-http.keel-system.svc.cluster.local:3000/keel/infra-gitops.git",
+            "https://forgejo.keel.local:8888/keel/infra-gitops.git",
             "main",
             "tenants/default/infra/kind",
         )
         .with_auth(Some(
             PkoGitAuth::from_flux_secret(
                 "git-credentials",
-                "http://forgejo-http.keel-system.svc.cluster.local:3000/keel/infra-gitops.git",
+                "https://forgejo.keel.local:8888/keel/infra-gitops.git",
                 &BTreeSet::new(),
             )
             .unwrap(),
@@ -2828,7 +3273,7 @@ mod tests {
         let doc: serde_json::Value = serde_yml::from_str(&yaml).unwrap();
         assert_eq!(
             doc["spec"]["projectRepo"],
-            "http://forgejo-http.keel-system.svc.cluster.local:3000/keel/infra-gitops.git"
+            "https://forgejo.keel.local:8888/keel/infra-gitops.git"
         );
         assert_eq!(doc["spec"]["repoDir"], "tenants/default/infra/kind");
         assert_eq!(doc["spec"]["branch"], "main");
@@ -2984,7 +3429,7 @@ spec:
 ";
 
     fn default_tenant_source(dir: &str) -> Result<PkoGitSource, PkoError> {
-        let url = "http://forgejo-http.keel-system.svc.cluster.local:3000/keel/infra-gitops.git";
+        let url = "https://forgejo.keel.local:8888/keel/infra-gitops.git";
         Ok(
             PkoGitSource::branch(url, "main", dir).with_auth(Some(PkoGitAuth::from_flux_secret(
                 "git-credentials",
@@ -3009,6 +3454,26 @@ spec:
         assert_eq!(src.branch.as_deref(), Some("main"));
         assert_eq!(src.shallow, Some(true));
         assert!(src.git_auth.as_ref().unwrap().basic_auth.is_some());
+        // The workspace now clones the forge itself: it trusts the public Keel CA bundle.
+        let pod = &stack
+            .spec
+            .workspace_template
+            .as_ref()
+            .unwrap()
+            .spec
+            .pod_template
+            .spec;
+        assert_eq!(
+            pod.volumes[0].config_map.as_ref().unwrap().name,
+            "keel-ca-bundle"
+        );
+        assert_eq!(pod.init_containers[0].name, "fetch");
+        assert_eq!(pod.containers[0].name, "pulumi");
+        assert!(
+            !pod.containers[0]
+                .security_context
+                .allow_privilege_escalation
+        );
         // Everything else is kept (no program/config change).
         assert_eq!(stack.spec.stack, "organization/kind-cluster/default-kind");
         assert_eq!(
@@ -3031,6 +3496,40 @@ spec:
             migrate_legacy_flux_source_stack(&out, "default", default_tenant_source).unwrap(),
             FluxSourceMigration::Unchanged
         );
+    }
+
+    #[test]
+    fn ca_trust_is_added_to_existing_workspace_templates_verbatim() {
+        let mut template = serde_json::to_value(
+            PkoWorkspaceTemplate::restricted("keel-pulumi-passphrase").with_secret_volume(
+                "target-kubeconfig",
+                "kc",
+                "/etc/keel/kubeconfig",
+            ),
+        )
+        .unwrap();
+        template["spec"]["podTemplate"]["spec"]["nodeSelector"] = serde_json::json!({"a": "b"});
+        add_keel_ca_trust_to_workspace_template(&mut template).unwrap();
+        let once = template.clone();
+        add_keel_ca_trust_to_workspace_template(&mut template).unwrap();
+        assert_eq!(template, once, "idempotent");
+        // Same shape as freshly synthesized Stacks; unknown fields are kept.
+        let expected = serde_json::to_value(
+            PkoWorkspaceTemplate::restricted("keel-pulumi-passphrase")
+                .with_secret_volume("target-kubeconfig", "kc", "/etc/keel/kubeconfig")
+                .with_keel_ca_trust(),
+        )
+        .unwrap();
+        let pod = &template["spec"]["podTemplate"]["spec"];
+        assert_eq!(pod["nodeSelector"], serde_json::json!({"a": "b"}));
+        for key in ["volumes", "initContainers", "containers"] {
+            assert_eq!(
+                pod[key], expected["spec"]["podTemplate"]["spec"][key],
+                "{key}"
+            );
+        }
+        let mut bad = serde_json::json!({"spec": "nope"});
+        assert!(add_keel_ca_trust_to_workspace_template(&mut bad).is_err());
     }
 
     #[test]

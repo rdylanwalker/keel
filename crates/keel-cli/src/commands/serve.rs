@@ -465,6 +465,13 @@ async fn build_serve_state_with_forward(
     )
     .with_oidc_config(oidc_cfg)
     .with_oidc_client_secret(std::env::var(OIDC_CLIENT_SECRET_ENV).ok())
+    // Forge HTTPS origin tenant/preview PKO Stacks clone the in-cluster Forgejo through
+    // (`forge.publicUrl`, platform configuration from the committed `.keel/config.yaml`).
+    .with_forge_public_url(
+        parsed_keel_cfg
+            .as_ref()
+            .and_then(|c| c.forge.public_url.clone()),
+    )
     // Tenant Stack proposals require the tenant state passphrase Secret whenever Secrets live in
     // the cluster; cluster-less local dev (in-memory store, nothing applied) skips the gate.
     .with_require_pulumi_passphrase(cluster_secret_store);

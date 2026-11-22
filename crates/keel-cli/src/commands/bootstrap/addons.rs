@@ -152,9 +152,151 @@ pub(crate) fn rewrite_corefile(
     (updated != corefile).then_some(updated)
 }
 
+/// Ingress hosts CoreDNS must rewrite to the Envoy Gateway proxy: only hosts the cluster
+/// actually serves. The in-cluster Forgejo host (PKO clones it through its HTTPS ingress) when
+/// `--with-forge` is set, and the IdP host only for the built-in Rauthy IdP (in-cluster OIDC
+/// discovery through the public issuer URL). An external IdP's host (`--oidc-public-url` with
+/// `--oidc-issuer`) is never rewritten: it has no Envoy route, so in-cluster OIDC calls would fail.
+pub(crate) fn coredns_ingress_rewrite_hosts(
+    ingress: &Stage0Ingress,
+    with_forge: bool,
+    with_rauthy: bool,
+) -> Vec<&str> {
+    let mut hosts = Vec::new();
+    if with_rauthy {
+        hosts.push(ingress.idp_host.as_str());
+    }
+    if with_forge {
+        hosts.push(ingress.forgejo_host.as_str());
+    }
+    hosts
+}
+
+/// Writes `keel-system/keel-ca-bundle` (key `ca.crt`) from the **public** certificate of the
+/// self-signed Keel CA (`keel-system/keel-ca-secret` `ca.crt`; its `tls.key` is never read into
+/// the bundle) and copies it into `keel-previews` and every existing `tenant-*` namespace
+/// ([`keel_ca_bundle_namespaces`]). Kyverno `sync-keel-ca-bundle` clones the `keel-system` source
+/// into tenant namespaces created later. PKO's operator and the tenant/preview workspace pods mount it to trust the Forgejo
+/// HTTPS ingress. Best effort: without a CA (it was not issued in time) nothing is written and the
+/// mounts stay empty (`optional: true`); re-running `keel bootstrap init` after a CA rotation
+/// refreshes every copy.
+async fn ensure_keel_ca_bundle(target: KubeTarget<'_>) {
+    let mut ca = None;
+    for _ in 0..15 {
+        ca = target
+            .read_secret_key(
+                KEEL_SYSTEM_NAMESPACE,
+                keel_kube::KEEL_CA_SECRET_NAME,
+                "ca.crt",
+            )
+            .await;
+        if ca.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    let Some(ca) = ca else {
+        tracing::warn!(
+            "keel-system/keel-ca-secret has no ca.crt yet; skipping the keel-ca-bundle ConfigMap (PKO cannot clone the in-cluster Forgejo over HTTPS until it exists; re-run `keel bootstrap init`)"
+        );
+        return;
+    };
+    let current = target
+        .output(&[
+            "-n",
+            KEEL_SYSTEM_NAMESPACE,
+            "get",
+            "configmap",
+            keel_core::KEEL_CA_BUNDLE_CONFIGMAP,
+            "--ignore-not-found",
+            "-o",
+            "jsonpath={.data.ca\\.crt}",
+        ])
+        .await
+        .unwrap_or_default();
+    let changed =
+        keel_kube::validate_public_ca_pem(&ca).is_ok_and(|pem| pem.trim() != current.trim());
+    let listed = target
+        .output(&["get", "namespaces", "-o", "name"])
+        .await
+        .unwrap_or_default();
+    for namespace in keel_ca_bundle_namespaces(&listed) {
+        let namespace = namespace.as_str();
+        let applied = keel_kube::build_keel_ca_bundle_configmap(namespace, &ca)
+            .map_err(CliError::from)
+            .and_then(|doc| serde_yml::to_string(&doc).map_err(CliError::from));
+        let result = match applied {
+            Ok(yaml) => target.apply(&yaml).await,
+            Err(e) => Err(e),
+        };
+        if let Err(err) = result {
+            tracing::warn!(namespace, error = %err, "Failed to write the keel-ca-bundle ConfigMap");
+        }
+    }
+    if changed {
+        // Go loads its trust store once per process: restart the PKO operator (installed before
+        // the CA existed, or trusting a rotated CA) so it picks up the new bundle.
+        restart_pko_operator(target).await;
+    }
+}
+
+/// Namespaces Stage 0 writes `keel-ca-bundle` into: `keel-system` (the source), `keel-previews`,
+/// `tenant-default` and every other existing `tenant-*` namespace (`kubectl get ns -o name`
+/// output), so a fresh install does not wait for Kyverno and a rotated CA reaches every copy.
+pub(crate) fn keel_ca_bundle_namespaces(listed: &str) -> Vec<String> {
+    let mut out = vec![
+        KEEL_SYSTEM_NAMESPACE.to_string(),
+        keel_core::KEEL_PREVIEWS_NAMESPACE.to_string(),
+        format!("tenant-{DEFAULT_TENANT_ID}"),
+    ];
+    for ns in listed
+        .split_whitespace()
+        .filter_map(|n| n.strip_prefix("namespace/"))
+        .filter(|n| keel_kube::is_keel_ca_bundle_target_namespace(n))
+    {
+        if !out.iter().any(|o| o == ns) {
+            out.push(ns.to_string());
+        }
+    }
+    out
+}
+
+/// Deployments in `keel-system` that belong to the PKO release (`pulumi-kubernetes-operator*`).
+pub(crate) fn pko_operator_deployments(names: &str) -> Vec<String> {
+    names
+        .split_whitespace()
+        .filter_map(|n| n.strip_prefix("deployment.apps/"))
+        .filter(|n| n.starts_with("pulumi-kubernetes-operator"))
+        .map(str::to_string)
+        .collect()
+}
+
+async fn restart_pko_operator(target: KubeTarget<'_>) {
+    let names = target
+        .output(&[
+            "-n",
+            KEEL_SYSTEM_NAMESPACE,
+            "get",
+            "deployments",
+            "-o",
+            "name",
+        ])
+        .await
+        .unwrap_or_default();
+    for name in pko_operator_deployments(&names) {
+        let resource = format!("deployment/{name}");
+        if let Err(err) = target
+            .output(&["-n", KEEL_SYSTEM_NAMESPACE, "rollout", "restart", &resource])
+            .await
+        {
+            tracing::warn!(deployment = %name, error = %err, "Could not restart the PKO operator to trust the Keel CA bundle");
+        }
+    }
+}
+
 /// Best-effort CoreDNS rewrite so in-cluster pods resolve the IdP / Forgejo ingress hosts to the
 /// Envoy Gateway proxy service in `keel-system`.
-async fn configure_coredns_local_rewrites(target: KubeTarget<'_>, ingress: &Stage0Ingress) {
+async fn configure_coredns_local_rewrites(target: KubeTarget<'_>, hosts: &[&str]) {
     let mut svc_name = None;
     for _ in 0..15 {
         svc_name = find_gateway_service(target).await;
@@ -188,11 +330,7 @@ async fn configure_coredns_local_rewrites(target: KubeTarget<'_>, ingress: &Stag
         }
     };
     let fqdn = format!("{svc_name}.{KEEL_SYSTEM_NAMESPACE}.svc.cluster.local");
-    let Some(updated) = rewrite_corefile(
-        &corefile,
-        &[ingress.idp_host.as_str(), ingress.forgejo_host.as_str()],
-        &fqdn,
-    ) else {
+    let Some(updated) = rewrite_corefile(&corefile, hosts, &fqdn) else {
         return;
     };
     let cm = serde_json::json!({
@@ -444,11 +582,17 @@ pub(crate) async fn install_stage0_core_addons(
                 &ingress.template_vars(),
             )?)
             .await?;
-        if artifacts.rauthy_config.is_some() {
-            // In-cluster OIDC discovery between Forgejo and Rauthy via the public hostnames.
-            configure_coredns_local_rewrites(target, ingress).await;
-        }
     }
+    let rewrite_hosts =
+        coredns_ingress_rewrite_hosts(ingress, with_forge, artifacts.rauthy_config.is_some());
+    if !rewrite_hosts.is_empty() {
+        // In-cluster pods resolve the public ingress hosts to Envoy Gateway: PKO (operator and
+        // tenant/preview workspaces) clones the in-cluster Forgejo over
+        // `https://<forgejo-host>` (`forge.publicUrl`; PKO rejects the `http://` Service URL), and
+        // Forgejo / keel-server reach the built-in Rauthy IdP for OIDC discovery.
+        configure_coredns_local_rewrites(target, &rewrite_hosts).await;
+    }
+    ensure_keel_ca_bundle(target).await;
 
     let mgmt_sa_name = artifacts
         .management_stack
@@ -1098,9 +1242,6 @@ mod tests {
             LOCAL_DOCKER_PROXY_YAML,
             INGRESS_GATEWAY_YAML,
             FORGEJO_ROUTE_YAML,
-            include_str!(
-                "../../../../../deploy/bootstrap/manifests/default-tenant-network-policy.yaml"
-            ),
         ] {
             let mut all_vars = vars.clone();
             all_vars.push(("MGMT_SA", "mgmt-sa"));
@@ -1110,6 +1251,58 @@ mod tests {
                 "unexpected source-controller NetworkPolicy in {rendered}"
             );
         }
+    }
+
+    #[test]
+    fn coredns_ingress_rewrites_follow_the_forge_not_only_rauthy() {
+        let ingress = Stage0Ingress::from_public_url("https://idp.example.org").unwrap();
+        let idp = ingress.idp_host.as_str();
+        let forgejo = ingress.forgejo_host.as_str();
+        assert_eq!(
+            coredns_ingress_rewrite_hosts(&ingress, true, true),
+            vec![idp, forgejo]
+        );
+        // External IdP (`--oidc-issuer`, Rauthy disabled): its host has no Envoy route, so
+        // only the in-cluster Forgejo host is rewritten.
+        assert_eq!(
+            coredns_ingress_rewrite_hosts(&ingress, true, false),
+            vec![forgejo]
+        );
+        assert_eq!(
+            coredns_ingress_rewrite_hosts(&ingress, false, true),
+            vec![idp]
+        );
+        assert!(coredns_ingress_rewrite_hosts(&ingress, false, false).is_empty());
+    }
+
+    #[test]
+    fn keel_ca_bundle_goes_to_keel_system_previews_and_every_tenant() {
+        let listed = "namespace/default\nnamespace/flux-system\nnamespace/keel-system\n\
+                      namespace/keel-previews\nnamespace/tenant-acme\nnamespace/tenant-default\n";
+        assert_eq!(
+            keel_ca_bundle_namespaces(listed),
+            [
+                "keel-system",
+                "keel-previews",
+                "tenant-default",
+                "tenant-acme"
+            ]
+        );
+        assert_eq!(
+            keel_ca_bundle_namespaces(""),
+            ["keel-system", "keel-previews", "tenant-default"]
+        );
+    }
+
+    #[test]
+    fn pko_operator_deployments_are_selected_by_release_prefix() {
+        let names = "deployment.apps/pulumi-kubernetes-operator-controller-manager\n\
+                     deployment.apps/keel-server\ndeployment.apps/forgejo\n";
+        assert_eq!(
+            pko_operator_deployments(names),
+            vec!["pulumi-kubernetes-operator-controller-manager".to_string()]
+        );
+        assert!(pko_operator_deployments("").is_empty());
     }
 
     #[test]

@@ -242,6 +242,22 @@ resources:
           capabilities:
             drop:
               - ALL
+        # Trust the public Keel CA (`keel-system/keel-ca-bundle`, `ca.crt` only) in addition to the
+        # system roots: the controller resolves tenant/preview Stack branches (go-git ls-remote)
+        # against the in-cluster Forgejo HTTPS ingress (`forge.publicUrl`). `optional`, so the
+        # operator also starts before the bundle exists or without a local CA.
+        extraEnv:
+          - name: SSL_CERT_DIR
+            value: /etc/ssl/certs:/etc/keel-ca
+        extraVolumes:
+          - name: keel-ca
+            configMap:
+              name: keel-ca-bundle
+              optional: true
+        extraVolumeMounts:
+          - name: keel-ca
+            mountPath: /etc/keel-ca
+            readOnly: true
 
   s3StateBackend:
     type: kubernetes:helm.sh/v3:Release

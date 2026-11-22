@@ -16,7 +16,8 @@ use axum::http::StatusCode;
 use keel_core::validate_dns_label;
 use keel_git::PullRequestInfo;
 use keel_kube::{
-    PLATFORM_OWNED_TENANT_FILES, label_platform_owned_manifests, platform_owned_labels_missing,
+    PLATFORM_OWNED_TENANT_FILES, ensure_tenant_pko_workspace_network_policy,
+    label_platform_owned_manifests, platform_owned_labels_missing,
 };
 use keel_pko::build_preview_branch;
 use serde::{Deserialize, Serialize};
@@ -99,7 +100,9 @@ pub async fn report_unlabelled_tenant_baselines(root: &Path) -> Vec<String> {
 ///
 /// Opens one PR on `keel/<id>/migrate-baseline-<ts>` that adds `keel.io/platform-owned: "true"` to
 /// the platform-written objects of `tenants/<id>/rbac.yaml` and `tenants/<id>/git-repository.yaml`
-/// (`keel_kube::label_platform_owned_manifests`; other documents stay byte-for-byte). Returns
+/// (`keel_kube::label_platform_owned_manifests`; other documents stay byte-for-byte) and appends
+/// the `allow-pko-workspace` NetworkPolicy to `rbac.yaml` when no baseline file defines it
+/// (`keel_kube::ensure_tenant_pko_workspace_network_policy`). Returns
 /// `201` with the PR, `200` when every object is already labelled (or `dryRun`), and `404` when
 /// the tenant has no `tenants/<id>/rbac.yaml`.
 pub async fn migrate_tenant_baseline(
@@ -117,24 +120,44 @@ pub async fn migrate_tenant_baseline(
         .sync_branch_from_remote(&state.repo_workdir, "origin", "main")
         .await?;
     let root = state.repo_workdir.clone();
-    let mut found_baseline = false;
-    let mut labelled: Vec<(String, String)> = Vec::new();
+    // (path, current content, changed)
+    let mut files: Vec<(String, String, bool)> = Vec::new();
     for file in PLATFORM_OWNED_TENANT_FILES {
         let rel = format!("tenants/{id}/{file}");
         let Some(content) = read_contained_optional(&root, &root.join(&rel)).await? else {
             continue;
         };
-        found_baseline |= file == "rbac.yaml";
-        if let Some(updated) = label_platform_owned_manifests(&content)? {
-            labelled.push((rel, updated));
+        match label_platform_owned_manifests(&content)? {
+            Some(updated) => files.push((rel, updated, true)),
+            None => files.push((rel, content, false)),
         }
     }
-    if !found_baseline {
+    let rbac_rel = format!("tenants/{id}/rbac.yaml");
+    let Some(rbac_index) = files.iter().position(|(rel, _, _)| *rel == rbac_rel) else {
         drop(guard);
         return Err(ServerError::NotFound(format!(
             "tenant `{id}` has no tenants/{id}/rbac.yaml"
         )));
+    };
+    // Tenants created by earlier releases lack `allow-pko-workspace`, so `default-deny-all` blocks
+    // their PKO workspace pods; add it to the baseline in the same PR.
+    let others: Vec<&str> = files
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != rbac_index)
+        .map(|(_, (_, content, _))| content.as_str())
+        .collect();
+    if let Some(updated) =
+        ensure_tenant_pko_workspace_network_policy(&id, &files[rbac_index].1, &others)?
+    {
+        files[rbac_index].1 = updated;
+        files[rbac_index].2 = true;
     }
+    let labelled: Vec<(String, String)> = files
+        .into_iter()
+        .filter(|(_, _, changed)| *changed)
+        .map(|(rel, content, _)| (rel, content))
+        .collect();
     let paths: Vec<String> = labelled.iter().map(|(p, _)| p.clone()).collect();
     if labelled.is_empty() || query.dry_run {
         drop(guard);
@@ -172,7 +195,9 @@ pub async fn migrate_tenant_baseline(
     let mut body = format!(
         "Labels the platform-written objects of tenant `{id}` with `keel.io/platform-owned: \"true\"` \
          so Kyverno `protect-platform-owned-tenant-objects` reserves changes to them for the \
-         platform (keel-tenant-reconciler / keel-server). Nothing else changes.\n\n- Commit: `{commit_sha}`\n"
+         platform (keel-tenant-reconciler / keel-server), and adds the tenant's \
+         `allow-pko-workspace` NetworkPolicy to `rbac.yaml` when it is missing (PKO workspace \
+         pods need it through `default-deny-all`). Nothing else changes.\n\n- Commit: `{commit_sha}`\n"
     );
     for p in &paths {
         body.push_str(&format!("- `{p}`\n"));

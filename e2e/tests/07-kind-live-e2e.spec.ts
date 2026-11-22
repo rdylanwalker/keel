@@ -1203,8 +1203,36 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
       const cluster = stackSources().find((s) => s.name === `${WORKLOAD_CLUSTER}-cluster`);
       expect(cluster, JSON.stringify(stackSources())).toBeTruthy();
       expect(cluster!.projectRepo).not.toBe('');
+      // PKO rejects http:// clone URLs: the in-cluster Forgejo is cloned through its HTTPS
+      // ingress origin (`forge.publicUrl`), Flux keeps the http Service URL.
+      expect(cluster!.projectRepo).toMatch(/^https:\/\//);
       expect(cluster!.fluxSource).toBe('');
       expect(legacy()).toEqual([]);
+
+      // Workspaces trust the Keel CA through the PUBLIC `keel-ca-bundle` ConfigMap only.
+      for (const ns of ['keel-system', 'tenant-default', 'keel-previews']) {
+        const ca = tryCmd('kubectl', [
+          'get',
+          'configmap',
+          'keel-ca-bundle',
+          '-n',
+          ns,
+          '-o',
+          'jsonpath={.data.ca\\.crt}',
+        ]).stdout;
+        expect(ca, `keel-ca-bundle in ${ns}`).toContain('BEGIN CERTIFICATE');
+        expect(ca, `keel-ca-bundle in ${ns}`).not.toContain('PRIVATE KEY');
+      }
+      const caVolume = tryCmd('kubectl', [
+        'get',
+        'stacks.pulumi.com',
+        `${WORKLOAD_CLUSTER}-cluster`,
+        '-n',
+        'tenant-default',
+        '-o',
+        'jsonpath={.spec.workspaceTemplate.spec.podTemplate.spec.volumes[?(@.name=="keel-ca")].configMap.name}|{.spec.workspaceTemplate.spec.podTemplate.spec.initContainers[?(@.name=="fetch")].volumeMounts[0].mountPath}',
+      ]).stdout;
+      expect(caVolume).toBe('keel-ca-bundle|/etc/keel-ca');
     });
 
     const workloadAppName = `${WORKLOAD_CLUSTER}-podinfo`;
@@ -1508,7 +1536,7 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
         '-o',
         'jsonpath={.spec.projectRepo}|{.spec.fluxSource.sourceRef.name}|{.spec.gitAuth.basicAuth.password.secret.name}',
       ]).stdout.split('|');
-      expect(source[0], source.join('|')).not.toBe('');
+      expect(source[0], source.join('|')).toMatch(/^https:\/\//);
       expect(source[1], source.join('|')).toBe('');
       expect(source[2], source.join('|')).toBe(`keel-preview-${prId}-git-credentials`);
 

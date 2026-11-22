@@ -14,7 +14,9 @@ use std::sync::{Arc, Mutex as StdMutex};
 use async_trait::async_trait;
 use k8s_openapi::api::core::v1::{ConfigMap, Pod, Secret, ServiceAccount};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, OwnerReference};
-use keel_core::KEEL_PREVIEWS_NAMESPACE;
+use keel_core::{
+    KEEL_CA_BUNDLE_CONFIGMAP, KEEL_CA_BUNDLE_KEY, KEEL_PREVIEWS_NAMESPACE, KEEL_SYSTEM_NAMESPACE,
+};
 use kube::api::{
     Api, DeleteParams, DynamicObject, ListParams, LogParams, Patch, PatchParams, PostParams,
 };
@@ -123,6 +125,21 @@ impl TenantGitSource {
     pub fn branch_or_default(&self) -> &str {
         self.branch.as_deref().unwrap_or(DEFAULT_TENANT_GIT_BRANCH)
     }
+
+    /// URL tenant and preview PKO `Stack`s clone (`spec.projectRepo`), derived from the Flux URL
+    /// with [`keel_pko::pko_project_repo_url`]: external `https://`/`ssh://` forges unchanged, the
+    /// in-cluster Forgejo `http://` Service mapped to the platform-configured Forgejo HTTPS origin
+    /// (`forge_public_url`, from `.keel/config.yaml` `forge.publicUrl`), anything else refused
+    /// with [`KubeError::TenantSourceUnavailable`]. The Flux `GitRepository` itself stays on its
+    /// own URL.
+    pub fn pko_project_repo(&self, forge_public_url: Option<&str>) -> Result<String, KubeError> {
+        keel_pko::pko_project_repo_url(&self.url, forge_public_url).map_err(|e| {
+            KubeError::TenantSourceUnavailable(format!(
+                "tenant Git source `{}/{TENANT_GIT_REPOSITORY_NAME}` cannot be cloned by PKO: {e}",
+                self.namespace
+            ))
+        })
+    }
 }
 
 /// Branch tenant Stacks track when the tenant source does not pin one.
@@ -180,9 +197,11 @@ pub fn tenant_git_source_from_manifest(
         }
         other => other,
     })?;
-    if let Err(e) = keel_pko::validate_git_source_url(&source.url) {
+    // The Flux URL may be the in-cluster Forgejo `http://` Service; PKO Stacks clone the URL
+    // derived from it by [`TenantGitSource::pko_project_repo`].
+    if let Err(e) = keel_pko::validate_flux_git_source_url(&source.url) {
         return Err(unavailable(&format!(
-            "has a Flux Git source PKO cannot clone ({e})"
+            "has a Flux Git source that is not a network Git URL ({e})"
         )));
     }
     // The platform-written read-only `git-credentials` Secret holds HTTP(S) `username`/`password`
@@ -593,6 +612,60 @@ impl KubePreviewCluster {
         Ok(())
     }
 
+    /// Best effort: refreshes `keel-previews/keel-ca-bundle` from the public
+    /// `keel-system/keel-ca-bundle` (Kyverno `sync-keel-ca-bundle` normally maintains it) so
+    /// preview workspaces trust the in-cluster Forgejo HTTPS ingress. Without a source (no local
+    /// CA, external forge with a public CA) nothing is written; the workspace volume is optional.
+    async fn ensure_preview_ca_bundle(&self) {
+        let source: Api<ConfigMap> = Api::namespaced(self.client.clone(), KEEL_SYSTEM_NAMESPACE);
+        let pem = match source.get_opt(KEEL_CA_BUNDLE_CONFIGMAP).await {
+            Ok(Some(cm)) => cm
+                .data
+                .as_ref()
+                .and_then(|d| d.get(KEEL_CA_BUNDLE_KEY))
+                .cloned(),
+            Ok(None) => None,
+            Err(e) => {
+                tracing::debug!(error = %e, "could not read keel-system/{KEEL_CA_BUNDLE_CONFIGMAP}");
+                None
+            }
+        };
+        let Some(pem) = pem else {
+            return;
+        };
+        let doc = match crate::ca_bundle::build_keel_ca_bundle_configmap(
+            KEEL_PREVIEWS_NAMESPACE,
+            &pem,
+        ) {
+            Ok(doc) => doc,
+            Err(e) => {
+                tracing::warn!(error = %e, "keel-system/{KEEL_CA_BUNDLE_CONFIGMAP} is not a public CA bundle; not copied");
+                return;
+            }
+        };
+        let target: Api<ConfigMap> = Api::namespaced(self.client.clone(), KEEL_PREVIEWS_NAMESPACE);
+        if let Ok(Some(existing)) = target.get_opt(KEEL_CA_BUNDLE_CONFIGMAP).await
+            && existing
+                .data
+                .as_ref()
+                .and_then(|d| d.get(KEEL_CA_BUNDLE_KEY))
+                .map(String::as_str)
+                == doc["data"][KEEL_CA_BUNDLE_KEY].as_str()
+        {
+            return;
+        }
+        if let Err(e) = target
+            .patch(
+                KEEL_CA_BUNDLE_CONFIGMAP,
+                &PatchParams::apply(PREVIEW_FIELD_MANAGER).force(),
+                &Patch::Apply(&doc),
+            )
+            .await
+        {
+            tracing::warn!(error = %e, "could not refresh keel-previews/{KEEL_CA_BUNDLE_CONFIGMAP}");
+        }
+    }
+
     async fn ensure_service_account(&self) {
         let api: Api<ServiceAccount> =
             Api::namespaced(self.client.clone(), KEEL_PREVIEWS_NAMESPACE);
@@ -734,6 +807,7 @@ impl PreviewCluster for KubePreviewCluster {
         };
 
         self.ensure_service_account().await;
+        self.ensure_preview_ca_bundle().await;
         let mut out = PreviewPrerequisites::default();
 
         // Tenant-scoped S3 identity only (fail closed: never fall back to admin keys).
@@ -1462,6 +1536,46 @@ spec:
         );
         assert_eq!(source.secret_name.as_deref(), Some("git-credentials"));
         assert_eq!(source.branch_or_default(), "main");
+        // Flux keeps the in-cluster http Service; PKO clones the Forgejo HTTPS ingress origin.
+        assert_eq!(
+            source
+                .pko_project_repo(Some("https://forgejo.keel.local:8888"))
+                .unwrap(),
+            "https://forgejo.keel.local:8888/keel/infra-gitops.git"
+        );
+        match source.pko_project_repo(None) {
+            Err(KubeError::TenantSourceUnavailable(msg)) => {
+                assert!(msg.contains("forge.publicUrl"), "{msg}");
+                assert!(msg.contains("tenant-default/keel-gitops"), "{msg}");
+            }
+            other => panic!("expected TenantSourceUnavailable, got {other:?}"),
+        }
+        // Any other plain-http source fails closed for PKO (Flux could still pull it).
+        let other_http = tenant_git_source_from_manifest(
+            "default",
+            Some(&DEFAULT_TENANT_STUB.replace(
+                "http://forgejo-http.keel-system.svc.cluster.local:3000",
+                "http://gitea.example.org",
+            )),
+        )
+        .unwrap();
+        assert!(matches!(
+            other_http.pko_project_repo(Some("https://forgejo.keel.local:8888")),
+            Err(KubeError::TenantSourceUnavailable(_))
+        ));
+        // External HTTPS forges pass through unchanged.
+        let external = tenant_git_source_from_manifest(
+            "default",
+            Some(&DEFAULT_TENANT_STUB.replace(
+                "http://forgejo-http.keel-system.svc.cluster.local:3000/keel/infra-gitops.git",
+                "https://github.com/acme/gitops.git",
+            )),
+        )
+        .unwrap();
+        assert_eq!(
+            external.pko_project_repo(None).unwrap(),
+            "https://github.com/acme/gitops.git"
+        );
 
         let public = DEFAULT_TENANT_STUB
             .replace("  secretRef:\n    name: git-credentials\n", "")
@@ -1524,7 +1638,7 @@ spec:
                 url,
             );
             let msg = refused("default", Some(&stub));
-            assert!(msg.contains("PKO cannot clone"), "{msg}");
+            assert!(msg.contains("not a network Git URL"), "{msg}");
         }
         // SSH sources would need an `identity` key the platform-written Secret does not have.
         for url in [

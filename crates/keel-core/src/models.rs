@@ -360,6 +360,49 @@ pub enum ForgeKind {
     Local,
 }
 
+/// Checks that `origin` is an `https://<host>[:port]` origin (no path, query, fragment,
+/// credentials or whitespace; a trailing `/` is tolerated). Returns the reason on failure.
+pub fn validate_https_origin(origin: &str) -> Result<(), &'static str> {
+    let Some(authority) = origin.strip_prefix("https://") else {
+        return Err("must use the https:// scheme");
+    };
+    let authority = authority.strip_suffix('/').unwrap_or(authority);
+    if authority.is_empty() {
+        return Err("has no host");
+    }
+    if authority
+        .chars()
+        .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '/' | '@' | '?' | '#'))
+    {
+        return Err("must not contain a path, query, fragment, credentials or whitespace");
+    }
+    let (host, port) = if let Some(rest) = authority.strip_prefix('[') {
+        // Bracketed IPv6 literal: `[addr]` or `[addr]:port`.
+        match rest.split_once(']') {
+            Some((addr, "")) => (addr, None),
+            Some((addr, tail)) => match tail.strip_prefix(':') {
+                Some(p) => (addr, Some(p)),
+                None => return Err("has an invalid host"),
+            },
+            None => return Err("has an invalid host"),
+        }
+    } else {
+        match authority.rsplit_once(':') {
+            Some((h, p)) => (h, Some(p)),
+            None => (authority, None),
+        }
+    };
+    if host.is_empty() {
+        return Err("has no host");
+    }
+    if let Some(port) = port
+        && port.parse::<u16>().map_or(true, |p| p == 0)
+    {
+        return Err("has an invalid port");
+    }
+    Ok(())
+}
+
 /// Git repository and forge configuration inside `.keel/config.yaml`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -368,6 +411,14 @@ pub struct ForgeConfig {
     pub repo_url: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_url: Option<String>,
+    /// HTTPS origin of the forge (`https://<host>[:port]`, no path), e.g.
+    /// `https://forgejo.keel.local:8888` for the Stage 0 in-cluster Forgejo behind Envoy Gateway.
+    /// Flux pulls the in-cluster Forgejo over its plain `http://` Service (`repoUrl`), which PKO
+    /// cannot clone, so tenant and preview PKO `Stack`s clone `<publicUrl>/<org>/<repo>.git`
+    /// instead (`keel_pko::pko_project_repo_url`). Written by `keel bootstrap init --with-forge`
+    /// (derived from `--oidc-public-url`); platform configuration, never tenant input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_url: Option<String>,
     #[serde(default = "default_branch")]
     pub default_branch: String,
     /// Outbound Flux polling interval (defaults to `1m` for NAT/firewall resilience).
@@ -389,6 +440,7 @@ impl Default for ForgeConfig {
             provider: ForgeKind::Local,
             repo_url: String::new(),
             api_url: None,
+            public_url: None,
             default_branch: default_branch(),
             poll_interval: default_poll_interval(),
         }
@@ -594,6 +646,13 @@ impl KeelConfig {
             return Err(CoreError::Validation(
                 "forge.defaultBranch must not be empty".to_string(),
             ));
+        }
+        if let Some(public_url) = &self.forge.public_url {
+            validate_https_origin(public_url).map_err(|why| {
+                CoreError::Validation(format!(
+                    "forge.publicUrl '{public_url}' {why} (expected e.g. `https://forgejo.example.com`)"
+                ))
+            })?;
         }
         if let Some(oidc) = &self.oidc
             && oidc.enabled
@@ -2778,6 +2837,7 @@ mod tests {
                 provider: ForgeKind::Forgejo,
                 repo_url: "https://git.example.com/platform/infra-gitops.git".to_string(),
                 api_url: Some("https://git.example.com/api/v1".to_string()),
+                public_url: Some("https://git.example.com".to_string()),
                 default_branch: "main".to_string(),
                 poll_interval: "1m".to_string(),
             },
@@ -2828,6 +2888,36 @@ mod tests {
         let mut empty_branch = KeelConfig::default();
         empty_branch.forge.default_branch = "".to_string();
         assert!(empty_branch.validate().is_err());
+
+        for ok in [
+            "https://forgejo.keel.local:8888",
+            "https://forgejo.example.com/",
+            "https://forgejo.example.com",
+        ] {
+            let mut c = KeelConfig::default();
+            c.forge.public_url = Some(ok.to_string());
+            assert!(c.validate().is_ok(), "{ok}");
+        }
+        for bad in [
+            "http://forgejo.keel.local:8888",
+            "https://forgejo.keel.local/sub",
+            "https://user:pw@forgejo.keel.local",
+            "https://",
+            "https://forgejo.keel.local:0",
+            "https://forgejo.keel.local:http",
+            "forgejo.keel.local",
+        ] {
+            let mut c = KeelConfig::default();
+            c.forge.public_url = Some(bad.to_string());
+            assert!(c.validate().is_err(), "{bad}");
+        }
+        // `publicUrl` is optional and omitted from YAML when unset (older configs still parse).
+        assert!(
+            !KeelConfig::default()
+                .to_yaml()
+                .unwrap()
+                .contains("publicUrl")
+        );
     }
 
     #[test]

@@ -1,0 +1,68 @@
+# Kyverno GeneratingPolicy + scoped RBAC: sync-keel-ca-bundle (SDD.md §4.2, §6.2)
+# Mirrors `keel_kube::kyverno::build_sync_keel_ca_bundle_manifests()`.
+# Clones the PUBLIC Keel CA certificate (`keel-system/keel-ca-bundle`, key `ca.crt`, written by
+# `keel bootstrap init` from the public half of `keel-system/keel-ca-secret`) into `keel-previews`
+# and every `tenant-*` namespace (new ones on creation, existing ones via generateExisting) and
+# keeps the copies synchronized. PKO workspace pods mount it (optional) so the `fetch` init
+# container and `pulumi` trust the in-cluster Forgejo HTTPS ingress. No Secret is ever read or
+# copied; without a local CA the source is absent and nothing is generated.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: keel-kyverno-ca-bundle-sync
+  labels:
+    app.kubernetes.io/managed-by: keel
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["list", "watch", "create"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["keel-ca-bundle"]
+    verbs: ["get", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: keel-kyverno-ca-bundle-sync
+  labels:
+    app.kubernetes.io/managed-by: keel
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: keel-kyverno-ca-bundle-sync
+subjects:
+  - kind: ServiceAccount
+    name: kyverno-background-controller
+    namespace: kyverno
+  - kind: ServiceAccount
+    name: kyverno-admission-controller
+    namespace: kyverno
+---
+apiVersion: policies.kyverno.io/v1
+kind: GeneratingPolicy
+metadata:
+  name: sync-keel-ca-bundle
+  labels:
+    app.kubernetes.io/managed-by: keel
+    keel.io/policy-tier: tenant-ca-trust
+spec:
+  evaluation:
+    generateExisting:
+      enabled: true
+    synchronize:
+      enabled: true
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["namespaces"]
+  matchConditions:
+    - name: previews-or-tenant-namespace
+      expression: "object.metadata.name == 'keel-previews' || (object.metadata.name.startsWith('tenant-') && object.metadata.name.size() > 7)"
+  variables:
+    - name: caBundle
+      expression: "resource.Get('v1', 'configmaps', 'keel-system', 'keel-ca-bundle')"
+  generate:
+    - expression: "generator.Apply(object.metadata.name, [{'apiVersion': dyn('v1'), 'kind': dyn('ConfigMap'), 'metadata': dyn({'name': 'keel-ca-bundle', 'labels': {'app.kubernetes.io/managed-by': 'keel', 'keel.io/ca-bundle': 'true'}}), 'data': dyn({'ca.crt': variables.caBundle.data['ca.crt']})}])"

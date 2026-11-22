@@ -302,6 +302,9 @@ enabledProviders:
 forge:
   provider: local
   repoUrl: "http://127.0.0.1:18080/repo.git"
+  # Forgejo HTTPS origin tenant/preview PKO Stacks clone the in-cluster Forgejo through
+  # (PKO rejects the http:// Service URL of the tenant source stubs below).
+  publicUrl: "https://forgejo.keel.local:8888"
 oidc:
   enabled: true
   issuerUrl: "${OIDC_ISSUER}"

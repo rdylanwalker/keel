@@ -2031,7 +2031,7 @@ spec:
     }
 
     #[test]
-    fn default_tenant_git_repository_yaml_is_valid_multi_doc() {
+    fn default_tenant_git_repository_yaml_is_a_single_protected_source() {
         let repo = FluxGitRepository {
             api_version: FLUX_GIT_REPO_API_VERSION.to_string(),
             kind: FLUX_GIT_REPO_KIND.to_string(),
@@ -2057,25 +2057,17 @@ spec:
         };
         let yaml = render_default_tenant_git_repository_yaml(&repo).unwrap();
         assert!(yaml.ends_with('\n'));
-        assert!(yaml.contains("\n---\n"));
-        for line in yaml.lines() {
-            if line.contains("---") {
-                assert_eq!(line, "---", "document separator must be on its own line");
-            }
-        }
-        let docs: Vec<&str> = yaml.split("\n---\n").collect();
-        assert_eq!(docs.len(), 2);
-        let first: serde_json::Value = serde_yml::from_str(docs[0]).unwrap();
-        let second: serde_json::Value = serde_yml::from_str(docs[1]).unwrap();
+        // Only the GitRepository: `allow-pko-workspace` is part of the tenant baseline
+        // (`tenants/default/rbac.yaml`), so kustomize never sees it twice.
+        let docs = keel_core::split_yaml_documents(&yaml);
+        assert_eq!(docs.len(), 1);
+        let first: serde_json::Value = serde_yml::from_str(&docs[0]).unwrap();
         assert_eq!(first["kind"], "GitRepository");
-        assert_eq!(second["kind"], "NetworkPolicy");
-        // Both platform-written tenant-default objects are Kyverno-protected from tenant edits.
-        for doc in [&first, &second] {
-            assert_eq!(
-                doc["metadata"]["labels"][keel_kube::PLATFORM_OWNED_LABEL],
-                "true"
-            );
-        }
+        // The platform-written tenant-default source is Kyverno-protected from tenant edits.
+        assert_eq!(
+            first["metadata"]["labels"][keel_kube::PLATFORM_OWNED_LABEL],
+            "true"
+        );
         // The caller's object is not mutated.
         assert!(
             !repo

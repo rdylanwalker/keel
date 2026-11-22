@@ -229,18 +229,41 @@ fn tenant_stack_backend_url(state: &AppState, tenant: &str) -> Result<String, Se
     })
 }
 
+/// A tenant's platform-written Git source resolved for PKO `Stack`s: the Flux source (branch,
+/// read-only credentials) plus the URL PKO clones (`spec.projectRepo`, see
+/// [`keel_kube::TenantGitSource::pko_project_repo`]).
+#[derive(Debug, Clone)]
+pub(crate) struct TenantStackSource {
+    pub source: keel_kube::TenantGitSource,
+    /// `https://`/`ssh://` URL PKO clones: the Flux URL for external forges, or the Forgejo HTTPS
+    /// origin (`forge.publicUrl`) for the in-cluster Forgejo `http://` Service.
+    pub project_repo: String,
+}
+
 /// Resolves the tenant's own Git source that its PKO `Stack`s clone (`gitSource`) from the
 /// platform-written `tenants/<id>/git-repository.yaml` on the committed GitOps `main` (never the
-/// live, tenant-editable `keel-gitops` object, and never the platform `flux-system` source).
+/// live, tenant-editable `keel-gitops` object, and never the platform `flux-system` source), and
+/// derives the URL PKO clones from it with the platform-configured forge HTTPS origin
+/// (`AppState::forge_public_url`; PKO cannot clone the in-cluster `http://` Forgejo Service).
 ///
 /// Fails closed with `409 Conflict` and an actionable message when the tenant has no usable
-/// source (e.g. tenants created through `POST /api/v1/tenants` before per-tenant repositories),
-/// so no Stack that could only work through whole-repository access is ever committed.
+/// source (e.g. tenants created through `POST /api/v1/tenants` before per-tenant repositories) or
+/// its URL cannot be cloned by PKO, so no Stack that could only work through whole-repository
+/// access (or could never clone) is ever committed.
 pub(crate) async fn resolve_tenant_stack_source(
     state: &AppState,
     tenant: &str,
-) -> Result<keel_kube::TenantGitSource, ServerError> {
-    match read_tenant_stack_source(state, tenant).await {
+) -> Result<TenantStackSource, ServerError> {
+    let resolved = read_tenant_stack_source(state, tenant)
+        .await
+        .and_then(|source| {
+            let project_repo = source.pko_project_repo(state.forge_public_url.as_deref())?;
+            Ok(TenantStackSource {
+                source,
+                project_repo,
+            })
+        });
+    match resolved {
         Ok(source) => Ok(source),
         Err(keel_kube::KubeError::TenantSourceUnavailable(reason)) => {
             tracing::warn!(
@@ -275,20 +298,31 @@ async fn read_tenant_stack_source(
     keel_kube::tenant_git_source_from_manifest(tenant, manifest.as_deref())
 }
 
-/// PKO `gitSource` for a tenant Stack in `repo_dir`: the tenant source URL and branch, with
-/// `gitAuth` referencing the tenant's read-only `git-credentials` Secret in its own namespace.
+/// PKO `gitSource` for a tenant Stack in `repo_dir`: the PKO clone URL and the tenant source
+/// branch, with `gitAuth` referencing the tenant's read-only `git-credentials` Secret in its own
+/// namespace.
 pub(crate) fn tenant_stack_git_source(
-    source: &keel_kube::TenantGitSource,
+    resolved: &TenantStackSource,
     repo_dir: &str,
 ) -> Result<PkoGitSource, keel_pko::PkoError> {
-    let auth = source
+    let auth = resolved
+        .source
         .secret_name
         .as_deref()
         .map(|secret| {
-            PkoGitAuth::from_flux_secret(secret, &source.url, &std::collections::BTreeSet::new())
+            PkoGitAuth::from_flux_secret(
+                secret,
+                &resolved.project_repo,
+                &std::collections::BTreeSet::new(),
+            )
         })
         .transpose()?;
-    Ok(PkoGitSource::branch(&source.url, source.branch_or_default(), repo_dir).with_auth(auth))
+    Ok(PkoGitSource::branch(
+        &resolved.project_repo,
+        resolved.source.branch_or_default(),
+        repo_dir,
+    )
+    .with_auth(auth))
 }
 
 /// Ensures `tenant_ns` holds the tenant's state credentials before a Pulumi Stack is committed:
@@ -3109,10 +3143,16 @@ async fn attach_preview_cluster_inputs(
     // platform-written `tenants/<id>/git-repository.yaml` on `origin/main`; never the live,
     // tenant-editable `keel-gitops` `spec.url` (the cluster source only supplies the read-only
     // credentials) and never the control-plane remote.
+    let forge_public_url = state.forge_public_url.as_deref();
     let platform_url = match params.tenant_repo_url.clone() {
-        Some(u) => u,
-        None => match read_tenant_stack_source(state, tenant).await {
-            Ok(source) => source.url,
+        // Stacks committed before PKO clone URLs were separated from Flux URLs may still carry the
+        // in-cluster `http://` Forgejo Service: preview them through the HTTPS origin too.
+        Some(u) => keel_pko::pko_project_repo_url(&u, forge_public_url).unwrap_or(u),
+        None => match read_tenant_stack_source(state, tenant)
+            .await
+            .and_then(|source| source.pko_project_repo(forge_public_url))
+        {
+            Ok(url) => url,
             Err(e) => {
                 tracing::warn!(
                     tenant,
@@ -3134,7 +3174,12 @@ async fn attach_preview_cluster_inputs(
             "Tenant `{tenant}` Git source cannot be cloned by PKO ({e}): PKO preview not executed"
         ));
     }
-    if platform_url != url {
+    // `url` is the live Flux URL; compare the clone URL PKO would derive from it.
+    if keel_pko::pko_project_repo_url(&url, forge_public_url)
+        .ok()
+        .as_deref()
+        != Some(platform_url.as_str())
+    {
         tracing::warn!(
             tenant,
             audit = "preview-source-mismatch",

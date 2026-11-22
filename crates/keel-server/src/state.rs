@@ -1153,6 +1153,11 @@ pub struct AppState {
     /// Provisions per-tenant scoped SeaweedFS S3 identities (`None` without a live cluster).
     pub tenant_s3_provisioner: Option<Arc<dyn keel_kube::TenantS3IdentityProvisioner>>,
     pub docker_proxy_url: Option<String>,
+    /// Forge HTTPS origin (`.keel/config.yaml` `forge.publicUrl`, e.g.
+    /// `https://forgejo.keel.local:8888`). Tenant and preview PKO Stacks clone the in-cluster
+    /// Forgejo through it because PKO rejects the `http://` Service URL Flux uses. Platform
+    /// configuration only; `None` makes such Stacks fail closed with an actionable `409`.
+    pub forge_public_url: Option<String>,
     pub git_lock: Arc<Mutex<()>>,
     /// Optional read-through cache of preview reports; the cluster (`keel-previews` preview
     /// `Stack` labels/annotations + report `ConfigMap`) is the source of truth (OPEN-10).
@@ -1195,6 +1200,7 @@ impl AppState {
             s3_credentials_secret: None,
             tenant_s3_provisioner: None,
             docker_proxy_url: None,
+            forge_public_url: None,
             git_lock: Arc::new(Mutex::new(())),
             preview_cache: Arc::new(RwLock::new(HashMap::new())),
             preview_cluster: None,
@@ -1220,6 +1226,15 @@ impl AppState {
     /// Configures an optional `DOCKER_HOST` proxy endpoint for local `kind`-in-`kind` PKO workspaces.
     pub fn with_docker_proxy_url(mut self, url: Option<String>) -> Self {
         self.docker_proxy_url = url;
+        self
+    }
+
+    /// Configures the forge HTTPS origin PKO Stacks clone the in-cluster Forgejo through
+    /// (`forge.publicUrl`). Blank values are ignored; a trailing `/` is dropped.
+    pub fn with_forge_public_url(mut self, url: Option<String>) -> Self {
+        self.forge_public_url = url
+            .map(|u| u.trim().trim_end_matches('/').to_string())
+            .filter(|u| !u.is_empty());
         self
     }
 

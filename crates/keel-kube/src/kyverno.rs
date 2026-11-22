@@ -9,7 +9,10 @@
 
 use std::collections::BTreeMap;
 
-use keel_core::{FLUX_SYSTEM_NAMESPACE, KEEL_PREVIEWS_NAMESPACE, KEEL_SYSTEM_NAMESPACE};
+use keel_core::{
+    FLUX_SYSTEM_NAMESPACE, KEEL_CA_BUNDLE_CONFIGMAP, KEEL_CA_BUNDLE_KEY, KEEL_PREVIEWS_NAMESPACE,
+    KEEL_SYSTEM_NAMESPACE,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -31,6 +34,9 @@ pub const POLICY_RESTRICT_TENANT_RECONCILER: &str = "restrict-tenant-reconciler"
 pub const POLICY_RESTRICT_TENANT_ROUTE_HOSTNAMES: &str = "restrict-tenant-route-hostnames";
 pub const POLICY_RESTRICT_TENANT_FLUX_SOURCES: &str = "restrict-tenant-flux-sources";
 pub const POLICY_RESTRICT_TENANT_FLUX_SOURCE_STATUS: &str = "restrict-tenant-flux-source-status";
+/// `GeneratingPolicy` cloning the public `keel-system/keel-ca-bundle` into `keel-previews` and
+/// every `tenant-*` namespace ([`build_sync_keel_ca_bundle_manifests`]).
+pub const POLICY_SYNC_KEEL_CA_BUNDLE: &str = "sync-keel-ca-bundle";
 pub const POLICY_PROTECT_PLATFORM_OWNED_TENANT_OBJECTS: &str =
     "protect-platform-owned-tenant-objects";
 pub const EXCEPTION_LOCAL_KIND_DOCKER_SOCKET: &str = "local-kind-docker-socket-exception";
@@ -993,6 +999,97 @@ pub fn build_restrict_tenant_route_hostnames_policy<S: AsRef<str>>(
     }))
 }
 
+/// Generates the `sync-keel-ca-bundle` Kyverno `GeneratingPolicy` (`policies.kyverno.io/v1`) and
+/// the least-privilege RBAC its controllers need (`ClusterRole`/`ClusterRoleBinding`
+/// `keel-kyverno-ca-bundle-sync`).
+///
+/// On every `keel-previews` / `tenant-*` Namespace (new ones on creation, existing ones through
+/// `generateExisting`) Kyverno writes ConfigMap `keel-ca-bundle` with exactly the `ca.crt` of
+/// `keel-system/keel-ca-bundle` (the **public** Keel CA certificate that `keel bootstrap init`
+/// copies out of `keel-ca-secret`), and keeps it synchronized (a deleted or edited copy is
+/// restored). PKO workspace pods mount it (`optional: true`) to trust the in-cluster Forgejo HTTPS
+/// ingress. No Secret is read: when no local CA exists the source is absent, nothing is generated
+/// and workspaces just use the system roots (external forge with a public CA).
+pub fn build_sync_keel_ca_bundle_manifests() -> Vec<Value> {
+    let labels = json!({ "app.kubernetes.io/managed-by": "keel" });
+    vec![
+        json!({
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "ClusterRole",
+            "metadata": { "name": "keel-kyverno-ca-bundle-sync", "labels": labels },
+            "rules": [
+                {
+                    "apiGroups": [""],
+                    "resources": ["configmaps"],
+                    "verbs": ["list", "watch", "create"]
+                },
+                {
+                    "apiGroups": [""],
+                    "resources": ["configmaps"],
+                    "resourceNames": [KEEL_CA_BUNDLE_CONFIGMAP],
+                    "verbs": ["get", "update", "patch", "delete"]
+                }
+            ]
+        }),
+        json!({
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "ClusterRoleBinding",
+            "metadata": { "name": "keel-kyverno-ca-bundle-sync", "labels": labels },
+            "roleRef": {
+                "apiGroup": "rbac.authorization.k8s.io",
+                "kind": "ClusterRole",
+                "name": "keel-kyverno-ca-bundle-sync"
+            },
+            "subjects": [
+                { "kind": "ServiceAccount", "name": "kyverno-background-controller", "namespace": "kyverno" },
+                { "kind": "ServiceAccount", "name": "kyverno-admission-controller", "namespace": "kyverno" }
+            ]
+        }),
+        json!({
+            "apiVersion": "policies.kyverno.io/v1",
+            "kind": "GeneratingPolicy",
+            "metadata": {
+                "name": POLICY_SYNC_KEEL_CA_BUNDLE,
+                "labels": {
+                    "app.kubernetes.io/managed-by": "keel",
+                    "keel.io/policy-tier": "tenant-ca-trust"
+                }
+            },
+            "spec": {
+                "evaluation": {
+                    "generateExisting": { "enabled": true },
+                    "synchronize": { "enabled": true }
+                },
+                "matchConstraints": {
+                    "resourceRules": [{
+                        "apiGroups": [""],
+                        "apiVersions": ["v1"],
+                        "operations": ["CREATE", "UPDATE"],
+                        "resources": ["namespaces"]
+                    }]
+                },
+                "matchConditions": [{
+                    "name": "previews-or-tenant-namespace",
+                    "expression": format!(
+                        "object.metadata.name == '{KEEL_PREVIEWS_NAMESPACE}' || (object.metadata.name.startsWith('tenant-') && object.metadata.name.size() > 7)"
+                    )
+                }],
+                "variables": [{
+                    "name": "caBundle",
+                    "expression": format!(
+                        "resource.Get('v1', 'configmaps', '{KEEL_SYSTEM_NAMESPACE}', '{KEEL_CA_BUNDLE_CONFIGMAP}')"
+                    )
+                }],
+                "generate": [{
+                    "expression": format!(
+                        "generator.Apply(object.metadata.name, [{{'apiVersion': dyn('v1'), 'kind': dyn('ConfigMap'), 'metadata': dyn({{'name': '{KEEL_CA_BUNDLE_CONFIGMAP}', 'labels': {{'app.kubernetes.io/managed-by': 'keel', 'keel.io/ca-bundle': 'true'}}}}), 'data': dyn({{'{KEEL_CA_BUNDLE_KEY}': variables.caBundle.data['{KEEL_CA_BUNDLE_KEY}']}})}}])"
+                    )
+                }]
+            }
+        }),
+    ]
+}
+
 /// Generated bundle of baseline Kyverno `ValidatingPolicy` manifests and optional local-dev `PolicyException`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct KyvernoManifestBundle {
@@ -1011,13 +1108,14 @@ impl KyvernoManifestBundle {
             build_restrict_pulumi_providers_policy(&config.allowed_providers)?,
         ];
 
-        let supporting_manifests = vec![
+        let mut supporting_manifests = vec![
             build_restrict_tenant_reconciler_policy(),
             build_restrict_tenant_route_hostnames_policy(&config.reserved_route_hostnames)?,
             build_restrict_tenant_flux_sources_policy(),
             build_restrict_tenant_flux_source_status_policy(),
             build_protect_platform_owned_tenant_objects_policy(),
         ];
+        supporting_manifests.extend(build_sync_keel_ca_bundle_manifests());
 
         let policy_exception = if config.local_dev_docker_socket_exception {
             Some(build_local_kind_docker_socket_exception(
@@ -1070,14 +1168,24 @@ mod tests {
 
         let bundle = KyvernoManifestBundle::generate(&cfg).unwrap();
         assert_eq!(bundle.cluster_policies.len(), 3);
-        assert_eq!(bundle.supporting_manifests.len(), 5);
+        // 5 ValidatingPolicies + sync-keel-ca-bundle (ClusterRole, binding, GeneratingPolicy).
+        assert_eq!(bundle.supporting_manifests.len(), 8);
         assert!(bundle.policy_exception.is_none());
-        assert_eq!(bundle.all_manifests().len(), 8);
+        assert_eq!(bundle.all_manifests().len(), 11);
+        // The only GeneratingPolicy copies the public CA bundle; the retired
+        // `sync-tenant-secrets` (control-plane credentials into tenants) never comes back.
+        let generating: Vec<Value> = bundle
+            .all_manifests()
+            .into_iter()
+            .filter(|m| m["kind"] == "GeneratingPolicy")
+            .map(|m| m["metadata"]["name"].clone())
+            .collect();
+        assert_eq!(generating, vec![json!(POLICY_SYNC_KEEL_CA_BUNDLE)]);
         assert!(
             !bundle
                 .to_multi_doc_yaml()
                 .unwrap()
-                .contains("GeneratingPolicy")
+                .contains(POLICY_SYNC_TENANT_SECRETS)
         );
 
         let names: Vec<&str> = bundle
@@ -1115,7 +1223,7 @@ mod tests {
         };
 
         let bundle = KyvernoManifestBundle::generate(&cfg).unwrap();
-        assert_eq!(bundle.all_manifests().len(), 9);
+        assert_eq!(bundle.all_manifests().len(), 12);
 
         let exc = bundle
             .policy_exception
@@ -1268,6 +1376,7 @@ mod tests {
         ] {
             docs.push(serde_yml::from_str(seed).unwrap());
         }
+        docs.extend(build_sync_keel_ca_bundle_manifests());
         for doc in docs {
             let text = doc.to_string();
             let stripped = text
@@ -1279,6 +1388,44 @@ mod tests {
                 doc["metadata"]["name"]
             );
         }
+    }
+
+    #[test]
+    fn sync_keel_ca_bundle_matches_seed_and_copies_only_the_public_ca() {
+        let seed: Vec<Value> = keel_core::split_yaml_documents(include_str!(
+            "../../../deploy/seed/kyverno-policies/sync-keel-ca-bundle.yaml"
+        ))
+        .iter()
+        .map(|d| serde_yml::from_str(d).unwrap())
+        .collect();
+        let generated = build_sync_keel_ca_bundle_manifests();
+        assert_eq!(seed, generated);
+        let policy = &generated[2];
+        assert_eq!(policy["kind"], "GeneratingPolicy");
+        assert_eq!(policy["metadata"]["name"], POLICY_SYNC_KEEL_CA_BUNDLE);
+        let text = policy.to_string();
+        // Never reads or copies a Secret (the CA Secret holds the private key).
+        assert!(!text.contains("secrets"), "{text}");
+        assert!(!text.contains("keel-ca-secret"), "{text}");
+        assert!(text.contains("'configmaps', 'keel-system', 'keel-ca-bundle'"));
+        let cond = policy["spec"]["matchConditions"][0]["expression"]
+            .as_str()
+            .unwrap();
+        assert!(cond.contains("keel-previews") && cond.contains("startsWith('tenant-')"));
+        // RBAC is limited to ConfigMaps, and to `keel-ca-bundle` for reads/updates.
+        for rule in generated[0]["rules"].as_array().unwrap() {
+            assert_eq!(rule["resources"], json!(["configmaps"]));
+            if rule["verbs"].as_array().unwrap().contains(&json!("get")) {
+                assert_eq!(rule["resourceNames"], json!(["keel-ca-bundle"]));
+            }
+        }
+        let bundle = KyvernoManifestBundle::generate(&KyvernoPolicyConfig::default()).unwrap();
+        assert!(
+            bundle
+                .all_manifests()
+                .iter()
+                .any(|m| m["metadata"]["name"] == POLICY_SYNC_KEEL_CA_BUNDLE)
+        );
     }
 
     #[test]
@@ -1763,7 +1910,7 @@ mod tests {
             }
         }
         let docs: Vec<&str> = yaml.split("\n---\n").collect();
-        assert_eq!(docs.len(), 9);
+        assert_eq!(docs.len(), 12);
         for doc in docs {
             let parsed: serde_json::Value =
                 serde_yml::from_str(doc).expect("each Kyverno multi-doc YAML part must parse");

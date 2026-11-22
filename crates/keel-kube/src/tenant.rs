@@ -202,6 +202,41 @@ pub fn label_platform_owned_manifests(yaml: &str) -> Result<Option<String>, Kube
     Ok(changed.then_some(out))
 }
 
+/// Appends the tenant's `allow-pko-workspace` `NetworkPolicy`
+/// ([`build_tenant_pko_workspace_network_policy`]) to its baseline `rbac.yaml` when none of the
+/// platform-written tenant files (`rbac_yaml` and `other_files`, e.g. `git-repository.yaml`, where
+/// earlier releases wrote it for `tenant-default`) defines it yet. Tenants created through the API
+/// by earlier releases lack it, so `default-deny-all` blocks their PKO workspace pods (no clone,
+/// no operator gRPC). Returns `None` when nothing changes; existing documents stay byte-for-byte.
+pub fn ensure_tenant_pko_workspace_network_policy(
+    tenant_id: &str,
+    rbac_yaml: &str,
+    other_files: &[&str],
+) -> Result<Option<String>, KubeError> {
+    let defines_policy = |yaml: &str| {
+        keel_core::split_yaml_documents(yaml).iter().any(|doc| {
+            serde_yml::from_str::<Value>(doc).is_ok_and(|v| {
+                v.get("kind").and_then(Value::as_str) == Some("NetworkPolicy")
+                    && v.pointer("/metadata/name").and_then(Value::as_str)
+                        == Some(TENANT_PKO_WORKSPACE_NETWORK_POLICY)
+            })
+        })
+    };
+    if defines_policy(rbac_yaml) || other_files.iter().any(|f| defines_policy(f)) {
+        return Ok(None);
+    }
+    let policy = serde_yml::to_string(&build_tenant_pko_workspace_network_policy(tenant_id)?)?;
+    let mut out = rbac_yaml.to_string();
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    if !out.trim().is_empty() {
+        out.push_str("---\n");
+    }
+    out.push_str(&policy);
+    Ok(Some(out))
+}
+
 fn tenant_common_labels(tenant_id: &str) -> BTreeMap<String, String> {
     BTreeMap::from([
         (
@@ -332,6 +367,120 @@ pub fn build_tenant_default_deny_network_policy(
             egress: None,
         }),
     })
+}
+
+/// Name of the per-tenant `NetworkPolicy` that admits PKO workspace pods through
+/// `default-deny-all`.
+pub const TENANT_PKO_WORKSPACE_NETWORK_POLICY: &str = "allow-pko-workspace";
+
+/// TCP port of the in-cluster SeaweedFS S3 state backend
+/// (`keel-system/s3-state-backend-seaweedfs-s3`, `keel_pko::IN_CLUSTER_S3_BACKEND_URL`).
+pub const IN_CLUSTER_S3_STATE_BACKEND_PORT: u16 = 8333;
+
+/// Private IPv4 ranges (RFC 1918 and CGNAT) PKO workspaces reach only on
+/// [`PKO_WORKSPACE_PRIVATE_EGRESS_PORTS`]. Link-local `169.254.0.0/16` (cloud instance metadata
+/// `169.254.169.254` on aws/gcp/azure/hetzner) is never allowed.
+pub const PKO_WORKSPACE_PRIVATE_EGRESS_CIDRS: [&str; 4] = [
+    "10.0.0.0/8",
+    "100.64.0.0/10",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+];
+
+/// TCP ports PKO workspaces may use towards private addresses: Git over SSH (22), HTTPS forges and
+/// the Kubernetes API Service (443), the API server endpoint after Service DNAT (6443) and the
+/// Proxmox VE API (8006).
+pub const PKO_WORKSPACE_PRIVATE_EGRESS_PORTS: [u16; 4] = [22, 443, 6443, 8006];
+
+/// Generates the `allow-pko-workspace` `NetworkPolicy` every tenant needs to run PKO `Stack`s
+/// through `default-deny-all`. Workspace pods (`auto.pulumi.com/component: workspace`) accept the
+/// PKO operator (`keel-system`) on the agent gRPC port `50051`. Egress is an allowlist:
+///
+/// * cluster DNS (`kube-system`, 53);
+/// * the `keel-ingress` Envoy proxy pods on [`KEEL_INGRESS_PROXY_PORTS`] (the `fetch` init
+///   container clones `projectRepo` from the in-cluster Forgejo HTTPS ingress), never other
+///   `keel-system` workloads (Forgejo's HTTP Service, the IdP, keel-server, SeaweedFS admin/filer);
+/// * `keel-system` on [`IN_CLUSTER_S3_STATE_BACKEND_PORT`] (the default Pulumi state backend);
+/// * [`PKO_WORKSPACE_PRIVATE_EGRESS_CIDRS`] on [`PKO_WORKSPACE_PRIVATE_EGRESS_PORTS`] (the
+///   Kubernetes API server, private forges over HTTPS/SSH, the Proxmox VE API);
+/// * public IPv4 on any port ([`PUBLIC_EGRESS_EXCEPT_CIDRS`] excluded: private, link-local,
+///   loopback, multicast and reserved ranges), for cloud provider APIs and external forges.
+///
+/// Cloud instance metadata (`169.254.0.0/16`) is never reachable. Whether an `ipBlock` also
+/// matches in-cluster pod IPs is CNI-specific, so `keel-system` workloads listening on 443/22 are
+/// not guaranteed to be unreachable; this is defense in depth, not a hard boundary.
+///
+/// The selector label is not privileged: a tenant can put it on any pod, and tenant identities
+/// can create their own `NetworkPolicy` objects, so default-deny for other tenant pods holds only
+/// against workloads that do neither.
+pub fn build_tenant_pko_workspace_network_policy(
+    tenant_id: &str,
+) -> Result<NetworkPolicy, KubeError> {
+    let ns_name = tenant_namespace(tenant_id)?;
+    let keel_system_selector = json!({
+        "matchLabels": { "kubernetes.io/metadata.name": "keel-system" }
+    });
+    let egress = json!([
+        {
+            "to": [{
+                "namespaceSelector": {
+                    "matchLabels": { "kubernetes.io/metadata.name": "kube-system" }
+                }
+            }],
+            "ports": [
+                { "protocol": "UDP", "port": 53 },
+                { "protocol": "TCP", "port": 53 }
+            ]
+        },
+        {
+            "to": [{
+                "namespaceSelector": keel_system_selector.clone(),
+                "podSelector": {
+                    "matchLabels": { ENVOY_OWNING_GATEWAY_LABEL: "keel-ingress" }
+                }
+            }],
+            "ports": tcp_ports(&KEEL_INGRESS_PROXY_PORTS)?,
+        },
+        {
+            "to": [{ "namespaceSelector": keel_system_selector }],
+            "ports": tcp_ports(&[IN_CLUSTER_S3_STATE_BACKEND_PORT])?,
+        },
+        {
+            "to": PKO_WORKSPACE_PRIVATE_EGRESS_CIDRS
+                .iter()
+                .map(|cidr| json!({ "ipBlock": { "cidr": cidr } }))
+                .collect::<Vec<_>>(),
+            "ports": tcp_ports(&PKO_WORKSPACE_PRIVATE_EGRESS_PORTS)?,
+        },
+        {
+            "to": [{
+                "ipBlock": { "cidr": "0.0.0.0/0", "except": PUBLIC_EGRESS_EXCEPT_CIDRS }
+            }]
+        }
+    ]);
+    let value = json!({
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "NetworkPolicy",
+        "metadata": {
+            "name": TENANT_PKO_WORKSPACE_NETWORK_POLICY,
+            "namespace": ns_name,
+            "labels": platform_owned_labels(tenant_id),
+        },
+        "spec": {
+            "podSelector": { "matchLabels": { "auto.pulumi.com/component": "workspace" } },
+            "policyTypes": ["Ingress", "Egress"],
+            "ingress": [{
+                "from": [{
+                    "namespaceSelector": {
+                        "matchLabels": { "kubernetes.io/metadata.name": "keel-system" }
+                    }
+                }],
+                "ports": [{ "protocol": "TCP", "port": 50051 }]
+            }],
+            "egress": egress
+        }
+    });
+    Ok(serde_json::from_value(value)?)
 }
 
 /// Generates a default `LimitRange` (`default-container-resources`) so upstream Helm charts
@@ -466,6 +615,8 @@ pub struct TenantManifestBundle {
     pub resource_quota: ResourceQuota,
     pub limit_range: LimitRange,
     pub network_policy: NetworkPolicy,
+    /// `allow-pko-workspace`: PKO workspace pods through `default-deny-all`.
+    pub pko_workspace_network_policy: NetworkPolicy,
     pub role_binding: RoleBinding,
     pub keel_server_role_binding: RoleBinding,
     pub auth_delegator_binding: ClusterRoleBinding,
@@ -480,6 +631,9 @@ impl TenantManifestBundle {
             resource_quota: build_tenant_resource_quota(config)?,
             limit_range: build_tenant_limit_range(&config.tenant_id)?,
             network_policy: build_tenant_default_deny_network_policy(&config.tenant_id)?,
+            pko_workspace_network_policy: build_tenant_pko_workspace_network_policy(
+                &config.tenant_id,
+            )?,
             role_binding: build_tenant_admin_role_binding(config)?,
             keel_server_role_binding: build_keel_server_tenant_role_binding(&config.tenant_id)?,
             auth_delegator_binding: build_tenant_auth_delegator_binding(config)?,
@@ -494,6 +648,7 @@ impl TenantManifestBundle {
             serde_json::to_value(&self.resource_quota)?,
             serde_json::to_value(&self.limit_range)?,
             serde_json::to_value(&self.network_policy)?,
+            serde_json::to_value(&self.pko_workspace_network_policy)?,
             serde_json::to_value(&self.role_binding)?,
             serde_json::to_value(&self.keel_server_role_binding)?,
             serde_json::to_value(&self.auth_delegator_binding)?,
@@ -2337,23 +2492,59 @@ mod tests {
 
         // JSON & multi-doc YAML serialization
         let json_docs = bundle.to_json_values().unwrap();
-        assert_eq!(json_docs.len(), 8);
+        assert_eq!(json_docs.len(), 9);
         assert_eq!(json_docs[0]["kind"], "Namespace");
         assert_eq!(json_docs[1]["kind"], "ServiceAccount");
         assert_eq!(json_docs[2]["kind"], "ResourceQuota");
         assert_eq!(json_docs[3]["kind"], "LimitRange");
         assert_eq!(json_docs[4]["kind"], "NetworkPolicy");
-        assert_eq!(json_docs[5]["kind"], "RoleBinding");
-        assert_eq!(json_docs[5]["metadata"]["name"], "tenant-acme-prod-admin");
+        // 5. allow-pko-workspace: PKO workspace pods through default-deny-all.
+        assert_eq!(json_docs[5]["kind"], "NetworkPolicy");
+        assert_eq!(json_docs[5]["metadata"]["name"], "allow-pko-workspace");
+        assert_eq!(json_docs[5]["metadata"]["namespace"], "tenant-acme-prod");
+        assert_eq!(
+            json_docs[5]["metadata"]["labels"]["keel.io/platform-owned"],
+            "true"
+        );
+        assert_eq!(
+            json_docs[5]["spec"]["podSelector"],
+            json!({"matchLabels": {"auto.pulumi.com/component": "workspace"}})
+        );
+        let egress = json_docs[5]["spec"]["egress"].as_array().unwrap();
+        assert_eq!(egress.len(), 5);
+        // Every rule names destinations; no allow-all `{}`.
+        assert!(
+            egress
+                .iter()
+                .all(|rule| rule["to"].as_array().is_some_and(|to| !to.is_empty()))
+        );
+        assert_eq!(
+            egress[1]["to"][0]["podSelector"]["matchLabels"][ENVOY_OWNING_GATEWAY_LABEL],
+            "keel-ingress"
+        );
+        assert_eq!(
+            egress[2]["ports"],
+            json!([{"protocol": "TCP", "port": 8333}])
+        );
+        assert!(egress[3]["ports"].as_array().is_some_and(|p| !p.is_empty()));
+        assert_eq!(
+            json_docs[5]["spec"]["ingress"],
+            json!([{
+                "from": [{"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "keel-system"}}}],
+                "ports": [{"protocol": "TCP", "port": 50051}]
+            }])
+        );
         assert_eq!(json_docs[6]["kind"], "RoleBinding");
-        assert_eq!(json_docs[6]["metadata"]["name"], "keel-server");
-        assert_eq!(json_docs[6]["metadata"]["namespace"], "tenant-acme-prod");
-        assert_eq!(json_docs[6]["roleRef"]["kind"], "ClusterRole");
-        assert_eq!(json_docs[6]["roleRef"]["name"], "keel-server-tenant");
-        assert_eq!(json_docs[6]["subjects"][0]["name"], "keel-server");
-        assert_eq!(json_docs[6]["subjects"][0]["namespace"], "keel-system");
-        assert_eq!(json_docs[7]["kind"], "ClusterRoleBinding");
-        assert_eq!(json_docs[7]["roleRef"]["name"], "system:auth-delegator");
+        assert_eq!(json_docs[6]["metadata"]["name"], "tenant-acme-prod-admin");
+        assert_eq!(json_docs[7]["kind"], "RoleBinding");
+        assert_eq!(json_docs[7]["metadata"]["name"], "keel-server");
+        assert_eq!(json_docs[7]["metadata"]["namespace"], "tenant-acme-prod");
+        assert_eq!(json_docs[7]["roleRef"]["kind"], "ClusterRole");
+        assert_eq!(json_docs[7]["roleRef"]["name"], "keel-server-tenant");
+        assert_eq!(json_docs[7]["subjects"][0]["name"], "keel-server");
+        assert_eq!(json_docs[7]["subjects"][0]["namespace"], "keel-system");
+        assert_eq!(json_docs[8]["kind"], "ClusterRoleBinding");
+        assert_eq!(json_docs[8]["roleRef"]["name"], "system:auth-delegator");
 
         let yaml = bundle.to_multi_doc_yaml().unwrap();
         assert!(yaml.contains("\n---\n"));
@@ -2897,5 +3088,88 @@ mod tests {
             .unwrap();
         assert_eq!(sub_from.len(), 1, "no Secret source without secret values");
         assert_eq!(sub_from[0]["optional"], false);
+    }
+
+    #[test]
+    fn pko_workspace_policy_never_allows_cloud_metadata() {
+        let policy =
+            serde_json::to_value(build_tenant_pko_workspace_network_policy("acme").unwrap())
+                .unwrap();
+        let egress = policy["spec"]["egress"].as_array().unwrap();
+        let mut public_rules = 0;
+        for rule in egress {
+            for peer in rule["to"].as_array().unwrap() {
+                let Some(block) = peer.get("ipBlock") else {
+                    // Selector peers are pods (DNS, Envoy proxies, state backend), never
+                    // link-local addresses, and always port-scoped.
+                    assert!(rule["ports"].as_array().is_some_and(|p| !p.is_empty()));
+                    continue;
+                };
+                let cidr = block["cidr"].as_str().unwrap();
+                assert!(!cidr.starts_with("169.254."), "{cidr}");
+                if cidr == "0.0.0.0/0" {
+                    public_rules += 1;
+                    let except: Vec<&str> = block["except"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|v| v.as_str().unwrap())
+                        .collect();
+                    for private in [
+                        "169.254.0.0/16",
+                        "10.0.0.0/8",
+                        "172.16.0.0/12",
+                        "192.168.0.0/16",
+                    ] {
+                        assert!(except.contains(&private), "{private} must be excluded");
+                    }
+                }
+            }
+        }
+        assert_eq!(public_rules, 1);
+    }
+
+    #[test]
+    fn baseline_migration_adds_a_missing_pko_workspace_policy_once() {
+        let legacy = "apiVersion: v1\nkind: Namespace\nmetadata:\n  name: tenant-acme\n";
+        let updated = ensure_tenant_pko_workspace_network_policy("acme", legacy, &[])
+            .unwrap()
+            .expect("added");
+        assert!(
+            updated.starts_with(legacy),
+            "existing documents stay byte-for-byte"
+        );
+        let docs = keel_core::split_yaml_documents(&updated);
+        assert_eq!(docs.len(), 2);
+        let policy: Value = serde_yml::from_str(&docs[1]).unwrap();
+        assert_eq!(
+            policy,
+            serde_json::to_value(build_tenant_pko_workspace_network_policy("acme").unwrap())
+                .unwrap()
+        );
+        // Idempotent, and never duplicated when another baseline file already defines it
+        // (`tenants/default/git-repository.yaml` of earlier releases).
+        assert!(
+            ensure_tenant_pko_workspace_network_policy("acme", &updated, &[])
+                .unwrap()
+                .is_none()
+        );
+        let stub = "kind: NetworkPolicy\nmetadata:\n  name: allow-pko-workspace\n";
+        assert!(
+            ensure_tenant_pko_workspace_network_policy("acme", legacy, &[stub])
+                .unwrap()
+                .is_none()
+        );
+        // A full current baseline already carries it.
+        let current = TenantManifestBundle::synthesize(&TenantIsolationConfig::new("acme"))
+            .unwrap()
+            .to_multi_doc_yaml()
+            .unwrap();
+        assert!(
+            ensure_tenant_pko_workspace_network_policy("acme", &current, &[])
+                .unwrap()
+                .is_none()
+        );
+        assert!(ensure_tenant_pko_workspace_network_policy("../x", legacy, &[]).is_err());
     }
 }

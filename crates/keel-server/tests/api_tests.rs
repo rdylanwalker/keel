@@ -27,6 +27,11 @@ struct TestFixture {
 /// Cluster-reachable GitOps URL used by the platform-written tenant source stubs.
 const TENANT_GIT_URL: &str =
     "http://forgejo-http.keel-system.svc.cluster.local:3000/keel/infra-gitops.git";
+/// Forgejo HTTPS origin (`forge.publicUrl`) the fixture server is configured with.
+const FORGE_PUBLIC_URL: &str = "https://forgejo.keel.local:8888";
+/// URL tenant/preview PKO Stacks clone: PKO rejects the http Service URL Flux uses, so the
+/// in-cluster Forgejo is cloned through its HTTPS ingress origin.
+const TENANT_PKO_GIT_URL: &str = "https://forgejo.keel.local:8888/keel/infra-gitops.git";
 
 fn tenant_git_source_stub(tenant: &str) -> String {
     format!(
@@ -260,7 +265,8 @@ spec:
         &workdir,
         bare_repo.to_string_lossy().to_string(),
         AuthPhase::OidcActive,
-    );
+    )
+    .with_forge_public_url(Some(FORGE_PUBLIC_URL.to_string()));
 
     TestFixture {
         _temp_dir: temp_dir,
@@ -2654,7 +2660,7 @@ spec:
     // Bundle infra items clone the tenant's own source through PKO `gitSource`.
     let cluster_stack_doc: Value = serde_yml::from_str(&cluster_stack).unwrap();
     assert!(cluster_stack_doc["spec"].get("fluxSource").is_none());
-    assert_eq!(cluster_stack_doc["spec"]["projectRepo"], TENANT_GIT_URL);
+    assert_eq!(cluster_stack_doc["spec"]["projectRepo"], TENANT_PKO_GIT_URL);
     assert_eq!(
         cluster_stack_doc["spec"]["repoDir"],
         "tenants/acme/bundles/prod-stack/cluster"
@@ -5224,7 +5230,7 @@ async fn test_pko_preview_lifecycle_is_applied_published_and_gced_from_cluster_s
             .is_empty()
     );
     assert!(applied["spec"].get("fluxSource").is_none());
-    assert_eq!(applied["spec"]["projectRepo"], TENANT_GIT_URL);
+    assert_eq!(applied["spec"]["projectRepo"], TENANT_PKO_GIT_URL);
     assert!(
         applied["spec"]["branch"]
             .as_str()
@@ -6430,7 +6436,7 @@ async fn test_tenant_infra_stack_uses_pko_git_source_of_the_tenant() {
     let stack: Value = serde_yml::from_str(&raw).unwrap();
     assert_eq!(stack["metadata"]["namespace"], "tenant-acme");
     assert!(stack["spec"].get("fluxSource").is_none(), "{raw}");
-    assert_eq!(stack["spec"]["projectRepo"], TENANT_GIT_URL);
+    assert_eq!(stack["spec"]["projectRepo"], TENANT_PKO_GIT_URL);
     assert_eq!(stack["spec"]["branch"], "main");
     assert!(stack["spec"].get("commit").is_none());
     assert_eq!(stack["spec"]["repoDir"], "tenants/acme/infra/gitsrc-vm");
@@ -6503,6 +6509,52 @@ async fn test_stack_proposal_fails_closed_without_tenant_git_source() {
     )
     .await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
+}
+
+/// PKO cannot clone the in-cluster `http://` Forgejo Service Flux uses: without the platform's
+/// Forgejo HTTPS origin (`forge.publicUrl`) a Pulumi Stack proposal fails closed with `409` and an
+/// actionable message before any branch or PR exists, and never commits an `http://` projectRepo.
+#[tokio::test]
+async fn test_stack_proposal_fails_closed_without_forge_public_url() {
+    let mut fixture = setup_fixture().await;
+    fixture.state.forge_public_url = None;
+    let cookie = login_and_get_cookie(&fixture).await;
+    let before = fixture
+        .state
+        .forge
+        .list_pull_requests(None, None)
+        .await
+        .unwrap()
+        .len();
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "proxmox-vm", "kind": "infra",
+                "name": "http-vm", "values": { "cores": 2 } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    let err: Value = serde_json::from_str(&body).unwrap();
+    let msg = err["error"].as_str().unwrap();
+    assert!(msg.contains("forge.publicUrl"), "{msg}");
+    assert!(msg.contains("tenant-acme/keel-gitops"), "{msg}");
+    assert_eq!(
+        fixture
+            .state
+            .forge
+            .list_pull_requests(None, None)
+            .await
+            .unwrap()
+            .len(),
+        before
+    );
+    assert!(
+        !fixture
+            .state
+            .repo_workdir
+            .join("tenants/acme/infra/http-vm")
+            .exists()
+    );
 }
 
 /// `keel serve --repo-dir` paths may contain spaces: the control-plane remote (a local bare repo)
@@ -6704,7 +6756,7 @@ async fn test_legacy_flux_source_stacks_migrate_to_git_source_through_one_pr() {
     .unwrap();
     let stack: Value = serde_yml::from_str(&raw).unwrap();
     assert!(stack["spec"].get("fluxSource").is_none(), "{raw}");
-    assert_eq!(stack["spec"]["projectRepo"], TENANT_GIT_URL);
+    assert_eq!(stack["spec"]["projectRepo"], TENANT_PKO_GIT_URL);
     assert_eq!(stack["spec"]["branch"], "main");
     assert_eq!(stack["spec"]["repoDir"], "tenants/acme/infra/legacy-vm");
     assert_eq!(stack["spec"]["shallow"], true);
@@ -9901,8 +9953,15 @@ async fn test_legacy_tenant_baseline_is_labelled_platform_owned_through_one_pr()
             .unwrap()
             .to_multi_doc_yaml()
             .unwrap();
-    let legacy = current.replace("    keel.io/platform-owned: \"true\"\n", "");
+    // Earlier releases wrote neither the label nor the `allow-pko-workspace` NetworkPolicy.
+    let legacy = keel_core::split_yaml_documents(&current)
+        .into_iter()
+        .filter(|d| !d.contains("name: allow-pko-workspace"))
+        .collect::<Vec<_>>()
+        .join("---\n")
+        .replace("    keel.io/platform-owned: \"true\"\n", "");
     assert_ne!(legacy, current);
+    assert!(!legacy.contains("allow-pko-workspace"));
     commit_on_main(&fixture, "tenants/acme/rbac.yaml", &legacy).await;
     let root = fixture.state.repo_workdir.clone();
     assert!(
@@ -9945,6 +10004,17 @@ async fn test_legacy_tenant_baseline_is_labelled_platform_owned_through_one_pr()
     checkout_proposal_branch(&fixture, &body.to_string()).await;
     let labelled = std::fs::read_to_string(root.join("tenants/acme/rbac.yaml")).unwrap();
     assert!(!keel_kube::platform_owned_labels_missing(&labelled));
+    // The same PR adds the missing PKO workspace NetworkPolicy (once, platform-owned).
+    assert_eq!(
+        labelled.matches("name: allow-pko-workspace").count(),
+        1,
+        "{labelled}"
+    );
+    assert!(
+        keel_kube::ensure_tenant_pko_workspace_network_policy("acme", &labelled, &[])
+            .unwrap()
+            .is_none()
+    );
     let repo = std::fs::read_to_string(root.join("tenants/acme/git-repository.yaml")).unwrap();
     assert!(!keel_kube::platform_owned_labels_missing(&repo), "{repo}");
     fixture

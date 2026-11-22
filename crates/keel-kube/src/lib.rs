@@ -7,6 +7,7 @@
 //! - Kyverno admission policies & explicit local-dev Docker socket `PolicyException` (`kyverno`),
 //! - Real-time CRD condition normalization & SSE telemetry broadcaster (`telemetry`).
 
+pub mod ca_bundle;
 pub mod kyverno;
 pub mod live;
 pub mod preview_runner;
@@ -15,13 +16,18 @@ pub mod secret_store;
 pub mod telemetry;
 pub mod tenant;
 
+pub use ca_bundle::{
+    KEEL_CA_BUNDLE_LABEL, KEEL_CA_SECRET_NAME, build_keel_ca_bundle_configmap,
+    is_keel_ca_bundle_target_namespace, validate_public_ca_pem,
+};
 pub use kyverno::{
     DockerSocketExceptionConfig, KyvernoManifestBundle, KyvernoPolicyConfig, PlatformOwnedWriter,
     build_disallow_privileged_containers_policy, build_local_kind_docker_socket_exception,
     build_protect_control_plane_policy, build_protect_platform_owned_tenant_objects_policy,
     build_restrict_pulumi_providers_policy, build_restrict_pulumi_providers_policy_for_registry,
     build_restrict_tenant_flux_source_status_policy, build_restrict_tenant_flux_sources_policy,
-    is_tenant_subject, platform_owned_writers, pulumi_provider_allowlist,
+    build_sync_keel_ca_bundle_manifests, is_tenant_subject, platform_owned_writers,
+    pulumi_provider_allowlist,
 };
 pub use live::{
     CanaryStatusInfo, ClusterEventSummary, KubeClusterStatusReader, LiveResourceInfo,
@@ -52,14 +58,16 @@ pub use telemetry::{
     WatchedCrdKind,
 };
 pub use tenant::{
-    FlaggerCanarySpecInput, FluxDependencyRef, FluxHealthCheckRef, FluxKustomizationSpecInput,
-    FluxManifestAppInput, FluxSubstituteReference, HelmChartSourceKind, HelmChartSourceRef,
-    HelmReleaseSpecInput, HelmValuesSecretRef, KEEL_SERVER_TENANT_CLUSTER_ROLE,
+    ENVOY_OWNING_GATEWAY_LABEL, FlaggerCanarySpecInput, FluxDependencyRef, FluxHealthCheckRef,
+    FluxKustomizationSpecInput, FluxManifestAppInput, FluxSubstituteReference, HelmChartSourceKind,
+    HelmChartSourceRef, HelmReleaseSpecInput, HelmValuesSecretRef, KEEL_SERVER_TENANT_CLUSTER_ROLE,
     MANIFEST_APP_CONFIG_DIR, PLATFORM_OWNED_KINDS, PLATFORM_OWNED_LABEL,
     PLATFORM_OWNED_TENANT_FILES, ROUTE_HOSTNAMES_ANNOTATION, RemoteKubeConfigRef,
-    TENANT_NAMESPACE_PREFIX, TenantIsolationConfig, TenantManifestBundle, TenantQuotaSpec,
-    build_keel_server_tenant_role_binding, build_tenant_default_deny_network_policy,
-    build_tenant_namespace, build_tenant_resource_quota, build_tenant_service_account,
+    TENANT_NAMESPACE_PREFIX, TENANT_PKO_WORKSPACE_NETWORK_POLICY, TenantIsolationConfig,
+    TenantManifestBundle, TenantQuotaSpec, build_keel_server_tenant_role_binding,
+    build_tenant_default_deny_network_policy, build_tenant_namespace,
+    build_tenant_pko_workspace_network_policy, build_tenant_resource_quota,
+    build_tenant_service_account, ensure_tenant_pko_workspace_network_policy,
     generate_flux_kustomization_manifest, label_platform_owned_manifests,
     manifest_app_config_kustomization_name, manifest_app_secrets_name,
     manifest_app_values_configmap_name, platform_owned_labels_missing,

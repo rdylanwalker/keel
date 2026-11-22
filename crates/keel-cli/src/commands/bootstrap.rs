@@ -391,6 +391,10 @@ pub async fn synthesize_seed_control_plane_with_ingress(
             } else {
                 None
             },
+            // PKO cannot clone the in-cluster `http://` Forgejo Service Flux uses; tenant and
+            // preview Stacks clone it through the Envoy Gateway HTTPS ingress instead (Keel CA,
+            // trusted through `keel-ca-bundle`).
+            public_url: cfg.with_forge.then(|| ingress.forgejo_origin()),
             default_branch: "main".to_string(),
             // Mandatory outbound pull-polling interval (`1m`) for NAT/firewall resilience (`AGENTS.md` §3.1)
             poll_interval: DEFAULT_POLL_INTERVAL.to_string(),
@@ -1440,9 +1444,6 @@ fn seed_core_catalog_files(artifacts: &SeedControlPlaneArtifacts) -> Vec<(String
         .collect()
 }
 
-const DEFAULT_TENANT_NETWORK_POLICY_YAML: &str =
-    include_str!("../../../../deploy/bootstrap/manifests/default-tenant-network-policy.yaml");
-
 /// Initializes a local seed GitOps repository on `main` using [`GitRunner`] (zero shell calls).
 pub async fn initialize_seed_git_repo(
     repo_dir: &Path,
@@ -1461,13 +1462,14 @@ pub(crate) fn render_default_tenant_git_repository_yaml(
         keel_kube::PLATFORM_OWNED_LABEL.to_string(),
         "true".to_string(),
     );
+    // The tenant's `allow-pko-workspace` NetworkPolicy is part of the baseline
+    // (`tenants/<id>/rbac.yaml`, `keel_kube::build_tenant_pko_workspace_network_policy`) for every
+    // tenant, so it is not repeated here.
     let mut repo_yaml = repo.to_yaml()?;
     if !repo_yaml.ends_with('\n') {
         repo_yaml.push('\n');
     }
-    Ok(format!(
-        "{repo_yaml}---\n{DEFAULT_TENANT_NETWORK_POLICY_YAML}"
-    ))
+    Ok(repo_yaml)
 }
 
 async fn initialize_seed_git_repo_with_push(
@@ -2268,7 +2270,10 @@ mod security_hardening_tests {
             .unwrap()
             .to_multi_doc_yaml()
             .unwrap();
-        assert!(!bundle.contains("GeneratingPolicy"));
+        // The only GeneratingPolicy copies the public CA bundle ConfigMap; no Secret is cloned.
+        assert!(!bundle.contains("sync-tenant-secrets"));
+        assert!(bundle.contains("sync-keel-ca-bundle"));
+        assert!(!bundle.contains("'secrets'"));
         assert!(!bundle.contains("keel-s3-credentials"));
         assert!(bundle.contains("restrict-tenant-reconciler"));
     }
@@ -2944,7 +2949,7 @@ mod security_hardening_tests {
     }
 
     /// The bootstrap-written `tenants/default/git-repository.yaml` is the platform-written source
-    /// keel-server resolves for tenant-default PKO Stacks (`gitSource`), and its
+    /// keel-server resolves for tenant-default PKO Stacks (`gitSource`), and the baseline's
     /// `allow-pko-workspace` policy lets the workspace pods clone it from the forge.
     #[tokio::test]
     async fn default_tenant_stub_is_the_tenant_stack_git_source() {
@@ -2964,25 +2969,54 @@ mod security_hardening_tests {
         assert_eq!(source.url, url);
         assert_eq!(source.branch_or_default(), "main");
         assert_eq!(source.secret_name.as_deref(), Some("git-credentials"));
-
-        let policy = keel_core::split_yaml_documents(&stub)
+        // PKO clones the Forgejo HTTPS ingress (Flux keeps the http Service URL).
+        assert_eq!(
+            source
+                .pko_project_repo(Some(&Stage0Ingress::default().forgejo_origin()))
+                .unwrap(),
+            "https://forgejo.keel.local:8888/keel/infra-gitops.git"
+        );
+        let stub_docs: Vec<Value> = keel_core::split_yaml_documents(&stub)
             .into_iter()
             .map(|d| serde_yml::from_str::<Value>(&d).unwrap())
-            .find(|d| d["kind"] == "NetworkPolicy")
+            .collect();
+        assert!(
+            stub_docs.iter().all(|d| d["kind"] != "NetworkPolicy"),
+            "the NetworkPolicy lives in the baseline (no duplicate kustomize id)"
+        );
+
+        let baseline = tenant_baseline_yaml("default").unwrap();
+        let policy = keel_core::split_yaml_documents(&baseline)
+            .into_iter()
+            .map(|d| serde_yml::from_str::<Value>(&d).unwrap())
+            .find(|d| d["metadata"]["name"] == "allow-pko-workspace")
             .expect("allow-pko-workspace policy");
-        assert_eq!(policy["metadata"]["name"], "allow-pko-workspace");
+        assert_eq!(policy["kind"], "NetworkPolicy");
+        assert_eq!(policy["metadata"]["namespace"], "tenant-default");
+        assert_eq!(
+            policy["metadata"]["labels"]["keel.io/platform-owned"],
+            "true"
+        );
         assert_eq!(
             policy["spec"]["podSelector"]["matchLabels"]["auto.pulumi.com/component"],
             "workspace"
         );
-        // Unrestricted egress (in-cluster Forgejo in keel-system and external forges on 443).
+        // Allowlisted egress: the Forgejo HTTPS ingress (keel-ingress Envoy proxy pods) and
+        // external forges, never an allow-all rule.
+        let egress = policy["spec"]["egress"].as_array().unwrap();
         assert!(
-            policy["spec"]["egress"]
-                .as_array()
-                .unwrap()
+            egress
                 .iter()
-                .any(|rule| rule.as_object().is_some_and(|o| o.is_empty())),
-            "{stub}"
+                .any(|rule| rule["to"][0]["podSelector"]["matchLabels"]
+                    [keel_kube::ENVOY_OWNING_GATEWAY_LABEL]
+                    == "keel-ingress"),
+            "{baseline}"
+        );
+        assert!(
+            egress
+                .iter()
+                .all(|rule| rule.as_object().is_some_and(|o| !o.is_empty())),
+            "{baseline}"
         );
     }
 
@@ -3439,6 +3473,22 @@ mod security_hardening_tests {
             };
             let a = artifacts_for(cfg, "https://idp.corp.example:9443").await;
             assert_eq!(a.with_forge, with_forge);
+            // PKO clones the in-cluster Forgejo through its HTTPS ingress origin (same host and
+            // port as `--oidc-public-url`); Flux keeps the http Service URL.
+            assert_eq!(
+                a.keel_config.forge.public_url.as_deref(),
+                with_forge.then_some("https://forgejo.corp.example:9443")
+            );
+            if with_forge {
+                assert_eq!(
+                    keel_pko::pko_project_repo_url(
+                        "http://forgejo-http.keel-system.svc.cluster.local:3000/keel/infra-gitops.git",
+                        a.keel_config.forge.public_url.as_deref()
+                    )
+                    .unwrap(),
+                    "https://forgejo.corp.example:9443/keel/infra-gitops.git"
+                );
+            }
             let files = seed_management_files(&a).unwrap();
             let core = keel_core::MANAGEMENT_CORE_ADDONS_DIR;
             let listed = kustomize_resources(file(&files, &format!("{core}/kustomization.yaml")));
