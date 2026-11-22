@@ -23,6 +23,11 @@ if (RECORD_DEMO) {
 }
 const MGMT_CLUSTER = process.env.KEEL_E2E_MGMT_CLUSTER || 'keel-mgmt';
 const WORKLOAD_CLUSTER = process.env.KEEL_E2E_WORKLOAD_CLUSTER || 'e2e-lab';
+/**
+ * kind cluster the 07.1 bundle actually creates: WORKLOAD_CLUSTER is only the bundle instance
+ * prefix, the cluster takes the kind-canary-platform `clusterName` default.
+ */
+const WORKLOAD_KIND_CLUSTER = 'workload-dev';
 /** kind cluster provisioned by tenant acme's PKO blueprint (07.6). */
 const ACME_CLUSTER = 'e2e-acme';
 const BASE_URL = process.env.KEEL_BASE_URL || 'http://127.0.0.1:8080';
@@ -154,6 +159,22 @@ function runCmdStdin(bin: string, args: string[], input: string): { ok: boolean;
   } catch (err) {
     const e = err as { stdout?: string; stderr?: string };
     return { ok: false, out: `${e.stdout ?? ''}${e.stderr ?? ''}` };
+  }
+}
+
+/**
+ * Stdout of a command that may print secrets or a lot of text (large buffer, never logged by
+ * callers); '' when the command fails.
+ */
+function captureQuiet(bin: string, args: string[]): string {
+  try {
+    return execFileSync(bin, args, {
+      encoding: 'utf-8',
+      maxBuffer: 512 * 1024 * 1024,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+  } catch {
+    return '';
   }
 }
 
@@ -642,6 +663,8 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
 
   let createdMgmtCluster = false;
   let serveProc: ChildProcess | null = null;
+  /** `true` when this run spawned `keel serve`, so SERVE_LOG_PATH is this run's log. */
+  let startedServe = false;
   let tmpRepoDir: string | null = null;
   const adminPassword = resolveE2eAdminPassword();
   const adminUsername = resolveE2eAdminUsername();
@@ -660,11 +683,7 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
         logStep(`Deleting existing kind cluster "${MGMT_CLUSTER}" (KEEL_E2E_REUSE_CLUSTER=0)...`);
         runCmd('kind', ['delete', 'cluster', '--name', MGMT_CLUSTER], undefined, true);
       }
-      if (clusters.includes('workload-dev')) {
-        logStep('Deleting stale workload kind cluster "workload-dev"...');
-        runCmd('kind', ['delete', 'cluster', '--name', 'workload-dev'], undefined, true);
-      }
-      for (const stale of [WORKLOAD_CLUSTER, ACME_CLUSTER]) {
+      for (const stale of [WORKLOAD_KIND_CLUSTER, ACME_CLUSTER]) {
         if (clusters.includes(stale)) {
           logStep(`Deleting stale workload kind cluster "${stale}"...`);
           runCmd('kind', ['delete', 'cluster', '--name', stale], undefined, true);
@@ -770,6 +789,7 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
         ['serve', '--bind', `${url.hostname}:${url.port || '8080'}`, '--repo-dir', repoDir],
         { stdio: ['ignore', logFd, logFd], detached: true },
       );
+      startedServe = true;
       await expect
         .poll(() => isServerUp(BASE_URL), {
           timeout: 30_000,
@@ -830,9 +850,19 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
       }
     }
 
+    // The workload cluster's real name is the bundle Stack's `clusterName` config.
+    const workloadKind =
+      tryCmd('kubectl', [
+        'get',
+        'stacks.pulumi.com',
+        `${WORKLOAD_CLUSTER}-cluster`,
+        '-n',
+        'tenant-default',
+        '-o',
+        'jsonpath={.spec.config.clusterName}',
+      ]).stdout || WORKLOAD_KIND_CLUSTER;
     const clustersToClean = [
-      WORKLOAD_CLUSTER,
-      ACME_CLUSTER,
+      ...new Set([workloadKind, WORKLOAD_KIND_CLUSTER, ACME_CLUSTER]),
       ...(createdMgmtCluster ? [MGMT_CLUSTER] : []),
     ];
     if (process.env.CI) {
@@ -1519,6 +1549,11 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
             p.title.toLowerCase().includes(acmeAppName.toLowerCase()),
           );
           expect(acmePr).toBeTruthy();
+          // The aggregated list never leaks tenant-default or platform proposals to acme.
+          expect(
+            prsJson.proposals.filter((p) => p.scope !== 'acme').map((p) => p.scope),
+            'acme sees acme proposals only',
+          ).toEqual([]);
 
           expect(acmePr!.scope).toBe('acme');
           const nonAdminMergeRes = await page.request.post(
@@ -1565,6 +1600,7 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
 
   test('07.3 - Infra proposal runs a real PKO preview Stack in keel-previews; CLI proposal list/show/close GCs it', async ({
     page,
+    browser,
   }) => {
     await signInViaRauthy(page, adminUsername, adminPassword);
     const instance = `e2e-preview-${Date.now().toString(36)}`;
@@ -1631,6 +1667,40 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
         '-o',
         'jsonpath={.items[*].metadata.name}',
       ]).stdout.trim();
+
+    await test.step('1c. Non-admin acme cannot read tenant-default or platform proposals', async () => {
+      const context = await browser.newContext({ ignoreHTTPSErrors: true });
+      const acmePage = await context.newPage();
+      try {
+        await signInViaRauthy(acmePage, 'acme@keel.local', acmePassword);
+        const all = await acmePage.request.get('/api/v1/proposals');
+        expect(all.status()).toBe(200);
+        const allBody = (await all.json()) as { proposals: ScopedProposalBody[] };
+        expect(
+          allBody.proposals.filter((p) => p.scope !== 'acme').map((p) => `${p.scope}#${p.id}`),
+          'acme lists acme proposals only',
+        ).toEqual([]);
+        // tenant-default's open PR and the platform scope, by list and by id.
+        for (const url of [
+          '/api/v1/tenants/default/proposals',
+          `/api/v1/tenants/default/proposals/${prId}/preview`,
+          '/api/v1/tenants/management/proposals',
+          `/api/v1/tenants/management/proposals/${prId}/preview`,
+        ]) {
+          const res = await acmePage.request.get(url);
+          const text = await res.text();
+          expect([403, 404], `${url} as acme: ${res.status()}`).toContain(res.status());
+          expect(text.includes(instance), `${url} must not leak the title`).toBe(false);
+          expect(
+            headSha !== '' && text.includes(headSha),
+            `${url} must not leak the head commit`,
+          ).toBe(false);
+        }
+        logStep(`acme denied tenant-default PR #${prId} and the platform scope`);
+      } finally {
+        await context.close();
+      }
+    });
 
     await test.step('2. Ephemeral preview Stack (spec.preview: true) appears in keel-previews', async () => {
       await expect.poll(previewStacks, { timeout: 120_000, intervals: [3_000] }).not.toBe('');
@@ -2403,9 +2473,15 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
       expect(res.ok, `clone ${url}: ${res.out}`).toBe(true);
       return dir;
     };
-    /** `true` when `needle` appears in any commit of the clone at `dir` (output never logged). */
-    const historyContains = (dir: string, needle: string) =>
-      runCmdAll('git', ['-C', dir, 'log', '--all', '--format=%H', `-S${needle}`]).out.trim() !== '';
+    /**
+     * Full patch history of every ref of the clone at `dir`, searched in-process so secrets never
+     * reach a command line (and the output is never logged).
+     */
+    const historyOf = (dir: string) => {
+      const history = captureQuiet('git', ['-C', dir, 'log', '--all', '-p', '--no-color']);
+      expect(history.length, `git log of ${dir}`).toBeGreaterThan(0);
+      return history;
+    };
     const kubectlJson = <T>(args: string[]): T =>
       JSON.parse(runCmd('kubectl', [...args, '-o', 'json'])) as T;
     type K8sObject = {
@@ -2414,6 +2490,9 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
     };
     const echoToken = `e2e-${randomUUID()}`;
     const echoText = 'hello-from-the-acme-repository';
+    /** Forgejo bot owning every tenant read token (`keel-system/keel-forgejo-tenant-reader`). */
+    const readerBot = secretValue('keel-system', 'keel-forgejo-tenant-reader', 'username');
+    expect(readerBot, 'keel-system/keel-forgejo-tenant-reader username').toBe('keel-tenant-reader');
 
     try {
       await test.step('1. Each tenant syncs its own repository with a cluster-only, repository-scoped credential', async () => {
@@ -2465,7 +2544,8 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
             'tenant-gitops-credentials',
           );
           const auth = tenantRepoAuth(tenant);
-          // A bot-owned, repository-scoped token: never the platform repository owner's.
+          // A token of the D9 reader bot (repository-scoped): never the platform repository owner's.
+          expect(auth.username, `${ns} credential user`).toBe(readerBot);
           expect(auth.username, `${ns} credential user`).not.toBe(admin.username);
           expect(auth.password === admin.password, `${ns} credential is not the forge token`).toBe(
             false,
@@ -2480,30 +2560,33 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
         logStep('tenant-default and tenant-acme sync their own repositories');
       });
 
-      await test.step("2. acme's credential reads the acme repository only, and only reads", async () => {
-        const acme = tenantRepoAuth('acme');
-        const tenantDefault = tenantRepoAuth('default');
-        const own = lsRemote(acme, acmeUrl);
-        expect(own.ok, `acme credential must read ${acmeUrl}: ${own.out}`).toBe(true);
-        expect(own.out).toContain('refs/heads/main');
-        for (const url of [monorepoUrl, tenantRepoUrl('default')]) {
-          const res = lsRemote(acme, url);
-          expect(res.ok, `acme credential must not read ${url}`).toBe(false);
-          expect(res.out, url).toMatch(/\b403\b/);
-          logStep(`acme credential denied (403) on ${url}`);
+      await test.step('2. Each tenant credential reads its own repository only, and only reads', async () => {
+        // tenant-default's credential is minted by bootstrap, acme's by the API: same checks.
+        for (const [tenant, other] of [
+          ['default', 'acme'],
+          ['acme', 'default'],
+        ] as const) {
+          const auth = tenantRepoAuth(tenant);
+          const ownUrl = tenantRepoUrl(tenant);
+          const own = lsRemote(auth, ownUrl);
+          expect(own.ok, `tenant-${tenant} credential must read ${ownUrl}: ${own.out}`).toBe(true);
+          expect(own.out).toContain('refs/heads/main');
+          for (const url of [monorepoUrl, tenantRepoUrl(other)]) {
+            const res = lsRemote(auth, url);
+            expect(res.ok, `tenant-${tenant} credential must not read ${url}`).toBe(false);
+            expect(res.out, url).toMatch(/\b403\b/);
+            logStep(`tenant-${tenant} credential denied (403) on ${url}`);
+          }
+          // Read-only: the receive-pack handshake is refused.
+          const ownClone = clone(auth, ownUrl, `tenant-${tenant}-as-self`);
+          const push = gitAs(
+            auth,
+            ['-C', ownClone, 'push', '--dry-run', 'origin', 'HEAD:refs/heads/keel-e2e-probe'],
+            caFile,
+          );
+          expect(push.ok, `tenant-${tenant} credential must not push`).toBe(false);
+          expect(push.out).toMatch(/\b403\b/);
         }
-        const cross = lsRemote(tenantDefault, acmeUrl);
-        expect(cross.ok, 'tenant-default credential must not read the acme repository').toBe(false);
-        expect(cross.out).toMatch(/\b403\b/);
-        // Read-only: the receive-pack handshake is refused.
-        const acmeClone = clone(acme, acmeUrl, 'acme-as-acme');
-        const push = gitAs(
-          acme,
-          ['-C', acmeClone, 'push', '--dry-run', 'origin', 'HEAD:refs/heads/keel-e2e-probe'],
-          caFile,
-        );
-        expect(push.ok, 'acme credential must not push').toBe(false);
-        expect(push.out).toMatch(/\b403\b/);
       });
 
       await test.step('3. acme manifest app with a secret value runs from the acme repository', async () => {
@@ -2583,11 +2666,31 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
           'jsonpath={.spec.template.spec.containers[0].env[?(@.name=="ECHO_API_TOKEN")].valueFrom.secretKeyRef.name}',
         ]);
         expect(envRef).toBe('http-echo-api-token');
-        // Never logged by keel serve.
-        expect(
-          fs.readFileSync(SERVE_LOG_PATH, 'utf-8').includes(echoToken),
-          'keel serve log must not contain the secret',
-        ).toBe(false);
+        // Never logged by keel serve (only checkable when this run started it), Flux or events.
+        if (startedServe) {
+          expect(
+            fs.readFileSync(SERVE_LOG_PATH, 'utf-8').includes(echoToken),
+            'keel serve log must not contain the secret',
+          ).toBe(false);
+        } else {
+          test.info().annotations.push({
+            type: 'skipped-check',
+            description: `keel serve at ${BASE_URL} was not started by this run; its log is not checked for the secret`,
+          });
+          logStep('keel serve was reused: its log is not checked for the secret');
+        }
+        for (const [label, args] of [
+          [
+            'kustomize-controller log',
+            ['logs', '-n', 'flux-system', 'deploy/kustomize-controller'],
+          ],
+          ['source-controller log', ['logs', '-n', 'flux-system', 'deploy/source-controller']],
+          ['tenant-acme events', ['get', 'events', '-n', 'tenant-acme', '-o', 'yaml']],
+        ] as const) {
+          const out = captureQuiet('kubectl', [...args]);
+          expect(out.length, label).toBeGreaterThan(0);
+          expect(out.includes(echoToken), `${label} must not contain the secret`).toBe(false);
+        }
       });
 
       await test.step('4. The monorepo holds only platform content and per-tenant stubs', async () => {
@@ -2615,6 +2718,21 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
             /^\s*-\s+[a-z0-9-]+\/(git-repository|rbac|sync)\.yaml\s*$/,
           );
         }
+        // No tenant object anywhere else in the monorepo (clusters/, apps/, catalog/, ...).
+        const stubFile = new RegExp(`^tenants/[a-z0-9-]+/(${TENANT_STUB_FILES.join('|')})$`);
+        const tenantObjects = listFiles(mono)
+          .filter((f) => /\.ya?ml$/.test(f) && !stubFile.test(f))
+          .filter((f) => {
+            const text = fs.readFileSync(path.join(mono, f), 'utf-8');
+            return (
+              /^\s*namespace:\s*["']?tenant-/m.test(text) ||
+              new RegExp(`projectRepo:.*/${TENANT_REPOS_ORG}/`).test(text)
+            );
+          });
+        expect(
+          tenantObjects,
+          'monorepo files outside the tenant stubs with tenant objects',
+        ).toEqual([]);
 
         const contentOf = (dir: string) =>
           listFiles(dir)
@@ -2650,58 +2768,45 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
           expect(acmeContent, `acme repository defines ${name}`).toContain(`name: ${name}`);
         }
         expect(acmeContent, 'acme secrets are SOPS-encrypted').toContain('ENC[');
-        // No tenant credential or secret value is in any repository's history.
-        const needles = [
-          echoToken,
-          tenantRepoAuth('acme').password,
-          tenantRepoAuth('default').password,
+        // No tenant credential, age private key, forge token or secret value is in any
+        // repository's history.
+        const ageKey = (tenant: string) => {
+          const ns = `tenant-${tenant}`;
+          const key =
+            secretValue(ns, 'sops-age', 'secret-key').trim() ||
+            (secretValue(ns, 'sops-age', 'age.agekey').match(/AGE-SECRET-KEY-\S+/)?.[0] ?? '');
+          expect(key, `${ns}/sops-age private key`).toMatch(/^AGE-SECRET-KEY-/);
+          return key;
+        };
+        const needles: Array<[string, string]> = [
+          ['acme apiToken', echoToken],
+          ['tenant-acme read token', tenantRepoAuth('acme').password],
+          ['tenant-default read token', tenantRepoAuth('default').password],
+          ['tenant-acme age key', ageKey('acme')],
+          ['tenant-default age key', ageKey('default')],
+          ['forge admin token', admin.password],
+          [
+            'reader bot password',
+            secretValue('keel-system', 'keel-forgejo-tenant-reader', 'password'),
+          ],
         ];
+        for (const [label, needle] of needles) {
+          expect(needle.length, label).toBeGreaterThan(8);
+        }
         for (const [label, dir] of [
           ['platform', mono],
           ['tenant-default', tenantClones.default],
           ['tenant-acme', tenantClones.acme],
         ] as const) {
-          for (const [i, needle] of needles.entries()) {
-            expect(historyContains(dir, needle), `${label} history holds secret #${i}`).toBe(false);
+          const history = historyOf(dir);
+          for (const [what, needle] of needles) {
+            expect(history.includes(needle), `${label} history holds the ${what}`).toBe(false);
           }
         }
         logStep('Monorepo: stubs only; tenant repositories: own content only; no secrets in Git');
       });
 
-      await test.step('5. `keel tenant repair-credentials acme` rotates the credential', async () => {
-        const before = tenantRepoAuth('acme');
-        const repair = runCmdAll(
-          KEEL_BIN,
-          ['tenant', 'repair-credentials', 'acme', '--server', BASE_URL],
-          cliEnv,
-        );
-        expect(repair.ok, repair.out).toBe(true);
-        expect(repair.out.includes(before.password), 'repair output holds no credential').toBe(
-          false,
-        );
-        await expect
-          .poll(() => tenantRepoAuth('acme').password !== before.password, {
-            timeout: 60_000,
-            intervals: [2_000],
-          })
-          .toBe(true);
-        const after = tenantRepoAuth('acme');
-        expect(repair.out.includes(after.password), 'repair output holds no credential').toBe(
-          false,
-        );
-        const old = lsRemote(before, acmeUrl);
-        expect(old.ok, 'the rotated-out acme token is revoked').toBe(false);
-        const fresh = lsRemote(after, acmeUrl);
-        expect(fresh.ok, `the new acme token reads ${acmeUrl}: ${fresh.out}`).toBe(true);
-        const denied = lsRemote(after, monorepoUrl);
-        expect(denied.ok, 'the new acme token cannot read the monorepo').toBe(false);
-        expect(denied.out).toMatch(/\b403\b/);
-        logStep(
-          'acme credential rotated: old token revoked, new token scoped to the acme repository',
-        );
-      });
-
-      await test.step('6. acme PKO blueprint: preview pinned to the acme PR commit, then Ready from the acme repository', async () => {
+      await test.step('5. acme PKO blueprint: preview pinned to the acme PR commit, then Ready from the acme repository', async () => {
         const existing = tryCmd('kubectl', [
           'get',
           'stacks.pulumi.com',
@@ -2730,7 +2835,6 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
           expect(proposal.repository.label).toBe('tenant-acme');
           const key = `acme-${proposal.id}`;
 
-          // The preview is launched after the rotation: it copies the NEW credential.
           await expect
             .poll(
               async () => {
@@ -2818,6 +2922,137 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
         expect(stack.spec.fluxSource).toBeUndefined();
         expect(JSON.stringify(stack.spec.gitAuth ?? {})).toContain('keel-gitops-credentials');
         logStep(`acme Stack ${stackName} Ready from ${acmeUrl}`);
+      });
+
+      await test.step('6. `keel tenant repair-credentials acme` rotates the credential; Flux and PKO keep working', async () => {
+        const before = tenantRepoAuth('acme');
+        const stackName = runCmd('kubectl', [
+          'get',
+          'stacks.pulumi.com',
+          '-n',
+          'tenant-acme',
+          '-o',
+          'jsonpath={.items[*].metadata.name}',
+        ])
+          .split(/\s+/)
+          .find((n) => n.startsWith(ACME_CLUSTER));
+        expect(stackName, 'acme Stack reconciling before the rotation').toBeTruthy();
+        const repair = runCmdAll(
+          KEEL_BIN,
+          ['tenant', 'repair-credentials', 'acme', '--server', BASE_URL],
+          cliEnv,
+        );
+        expect(repair.ok, repair.out).toBe(true);
+        expect(repair.out.includes(before.password), 'repair output holds no credential').toBe(
+          false,
+        );
+        await expect
+          .poll(() => tenantRepoAuth('acme').password !== before.password, {
+            timeout: 60_000,
+            intervals: [2_000],
+          })
+          .toBe(true);
+        const after = tenantRepoAuth('acme');
+        expect(repair.out.includes(after.password), 'repair output holds no credential').toBe(
+          false,
+        );
+        expect(after.username, 'rotated credential user').toBe(readerBot);
+        const old = lsRemote(before, acmeUrl);
+        expect(old.ok, 'the rotated-out acme token is revoked').toBe(false);
+        const fresh = lsRemote(after, acmeUrl);
+        expect(fresh.ok, `the new acme token reads ${acmeUrl}: ${fresh.out}`).toBe(true);
+        for (const url of [monorepoUrl, tenantRepoUrl('default')]) {
+          const denied = lsRemote(after, url);
+          expect(denied.ok, `the new acme token cannot read ${url}`).toBe(false);
+          expect(denied.out).toMatch(/\b403\b/);
+        }
+        logStep(
+          'acme credential rotated: old token revoked, new token scoped to the acme repository',
+        );
+
+        // A new acme commit (merged through the PR flow) must reach both the existing Flux
+        // source and the Stack that was reconciling with the now-revoked token.
+        const rotatedText = `${echoText}-${Date.now().toString(36)}`;
+        const res = await page.request.post('/api/v1/tenants/acme/proposals', {
+          headers: SAME_ORIGIN,
+          data: {
+            tenant: 'acme',
+            catalogId: 'http-echo-manifest',
+            name: 'acme-echo',
+            values: { echoText: rotatedText, replicas: 1, apiToken: echoToken },
+          },
+        });
+        const text = await res.text();
+        expect(res.status(), text).toBe(201);
+        const proposal = (JSON.parse(text) as { proposal: ScopedProposalBody }).proposal;
+        expect(proposal.scope).toBe('acme');
+        const merged = await page.request.post(
+          `/api/v1/tenants/acme/proposals/${proposal.id}/merge`,
+          { headers: SAME_ORIGIN },
+        );
+        expect(merged.status(), await merged.text()).toBe(200);
+        const head = lsRemote(after, acmeUrl).out.match(
+          /^([0-9a-f]{40})\s+refs\/heads\/main$/m,
+        )?.[1];
+        expect(head, 'acme main after the post-rotation merge').toBeTruthy();
+        logStep(`Merged post-rotation acme PR #${proposal.id} (main ${head})`);
+
+        const requestedAt = `${Date.now()}`;
+        runCmd('kubectl', [
+          'annotate',
+          'gitrepositories.source.toolkit.fluxcd.io',
+          'keel-gitops',
+          '-n',
+          'tenant-acme',
+          `reconcile.fluxcd.io/requestedAt=${requestedAt}`,
+          '--overwrite',
+        ]);
+        const sourceState = () =>
+          tryCmd('kubectl', [
+            'get',
+            'gitrepositories.source.toolkit.fluxcd.io',
+            'keel-gitops',
+            '-n',
+            'tenant-acme',
+            '-o',
+            'jsonpath={.status.lastHandledReconcileAt} {.status.artifact.revision} {.status.conditions[?(@.type=="Ready")].status}',
+          ]).stdout;
+        await expect
+          .poll(sourceState, { timeout: 180_000, intervals: [3_000] })
+          .toBe(`${requestedAt} main@sha1:${head} True`);
+        await waitForK8sReady('kustomization', 'acme-echo', 'tenant-acme', 300_000);
+        await expect
+          .poll(
+            () =>
+              tryCmd('kubectl', [
+                'get',
+                'deployment',
+                'http-echo',
+                '-n',
+                'tenant-acme',
+                '-o',
+                'jsonpath={.spec.template.spec.containers[0].args}',
+              ]).stdout.includes(`-text=${rotatedText}`),
+            { timeout: 180_000, intervals: [3_000] },
+          )
+          .toBe(true);
+        logStep(`tenant-acme/keel-gitops fetched ${head} with the rotated credential`);
+
+        // PKO polls the branch every resyncFrequencySeconds (300s) and clones the new commit.
+        const stackState = () =>
+          tryCmd('kubectl', [
+            'get',
+            'stacks.pulumi.com',
+            stackName!,
+            '-n',
+            'tenant-acme',
+            '-o',
+            'jsonpath={.status.lastUpdate.lastSuccessfulCommit} {.status.lastUpdate.state} {.status.conditions[?(@.type=="Ready")].status}',
+          ]).stdout;
+        await expect
+          .poll(stackState, { timeout: 720_000, intervals: [10_000] })
+          .toBe(`${head} succeeded True`);
+        logStep(`acme Stack ${stackName} reconciled ${head} with the rotated credential`);
       });
 
       await test.step('7. tenant-default and acme workloads are applied from their own repository only', async () => {
