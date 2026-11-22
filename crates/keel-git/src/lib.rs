@@ -4,13 +4,20 @@
 //! (Forgejo/Gitea, GitHub, GitLab, and Local Git).
 
 pub mod forge;
+pub mod forgejo_admin;
 pub mod git;
 pub mod local;
 pub mod remote;
+#[cfg(test)]
+mod test_http;
 
 pub use forge::{
     CreatePrRequest, ForgeError, ForgeProvider, PullRequestComment, PullRequestInfo,
     PullRequestState, RepositoryEnsureOutcome, validate_commit_sha,
+};
+pub use forgejo_admin::{
+    AccessTokenInfo, MintedAccessToken, ORG_OWNERS_TEAM, ProvisionOutcome, RepositoryTarget,
+    ServiceUser, ServiceUserSpec, StrayCredentialReport, TeamInfo, TeamSpec,
 };
 pub use git::{
     CommitAuthor, EphemeralSecretFile, GitCredentials, GitError, GitRunner, WorkdirSync,

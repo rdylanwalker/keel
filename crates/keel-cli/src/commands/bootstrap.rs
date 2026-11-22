@@ -273,6 +273,9 @@ pub struct SeedControlPlaneArtifacts {
     pub with_forge: bool,
     /// `--with-keel-server`: keel-server runs in-cluster as the Flux-managed `keel-server` add-on.
     pub with_keel_server: bool,
+    /// Whether `core-addons/forgejo.yaml` carries the `keel-forgejo-hardening` values (`false`
+    /// on re-runs against a live, ephemeral Forgejo; see [`forgejo_hardening_decision`]).
+    pub forgejo_hardened: bool,
 }
 
 impl std::fmt::Debug for SeedControlPlaneArtifacts {
@@ -285,6 +288,7 @@ impl std::fmt::Debug for SeedControlPlaneArtifacts {
             .field("ingress", &self.ingress)
             .field("with_forge", &self.with_forge)
             .field("with_keel_server", &self.with_keel_server)
+            .field("forgejo_hardened", &self.forgejo_hardened)
             .field(
                 "rauthy_secret",
                 &self
@@ -637,6 +641,7 @@ pub async fn synthesize_seed_control_plane_with_ingress(
         ingress,
         with_forge: cfg.with_forge,
         with_keel_server: cfg.with_keel_server,
+        forgejo_hardened: true,
     })
 }
 
@@ -1017,12 +1022,146 @@ pub(crate) fn forgejo_stack_config(ingress: &Stage0Ingress) -> Vec<(&'static str
 /// Renders `core-addons/forgejo.yaml`: the Flux `HelmRelease` that adopts the Stage 0 Forgejo
 /// release in place, with `ROOT_URL` from `--oidc-public-url` (host and port are validated by
 /// [`Stage0Ingress`]), plus its `HelmRepository` and `forgejo-ingress` HTTPRoute.
-pub(crate) fn render_seed_forgejo_helmrelease(ingress: &Stage0Ingress) -> Result<String, CliError> {
+///
+/// With `hardened == false` the `keel-forgejo-hardening` block (forks off, local sign-up closed,
+/// organisation creation restricted) is left out, so a re-run never changes the values of a
+/// live, ephemeral Forgejo (see [`forgejo_hardening_decision`]).
+pub(crate) fn render_seed_forgejo_helmrelease(
+    ingress: &Stage0Ingress,
+    hardened: bool,
+) -> Result<String, CliError> {
     // `ROOT_URL` is not DNS-safe (scheme, port, path), so it is substituted before the
     // DNS-validated host placeholders.
-    let out =
+    let mut out =
         SEED_CORE_ADDON_FORGEJO_YAML.replace("${FORGEJO_ROOT_URL}", &forgejo_root_url(ingress));
+    if !hardened {
+        out = strip_forgejo_hardening_block(&out)?;
+    }
     render_manifest(&out, &ingress.template_vars())
+}
+
+const FORGEJO_HARDENING_BEGIN: &str = "# BEGIN keel-forgejo-hardening";
+const FORGEJO_HARDENING_END: &str = "# END keel-forgejo-hardening";
+
+/// Removes the lines from `# BEGIN keel-forgejo-hardening` to `# END keel-forgejo-hardening`.
+fn strip_forgejo_hardening_block(yaml: &str) -> Result<String, CliError> {
+    let mut out = String::with_capacity(yaml.len());
+    let mut inside = false;
+    let mut found = false;
+    for line in yaml.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with(FORGEJO_HARDENING_BEGIN) {
+            inside = true;
+            found = true;
+        } else if inside && trimmed.starts_with(FORGEJO_HARDENING_END) {
+            inside = false;
+        } else if !inside {
+            out.push_str(line);
+        }
+    }
+    if !found || inside {
+        return Err(CliError::Execution(
+            "seed forgejo.yaml has no complete keel-forgejo-hardening block".to_string(),
+        ));
+    }
+    Ok(out)
+}
+
+/// What Stage 0 knows about the live Forgejo before it renders the seed `HelmRelease`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LiveForgejo {
+    /// `Some(false)`: no Forgejo yet (fresh install). `None`: could not tell.
+    pub(crate) installed: Option<bool>,
+    /// The live `flux-system/forgejo` HelmRelease sets `persistence.enabled: true`.
+    pub(crate) persistence_enabled: bool,
+    /// The live Forgejo configuration already carries every hardening setting.
+    pub(crate) hardened: bool,
+}
+
+/// Whether the seed `HelmRelease` may carry the `keel-forgejo-hardening` values. A values change
+/// restarts the Forgejo pod (chart `checksum/config`), and with persistence disabled the restart
+/// wipes every repository, including the one Flux reconciles from (`NFR-REL-01`). So the block is
+/// only written on fresh installs, when persistence is enabled, or when the live configuration
+/// already has it (no change); otherwise it is deferred and reported in a bootstrap note.
+pub(crate) fn forgejo_hardening_decision(live: LiveForgejo) -> bool {
+    live.installed == Some(false) || live.persistence_enabled || live.hardened
+}
+
+/// Settings of the `keel-forgejo-hardening` block as `(section, KEY=VALUE)` in the chart's
+/// `<release>-inline-config` Secret.
+const FORGEJO_HARDENING_SETTINGS: &[(&str, &str)] = &[
+    ("repository", "DISABLE_FORKS=true"),
+    ("service", "ALLOW_ONLY_EXTERNAL_REGISTRATION=true"),
+    ("service", "DEFAULT_ALLOW_CREATE_ORGANIZATION=false"),
+];
+
+/// `true` when every hardening setting appears in the inline-config `sections` (section name,
+/// `KEY=VALUE` lines).
+fn inline_config_is_hardened(sections: &[(&str, Option<String>)]) -> bool {
+    FORGEJO_HARDENING_SETTINGS.iter().all(|(section, setting)| {
+        sections.iter().any(|(name, body)| {
+            name == section
+                && body
+                    .as_deref()
+                    .is_some_and(|b| b.lines().any(|l| l.trim().eq_ignore_ascii_case(setting)))
+        })
+    })
+}
+
+/// Inspects the live Forgejo (Deployment, `flux-system/forgejo` HelmRelease and the chart's
+/// `forgejo-inline-config` Secret) for [`forgejo_hardening_decision`].
+async fn inspect_live_forgejo(target: KubeTarget<'_>) -> LiveForgejo {
+    let installed = target
+        .output(&[
+            "-n",
+            KEEL_SYSTEM_NAMESPACE,
+            "get",
+            "deployment",
+            "forgejo",
+            "--ignore-not-found",
+            "-o",
+            "name",
+        ])
+        .await
+        .ok()
+        .map(|out| !out.trim().is_empty());
+    if installed != Some(true) {
+        return LiveForgejo {
+            installed,
+            persistence_enabled: false,
+            hardened: false,
+        };
+    }
+    let persistence_enabled = target
+        .output(&[
+            "-n",
+            "flux-system",
+            "get",
+            "helmreleases.helm.toolkit.fluxcd.io",
+            "forgejo",
+            "--ignore-not-found",
+            "-o",
+            "jsonpath={.spec.values.persistence.enabled}",
+        ])
+        .await
+        .is_ok_and(|out| out.trim() == "true");
+    let mut sections = Vec::new();
+    for section in ["repository", "service"] {
+        let body = target
+            .read_secret_key(KEEL_SYSTEM_NAMESPACE, "forgejo-inline-config", section)
+            .await;
+        sections.push((section, body));
+    }
+    LiveForgejo {
+        installed,
+        persistence_enabled,
+        hardened: inline_config_is_hardened(&sections),
+    }
+}
+
+/// Bootstrap note for a deferred `keel-forgejo-hardening` block.
+fn forgejo_hardening_deferred_note() -> String {
+    "Forgejo hardening (forks disabled, local sign-up closed, organisation creation limited to admins) was NOT added to `core-addons/forgejo.yaml`: the live Forgejo has persistence disabled, and changing its values would restart the pod and wipe every repository, including the one Flux reconciles from. Back up Forgejo (`forgejo dump` or a pushed mirror), set `persistence.enabled: true` in `core-addons/forgejo.yaml` in Git, then re-run `keel bootstrap init` to add the hardening".to_string()
 }
 
 /// Renders `clusters/management/core-addons/kustomization.yaml`, listing `rauthy.yaml` only when
@@ -1371,7 +1510,7 @@ fn seed_core_addon_files(
     if artifacts.with_forge {
         files.push((
             "forgejo.yaml",
-            render_seed_forgejo_helmrelease(&artifacts.ingress)?,
+            render_seed_forgejo_helmrelease(&artifacts.ingress, artifacts.forgejo_hardened)?,
         ));
     }
     if artifacts.with_keel_server {
@@ -1938,6 +2077,15 @@ pub async fn execute_bootstrap_init_with_target(
         connection.context.as_deref(),
         connection.kubeconfig_path.as_deref(),
     );
+    if cfg.with_forge {
+        // Before Stage 0 touches Forgejo: a fresh install gets the hardened values; a live,
+        // ephemeral Forgejo keeps its values so the seed push never restarts (wipes) it.
+        artifacts.forgejo_hardened =
+            forgejo_hardening_decision(inspect_live_forgejo(kube_target).await);
+        if !artifacts.forgejo_hardened {
+            notes.push(forgejo_hardening_deferred_note());
+        }
+    }
     if !args.skip_core_install {
         let stage0 = stage0
             .as_ref()
@@ -1991,6 +2139,7 @@ pub async fn execute_bootstrap_init_with_target(
             pf.local_port,
             forgejo_oidc_secret,
             &artifacts.ingress.discovery_url(),
+            &mut notes,
         )
         .await?;
         push_url_override = Some(format!(
@@ -3390,11 +3539,81 @@ mod security_hardening_tests {
     }
 
     #[test]
+    fn forgejo_hardening_is_deferred_on_a_live_ephemeral_forgejo() {
+        let live = |installed, persistence_enabled, hardened| LiveForgejo {
+            installed,
+            persistence_enabled,
+            hardened,
+        };
+        // Fresh install, persistent data, or already hardened (no values change) -> hardened.
+        assert!(forgejo_hardening_decision(live(Some(false), false, false)));
+        assert!(forgejo_hardening_decision(live(Some(true), true, false)));
+        assert!(forgejo_hardening_decision(live(Some(true), false, true)));
+        // Live and ephemeral, not yet hardened, or unknown -> keep the current values.
+        assert!(!forgejo_hardening_decision(live(Some(true), false, false)));
+        assert!(!forgejo_hardening_decision(live(None, false, false)));
+
+        let ingress = Stage0Ingress::default();
+        let hardened = render_seed_forgejo_helmrelease(&ingress, true).unwrap();
+        let deferred = render_seed_forgejo_helmrelease(&ingress, false).unwrap();
+        assert!(hardened.contains("DISABLE_FORKS"));
+        assert!(!deferred.contains("keel-forgejo-hardening"));
+        assert!(!deferred.contains("DISABLE_FORKS"));
+        let hr = |text: &str| {
+            yaml_docs(text)
+                .into_iter()
+                .find(|d| d["kind"] == "HelmRelease")
+                .unwrap()
+        };
+        let (mut want, got) = (hr(&hardened), hr(&deferred));
+        let config = want["spec"]["values"]["gitea"]["config"]
+            .as_object_mut()
+            .unwrap();
+        assert!(config.remove("repository").is_some());
+        assert!(config.remove("service").is_some());
+        // Only the hardening block differs; everything else is unchanged.
+        assert_eq!(got, want);
+        assert_eq!(yaml_docs(&deferred).len(), 3);
+        assert!(strip_forgejo_hardening_block("a: 1\n").is_err());
+        assert!(strip_forgejo_hardening_block("# BEGIN keel-forgejo-hardening\n").is_err());
+
+        let note = forgejo_hardening_deferred_note();
+        assert!(note.contains("persistence.enabled: true"), "{note}");
+    }
+
+    #[test]
+    fn live_inline_config_hardening_detection() {
+        let full = [
+            ("repository", Some("ROOT=/data/git\nDISABLE_FORKS=true".to_string())),
+            (
+                "service",
+                Some(
+                    "ALLOW_ONLY_EXTERNAL_REGISTRATION=true\nDEFAULT_ALLOW_CREATE_ORGANIZATION=false"
+                        .to_string(),
+                ),
+            ),
+        ];
+        assert!(inline_config_is_hardened(&full));
+        let partial = [
+            full[0].clone(),
+            (
+                "service",
+                Some("ALLOW_ONLY_EXTERNAL_REGISTRATION=true".to_string()),
+            ),
+        ];
+        assert!(!inline_config_is_hardened(&partial));
+        assert!(!inline_config_is_hardened(&[
+            ("repository", None),
+            ("service", None)
+        ]));
+    }
+
+    #[test]
     fn forgejo_helmrelease_adopts_stage0_release_in_place() {
         let ingress = Stage0Ingress::from_public_url("https://idp.corp.example:9443").unwrap();
         let root_url = forgejo_root_url(&ingress);
         assert_eq!(root_url, "https://forgejo.corp.example:9443/");
-        let rendered = render_seed_forgejo_helmrelease(&ingress).unwrap();
+        let rendered = render_seed_forgejo_helmrelease(&ingress, true).unwrap();
         let docs = yaml_docs(&rendered);
         let repo = docs.iter().find(|d| d["kind"] == "HelmRepository").unwrap();
         let hr = docs.iter().find(|d| d["kind"] == "HelmRelease").unwrap();
@@ -3441,6 +3660,26 @@ mod security_hardening_tests {
             hr["spec"]["values"]["gitea"]["admin"]["existingSecret"],
             forge::FORGEJO_ADMIN_SECRET_NAME
         );
+        // Tenant users read their own repository; forks must not outlive their access. No local
+        // sign-up (nobody registers Keel's bot name first) and no organisation creation by
+        // non-admins (nobody squats `keel-tenants`).
+        for values in [&hr["spec"]["values"], &stage0_values] {
+            let config = &values["gitea"]["config"];
+            assert_eq!(config["repository"]["DISABLE_FORKS"], true);
+            assert_eq!(config["service"]["ALLOW_ONLY_EXTERNAL_REGISTRATION"], true);
+            assert_eq!(
+                config["service"]["DEFAULT_ALLOW_CREATE_ORGANIZATION"],
+                false
+            );
+        }
+        // Every hardening value is checked against the live inline config on re-runs.
+        for (section, setting) in FORGEJO_HARDENING_SETTINGS {
+            let (key, value) = setting.split_once('=').unwrap();
+            assert_eq!(
+                hr["spec"]["values"]["gitea"]["config"][*section][key].to_string(),
+                value
+            );
+        }
         assert!(
             hr["spec"]["values"]["gitea"]["admin"]
                 .get("password")
@@ -3586,7 +3825,7 @@ mod security_hardening_tests {
             .unwrap()
             .1;
         assert_ne!(root_url, &forgejo_root_url(&Stage0Ingress::default()));
-        let rendered = render_seed_forgejo_helmrelease(&ingress).unwrap();
+        let rendered = render_seed_forgejo_helmrelease(&ingress, true).unwrap();
         let hr = yaml_docs(&rendered)
             .into_iter()
             .find(|d| d["kind"] == "HelmRelease")

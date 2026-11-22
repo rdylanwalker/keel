@@ -33,7 +33,7 @@ fn normalize_base_url(base_url: &str) -> Result<String, ForgeError> {
     Ok(trimmed.to_string())
 }
 
-fn validate_slug(value: &str, field: &str) -> Result<String, ForgeError> {
+pub(crate) fn validate_slug(value: &str, field: &str) -> Result<String, ForgeError> {
     let trimmed = value.trim().trim_matches('/');
     if trimmed.is_empty()
         || trimmed.contains("..")
@@ -158,7 +158,7 @@ fn build_slug(scheme: &str, host_port: &str, raw_path: &str) -> Result<RemoteRep
     })
 }
 
-async fn map_error_response(
+pub(crate) async fn map_error_response(
     resp: reqwest::Response,
     pr_id_hint: Option<&str>,
     is_merge: bool,
@@ -195,7 +195,7 @@ async fn map_error_response(
 
 /// Credentials used by [`ForgejoGiteaProvider`].
 #[derive(Clone)]
-enum ForgejoAuth {
+pub(crate) enum ForgejoAuth {
     /// Personal access token (`Authorization: token <pat>`).
     Token(String),
     /// HTTP basic auth (used by Stage 0 before any access token has been minted).
@@ -205,11 +205,11 @@ enum ForgejoAuth {
 /// Forgejo / Gitea REST v1 [`ForgeProvider`] adapter (`/api/v1/repos/{owner}/{repo}/...`).
 #[derive(Clone)]
 pub struct ForgejoGiteaProvider {
-    client: Client,
-    base_url: String,
+    pub(crate) client: Client,
+    pub(crate) base_url: String,
     owner: String,
     repo: String,
-    auth: ForgejoAuth,
+    pub(crate) auth: ForgejoAuth,
 }
 
 impl fmt::Debug for ForgejoGiteaProvider {
@@ -1383,49 +1383,12 @@ impl ForgeProvider for GitLabProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_http::{request_line, spawn_mock_http_server};
     use base64::Engine as _;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
 
     /// Per-run random Basic-auth password so no credential literal lives in the test source.
     fn random_test_password() -> String {
         uuid::Uuid::new_v4().simple().to_string()
-    }
-
-    /// Spawns a lightweight local HTTP server returning canned status/JSON responses sequentially.
-    async fn spawn_mock_http_server(
-        responses: Vec<(u16, String)>,
-    ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let base_url = format!("http://{addr}");
-
-        let handle = tokio::spawn(async move {
-            let mut captured_requests = Vec::with_capacity(responses.len());
-            for (status, body) in responses {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                let mut buf = vec![0u8; 8192];
-                let n = stream.read(&mut buf).await.unwrap();
-                captured_requests.push(String::from_utf8_lossy(&buf[..n]).into_owned());
-
-                let reason = match status {
-                    200 => "OK",
-                    201 => "Created",
-                    404 => "Not Found",
-                    409 => "Conflict",
-                    _ => "Error",
-                };
-                let http_resp = format!(
-                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                stream.write_all(http_resp.as_bytes()).await.unwrap();
-                stream.shutdown().await.unwrap();
-            }
-            captured_requests
-        });
-
-        (base_url, handle)
     }
 
     #[test]
@@ -1877,10 +1840,6 @@ mod tests {
 
         assert!(parse_remote_repo_url("/local/path/repo.git").is_err());
         assert!(parse_remote_repo_url("").is_err());
-    }
-
-    fn request_line(req: &str) -> &str {
-        req.lines().next().unwrap_or_default()
     }
 
     #[tokio::test]

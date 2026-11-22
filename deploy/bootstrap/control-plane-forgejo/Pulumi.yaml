@@ -72,6 +72,20 @@ resources:
               ROOT_URL: ${forgejoRootUrl}
             database:
               DB_TYPE: sqlite3
+            # BEGIN keel-forgejo-hardening (`SDD.md` §6.2). On re-runs against a live, ephemeral
+            # Forgejo (persistence disabled) `keel bootstrap init` omits this block: any values change
+            # restarts the pod and would wipe its repositories.
+            repository:
+              # Tenant users get read access to their own repository; a fork would outlive their
+              # removal from it, so forking is off instance-wide.
+              DISABLE_FORKS: true
+            service:
+              # No local sign-up (accounts come from the OIDC IdP or the admin API), so nobody can
+              # register Keel's service-account names first.
+              ALLOW_ONLY_EXTERNAL_REGISTRATION: true
+              # Only site admins create organisations, so nobody can squat `keel-tenants`.
+              DEFAULT_ALLOW_CREATE_ORGANIZATION: false
+            # END keel-forgejo-hardening
             oauth2_client:
               ENABLE_AUTO_REGISTRATION: true
               ACCOUNT_LINKING: auto

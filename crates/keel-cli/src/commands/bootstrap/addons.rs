@@ -1089,7 +1089,7 @@ mod tests {
         // `core-addons/forgejo.yaml`, so the adoption never rewrites it.
         let ingress = Stage0Ingress::from_public_url("https://idp.corp.example:9443").unwrap();
         let stage0 = docs(&render_manifest(FORGEJO_ROUTE_YAML, &ingress.template_vars()).unwrap());
-        let git = docs(&super::super::render_seed_forgejo_helmrelease(&ingress).unwrap());
+        let git = docs(&super::super::render_seed_forgejo_helmrelease(&ingress, true).unwrap());
         let route = git.iter().find(|d| d["kind"] == "HTTPRoute").unwrap();
         assert_eq!(stage0.len(), 1);
         assert_eq!(&stage0[0], route);

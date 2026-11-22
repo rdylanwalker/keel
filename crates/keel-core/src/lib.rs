@@ -80,6 +80,27 @@ pub const KEEL_CA_BUNDLE_CONFIGMAP: &str = "keel-ca-bundle";
 /// Key of the PEM certificate in [`KEEL_CA_BUNDLE_CONFIGMAP`].
 pub const KEEL_CA_BUNDLE_KEY: &str = "ca.crt";
 
+/// Private in-cluster Forgejo organisation that holds the per-tenant repositories
+/// (`SDD.md` §6.2). Created by `keel bootstrap init --with-forge`; the Stage 0 admin owns it.
+pub const TENANT_REPOS_ORG: &str = "keel-tenants";
+
+/// Dedicated non-admin, restricted Forgejo bot user. It only owns repository-scoped read tokens
+/// (one per tenant repository); nothing else authenticates as it (`SDD.md` §6.2).
+pub const TENANT_REPO_READER_USERNAME: &str = "keel-tenant-reader";
+
+/// [`TENANT_REPOS_ORG`] team granting [`TENANT_REPO_READER_USERNAME`] read-only code access to
+/// every current and future tenant repository.
+pub const TENANT_REPO_READERS_TEAM: &str = "tenant-readers";
+
+/// `keel-system` Secret (keys `username`, `password`) with the [`TENANT_REPO_READER_USERNAME`]
+/// credentials. Forgejo only mints tokens over basic auth as the token owner, so the server uses
+/// these to mint per-repository read tokens. Cluster-only, never written to Git.
+pub const TENANT_REPO_READER_SECRET_NAME: &str = "keel-forgejo-tenant-reader";
+
+/// Name prefix of the repository-scoped read tokens Keel mints as
+/// [`TENANT_REPO_READER_USERNAME`]. Stage 0 deletes every other token the bot owns.
+pub const TENANT_REPO_TOKEN_NAME_PREFIX: &str = "keel-tenant-repo-";
+
 /// Unified error type for `keel-core` operations.
 #[derive(Error, Debug)]
 pub enum CoreError {
