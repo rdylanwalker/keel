@@ -144,7 +144,7 @@ pub async fn get_catalog(
         .map(|p| p.id.clone())
         .collect();
 
-    let (mut applications, manifests_yaml) = load_catalog_items_from_dir(
+    let (mut applications, mut manifests_yaml) = load_catalog_items_from_dir(
         &state.repo_workdir,
         &state.repo_workdir.join("catalog/apps"),
     )
@@ -167,14 +167,25 @@ pub async fn get_catalog(
     };
 
     applications.retain(|a| is_item_visible(a.application.metadata.tenant.as_deref()));
+    // Manifest bodies of hidden (other tenants' private) applications are never returned.
+    manifests_yaml.retain(|id, _| {
+        applications
+            .iter()
+            .any(|a| a.application.metadata.id == *id)
+    });
 
+    // Management-plane core add-ons are cluster-admin only (like `GET /api/v1/management/addons`).
     let mut core_addons = Vec::new();
-    for path in find_catalog_files(
-        &state.repo_workdir,
-        &state.repo_workdir.join("catalog/core"),
-    )
-    .await
-    {
+    let core_files = if auth.is_admin() {
+        find_catalog_files(
+            &state.repo_workdir,
+            &state.repo_workdir.join("catalog/core"),
+        )
+        .await
+    } else {
+        Vec::new()
+    };
+    for path in core_files {
         let yaml = read_contained_to_string(&state.repo_workdir, &path).await?;
         match parse_catalog_application(&yaml) {
             Ok(app) => core_addons.push(app),

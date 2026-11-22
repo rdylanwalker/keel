@@ -25,7 +25,7 @@ use keel_pko::{
 };
 use keel_server::{
     AppState, KubeClusterStateProvider, RepoClusterStateProvider, TenantRepoForge,
-    TenantRepoForgeKind, TenantRepoNaming, TenantRepos, build_router,
+    TenantRepoForgeKind, TenantRepoManifests, TenantRepoNaming, TenantRepos, build_router,
 };
 use zeroize::Zeroizing;
 
@@ -579,7 +579,19 @@ async fn build_serve_state_with_forward(
     } else {
         None
     };
-    let repo_state_provider = RepoClusterStateProvider::new(&repo_workdir);
+    // Tenants with their own repositories: workloads are listed from each tenant repository's
+    // committed `main` (read-only mirrors), never from the platform repository alone.
+    let repo_state_provider = if tenant_repos.is_dedicated() {
+        RepoClusterStateProvider::new(&repo_workdir).with_tenant_source(Arc::new(
+            TenantRepoManifests::new(
+                tenant_repos.clone(),
+                Clone::clone(&git_runner),
+                &repo_workdir,
+            ),
+        ))
+    } else {
+        RepoClusterStateProvider::new(&repo_workdir)
+    };
     let mgmt_stack_backend = live_mgmt_backend.or_else(|| {
         std::fs::read_to_string(repo_workdir.join("clusters/management/management-stack.yaml"))
             .ok()
@@ -612,7 +624,8 @@ async fn build_serve_state_with_forward(
     // Tenant Stack proposals require the tenant state passphrase Secret whenever Secrets live in
     // the cluster; cluster-less local dev (in-memory store, nothing applied) skips the gate.
     .with_require_pulumi_passphrase(cluster_secret_store)
-    .with_tenant_repos(tenant_repos);
+    .with_tenant_repos(tenant_repos)
+    .with_state_provider(Arc::new(repo_state_provider.clone()));
     if let Some(backend) = mgmt_stack_backend {
         state.backend_url = backend;
     }

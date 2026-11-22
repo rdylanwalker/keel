@@ -44,40 +44,152 @@ pub struct StacksResponse {
     pub state_backend: Option<String>,
 }
 
+/// Authorizes the caller for a workload namespace and returns its tenant: `tenant-<id>` needs
+/// access to tenant `<id>`; any other namespace holds no tenant content and needs a cluster
+/// administrator (returned unchanged). An IdP group that merely equals `tenant-<namespace>` never
+/// opens a non-tenant namespace.
+fn authorize_namespace<'a>(auth: &AuthSession, namespace: &'a str) -> Result<&'a str, ServerError> {
+    match namespace.strip_prefix("tenant-") {
+        Some(tenant) => {
+            auth.require_tenant_access(tenant)?;
+            Ok(tenant)
+        }
+        None => {
+            auth.require_admin()?;
+            Ok(namespace)
+        }
+    }
+}
+
+/// [`authorize_namespace`] for reads of a tenant's GitOps content (`config`, `ssh-info`): a
+/// non-tenant namespace has none (`404` for cluster administrators, `403` for everyone else).
+fn authorize_tenant_namespace<'a>(
+    auth: &AuthSession,
+    namespace: &'a str,
+) -> Result<&'a str, ServerError> {
+    let tenant = authorize_namespace(auth, namespace)?;
+    if namespace.strip_prefix("tenant-") != Some(tenant) {
+        return Err(ServerError::NotFound(format!(
+            "'{namespace}' is not a tenant namespace"
+        )));
+    }
+    Ok(tenant)
+}
+
+/// Tenants whose workloads a listing covers: `None` for every tenant (cluster administrators
+/// without a filter), else the requested tenant or the caller's own tenants. A `tenant` filter
+/// needs tenant access; the `management` pseudo-tenant is cluster-admin only.
+fn listing_tenants(
+    auth: &AuthSession,
+    tenant: Option<&str>,
+) -> Result<Option<Vec<String>>, ServerError> {
+    match tenant {
+        Some(t) if t == MANAGEMENT_TENANT => {
+            auth.require_admin()?;
+            Ok(Some(vec![t.to_string()]))
+        }
+        Some(t) => {
+            auth.require_tenant_access(t)?;
+            Ok(Some(vec![t.to_string()]))
+        }
+        None if auth.is_admin() => Ok(None),
+        None => Ok(Some(auth.tenant_group_ids())),
+    }
+}
+
+/// `true` when a non-admin caller may see a workload in `namespace`: only `tenant-<id>` namespaces
+/// of the caller's tenants (matching the `tenant` filter, when set). Applied on top of the
+/// per-tenant listing so neither a `keel.io/tenant` label nor a document in the wrong directory
+/// can surface another tenant's workload.
+fn workload_visible(auth: &AuthSession, filter: Option<&str>, namespace: &str) -> bool {
+    if auth.is_admin() {
+        return true;
+    }
+    namespace.strip_prefix("tenant-").is_some_and(|t| {
+        filter.is_none_or(|f| f == t)
+            && t != MANAGEMENT_TENANT
+            && auth.require_tenant_access(t).is_ok()
+    })
+}
+
+/// Strips any `user[:password]@` from an `http(s)://` URL so a credential embedded in a configured
+/// remote never reaches an API response (`NFR-SEC-05`). Other forms are returned unchanged.
+pub(crate) fn redact_url_userinfo(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_string();
+    };
+    if !matches!(scheme.to_ascii_lowercase().as_str(), "http" | "https") {
+        return url.to_string();
+    }
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(authority_end);
+    match authority.rsplit_once('@') {
+        Some((_, host)) => format!("{scheme}://{host}{tail}"),
+        None => url.to_string(),
+    }
+}
+
 /// `GET /api/v1/stacks`
+///
+/// Cluster administrators see every stack; other callers only the stacks of their tenants'
+/// namespaces. With per-tenant repositories each tenant's desired stacks come from its own
+/// repository. `gitRepoUrl` is the repository holding the listed content: the platform
+/// repository for administrators (and the Local Git provider), the tenant's own repository for
+/// a `tenant` filter, and absent otherwise. `stateBackend` (the platform's Pulumi backend) is
+/// returned only where the platform repository URL is.
 pub async fn list_stacks(
     auth: AuthSession,
     State(state): State<AppState>,
     Query(query): Query<ListStacksQuery>,
 ) -> Result<Json<StacksResponse>, ServerError> {
-    if let Some(ref tenant) = query.tenant {
-        auth.require_tenant_access(tenant)?;
-    }
-    let mut stacks = state
-        .state_provider
-        .list_stacks(query.tenant.as_deref(), query.provider.as_deref())
-        .await?;
-    if query.tenant.is_none() && !auth.is_admin() {
-        stacks.retain(|s| {
-            let tenant = s.namespace.strip_prefix("tenant-").unwrap_or(&s.namespace);
-            auth.require_tenant_access(tenant).is_ok()
-        });
+    let filter = query.tenant.as_deref();
+    let mut stacks = match listing_tenants(&auth, filter)? {
+        None => {
+            state
+                .state_provider
+                .list_stacks(None, query.provider.as_deref())
+                .await?
+        }
+        Some(tenants) => {
+            state
+                .state_provider
+                .list_stacks_for_tenants(&tenants, query.provider.as_deref())
+                .await?
+        }
+    };
+    if filter != Some(MANAGEMENT_TENANT) {
+        stacks.retain(|s| workload_visible(&auth, filter, &s.namespace));
     }
 
-    let flux_repo_url = tokio::fs::read_to_string(
-        state
-            .repo_workdir
-            .join("clusters/management/flux-system/git-repository.yaml"),
-    )
-    .await
-    .ok()
-    .and_then(|raw| serde_yml::from_str::<serde_json::Value>(&raw).ok())
-    .and_then(|v| {
-        v.get("spec")
-            .and_then(|s| s.get("url"))
-            .and_then(|u| u.as_str())
-            .map(str::to_string)
-    });
+    let platform_repo_url = || async {
+        tokio::fs::read_to_string(
+            state
+                .repo_workdir
+                .join("clusters/management/flux-system/git-repository.yaml"),
+        )
+        .await
+        .ok()
+        .and_then(|raw| serde_yml::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|v| {
+            v.get("spec")
+                .and_then(|s| s.get("url"))
+                .and_then(|u| u.as_str())
+                .map(str::to_string)
+        })
+        .or_else(|| Some(state.remote_url.clone()))
+    };
+    // The platform's Pulumi state backend is platform infrastructure: same audience as the
+    // platform repository URL.
+    let platform_visible = auth.is_admin() || !state.tenant_repos.is_dedicated();
+    let state_backend = platform_visible.then(|| redact_url_userinfo(&state.backend_url));
+    let git_repo_url = match (state.tenant_repos.forge(), filter) {
+        // The tenant's own repository.
+        (Some(forge), Some(t)) if t != MANAGEMENT_TENANT => forge.clone_url(t).ok(),
+        _ if platform_visible => platform_repo_url().await,
+        // Tenant users have no access to the platform repository.
+        _ => None,
+    }
+    .map(|url| redact_url_userinfo(&url));
 
     let forge_provider = tokio::fs::read_to_string(state.repo_workdir.join(".keel/config.yaml"))
         .await
@@ -92,9 +204,9 @@ pub async fn list_stacks(
 
     Ok(Json(StacksResponse {
         stacks,
-        git_repo_url: flux_repo_url.or_else(|| Some(state.remote_url.clone())),
+        git_repo_url,
         forge_provider,
-        state_backend: Some(state.backend_url.clone()),
+        state_backend,
     }))
 }
 
@@ -221,9 +333,8 @@ async fn delete_gitops_resource_pr(
         ));
     }
 
-    let tenant = namespace.strip_prefix("tenant-").unwrap_or(&namespace);
+    let tenant = authorize_namespace(&auth, &namespace)?;
     validate_dns_label(tenant, "tenant")?;
-    auth.require_tenant_access(tenant)?;
 
     let timestamp = Utc::now().timestamp().max(1) as u64;
     let action_label = format!("delete-{name}");
@@ -364,8 +475,7 @@ pub async fn get_stack_config(
     validate_dns_label(&namespace, "namespace")?;
     validate_dns_label(&name, "name")?;
 
-    let tenant = namespace.strip_prefix("tenant-").unwrap_or(&namespace);
-    auth.require_tenant_access(tenant)?;
+    let tenant = authorize_tenant_namespace(&auth, &namespace)?;
 
     let not_found =
         || ServerError::NotFound(format!("Stack '{name}' not found in tenant '{tenant}'"));
@@ -376,14 +486,17 @@ pub async fn get_stack_config(
         let reader = RepoReader::committed_in(&state, &repo.workdir)
             .await
             .ok_or_else(not_found)?;
-        return read_stack_config(&reader, tenant, &name)
+        // The catalog lives in the platform repository (committed refs only: `git_lock` is never
+        // taken after a tenant lock).
+        let catalog = RepoReader::committed(&state).await;
+        return read_stack_config(&reader, catalog.as_ref(), tenant, &name)
             .await
             .map(Json)
             .ok_or_else(not_found);
     }
     // Prefer committed `origin/main` state read without touching the shared worktree (`OPEN-13`).
     if let Some(reader) = RepoReader::committed(&state).await
-        && let Some(resp) = read_stack_config(&reader, tenant, &name).await
+        && let Some(resp) = read_stack_config(&reader, Some(&reader), tenant, &name).await
     {
         return Ok(Json(resp));
     }
@@ -393,7 +506,7 @@ pub async fn get_stack_config(
     let reader = RepoReader::Worktree {
         root: &state.repo_workdir,
     };
-    read_stack_config(&reader, tenant, &name)
+    read_stack_config(&reader, Some(&reader), tenant, &name)
         .await
         .map(Json)
         .ok_or_else(|| {
@@ -401,9 +514,12 @@ pub async fn get_stack_config(
         })
 }
 
-/// Reads `values.yaml` + catalog id for an infra stack through `reader`; `None` if the stack dir is absent.
+/// Reads `values.yaml` + catalog id for an infra stack through `reader` (the tenant's
+/// repository) and `catalog` (the platform repository; only blueprints shared or owned by
+/// `tenant` are matched); `None` if the stack dir is absent.
 async fn read_stack_config(
     reader: &RepoReader<'_>,
+    catalog: Option<&RepoReader<'_>>,
     tenant: &str,
     name: &str,
 ) -> Option<ReleaseConfigResponse> {
@@ -418,21 +534,27 @@ async fn read_stack_config(
     };
 
     let mut catalog_id = name.to_string();
-    if !reader
-        .exists(&format!("catalog/infra/{name}/catalog.yaml"))
-        .await
+    if let Some(catalog) = catalog
+        && !catalog
+            .exists(&format!("catalog/infra/{name}/catalog.yaml"))
+            .await
         && let Some(raw) = reader.read(&format!("{dir}/stack.yaml")).await
         && let Ok(doc) = serde_yml::from_str::<Value>(&raw)
         && let Some(provider) = doc
             .pointer("/metadata/labels/keel.io~1provider")
             .and_then(Value::as_str)
     {
-        for entry in reader.list_dir("catalog/infra").await {
-            if let Some(cat_raw) = reader
+        for entry in catalog.list_dir("catalog/infra").await {
+            if let Some(cat_raw) = catalog
                 .read(&format!("catalog/infra/{entry}/catalog.yaml"))
                 .await
                 && let Ok(CatalogManifest::InfraBlueprint(bp)) = parse_catalog(&cat_raw)
                 && bp.metadata.provider == provider
+                && bp
+                    .metadata
+                    .tenant
+                    .as_deref()
+                    .is_none_or(|owner| owner == tenant)
             {
                 catalog_id = bp.metadata.id;
                 break;
@@ -489,8 +611,7 @@ pub async fn get_release_config(
         return Err(management_addon_config_conflict(&namespace, &name));
     }
 
-    let tenant = namespace.strip_prefix("tenant-").unwrap_or(&namespace);
-    auth.require_tenant_access(tenant)?;
+    let tenant = authorize_tenant_namespace(&auth, &namespace)?;
     // The tenant's repository (its own clone, or the platform checkout for the Local Git
     // provider), read under its lock so mutating handlers cannot interleave.
     let repo = ScopeRepo::for_tenant(&state, tenant)?;
@@ -632,6 +753,11 @@ pub async fn get_release_config(
                 if let Ok(raw) = tokio::fs::read_to_string(&candidate).await
                     && let Ok(CatalogManifest::Application(app)) = parse_catalog(&raw)
                     && app.spec.upstream.chart.as_deref() == Some(chart.as_str())
+                    && app
+                        .metadata
+                        .tenant
+                        .as_deref()
+                        .is_none_or(|owner| owner == tenant)
                 {
                     catalog_id = app.metadata.id;
                     break;
@@ -674,8 +800,7 @@ pub async fn get_bundle_config(
     validate_dns_label(&namespace, "namespace")?;
     validate_dns_label(&name, "name")?;
 
-    let tenant = namespace.strip_prefix("tenant-").unwrap_or(&namespace);
-    auth.require_tenant_access(tenant)?;
+    let tenant = authorize_tenant_namespace(&auth, &namespace)?;
     let repo = ScopeRepo::for_tenant(&state, tenant)?;
     let _repo_guard = repo.lock(&state).await;
     repo.sync_main_for_read(&state).await?;
@@ -872,8 +997,7 @@ pub async fn reconcile_stack(
 ) -> Result<Json<ReconcileStackResponse>, ServerError> {
     validate_dns_label(&namespace, "namespace")?;
     validate_dns_label(&name, "name")?;
-    let tenant = namespace.strip_prefix("tenant-").unwrap_or(&namespace);
-    auth.require_tenant_access(tenant)?;
+    authorize_namespace(&auth, &namespace)?;
     require_known_stack(&state, &namespace, &name).await?;
 
     let message = state
@@ -1061,9 +1185,8 @@ async fn resolve_stack_ssh_info(
 ) -> Result<ResolvedStackSsh, SshInfoError> {
     validate_dns_label(namespace, "namespace").map_err(ServerError::from)?;
     validate_dns_label(name, "name").map_err(ServerError::from)?;
-    let tenant = namespace.strip_prefix("tenant-").unwrap_or(namespace);
+    let tenant = authorize_tenant_namespace(auth, namespace)?;
     validate_dns_label(tenant, "tenant").map_err(ServerError::from)?;
-    auth.require_tenant_access(tenant)?;
 
     // The stack must exist (in Git or live) and be a VM; never fabricate a target (`OPEN-17`).
     let summary = state
@@ -1313,19 +1436,17 @@ pub async fn list_releases(
             .await?;
         return Ok(Json(ReleasesResponse { releases }));
     }
-    if let Some(ref tenant) = query.tenant {
-        auth.require_tenant_access(tenant)?;
-    }
-    let mut releases = state
-        .state_provider
-        .list_releases(query.tenant.as_deref())
-        .await?;
-    if query.tenant.is_none() && !auth.is_admin() {
-        releases.retain(|r| {
-            let tenant = r.namespace.strip_prefix("tenant-").unwrap_or(&r.namespace);
-            auth.require_tenant_access(tenant).is_ok()
-        });
-    }
+    let filter = query.tenant.as_deref();
+    let mut releases = match listing_tenants(&auth, filter)? {
+        None => state.state_provider.list_releases(None).await?,
+        Some(tenants) => {
+            state
+                .state_provider
+                .list_releases_for_tenants(&tenants)
+                .await?
+        }
+    };
+    releases.retain(|r| workload_visible(&auth, filter, &r.namespace));
     if query.tenant.is_none() && auth.is_admin() {
         let addons = state
             .state_provider
@@ -1354,4 +1475,90 @@ fn management_addon_config_conflict(namespace: &str, name: &str) -> ServerError 
          values via POST /api/v1/management/addons/{name}/upgrade (or /rollback), which opens a \
          reviewed GitOps PR"
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use keel_core::AuthPhase;
+
+    fn session(groups: &[&str]) -> AuthSession {
+        AuthSession {
+            claims: crate::auth::SessionClaims {
+                sub: "u".to_string(),
+                email: None,
+                name: None,
+                groups: groups.iter().map(|g| g.to_string()).collect(),
+                auth_phase: AuthPhase::OidcActive,
+                exp: Utc::now().timestamp() + 3600,
+            },
+        }
+    }
+
+    #[test]
+    fn urls_never_carry_userinfo() {
+        assert_eq!(
+            redact_url_userinfo("https://bot:s3cret@forge.example.com/org/repo.git"),
+            "https://forge.example.com/org/repo.git"
+        );
+        assert_eq!(
+            redact_url_userinfo("http://token@forge.local:3000/o/r?x=@y"),
+            "http://forge.local:3000/o/r?x=@y"
+        );
+        for unchanged in [
+            "https://forge.example.com/org/repo.git",
+            "ssh://git@github.com:22/o/r.git",
+            "/var/lib/keel/gitops.git",
+            "s3://keel-state?endpoint=seaweedfs:8333",
+        ] {
+            assert_eq!(redact_url_userinfo(unchanged), unchanged);
+        }
+    }
+
+    #[test]
+    fn namespaces_map_to_tenants_strictly() {
+        let member = session(&["tenant-acme", "tenant-keel-system"]);
+        assert_eq!(authorize_namespace(&member, "tenant-acme").unwrap(), "acme");
+        assert!(matches!(
+            authorize_namespace(&member, "tenant-beta"),
+            Err(ServerError::Forbidden(_))
+        ));
+        // A group named like a non-tenant namespace never opens it.
+        assert!(matches!(
+            authorize_namespace(&member, "keel-system"),
+            Err(ServerError::Forbidden(_))
+        ));
+        let admin = session(&["keel-admins"]);
+        assert_eq!(
+            authorize_namespace(&admin, "keel-system").unwrap(),
+            "keel-system"
+        );
+        assert!(matches!(
+            authorize_tenant_namespace(&admin, "keel-system"),
+            Err(ServerError::NotFound(_))
+        ));
+        assert_eq!(
+            authorize_tenant_namespace(&admin, "tenant-beta").unwrap(),
+            "beta"
+        );
+    }
+
+    #[test]
+    fn listings_cover_only_the_callers_tenants() {
+        let member = session(&["tenant-acme", "tenant-management"]);
+        assert_eq!(
+            listing_tenants(&member, None).unwrap(),
+            Some(vec!["acme".to_string()])
+        );
+        assert!(listing_tenants(&member, Some("beta")).is_err());
+        assert!(listing_tenants(&member, Some(MANAGEMENT_TENANT)).is_err());
+        assert!(workload_visible(&member, None, "tenant-acme"));
+        assert!(!workload_visible(&member, Some("beta"), "tenant-acme"));
+        assert!(!workload_visible(&member, None, "tenant-beta"));
+        assert!(!workload_visible(&member, None, "keel-previews"));
+        assert!(!workload_visible(&member, None, "tenant-management"));
+        let admin = session(&["keel-admins"]);
+        assert_eq!(listing_tenants(&admin, None).unwrap(), None);
+        assert!(workload_visible(&admin, None, "flux-system"));
+    }
 }

@@ -1111,6 +1111,227 @@ pub fn spawn_post_merge_completion(
     });
 }
 
+/// Bound of one tenant repository mirror fetch on the workload listing paths.
+pub const MANIFEST_MIRROR_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// A tenant repository mirror fetched more recently than this is not fetched again by the
+/// workload listings (`GET /api/v1/stacks`, `GET /api/v1/releases`), which clients poll.
+pub const MANIFEST_MIRROR_TTL: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// [`crate::state::TenantManifestSource`] over the read-only tenant repository mirrors
+/// ([`TenantRepos::sync_mirror`]): each tenant repository's committed `main` is fetched at most
+/// once per [`MANIFEST_MIRROR_TTL`] (bounded concurrency; a failed fetch is retried only after
+/// an exponential backoff, the last snapshot being served meanwhile) and its `tenants/<id>/` YAML is read
+/// through object reads only, cached per commit. Only files under `tenants/<id>/` of tenant
+/// `<id>`'s own repository are returned. A disposable in-memory cache: keel-server stays
+/// stateless.
+#[derive(Clone)]
+pub struct TenantRepoManifests {
+    repos: TenantRepos,
+    git: GitRunner,
+    platform_workdir: PathBuf,
+    /// Successful fetches are not repeated within this window.
+    ttl: std::time::Duration,
+    /// Per tenant: the last mirror fetch attempt, successful or not.
+    fetched: Arc<std::sync::Mutex<HashMap<String, FetchAttempt>>>,
+    /// Per tenant: the `main` commit and its `tenants/<id>/` YAML.
+    snapshots: Arc<std::sync::Mutex<HashMap<String, TenantSnapshot>>>,
+}
+
+/// A tenant repository's `main` commit and its `tenants/<id>/` YAML.
+type TenantSnapshot = (String, Arc<crate::state::ManifestTree>);
+
+/// Longest wait before a tenant repository mirror that keeps failing is fetched again.
+pub const MANIFEST_MIRROR_MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// The last mirror fetch attempt of one tenant repository.
+#[derive(Debug, Clone, Copy)]
+struct FetchAttempt {
+    at: std::time::Instant,
+    /// Consecutive failed attempts (`0` after a successful fetch).
+    failures: u32,
+}
+
+impl FetchAttempt {
+    /// Window in which the mirror is not fetched again: `ttl` after a success, else
+    /// `ttl × 2^(failures-1)` capped at [`MANIFEST_MIRROR_MAX_BACKOFF`] (never shorter than `ttl`),
+    /// so an unreachable repository is not retried by every listing poll.
+    fn window(&self, ttl: std::time::Duration) -> std::time::Duration {
+        if self.failures == 0 {
+            return ttl;
+        }
+        let factor = 1u32 << (self.failures - 1).min(16);
+        ttl.saturating_mul(factor)
+            .min(MANIFEST_MIRROR_MAX_BACKOFF)
+            .max(ttl)
+    }
+
+    fn current(&self, ttl: std::time::Duration) -> bool {
+        self.at.elapsed() < self.window(ttl)
+    }
+}
+
+impl std::fmt::Debug for TenantRepoManifests {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TenantRepoManifests")
+            .field("repos", &self.repos)
+            .field("platform_workdir", &self.platform_workdir)
+            .finish_non_exhaustive()
+    }
+}
+
+impl TenantRepoManifests {
+    pub fn new(repos: TenantRepos, git: GitRunner, platform_workdir: impl Into<PathBuf>) -> Self {
+        Self {
+            repos,
+            git,
+            platform_workdir: platform_workdir.into(),
+            ttl: MANIFEST_MIRROR_TTL,
+            fetched: Arc::default(),
+            snapshots: Arc::default(),
+        }
+    }
+
+    /// Overrides [`MANIFEST_MIRROR_TTL`] (tests).
+    pub fn with_ttl(mut self, ttl: std::time::Duration) -> Self {
+        self.ttl = ttl;
+        self
+    }
+
+    fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+        m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The committed `tenants/<tenant>/` YAML of `tenant`'s repository.
+    async fn snapshot(
+        &self,
+        platform_remote: &str,
+        tenant: &str,
+    ) -> Result<Arc<crate::state::ManifestTree>, ServerError> {
+        let dir = self.repos.mirror_dir(tenant)?;
+        {
+            // Concurrent listings wait for one fetch and then see it as current.
+            let _fetch_guard = self.repos.lock(&format!("{tenant}#manifests")).await;
+            let last = Self::lock(&self.fetched).get(tenant).copied();
+            match last {
+                Some(attempt) if attempt.current(self.ttl) && attempt.failures > 0 => {
+                    return Err(ServerError::ServiceUnavailable(format!(
+                        "tenant `{tenant}` repository fetch failed recently; retrying after backoff"
+                    )));
+                }
+                Some(attempt)
+                    if attempt.current(self.ttl)
+                        && tokio::fs::try_exists(dir.join(".git"))
+                            .await
+                            .unwrap_or(false) => {}
+                _ => {
+                    let outcome = self
+                        .repos
+                        .sync_mirror(
+                            &self.git,
+                            platform_remote,
+                            tenant,
+                            MANIFEST_MIRROR_FETCH_TIMEOUT,
+                        )
+                        .await;
+                    let failures = match (&outcome, last) {
+                        (Ok(_), _) => 0,
+                        (Err(_), Some(prev)) => prev.failures.saturating_add(1),
+                        (Err(_), None) => 1,
+                    };
+                    Self::lock(&self.fetched).insert(
+                        tenant.to_string(),
+                        FetchAttempt {
+                            at: std::time::Instant::now(),
+                            failures,
+                        },
+                    );
+                    outcome?;
+                }
+            }
+        }
+        let sha = self.git.rev_parse(&dir, "refs/remotes/origin/main").await?;
+        keel_git::validate_commit_sha(&sha)?;
+        if let Some((cached_sha, tree)) = Self::lock(&self.snapshots).get(tenant)
+            && *cached_sha == sha
+        {
+            return Ok(tree.clone());
+        }
+        let prefix = format!("tenants/{tenant}/");
+        let mut tree = crate::state::ManifestTree::new();
+        for path in self
+            .git
+            .list_files_at_ref(&dir, &sha, &format!("tenants/{tenant}"))
+            .await?
+        {
+            let is_yaml = path.ends_with(".yaml") || path.ends_with(".yml");
+            if !is_yaml || !path.starts_with(&prefix) {
+                continue;
+            }
+            if let Some(content) = self.git.read_file_at_ref(&dir, &sha, &path).await? {
+                tree.insert(path, content);
+            }
+        }
+        let tree = Arc::new(tree);
+        Self::lock(&self.snapshots).insert(tenant.to_string(), (sha, tree.clone()));
+        Ok(tree)
+    }
+
+    /// The last snapshot of `tenant` (whatever its age).
+    fn last_snapshot(&self, tenant: &str) -> Option<Arc<crate::state::ManifestTree>> {
+        Self::lock(&self.snapshots)
+            .get(tenant)
+            .map(|(_, tree)| tree.clone())
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::state::TenantManifestSource for TenantRepoManifests {
+    async fn tenant_manifests(
+        &self,
+        tenants: &[String],
+    ) -> Vec<(String, Arc<crate::state::ManifestTree>)> {
+        use futures::StreamExt as _;
+        if self.repos.forge().is_none() || tenants.is_empty() {
+            return Vec::new();
+        }
+        let platform_remote = match self
+            .git
+            .get_remote_url(&self.platform_workdir, "origin")
+            .await
+        {
+            Ok(url) => url,
+            Err(err) => {
+                tracing::warn!(error = %err, "platform remote unavailable; tenant repository workloads are not listed");
+                return tenants
+                    .iter()
+                    .filter_map(|t| self.last_snapshot(t).map(|tree| (t.clone(), tree)))
+                    .collect();
+            }
+        };
+        let mut out: Vec<(String, Arc<crate::state::ManifestTree>)> =
+            futures::stream::iter(tenants.iter().cloned())
+                .map(|tenant| {
+                    let platform_remote = platform_remote.as_str();
+                    async move {
+                        match self.snapshot(platform_remote, &tenant).await {
+                            Ok(tree) => Some((tenant, tree)),
+                            Err(err) => {
+                                tracing::warn!(tenant = %tenant, error = %err, "tenant repository unavailable for the workload listing; serving its last snapshot");
+                                self.last_snapshot(&tenant).map(|tree| (tenant, tree))
+                            }
+                        }
+                    }
+                })
+                .buffer_unordered(crate::proposal_repo::PROPOSAL_LIST_CONCURRENCY)
+                .filter_map(futures::future::ready)
+                .collect()
+                .await;
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1240,6 +1461,22 @@ mod tests {
         assert!(!waiter.is_finished());
         drop(a);
         waiter.await.unwrap();
+    }
+
+    #[test]
+    fn failed_mirror_fetches_back_off_exponentially() {
+        let ttl = std::time::Duration::from_secs(15);
+        let attempt = |failures| FetchAttempt {
+            at: std::time::Instant::now(),
+            failures,
+        };
+        assert_eq!(attempt(0).window(ttl), ttl);
+        assert_eq!(attempt(1).window(ttl), ttl);
+        assert_eq!(attempt(2).window(ttl), ttl * 2);
+        assert_eq!(attempt(3).window(ttl), ttl * 4);
+        assert_eq!(attempt(40).window(ttl), MANIFEST_MIRROR_MAX_BACKOFF);
+        assert!(attempt(1).current(ttl));
+        assert!(!attempt(1).current(std::time::Duration::ZERO));
     }
 
     #[test]

@@ -27,12 +27,12 @@ pub use error::{ErrorResponse, ServerError};
 pub use keel_core::StackSshInfoResponse;
 pub use routes::{CatalogItemDto, CreateCatalogItemRequest, healthz as health_check};
 pub use state::{
-    AppState, CachedPreview, ClusterStateProvider, KubeClusterStateProvider, ReleaseSummary,
-    RepoClusterStateProvider, StackSummary,
+    AppState, CachedPreview, ClusterStateProvider, KubeClusterStateProvider, ManifestTree,
+    ReleaseSummary, RepoClusterStateProvider, StackSummary, TenantManifestSource,
 };
 pub use tenant_repos::{
-    TenantRepoCloneBase, TenantRepoForge, TenantRepoForgeKind, TenantRepoLayout, TenantRepoNaming,
-    TenantRepos,
+    TenantRepoCloneBase, TenantRepoForge, TenantRepoForgeKind, TenantRepoLayout,
+    TenantRepoManifests, TenantRepoNaming, TenantRepos,
 };
 
 /// Builds the complete stateless Axum [`Router`] with all REST, SSE, auth, and embedded SPA routes.

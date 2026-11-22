@@ -149,6 +149,32 @@ pub trait ClusterStateProvider: Send + Sync {
     async fn list_releases(&self, tenant: Option<&str>)
     -> Result<Vec<ReleaseSummary>, ServerError>;
 
+    /// [`Self::list_stacks`] for several tenants (a non-admin caller's tenants). Providers that
+    /// read shared state override this to read it once instead of once per tenant.
+    async fn list_stacks_for_tenants(
+        &self,
+        tenants: &[String],
+        provider: Option<&str>,
+    ) -> Result<Vec<StackSummary>, ServerError> {
+        let mut out = Vec::new();
+        for tenant in tenants {
+            out.extend(self.list_stacks(Some(tenant), provider).await?);
+        }
+        Ok(out)
+    }
+
+    /// [`Self::list_releases`] for several tenants (see [`Self::list_stacks_for_tenants`]).
+    async fn list_releases_for_tenants(
+        &self,
+        tenants: &[String],
+    ) -> Result<Vec<ReleaseSummary>, ServerError> {
+        let mut out = Vec::new();
+        for tenant in tenants {
+            out.extend(self.list_releases(Some(tenant)).await?);
+        }
+        Ok(out)
+    }
+
     /// Management-plane core add-ons (`clusters/management/core-addons/`) as protected
     /// releases, with live Flux status where available. Callers must restrict this to cluster
     /// admins; it never includes the infrastructure root Kustomizations (`flux-system`,
@@ -252,11 +278,97 @@ pub trait ClusterStateProvider: Send + Sync {
     }
 }
 
-/// Default stateless [`ClusterStateProvider`] that scans `tenants/` and `deploy/`
-/// YAML manifests inside `repo_workdir` (and optionally merges cached CRD summaries).
-#[derive(Debug, Clone)]
+/// Committed YAML files of a repository subtree: repository-relative path (`/`-separated) →
+/// contents.
+pub type ManifestTree = std::collections::BTreeMap<String, String>;
+
+/// Desired manifests of tenants that have their own repositories (every remote forge): the
+/// committed `tenants/<id>/` YAML of each tenant repository's `main`. Implemented over
+/// disposable read-only mirrors by [`crate::tenant_repos::TenantRepoManifests`].
+#[async_trait]
+pub trait TenantManifestSource: Send + Sync {
+    /// The `tenants/<id>/` tree of each of `tenants` (repository-relative paths, only files under
+    /// `tenants/<id>/`). A tenant whose repository cannot be read is served from its last
+    /// snapshot, or omitted (logged) when there is none.
+    async fn tenant_manifests(&self, tenants: &[String]) -> Vec<(String, Arc<ManifestTree>)>;
+}
+
+/// Default stateless [`ClusterStateProvider`] that scans `tenants/` and `clusters/` YAML
+/// manifests inside `repo_workdir` and, when tenants have their own repositories, each tenant
+/// repository's committed `tenants/<id>/` ([`TenantManifestSource`]).
+///
+/// Content read from tenant `<id>`'s own repository is confined to it: documents outside the
+/// `tenant-<id>` namespace are ignored and the tenant is always `<id>` (never a `keel.io/tenant`
+/// label), so one tenant's repository can never inject entries into another tenant's listings.
+/// Platform-owned objects (`keel.io/platform-owned`, e.g. the `keel-tenant-root` stub
+/// Kustomization) are never reported as tenant workloads.
+#[derive(Clone)]
 pub struct RepoClusterStateProvider {
     repo_workdir: PathBuf,
+    tenant_source: Option<Arc<dyn TenantManifestSource>>,
+}
+
+impl std::fmt::Debug for RepoClusterStateProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RepoClusterStateProvider")
+            .field("repo_workdir", &self.repo_workdir)
+            .field("tenant_source", &self.tenant_source.is_some())
+            .finish()
+    }
+}
+
+/// One desired-state tree: the platform working tree (`confine: None`) or tenant `<id>`'s own
+/// repository (`confine: Some(id)`).
+struct DesiredTree {
+    confine: Option<String>,
+    files: Arc<ManifestTree>,
+}
+
+/// `true` for an object the platform owns inside a tenant namespace (stub source/root
+/// Kustomization, baseline RBAC); never a tenant workload.
+fn is_platform_owned(val: &Value) -> bool {
+    val.pointer(&format!(
+        "/metadata/labels/{}",
+        keel_kube::PLATFORM_OWNED_LABEL.replace('/', "~1")
+    ))
+    .is_some_and(|v| !v.is_null())
+}
+
+/// Repository-relative paths of `tree` in path-component order (`a/b` before `a-b/...`).
+fn sorted_tree_paths(tree: &ManifestTree) -> Vec<&String> {
+    let mut paths: Vec<&String> = tree.keys().collect();
+    paths.sort_by(|a, b| a.split('/').cmp(b.split('/')));
+    paths
+}
+
+/// Parent directory of a repository-relative path (`""` at the root).
+fn rel_parent(rel: &str) -> &str {
+    rel.rsplit_once('/').map_or("", |(parent, _)| parent)
+}
+
+/// Applies tenant-repository confinement to a document: `None` (skip) when its namespace is not
+/// `tenant-<id>` (an absent namespace is the root Kustomization's `targetNamespace`), else the
+/// namespace and the forced tenant id.
+fn confine_document(confine: &str, val: &Value) -> Option<(String, String)> {
+    let expected = format!("tenant-{confine}");
+    match val.pointer("/metadata/namespace").and_then(Value::as_str) {
+        None => Some((expected, confine.to_string())),
+        Some(ns) if ns == expected => Some((expected, confine.to_string())),
+        Some(_) => None,
+    }
+}
+
+/// Tenants a listing covers: `None` for every tenant, else only the listed ones.
+type TenantScope<'a> = Option<&'a [String]>;
+
+/// `true` when a document of `doc_tenant` belongs to `scope`.
+fn in_scope(scope: TenantScope<'_>, doc_tenant: Option<&str>) -> bool {
+    scope.is_none_or(|ids| doc_tenant.is_some_and(|t| ids.iter().any(|id| id == t)))
+}
+
+/// One-tenant [`TenantScope`] storage for the `tenant: Option<&str>` entry points.
+fn single_scope(tenant: Option<&str>) -> Option<[String; 1]> {
+    tenant.map(|t| [t.to_string()])
 }
 
 fn infer_stack_resource_kind(
@@ -317,7 +429,14 @@ impl RepoClusterStateProvider {
     pub fn new(repo_workdir: impl Into<PathBuf>) -> Self {
         Self {
             repo_workdir: repo_workdir.into(),
+            tenant_source: None,
         }
+    }
+
+    /// Also lists tenant workloads from each tenant's own repository through `source`.
+    pub fn with_tenant_source(mut self, source: Arc<dyn TenantManifestSource>) -> Self {
+        self.tenant_source = Some(source);
+        self
     }
 
     /// Reads the Stage 0 `bootstrapTarget` (e.g. `kind`, `aws`) from `.keel/config.yaml`, used as
@@ -348,85 +467,135 @@ impl RepoClusterStateProvider {
         }
     }
 
-    fn infer_tenant_from_path(repo_root: &Path, file_path: &Path) -> Option<String> {
-        let rel = file_path.strip_prefix(repo_root).ok()?;
-        let mut comps = rel.components();
-        let first = comps.next()?.as_os_str().to_str()?;
-        if first == "tenants" {
-            let tenant = comps.next()?.as_os_str().to_str()?;
-            return Some(tenant.to_string());
-        }
-        None
-    }
-
-    fn infer_bundle_from_path(repo_root: &Path, file_path: &Path) -> Option<String> {
-        let rel = file_path.strip_prefix(repo_root).ok()?;
-        let mut comps = rel.components();
-        if comps.next()?.as_os_str().to_str()? != "tenants" {
-            return None;
-        }
-        let _tenant = comps.next()?;
-        if comps.next()?.as_os_str().to_str()? != "bundles" {
-            return None;
-        }
-        comps
-            .next()
-            .and_then(|c| c.as_os_str().to_str())
-            .map(str::to_owned)
-    }
-
-    fn infer_bundle_item_from_path(repo_root: &Path, file_path: &Path) -> Option<String> {
-        let rel = file_path.strip_prefix(repo_root).ok()?;
-        let mut comps = rel.components();
-        if comps.next()?.as_os_str().to_str()? != "tenants" {
-            return None;
-        }
-        let _tenant = comps.next()?;
-        if comps.next()?.as_os_str().to_str()? != "bundles" {
-            return None;
-        }
-        let _bundle = comps.next()?;
-        comps
-            .next()
-            .and_then(|c| c.as_os_str().to_str())
-            .map(str::to_owned)
-    }
-}
-
-#[async_trait]
-impl ClusterStateProvider for RepoClusterStateProvider {
-    async fn list_stacks(
-        &self,
-        tenant: Option<&str>,
-        provider: Option<&str>,
-    ) -> Result<Vec<StackSummary>, ServerError> {
+    /// YAML files under `subdirs` of the platform working tree.
+    async fn worktree_tree(&self, subdirs: &[&str]) -> ManifestTree {
         let mut files = Vec::new();
-        Self::collect_yaml_files(&self.repo_workdir.join("tenants"), &mut files);
-        Self::collect_yaml_files(&self.repo_workdir.join("clusters"), &mut files);
-        files.sort();
-
-        let mut stacks = Vec::new();
+        for sub in subdirs {
+            Self::collect_yaml_files(&self.repo_workdir.join(sub), &mut files);
+        }
+        let mut tree = ManifestTree::new();
         for path in files {
-            let Ok(content) = tokio::fs::read_to_string(&path).await else {
+            let Some(rel) = path
+                .strip_prefix(&self.repo_workdir)
+                .ok()
+                .and_then(|r| r.to_str())
+                .map(|r| r.replace('\\', "/"))
+            else {
                 continue;
             };
-            for doc in split_yaml_documents(&content) {
+            if let Ok(content) = tokio::fs::read_to_string(&path).await {
+                tree.insert(rel, content);
+            }
+        }
+        tree
+    }
+
+    /// Tenant ids with a directory under the platform `tenants/` (their stubs).
+    fn platform_tenant_ids(&self) -> Vec<String> {
+        let Ok(entries) = std::fs::read_dir(self.repo_workdir.join("tenants")) else {
+            return Vec::new();
+        };
+        let mut ids: Vec<String> = entries
+            .flatten()
+            .filter(|e| e.path().is_dir())
+            .filter_map(|e| e.file_name().to_str().map(str::to_owned))
+            .filter(|id| {
+                id != MANAGEMENT_TENANT && keel_core::validate_dns_label(id, "tenant").is_ok()
+            })
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    /// The platform working tree (`subdirs`) followed by the tenant repositories (all tenants,
+    /// or only those in `scope`) when tenants have their own repositories. With tenant
+    /// repositories the platform `tenants/` holds only platform-owned stubs, so it is never read
+    /// for tenant workloads (a stray document there is not reconciled by Flux).
+    async fn desired_trees(&self, scope: TenantScope<'_>, subdirs: &[&str]) -> Vec<DesiredTree> {
+        let platform_subdirs: Vec<&str> = subdirs
+            .iter()
+            .copied()
+            .filter(|sub| self.tenant_source.is_none() || *sub != "tenants")
+            .collect();
+        let mut trees = vec![DesiredTree {
+            confine: None,
+            files: Arc::new(self.worktree_tree(&platform_subdirs).await),
+        }];
+        if let Some(source) = &self.tenant_source {
+            let mut ids = self.platform_tenant_ids();
+            if let Some(scope) = scope {
+                ids.retain(|id| scope.contains(id));
+            }
+            if !ids.is_empty() {
+                for (id, files) in source.tenant_manifests(&ids).await {
+                    trees.push(DesiredTree {
+                        confine: Some(id),
+                        files,
+                    });
+                }
+            }
+        }
+        trees
+    }
+
+    fn infer_tenant_from_path(rel: &str) -> Option<String> {
+        let mut comps = rel.split('/');
+        (comps.next()? == "tenants")
+            .then(|| comps.next())
+            .flatten()
+            .map(str::to_owned)
+    }
+
+    /// `(bundle, item)` of a `tenants/<id>/bundles/<bundle>/<item>/...` path.
+    fn infer_bundle_from_path(rel: &str) -> (Option<String>, Option<String>) {
+        let comps: Vec<&str> = rel.split('/').collect();
+        if comps.len() < 4 || comps[0] != "tenants" || comps[2] != "bundles" {
+            return (None, None);
+        }
+        (
+            Some(comps[3].to_string()),
+            comps.get(4).map(|c| (*c).to_string()),
+        )
+    }
+
+    fn stacks_from_tree(
+        &self,
+        tree: &DesiredTree,
+        scope: TenantScope<'_>,
+        provider: Option<&str>,
+        out: &mut Vec<StackSummary>,
+    ) {
+        for rel in sorted_tree_paths(&tree.files) {
+            let content = &tree.files[rel];
+            for doc in split_yaml_documents(content) {
                 let Ok(val) = serde_yml::from_str::<Value>(&doc) else {
                     continue;
                 };
-                if val.get("kind").and_then(Value::as_str) != Some("Stack") {
+                if val.get("kind").and_then(Value::as_str) != Some("Stack")
+                    || is_platform_owned(&val)
+                {
                     continue;
                 }
+                let confined = match tree.confine.as_deref() {
+                    Some(id) => match confine_document(id, &val) {
+                        Some(c) => Some(c),
+                        None => continue,
+                    },
+                    None => None,
+                };
                 let name = val
                     .pointer("/metadata/name")
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_string();
-                let namespace = val
-                    .pointer("/metadata/namespace")
-                    .and_then(Value::as_str)
-                    .unwrap_or("default")
-                    .to_string();
+                let namespace = match &confined {
+                    Some((ns, _)) => ns.clone(),
+                    None => val
+                        .pointer("/metadata/namespace")
+                        .and_then(Value::as_str)
+                        .unwrap_or("default")
+                        .to_string(),
+                };
                 let stack_name = val
                     .pointer("/spec/stack")
                     .and_then(Value::as_str)
@@ -439,29 +608,31 @@ impl ClusterStateProvider for RepoClusterStateProvider {
                 // Same semantics as `keel_pko::PkoStack::is_protected` (`keel.io/protect` label or
                 // `spec.config.protect`), shared with the force-delete guard (`NFR-REL-01`).
                 let protect = keel_kube::is_stack_manifest_protected(&val);
-                let doc_tenant = val
-                    .pointer("/metadata/labels/keel.io~1tenant")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-                    .or_else(|| Self::infer_tenant_from_path(&self.repo_workdir, &path));
+                let doc_tenant = match &confined {
+                    Some((_, id)) => Some(id.clone()),
+                    None => val
+                        .pointer("/metadata/labels/keel.io~1tenant")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                        .or_else(|| Self::infer_tenant_from_path(rel)),
+                };
                 let doc_provider = val
                     .pointer("/metadata/labels/keel.io~1provider")
                     .and_then(Value::as_str)
                     .map(str::to_owned);
+                let (path_bundle, path_item) = Self::infer_bundle_from_path(rel);
                 let doc_bundle = val
                     .pointer("/metadata/labels/keel.io~1bundle")
                     .and_then(Value::as_str)
                     .map(str::to_owned)
-                    .or_else(|| Self::infer_bundle_from_path(&self.repo_workdir, &path));
+                    .or(path_bundle);
                 let doc_bundle_item = val
                     .pointer("/metadata/labels/keel.io~1bundle-item")
                     .and_then(Value::as_str)
                     .map(str::to_owned)
-                    .or_else(|| Self::infer_bundle_item_from_path(&self.repo_workdir, &path));
+                    .or(path_item);
 
-                if let Some(t_filter) = tenant
-                    && doc_tenant.as_deref() != Some(t_filter)
-                {
+                if !in_scope(scope, doc_tenant.as_deref()) {
                     continue;
                 }
                 if let Some(p_filter) = provider
@@ -475,6 +646,13 @@ impl ClusterStateProvider for RepoClusterStateProvider {
                     .and_then(Value::as_str);
                 let stack_type =
                     infer_stack_type(&name, &namespace, doc_provider.as_deref(), label_type);
+                // A tenant repository never declares the management control plane, whatever its
+                // `keel.io/type` label says.
+                if tree.confine.is_some()
+                    && (stack_type == "management" || name == "management-cluster-core")
+                {
+                    continue;
+                }
 
                 let catalog_id = val
                     .pointer("/metadata/labels/keel.io~1catalog-id")
@@ -512,7 +690,7 @@ impl ClusterStateProvider for RepoClusterStateProvider {
                     doc_provider
                 };
 
-                stacks.push(StackSummary {
+                out.push(StackSummary {
                     name,
                     namespace,
                     tenant: doc_tenant,
@@ -531,72 +709,36 @@ impl ClusterStateProvider for RepoClusterStateProvider {
                 });
             }
         }
-
-        if tenant.is_none()
-            && provider.is_none()
-            && !stacks.iter().any(|s| s.name == "management-cluster-core")
-        {
-            stacks.insert(
-                0,
-                StackSummary {
-                    name: "management-cluster-core".to_string(),
-                    namespace: "flux-system".to_string(),
-                    tenant: Some(MANAGEMENT_TENANT.to_string()),
-                    stack: "keel/management/core".to_string(),
-                    provider: self.bootstrap_target(),
-                    stack_type: "management".to_string(),
-                    preview: false,
-                    protect: true,
-                    resource_kind: Some(InfraResourceKind::Cluster),
-                    catalog_id: None,
-                    bundle: None,
-                    bundle_item: None,
-                    resource_count: None,
-                    last_synced: None,
-                    status: "Pending".to_string(),
-                },
-            );
-        }
-
-        Ok(stacks)
     }
 
-    async fn list_releases(
-        &self,
-        tenant: Option<&str>,
-    ) -> Result<Vec<ReleaseSummary>, ServerError> {
-        let mut files = Vec::new();
-        let tenants_root = self.repo_workdir.join("tenants");
-        Self::collect_yaml_files(&tenants_root, &mut files);
-        files.sort();
-
+    fn releases_from_tree(
+        tree: &DesiredTree,
+        scope: TenantScope<'_>,
+        out: &mut Vec<ReleaseSummary>,
+    ) {
+        let files = &tree.files;
         // Cache item-level kustomization.yaml resource allowlists so stale unreferenced
         // manifests (e.g. a leftover helmrelease.yaml beside helmrelease-canary.yaml) are ignored.
-        let mut kustomize_allowlists: HashMap<PathBuf, Option<std::collections::HashSet<String>>> =
+        let mut kustomize_allowlists: HashMap<String, Option<std::collections::HashSet<String>>> =
             HashMap::new();
 
-        let mut releases = Vec::new();
-        for path in files {
-            let fname = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            let has_manifests_yaml = path
-                .parent()
-                .is_some_and(|p| p.join("manifests.yaml").is_file());
-            let has_stack_yaml = path
-                .parent()
-                .is_some_and(|p| p.join("stack.yaml").is_file());
+        for rel in sorted_tree_paths(files) {
+            if !rel.starts_with("tenants/") {
+                continue;
+            }
+            let parent = rel_parent(rel);
+            let fname = rel.rsplit('/').next().unwrap_or("");
+            let has_manifests_yaml = files.contains_key(&format!("{parent}/manifests.yaml"));
+            let has_stack_yaml = files.contains_key(&format!("{parent}/stack.yaml"));
             if fname == "flux-kustomization.yaml" && (!has_manifests_yaml || has_stack_yaml) {
                 continue;
             }
-            if let Some(parent) = path.parent()
-                && parent != tenants_root.as_path()
-                && fname != "flux-kustomization.yaml"
-            {
+            if parent != "tenants" && fname != "flux-kustomization.yaml" {
                 let allowed = kustomize_allowlists
-                    .entry(parent.to_path_buf())
+                    .entry(parent.to_string())
                     .or_insert_with(|| {
-                        let k_path = parent.join("kustomization.yaml");
-                        let raw = std::fs::read_to_string(k_path).ok()?;
-                        let doc = serde_yml::from_str::<Value>(&raw).ok()?;
+                        let raw = files.get(&format!("{parent}/kustomization.yaml"))?;
+                        let doc = serde_yml::from_str::<Value>(raw).ok()?;
                         let arr = doc.get("resources")?.as_array()?;
                         Some(
                             arr.iter()
@@ -613,10 +755,8 @@ impl ClusterStateProvider for RepoClusterStateProvider {
                     continue;
                 }
             }
-            let Ok(content) = tokio::fs::read_to_string(&path).await else {
-                continue;
-            };
-            for doc in split_yaml_documents(&content) {
+            let content = &files[rel];
+            for doc in split_yaml_documents(content) {
                 let Ok(val) = serde_yml::from_str::<Value>(&doc) else {
                     continue;
                 };
@@ -631,7 +771,7 @@ impl ClusterStateProvider for RepoClusterStateProvider {
                         && api_version.starts_with("kustomize.toolkit.fluxcd.io/"))
                     || kind == "Canary"
                     || is_manifest_pulumi_stack;
-                if !is_flux_release {
+                if !is_flux_release || is_platform_owned(&val) {
                     continue;
                 }
                 // `<instance>-config` Kustomizations (SOPS secrets of an app) are part of the
@@ -643,6 +783,13 @@ impl ClusterStateProvider for RepoClusterStateProvider {
                 {
                     continue;
                 }
+                let confined = match tree.confine.as_deref() {
+                    Some(id) => match confine_document(id, &val) {
+                        Some(c) => Some(c),
+                        None => continue,
+                    },
+                    None => None,
+                };
                 let name = val
                     .pointer("/metadata/name")
                     .and_then(Value::as_str)
@@ -652,20 +799,24 @@ impl ClusterStateProvider for RepoClusterStateProvider {
                 if name.is_empty() {
                     continue;
                 }
-                let namespace = val
-                    .pointer("/metadata/namespace")
-                    .and_then(Value::as_str)
-                    .unwrap_or("default")
-                    .to_string();
-                let doc_tenant = val
-                    .pointer("/metadata/labels/keel.io~1tenant")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-                    .or_else(|| Self::infer_tenant_from_path(&self.repo_workdir, &path));
+                let namespace = match &confined {
+                    Some((ns, _)) => ns.clone(),
+                    None => val
+                        .pointer("/metadata/namespace")
+                        .and_then(Value::as_str)
+                        .unwrap_or("default")
+                        .to_string(),
+                };
+                let doc_tenant = match &confined {
+                    Some((_, id)) => Some(id.clone()),
+                    None => val
+                        .pointer("/metadata/labels/keel.io~1tenant")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                        .or_else(|| Self::infer_tenant_from_path(rel)),
+                };
 
-                if let Some(t_filter) = tenant
-                    && doc_tenant.as_deref() != Some(t_filter)
-                {
+                if !in_scope(scope, doc_tenant.as_deref()) {
                     continue;
                 }
 
@@ -696,18 +847,19 @@ impl ClusterStateProvider for RepoClusterStateProvider {
                     .pointer("/spec/kubeConfig/secretRef/name")
                     .and_then(Value::as_str)
                     .map(str::to_owned);
+                let (path_bundle, path_item) = Self::infer_bundle_from_path(rel);
                 let doc_bundle = val
                     .pointer("/metadata/labels/keel.io~1bundle")
                     .and_then(Value::as_str)
                     .map(str::to_owned)
-                    .or_else(|| Self::infer_bundle_from_path(&self.repo_workdir, &path));
+                    .or(path_bundle);
                 let doc_bundle_item = val
                     .pointer("/metadata/labels/keel.io~1bundle-item")
                     .and_then(Value::as_str)
                     .map(str::to_owned)
-                    .or_else(|| Self::infer_bundle_item_from_path(&self.repo_workdir, &path));
+                    .or(path_item);
 
-                releases.push(ReleaseSummary {
+                out.push(ReleaseSummary {
                     name,
                     namespace,
                     tenant: doc_tenant,
@@ -728,6 +880,59 @@ impl ClusterStateProvider for RepoClusterStateProvider {
                     ..ReleaseSummary::default()
                 });
             }
+        }
+    }
+}
+
+impl RepoClusterStateProvider {
+    async fn stacks_in(
+        &self,
+        scope: TenantScope<'_>,
+        provider: Option<&str>,
+    ) -> Result<Vec<StackSummary>, ServerError> {
+        let mut stacks = Vec::new();
+        for tree in self.desired_trees(scope, &["tenants", "clusters"]).await {
+            self.stacks_from_tree(&tree, scope, provider, &mut stacks);
+        }
+
+        if scope.is_none()
+            && provider.is_none()
+            && !stacks
+                .iter()
+                .any(|s| s.namespace == "flux-system" && s.name == "management-cluster-core")
+        {
+            stacks.insert(
+                0,
+                StackSummary {
+                    name: "management-cluster-core".to_string(),
+                    namespace: "flux-system".to_string(),
+                    tenant: Some(MANAGEMENT_TENANT.to_string()),
+                    stack: "keel/management/core".to_string(),
+                    provider: self.bootstrap_target(),
+                    stack_type: "management".to_string(),
+                    preview: false,
+                    protect: true,
+                    resource_kind: Some(InfraResourceKind::Cluster),
+                    catalog_id: None,
+                    bundle: None,
+                    bundle_item: None,
+                    resource_count: None,
+                    last_synced: None,
+                    status: "Pending".to_string(),
+                },
+            );
+        }
+
+        Ok(stacks)
+    }
+
+    async fn releases_in(
+        &self,
+        scope: TenantScope<'_>,
+    ) -> Result<Vec<ReleaseSummary>, ServerError> {
+        let mut releases = Vec::new();
+        for tree in self.desired_trees(scope, &["tenants"]).await {
+            Self::releases_from_tree(&tree, scope, &mut releases);
         }
 
         // Deduplicate paired HelmRelease + Canary (and any duplicate (namespace, name) manifests)
@@ -753,6 +958,42 @@ impl ClusterStateProvider for RepoClusterStateProvider {
         releases.retain(|r| seen.insert((r.namespace.clone(), r.name.clone())));
 
         Ok(releases)
+    }
+}
+
+#[async_trait]
+impl ClusterStateProvider for RepoClusterStateProvider {
+    async fn list_stacks(
+        &self,
+        tenant: Option<&str>,
+        provider: Option<&str>,
+    ) -> Result<Vec<StackSummary>, ServerError> {
+        let one = single_scope(tenant);
+        self.stacks_in(one.as_ref().map(|a| a.as_slice()), provider)
+            .await
+    }
+
+    async fn list_releases(
+        &self,
+        tenant: Option<&str>,
+    ) -> Result<Vec<ReleaseSummary>, ServerError> {
+        let one = single_scope(tenant);
+        self.releases_in(one.as_ref().map(|a| a.as_slice())).await
+    }
+
+    async fn list_stacks_for_tenants(
+        &self,
+        tenants: &[String],
+        provider: Option<&str>,
+    ) -> Result<Vec<StackSummary>, ServerError> {
+        self.stacks_in(Some(tenants), provider).await
+    }
+
+    async fn list_releases_for_tenants(
+        &self,
+        tenants: &[String],
+    ) -> Result<Vec<ReleaseSummary>, ServerError> {
+        self.releases_in(Some(tenants)).await
     }
 
     async fn list_management_addon_releases(&self) -> Result<Vec<ReleaseSummary>, ServerError> {
@@ -789,14 +1030,13 @@ impl KubeClusterStateProvider {
     }
 }
 
-#[async_trait]
-impl ClusterStateProvider for KubeClusterStateProvider {
-    async fn list_stacks(
+impl KubeClusterStateProvider {
+    async fn stacks_in(
         &self,
-        tenant: Option<&str>,
+        scope: TenantScope<'_>,
         provider: Option<&str>,
     ) -> Result<Vec<StackSummary>, ServerError> {
-        let mut stacks = self.repo.list_stacks(tenant, provider).await?;
+        let mut stacks = self.repo.stacks_in(scope, provider).await?;
         let live = self.live.stack_status_details().await;
         for stack in &mut stacks {
             let is_management = stack.stack_type == "management";
@@ -834,13 +1074,10 @@ impl ClusterStateProvider for KubeClusterStateProvider {
             if !ns.starts_with("tenant-") {
                 continue;
             }
-            let inferred_tenant = info
-                .tenant
-                .as_deref()
-                .or_else(|| ns.strip_prefix("tenant-"));
-            if let Some(t_filter) = tenant
-                && inferred_tenant != Some(t_filter)
-            {
+            // The namespace decides the tenant: a `keel.io/tenant` label on a live object is
+            // tenant-controlled and must never list it under another tenant.
+            let inferred_tenant = ns.strip_prefix("tenant-");
+            if !in_scope(scope, inferred_tenant) {
                 continue;
             }
             if let Some(p_filter) = provider
@@ -886,16 +1123,12 @@ impl ClusterStateProvider for KubeClusterStateProvider {
         Ok(stacks)
     }
 
-    async fn list_releases(
+    async fn releases_in(
         &self,
-        tenant: Option<&str>,
+        scope: TenantScope<'_>,
     ) -> Result<Vec<ReleaseSummary>, ServerError> {
-        let mut releases = self.repo.list_releases(tenant).await?;
-        let known_stacks = self
-            .repo
-            .list_stacks(tenant, None)
-            .await
-            .unwrap_or_default();
+        let mut releases = self.repo.releases_in(scope).await?;
+        let known_stacks = self.repo.stacks_in(scope, None).await.unwrap_or_default();
 
         let live_stacks = self.live.stack_statuses().await;
         let live = self.live.release_status_details().await;
@@ -927,9 +1160,11 @@ impl ClusterStateProvider for KubeClusterStateProvider {
                 continue;
             }
             let inferred_tenant = ns.strip_prefix("tenant-");
-            if let Some(t_filter) = tenant
-                && inferred_tenant != Some(t_filter)
-            {
+            if !in_scope(scope, inferred_tenant) {
+                continue;
+            }
+            // The platform-owned root Kustomization of a tenant repository is not a release.
+            if name == keel_kube::TENANT_ROOT_KUSTOMIZATION_NAME {
                 continue;
             }
             if live_stacks.contains_key(&(ns.clone(), name.clone()))
@@ -966,6 +1201,42 @@ impl ClusterStateProvider for KubeClusterStateProvider {
             }
         }
         Ok(releases)
+    }
+}
+
+#[async_trait]
+impl ClusterStateProvider for KubeClusterStateProvider {
+    async fn list_stacks(
+        &self,
+        tenant: Option<&str>,
+        provider: Option<&str>,
+    ) -> Result<Vec<StackSummary>, ServerError> {
+        let one = single_scope(tenant);
+        self.stacks_in(one.as_ref().map(|a| a.as_slice()), provider)
+            .await
+    }
+
+    async fn list_releases(
+        &self,
+        tenant: Option<&str>,
+    ) -> Result<Vec<ReleaseSummary>, ServerError> {
+        let one = single_scope(tenant);
+        self.releases_in(one.as_ref().map(|a| a.as_slice())).await
+    }
+
+    async fn list_stacks_for_tenants(
+        &self,
+        tenants: &[String],
+        provider: Option<&str>,
+    ) -> Result<Vec<StackSummary>, ServerError> {
+        self.stacks_in(Some(tenants), provider).await
+    }
+
+    async fn list_releases_for_tenants(
+        &self,
+        tenants: &[String],
+    ) -> Result<Vec<ReleaseSummary>, ServerError> {
+        self.releases_in(Some(tenants)).await
     }
 
     async fn list_management_addon_releases(&self) -> Result<Vec<ReleaseSummary>, ServerError> {
@@ -1698,6 +1969,217 @@ mod tests {
         info.protected = protected;
         info.resource_count = Some(7);
         info
+    }
+
+    /// Fixed tenant trees (paths relative to the repository root).
+    struct FixedTenantSource(Vec<(String, Vec<(String, String)>)>);
+
+    #[async_trait]
+    impl TenantManifestSource for FixedTenantSource {
+        async fn tenant_manifests(&self, tenants: &[String]) -> Vec<(String, Arc<ManifestTree>)> {
+            self.0
+                .iter()
+                .filter(|(t, _)| tenants.contains(t))
+                .map(|(t, files)| (t.clone(), Arc::new(files.iter().cloned().collect())))
+                .collect()
+        }
+    }
+
+    #[tokio::test]
+    async fn tenant_repository_content_is_confined_to_its_tenant() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Platform: the stubs (with the platform-owned root Kustomization) of acme and beta.
+        for t in ["acme", "beta"] {
+            let dir = tmp.path().join(format!("tenants/{t}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("sync.yaml"),
+                serde_yml::to_string(&keel_kube::build_tenant_root_kustomization(t).unwrap())
+                    .unwrap(),
+            )
+            .unwrap();
+        }
+        let hr = |name: &str, ns: &str, labels: &str| {
+            format!(
+                "apiVersion: helm.toolkit.fluxcd.io/v2\nkind: HelmRelease\nmetadata:\n  name: {name}\n  namespace: {ns}\n  labels:\n    x: y\n{labels}spec:\n  chart:\n    spec:\n      chart: c\n"
+            )
+        };
+        let st = |name: &str, ns: Option<&str>, labels: &str| {
+            let ns = ns
+                .map(|n| format!("  namespace: {n}\n"))
+                .unwrap_or_default();
+            format!(
+                "apiVersion: pulumi.com/v1\nkind: Stack\nmetadata:\n  name: {name}\n{ns}  labels:\n    x: y\n{labels}spec:\n  stack: {name}\n"
+            )
+        };
+        let source = FixedTenantSource(vec![
+            (
+                "acme".to_string(),
+                vec![
+                    (
+                        "tenants/acme/apps/web/helmrelease.yaml".into(),
+                        hr("web", "tenant-acme", ""),
+                    ),
+                    // Into beta's namespace: dropped.
+                    (
+                        "tenants/acme/apps/x/helmrelease.yaml".into(),
+                        hr("x", "tenant-beta", ""),
+                    ),
+                    // Labelled as beta's: still acme's.
+                    (
+                        "tenants/acme/infra/vm/stack.yaml".into(),
+                        st("vm", Some("tenant-acme"), "    keel.io/tenant: beta\n"),
+                    ),
+                    // No namespace: the root Kustomization's `targetNamespace`.
+                    (
+                        "tenants/acme/infra/bare/stack.yaml".into(),
+                        st("bare", None, ""),
+                    ),
+                    // A tenant repository never declares the management plane.
+                    (
+                        "tenants/acme/infra/mgmt/stack.yaml".into(),
+                        st(
+                            "management-cluster-core",
+                            Some("tenant-acme"),
+                            "    keel.io/type: management\n",
+                        ),
+                    ),
+                    // ... not even disguised as a workload (would hide the real one).
+                    (
+                        "tenants/acme/infra/mgmt2/stack.yaml".into(),
+                        st(
+                            "management-cluster-core",
+                            Some("tenant-acme"),
+                            "    keel.io/type: workload\n",
+                        ),
+                    ),
+                ],
+            ),
+            (
+                "beta".to_string(),
+                vec![(
+                    "tenants/beta/apps/api/helmrelease.yaml".into(),
+                    hr("api", "tenant-beta", ""),
+                )],
+            ),
+            // Not a platform tenant: never requested.
+            (
+                "ghost".to_string(),
+                vec![(
+                    "tenants/ghost/apps/g/helmrelease.yaml".into(),
+                    hr("g", "tenant-ghost", ""),
+                )],
+            ),
+        ]);
+        // A stray workload document in the platform repository's `tenants/` is never reconciled
+        // (the platform applies only the stubs): not listed.
+        let stray = tmp.path().join("tenants/acme/apps/stray");
+        std::fs::create_dir_all(&stray).unwrap();
+        std::fs::write(
+            stray.join("helmrelease.yaml"),
+            hr("stray", "tenant-acme", ""),
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("tenants/acme/stack.yaml"),
+            st("stray-stack", Some("tenant-acme"), ""),
+        )
+        .unwrap();
+        let provider =
+            RepoClusterStateProvider::new(tmp.path()).with_tenant_source(Arc::new(source));
+
+        // The management stack stays listed (from the platform) for cluster administrators.
+        let all_stacks = provider.list_stacks(None, None).await.unwrap();
+        assert!(
+            all_stacks
+                .iter()
+                .any(|s| s.namespace == "flux-system" && s.name == "management-cluster-core"),
+            "{all_stacks:?}"
+        );
+        assert!(
+            !all_stacks
+                .iter()
+                .any(|s| s.name == "management-cluster-core" && s.namespace != "flux-system"),
+            "{all_stacks:?}"
+        );
+        assert!(!all_stacks.iter().any(|s| s.name == "stray-stack"));
+
+        // Several tenants at once (a member of both).
+        let both = ["acme".to_string(), "beta".to_string()];
+        let mut both_releases: Vec<String> = provider
+            .list_releases_for_tenants(&both)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.name)
+            .collect();
+        both_releases.sort();
+        assert_eq!(both_releases, vec!["api", "web"]);
+        assert_eq!(
+            provider
+                .list_releases_for_tenants(&both[1..])
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let releases = provider.list_releases(None).await.unwrap();
+        let mut keys: Vec<(String, String, Option<String>)> = releases
+            .iter()
+            .map(|r| (r.namespace.clone(), r.name.clone(), r.tenant.clone()))
+            .collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                ("tenant-acme".into(), "web".into(), Some("acme".into())),
+                ("tenant-beta".into(), "api".into(), Some("beta".into())),
+            ]
+        );
+        let beta = provider.list_releases(Some("beta")).await.unwrap();
+        assert_eq!(beta.len(), 1);
+        assert_eq!(beta[0].name, "api");
+
+        let stacks = provider.list_stacks(Some("beta"), None).await.unwrap();
+        assert!(stacks.is_empty(), "{stacks:?}");
+        let mut acme: Vec<(String, String)> = provider
+            .list_stacks(Some("acme"), None)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|s| (s.namespace, s.name))
+            .collect();
+        acme.sort();
+        assert_eq!(
+            acme,
+            vec![
+                ("tenant-acme".into(), "bare".into()),
+                ("tenant-acme".into(), "vm".into()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn live_objects_are_listed_by_namespace_never_by_label() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut info = live_info(LiveResourceStatus::Synced, Some("aws"), false, false);
+        info.tenant = Some("acme".to_string());
+        let stacks = HashMap::from([(("tenant-beta".to_string(), "spoof".to_string()), info)]);
+        let provider = KubeClusterStateProvider::new(
+            RepoClusterStateProvider::new(tmp.path()),
+            Arc::new(DetailLiveStatus { stacks }),
+        );
+        assert!(
+            provider
+                .list_stacks(Some("acme"), None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let beta = provider.list_stacks(Some("beta"), None).await.unwrap();
+        assert_eq!(beta.len(), 1);
+        assert_eq!(beta[0].tenant.as_deref(), Some("beta"));
     }
 
     #[tokio::test]

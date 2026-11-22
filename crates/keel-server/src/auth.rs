@@ -174,6 +174,11 @@ impl AuthSession {
         if self.is_admin() {
             return true;
         }
+        // The management pseudo-tenant is the control plane itself: no IdP group named after it
+        // (`tenant-management`, `tenant-management-admin`) grants anything.
+        if tenant_id == crate::state::MANAGEMENT_TENANT {
+            return false;
+        }
         let prefixed = format!("{TENANT_GROUP_PREFIX}{tenant_id}-admin");
         self.claims.groups.iter().any(|g| g == &prefixed)
     }
@@ -183,8 +188,30 @@ impl AuthSession {
         self.claims.groups.iter().any(|g| {
             g.strip_prefix(TENANT_GROUP_PREFIX)
                 .and_then(|rest| rest.strip_suffix("-admin"))
-                .is_some_and(|id| !id.is_empty())
+                .is_some_and(|id| !id.is_empty() && id != crate::state::MANAGEMENT_TENANT)
         })
+    }
+
+    /// Tenant ids named by the caller's tenant groups (`tenant-<id>` member, `tenant-<id>-admin`
+    /// admin), sorted and deduplicated. Says nothing about cluster administrators (who see every
+    /// tenant) and does not check that the tenants exist.
+    pub fn tenant_group_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self
+            .claims
+            .groups
+            .iter()
+            .filter_map(|g| g.strip_prefix(TENANT_GROUP_PREFIX))
+            .map(|rest| rest.strip_suffix("-admin").unwrap_or(rest))
+            .filter(|id| {
+                *id != crate::state::MANAGEMENT_TENANT
+                    && keel_core::validate_dns_label(id, "tenant").is_ok()
+            })
+            .filter(|id| self.require_tenant_access(id).is_ok())
+            .map(str::to_string)
+            .collect();
+        ids.sort();
+        ids.dedup();
+        ids
     }
 
     /// Enforces tenant-scoped admin privileges for `tenant_id`, returning `403 Forbidden` otherwise.
@@ -204,7 +231,9 @@ impl AuthSession {
             return Ok(());
         }
         let prefixed = format!("{TENANT_GROUP_PREFIX}{tenant_id}");
-        if self.claims.groups.iter().any(|g| g == &prefixed) {
+        if tenant_id != crate::state::MANAGEMENT_TENANT
+            && self.claims.groups.iter().any(|g| g == &prefixed)
+        {
             Ok(())
         } else {
             Err(ServerError::Forbidden(format!(
@@ -1564,6 +1593,47 @@ mod tests {
         assert_eq!(decoded, admin.claims);
         assert!(decrypt_session_token(&key, "!!!not-base64!!!").is_err());
         assert!(decrypt_session_token(&[8u8; 32], &token).is_err());
+    }
+
+    #[test]
+    fn tenant_groups_name_tenants_and_never_the_management_plane() {
+        let session = |groups: &[&str]| AuthSession {
+            claims: SessionClaims {
+                sub: "u".to_string(),
+                email: None,
+                name: None,
+                groups: groups.iter().map(|g| g.to_string()).collect(),
+                auth_phase: AuthPhase::OidcActive,
+                exp: Utc::now().timestamp() + 3600,
+            },
+        };
+        let user = session(&[
+            "tenant-acme",
+            "tenant-beta-admin",
+            "tenant-acme-admin",
+            "tenant-management",
+            "tenant-management-admin",
+            "tenant-Bad_Id",
+            "developers",
+        ]);
+        assert_eq!(user.tenant_group_ids(), vec!["acme", "beta"]);
+        // An IdP group named after the management pseudo-tenant grants nothing.
+        let mgmt = session(&["tenant-management", "tenant-management-admin"]);
+        assert!(
+            mgmt.require_tenant_access(crate::state::MANAGEMENT_TENANT)
+                .is_err()
+        );
+        assert!(!mgmt.is_tenant_admin(crate::state::MANAGEMENT_TENANT));
+        assert!(!mgmt.is_any_tenant_admin());
+        assert!(mgmt.tenant_group_ids().is_empty());
+        // Cluster administrators keep the management plane.
+        let admin = session(&["keel-admins"]);
+        assert!(
+            admin
+                .require_tenant_access(crate::state::MANAGEMENT_TENANT)
+                .is_ok()
+        );
+        assert!(admin.tenant_group_ids().is_empty());
     }
 
     #[test]
