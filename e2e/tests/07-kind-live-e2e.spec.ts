@@ -962,7 +962,7 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
     });
   });
 
-  test('07.1 - CLI standalone app on mgmt -> GUI bundle workload kind cluster -> GUI standalone canary app on workload cluster', async ({
+  test('07.1 - CLI standalone canary app on mgmt -> GUI bundle workload kind cluster -> GUI standalone canary app on workload cluster', async ({
     page,
   }) => {
     if (RECORD_DEMO) {
@@ -1010,8 +1010,11 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
       }
     });
 
-    await test.step('2. CLI: Deploy standalone podinfo on management cluster', async () => {
-      logStep('Running `keel app install` for podinfo on management cluster...');
+    await test.step('2. CLI: Deploy standalone canary podinfo on management cluster', async () => {
+      // `--canary` on the management cluster: `tenant-default-sa` applies the Flagger Canary
+      // through `keel-tenant-flagger-canaries` (aggregated into `admin`), and the Canary passes
+      // the `restrict-tenant-flagger-canaries` Kyverno policy.
+      logStep('Running `keel app install --canary` for podinfo on management cluster...');
       const valuesPath = path.join(os.tmpdir(), 'keel-e2e-mgmt-podinfo.yaml');
       fs.writeFileSync(
         valuesPath,
@@ -1043,6 +1046,7 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
           'default',
           '--values-file',
           valuesPath,
+          '--canary',
           '--server',
           BASE_URL,
         ],
@@ -1317,6 +1321,25 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
         waitForNamespace('tenant-acme', 120_000),
         waitForK8sReady('stack', `${WORKLOAD_CLUSTER}-cluster`, 'tenant-default', 480_000),
       ]);
+      // The tenant root Kustomization applies the canary app's Canary as tenant-default-sa; a
+      // missing Flagger RBAC grant fails the whole tree (`canaries.flagger.app ... forbidden`).
+      await waitForK8sReady('kustomization', 'keel-tenant-root', 'tenant-default', 180_000);
+      await expect
+        .poll(
+          () =>
+            tryCmd('kubectl', [
+              'get',
+              'canaries.flagger.app',
+              'podinfo',
+              '-n',
+              'tenant-default',
+              '-o',
+              'jsonpath={.status.phase}',
+            ]).stdout.trim(),
+          { timeout: 300_000, intervals: [5_000] },
+        )
+        .toMatch(/^(Initialized|Succeeded)$/);
+      logStep('Management-cluster canary podinfo: keel-tenant-root Ready, Canary initialized');
       await Promise.all([
         waitForK8sReady('stack', `${WORKLOAD_CLUSTER}-canary-config`, 'tenant-default', 300_000),
         waitForK8sReady('helmrelease', `${WORKLOAD_CLUSTER}-flagger`, 'tenant-default', 300_000),
@@ -2439,6 +2462,98 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
       const ok = dryRunApply(admin, hr(`${tenantNs}-sa`));
       expect(ok.ok, `HelmRelease with the tenant SA (dry run) must pass: ${ok.out}`).toBe(true);
       logStep(`${tenantNs} HelmReleases: missing/foreign SA denied, ${tenantNs}-sa admitted`);
+    });
+
+    await test.step('6. Tenant SA manages Flagger Canaries; Kyverno admits only the Keel-generated shape', async () => {
+      const canI = (verb: string, resource: string) =>
+        tryCmd('kubectl', [
+          'auth',
+          'can-i',
+          verb,
+          resource,
+          '-n',
+          tenantNs,
+          `--as=${tenantSa}`,
+        ]).stdout.trim();
+      expect(canI('patch', 'canaries.flagger.app'), `${tenantSa} patches Canaries`).toBe('yes');
+      expect(canI('create', 'metrictemplates.flagger.app'), 'no tenant MetricTemplates').toBe('no');
+      expect(canI('create', 'alertproviders.flagger.app'), 'no tenant AlertProviders').toBe('no');
+      expect(
+        policyExists('restrict-tenant-flagger-canaries'),
+        'restrict-tenant-flagger-canaries must exist',
+      ).toBe(true);
+      // Mirrors `keel_kube::synthesize_flagger_canary`; `analysisExtra` lines are appended to
+      // `spec.analysis`.
+      const canary = (
+        opts: {
+          gatewayNs?: string;
+          templateNs?: string;
+          query?: boolean;
+          analysisExtra?: string[];
+        } = {},
+      ) => [
+        'apiVersion: flagger.app/v1beta1',
+        'kind: Canary',
+        'metadata:',
+        '  name: keel-e2e-probe',
+        `  namespace: ${tenantNs}`,
+        'spec:',
+        '  provider: gatewayapi:v1',
+        '  targetRef:',
+        '    apiVersion: apps/v1',
+        '    kind: Deployment',
+        '    name: keel-e2e-probe',
+        '  service:',
+        '    port: 9898',
+        '    targetPort: 9898',
+        '    gatewayRefs:',
+        '      - name: keel-ingress',
+        `        namespace: ${opts.gatewayNs ?? 'keel-system'}`,
+        '        group: gateway.networking.k8s.io',
+        '        kind: Gateway',
+        '  analysis:',
+        '    interval: 30s',
+        '    threshold: 5',
+        '    maxWeight: 50',
+        '    stepWeight: 10',
+        '    metrics:',
+        '      - name: envoy-request-success-rate',
+        '        templateRef:',
+        '          name: envoy-gateway-request-success-rate',
+        `          namespace: ${opts.templateNs ?? 'keel-system'}`,
+        ...(opts.query ? ['        query: up'] : []),
+        '        thresholdRange:',
+        '          min: 99',
+        '        interval: 2m',
+        ...(opts.analysisExtra ?? []),
+      ];
+      const canaryDenied = /restrict-tenant-flagger-canaries|Tenant Flagger Canar/;
+      const ok = dryRunApply([`--as=${tenantSa}`], canary());
+      expect(ok.ok, `Keel-shaped Canary (dry run) must pass: ${ok.out}`).toBe(true);
+      const bad: Array<[string, string[]]> = [
+        [
+          'webhook',
+          canary({
+            analysisExtra: [
+              '    webhooks:',
+              '      - name: probe',
+              '        type: pre-rollout',
+              '        url: http://keel-server.keel-system:8080/',
+            ],
+          }),
+        ],
+        ['inline query', canary({ query: true })],
+        ['foreign templateRef', canary({ templateNs: 'tenant-default' })],
+        ['foreign gateway', canary({ gatewayNs: 'tenant-default' })],
+      ];
+      for (const [name, manifest] of bad) {
+        const res = dryRunApply([`--as=${tenantSa}`], manifest);
+        expect(res.ok, `${name} Canary (dry run) must be denied: ${res.out}`).toBe(false);
+        expect(res.out, name).toMatch(canaryDenied);
+      }
+      logStep(
+        `${tenantNs} Canaries: tenant SA admitted for the Keel shape; webhook, inline query, foreign template and gateway denied`,
+      );
     });
   });
 

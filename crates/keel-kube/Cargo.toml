@@ -32,4 +32,6 @@ tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+# CEL interpreter: evaluates the generated Kyverno `ValidatingPolicy` expressions in unit tests.
+cel = { version = "0.16", default-features = false }
 tower = { version = "0.5", features = ["util"] }

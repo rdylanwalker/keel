@@ -873,6 +873,13 @@ pub fn synthesize_helm_release_yaml(input: &HelmReleaseSpecInput) -> Result<Stri
     Ok(keel_core::yaml::to_string(&manifest)?)
 }
 
+/// Name of the shared platform Gateway (`keel-system/keel-ingress`) that tenant routes and
+/// Flagger `Canary`s attach to.
+pub const KEEL_INGRESS_GATEWAY_NAME: &str = "keel-ingress";
+
+/// Flagger mesh provider of every Keel `Canary` (Envoy Gateway through the Gateway API).
+pub const FLAGGER_CANARY_PROVIDER: &str = "gatewayapi:v1";
+
 /// Input specification for synthesizing a Flagger `Canary` (`flagger.app/v1beta1`) targeting
 /// Envoy Gateway (`gatewayapi:v1`) and Prometheus (`SDD.md` §5.2, `NFR-REL-03`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -894,8 +901,8 @@ impl FlaggerCanarySpecInput {
             release_name: release_name.into(),
             target_deployment_name: None,
             service_port: 80,
-            gateway_name: "keel-ingress".to_string(),
-            gateway_namespace: "keel-system".to_string(),
+            gateway_name: KEEL_INGRESS_GATEWAY_NAME.to_string(),
+            gateway_namespace: keel_core::KEEL_SYSTEM_NAMESPACE.to_string(),
             hosts: Vec::new(),
             extra_labels: BTreeMap::new(),
         }
@@ -958,7 +965,7 @@ pub fn synthesize_flagger_canary(input: &FlaggerCanarySpecInput) -> Result<Value
             "labels": labels,
         },
         "spec": {
-            "provider": "gatewayapi:v1",
+            "provider": FLAGGER_CANARY_PROVIDER,
             "targetRef": {
                 "apiVersion": "apps/v1",
                 "kind": "Deployment",
@@ -1886,12 +1893,51 @@ pub fn build_tenant_gateway_routes_cluster_role() -> Value {
     })
 }
 
-/// Serializes `build_tenant_reconciler_rbac` plus
-/// `build_tenant_gateway_routes_cluster_role` into multi-document YAML.
+/// Name of the `ClusterRole` aggregated into `ClusterRole/admin` that lets tenant
+/// `ServiceAccount`s (bound to `admin` in `tenant-<id>`) manage Flagger `Canary` objects.
+pub const TENANT_FLAGGER_CANARIES_CLUSTER_ROLE: &str = "keel-tenant-flagger-canaries";
+
+/// Synthesizes `ClusterRole/keel-tenant-flagger-canaries`, aggregated into the built-in
+/// `ClusterRole/admin` (`rbac.authorization.k8s.io/aggregate-to-admin`).
+///
+/// The Flagger chart does not aggregate its CRDs into `admin`, so without it a tenant Flux
+/// `Kustomization` (impersonating `tenant-<id>-sa`) cannot apply the `Canary` Keel synthesizes for
+/// a canary app (`synthesize_flagger_canary`), and the whole tenant root `Kustomization` fails.
+/// Only `canaries` are granted: the synthesized `Canary` references the platform-owned
+/// `MetricTemplate`s in `keel-system`, so tenants never need `metrictemplates` (which carry an
+/// arbitrary metrics-provider address Flagger would query) or `alertproviders`. The `Canary`
+/// spec itself can still steer Flagger (webhooks, inline queries, foreign templates or
+/// Gateways), so the Kyverno `restrict-tenant-flagger-canaries` policy
+/// (`crate::kyverno::build_restrict_tenant_flagger_canaries_policy`) admits only the shape
+/// `synthesize_flagger_canary` produces.
+pub fn build_tenant_flagger_canaries_cluster_role() -> Value {
+    json!({
+        "apiVersion": "rbac.authorization.k8s.io/v1",
+        "kind": "ClusterRole",
+        "metadata": {
+            "name": TENANT_FLAGGER_CANARIES_CLUSTER_ROLE,
+            "labels": {
+                "app.kubernetes.io/managed-by": "keel",
+                "app.kubernetes.io/part-of": "keel-control-plane",
+                "rbac.authorization.k8s.io/aggregate-to-admin": "true"
+            }
+        },
+        "rules": [{
+            "apiGroups": ["flagger.app"],
+            "resources": ["canaries"],
+            "verbs": ["get", "list", "watch", "create", "update", "patch", "delete"]
+        }]
+    })
+}
+
+/// Serializes `build_tenant_reconciler_rbac` plus the `admin`-aggregated tenant roles
+/// (`build_tenant_gateway_routes_cluster_role`, `build_tenant_flagger_canaries_cluster_role`)
+/// into multi-document YAML.
 pub fn build_tenant_reconciler_rbac_yaml() -> Result<String, KubeError> {
-    let docs = build_tenant_reconciler_rbac()
-        .into_iter()
-        .chain([build_tenant_gateway_routes_cluster_role()]);
+    let docs = build_tenant_reconciler_rbac().into_iter().chain([
+        build_tenant_gateway_routes_cluster_role(),
+        build_tenant_flagger_canaries_cluster_role(),
+    ]);
     Ok(keel_core::to_yaml_documents(docs)?)
 }
 
@@ -2178,7 +2224,46 @@ mod tests {
         assert_eq!(binding["subjects"][0]["namespace"], "flux-system");
 
         let yaml = build_tenant_reconciler_rbac_yaml().unwrap();
-        assert_eq!(yaml.matches("\n---\n").count(), 3);
+        assert_eq!(yaml.matches("\n---\n").count(), 4);
+    }
+
+    #[test]
+    fn tenant_flagger_canaries_role_aggregates_into_admin_and_matches_seed() {
+        let role = build_tenant_flagger_canaries_cluster_role();
+        assert_eq!(
+            role["metadata"]["labels"]["rbac.authorization.k8s.io/aggregate-to-admin"],
+            "true"
+        );
+        let rules = role["rules"].as_array().unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0]["apiGroups"], json!(["flagger.app"]));
+        // Least privilege: tenants reference platform MetricTemplates, never create them.
+        assert_eq!(rules[0]["resources"], json!(["canaries"]));
+        for verb in ["bind", "escalate", "impersonate", "*"] {
+            assert!(!rules[0]["verbs"].as_array().unwrap().contains(&json!(verb)));
+        }
+
+        // Every kind the synthesized Canary needs is covered by this role.
+        let canary =
+            synthesize_flagger_canary(&FlaggerCanarySpecInput::new("acme", "web")).unwrap();
+        let api_version = canary["apiVersion"].as_str().unwrap();
+        assert_eq!(api_version.split('/').next(), Some("flagger.app"));
+        assert_eq!(canary["kind"], "Canary");
+        for metric in canary["spec"]["analysis"]["metrics"].as_array().unwrap() {
+            assert_eq!(metric["templateRef"]["namespace"], "keel-system");
+        }
+
+        let seed = include_str!("../../../deploy/seed/flux-system/tenant-reconciler-rbac.yaml");
+        let seed_role = seed
+            .split("\n---\n")
+            .map(|d| noyalib::from_str::<Value>(d).unwrap())
+            .find(|d| d["metadata"]["name"] == TENANT_FLAGGER_CANARIES_CLUSTER_ROLE)
+            .expect("seed keel-tenant-flagger-canaries ClusterRole");
+        assert_eq!(seed_role["metadata"]["labels"], role["metadata"]["labels"]);
+        assert_eq!(seed_role["rules"], role["rules"]);
+
+        let yaml = build_tenant_reconciler_rbac_yaml().unwrap();
+        assert!(yaml.contains(TENANT_FLAGGER_CANARIES_CLUSTER_ROLE));
     }
 
     #[test]

@@ -41,7 +41,7 @@ Keel is alpha software. This page collects the limitations and open bugs a user 
 
 ### Canary apps on the management cluster
 
-In v0.12.0, the tenant ServiceAccount has no permission to manage Flagger `Canary` objects. A canary app (`--canary`, or **Enable Flagger Canary**) installed into a tenant namespace on the management cluster therefore fails with `canaries.flagger.app "<app>" is forbidden`, and because the tenant's root Kustomization fails as a whole, the tenant's other apps stop updating too. Canaries on a remote workload cluster are not affected. Until this is fixed, grant the permission through an aggregated role:
+**v0.12.0 only; fixed in the next release.** In v0.12.0, the tenant ServiceAccount has no permission to manage Flagger `Canary` objects. A canary app (`--canary`, or **Enable Flagger Canary**) installed into a tenant namespace on the management cluster therefore fails with `canaries.flagger.app "<app>" is forbidden`, and because the tenant's root Kustomization fails as a whole, the tenant's other apps stop updating too. Canaries on a remote workload cluster are not affected. On v0.12.0, grant the permission through an aggregated role:
 
 ```bash
 kubectl --context kind-keel-mgmt apply -f - <<'EOF'
@@ -53,12 +53,12 @@ metadata:
     rbac.authorization.k8s.io/aggregate-to-admin: "true"
 rules:
   - apiGroups: ["flagger.app"]
-    resources: ["canaries", "metrictemplates", "alertproviders"]
+    resources: ["canaries"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 EOF
 ```
 
-Delete the role (`kubectl delete clusterrole keel-tenant-flagger-workaround`) once a release fixes the bug.
+v0.12.0 has no admission policy for Canaries, so this role lets every tenant admin point Flagger's webhooks and metric queries anywhere. Use it only on a single-user test cluster. The next release ships its own role (`keel-tenant-flagger-canaries`) together with the `restrict-tenant-flagger-canaries` Kyverno policy; after upgrading, delete the workaround with `kubectl delete clusterrole keel-tenant-flagger-workaround`.
 
 ### Other app limitations
 

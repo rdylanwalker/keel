@@ -18,8 +18,9 @@ use serde_json::{Value, json};
 
 use crate::KubeError;
 use crate::tenant::{
-    KEEL_SERVER_NAMESPACE, KEEL_SERVER_SERVICE_ACCOUNT, PLATFORM_OWNED_LABEL,
-    TENANT_RECONCILER_SERVICE_ACCOUNT, validate_resource_name,
+    FLAGGER_CANARY_PROVIDER, KEEL_INGRESS_GATEWAY_NAME, KEEL_SERVER_NAMESPACE,
+    KEEL_SERVER_SERVICE_ACCOUNT, PLATFORM_OWNED_LABEL, TENANT_RECONCILER_SERVICE_ACCOUNT,
+    validate_resource_name,
 };
 
 pub const POLICY_DISALLOW_PRIVILEGED: &str = "disallow-privileged-containers";
@@ -27,6 +28,9 @@ pub const POLICY_PROTECT_CONTROL_PLANE: &str = "protect-control-plane";
 pub const POLICY_RESTRICT_PULUMI_PROVIDERS: &str = "restrict-pulumi-providers";
 pub const POLICY_RESTRICT_TENANT_RECONCILER: &str = "restrict-tenant-reconciler";
 pub const POLICY_RESTRICT_TENANT_ROUTE_HOSTNAMES: &str = "restrict-tenant-route-hostnames";
+/// `ValidatingPolicy` limiting tenant Flagger `Canary` specs to what Keel synthesizes
+/// ([`build_restrict_tenant_flagger_canaries_policy`]).
+pub const POLICY_RESTRICT_TENANT_FLAGGER_CANARIES: &str = "restrict-tenant-flagger-canaries";
 pub const POLICY_RESTRICT_TENANT_FLUX_SOURCES: &str = "restrict-tenant-flux-sources";
 pub const POLICY_RESTRICT_TENANT_FLUX_SOURCE_STATUS: &str = "restrict-tenant-flux-source-status";
 /// `ValidatingPolicy` denying tenant subjects writes to PKO-internal objects (`auto.pulumi.com`
@@ -1165,6 +1169,116 @@ pub fn build_restrict_tenant_route_hostnames_policy<S: AsRef<str>>(
     }))
 }
 
+/// Generates `ValidatingPolicy/restrict-tenant-flagger-canaries` (`policies.kyverno.io/v1`).
+///
+/// Tenant identities may manage Flagger `Canary` objects in their namespace
+/// (`ClusterRole/keel-tenant-flagger-canaries`, aggregated into `admin`). Flagger runs
+/// cluster-wide in `keel-system` and queries the shared platform Prometheus, so a free-form
+/// `Canary` would make it act for the tenant outside the tenant's own network and data
+/// boundaries. In `tenant-*` namespaces this policy admits only the shape Keel synthesizes
+/// (`synthesize_flagger_canary`), for every requester (Flux, `kubectl`, platform admins):
+///
+/// * `spec.provider` is `gatewayapi:v1`;
+/// * every `spec.service.gatewayRefs` entry is the shared `keel-system/keel-ingress` Gateway;
+/// * no `spec.analysis.webhooks` (Flagger would call any URL from `keel-system`: SSRF around the
+///   tenant's egress NetworkPolicies);
+/// * every `spec.analysis.metrics` entry references a platform `MetricTemplate` in `keel-system`
+///   and carries neither an inline `query` nor `templateVariables` (otherwise the tenant runs
+///   arbitrary PromQL against the shared Prometheus and reads other tenants' metrics back through
+///   Canary events and status);
+/// * `spec.analysis.alerts` only reference `AlertProvider`s in the Canary's own namespace.
+///
+/// Updates that leave `spec` unchanged (finalizers, annotations, Flagger's own metadata writes)
+/// and objects being deleted always pass. Hostnames of the routes Flagger generates are checked
+/// by `restrict-tenant-route-hostnames`, which matches route writes in `tenant-*` namespaces
+/// whoever the writer is. Fails closed; the `matchConditions` keep platform namespaces out of the
+/// webhook (anti-lockout, `NFR-REL-01`).
+pub fn build_restrict_tenant_flagger_canaries_policy() -> Value {
+    let ns = KEEL_SYSTEM_NAMESPACE;
+    let gateway = KEEL_INGRESS_GATEWAY_NAME;
+    let provider = FLAGGER_CANARY_PROVIDER;
+    json!({
+        "apiVersion": "policies.kyverno.io/v1",
+        "kind": "ValidatingPolicy",
+        "metadata": {
+            "name": POLICY_RESTRICT_TENANT_FLAGGER_CANARIES,
+            "labels": {
+                "app.kubernetes.io/managed-by": "keel",
+                "keel.io/policy-tier": "tenant-isolation"
+            }
+        },
+        "spec": {
+            "validationActions": ["Deny"],
+            "failurePolicy": "Fail",
+            "evaluation": {
+                "background": {
+                    "enabled": false
+                }
+            },
+            "matchConstraints": {
+                "resourceRules": [
+                    {
+                        "apiGroups": ["flagger.app"],
+                        "apiVersions": ["*"],
+                        "operations": ["CREATE", "UPDATE"],
+                        "resources": ["canaries"]
+                    }
+                ]
+            },
+            "matchConditions": [
+                {
+                    "name": "tenant-namespace",
+                    "expression": format!("{CEL_REQUEST_NAMESPACE}.startsWith('tenant-')")
+                }
+            ],
+            "variables": [
+                {
+                    "name": "ns",
+                    "expression": CEL_REQUEST_NAMESPACE
+                },
+                {
+                    "name": "exempt",
+                    "expression": CEL_SPEC_PRESERVING_UPDATE
+                },
+                {
+                    "name": "spec",
+                    "expression": "has(object.spec) ? object.spec : {}"
+                },
+                {
+                    "name": "service",
+                    "expression": "has(object.spec) && has(object.spec.service) ? object.spec.service : {}"
+                },
+                {
+                    "name": "analysis",
+                    "expression": "has(object.spec) && has(object.spec.analysis) ? object.spec.analysis : {}"
+                }
+            ],
+            "validations": [
+                {
+                    "expression": format!("variables.exempt || (has(variables.spec.provider) && variables.spec.provider == '{provider}')"),
+                    "message": format!("Tenant Flagger Canaries must set `spec.provider: {provider}` (Envoy Gateway on the shared `{ns}/{gateway}` Gateway).")
+                },
+                {
+                    "expression": format!("variables.exempt || (has(variables.service.gatewayRefs) && size(variables.service.gatewayRefs) > 0 && variables.service.gatewayRefs.all(g, has(g.name) && g.name == '{gateway}' && has(g.namespace) && g.namespace == '{ns}' && (!has(g.kind) || g.kind == 'Gateway') && (!has(g.group) || g.group == 'gateway.networking.k8s.io')))"),
+                    "message": format!("Tenant Flagger Canaries may only route through the shared `{ns}/{gateway}` Gateway (`spec.service.gatewayRefs`).")
+                },
+                {
+                    "expression": "variables.exempt || !has(variables.analysis.webhooks) || size(variables.analysis.webhooks) == 0",
+                    "message": "Tenant Flagger Canaries may not set `spec.analysis.webhooks`: Flagger would call the URL from the platform namespace, bypassing the tenant's network policies."
+                },
+                {
+                    "expression": format!("variables.exempt || !has(variables.analysis.metrics) || variables.analysis.metrics.all(m, has(m.templateRef) && has(m.templateRef.namespace) && m.templateRef.namespace == '{ns}' && !has(m.query) && !has(m.templateVariables))"),
+                    "message": format!("Tenant Flagger Canary metrics must reference a platform MetricTemplate in `{ns}` (`templateRef` with `namespace: {ns}`) and may not set an inline `query` or `templateVariables`: they would run arbitrary queries against the shared platform Prometheus.")
+                },
+                {
+                    "expression": "variables.exempt || !has(variables.analysis.alerts) || variables.analysis.alerts.all(a, !has(a.providerRef) || !has(a.providerRef.namespace) || a.providerRef.namespace == variables.ns)",
+                    "message": "Tenant Flagger Canary alerts may only reference an AlertProvider in the Canary's own namespace."
+                }
+            ]
+        }
+    })
+}
+
 /// Generates the `sync-keel-ca-bundle` Kyverno `GeneratingPolicy` (`policies.kyverno.io/v1`) and
 /// the least-privilege RBAC its controllers need (`ClusterRole`/`ClusterRoleBinding`
 /// `keel-kyverno-ca-bundle-sync`).
@@ -1277,6 +1391,7 @@ impl KyvernoManifestBundle {
         let mut supporting_manifests = vec![
             build_restrict_tenant_reconciler_policy(),
             build_restrict_tenant_route_hostnames_policy(&config.reserved_route_hostnames)?,
+            build_restrict_tenant_flagger_canaries_policy(),
             build_restrict_tenant_flux_sources_policy(),
             build_restrict_tenant_flux_source_status_policy(),
             build_restrict_tenant_pulumi_objects_policy(),
@@ -1342,10 +1457,10 @@ mod tests {
 
         let bundle = KyvernoManifestBundle::generate(&cfg).unwrap();
         assert_eq!(bundle.cluster_policies.len(), 3);
-        // 6 ValidatingPolicies + sync-keel-ca-bundle (ClusterRole, binding, GeneratingPolicy).
-        assert_eq!(bundle.supporting_manifests.len(), 9);
+        // 7 ValidatingPolicies + sync-keel-ca-bundle (ClusterRole, binding, GeneratingPolicy).
+        assert_eq!(bundle.supporting_manifests.len(), 10);
         assert!(bundle.policy_exception.is_none());
-        assert_eq!(bundle.all_manifests().len(), 12);
+        assert_eq!(bundle.all_manifests().len(), 13);
         // The only GeneratingPolicy copies the public CA bundle; the retired
         // `sync-tenant-secrets` (control-plane credentials into tenants) never comes back.
         let generating: Vec<Value> = bundle
@@ -1397,7 +1512,7 @@ mod tests {
         };
 
         let bundle = KyvernoManifestBundle::generate(&cfg).unwrap();
-        assert_eq!(bundle.all_manifests().len(), 13);
+        assert_eq!(bundle.all_manifests().len(), 14);
 
         let exc = bundle
             .policy_exception
@@ -2307,7 +2422,7 @@ mod tests {
             }
         }
         let docs: Vec<&str> = yaml.split("\n---\n").collect();
-        assert_eq!(docs.len(), 13);
+        assert_eq!(docs.len(), 14);
         for doc in docs {
             let parsed: serde_json::Value =
                 noyalib::from_str(doc).expect("each Kyverno multi-doc YAML part must parse");
@@ -2362,5 +2477,289 @@ mod tests {
         // CEL-injection guard: only DNS hostnames are accepted.
         assert!(build_restrict_tenant_route_hostnames_policy(&["x' || true || '"]).is_err());
         assert!(build_restrict_tenant_route_hostnames_policy(&["Bad_Host"]).is_err());
+    }
+
+    /// Admission outcome of a `ValidatingPolicy` for one request, evaluated with the `cel`
+    /// interpreter: `Ok(())` when the request is admitted (or not matched), else the messages of
+    /// the failing validations. Mirrors Kyverno's order: `matchConditions`, `variables` (in
+    /// order, each seeing the earlier ones), `validations`.
+    fn evaluate_validating_policy(
+        policy: &Value,
+        operation: &str,
+        namespace: &str,
+        object: &Value,
+        old_object: Option<&Value>,
+    ) -> Result<(), Vec<String>> {
+        use std::collections::HashMap;
+
+        let request = json!({
+            "operation": operation,
+            "namespace": namespace,
+            "name": object["metadata"]["name"],
+            "kind": {
+                "group": object["apiVersion"].as_str().unwrap().split('/').next().unwrap(),
+                "kind": object["kind"]
+            },
+            "userInfo": {
+                "username": format!("system:serviceaccount:{namespace}:{namespace}-sa"),
+                "groups": ["system:serviceaccounts", format!("system:serviceaccounts:{namespace}")]
+            }
+        });
+        let base = |variables: &HashMap<String, cel::Value>| {
+            let mut ctx = cel::Context::default();
+            ctx.add_variable("request", cel::to_value(&request).unwrap())
+                .unwrap();
+            ctx.add_variable("object", cel::to_value(object).unwrap())
+                .unwrap();
+            match old_object {
+                Some(old) => ctx
+                    .add_variable("oldObject", cel::to_value(old).unwrap())
+                    .unwrap(),
+                None => ctx.add_variable_from_value("oldObject", cel::Value::Null),
+            }
+            ctx.add_variable_from_value("variables", cel::Value::from(variables.clone()));
+            ctx
+        };
+        let eval = |expr: &str, variables: &HashMap<String, cel::Value>| {
+            cel::Program::compile(expr)
+                .unwrap_or_else(|e| panic!("CEL `{expr}` does not compile: {e}"))
+                .execute(&base(variables))
+                .unwrap_or_else(|e| panic!("CEL `{expr}` failed: {e}"))
+        };
+
+        let mut variables = HashMap::new();
+        for condition in policy["spec"]["matchConditions"].as_array().unwrap() {
+            if eval(condition["expression"].as_str().unwrap(), &variables) != cel::Value::Bool(true)
+            {
+                return Ok(());
+            }
+        }
+        for variable in policy["spec"]["variables"].as_array().into_iter().flatten() {
+            let value = eval(variable["expression"].as_str().unwrap(), &variables);
+            variables.insert(variable["name"].as_str().unwrap().to_string(), value);
+        }
+        let denied: Vec<String> = policy["spec"]["validations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(
+                |v| match eval(v["expression"].as_str().unwrap(), &variables) {
+                    cel::Value::Bool(ok) => !ok,
+                    other => panic!("validation returned a non-bool: {other:?}"),
+                },
+            )
+            .map(|v| v["message"].as_str().unwrap().to_string())
+            .collect();
+        if denied.is_empty() {
+            Ok(())
+        } else {
+            Err(denied)
+        }
+    }
+
+    fn synthesized_canary() -> Value {
+        let mut input = crate::tenant::FlaggerCanarySpecInput::new("acme", "web");
+        input.hosts.push("web.acme.example".to_string());
+        crate::tenant::synthesize_flagger_canary(&input).unwrap()
+    }
+
+    #[test]
+    fn restrict_tenant_flagger_canaries_policy_is_enforced_at_stage0() {
+        let policy = build_restrict_tenant_flagger_canaries_policy();
+        assert_eq!(
+            policy["metadata"]["name"],
+            POLICY_RESTRICT_TENANT_FLAGGER_CANARIES
+        );
+        assert_eq!(policy["spec"]["validationActions"], json!(["Deny"]));
+        assert_eq!(policy["spec"]["failurePolicy"], "Fail");
+        assert_eq!(
+            policy["spec"]["matchConstraints"]["resourceRules"],
+            json!([{
+                "apiGroups": ["flagger.app"],
+                "apiVersions": ["*"],
+                "operations": ["CREATE", "UPDATE"],
+                "resources": ["canaries"]
+            }])
+        );
+        let bundle = KyvernoManifestBundle::generate(&KyvernoPolicyConfig::default()).unwrap();
+        assert!(bundle.supporting_manifests.contains(&policy));
+    }
+
+    #[test]
+    fn restrict_tenant_flagger_canaries_policy_admits_synthesized_canaries() {
+        let policy = build_restrict_tenant_flagger_canaries_policy();
+        let canary = synthesized_canary();
+        assert_eq!(
+            evaluate_validating_policy(&policy, "CREATE", "tenant-acme", &canary, None),
+            Ok(())
+        );
+        let mut updated = canary.clone();
+        updated["spec"]["analysis"]["maxWeight"] = json!(30);
+        assert_eq!(
+            evaluate_validating_policy(&policy, "UPDATE", "tenant-acme", &updated, Some(&canary)),
+            Ok(())
+        );
+        // An AlertProvider in the Canary's own namespace is fine.
+        let mut alerting = canary.clone();
+        alerting["spec"]["analysis"]["alerts"] = json!([{ "name": "on-call", "providerRef": { "name": "slack", "namespace": "tenant-acme" } }]);
+        assert_eq!(
+            evaluate_validating_policy(&policy, "CREATE", "tenant-acme", &alerting, None),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn restrict_tenant_flagger_canaries_policy_denies_flagger_side_channels() {
+        let policy = build_restrict_tenant_flagger_canaries_policy();
+        let canary = synthesized_canary();
+        type Mutation = Box<dyn Fn(&mut Value)>;
+        let cases: Vec<(&str, Mutation, &str)> = vec![
+            (
+                "webhook",
+                Box::new(|c| {
+                    c["spec"]["analysis"]["webhooks"] = json!([{
+                        "name": "probe",
+                        "url": "http://keel-server.keel-system:8080/api/v1/tenants",
+                        "type": "pre-rollout"
+                    }])
+                }),
+                "webhooks",
+            ),
+            (
+                "inline query",
+                Box::new(|c| {
+                    c["spec"]["analysis"]["metrics"][0] = json!({
+                        "name": "steal",
+                        "query": "sum(rate(http_requests_total{namespace=\"tenant-other\"}[1m]))",
+                        "thresholdRange": { "min": 0 }
+                    })
+                }),
+                "MetricTemplate",
+            ),
+            (
+                "inline query next to a platform templateRef",
+                Box::new(|c| {
+                    c["spec"]["analysis"]["metrics"][0]["query"] = json!("up");
+                }),
+                "MetricTemplate",
+            ),
+            (
+                "foreign templateRef",
+                Box::new(|c| {
+                    c["spec"]["analysis"]["metrics"][1]["templateRef"]["namespace"] =
+                        json!("tenant-other");
+                }),
+                "MetricTemplate",
+            ),
+            (
+                "templateRef without namespace",
+                Box::new(|c| {
+                    c["spec"]["analysis"]["metrics"][1]["templateRef"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("namespace");
+                }),
+                "MetricTemplate",
+            ),
+            (
+                "templateVariables",
+                Box::new(|c| {
+                    c["spec"]["analysis"]["metrics"][0]["templateVariables"] =
+                        json!({ "namespace": "tenant-other" });
+                }),
+                "MetricTemplate",
+            ),
+            (
+                "foreign gateway namespace",
+                Box::new(|c| {
+                    c["spec"]["service"]["gatewayRefs"][0]["namespace"] = json!("tenant-other");
+                }),
+                "gatewayRefs",
+            ),
+            (
+                "foreign gateway name",
+                Box::new(|c| {
+                    c["spec"]["service"]["gatewayRefs"][0]["name"] = json!("internal");
+                }),
+                "gatewayRefs",
+            ),
+            (
+                "second gateway",
+                Box::new(|c| {
+                    c["spec"]["service"]["gatewayRefs"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(json!({ "name": "internal", "namespace": "keel-system" }));
+                }),
+                "gatewayRefs",
+            ),
+            (
+                "no gateway",
+                Box::new(|c| {
+                    c["spec"]["service"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("gatewayRefs");
+                }),
+                "gatewayRefs",
+            ),
+            (
+                "other provider",
+                Box::new(|c| c["spec"]["provider"] = json!("nginx")),
+                "spec.provider",
+            ),
+            (
+                "foreign alert provider",
+                Box::new(|c| {
+                    c["spec"]["analysis"]["alerts"] = json!([{
+                        "name": "spam",
+                        "providerRef": { "name": "platform-pager", "namespace": "keel-system" }
+                    }])
+                }),
+                "AlertProvider",
+            ),
+        ];
+        for (case, mutate, expected) in cases {
+            let mut bad = canary.clone();
+            mutate(&mut bad);
+            let denied = evaluate_validating_policy(&policy, "CREATE", "tenant-acme", &bad, None)
+                .expect_err(case);
+            assert!(
+                denied.iter().any(|m| m.contains(expected)),
+                "{case}: {denied:?}"
+            );
+            // Changing an admitted Canary into the bad shape is denied too.
+            assert!(
+                evaluate_validating_policy(&policy, "UPDATE", "tenant-acme", &bad, Some(&canary))
+                    .is_err(),
+                "{case} (update)"
+            );
+        }
+    }
+
+    #[test]
+    fn restrict_tenant_flagger_canaries_policy_never_blocks_cleanup_or_platform_namespaces() {
+        let policy = build_restrict_tenant_flagger_canaries_policy();
+        let mut bad = synthesized_canary();
+        bad["spec"]["analysis"]["webhooks"] = json!([{ "name": "x", "url": "http://x" }]);
+        // Metadata-only updates (finalizers, annotations) and deletion of an existing Canary.
+        let mut annotated = bad.clone();
+        annotated["metadata"]["annotations"] = json!({ "reconcile.fluxcd.io/requestedAt": "now" });
+        assert_eq!(
+            evaluate_validating_policy(&policy, "UPDATE", "tenant-acme", &annotated, Some(&bad)),
+            Ok(())
+        );
+        let mut deleting = bad.clone();
+        deleting["metadata"]["deletionTimestamp"] = json!("2026-01-01T00:00:00Z");
+        deleting["spec"]["analysis"]["maxWeight"] = json!(10);
+        assert_eq!(
+            evaluate_validating_policy(&policy, "UPDATE", "tenant-acme", &deleting, Some(&bad)),
+            Ok(())
+        );
+        // Platform namespaces never reach the policy.
+        assert_eq!(
+            evaluate_validating_policy(&policy, "CREATE", "keel-system", &bad, None),
+            Ok(())
+        );
     }
 }

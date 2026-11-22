@@ -104,3 +104,21 @@ rules:
   - apiGroups: ["gateway.networking.k8s.io"]
     resources: ["httproutes", "grpcroutes"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+# Aggregated into the built-in ClusterRole/admin so tenant ServiceAccounts can apply the Flagger
+# `Canary` Keel generates for a canary app. Only `canaries`: the generated Canary references the
+# platform-owned MetricTemplates in `keel-system`, so tenants never create `metrictemplates` or
+# `alertproviders`. The Kyverno policy `restrict-tenant-flagger-canaries` limits the Canary spec
+# to that shape. Mirrors `keel_kube::tenant::build_tenant_flagger_canaries_cluster_role()`.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: keel-tenant-flagger-canaries
+  labels:
+    app.kubernetes.io/managed-by: keel
+    app.kubernetes.io/part-of: keel-control-plane
+    rbac.authorization.k8s.io/aggregate-to-admin: "true"
+rules:
+  - apiGroups: ["flagger.app"]
+    resources: ["canaries"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
