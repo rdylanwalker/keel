@@ -1,9 +1,8 @@
 //! Pure `git` CLI runner executing operations via `tokio::process::Command`
 //! with explicit argument vectors (zero shell invocation per `NFR-SEC-06`)
-//! and ephemeral SSH/HTTPS credential injection (`NFR-SEC-05`).
+//! and ephemeral HTTPS credential injection (`NFR-SEC-05`).
 
 use std::fmt;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
 
@@ -76,15 +75,12 @@ impl CommitAuthor {
 }
 
 /// Ephemeral credentials injected into `git` subprocesses without persisting or logging secrets.
+///
+/// Only HTTPS credentials are injected. SSH remotes use the host's own `ssh` configuration.
 #[derive(Clone, Default)]
 pub enum GitCredentials {
     #[default]
     None,
-    /// Ephemeral SSH private key written with strict `0600` permissions and deleted on drop.
-    SshKey {
-        private_key_pem: String,
-        known_hosts: Option<String>,
-    },
     /// Ephemeral HTTPS Basic / Personal Access Token credentials injected via Git environment config.
     HttpsBasic {
         username: String,
@@ -96,11 +92,6 @@ impl fmt::Debug for GitCredentials {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::None => write!(f, "GitCredentials::None"),
-            Self::SshKey { known_hosts, .. } => f
-                .debug_struct("GitCredentials::SshKey")
-                .field("private_key_pem", &"[REDACTED]")
-                .field("known_hosts", &known_hosts.as_ref().map(|_| "[PRESENT]"))
-                .finish(),
             Self::HttpsBasic { username, .. } => f
                 .debug_struct("GitCredentials::HttpsBasic")
                 .field("username", username)
@@ -110,83 +101,10 @@ impl fmt::Debug for GitCredentials {
     }
 }
 
-/// RAII temporary secret file created atomically with `0600` permissions and scrubbed on [`Drop`].
-pub struct EphemeralSecretFile {
-    path: PathBuf,
-    byte_len: usize,
-}
-
-impl EphemeralSecretFile {
-    /// Writes secret material to a freshly created `0600` file in the OS temporary directory.
-    pub fn create(prefix: &str, contents: &[u8]) -> Result<Self, GitError> {
-        let safe_prefix = sanitize_branch_segment(prefix);
-        let file_name = format!(
-            "keel-{}-{}.tmp",
-            if safe_prefix.is_empty() {
-                "secret"
-            } else {
-                &safe_prefix
-            },
-            uuid::Uuid::new_v4()
-        );
-        let path = std::env::temp_dir().join(file_name);
-
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-
-        let mut file = opts.open(&path)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        }
-        file.write_all(contents)?;
-        file.sync_all()?;
-        drop(file);
-
-        Ok(Self {
-            path,
-            byte_len: contents.len(),
-        })
-    }
-
-    /// Path to the ephemeral secret file while this guard remains alive.
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl fmt::Debug for EphemeralSecretFile {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("EphemeralSecretFile")
-            .field("path", &self.path)
-            .finish()
-    }
-}
-
-impl Drop for EphemeralSecretFile {
-    fn drop(&mut self) {
-        if self.byte_len > 0
-            && let Ok(mut f) = std::fs::OpenOptions::new().write(true).open(&self.path)
-        {
-            let zeros = vec![0u8; self.byte_len];
-            let _ = f.write_all(&zeros);
-            let _ = f.sync_all();
-        }
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
-
-/// Prepared environment variables and RAII guards for a single `git` invocation.
+/// Prepared environment variables for a single `git` invocation.
 pub(crate) struct PreparedAuthEnv {
     pub envs: Vec<(String, String)>,
     pub redact_tokens: Vec<String>,
-    pub _files: Vec<EphemeralSecretFile>,
 }
 
 impl PreparedAuthEnv {
@@ -195,60 +113,7 @@ impl PreparedAuthEnv {
             GitCredentials::None => Ok(Self {
                 envs: Vec::new(),
                 redact_tokens: Vec::new(),
-                _files: Vec::new(),
             }),
-            GitCredentials::SshKey {
-                private_key_pem,
-                known_hosts,
-            } => {
-                if private_key_pem.trim().is_empty() || private_key_pem.contains('\0') {
-                    return Err(GitError::InvalidArgument {
-                        field: "private_key_pem",
-                        reason: "SSH private key must be non-empty and free of NUL bytes"
-                            .to_string(),
-                    });
-                }
-
-                let mut normalized_key = private_key_pem.clone();
-                if !normalized_key.ends_with('\n') {
-                    normalized_key.push('\n');
-                }
-                let key_file = EphemeralSecretFile::create("ssh-key", normalized_key.as_bytes())?;
-                let quoted_key_path = shell_single_quote_path(key_file.path())?;
-
-                let mut files = vec![key_file];
-                let host_check_opts = if let Some(hosts) = known_hosts {
-                    if hosts.contains('\0') || hosts.contains('\n') || hosts.contains('\r') {
-                        return Err(GitError::InvalidArgument {
-                            field: "known_hosts",
-                            reason:
-                                "known_hosts must not contain NUL or newline control characters"
-                                    .to_string(),
-                        });
-                    }
-                    let hosts_file = EphemeralSecretFile::create("known-hosts", hosts.as_bytes())?;
-                    let quoted_hosts_path = shell_single_quote_path(hosts_file.path())?;
-                    files.push(hosts_file);
-                    format!(
-                        "-o StrictHostKeyChecking=yes -o UserKnownHostsFile={quoted_hosts_path}"
-                    )
-                } else {
-                    tracing::warn!(
-                        "SSH known_hosts not provided; using StrictHostKeyChecking=accept-new (TOFU)"
-                    );
-                    "-o StrictHostKeyChecking=accept-new".to_string()
-                };
-
-                let ssh_cmd = format!(
-                    "ssh -i {quoted_key_path} -o IdentitiesOnly=yes -o BatchMode=yes {host_check_opts}"
-                );
-
-                Ok(Self {
-                    envs: vec![("GIT_SSH_COMMAND".to_string(), ssh_cmd)],
-                    redact_tokens: vec![private_key_pem.trim().to_string()],
-                    _files: files,
-                })
-            }
             GitCredentials::HttpsBasic {
                 username,
                 password_or_token,
@@ -285,26 +150,10 @@ impl PreparedAuthEnv {
                         ("GIT_CONFIG_VALUE_0".to_string(), header_value),
                     ],
                     redact_tokens: vec![password_or_token.clone(), encoded],
-                    _files: Vec::new(),
                 })
             }
         }
     }
-}
-
-fn shell_single_quote_path(path: &Path) -> Result<String, GitError> {
-    let s = path.to_str().ok_or_else(|| GitError::InvalidArgument {
-        field: "temp_path",
-        reason: "temporary path is not valid UTF-8".to_string(),
-    })?;
-    if s.starts_with('-') || s.contains('\0') || s.contains('\n') || s.contains('\r') {
-        return Err(GitError::InvalidArgument {
-            field: "temp_path",
-            reason: "temporary path contains control characters or leading '-'".to_string(),
-        });
-    }
-    let escaped = s.replace('\'', "'\\''");
-    Ok(format!("'{escaped}'"))
 }
 
 /// Sanitizes an arbitrary string segment (such as a tenant ID or action name)
@@ -333,28 +182,6 @@ pub fn sanitize_branch_segment(raw: &str) -> String {
         }
     }
     out
-}
-
-/// Deterministically formats a proposal branch name as `keel/<tenant>/<action>-<timestamp>`,
-/// sanitizing `tenant` and `action` to safe Git branch characters.
-pub fn format_proposal_branch(tenant: &str, action: &str, timestamp: i64) -> String {
-    let clean_tenant = {
-        let s = sanitize_branch_segment(tenant);
-        if s.is_empty() {
-            "default".to_string()
-        } else {
-            s
-        }
-    };
-    let clean_action = {
-        let s = sanitize_branch_segment(action);
-        if s.is_empty() {
-            "proposal".to_string()
-        } else {
-            s
-        }
-    };
-    format!("keel/{clean_tenant}/{clean_action}-{timestamp}")
 }
 
 /// Extracts the `<tenant>` segment from a canonical `keel/<tenant>/<action>-<timestamp>` branch name.
@@ -1111,8 +938,11 @@ impl GitRunner {
             .collect())
     }
 
-    /// Reads the UTF-8 contents of an object `<rev>:<repo_rel_path>` from a bare or non-bare repo.
-    pub async fn show_file_at_ref(
+    /// Reads the UTF-8 contents of `<rev>:<repo_rel_path>` from a bare or non-bare repo without
+    /// touching the checked-out worktree, so request handlers can read committed state (e.g.
+    /// `origin/main`) without holding the shared git lock while mutations check out other
+    /// branches. Returns `Ok(None)` when the path does not exist at `rev`.
+    pub async fn read_file_at_ref(
         &self,
         repo_dir: &Path,
         rev: &str,
@@ -1129,31 +959,6 @@ impl GitRunner {
             Err(GitError::CommandFailed { .. }) => Ok(None),
             Err(e) => Err(e),
         }
-    }
-
-    /// Reads `<rev>:<repo_rel_path>` without touching the checked-out worktree, so request handlers
-    /// can read committed state (e.g. `origin/main`) without holding the shared git lock while
-    /// mutations check out other branches. Returns `Ok(None)` when the path does not exist at `rev`.
-    ///
-    /// Alias of [`GitRunner::show_file_at_ref`] with a name matching [`GitRunner::list_dir_at_ref`].
-    pub async fn read_file_at_ref(
-        &self,
-        repo_dir: &Path,
-        rev: &str,
-        repo_rel_path: &str,
-    ) -> Result<Option<String>, GitError> {
-        self.show_file_at_ref(repo_dir, rev, repo_rel_path).await
-    }
-
-    /// Lists entry names of the directory `<rev>:<repo_rel_dir>` without touching the worktree.
-    /// Returns an empty list when the directory does not exist at `rev`.
-    pub async fn list_dir_at_ref(
-        &self,
-        repo_dir: &Path,
-        rev: &str,
-        repo_rel_dir: &str,
-    ) -> Result<Vec<String>, GitError> {
-        self.list_tree_names(repo_dir, rev, repo_rel_dir).await
     }
 
     /// Lists every file path (repository-relative, recursive) under `repo_rel_dir` at `rev`
@@ -1207,8 +1012,10 @@ impl GitRunner {
         }
     }
 
-    /// Lists entry names inside `<rev>:<repo_rel_dir>` in a bare or non-bare repo.
-    pub(crate) async fn list_tree_names(
+    /// Lists entry names of the directory `<rev>:<repo_rel_dir>` in a bare or non-bare repo
+    /// without touching the worktree. Returns an empty list when the directory does not exist
+    /// at `rev`.
+    pub async fn list_dir_at_ref(
         &self,
         repo_dir: &Path,
         rev: &str,
@@ -1478,28 +1285,26 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn test_format_proposal_branch_and_sanitization() {
+    fn test_branch_segment_sanitization_and_tenant_parsing() {
+        assert_eq!(sanitize_branch_segment("acme"), "acme");
         assert_eq!(
-            format_proposal_branch("acme", "deploy-postgres", 1_731_600_000),
-            "keel/acme/deploy-postgres-1731600000"
+            sanitize_branch_segment("Tenant_Alpha / Prod!"),
+            "tenant-alpha-prod"
         );
+        assert_eq!(sanitize_branch_segment("../etc/passwd"), "etc-passwd");
         assert_eq!(
-            format_proposal_branch("Tenant_Alpha / Prod!", "Install Authentik!", 42),
-            "keel/tenant-alpha-prod/install-authentik-42"
+            sanitize_branch_segment("$(whoami); rm -rf /"),
+            "whoami-rm-rf"
         );
-        assert_eq!(
-            format_proposal_branch("../etc/passwd", "$(whoami); rm -rf /", 99),
-            "keel/etc-passwd/whoami-rm-rf-99"
-        );
-        assert_eq!(
-            format_proposal_branch("---", "!!!", 100),
-            "keel/default/proposal-100"
-        );
+        assert_eq!(sanitize_branch_segment("---"), "");
 
-        let long_seg = "a".repeat(100);
-        let branch = format_proposal_branch(&long_seg, "update", 1);
-        let parsed_tenant = parse_proposal_branch_tenant(&branch).unwrap();
-        assert_eq!(parsed_tenant.len(), 63);
+        let long_seg = sanitize_branch_segment(&"a".repeat(100));
+        assert_eq!(long_seg.len(), 63);
+        let branch = format!("keel/{long_seg}/update-1");
+        assert_eq!(
+            parse_proposal_branch_tenant(&branch),
+            Some(long_seg.as_str())
+        );
         assert!(validate_git_ref(&branch, "branch").is_ok());
 
         assert_eq!(
@@ -1567,7 +1372,7 @@ mod tests {
         let dir = Path::new("/nonexistent-keel-repo");
         for path in ["../secret", "/abs/path", "--help"] {
             assert!(matches!(
-                runner.show_file_at_ref(dir, "main", path).await,
+                runner.read_file_at_ref(dir, "main", path).await,
                 Err(GitError::InvalidArgument { .. })
             ));
             assert!(matches!(
@@ -1626,87 +1431,6 @@ mod tests {
     }
 
     #[test]
-    fn test_ephemeral_ssh_key_permissions_and_drop_cleanup() {
-        let fake_pem = "-----BEGIN OPENSSH PRIVATE KEY-----\nsuper-secret-key-material\n-----END OPENSSH PRIVATE KEY-----";
-        let creds = GitCredentials::SshKey {
-            private_key_pem: fake_pem.to_string(),
-            known_hosts: Some("forge.example.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5".to_string()),
-        };
-
-        // Ensure Debug never leaks private key material
-        let debug_repr = format!("{creds:?}");
-        assert!(!debug_repr.contains("super-secret-key-material"));
-        assert!(debug_repr.contains("[REDACTED]"));
-
-        let guard = PreparedAuthEnv::from_credentials(&creds).unwrap();
-        assert_eq!(guard._files.len(), 2);
-        let key_path = guard._files[0].path().to_path_buf();
-        let hosts_path = guard._files[1].path().to_path_buf();
-        assert!(key_path.exists());
-        assert!(hosts_path.exists());
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let key_mode = std::fs::metadata(&key_path).unwrap().permissions().mode() & 0o777;
-            let hosts_mode = std::fs::metadata(&hosts_path).unwrap().permissions().mode() & 0o777;
-            assert_eq!(key_mode, 0o600);
-            assert_eq!(hosts_mode, 0o600);
-        }
-
-        let ssh_cmd = &guard.envs[0].1;
-        assert_eq!(guard.envs[0].0, "GIT_SSH_COMMAND");
-        assert!(ssh_cmd.contains("IdentitiesOnly=yes"));
-        assert!(ssh_cmd.contains("BatchMode=yes"));
-        assert!(ssh_cmd.contains("StrictHostKeyChecking=yes"));
-
-        drop(guard);
-        assert!(
-            !key_path.exists(),
-            "ephemeral SSH key must be deleted on drop"
-        );
-        assert!(
-            !hosts_path.exists(),
-            "ephemeral known_hosts must be deleted on drop"
-        );
-
-        let creds_no_hosts = GitCredentials::SshKey {
-            private_key_pem: fake_pem.to_string(),
-            known_hosts: None,
-        };
-        let guard_no_hosts = PreparedAuthEnv::from_credentials(&creds_no_hosts).unwrap();
-        assert!(format!("{:?}", guard_no_hosts._files[0]).contains("EphemeralSecretFile"));
-        assert!(
-            guard_no_hosts.envs[0]
-                .1
-                .contains("StrictHostKeyChecking=accept-new")
-        );
-        drop(guard_no_hosts);
-
-        assert!(
-            PreparedAuthEnv::from_credentials(&GitCredentials::SshKey {
-                private_key_pem: "  ".to_string(),
-                known_hosts: None,
-            })
-            .is_err()
-        );
-        assert!(
-            PreparedAuthEnv::from_credentials(&GitCredentials::SshKey {
-                private_key_pem: fake_pem.to_string(),
-                known_hosts: Some("bad\0hosts".to_string()),
-            })
-            .is_err()
-        );
-        assert!(
-            PreparedAuthEnv::from_credentials(&GitCredentials::HttpsBasic {
-                username: "user\ninjected".to_string(),
-                password_or_token: "tok".to_string(),
-            })
-            .is_err()
-        );
-    }
-
-    #[test]
     fn test_https_credentials_redaction_and_env() {
         let creds = GitCredentials::HttpsBasic {
             username: "oauth2".to_string(),
@@ -1738,6 +1462,14 @@ mod tests {
         let scrubbed = redact_sensitive(leaked, &guard.redact_tokens);
         assert!(!scrubbed.contains("glpat-topsecret12345"));
         assert!(scrubbed.contains("[REDACTED]"));
+
+        assert!(
+            PreparedAuthEnv::from_credentials(&GitCredentials::HttpsBasic {
+                username: "user\ninjected".to_string(),
+                password_or_token: "tok".to_string(),
+            })
+            .is_err()
+        );
     }
 
     #[tokio::test]
@@ -1777,8 +1509,8 @@ mod tests {
         runner.push(&work_a, "origin", "main").await.unwrap();
 
         // Create proposal branch, add manifest, push, inspect diff_stat, and fast-forward merge
-        let branch = format_proposal_branch("tenant-1", "add-stack", 1_700_000_000);
-        runner.checkout_new_branch(&work_a, &branch).await.unwrap();
+        let branch = "keel/tenant-1/add-stack-1700000000";
+        runner.checkout_new_branch(&work_a, branch).await.unwrap();
         let stack_dir = work_a.join("tenants/tenant-1/infra/db");
         tokio::fs::create_dir_all(&stack_dir).await.unwrap();
         tokio::fs::write(stack_dir.join("stack.yaml"), "kind: Stack\n")
@@ -1792,9 +1524,9 @@ mod tests {
             .commit(&work_a, "feat(tenant-1): add db stack", &author)
             .await
             .unwrap();
-        runner.push(&work_a, "origin", &branch).await.unwrap();
+        runner.push(&work_a, "origin", branch).await.unwrap();
 
-        let stat = runner.diff_stat(&work_a, "main", &branch).await.unwrap();
+        let stat = runner.diff_stat(&work_a, "main", branch).await.unwrap();
         assert!(stat.contains("stack.yaml"));
 
         // Clone into second workdir, fetch, and fast-forward merge into main
@@ -1810,7 +1542,7 @@ mod tests {
         assert_eq!(merged_sha, branch_sha);
         runner.push(&work_b, "origin", "main").await.unwrap();
 
-        runner.checkout_branch(&work_b, &branch).await.unwrap();
+        runner.checkout_branch(&work_b, branch).await.unwrap();
         assert!(
             runner
                 .checkout_branch(&work_b, "nonexistent-branch")
@@ -1822,7 +1554,7 @@ mod tests {
         assert!(runner.commit(&work_b, "   ", &author).await.is_err());
 
         let release_sha = runner
-            .fast_forward_merge(&work_b, "release-v1", &branch)
+            .fast_forward_merge(&work_b, "release-v1", branch)
             .await
             .unwrap();
         assert_eq!(release_sha, branch_sha);
@@ -1860,7 +1592,7 @@ mod tests {
         );
 
         // The local-only reset discards changes and returns to `origin/main` from a branch.
-        runner.checkout_branch(&work_b, &branch).await.unwrap();
+        runner.checkout_branch(&work_b, branch).await.unwrap();
         tokio::fs::write(work_b.join("untracked.txt"), "dirty\n")
             .await
             .unwrap();

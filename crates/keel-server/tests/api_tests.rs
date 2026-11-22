@@ -5944,7 +5944,7 @@ async fn test_tenant_stacks_use_tenant_passphrase_secret_and_fail_closed_without
     let stack_yaml = fixture
         .state
         .git_runner
-        .show_file_at_ref(
+        .read_file_at_ref(
             &fixture.state.repo_workdir,
             branch,
             "tenants/acme/infra/vm-pass/stack.yaml",

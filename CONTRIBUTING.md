@@ -27,7 +27,7 @@ Please ensure any logs, manifests, or screenshots redact all secrets and sensiti
 keel/
 ├── crates/
 │   ├── keel-core/          # Domain models, BootstrapTarget, Stage 0 state paths, JSONSchema, catalog, SOPS/age
-│   ├── keel-git/           # Direct git CLI runner (SSH/HTTPS) & ForgeProvider trait adapters
+│   ├── keel-git/           # Direct git CLI runner (HTTPS credentials) & ForgeProvider trait adapters
 │   ├── keel-pko/           # PKO v2 Stack synthesis, ephemeral previews, PKO run mapping, diff parser
 │   ├── keel-kube/          # kube-rs watchers, SSE telemetry, tenant RBAC, preview runner, tenant S3 identities
 │   ├── keel-server/        # Stateless axum HTTP/SSE server, OIDC PKCE auth, preview lifecycle, embedded SPA

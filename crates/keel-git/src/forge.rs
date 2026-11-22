@@ -58,12 +58,6 @@ impl CreatePrRequest {
         }
     }
 
-    /// Overrides the target base branch (defaults to `"main"`).
-    pub fn with_target_branch(mut self, target_branch: impl Into<String>) -> Self {
-        self.target_branch = target_branch.into();
-        self
-    }
-
     /// Explicitly sets the tenant identifier associated with this proposal.
     pub fn with_tenant(mut self, tenant: impl Into<String>) -> Self {
         self.tenant = Some(tenant.into());
@@ -160,18 +154,6 @@ pub enum ForgeError {
     /// on the development-only [`crate::LocalGitProvider`], `SDD.md` §3.2).
     #[error("Forge operation not supported by this provider: {0}")]
     Unsupported(String),
-
-    /// A user's effective access to a repository is higher than Keel may leave in place
-    /// (organisation owner, team or base permission, or inherited GitLab group membership).
-    /// Keel cannot lower it per repository; an operator must change the membership.
-    #[error(
-        "Forge user '{user}' has '{permission}' access to '{repository}' through organisation, team or group membership; Keel cannot reduce it per repository"
-    )]
-    ElevatedAccess {
-        user: String,
-        repository: String,
-        permission: String,
-    },
 }
 
 impl ForgeError {
@@ -292,8 +274,7 @@ impl RepositoryInfo {
     }
 }
 
-/// Transport of the per-repository read-only credential a provider issues
-/// ([`ForgeProvider::read_credential_kind`]).
+/// Transport of the per-repository read-only credential a forge issues.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum RepoCredentialKind {
@@ -405,30 +386,6 @@ pub enum ForkPolicyOutcome {
     RequiresAdminSetting(String),
 }
 
-/// Outcome of [`ForgeProvider::ensure_read_collaborator`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum CollaboratorOutcome {
-    /// The user was added with read access.
-    Added,
-    /// GitHub: an invitation was created; access starts once the user accepts it.
-    Invited,
-    /// The user was a collaborator with another permission and now has read access.
-    Updated,
-    /// The user already had read access.
-    Unchanged,
-}
-
-/// A fork of a repository ([`ForgeProvider::list_forks`]).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ForkInfo {
-    /// `owner/name` of the fork.
-    pub full_name: String,
-    /// Web URL of the fork.
-    pub html_url: Option<String>,
-}
-
 /// Thin forge abstraction isolating PR/MR operations across Forgejo/Gitea, GitHub, GitLab,
 /// and offline/air-gapped [`crate::LocalGitProvider`] repositories (`SDD.md` §3.2).
 #[async_trait]
@@ -446,21 +403,20 @@ pub trait ForgeProvider: Send + Sync {
         markdown_report: &str,
     ) -> Result<(), ForgeError>;
 
-    async fn list_open_pull_requests(
-        &self,
-        tenant: Option<&str>,
-    ) -> Result<Vec<PullRequestInfo>, ForgeError>;
-
+    /// Lists PRs, optionally filtered by tenant and state (`None` = every state).
     async fn list_pull_requests(
         &self,
         tenant: Option<&str>,
         state: Option<PullRequestState>,
+    ) -> Result<Vec<PullRequestInfo>, ForgeError>;
+
+    /// Lists open PRs, optionally filtered by tenant.
+    async fn list_open_pull_requests(
+        &self,
+        tenant: Option<&str>,
     ) -> Result<Vec<PullRequestInfo>, ForgeError> {
-        let open = self.list_open_pull_requests(tenant).await?;
-        match state {
-            None | Some(PullRequestState::Open) => Ok(open),
-            Some(_) => Ok(Vec::new()),
-        }
+        self.list_pull_requests(tenant, Some(PullRequestState::Open))
+            .await
     }
 
     /// Merges the PR. When `expected_head_sha` is `Some`, the forge must refuse the merge if the
@@ -503,9 +459,7 @@ pub trait ForgeProvider: Send + Sync {
     /// An existing repository is never modified. It is adopted only when the forge reports the
     /// requested owner/name (a renamed or transferred repository answered through a redirect is
     /// refused) and, when `opts.private` is set, reports it as private; otherwise
-    /// [`ForgeError::InvalidInput`]. An adopted repository may have been pre-created by someone
-    /// else: callers must reconcile its collaborators and deploy keys ([`Self::list_deploy_keys`],
-    /// [`Self::remove_collaborator`]) before trusting it.
+    /// [`ForgeError::InvalidInput`].
     async fn ensure_named_repository(
         &self,
         _owner: &str,
@@ -513,11 +467,6 @@ pub trait ForgeProvider: Send + Sync {
         _opts: &RepositoryOptions,
     ) -> Result<RepositoryInfo, ForgeError> {
         Err(ForgeError::unsupported("ensure_named_repository"))
-    }
-
-    /// Transport of the read-only per-repository credential this forge issues.
-    fn read_credential_kind(&self) -> Result<RepoCredentialKind, ForgeError> {
-        Err(ForgeError::unsupported("read_credential_kind"))
     }
 
     /// Mints a read-only token that works on `repo` only (Forgejo 15+: `read:repository` token
@@ -588,24 +537,6 @@ pub trait ForgeProvider: Send + Sync {
         Err(ForgeError::unsupported("revoke_deploy_key"))
     }
 
-    /// Removes every deploy key of `repo` whose fingerprint equals `fingerprint`
-    /// (`SHA256:<base64>`, as returned by [`crate::ssh_public_key_fingerprint`]). Returns the
-    /// number of keys removed.
-    async fn revoke_deploy_keys_by_fingerprint(
-        &self,
-        repo: &RepositoryTarget,
-        fingerprint: &str,
-    ) -> Result<usize, ForgeError> {
-        let mut removed = 0;
-        for key in self.list_deploy_keys(repo).await? {
-            if key.fingerprint.as_deref() == Some(fingerprint) {
-                self.revoke_deploy_key(repo, &key.id).await?;
-                removed += 1;
-            }
-        }
-        Ok(removed)
-    }
-
     /// Protects [`PROTECTED_MAIN_BRANCH`] of `repo`: no direct or force pushes and no deletion
     /// (also for repository admins), changes only through merged PRs/MRs, no required approvals
     /// (Keel merges after its own checks).
@@ -627,36 +558,6 @@ pub trait ForgeProvider: Send + Sync {
         _repo: &RepositoryTarget,
     ) -> Result<ForkPolicyOutcome, ForgeError> {
         Err(ForgeError::unsupported("disable_forks"))
-    }
-
-    /// Grants `username` read-only access to `repo` (D1: tenant users may read, never push), then
-    /// verifies the user's effective access: organisation owner, team, base-permission or
-    /// inherited group access above read fails with [`ForgeError::ElevatedAccess`] (the direct
-    /// grant may already have been set). `Added`/`Updated`/`Unchanged`/`Invited` therefore mean
-    /// the user has at most read access.
-    async fn ensure_read_collaborator(
-        &self,
-        _repo: &RepositoryTarget,
-        _username: &str,
-    ) -> Result<CollaboratorOutcome, ForgeError> {
-        Err(ForgeError::unsupported("ensure_read_collaborator"))
-    }
-
-    /// Removes `username`'s direct access to `repo` (GitHub: also cancels pending
-    /// invitations). Not being a collaborator is success. Access that remains through the
-    /// organisation, teams or group membership fails with [`ForgeError::ElevatedAccess`] (the
-    /// direct grant has been removed by then).
-    async fn remove_collaborator(
-        &self,
-        _repo: &RepositoryTarget,
-        _username: &str,
-    ) -> Result<(), ForgeError> {
-        Err(ForgeError::unsupported("remove_collaborator"))
-    }
-
-    /// Lists the forks of `repo` (fails closed instead of truncating).
-    async fn list_forks(&self, _repo: &RepositoryTarget) -> Result<Vec<ForkInfo>, ForgeError> {
-        Err(ForgeError::unsupported("list_forks"))
     }
 
     /// The forge's published SSH host public keys (one OpenSSH `<type> <base64>` line each) for
@@ -707,10 +608,9 @@ mod tests {
         assert_eq!(PullRequestState::Closed.to_string(), "closed");
 
         let req = CreatePrRequest::new("Title", "Body", "feature/custom-branch")
-            .with_target_branch("release")
             .with_tenant("team-sec")
             .with_author("Ops <ops@keel.io>");
-        assert_eq!(req.target_branch, "release");
+        assert_eq!(req.target_branch, "main");
         assert_eq!(req.tenant.as_deref(), Some("team-sec"));
         assert_eq!(req.author.as_deref(), Some("Ops <ops@keel.io>"));
 

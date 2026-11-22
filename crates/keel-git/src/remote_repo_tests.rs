@@ -1,7 +1,7 @@
 //! Mock-HTTP tests for the per-repository forge operations (`remote_repo.rs`).
 
 use super::*;
-use crate::forge::RepoCredentialKind;
+use crate::http::LIST_PAGE_SIZE;
 use crate::ssh_keys::generate_ed25519_key_pair;
 use crate::test_http::{request_body, request_line, spawn_mock_http_server};
 
@@ -52,21 +52,6 @@ fn helpers_validate_ids_segments_and_plan_deploy_keys() {
     }
     assert!(RepositoryTarget::new("o", "%2e%2e").is_err());
     assert!(RepositoryTarget::new("team/../x", "r").is_err());
-
-    assert_eq!(effective_permission(None), "none");
-    assert_eq!(
-        effective_permission(Some(&json!({"permission": "admin", "role_name": "admin"}))),
-        "admin"
-    );
-    assert_eq!(
-        effective_permission(Some(&json!({"permission": "read", "role_name": "triage"}))),
-        "triage"
-    );
-    assert_eq!(
-        effective_permission(Some(&json!({"permission": "none", "role_name": "read"}))),
-        "none"
-    );
-    assert_eq!(effective_permission(Some(&json!({}))), "unknown");
 
     assert!(repo_read_token_name("keel-tenant-repo-acme").is_ok());
     for bad in ["t", "keel-tenant-repo-", "keel-tenant-repo-a\nb", " "] {
@@ -232,10 +217,6 @@ async fn forgejo_for_repository_scopes_pr_calls_and_keeps_credentials() {
             Err(ForgeError::InvalidInput(_))
         ));
     }
-    assert_eq!(
-        p.read_credential_kind().unwrap(),
-        RepoCredentialKind::HttpsToken
-    );
 }
 
 #[tokio::test]
@@ -624,9 +605,8 @@ async fn forgejo_deploy_keys_are_matched_by_fingerprint() {
         Err(ForgeError::InvalidInput(_))
     ));
 
-    // List + revoke (404 = ok) + revoke by fingerprint.
-    let (url, handle) =
-        spawn_mock_http_server(vec![
+    // List + revoke (404 = ok).
+    let (url, handle) = spawn_mock_http_server(vec![
         r(
             200,
             json!([key_json(1, &pk, true), key_json(2, &other, true), {"id": 3, "key": "garbage"}])
@@ -634,10 +614,8 @@ async fn forgejo_deploy_keys_are_matched_by_fingerprint() {
         ),
         r(404, "{}"),
         r(403, r#"{"message":"forbidden"}"#),
-        r(200, json!([key_json(1, &pk, true), key_json(2, &other, false)]).to_string()),
-        r(204, ""),
     ])
-        .await;
+    .await;
     let p = ForgejoGiteaProvider::new(&url, "o", "r", "tok").unwrap();
     let keys = p.list_deploy_keys(&repo).await.unwrap();
     assert_eq!(keys.len(), 3);
@@ -648,15 +626,9 @@ async fn forgejo_deploy_keys_are_matched_by_fingerprint() {
         p.revoke_deploy_key(&repo, "1").await,
         Err(ForgeError::Api { status: 403, .. })
     ));
-    assert_eq!(
-        p.revoke_deploy_keys_by_fingerprint(&repo, &fp)
-            .await
-            .unwrap(),
-        1
-    );
     let reqs = handle.await.unwrap();
     assert_eq!(
-        request_line(&reqs[4]),
+        request_line(&reqs[1]),
         "DELETE /api/v1/repos/keel-tenants/tenant-acme/keys/1 HTTP/1.1"
     );
 }
@@ -782,100 +754,9 @@ async fn forgejo_fork_policy_is_the_instance_setting() {
 }
 
 #[tokio::test]
-async fn forgejo_read_collaborators_and_forks() {
-    let repo = target("keel-tenants", "tenant-acme");
-    let read = r#"{"permission":"read","role_name":"read"}"#;
-    let (url, handle) = spawn_mock_http_server(vec![
-        // Added (then effective permission re-read)
-        r(404, "{}"),
-        r(204, ""),
-        r(200, read),
-        // Unchanged
-        r(204, ""),
-        r(200, read),
-        // Updated (write -> read)
-        r(204, ""),
-        r(200, r#"{"permission":"write"}"#),
-        r(204, ""),
-        r(200, read),
-        // Error
-        r(404, "{}"),
-        r(403, r#"{"message":"no"}"#),
-        // Remove: 204 then no access left; 404 (not a collaborator) then no access left
-        r(204, ""),
-        r(200, r#"{"permission":"none"}"#),
-        r(404, "{}"),
-        r(404, "{}"),
-        // Forks
-        r(
-            200,
-            r#"[{"full_name":"alice/tenant-acme","html_url":"https://f/alice/tenant-acme"},{"name":"no-full-name"}]"#,
-        ),
-    ])
-    .await;
-    let p = ForgejoGiteaProvider::new(&url, "o", "r", "tok").unwrap();
-    assert_eq!(
-        p.ensure_read_collaborator(&repo, "alice").await.unwrap(),
-        CollaboratorOutcome::Added
-    );
-    assert_eq!(
-        p.ensure_read_collaborator(&repo, "alice").await.unwrap(),
-        CollaboratorOutcome::Unchanged
-    );
-    assert_eq!(
-        p.ensure_read_collaborator(&repo, "alice").await.unwrap(),
-        CollaboratorOutcome::Updated
-    );
-    assert!(matches!(
-        p.ensure_read_collaborator(&repo, "alice").await,
-        Err(ForgeError::Api { status: 403, .. })
-    ));
-    p.remove_collaborator(&repo, "alice").await.unwrap();
-    p.remove_collaborator(&repo, "alice").await.unwrap();
-    let forks = p.list_forks(&repo).await.unwrap();
-    assert_eq!(
-        forks,
-        vec![ForkInfo {
-            full_name: "alice/tenant-acme".to_string(),
-            html_url: Some("https://f/alice/tenant-acme".to_string()),
-        }]
-    );
-    let reqs = handle.await.unwrap();
-    assert_eq!(
-        request_line(&reqs[0]),
-        "GET /api/v1/repos/keel-tenants/tenant-acme/collaborators/alice HTTP/1.1"
-    );
-    assert_eq!(
-        request_line(&reqs[1]),
-        "PUT /api/v1/repos/keel-tenants/tenant-acme/collaborators/alice HTTP/1.1"
-    );
-    assert_eq!(request_body(&reqs[1]), json!({"permission": "read"}));
-    assert_eq!(
-        request_line(&reqs[2]),
-        "GET /api/v1/repos/keel-tenants/tenant-acme/collaborators/alice/permission HTTP/1.1"
-    );
-    assert_eq!(
-        request_line(&reqs[11]),
-        "DELETE /api/v1/repos/keel-tenants/tenant-acme/collaborators/alice HTTP/1.1"
-    );
-    assert_eq!(
-        request_line(&reqs[12]),
-        "GET /api/v1/repos/keel-tenants/tenant-acme/collaborators/alice/permission HTTP/1.1"
-    );
-    assert!(
-        request_line(&reqs[15]).starts_with("GET /api/v1/repos/keel-tenants/tenant-acme/forks?")
-    );
-    for bad in ["a/b", "%2e%2e", ".%2E", "%2f", "."] {
-        assert!(matches!(
-            p.ensure_read_collaborator(&repo, bad).await,
-            Err(ForgeError::InvalidInput(_))
-        ));
-        assert!(matches!(
-            p.remove_collaborator(&repo, bad).await,
-            Err(ForgeError::InvalidInput(_))
-        ));
-    }
-    // A crafted owner/name on a hand-built target never reaches the forge either.
+async fn forgejo_crafted_targets_never_reach_the_forge() {
+    // Port 9 (discard) is never contacted: validation fails before any request.
+    let p = ForgejoGiteaProvider::new("http://127.0.0.1:9", "o", "r", "tok").unwrap();
     let crafted = RepositoryTarget {
         owner: "%2e%2e".to_string(),
         name: "r".to_string(),
@@ -886,7 +767,7 @@ async fn forgejo_read_collaborators_and_forks() {
         Err(ForgeError::InvalidInput(_))
     ));
     assert!(matches!(
-        p.remove_collaborator(&crafted, "alice").await,
+        p.revoke_deploy_key(&crafted, "1").await,
         Err(ForgeError::InvalidInput(_))
     ));
     for (o, n) in [("%2e%2e", "r"), ("o", ".%2E"), ("o", "."), ("o", "a%2fb")] {
@@ -898,95 +779,20 @@ async fn forgejo_read_collaborators_and_forks() {
 }
 
 #[tokio::test]
-async fn forgejo_collaborator_with_organisation_access_fails_closed() {
-    let repo = target("keel-tenants", "tenant-acme");
-    let (url, handle) = spawn_mock_http_server(vec![
-        // Direct grant set to read, but the user is an organisation owner.
-        r(204, ""),
-        r(200, r#"{"permission":"owner","role_name":"owner"}"#),
-        r(204, ""),
-        r(200, r#"{"permission":"owner","role_name":"owner"}"#),
-        // New collaborator who is in a write team.
-        r(404, "{}"),
-        r(204, ""),
-        r(200, r#"{"permission":"write","role_name":"write"}"#),
-        // Removal leaves team access.
-        r(204, ""),
-        r(200, r#"{"permission":"write","role_name":"write"}"#),
-    ])
-    .await;
-    let p = ForgejoGiteaProvider::new(&url, "o", "r", "tok").unwrap();
-    for expected in ["owner", "write"] {
-        let err = p
-            .ensure_read_collaborator(&repo, "alice")
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(&err, ForgeError::ElevatedAccess { user, permission, .. } if user == "alice" && permission == expected),
-            "{err}"
-        );
-    }
-    let err = p.remove_collaborator(&repo, "alice").await.unwrap_err();
-    assert!(
-        matches!(&err, ForgeError::ElevatedAccess { repository, .. } if repository == "keel-tenants/tenant-acme"),
-        "{err}"
-    );
-    assert_eq!(handle.await.unwrap().len(), 9);
-}
-
-#[tokio::test]
 async fn listings_follow_full_pages() {
     let page: Vec<Value> = (0..LIST_PAGE_SIZE)
-        .map(|i| json!({"full_name": format!("u{i}/r")}))
+        .map(|i| json!({"id": i + 1, "key": "garbage"}))
         .collect();
     let (url, handle) = spawn_mock_http_server(vec![
         r(200, Value::Array(page).to_string()),
-        r(200, r#"[{"full_name":"last/r"}]"#),
+        r(200, r#"[{"id": 999, "key": "garbage"}]"#),
     ])
     .await;
     let p = ForgejoGiteaProvider::new(&url, "o", "r", "tok").unwrap();
-    let forks = p.list_forks(&target("o", "r")).await.unwrap();
-    assert_eq!(forks.len(), LIST_PAGE_SIZE + 1);
+    let keys = p.list_deploy_keys(&target("o", "r")).await.unwrap();
+    assert_eq!(keys.len(), LIST_PAGE_SIZE + 1);
     let reqs = handle.await.unwrap();
     assert!(request_line(&reqs[1]).contains("page=2"));
-}
-
-/// Forgejo 15 unregisters `GET .../forks` while `DISABLE_FORKS` is set (plain-text 404).
-#[tokio::test]
-async fn forgejo_forks_listing_with_forks_disabled_uses_forks_count() {
-    let route_gone = || r(404, "404 page not found");
-    let (url, handle) = spawn_mock_http_server(vec![
-        // No forks: empty listing.
-        route_gone(),
-        r(200, r#"{"name":"r","owner":{"login":"o"},"forks_count":0}"#),
-        // Forks created before DISABLE_FORKS was set cannot be listed: fail closed.
-        route_gone(),
-        r(200, r#"{"name":"r","owner":{"login":"o"},"forks_count":2}"#),
-        // No forks_count reported: fail closed.
-        route_gone(),
-        r(200, r#"{"name":"r","owner":{"login":"o"}}"#),
-        // Missing repository stays NotFound.
-        route_gone(),
-        r(404, r#"{"message":"The target couldn't be found."}"#),
-    ])
-    .await;
-    let p = ForgejoGiteaProvider::new(&url, "o", "r", "tok").unwrap();
-    let repo = target("o", "r");
-    assert!(p.list_forks(&repo).await.unwrap().is_empty());
-    let err = p.list_forks(&repo).await.unwrap_err().to_string();
-    assert!(
-        err.contains("2 fork(s)") && err.contains("DISABLE_FORKS"),
-        "{err}"
-    );
-    let err = p.list_forks(&repo).await.unwrap_err().to_string();
-    assert!(err.contains("an unknown number of fork(s)"), "{err}");
-    assert!(matches!(
-        p.list_forks(&repo).await,
-        Err(ForgeError::NotFound(_))
-    ));
-    let reqs = handle.await.unwrap();
-    assert!(request_line(&reqs[0]).starts_with("GET /api/v1/repos/o/r/forks?"));
-    assert_eq!(request_line(&reqs[1]), "GET /api/v1/repos/o/r HTTP/1.1");
 }
 
 // ----------------------------------------------------------------------------
@@ -996,10 +802,6 @@ async fn forgejo_forks_listing_with_forks_disabled_uses_forks_count() {
 #[tokio::test]
 async fn github_for_repository_credentials_and_named_repository() {
     let p0 = GitHubProvider::new("https://api.github.com", "acme", "infra", "gh-tok").unwrap();
-    assert_eq!(
-        p0.read_credential_kind().unwrap(),
-        RepoCredentialKind::SshDeployKey
-    );
     let repo = target("acme", "tenant-a");
     assert!(matches!(
         p0.create_repo_read_token(&repo, "t").await,
@@ -1318,117 +1120,6 @@ async fn github_fork_policy_per_repository() {
     assert_eq!(reqs.len(), 9);
 }
 
-#[tokio::test]
-async fn github_collaborators_invitations_and_forks() {
-    let repo = target("acme", "tenant-a");
-    let read = r#"{"permission":"read","role_name":"read"}"#;
-    let (url, handle) = spawn_mock_http_server(vec![
-        // Invited (201): no access until accepted
-        r(404, "{}"),
-        r(201, r#"{"id":5}"#),
-        r(200, r#"{"permission":"none","role_name":"none"}"#),
-        // Added (204)
-        r(404, "{}"),
-        r(204, ""),
-        r(200, read),
-        // Unchanged
-        r(204, ""),
-        r(200, read),
-        // Updated (direct admin -> pull)
-        r(204, ""),
-        r(200, r#"{"permission":"admin","role_name":"admin"}"#),
-        r(204, ""),
-        r(200, read),
-        // Remove: collaborator 204, invitations listing, cancel alice's invitation, no access left
-        r(204, ""),
-        r(
-            200,
-            r#"[{"id":5,"invitee":{"login":"Alice"}},{"id":6,"invitee":{"login":"bob"}}]"#,
-        ),
-        r(204, ""),
-        r(404, "{}"),
-        // Forks
-        r(200, r#"[{"full_name":"mallory/tenant-a","html_url":"https://github.com/mallory/tenant-a"}]"#),
-    ])
-    .await;
-    let p = GitHubProvider::new(&url, "acme", "infra", "gh-tok").unwrap();
-    for expected in [
-        CollaboratorOutcome::Invited,
-        CollaboratorOutcome::Added,
-        CollaboratorOutcome::Unchanged,
-        CollaboratorOutcome::Updated,
-    ] {
-        assert_eq!(
-            p.ensure_read_collaborator(&repo, "alice").await.unwrap(),
-            expected
-        );
-    }
-    p.remove_collaborator(&repo, "alice").await.unwrap();
-    assert_eq!(p.list_forks(&repo).await.unwrap().len(), 1);
-    let reqs = handle.await.unwrap();
-    assert_eq!(
-        request_line(&reqs[1]),
-        "PUT /repos/acme/tenant-a/collaborators/alice HTTP/1.1"
-    );
-    assert_eq!(request_body(&reqs[1]), json!({"permission": "pull"}));
-    assert_eq!(
-        request_line(&reqs[2]),
-        "GET /repos/acme/tenant-a/collaborators/alice/permission HTTP/1.1"
-    );
-    assert_eq!(
-        request_line(&reqs[12]),
-        "DELETE /repos/acme/tenant-a/collaborators/alice HTTP/1.1"
-    );
-    assert!(request_line(&reqs[13]).starts_with("GET /repos/acme/tenant-a/invitations?"));
-    assert_eq!(
-        request_line(&reqs[14]),
-        "DELETE /repos/acme/tenant-a/invitations/5 HTTP/1.1"
-    );
-    assert_eq!(
-        request_line(&reqs[15]),
-        "GET /repos/acme/tenant-a/collaborators/alice/permission HTTP/1.1"
-    );
-    assert!(request_line(&reqs[16]).starts_with("GET /repos/acme/tenant-a/forks?"));
-}
-
-#[tokio::test]
-async fn github_collaborator_with_team_or_org_access_fails_closed() {
-    let repo = target("acme", "tenant-a");
-    let (url, handle) = spawn_mock_http_server(vec![
-        // Org admin: direct `pull` set, effective admin remains.
-        r(204, ""),
-        r(200, r#"{"permission":"admin","role_name":"admin"}"#),
-        r(204, ""),
-        r(200, r#"{"permission":"admin","role_name":"admin"}"#),
-        // Triage through a team is more than read.
-        r(204, ""),
-        r(200, r#"{"permission":"read","role_name":"triage"}"#),
-        r(204, ""),
-        r(200, r#"{"permission":"read","role_name":"triage"}"#),
-        // Removal: base permission keeps write access.
-        r(204, ""),
-        r(200, "[]"),
-        r(200, r#"{"permission":"write","role_name":"write"}"#),
-    ])
-    .await;
-    let p = GitHubProvider::new(&url, "acme", "infra", "gh-tok").unwrap();
-    for expected in ["admin", "triage"] {
-        let err = p
-            .ensure_read_collaborator(&repo, "alice")
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(&err, ForgeError::ElevatedAccess { permission, .. } if permission == expected),
-            "{err}"
-        );
-    }
-    assert!(matches!(
-        p.remove_collaborator(&repo, "alice").await,
-        Err(ForgeError::ElevatedAccess { .. })
-    ));
-    assert_eq!(handle.await.unwrap().len(), 11);
-}
-
 // ----------------------------------------------------------------------------
 // GitLab
 // ----------------------------------------------------------------------------
@@ -1458,10 +1149,6 @@ async fn gitlab_for_repository_and_named_repository() {
     ])
     .await;
     let p = GitLabProvider::new(&url, "team/infra", "gl-tok").unwrap();
-    assert_eq!(
-        p.read_credential_kind().unwrap(),
-        RepoCredentialKind::HttpsToken
-    );
     let scoped = p.for_repository("team/tenants", "tenant-a").unwrap();
     scoped.list_open_pull_requests(None).await.unwrap();
     let existing = p
@@ -1795,7 +1482,7 @@ async fn gitlab_main_protection_deletes_and_recreates_default_rule() {
 }
 
 #[tokio::test]
-async fn gitlab_forks_and_members() {
+async fn gitlab_disable_forks() {
     let repo = target("team", "tenant-a");
     let (url, handle) = spawn_mock_http_server(vec![
         // disable_forks: enabled -> PUT
@@ -1803,32 +1490,6 @@ async fn gitlab_forks_and_members() {
         r(200, r#"{"forking_access_level":"disabled"}"#),
         // already disabled
         r(200, r#"{"forking_access_level":"disabled"}"#),
-        // ensure member: Added (then effective level checked)
-        r(200, r#"[{"id":11,"username":"alice"}]"#),
-        r(404, "{}"),
-        r(201, r#"{"id":11,"access_level":20}"#),
-        r(200, r#"{"id":11,"access_level":20}"#),
-        // Updated (developer -> reporter)
-        r(200, r#"[{"id":11,"username":"alice"}]"#),
-        r(200, r#"{"id":11,"access_level":30}"#),
-        r(200, r#"{"id":11,"access_level":20}"#),
-        r(200, r#"{"id":11,"access_level":20}"#),
-        // Unchanged
-        r(200, r#"[{"id":11,"username":"alice"}]"#),
-        r(200, r#"{"id":11,"access_level":20}"#),
-        r(200, r#"{"id":11,"access_level":20}"#),
-        // Unknown user
-        r(200, r#"[{"id":12,"username":"alice2"}]"#),
-        // Remove: unknown user is a no-op; known user DELETE (404 ok), no access left
-        r(200, "[]"),
-        r(200, r#"[{"id":11,"username":"alice"}]"#),
-        r(404, "{}"),
-        r(404, "{}"),
-        // forks
-        r(
-            200,
-            r#"[{"path_with_namespace":"mallory/tenant-a","web_url":"https://gl/mallory/tenant-a"}]"#,
-        ),
     ])
     .await;
     let p = GitLabProvider::new(&url, "team/infra", "gl-tok").unwrap();
@@ -1840,24 +1501,6 @@ async fn gitlab_forks_and_members() {
         p.disable_forks(&repo).await.unwrap(),
         ForkPolicyOutcome::AlreadyDisabled
     );
-    for expected in [
-        CollaboratorOutcome::Added,
-        CollaboratorOutcome::Updated,
-        CollaboratorOutcome::Unchanged,
-    ] {
-        assert_eq!(
-            p.ensure_read_collaborator(&repo, "alice").await.unwrap(),
-            expected
-        );
-    }
-    assert!(matches!(
-        p.ensure_read_collaborator(&repo, "alice").await,
-        Err(ForgeError::NotFound(ref u)) if u == "alice"
-    ));
-    p.remove_collaborator(&repo, "alice").await.unwrap();
-    p.remove_collaborator(&repo, "alice").await.unwrap();
-    let forks = p.list_forks(&repo).await.unwrap();
-    assert_eq!(forks[0].full_name, "mallory/tenant-a");
     let reqs = handle.await.unwrap();
     assert_eq!(
         request_line(&reqs[1]),
@@ -1867,88 +1510,4 @@ async fn gitlab_forks_and_members() {
         request_body(&reqs[1]),
         json!({"forking_access_level": "disabled"})
     );
-    assert_eq!(
-        request_line(&reqs[3]),
-        "GET /api/v4/users?username=alice HTTP/1.1"
-    );
-    assert_eq!(
-        request_line(&reqs[5]),
-        "POST /api/v4/projects/team%2Ftenant-a/members HTTP/1.1"
-    );
-    assert_eq!(
-        request_body(&reqs[5]),
-        json!({"user_id": 11, "access_level": 20})
-    );
-    assert_eq!(
-        request_line(&reqs[6]),
-        "GET /api/v4/projects/team%2Ftenant-a/members/all/11 HTTP/1.1"
-    );
-    assert_eq!(
-        request_line(&reqs[9]),
-        "PUT /api/v4/projects/team%2Ftenant-a/members/11 HTTP/1.1"
-    );
-    assert_eq!(
-        request_line(&reqs[17]),
-        "DELETE /api/v4/projects/team%2Ftenant-a/members/11 HTTP/1.1"
-    );
-    assert_eq!(
-        request_line(&reqs[18]),
-        "GET /api/v4/projects/team%2Ftenant-a/members/all/11 HTTP/1.1"
-    );
-    assert!(request_line(&reqs[19]).starts_with("GET /api/v4/projects/team%2Ftenant-a/forks?"));
-}
-
-#[tokio::test]
-async fn gitlab_member_with_inherited_access_fails_closed() {
-    let repo = target("team", "tenant-a");
-    let alice = r#"[{"id":11,"username":"alice"}]"#;
-    let (url, handle) = spawn_mock_http_server(vec![
-        // Direct Reporter, but inherited Maintainer: not Unchanged.
-        r(200, alice),
-        r(200, r#"{"id":11,"access_level":20}"#),
-        r(200, r#"{"id":11,"access_level":40}"#),
-        // No direct membership; GitLab refuses the lower direct grant with 400.
-        r(200, alice),
-        r(404, "{}"),
-        r(
-            400,
-            r#"{"message":{"access_level":["should be greater than or equal to Developer inherited membership from group team"]}}"#,
-        ),
-        r(200, r#"{"id":11,"access_level":30}"#),
-        // A 400 for another reason surfaces as is.
-        r(200, alice),
-        r(404, "{}"),
-        r(400, r#"{"message":"bad request"}"#),
-        r(200, r#"{"id":11,"access_level":20}"#),
-        // Removal leaves inherited access.
-        r(200, alice),
-        r(204, ""),
-        r(200, r#"{"id":11,"access_level":30}"#),
-    ])
-    .await;
-    let p = GitLabProvider::new(&url, "team/infra", "gl-tok").unwrap();
-    for expected in ["access_level 40", "access_level 30"] {
-        let err = p
-            .ensure_read_collaborator(&repo, "alice")
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(&err, ForgeError::ElevatedAccess { permission, .. } if permission == expected),
-            "{err}"
-        );
-    }
-    assert!(matches!(
-        p.ensure_read_collaborator(&repo, "alice").await,
-        Err(ForgeError::Api { status: 400, .. })
-    ));
-    assert!(matches!(
-        p.remove_collaborator(&repo, "alice").await,
-        Err(ForgeError::ElevatedAccess { .. })
-    ));
-    let reqs = handle.await.unwrap();
-    assert_eq!(reqs.len(), 14);
-    assert!(matches!(
-        p.ensure_read_collaborator(&repo, "%2e%2e").await,
-        Err(ForgeError::InvalidInput(_))
-    ));
 }

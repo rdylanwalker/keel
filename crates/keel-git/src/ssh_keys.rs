@@ -11,12 +11,6 @@ use zeroize::Zeroizing;
 
 use crate::forge::ForgeError;
 
-/// GitHub's SSH-over-HTTPS-port endpoint, for networks that block outbound port 22 (D6).
-/// Its host keys are the same as `github.com`'s (`GET /meta` `ssh_keys`).
-pub const GITHUB_SSH_FALLBACK_HOST: &str = "ssh.github.com";
-/// Port of [`GITHUB_SSH_FALLBACK_HOST`].
-pub const GITHUB_SSH_FALLBACK_PORT: u16 = 443;
-
 /// A freshly generated ed25519 key pair in OpenSSH format. `Debug` never prints the private key.
 pub struct GeneratedSshKeyPair {
     /// OpenSSH private key (`-----BEGIN OPENSSH PRIVATE KEY-----`, LF line endings, unencrypted).
@@ -251,7 +245,7 @@ mod tests {
             format!("github.com {HOST_KEY}")
         );
         assert_eq!(
-            known_hosts_line(GITHUB_SSH_FALLBACK_HOST, GITHUB_SSH_FALLBACK_PORT, HOST_KEY).unwrap(),
+            known_hosts_line("ssh.github.com", 443, HOST_KEY).unwrap(),
             format!("[ssh.github.com]:443 {HOST_KEY}")
         );
         assert_eq!(

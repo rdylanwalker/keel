@@ -660,7 +660,7 @@ pub async fn rollback_management_addon(
         for sha in commits {
             let Some(prev_raw) = state
                 .git_runner
-                .show_file_at_ref(&state.repo_workdir, &sha, &manifest.rel_path)
+                .read_file_at_ref(&state.repo_workdir, &sha, &manifest.rel_path)
                 .await?
             else {
                 continue;

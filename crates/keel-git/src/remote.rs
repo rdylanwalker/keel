@@ -10,13 +10,14 @@ use std::time::Duration;
 
 use std::sync::Arc;
 
+use crate::http::{PageCap, fetch_pages, get_optional};
 use crate::remote_repo::ExistingRepo;
 
 use crate::forge::{
-    BranchProtectionOutcome, CollaboratorOutcome, CreatePrRequest, DeployKeyInfo, EnsuredDeployKey,
-    ForgeError, ForgeProvider, ForkInfo, ForkPolicyOutcome, PullRequestInfo, PullRequestState,
-    RepoCredentialKind, RepoReadToken, RepoReadTokenInfo, RepositoryEnsureOutcome, RepositoryInfo,
-    RepositoryOptions, RepositoryTarget, matches_tenant, validate_commit_sha,
+    BranchProtectionOutcome, CreatePrRequest, DeployKeyInfo, EnsuredDeployKey, ForgeError,
+    ForgeProvider, ForkPolicyOutcome, PullRequestInfo, PullRequestState, RepoReadToken,
+    RepoReadTokenInfo, RepositoryEnsureOutcome, RepositoryInfo, RepositoryOptions,
+    RepositoryTarget, matches_tenant, validate_commit_sha,
 };
 use crate::git::parse_proposal_branch_tenant;
 
@@ -327,54 +328,14 @@ impl ForgejoGiteaProvider {
         })
     }
 
-    /// Returns the base repository API endpoint URL.
-    pub fn repo_api_url(&self) -> String {
-        format!(
-            "{}/api/v1/repos/{}/{}",
-            self.base_url, self.owner, self.repo
-        )
+    /// `{base_url}/api/v1{path}`: every Forgejo/Gitea REST URL is built here.
+    pub(crate) fn api(&self, path: &str) -> String {
+        format!("{}/api/v1{path}", self.base_url)
     }
 
-    /// Mints a personal access token for the basic-auth user (`POST /api/v1/users/{user}/tokens`).
-    /// Forgejo/Gitea only accept basic auth on this endpoint, so token-authenticated providers
-    /// return [`ForgeError::InvalidInput`].
-    pub async fn create_access_token(
-        &self,
-        name: &str,
-        scopes: &[&str],
-    ) -> Result<String, ForgeError> {
-        let ForgejoAuth::Basic { username, .. } = &self.auth else {
-            return Err(ForgeError::InvalidInput(
-                "minting a Forgejo/Gitea access token requires basic auth".to_string(),
-            ));
-        };
-        if name.trim().is_empty() {
-            return Err(ForgeError::InvalidInput(
-                "access token name must not be empty".to_string(),
-            ));
-        }
-        let user = validate_slug(username, "username")?;
-        let resp = self
-            .authorized(
-                self.client
-                    .post(format!("{}/api/v1/users/{user}/tokens", self.base_url)),
-            )
-            .json(&serde_json::json!({ "name": name, "scopes": scopes }))
-            .send()
-            .await?;
-        if !resp.status().is_success() {
-            return Err(map_error_response(resp, Some("access token"), false).await);
-        }
-        let body: serde_json::Value = resp.json().await?;
-        body.get("sha1")
-            .or_else(|| body.get("token"))
-            .and_then(serde_json::Value::as_str)
-            .filter(|s| !s.is_empty())
-            .map(ToOwned::to_owned)
-            .ok_or_else(|| ForgeError::Api {
-                status: 200,
-                message: "Forgejo access token response missing token field".to_string(),
-            })
+    /// Returns the base repository API endpoint URL.
+    pub fn repo_api_url(&self) -> String {
+        self.api(&format!("/repos/{}/{}", self.owner, self.repo))
     }
 
     /// Builds an authenticated `reqwest::RequestBuilder` with Forgejo/Gitea token (or basic) auth.
@@ -434,42 +395,6 @@ struct GiteaGitHubPrResponse {
     updated_at: DateTime<Utc>,
     #[serde(default)]
     merge_commit_sha: Option<String>,
-}
-
-/// Page size requested from forge list endpoints (GitHub/GitLab cap at 100, Gitea at its
-/// configured `MAX_RESPONSE_ITEMS`, default 50).
-pub(crate) const LIST_PAGE_SIZE: usize = 50;
-
-/// Hard cap on pages fetched per listing (`LIST_PAGE_SIZE * MAX_LIST_PAGES` PRs) so a huge or
-/// misbehaving forge cannot pin a request handler; truncation is logged.
-pub(crate) const MAX_LIST_PAGES: usize = 40;
-
-/// Returns `true` when an RFC 8288 `Link` header advertises a `rel="next"` page.
-pub(crate) fn link_header_has_next(headers: &reqwest::header::HeaderMap) -> bool {
-    headers
-        .get_all(reqwest::header::LINK)
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .flat_map(|v| v.split(','))
-        .any(|part| {
-            part.split(';')
-                .skip(1)
-                .any(|p| matches!(p.trim(), "rel=\"next\"" | "rel=next"))
-        })
-}
-
-/// Decides whether another page must be fetched: an explicit `next` link wins; otherwise a full
-/// page implies more results (Gitea does not always emit `Link` headers).
-pub(crate) fn page_has_more(batch_len: usize, has_next_link: bool) -> bool {
-    batch_len > 0 && (has_next_link || batch_len >= LIST_PAGE_SIZE)
-}
-
-fn warn_list_truncated(what: &str, fetched: usize) {
-    tracing::warn!(
-        fetched,
-        max_pages = MAX_LIST_PAGES,
-        "Forge listing of {what} truncated at page cap; older entries are omitted"
-    );
 }
 
 fn rewrite_local_forge_url(base_url: &str, html_url: String) -> String {
@@ -623,26 +548,15 @@ where
         Some(PullRequestState::Open) => "open",
         Some(PullRequestState::Closed | PullRequestState::Merged) => "closed",
     };
-    let mut items: Vec<GiteaGitHubPrResponse> = Vec::new();
-    for page in 1..=MAX_LIST_PAGES {
-        let url = format!(
-            "{repo_api_url}/pulls?state={state_param}&{page_size_param}={LIST_PAGE_SIZE}&page={page}"
-        );
-        let resp = authorize(client.get(&url)).send().await?;
-        if !resp.status().is_success() {
-            return Err(map_error_response(resp, None, false).await);
-        }
-        let has_next_link = link_header_has_next(resp.headers());
-        let batch: Vec<GiteaGitHubPrResponse> = resp.json().await?;
-        let batch_len = batch.len();
-        items.extend(batch);
-        if !page_has_more(batch_len, has_next_link) {
-            break;
-        }
-        if page == MAX_LIST_PAGES {
-            warn_list_truncated("pull requests", items.len());
-        }
-    }
+    let items: Vec<GiteaGitHubPrResponse> = fetch_pages(
+        client,
+        &format!("{repo_api_url}/pulls?state={state_param}"),
+        page_size_param,
+        authorize,
+        "pull requests",
+        PageCap::TruncateWithWarning,
+    )
+    .await?;
     let prs = items
         .into_iter()
         .map(|item| item.into_pr_info(None, base_url))
@@ -715,14 +629,6 @@ impl ForgeProvider for ForgejoGiteaProvider {
             markdown_report,
         )
         .await
-    }
-
-    async fn list_open_pull_requests(
-        &self,
-        tenant: Option<&str>,
-    ) -> Result<Vec<PullRequestInfo>, ForgeError> {
-        self.list_pull_requests(tenant, Some(PullRequestState::Open))
-            .await
     }
 
     async fn list_pull_requests(
@@ -833,10 +739,6 @@ impl ForgeProvider for ForgejoGiteaProvider {
             .await
     }
 
-    fn read_credential_kind(&self) -> Result<RepoCredentialKind, ForgeError> {
-        Ok(RepoCredentialKind::HttpsToken)
-    }
-
     /// Requires a basic-auth provider for the token-owning bot (Forgejo mints tokens only as
     /// the owner over basic auth) and Forgejo 15+ (repository-specific tokens; Gitea fails
     /// closed).
@@ -902,26 +804,6 @@ impl ForgeProvider for ForgejoGiteaProvider {
     ) -> Result<ForkPolicyOutcome, ForgeError> {
         self.repo_fork_policy().await
     }
-
-    async fn ensure_read_collaborator(
-        &self,
-        repo: &RepositoryTarget,
-        username: &str,
-    ) -> Result<CollaboratorOutcome, ForgeError> {
-        self.ensure_repo_read_collaborator(repo, username).await
-    }
-
-    async fn remove_collaborator(
-        &self,
-        repo: &RepositoryTarget,
-        username: &str,
-    ) -> Result<(), ForgeError> {
-        self.remove_repo_collaborator(repo, username).await
-    }
-
-    async fn list_forks(&self, repo: &RepositoryTarget) -> Result<Vec<ForkInfo>, ForgeError> {
-        self.list_repo_forks(repo).await
-    }
 }
 
 // ============================================================================
@@ -972,9 +854,14 @@ impl GitHubProvider {
         })
     }
 
+    /// `{base_url}{path}`: every GitHub REST URL is built here.
+    pub(crate) fn api(&self, path: &str) -> String {
+        format!("{}{path}", self.base_url)
+    }
+
     /// Returns the base repository API endpoint URL.
     pub fn repo_api_url(&self) -> String {
-        format!("{}/repos/{}/{}", self.base_url, self.owner, self.repo)
+        self.api(&format!("/repos/{}/{}", self.owner, self.repo))
     }
 
     /// Builds an authenticated `reqwest::RequestBuilder` with GitHub REST v3 headers.
@@ -1033,14 +920,6 @@ impl ForgeProvider for GitHubProvider {
             markdown_report,
         )
         .await
-    }
-
-    async fn list_open_pull_requests(
-        &self,
-        tenant: Option<&str>,
-    ) -> Result<Vec<PullRequestInfo>, ForgeError> {
-        self.list_pull_requests(tenant, Some(PullRequestState::Open))
-            .await
     }
 
     async fn list_pull_requests(
@@ -1140,10 +1019,6 @@ impl ForgeProvider for GitHubProvider {
             .await
     }
 
-    fn read_credential_kind(&self) -> Result<RepoCredentialKind, ForgeError> {
-        Ok(RepoCredentialKind::SshDeployKey)
-    }
-
     /// GitHub has no repository-scoped read token for a PAT owner; use a read-only deploy key
     /// ([`ForgeProvider::ensure_deploy_key`]).
     async fn create_repo_read_token(
@@ -1196,28 +1071,34 @@ impl ForgeProvider for GitHubProvider {
         self.disable_repo_forks(repo).await
     }
 
-    async fn ensure_read_collaborator(
-        &self,
-        repo: &RepositoryTarget,
-        username: &str,
-    ) -> Result<CollaboratorOutcome, ForgeError> {
-        self.ensure_repo_read_collaborator(repo, username).await
-    }
-
-    async fn remove_collaborator(
-        &self,
-        repo: &RepositoryTarget,
-        username: &str,
-    ) -> Result<(), ForgeError> {
-        self.remove_repo_collaborator(repo, username).await
-    }
-
+    /// GitHub's published SSH host keys (`GET /meta` `ssh_keys`), for building `known_hosts`
+    /// without trusting on first use.
     async fn ssh_host_keys(&self) -> Result<Vec<String>, ForgeError> {
-        GitHubProvider::ssh_host_keys(self).await
-    }
-
-    async fn list_forks(&self, repo: &RepositoryTarget) -> Result<Vec<ForkInfo>, ForgeError> {
-        self.list_repo_forks(repo).await
+        let meta = get_optional(
+            &self.client,
+            &self.api("/meta"),
+            |b| self.authorized(b),
+            "meta",
+        )
+        .await?
+        .unwrap_or(serde_json::Value::Null);
+        let keys: Vec<String> = meta
+            .get("ssh_keys")
+            .and_then(serde_json::Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .filter_map(|k| crate::ssh_keys::normalize_ssh_public_key(k).ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if keys.is_empty() {
+            return Err(ForgeError::Api {
+                status: 200,
+                message: "GitHub /meta returned no usable ssh_keys".to_string(),
+            });
+        }
+        Ok(keys)
     }
 }
 
@@ -1269,9 +1150,14 @@ impl GitLabProvider {
         })
     }
 
+    /// `{base_url}/api/v4{path}`: every GitLab REST URL is built here.
+    pub(crate) fn api(&self, path: &str) -> String {
+        format!("{}/api/v4{path}", self.base_url)
+    }
+
     /// Returns the base GitLab REST v4 project API URL.
     pub fn project_api_url(&self) -> String {
-        format!("{}/api/v4/projects/{}", self.base_url, self.encoded_project)
+        self.api(&format!("/projects/{}", self.encoded_project))
     }
 
     /// Builds an authenticated `reqwest::RequestBuilder` with `PRIVATE-TOKEN` header.
@@ -1419,14 +1305,6 @@ impl ForgeProvider for GitLabProvider {
         Ok(())
     }
 
-    async fn list_open_pull_requests(
-        &self,
-        tenant: Option<&str>,
-    ) -> Result<Vec<PullRequestInfo>, ForgeError> {
-        self.list_pull_requests(tenant, Some(PullRequestState::Open))
-            .await
-    }
-
     async fn list_pull_requests(
         &self,
         tenant: Option<&str>,
@@ -1438,32 +1316,18 @@ impl ForgeProvider for GitLabProvider {
             Some(PullRequestState::Merged) => "merged",
             Some(PullRequestState::Closed) => "closed",
         };
-        let mut items: Vec<GitLabMrResponse> = Vec::new();
-        for page in 1..=MAX_LIST_PAGES {
-            let url = format!(
-                "{}/merge_requests?state={state_param}&per_page={LIST_PAGE_SIZE}&page={page}",
+        let items: Vec<GitLabMrResponse> = fetch_pages(
+            &self.client,
+            &format!(
+                "{}/merge_requests?state={state_param}",
                 self.project_api_url()
-            );
-            let resp = self.authorized(self.client.get(&url)).send().await?;
-            if !resp.status().is_success() {
-                return Err(map_error_response(resp, None, false).await);
-            }
-            let has_next = link_header_has_next(resp.headers())
-                || resp
-                    .headers()
-                    .get("x-next-page")
-                    .and_then(|v| v.to_str().ok())
-                    .is_some_and(|v| !v.trim().is_empty());
-            let batch: Vec<GitLabMrResponse> = resp.json().await?;
-            let batch_len = batch.len();
-            items.extend(batch);
-            if !page_has_more(batch_len, has_next) {
-                break;
-            }
-            if page == MAX_LIST_PAGES {
-                warn_list_truncated("merge requests", items.len());
-            }
-        }
+            ),
+            "per_page",
+            |b| self.authorized(b),
+            "merge requests",
+            PageCap::TruncateWithWarning,
+        )
+        .await?;
         let prs = items
             .into_iter()
             .map(|item| item.into_pr_info(None))
@@ -1564,10 +1428,6 @@ impl ForgeProvider for GitLabProvider {
             .await
     }
 
-    fn read_credential_kind(&self) -> Result<RepoCredentialKind, ForgeError> {
-        Ok(RepoCredentialKind::HttpsToken)
-    }
-
     async fn create_repo_read_token(
         &self,
         repo: &RepositoryTarget,
@@ -1630,31 +1490,12 @@ impl ForgeProvider for GitLabProvider {
     ) -> Result<ForkPolicyOutcome, ForgeError> {
         self.disable_repo_forks(repo).await
     }
-
-    async fn ensure_read_collaborator(
-        &self,
-        repo: &RepositoryTarget,
-        username: &str,
-    ) -> Result<CollaboratorOutcome, ForgeError> {
-        self.ensure_repo_read_collaborator(repo, username).await
-    }
-
-    async fn remove_collaborator(
-        &self,
-        repo: &RepositoryTarget,
-        username: &str,
-    ) -> Result<(), ForgeError> {
-        self.remove_repo_collaborator(repo, username).await
-    }
-
-    async fn list_forks(&self, repo: &RepositoryTarget) -> Result<Vec<ForkInfo>, ForgeError> {
-        self.list_repo_forks(repo).await
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::http::LIST_PAGE_SIZE;
     use crate::test_http::{request_line, spawn_mock_http_server};
     use base64::Engine as _;
 
@@ -1781,24 +1622,6 @@ mod tests {
         let reqs = handle.await.unwrap();
         assert!(reqs[0].contains("limit=50&page=1"));
         assert!(reqs[1].contains("limit=50&page=2"));
-
-        let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert(
-            reqwest::header::LINK,
-            r#"<https://api.github.com/x?page=2>; rel="next", <https://api.github.com/x?page=9>; rel="last""#
-                .parse()
-                .unwrap(),
-        );
-        assert!(link_header_has_next(&headers));
-        headers.insert(
-            reqwest::header::LINK,
-            r#"<https://api.github.com/x?page=1>; rel="prev""#.parse().unwrap(),
-        );
-        assert!(!link_header_has_next(&headers));
-        assert!(page_has_more(LIST_PAGE_SIZE, false));
-        assert!(page_has_more(3, true));
-        assert!(!page_has_more(3, false));
-        assert!(!page_has_more(0, true));
     }
 
     #[tokio::test]

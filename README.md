@@ -234,7 +234,7 @@ flowchart TB
     GUI <-->|"REST + SSE"| API
     CLI <-->|"REST / Local Bootstrap"| API
     API -->|"OIDC PKCE"| OIDC
-    API -->|"git CLI (SSH/HTTPS) + Forge API"| FORGE
+    API -->|"git CLI (HTTPS) + Forge API"| FORGE
     API <-->|"Watch CRDs & Previews"| FLUX
     API <-->|"Watch Stacks & Diffs"| PKO
     FORGE -->|"Poll / Webhook"| FLUX

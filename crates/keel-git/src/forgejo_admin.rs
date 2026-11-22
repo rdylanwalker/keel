@@ -23,6 +23,7 @@ use serde_json::{Value, json};
 pub use crate::forge::RepositoryTarget;
 
 use crate::forge::ForgeError;
+use crate::http::{PageCap, delete_ignoring_missing, fetch_pages};
 use crate::remote::{ForgejoAuth, ForgejoGiteaProvider, map_error_response, validate_slug};
 
 /// Result of an idempotent `ensure_*` call.
@@ -259,14 +260,7 @@ struct IdOnly {
     id: i64,
 }
 
-const PAGE_LIMIT: usize = 50;
-const MAX_PAGES: usize = 20;
-
 impl ForgejoGiteaProvider {
-    pub(crate) fn api(&self, path: &str) -> String {
-        format!("{}/api/v1{path}", self.base_url)
-    }
-
     pub(crate) fn basic_auth_username(&self, action: &str) -> Result<String, ForgeError> {
         match &self.auth {
             ForgejoAuth::Basic { username, .. } => validate_slug(username, "username"),
@@ -276,55 +270,80 @@ impl ForgejoGiteaProvider {
         }
     }
 
-    /// `GET`s every page of a list endpoint (`page`/`limit` query parameters).
+    /// `GET`s every page of a list endpoint; fails closed instead of truncating.
     pub(crate) async fn get_all<T: DeserializeOwned>(
         &self,
         path: &str,
         what: &str,
     ) -> Result<Vec<T>, ForgeError> {
-        let sep = if path.contains('?') { '&' } else { '?' };
-        let mut out = Vec::new();
-        for page in 1..=MAX_PAGES {
-            let resp = self
-                .authorized(
-                    self.client
-                        .get(self.api(&format!("{path}{sep}page={page}&limit={PAGE_LIMIT}"))),
-                )
-                .send()
-                .await?;
-            if !resp.status().is_success() {
-                return Err(map_error_response(resp, Some(what), false).await);
-            }
-            let items: Vec<T> = resp.json().await?;
-            let n = items.len();
-            out.extend(items);
-            if n < PAGE_LIMIT {
-                return Ok(out);
-            }
-        }
-        Err(ForgeError::Api {
-            status: 200,
-            message: format!(
-                "more than {} {what} entries; refusing to act on a partial listing",
-                PAGE_LIMIT * MAX_PAGES
-            ),
-        })
+        fetch_pages(
+            &self.client,
+            &self.api(path),
+            "limit",
+            |b| self.authorized(b),
+            what,
+            PageCap::FailClosed,
+        )
+        .await
     }
 
     /// `DELETE`, treating 404 as already deleted.
-    pub(crate) async fn delete_ignoring_missing(
+    async fn delete_path(&self, path: &str, what: &str) -> Result<(), ForgeError> {
+        delete_ignoring_missing(&self.client, &self.api(path), |b| self.authorized(b), what).await
+    }
+
+    /// Validates a token-minting request: requires basic auth (Forgejo/Gitea only mint tokens over
+    /// basic auth) and a non-empty `name`. Returns the basic-auth username.
+    fn token_minting_user(&self, action: &str, name: &str) -> Result<String, ForgeError> {
+        let user = self.basic_auth_username(action)?;
+        if name.trim().is_empty() {
+            return Err(ForgeError::InvalidInput(
+                "access token name must not be empty".to_string(),
+            ));
+        }
+        Ok(user)
+    }
+
+    /// `POST /api/v1/users/{user}/tokens` with `body` plus `name`. Returns the response JSON.
+    async fn post_user_token(
         &self,
-        path: &str,
-        what: &str,
-    ) -> Result<(), ForgeError> {
+        user: &str,
+        name: &str,
+        mut body: Value,
+    ) -> Result<Value, ForgeError> {
+        body["name"] = Value::from(name);
         let resp = self
-            .authorized(self.client.delete(self.api(path)))
+            .authorized(self.client.post(self.api(&format!("/users/{user}/tokens"))))
+            .json(&body)
             .send()
             .await?;
-        if resp.status().is_success() || resp.status() == StatusCode::NOT_FOUND {
-            return Ok(());
+        if !resp.status().is_success() {
+            return Err(map_error_response(resp, Some("access token"), false).await);
         }
-        Err(map_error_response(resp, Some(what), false).await)
+        Ok(resp.json().await?)
+    }
+
+    /// Mints a personal access token for the basic-auth user (`POST /api/v1/users/{user}/tokens`).
+    /// Forgejo/Gitea only accept basic auth on this endpoint, so token-authenticated providers
+    /// return [`ForgeError::InvalidInput`].
+    pub async fn create_access_token(
+        &self,
+        name: &str,
+        scopes: &[&str],
+    ) -> Result<String, ForgeError> {
+        let user = self.token_minting_user("minting a Forgejo/Gitea access token", name)?;
+        let body = self
+            .post_user_token(&user, name, json!({ "scopes": scopes }))
+            .await?;
+        body.get("sha1")
+            .or_else(|| body.get("token"))
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| ForgeError::Api {
+                status: 200,
+                message: "Forgejo access token response missing token field".to_string(),
+            })
     }
 
     /// Returns the login of the authenticated account (`GET /api/v1/user`). Used to verify that
@@ -716,11 +735,8 @@ impl ForgejoGiteaProvider {
                 continue;
             }
             let login = validate_slug(&current, "username")?;
-            self.delete_ignoring_missing(
-                &format!("/teams/{team_id}/members/{login}"),
-                "team member",
-            )
-            .await?;
+            self.delete_path(&format!("/teams/{team_id}/members/{login}"), "team member")
+                .await?;
             removed.push(login);
         }
         for member in members {
@@ -742,12 +758,7 @@ impl ForgejoGiteaProvider {
         scopes: &[&str],
         repositories: &[RepositoryTarget],
     ) -> Result<MintedAccessToken, ForgeError> {
-        let user = self.basic_auth_username("minting a repository-scoped token")?;
-        if name.trim().is_empty() {
-            return Err(ForgeError::InvalidInput(
-                "access token name must not be empty".to_string(),
-            ));
-        }
+        let user = self.token_minting_user("minting a repository-scoped token", name)?;
         if repositories.is_empty() {
             return Err(ForgeError::InvalidInput(
                 "a repository-scoped token needs at least one repository".to_string(),
@@ -757,15 +768,14 @@ impl ForgejoGiteaProvider {
             .iter()
             .map(|r| json!({ "owner": r.owner, "name": r.name }))
             .collect();
-        let resp = self
-            .authorized(self.client.post(self.api(&format!("/users/{user}/tokens"))))
-            .json(&json!({ "name": name, "scopes": scopes, "repositories": targets }))
-            .send()
-            .await?;
-        if !resp.status().is_success() {
-            return Err(map_error_response(resp, Some("access token"), false).await);
-        }
-        let body: TokenResponse = resp.json().await?;
+        let body: TokenResponse = serde_json::from_value(
+            self.post_user_token(
+                &user,
+                name,
+                json!({ "scopes": scopes, "repositories": targets }),
+            )
+            .await?,
+        )?;
         let token = body.sha1.filter(|s| !s.is_empty());
         let wanted: BTreeSet<String> = repositories
             .iter()
@@ -827,7 +837,7 @@ impl ForgejoGiteaProvider {
     /// A missing token (404) counts as deleted.
     pub async fn delete_access_token(&self, id: i64) -> Result<(), ForgeError> {
         let user = self.basic_auth_username("deleting an access token")?;
-        self.delete_ignoring_missing(&format!("/users/{user}/tokens/{id}"), "access token")
+        self.delete_path(&format!("/users/{user}/tokens/{id}"), "access token")
             .await
     }
 
@@ -857,7 +867,7 @@ impl ForgejoGiteaProvider {
         ] {
             let items: Vec<IdOnly> = self.get_all(list, what).await?;
             for item in items {
-                self.delete_ignoring_missing(&format!("{list}/{}", item.id), what)
+                self.delete_path(&format!("{list}/{}", item.id), what)
                     .await?;
                 *counter += 1;
             }
@@ -1245,15 +1255,15 @@ mod tests {
         let reqs = h.await.unwrap();
         assert_eq!(
             request_line(&reqs[0]),
-            "GET /api/v1/orgs/keel-tenants/teams?page=1&limit=50 HTTP/1.1"
+            "GET /api/v1/orgs/keel-tenants/teams?limit=50&page=1 HTTP/1.1"
         );
         assert_eq!(
             request_line(&reqs[1]),
-            "GET /api/v1/teams/1/members?page=1&limit=50 HTTP/1.1"
+            "GET /api/v1/teams/1/members?limit=50&page=1 HTTP/1.1"
         );
         assert_eq!(
             request_line(&reqs[2]),
-            "GET /api/v1/teams/5/repos?page=1&limit=50 HTTP/1.1"
+            "GET /api/v1/teams/5/repos?limit=50&page=1 HTTP/1.1"
         );
 
         // Squatted: the creator is still an owner -> error.
@@ -1399,13 +1409,13 @@ mod tests {
         assert_eq!(
             lines,
             vec![
-                "GET /api/v1/users/keel-tenant-reader/tokens?page=1&limit=50 HTTP/1.1",
+                "GET /api/v1/users/keel-tenant-reader/tokens?limit=50&page=1 HTTP/1.1",
                 "DELETE /api/v1/users/keel-tenant-reader/tokens/22 HTTP/1.1",
-                "GET /api/v1/user/keys?page=1&limit=50 HTTP/1.1",
+                "GET /api/v1/user/keys?limit=50&page=1 HTTP/1.1",
                 "DELETE /api/v1/user/keys/31 HTTP/1.1",
-                "GET /api/v1/user/gpg_keys?page=1&limit=50 HTTP/1.1",
+                "GET /api/v1/user/gpg_keys?limit=50&page=1 HTTP/1.1",
                 "DELETE /api/v1/user/gpg_keys/41 HTTP/1.1",
-                "GET /api/v1/user/applications/oauth2?page=1&limit=50 HTTP/1.1",
+                "GET /api/v1/user/applications/oauth2?limit=50&page=1 HTTP/1.1",
             ]
         );
 
@@ -1444,7 +1454,7 @@ mod tests {
         let reqs = h.await.unwrap();
         assert_eq!(
             request_line(&reqs[0]),
-            "GET /api/v1/orgs/keel-tenants/teams?page=1&limit=50 HTTP/1.1"
+            "GET /api/v1/orgs/keel-tenants/teams?limit=50&page=1 HTTP/1.1"
         );
         assert_eq!(
             request_line(&reqs[1]),

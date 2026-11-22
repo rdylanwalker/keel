@@ -624,9 +624,7 @@ pub fn provisioning_error(tenant: &str, repo: &str, step: &str, err: ForgeError)
     let msg =
         format!("tenant `{tenant}` repository `{repo}`: {step} failed: {err}; retry the request");
     match err {
-        ForgeError::InvalidInput(_) | ForgeError::ElevatedAccess { .. } => {
-            ServerError::Conflict(msg)
-        }
+        ForgeError::InvalidInput(_) => ServerError::Conflict(msg),
         _ => ServerError::ServiceUnavailable(msg),
     }
 }

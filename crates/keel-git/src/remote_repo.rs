@@ -1,25 +1,26 @@
 //! Per-repository forge operations for per-tenant repositories (`SDD.md` §3.2): repository
 //! creation with explicit owner resolution, read-only credentials (repository-scoped tokens,
-//! deploy keys), `main` protection, fork policy and read-only collaborators.
+//! deploy keys), `main` protection and fork policy.
 //!
 //! These are inherent `pub(crate)` helpers; the `ForgeProvider` impls in [`crate::remote`]
 //! delegate to them. REST wrappers only: no git transport, no secrets in logs or errors.
 
 use std::sync::Arc;
 
-use reqwest::{Client, RequestBuilder, Response, StatusCode};
-use serde::de::DeserializeOwned;
+use reqwest::{Client, RequestBuilder, StatusCode};
 use serde_json::{Value, json};
 
 use crate::forge::{
-    BranchProtectionOutcome, CollaboratorOutcome, DeployKeyInfo, DeployKeyOutcome,
-    EnsuredDeployKey, ForgeError, ForgeProvider, ForkInfo, ForkPolicyOutcome,
-    PROTECTED_MAIN_BRANCH, REPO_READ_TOKEN_NAME_PREFIX, RepoReadToken, RepoReadTokenInfo,
-    RepositoryEnsureOutcome, RepositoryInfo, RepositoryOptions, RepositoryTarget,
+    BranchProtectionOutcome, DeployKeyInfo, DeployKeyOutcome, EnsuredDeployKey, ForgeError,
+    ForgeProvider, ForkPolicyOutcome, PROTECTED_MAIN_BRANCH, REPO_READ_TOKEN_NAME_PREFIX,
+    RepoReadToken, RepoReadTokenInfo, RepositoryEnsureOutcome, RepositoryInfo, RepositoryOptions,
+    RepositoryTarget,
+};
+use crate::http::{
+    PageCap, delete_ignoring_missing, error_for, fetch_pages, get_optional, json_body,
 };
 use crate::remote::{
-    ForgejoGiteaProvider, GitHubProvider, GitLabProvider, LIST_PAGE_SIZE, MAX_LIST_PAGES,
-    link_header_has_next, map_error_response, page_has_more, url_encode_project_path,
+    ForgejoGiteaProvider, GitHubProvider, GitLabProvider, url_encode_project_path,
 };
 use crate::ssh_keys::{normalize_ssh_public_key, ssh_public_key_fingerprint};
 
@@ -78,102 +79,6 @@ fn flat_repo_path(repo: &RepositoryTarget) -> Result<String, ForgeError> {
     ))
 }
 
-async fn error_for(resp: Response, what: &str) -> ForgeError {
-    map_error_response(resp, Some(what), false).await
-}
-
-/// Parses a (possibly empty) JSON body.
-async fn json_body(resp: Response) -> Result<Value, ForgeError> {
-    let text = resp.text().await?;
-    if text.trim().is_empty() {
-        return Ok(Value::Null);
-    }
-    Ok(serde_json::from_str(&text)?)
-}
-
-/// `GET` returning `Some(json)` on success and `None` on 404.
-async fn get_optional<F>(
-    client: &Client,
-    url: &str,
-    authorize: F,
-    what: &str,
-) -> Result<Option<Value>, ForgeError>
-where
-    F: Fn(RequestBuilder) -> RequestBuilder,
-{
-    let resp = authorize(client.get(url)).send().await?;
-    if resp.status() == StatusCode::NOT_FOUND {
-        return Ok(None);
-    }
-    if !resp.status().is_success() {
-        return Err(error_for(resp, what).await);
-    }
-    Ok(Some(json_body(resp).await?))
-}
-
-/// `GET`s every page of a list endpoint; fails closed instead of truncating, because callers
-/// act on the complete set (stray deploy keys, forks, ...).
-async fn fetch_all_pages<T, F>(
-    client: &Client,
-    url: &str,
-    page_size_param: &str,
-    authorize: F,
-    what: &str,
-) -> Result<Vec<T>, ForgeError>
-where
-    T: DeserializeOwned,
-    F: Fn(RequestBuilder) -> RequestBuilder,
-{
-    let sep = if url.contains('?') { '&' } else { '?' };
-    let mut out = Vec::new();
-    for page in 1..=MAX_LIST_PAGES {
-        let resp = authorize(client.get(format!(
-            "{url}{sep}{page_size_param}={LIST_PAGE_SIZE}&page={page}"
-        )))
-        .send()
-        .await?;
-        if !resp.status().is_success() {
-            return Err(error_for(resp, what).await);
-        }
-        let has_next = link_header_has_next(resp.headers())
-            || resp
-                .headers()
-                .get("x-next-page")
-                .and_then(|v| v.to_str().ok())
-                .is_some_and(|v| !v.trim().is_empty());
-        let batch: Vec<T> = resp.json().await?;
-        let n = batch.len();
-        out.extend(batch);
-        if !page_has_more(n, has_next) {
-            return Ok(out);
-        }
-    }
-    Err(ForgeError::Api {
-        status: 200,
-        message: format!(
-            "more than {} {what}; refusing to act on a partial listing",
-            LIST_PAGE_SIZE * MAX_LIST_PAGES
-        ),
-    })
-}
-
-/// `DELETE`, treating 404 as already gone.
-async fn delete_ignoring_missing<F>(
-    client: &Client,
-    url: &str,
-    authorize: F,
-    what: &str,
-) -> Result<(), ForgeError>
-where
-    F: Fn(RequestBuilder) -> RequestBuilder,
-{
-    let resp = authorize(client.delete(url)).send().await?;
-    if resp.status().is_success() || resp.status() == StatusCode::NOT_FOUND {
-        return Ok(());
-    }
-    Err(error_for(resp, what).await)
-}
-
 /// Fails with `InvalidInput` when [`PROTECTED_MAIN_BRANCH`] does not exist yet: Forgejo and
 /// GitLab would protect the missing branch and then reject Keel's own initial push, and GitHub
 /// answers the protection call with a bare 404.
@@ -195,14 +100,6 @@ where
         )));
     }
     Ok(())
-}
-
-fn elevated(user: &str, repo: &RepositoryTarget, permission: &str) -> ForgeError {
-    ForgeError::ElevatedAccess {
-        user: user.to_string(),
-        repository: repo.full_name(),
-        permission: permission.to_string(),
-    }
 }
 
 /// Forge ids are numbers on every supported forge; accept both JSON numbers and strings.
@@ -361,24 +258,6 @@ fn verify_existing(
     Ok(info)
 }
 
-/// Effective permission from a Forgejo/Gitea/GitHub `GET .../collaborators/{u}/permission` body
-/// (`None` = 404). GitHub's `role_name` (read, triage, write, maintain, admin or a custom role)
-/// is more precise than `permission` (admin/write/read/none); `permission: none` always wins.
-/// Unknown shapes are reported as `unknown`, which callers treat as elevated (fail closed).
-fn effective_permission(v: Option<&Value>) -> String {
-    let Some(v) = v else {
-        return "none".to_string();
-    };
-    let permission = str_field(v, "permission");
-    if permission.as_deref() == Some("none") {
-        return "none".to_string();
-    }
-    str_field(v, "role_name")
-        .or(permission)
-        .unwrap_or_else(|| "unknown".to_string())
-        .to_ascii_lowercase()
-}
-
 /// Validates a token name minted by `create_repo_read_token`: it must carry
 /// [`REPO_READ_TOKEN_NAME_PREFIX`] (Stage 0 deletes every other token of the Forgejo bot) and be
 /// printable.
@@ -409,12 +288,13 @@ async fn flat_list_deploy_keys<F>(
 where
     F: Fn(RequestBuilder) -> RequestBuilder,
 {
-    let raw: Vec<Value> = fetch_all_pages(
+    let raw: Vec<Value> = fetch_pages(
         client,
         &format!("{repo_api}/keys"),
         page_size_param,
         authorize,
         "deploy keys",
+        PageCap::FailClosed,
     )
     .await?;
     Ok(raw
@@ -496,34 +376,6 @@ where
         },
         outcome,
     })
-}
-
-async fn flat_list_forks<F>(
-    client: &Client,
-    repo_api: &str,
-    page_size_param: &str,
-    authorize: F,
-) -> Result<Vec<ForkInfo>, ForgeError>
-where
-    F: Fn(RequestBuilder) -> RequestBuilder,
-{
-    let raw: Vec<Value> = fetch_all_pages(
-        client,
-        &format!("{repo_api}/forks"),
-        page_size_param,
-        authorize,
-        "forks",
-    )
-    .await?;
-    Ok(raw
-        .iter()
-        .filter_map(|f| {
-            Some(ForkInfo {
-                full_name: str_field(f, "full_name")?,
-                html_url: str_field(f, "html_url"),
-            })
-        })
-        .collect())
 }
 
 // ============================================================================
@@ -870,102 +722,6 @@ impl ForgejoGiteaProvider {
             ))
         }
     }
-
-    /// Effective permission of `url`'s user (`GET .../collaborators/{u}/permission`), which
-    /// includes organisation owner and team access.
-    async fn effective_permission(&self, collaborator_url: &str) -> Result<String, ForgeError> {
-        let perm = get_optional(
-            &self.client,
-            &format!("{collaborator_url}/permission"),
-            |b| self.authorized(b),
-            "collaborator permission",
-        )
-        .await?;
-        Ok(effective_permission(perm.as_ref()))
-    }
-
-    /// Grants direct `read`, then re-reads the effective permission: access through the
-    /// organisation (owners, teams) cannot be lowered per repository and fails with
-    /// [`ForgeError::ElevatedAccess`] instead of reporting a read-only user.
-    pub(crate) async fn ensure_repo_read_collaborator(
-        &self,
-        repo: &RepositoryTarget,
-        username: &str,
-    ) -> Result<CollaboratorOutcome, ForgeError> {
-        let user = single_segment(username, "username")?;
-        let url = format!("{}/collaborators/{user}", self.repo_api_for(repo)?);
-        let authorize = |b| self.authorized(b);
-        let is_collaborator = get_optional(&self.client, &url, authorize, "collaborator")
-            .await?
-            .is_some();
-        if is_collaborator && self.effective_permission(&url).await? == "read" {
-            return Ok(CollaboratorOutcome::Unchanged);
-        }
-        let resp = authorize(self.client.put(&url))
-            .json(&json!({ "permission": "read" }))
-            .send()
-            .await?;
-        if !resp.status().is_success() {
-            return Err(error_for(resp, "collaborator").await);
-        }
-        let effective = self.effective_permission(&url).await?;
-        if !matches!(effective.as_str(), "read" | "none") {
-            return Err(elevated(&user, repo, &effective));
-        }
-        Ok(if is_collaborator {
-            CollaboratorOutcome::Updated
-        } else {
-            CollaboratorOutcome::Added
-        })
-    }
-
-    /// Removes the direct grant, then fails with [`ForgeError::ElevatedAccess`] when the user
-    /// still has access through the organisation (owners, teams).
-    pub(crate) async fn remove_repo_collaborator(
-        &self,
-        repo: &RepositoryTarget,
-        username: &str,
-    ) -> Result<(), ForgeError> {
-        let user = single_segment(username, "username")?;
-        let url = format!("{}/collaborators/{user}", self.repo_api_for(repo)?);
-        delete_ignoring_missing(&self.client, &url, |b| self.authorized(b), "collaborator").await?;
-        let effective = self.effective_permission(&url).await?;
-        if effective != "none" {
-            return Err(elevated(&user, repo, &effective));
-        }
-        Ok(())
-    }
-
-    /// Forgejo removes the `GET .../forks` route entirely while `[repository] DISABLE_FORKS` is
-    /// set (plain-text `404 page not found`, even for site admins). A 404 is therefore resolved
-    /// through the repository object: no repository stays [`ForgeError::NotFound`];
-    /// `forks_count: 0` means there are no forks; forks created before the setting was enabled
-    /// (or a missing `forks_count`) fail closed, because they cannot be listed.
-    pub(crate) async fn list_repo_forks(
-        &self,
-        repo: &RepositoryTarget,
-    ) -> Result<Vec<ForkInfo>, ForgeError> {
-        let repo_api = self.repo_api_for(repo)?;
-        let authorize = |b| self.authorized(b);
-        let err = match flat_list_forks(&self.client, &repo_api, "limit", authorize).await {
-            Err(err @ ForgeError::NotFound(_)) => err,
-            other => return other,
-        };
-        let Some(info) = get_optional(&self.client, &repo_api, authorize, "repository").await?
-        else {
-            return Err(err);
-        };
-        match info.get("forks_count").and_then(Value::as_u64) {
-            Some(0) => Ok(Vec::new()),
-            count => Err(ForgeError::Api {
-                status: 404,
-                message: format!(
-                    "repository '{repo}' reports {} fork(s) but Forgejo/Gitea does not list forks while `[repository] DISABLE_FORKS` is set; review them in the Forgejo UI or temporarily re-enable forks",
-                    count.map_or_else(|| "an unknown number of".to_string(), |c| c.to_string())
-                ),
-            }),
-        }
-    }
 }
 
 // ============================================================================
@@ -1052,10 +808,6 @@ fn github_fork_policy_refusal(body: &str) -> bool {
 }
 
 impl GitHubProvider {
-    fn api(&self, path: &str) -> String {
-        format!("{}{path}", self.base_url)
-    }
-
     fn repo_api_for(&self, repo: &RepositoryTarget) -> Result<String, ForgeError> {
         Ok(self.api(&format!("/repos/{}", flat_repo_path(repo)?)))
     }
@@ -1084,19 +836,6 @@ impl GitHubProvider {
             status: 200,
             message: "GitHub /user response has no login".to_string(),
         })
-    }
-
-    /// Effective permission (`GET .../collaborators/{u}/permission`, `role_name`), including
-    /// organisation owner, team and base-permission access.
-    async fn effective_permission(&self, collaborator_url: &str) -> Result<String, ForgeError> {
-        let perm = get_optional(
-            &self.client,
-            &format!("{collaborator_url}/permission"),
-            |b| self.authorized(b),
-            "collaborator permission",
-        )
-        .await?;
-        Ok(effective_permission(perm.as_ref()))
     }
 
     /// `GET /users/{owner}` reports `type: Organization|User`; a user must be the token owner.
@@ -1206,36 +945,6 @@ impl GitHubProvider {
             info.default_branch = wanted;
         }
         Ok(info)
-    }
-
-    /// GitHub's published SSH host keys (`GET /meta` `ssh_keys`), for building `known_hosts`
-    /// without trusting on first use. They also apply to [`crate::GITHUB_SSH_FALLBACK_HOST`].
-    pub async fn ssh_host_keys(&self) -> Result<Vec<String>, ForgeError> {
-        let meta = get_optional(
-            &self.client,
-            &self.api("/meta"),
-            |b| self.authorized(b),
-            "meta",
-        )
-        .await?
-        .unwrap_or(Value::Null);
-        let keys: Vec<String> = meta
-            .get("ssh_keys")
-            .and_then(Value::as_array)
-            .map(|a| {
-                a.iter()
-                    .filter_map(Value::as_str)
-                    .filter_map(|k| normalize_ssh_public_key(k).ok())
-                    .collect()
-            })
-            .unwrap_or_default();
-        if keys.is_empty() {
-            return Err(ForgeError::Api {
-                status: 200,
-                message: "GitHub /meta returned no usable ssh_keys".to_string(),
-            });
-        }
-        Ok(keys)
     }
 
     pub(crate) async fn list_repo_deploy_keys(
@@ -1398,104 +1107,6 @@ impl GitHubProvider {
             ))
         }
     }
-
-    pub(crate) async fn ensure_repo_read_collaborator(
-        &self,
-        repo: &RepositoryTarget,
-        username: &str,
-    ) -> Result<CollaboratorOutcome, ForgeError> {
-        let user = single_segment(username, "username")?;
-        let url = format!("{}/collaborators/{user}", self.repo_api_for(repo)?);
-        let authorize = |b| self.authorized(b);
-        // 204 = collaborator (also through teams, base permission or ownership), 404 = not.
-        let is_collaborator = get_optional(&self.client, &url, authorize, "collaborator")
-            .await?
-            .is_some();
-        if is_collaborator && self.effective_permission(&url).await? == "read" {
-            return Ok(CollaboratorOutcome::Unchanged);
-        }
-        let resp = authorize(self.client.put(&url))
-            .json(&json!({ "permission": "pull" }))
-            .send()
-            .await?;
-        let status = resp.status();
-        if !status.is_success() {
-            return Err(error_for(resp, "collaborator").await);
-        }
-        // Organisation owners, teams and the base permission are not lowered by a direct grant.
-        // A pending invitee has no access yet (`none`).
-        let effective = self.effective_permission(&url).await?;
-        if !matches!(effective.as_str(), "read" | "none") {
-            return Err(elevated(&user, repo, &effective));
-        }
-        Ok(if is_collaborator {
-            CollaboratorOutcome::Updated
-        } else if status == StatusCode::CREATED {
-            CollaboratorOutcome::Invited
-        } else {
-            CollaboratorOutcome::Added
-        })
-    }
-
-    pub(crate) async fn remove_repo_collaborator(
-        &self,
-        repo: &RepositoryTarget,
-        username: &str,
-    ) -> Result<(), ForgeError> {
-        let user = single_segment(username, "username")?;
-        let repo_api = self.repo_api_for(repo)?;
-        let authorize = |b| self.authorized(b);
-        delete_ignoring_missing(
-            &self.client,
-            &format!("{repo_api}/collaborators/{user}"),
-            authorize,
-            "collaborator",
-        )
-        .await?;
-        // A pending invitation would grant access once accepted: cancel it too.
-        let invitations: Vec<Value> = fetch_all_pages(
-            &self.client,
-            &format!("{repo_api}/invitations"),
-            "per_page",
-            authorize,
-            "invitations",
-        )
-        .await?;
-        for inv in invitations.iter().filter(|i| {
-            i.get("invitee")
-                .and_then(|u| u.get("login"))
-                .and_then(Value::as_str)
-                .is_some_and(|l| l.eq_ignore_ascii_case(&user))
-        }) {
-            if let Some(id) = inv.get("id").and_then(id_string) {
-                delete_ignoring_missing(
-                    &self.client,
-                    &format!("{repo_api}/invitations/{id}"),
-                    authorize,
-                    "invitation",
-                )
-                .await?;
-            }
-        }
-        // Team, base-permission or owner access survives removing the direct grant.
-        let effective = self
-            .effective_permission(&format!("{repo_api}/collaborators/{user}"))
-            .await?;
-        if effective != "none" {
-            return Err(elevated(&user, repo, &effective));
-        }
-        Ok(())
-    }
-
-    pub(crate) async fn list_repo_forks(
-        &self,
-        repo: &RepositoryTarget,
-    ) -> Result<Vec<ForkInfo>, ForgeError> {
-        flat_list_forks(&self.client, &self.repo_api_for(repo)?, "per_page", |b| {
-            self.authorized(b)
-        })
-        .await
-    }
 }
 
 // ============================================================================
@@ -1504,7 +1115,6 @@ impl GitHubProvider {
 
 /// GitLab access levels.
 const GITLAB_NO_ACCESS: u64 = 0;
-const GITLAB_REPORTER: u64 = 20;
 const GITLAB_MAINTAINER: u64 = 40;
 
 fn gitlab_access_levels<'a>(v: &'a Value, key: &str) -> Vec<&'a Value> {
@@ -1563,11 +1173,7 @@ impl GitLabProvider {
             namespace_path(&repo.owner, "owner")?,
             single_segment(&repo.name, "repo")?
         );
-        Ok(format!(
-            "{}/api/v4/projects/{}",
-            self.base_url,
-            url_encode_project_path(&path)
-        ))
+        Ok(self.api(&format!("/projects/{}", url_encode_project_path(&path))))
     }
 
     pub(crate) fn scoped_to(
@@ -1590,7 +1196,7 @@ impl GitLabProvider {
     async fn authenticated_username(&self) -> Result<String, ForgeError> {
         let user = get_optional(
             &self.client,
-            &format!("{}/api/v4/user", self.base_url),
+            &self.api("/user"),
             |b| self.authorized(b),
             "user",
         )
@@ -1608,11 +1214,10 @@ impl GitLabProvider {
     async fn creation_namespace_id(&self, namespace: &str) -> Result<u64, ForgeError> {
         let ns = get_optional(
             &self.client,
-            &format!(
-                "{}/api/v4/namespaces/{}",
-                self.base_url,
+            &self.api(&format!(
+                "/namespaces/{}",
                 url_encode_project_path(namespace)
-            ),
+            )),
             |b| self.authorized(b),
             namespace,
         )
@@ -1682,13 +1287,10 @@ impl GitLabProvider {
         if let Some(description) = opts.description.as_deref() {
             body["description"] = Value::from(description);
         }
-        let resp = authorize(
-            self.client
-                .post(format!("{}/api/v4/projects", self.base_url)),
-        )
-        .json(&body)
-        .send()
-        .await?;
+        let resp = authorize(self.client.post(self.api("/projects")))
+            .json(&body)
+            .send()
+            .await?;
         if resp.status() == StatusCode::BAD_REQUEST || resp.status() == StatusCode::CONFLICT {
             // "has already been taken" (concurrent create) counts as existing.
             let err = error_for(resp, "repository").await;
@@ -1766,12 +1368,13 @@ impl GitLabProvider {
         &self,
         repo: &RepositoryTarget,
     ) -> Result<Vec<RepoReadTokenInfo>, ForgeError> {
-        let raw: Vec<Value> = fetch_all_pages(
+        let raw: Vec<Value> = fetch_pages(
             &self.client,
             &format!("{}/deploy_tokens?active=true", self.project_api_for(repo)?),
             "per_page",
             |b| self.authorized(b),
             "deploy tokens",
+            PageCap::FailClosed,
         )
         .await?;
         Ok(raw
@@ -1808,12 +1411,13 @@ impl GitLabProvider {
         &self,
         repo: &RepositoryTarget,
     ) -> Result<Vec<DeployKeyInfo>, ForgeError> {
-        let raw: Vec<Value> = fetch_all_pages(
+        let raw: Vec<Value> = fetch_pages(
             &self.client,
             &format!("{}/deploy_keys", self.project_api_for(repo)?),
             "per_page",
             |b| self.authorized(b),
             "deploy keys",
+            PageCap::FailClosed,
         )
         .await?;
         Ok(raw
@@ -1956,159 +1560,6 @@ impl GitLabProvider {
             return Err(error_for(resp, "repository").await);
         }
         Ok(ForkPolicyOutcome::Disabled)
-    }
-
-    /// Resolves a username to its numeric id (`GET /users?username=`); `None` when unknown.
-    async fn user_id(&self, username: &str) -> Result<Option<u64>, ForgeError> {
-        let user = single_segment(username, "username")?;
-        let resp = self
-            .authorized(
-                self.client
-                    .get(format!("{}/api/v4/users", self.base_url))
-                    .query(&[("username", user.as_str())]),
-            )
-            .send()
-            .await?;
-        if !resp.status().is_success() {
-            return Err(error_for(resp, "user").await);
-        }
-        let users: Vec<Value> = resp.json().await?;
-        Ok(users
-            .iter()
-            .find(|u| {
-                u.get("username")
-                    .and_then(Value::as_str)
-                    .is_some_and(|n| n.eq_ignore_ascii_case(&user))
-            })
-            .and_then(|u| u.get("id"))
-            .and_then(Value::as_u64))
-    }
-
-    /// Effective access level of `user_id` on the project (`GET .../members/all/:user_id`,
-    /// including inherited group membership); 0 when the user is not a member. A response
-    /// without `access_level` is treated as the highest level (fail closed).
-    async fn effective_access_level(
-        &self,
-        project_api: &str,
-        user_id: u64,
-    ) -> Result<u64, ForgeError> {
-        let member = get_optional(
-            &self.client,
-            &format!("{project_api}/members/all/{user_id}"),
-            |b| self.authorized(b),
-            "member",
-        )
-        .await?;
-        Ok(member.map_or(0, |m| {
-            m.get("access_level")
-                .and_then(Value::as_u64)
-                .unwrap_or(u64::MAX)
-        }))
-    }
-
-    /// Direct project membership with Reporter access (read code, no push), then the effective
-    /// access level (including inherited group membership) is checked: higher inherited access
-    /// cannot be lowered per project and fails with [`ForgeError::ElevatedAccess`] (GitLab also
-    /// refuses the direct grant with a 400 in that case).
-    pub(crate) async fn ensure_repo_read_collaborator(
-        &self,
-        repo: &RepositoryTarget,
-        username: &str,
-    ) -> Result<CollaboratorOutcome, ForgeError> {
-        let project_api = self.project_api_for(repo)?;
-        let user = single_segment(username, "username")?;
-        let user_id = self
-            .user_id(&user)
-            .await?
-            .ok_or_else(|| ForgeError::NotFound(user.clone()))?;
-        let authorize = |b| self.authorized(b);
-        let member_url = format!("{project_api}/members/{user_id}");
-        let outcome = match get_optional(&self.client, &member_url, authorize, "member").await? {
-            Some(m) if m.get("access_level").and_then(Value::as_u64) == Some(GITLAB_REPORTER) => {
-                CollaboratorOutcome::Unchanged
-            }
-            Some(_) => {
-                let resp = authorize(self.client.put(&member_url))
-                    .json(&json!({ "access_level": GITLAB_REPORTER }))
-                    .send()
-                    .await?;
-                if !resp.status().is_success() {
-                    return Err(error_for(resp, "member").await);
-                }
-                CollaboratorOutcome::Updated
-            }
-            None => {
-                let resp = authorize(self.client.post(format!("{project_api}/members")))
-                    .json(&json!({ "user_id": user_id, "access_level": GITLAB_REPORTER }))
-                    .send()
-                    .await?;
-                if !resp.status().is_success() {
-                    let err = error_for(resp, "member").await;
-                    if matches!(err, ForgeError::Api { status: 400, .. }) {
-                        let level = self.effective_access_level(&project_api, user_id).await?;
-                        if level > GITLAB_REPORTER {
-                            return Err(elevated(&user, repo, &format!("access_level {level}")));
-                        }
-                    }
-                    return Err(err);
-                }
-                CollaboratorOutcome::Added
-            }
-        };
-        let level = self.effective_access_level(&project_api, user_id).await?;
-        if level > GITLAB_REPORTER {
-            return Err(elevated(&user, repo, &format!("access_level {level}")));
-        }
-        Ok(outcome)
-    }
-
-    /// Removes the direct membership, then fails with [`ForgeError::ElevatedAccess`] when the
-    /// user still has (inherited) access to the project.
-    pub(crate) async fn remove_repo_collaborator(
-        &self,
-        repo: &RepositoryTarget,
-        username: &str,
-    ) -> Result<(), ForgeError> {
-        let project_api = self.project_api_for(repo)?;
-        let user = single_segment(username, "username")?;
-        let Some(user_id) = self.user_id(&user).await? else {
-            return Ok(());
-        };
-        delete_ignoring_missing(
-            &self.client,
-            &format!("{project_api}/members/{user_id}"),
-            |b| self.authorized(b),
-            "member",
-        )
-        .await?;
-        let level = self.effective_access_level(&project_api, user_id).await?;
-        if level > 0 {
-            return Err(elevated(&user, repo, &format!("access_level {level}")));
-        }
-        Ok(())
-    }
-
-    pub(crate) async fn list_repo_forks(
-        &self,
-        repo: &RepositoryTarget,
-    ) -> Result<Vec<ForkInfo>, ForgeError> {
-        let raw: Vec<Value> = fetch_all_pages(
-            &self.client,
-            &format!("{}/forks", self.project_api_for(repo)?),
-            "per_page",
-            |b| self.authorized(b),
-            "forks",
-        )
-        .await?;
-        Ok(raw
-            .iter()
-            .filter_map(|f| {
-                Some(ForkInfo {
-                    full_name: str_field(f, "path_with_namespace")?,
-                    html_url: str_field(f, "web_url"),
-                })
-            })
-            .collect())
     }
 }
 

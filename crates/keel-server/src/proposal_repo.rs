@@ -634,9 +634,10 @@ mod tests {
         async fn post_preview_comment(&self, _pr_id: &str, _md: &str) -> Result<(), ForgeError> {
             Ok(())
         }
-        async fn list_open_pull_requests(
+        async fn list_pull_requests(
             &self,
             _tenant: Option<&str>,
+            _state: Option<PullRequestState>,
         ) -> Result<Vec<PullRequestInfo>, ForgeError> {
             if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
                 Ok(vec![pr("1")])

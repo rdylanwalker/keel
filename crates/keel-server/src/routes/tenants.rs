@@ -386,7 +386,7 @@ async fn proposal_matches(
     }
     for (path, content) in expected {
         if let Some(content) = content
-            && git.show_file_at_ref(dir, &head, path).await?.as_deref() != Some(content.as_str())
+            && git.read_file_at_ref(dir, &head, path).await?.as_deref() != Some(content.as_str())
         {
             return Ok(None);
         }
@@ -457,7 +457,7 @@ async fn find_resumable_stub_proposal(
             let mut resources = kustomization_resources(
                 state
                     .git_runner
-                    .show_file_at_ref(&state.repo_workdir, &head, "tenants/kustomization.yaml")
+                    .read_file_at_ref(&state.repo_workdir, &head, "tenants/kustomization.yaml")
                     .await?
                     .as_deref(),
             );

@@ -15,9 +15,8 @@ use keel_core::AuthPhase;
 use keel_git::{
     BranchProtectionOutcome, CommitAuthor, CreatePrRequest, DeployKeyInfo, DeployKeyOutcome,
     EnsuredDeployKey, ForgeError, ForgeProvider, ForkPolicyOutcome, GitRunner, LocalGitProvider,
-    PullRequestInfo, PullRequestState, RepoCredentialKind, RepoReadToken, RepoReadTokenInfo,
-    RepositoryEnsureOutcome, RepositoryInfo, RepositoryOptions, RepositoryTarget,
-    ssh_public_key_fingerprint,
+    PullRequestInfo, PullRequestState, RepoReadToken, RepoReadTokenInfo, RepositoryEnsureOutcome,
+    RepositoryInfo, RepositoryOptions, RepositoryTarget, ssh_public_key_fingerprint,
 };
 use keel_kube::secret_store::SecretBackend;
 use keel_kube::{InMemorySecretStore, KubeError, SecretStateStore, TelemetryMux};
@@ -80,12 +79,6 @@ impl ForgeProvider for MockForge {
     async fn post_preview_comment(&self, pr_id: &str, report: &str) -> Result<(), ForgeError> {
         self.inner.post_preview_comment(pr_id, report).await
     }
-    async fn list_open_pull_requests(
-        &self,
-        tenant: Option<&str>,
-    ) -> Result<Vec<PullRequestInfo>, ForgeError> {
-        self.inner.list_open_pull_requests(tenant).await
-    }
     async fn list_pull_requests(
         &self,
         tenant: Option<&str>,
@@ -143,12 +136,6 @@ impl ForgeProvider for MockForge {
             .await?;
         info.html_url = Some(format!("{FORGE_ORIGIN}/{owner}/{name}"));
         Ok(info)
-    }
-    fn read_credential_kind(&self) -> Result<RepoCredentialKind, ForgeError> {
-        Ok(match self.kind {
-            TenantRepoForgeKind::GitHub => RepoCredentialKind::SshDeployKey,
-            _ => RepoCredentialKind::HttpsToken,
-        })
     }
     async fn create_repo_read_token(
         &self,

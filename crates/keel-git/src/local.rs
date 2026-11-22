@@ -78,53 +78,6 @@ impl LocalGitProvider {
         }
     }
 
-    /// Returns the path to the backing bare Git repository.
-    pub fn bare_repo_path(&self) -> &Path {
-        &self.bare_repo_path
-    }
-
-    /// Closes an open pull request without merging it.
-    pub async fn close_pull_request(&self, pr_id: &str) -> Result<PullRequestInfo, ForgeError> {
-        validate_pr_id(pr_id)?;
-        let _guard = self.mutex.lock().await;
-
-        let mut pr = self
-            .read_proposal_unlocked(pr_id)
-            .await?
-            .ok_or_else(|| ForgeError::NotFound(pr_id.to_string()))?;
-
-        if pr.state != PullRequestState::Open {
-            return Err(ForgeError::InvalidState(pr_id.to_string(), pr.state));
-        }
-
-        pr.state = PullRequestState::Closed;
-        pr.updated_at = Utc::now();
-        self.write_proposal_unlocked(&pr, &format!("chore(proposals): close proposal #{pr_id}"))
-            .await?;
-        Ok(pr)
-    }
-
-    /// Reopens a closed pull request without modifying its branch or merge state.
-    pub async fn reopen_pull_request(&self, pr_id: &str) -> Result<PullRequestInfo, ForgeError> {
-        validate_pr_id(pr_id)?;
-        let _guard = self.mutex.lock().await;
-
-        let mut pr = self
-            .read_proposal_unlocked(pr_id)
-            .await?
-            .ok_or_else(|| ForgeError::NotFound(pr_id.to_string()))?;
-
-        if pr.state != PullRequestState::Closed {
-            return Err(ForgeError::InvalidState(pr_id.to_string(), pr.state));
-        }
-
-        pr.state = PullRequestState::Open;
-        pr.updated_at = Utc::now();
-        self.write_proposal_unlocked(&pr, &format!("chore(proposals): reopen proposal #{pr_id}"))
-            .await?;
-        Ok(pr)
-    }
-
     /// Sibling bare repository `<parent of this repository>/<owner>/<name>.git` (development
     /// only: no access control, `SDD.md` §3.2 D8).
     fn sibling(&self, owner: &str, name: &str) -> Result<Self, ForgeError> {
@@ -199,7 +152,7 @@ impl LocalGitProvider {
         }
         let Some(raw) = self
             .git_runner
-            .show_file_at_ref(&self.bare_repo_path, &full_ref, &rel_path)
+            .read_file_at_ref(&self.bare_repo_path, &full_ref, &rel_path)
             .await?
         else {
             return Ok(None);
@@ -220,7 +173,7 @@ impl LocalGitProvider {
 
         let entries = self
             .git_runner
-            .list_tree_names(&self.bare_repo_path, &full_ref, PROPOSALS_DIR)
+            .list_dir_at_ref(&self.bare_repo_path, &full_ref, PROPOSALS_DIR)
             .await?;
 
         let mut proposals = Vec::with_capacity(entries.len());
@@ -483,14 +436,6 @@ impl ForgeProvider for LocalGitProvider {
         Ok(())
     }
 
-    async fn list_open_pull_requests(
-        &self,
-        tenant: Option<&str>,
-    ) -> Result<Vec<PullRequestInfo>, ForgeError> {
-        self.list_pull_requests(tenant, Some(PullRequestState::Open))
-            .await
-    }
-
     async fn list_pull_requests(
         &self,
         tenant: Option<&str>,
@@ -607,12 +552,46 @@ impl ForgeProvider for LocalGitProvider {
         Ok(pr)
     }
 
+    /// Closes an open pull request without merging it.
     async fn close_pull_request(&self, pr_id: &str) -> Result<PullRequestInfo, ForgeError> {
-        LocalGitProvider::close_pull_request(self, pr_id).await
+        validate_pr_id(pr_id)?;
+        let _guard = self.mutex.lock().await;
+
+        let mut pr = self
+            .read_proposal_unlocked(pr_id)
+            .await?
+            .ok_or_else(|| ForgeError::NotFound(pr_id.to_string()))?;
+
+        if pr.state != PullRequestState::Open {
+            return Err(ForgeError::InvalidState(pr_id.to_string(), pr.state));
+        }
+
+        pr.state = PullRequestState::Closed;
+        pr.updated_at = Utc::now();
+        self.write_proposal_unlocked(&pr, &format!("chore(proposals): close proposal #{pr_id}"))
+            .await?;
+        Ok(pr)
     }
 
+    /// Reopens a closed pull request without modifying its branch or merge state.
     async fn reopen_pull_request(&self, pr_id: &str) -> Result<PullRequestInfo, ForgeError> {
-        LocalGitProvider::reopen_pull_request(self, pr_id).await
+        validate_pr_id(pr_id)?;
+        let _guard = self.mutex.lock().await;
+
+        let mut pr = self
+            .read_proposal_unlocked(pr_id)
+            .await?
+            .ok_or_else(|| ForgeError::NotFound(pr_id.to_string()))?;
+
+        if pr.state != PullRequestState::Closed {
+            return Err(ForgeError::InvalidState(pr_id.to_string(), pr.state));
+        }
+
+        pr.state = PullRequestState::Open;
+        pr.updated_at = Utc::now();
+        self.write_proposal_unlocked(&pr, &format!("chore(proposals): reopen proposal #{pr_id}"))
+            .await?;
+        Ok(pr)
     }
 
     /// Initializes the backing bare repository when missing. `private` has no meaning for a
@@ -730,7 +709,6 @@ fn validate_pr_id(pr_id: &str) -> Result<(), ForgeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::git::format_proposal_branch;
     use tempfile::TempDir;
 
     async fn seed_bare_repo(tmp: &TempDir) -> (PathBuf, GitRunner, CommitAuthor) {
@@ -765,7 +743,6 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let (bare, runner, author) = seed_bare_repo(&tmp).await;
         let provider = LocalGitProvider::new(&bare);
-        assert_eq!(provider.bare_repo_path(), bare.as_path());
 
         assert!(
             provider
@@ -781,7 +758,7 @@ mod tests {
             .clone(bare.to_str().unwrap(), &work_alpha)
             .await
             .unwrap();
-        let branch_alpha = format_proposal_branch("alpha", "install-authentik", 1_731_600_001);
+        let branch_alpha = "keel/alpha/install-authentik-1731600001".to_string();
         runner
             .checkout_new_branch(&work_alpha, &branch_alpha)
             .await
@@ -810,7 +787,7 @@ mod tests {
             .clone(bare.to_str().unwrap(), &work_beta)
             .await
             .unwrap();
-        let branch_beta = format_proposal_branch("beta", "provision-postgres", 1_731_600_002);
+        let branch_beta = "keel/beta/provision-postgres-1731600002".to_string();
         runner
             .checkout_new_branch(&work_beta, &branch_beta)
             .await
@@ -1194,10 +1171,6 @@ mod tests {
         let p = LocalGitProvider::new(tmp.path().join("r.git"));
         let repo = crate::forge::RepositoryTarget::new("o", "r").unwrap();
         assert!(matches!(
-            p.read_credential_kind(),
-            Err(ForgeError::Unsupported(_))
-        ));
-        assert!(matches!(
             p.create_repo_read_token(&repo, "t").await,
             Err(ForgeError::Unsupported(_))
         ));
@@ -1218,10 +1191,6 @@ mod tests {
             Err(ForgeError::Unsupported(_))
         ));
         assert!(matches!(
-            p.revoke_deploy_keys_by_fingerprint(&repo, "SHA256:x").await,
-            Err(ForgeError::Unsupported(_))
-        ));
-        assert!(matches!(
             p.ensure_main_protection(&repo).await,
             Err(ForgeError::Unsupported(_))
         ));
@@ -1229,19 +1198,7 @@ mod tests {
             p.disable_forks(&repo).await,
             Err(ForgeError::Unsupported(_))
         ));
-        assert!(matches!(
-            p.ensure_read_collaborator(&repo, "u").await,
-            Err(ForgeError::Unsupported(_))
-        ));
-        assert!(matches!(
-            p.remove_collaborator(&repo, "u").await,
-            Err(ForgeError::Unsupported(_))
-        ));
-        assert!(matches!(
-            p.list_forks(&repo).await,
-            Err(ForgeError::Unsupported(_))
-        ));
-        let err = p.list_forks(&repo).await.unwrap_err().to_string();
-        assert!(err.contains("list_forks"), "{err}");
+        let err = p.disable_forks(&repo).await.unwrap_err().to_string();
+        assert!(err.contains("disable_forks"), "{err}");
     }
 }

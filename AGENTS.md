@@ -27,7 +27,7 @@ keel/
 ├── .github/workflows/          # ci.yml, e2e.yml, release.yml, docs.yml (GitHub Pages)
 ├── crates/
 │   ├── keel-core/              # Domain models, BootstrapTarget, Stage 0 state paths/passphrase, catalog parser, JSONSchema, SOPS/age
-│   ├── keel-git/               # Direct git CLI runner (SSH/HTTPS) + ForgeProvider trait (incl. ensure_repository)
+│   ├── keel-git/               # Direct git CLI runner (HTTPS credentials) + ForgeProvider trait (incl. ensure_repository)
 │   ├── keel-pko/               # PKO v2 Stack synthesis, ephemeral previews, PKO run/status mapping, diff parser
 │   ├── keel-kube/              # kube-rs watchers, SSE telemetry, tenant RBAC, K8s Secret state, preview runner, tenant S3 identities
 │   ├── keel-server/            # Stateless axum REST/SSE API, OIDC PKCE auth, preview lifecycle, security headers, embedded SPA
