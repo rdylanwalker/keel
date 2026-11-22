@@ -71,9 +71,20 @@ fn publish_phase(state: &AppState, pr_id: &str, stack_name: &str, run: &PreviewR
 /// Returns the initial run status: `Pending` (with `stack` set) when applied, `Failed` with the
 /// API/admission error when the apply was rejected, or `NotExecuted` without a live cluster.
 ///
-/// `secret_copies` are the per-preview provider-credential Secrets planned by
-/// `EphemeralPreviewParams::inherit_tenant_credentials`; they are created after the Stack (so
-/// they can be owned by it) and the preview is torn down if any copy cannot be made.
+/// `secret_copies` are the per-preview Secrets (read-only Git credentials, state passphrase,
+/// provider credentials) planned by `attach_preview_cluster_inputs` /
+/// `EphemeralPreviewParams::inherit_tenant_credentials`. Order matters: PKO resolves the preview
+/// `Stack`'s `gitAuth` (and workspace `envRefs`) as soon as it sees the object, and a missing
+/// Secret stalls it with `SpecInvalid`, which PKO never retries until the spec changes. So:
+///
+/// 1. copy every Secret (no owner yet, labelled `keel.io/pr-id`); on failure nothing is applied;
+/// 2. apply the `Stack`;
+/// 3. adopt the copies (ownerReference → the live `Stack` UID) so they are GC'd with it.
+///
+/// Copies are removed again when the launch fails before a `Stack` of this PR existed; an
+/// adoption failure tears the whole preview down (`Stack` + copies), so a running preview's
+/// credentials are always owned by its `Stack`. Copies orphaned by a crash between the steps are
+/// deleted by label on PR merge/close ([`gc_preview_for_pr`], [`reconcile_previews_once`]).
 pub async fn launch_pko_preview(
     state: &AppState,
     bundle: &PreviewStack,
@@ -106,20 +117,55 @@ pub async fn launch_pko_preview(
         Err(e) => return PreviewRunStatus::apply_failed(format!("preview synthesis failed: {e}")),
     };
     let stack_name = bundle.stack.metadata.name.clone();
+    let pr_id = bundle
+        .stack
+        .metadata
+        .labels
+        .get("keel.io/pr-id")
+        .cloned()
+        .unwrap_or_else(|| bundle.pr_id.clone());
+    // A re-launch (new commit) updates a live preview whose adopted copies must survive a failed
+    // re-launch; an unreadable Stack is treated as live (never delete copies in use).
+    let preexisting = !matches!(cluster.get_preview_stack(&stack_name).await, Ok(None));
+    let cleanup_copies = || async {
+        if preexisting {
+            return;
+        }
+        if let Err(e) = cluster.delete_preview_secrets(&pr_id).await {
+            tracing::warn!(pr_id = %bundle.pr_id, error = %e, "failed to delete preview Secret copies; they are removed by label on PR merge/close");
+        }
+    };
+
+    let copied = match cluster
+        .copy_preview_secrets(&bundle.tenant, &pr_id, secret_copies)
+        .await
+    {
+        Ok(copied) => copied,
+        Err(e) => {
+            tracing::warn!(pr_id = %bundle.pr_id, error = %e, "failed to copy preview credentials");
+            cleanup_copies().await;
+            let run = PreviewRunStatus::not_executed(format!(
+                "Credentials for the preview are unavailable ({e}): PKO preview not executed"
+            ));
+            publish_phase(state, &bundle.pr_id, &stack_name, &run);
+            return run;
+        }
+    };
     if let Err(e) = cluster.apply_preview(&stack).await {
         tracing::warn!(pr_id = %bundle.pr_id, error = %e, "failed to apply ephemeral preview Stack");
+        cleanup_copies().await;
         let run = PreviewRunStatus::apply_failed(format!("Applying preview Stack failed: {e}"));
         publish_phase(state, &bundle.pr_id, &stack_name, &run);
         return run;
     }
-    if let Err(e) = cluster
-        .copy_preview_secrets(&bundle.tenant, &stack_name, secret_copies)
-        .await
-    {
-        tracing::warn!(pr_id = %bundle.pr_id, error = %e, "failed to copy preview provider credentials");
+    if let Err(e) = cluster.adopt_preview_secrets(&stack_name, &copied).await {
+        tracing::warn!(pr_id = %bundle.pr_id, error = %e, "failed to attach preview Secret copies to the preview Stack; tearing the preview down");
         let _ = cluster.delete_preview_object("Stack", &stack_name).await;
+        if let Err(e) = cluster.delete_preview_secrets(&pr_id).await {
+            tracing::warn!(pr_id = %bundle.pr_id, error = %e, "failed to delete preview Secret copies; they are removed by label on PR merge/close");
+        }
         let run = PreviewRunStatus::not_executed(format!(
-            "Provider credentials for the preview are unavailable ({e}): PKO preview not executed"
+            "Preview credentials could not be attached to the preview Stack ({e}): PKO preview not executed"
         ));
         publish_phase(state, &bundle.pr_id, &stack_name, &run);
         return run;
@@ -335,6 +381,10 @@ pub async fn gc_preview_for_pr(state: &AppState, pr_id: &str, reason: &str) -> G
         );
         let plan = plan_preview_gc(&candidates_from(&values), &[pr_id]);
         execute_gc(state, cluster.as_ref(), &plan, reason).await;
+        // Adopted copies go with their Stack; this also removes copies never adopted.
+        if let Err(e) = cluster.delete_preview_secrets(pr_id).await {
+            tracing::warn!(pr_id, error = %e, "failed to garbage-collect preview Secret copies");
+        }
         return plan;
     }
     match cached {
@@ -382,6 +432,15 @@ pub async fn reconcile_previews_once(state: &AppState) -> PreviewReconcileOutcom
         })
         .collect();
 
+    // PRs of per-preview Secret copies too, so copies never adopted by a Stack (launch failure,
+    // keel-server stopped mid-launch) are still removed once their PR is merged/closed.
+    let secret_pr_ids = match cluster.list_preview_secret_pr_ids().await {
+        Ok(ids) => ids,
+        Err(e) => {
+            tracing::debug!(error = %e, "could not list preview Secret copies");
+            BTreeSet::new()
+        }
+    };
     let pr_ids: BTreeSet<String> = records
         .iter()
         .map(|r| r.pr_id.clone())
@@ -390,6 +449,7 @@ pub async fn reconcile_previews_once(state: &AppState) -> PreviewReconcileOutcom
                 .iter()
                 .filter_map(|c| c.labels.get("keel.io/pr-id").cloned()),
         )
+        .chain(secret_pr_ids.iter().cloned())
         .collect();
     let mut pr_states: BTreeMap<String, PrLifecycle> = BTreeMap::new();
     for id in pr_ids {
@@ -417,6 +477,19 @@ pub async fn reconcile_previews_once(state: &AppState) -> PreviewReconcileOutcom
     let plan = plan_preview_reconcile(&candidates, &records, &pr_states);
     outcome.deleted = plan.gc.targets.len();
     execute_gc(state, cluster.as_ref(), &plan.gc, "merged/closed").await;
+    // Open PRs are never swept: their copies may belong to a launch in progress (copies are
+    // written before the Stack exists).
+    for pr_id in &secret_pr_ids {
+        if matches!(pr_states.get(pr_id), Some(state) if !matches!(state, PrLifecycle::Open { .. }))
+        {
+            match cluster.delete_preview_secrets(pr_id).await {
+                Ok(n) => outcome.deleted += n,
+                Err(e) => {
+                    tracing::warn!(pr_id = %pr_id, error = %e, "failed to garbage-collect preview Secret copies")
+                }
+            }
+        }
+    }
 
     for (pr_id, head_sha) in &plan.head_moved {
         let annotations = BTreeMap::from([(ANNOTATION_HEAD_SHA.to_string(), head_sha.clone())]);

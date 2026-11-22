@@ -432,17 +432,84 @@ pub trait PreviewCluster: Send + Sync {
     /// Deletes a preview object (`Stack`, `GitRepository`, `ConfigMap`). `Ok(false)` if absent.
     async fn delete_preview_object(&self, kind: &str, name: &str) -> Result<bool, KubeError>;
 
-    /// Copies exactly the planned provider-credential Secrets (only the referenced keys) from
+    /// Copies exactly the planned per-preview Secrets (only the referenced keys) from
     /// `tenant-<id>` into `keel-previews` under their per-preview names, labelled
-    /// `keel.io/pr-id` / `keel.io/tenant` and owned by the already-applied preview `stack_name`
-    /// (garbage-collected with it). Copies carrying `proposed_data` use those PR values instead of
-    /// the live tenant Secret. Fails if a source Secret or referenced key is missing.
+    /// `keel.io/secret-kind=preview-provider-credentials`, `keel.io/tenant` and
+    /// `keel.io/pr-id=<pr_id>` (normalized like the preview `Stack` label). Copies carrying
+    /// `proposed_data` use those PR values instead of the live tenant Secret. Fails if a source
+    /// Secret or referenced key is missing.
+    ///
+    /// Runs **before** the preview `Stack` is applied: PKO resolves `spec.gitAuth`/`envRefs`
+    /// immediately and stalls a `Stack` whose Secret is missing (`SpecInvalid`, never retried
+    /// until the spec changes). The copies therefore carry no owner yet; see
+    /// [`Self::adopt_preview_secrets`]. Returns the names written (possibly a prefix of `copies`
+    /// on error; callers clean up with [`Self::delete_preview_secrets`]).
     async fn copy_preview_secrets(
         &self,
         tenant: &str,
-        stack_name: &str,
+        pr_id: &str,
         copies: &[PreviewSecretCopy],
     ) -> Result<Vec<String>, KubeError>;
+
+    /// Sets the ownerReference of the per-preview Secret copies `secret_names` to the live preview
+    /// `stack_name` (`pulumi.com/v1` `Stack`, its UID), so they are garbage-collected with it.
+    async fn adopt_preview_secrets(
+        &self,
+        stack_name: &str,
+        secret_names: &[String],
+    ) -> Result<(), KubeError>;
+
+    /// Deletes every per-preview Secret copy of `pr_id` (selected by the
+    /// `keel.io/secret-kind=preview-provider-credentials` and `keel.io/pr-id` labels, so copies
+    /// never adopted by a `Stack` are found too). Returns the number deleted.
+    async fn delete_preview_secrets(&self, pr_id: &str) -> Result<usize, KubeError>;
+
+    /// PR ids (`keel.io/pr-id` labels) of all per-preview Secret copies in `keel-previews`
+    /// (metadata only; never Secret values).
+    async fn list_preview_secret_pr_ids(&self) -> Result<BTreeSet<String>, KubeError>;
+}
+
+/// Normalizes a PR id into the `keel.io/pr-id` label value used on preview objects (trimmed,
+/// leading `#` stripped, lowercase, a DNS label), refusing anything else so it can never alter a
+/// label selector.
+pub fn preview_pr_label(pr_id: &str) -> Result<String, KubeError> {
+    let normalized = pr_id.trim().trim_start_matches('#').to_ascii_lowercase();
+    let valid = !normalized.is_empty()
+        && normalized.len() <= 63
+        && normalized
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && !normalized.starts_with('-')
+        && !normalized.ends_with('-');
+    if valid {
+        Ok(normalized)
+    } else {
+        Err(KubeError::InvalidInput(format!(
+            "invalid preview PR id `{pr_id}`"
+        )))
+    }
+}
+
+fn preview_secret_selector(pr_label: Option<&str>) -> String {
+    let mut selector = format!("keel.io/secret-kind={PREVIEW_PROVIDER_SECRET_KIND}");
+    if let Some(pr) = pr_label {
+        selector.push_str(&format!(",keel.io/pr-id={pr}"));
+    }
+    selector
+}
+
+fn preview_stack_owner(stack_name: &str, uid: Option<String>) -> Result<OwnerReference, KubeError> {
+    let uid = uid.filter(|u| !u.is_empty()).ok_or_else(|| {
+        KubeError::InvalidInput(format!("preview Stack `{stack_name}` has no UID"))
+    })?;
+    Ok(OwnerReference {
+        api_version: "pulumi.com/v1".to_string(),
+        kind: "Stack".to_string(),
+        name: stack_name.to_string(),
+        uid,
+        controller: None,
+        block_owner_deletion: None,
+    })
 }
 
 /// Resolves the exact key → bytes payload for one preview Secret copy.
@@ -479,8 +546,8 @@ fn preview_copy_payload(
     Ok(out)
 }
 
-fn preview_copy_labels(tenant: &str, pr_id: Option<&str>) -> BTreeMap<String, String> {
-    let mut labels = BTreeMap::from([
+fn preview_copy_labels(tenant: &str, pr_label: &str) -> BTreeMap<String, String> {
+    BTreeMap::from([
         (
             "app.kubernetes.io/managed-by".to_string(),
             "keel".to_string(),
@@ -490,12 +557,13 @@ fn preview_copy_labels(tenant: &str, pr_id: Option<&str>) -> BTreeMap<String, St
             PREVIEW_PROVIDER_SECRET_KIND.to_string(),
         ),
         ("keel.io/tenant".to_string(), tenant.to_string()),
-    ]);
-    if let Some(pr) = pr_id {
-        labels.insert("keel.io/pr-id".to_string(), pr.to_string());
-    }
-    labels
+        ("keel.io/pr-id".to_string(), pr_label.to_string()),
+    ])
 }
+
+/// Field manager of the ownerReference patch on preview Secret copies (kept apart from
+/// [`PREVIEW_FIELD_MANAGER`] so re-applying a copy never drops its owner).
+pub const PREVIEW_OWNER_FIELD_MANAGER: &str = "keel-server-preview-owner";
 
 fn stack_ar() -> ApiResource {
     ApiResource {
@@ -1056,27 +1124,14 @@ impl PreviewCluster for KubePreviewCluster {
     async fn copy_preview_secrets(
         &self,
         tenant: &str,
-        stack_name: &str,
+        pr_id: &str,
         copies: &[PreviewSecretCopy],
     ) -> Result<Vec<String>, KubeError> {
+        let tenant_ns = tenant_namespace(tenant)?;
+        let pr_label = preview_pr_label(pr_id)?;
         if copies.is_empty() {
             return Ok(Vec::new());
         }
-        let tenant_ns = tenant_namespace(tenant)?;
-        let Some(stack) = self.dyn_api(&stack_ar()).get_opt(stack_name).await? else {
-            return Err(KubeError::InvalidInput(format!(
-                "preview Stack `{stack_name}` not found"
-            )));
-        };
-        let owner = OwnerReference {
-            api_version: "pulumi.com/v1".to_string(),
-            kind: "Stack".to_string(),
-            name: stack_name.to_string(),
-            uid: stack.metadata.uid.clone().unwrap_or_default(),
-            controller: None,
-            block_owner_deletion: None,
-        };
-        let pr_id = stack.labels().get("keel.io/pr-id").cloned();
         let tenant_api: Api<Secret> = Api::namespaced(self.client.clone(), &tenant_ns);
         let preview_api: Api<Secret> =
             Api::namespaced(self.client.clone(), KEEL_PREVIEWS_NAMESPACE);
@@ -1094,12 +1149,12 @@ impl PreviewCluster for KubePreviewCluster {
                 })
             };
             let payload = preview_copy_payload(copy, live.as_ref())?;
+            // No ownerReference: the preview Stack does not exist yet (see the trait docs).
             let secret = Secret {
                 metadata: ObjectMeta {
                     name: Some(copy.target_name.clone()),
                     namespace: Some(KEEL_PREVIEWS_NAMESPACE.to_string()),
-                    labels: Some(preview_copy_labels(tenant, pr_id.as_deref())),
-                    owner_references: Some(vec![owner.clone()]),
+                    labels: Some(preview_copy_labels(tenant, &pr_label)),
                     ..ObjectMeta::default()
                 },
                 type_: Some("Opaque".to_string()),
@@ -1122,6 +1177,64 @@ impl PreviewCluster for KubePreviewCluster {
         }
         Ok(created)
     }
+
+    async fn adopt_preview_secrets(
+        &self,
+        stack_name: &str,
+        secret_names: &[String],
+    ) -> Result<(), KubeError> {
+        if secret_names.is_empty() {
+            return Ok(());
+        }
+        let Some(stack) = self.dyn_api(&stack_ar()).get_opt(stack_name).await? else {
+            return Err(KubeError::InvalidInput(format!(
+                "preview Stack `{stack_name}` not found"
+            )));
+        };
+        let owner = preview_stack_owner(stack_name, stack.metadata.uid.clone())?;
+        // JSON merge patch: fails with 404 instead of re-creating a deleted copy, and replaces
+        // any owner left by an earlier (since deleted) preview Stack of the same PR.
+        let patch = json!({ "metadata": { "ownerReferences": [owner] } });
+        let params = PatchParams {
+            field_manager: Some(PREVIEW_OWNER_FIELD_MANAGER.to_string()),
+            ..PatchParams::default()
+        };
+        let api: Api<Secret> = Api::namespaced(self.client.clone(), KEEL_PREVIEWS_NAMESPACE);
+        for name in secret_names {
+            api.patch(name, &params, &Patch::Merge(&patch)).await?;
+        }
+        Ok(())
+    }
+
+    async fn delete_preview_secrets(&self, pr_id: &str) -> Result<usize, KubeError> {
+        let pr_label = preview_pr_label(pr_id)?;
+        let api: Api<Secret> = Api::namespaced(self.client.clone(), KEEL_PREVIEWS_NAMESPACE);
+        let list = api
+            .list_metadata(&ListParams::default().labels(&preview_secret_selector(Some(&pr_label))))
+            .await?;
+        let mut deleted = 0;
+        for secret in list.items {
+            let name = secret.name_any();
+            match api.delete(&name, &DeleteParams::default()).await {
+                Ok(_) => deleted += 1,
+                Err(e) if not_found(&e) => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(deleted)
+    }
+
+    async fn list_preview_secret_pr_ids(&self) -> Result<BTreeSet<String>, KubeError> {
+        let api: Api<Secret> = Api::namespaced(self.client.clone(), KEEL_PREVIEWS_NAMESPACE);
+        let list = api
+            .list_metadata(&ListParams::default().labels(&preview_secret_selector(None)))
+            .await?;
+        Ok(list
+            .items
+            .iter()
+            .filter_map(|s| s.labels().get("keel.io/pr-id").cloned())
+            .collect())
+    }
 }
 
 #[derive(Default)]
@@ -1132,6 +1245,10 @@ struct InMemoryState {
     logs: HashMap<String, String>,
     reports: HashMap<String, String>,
     apply_error: Option<String>,
+    adopt_error: Option<String>,
+    /// Mutating calls in order (`copy:<name>`, `apply:<stack>`, `adopt:<name>`,
+    /// `delete:<kind>/<name>`, `delete-secrets:<pr>`), for ordering assertions.
+    operations: Vec<String>,
     /// `(tenant, name)` → data of Secrets living in tenant namespaces.
     tenant_secrets: BTreeMap<(String, String), BTreeMap<String, Vec<u8>>>,
     /// `keel-previews` Secret copies: name → (owner Stack, labels, data).
@@ -1141,7 +1258,8 @@ struct InMemoryState {
 /// A Secret copy stored by [`InMemoryPreviewCluster`].
 #[derive(Clone, PartialEq, Eq)]
 pub struct InMemoryPreviewSecret {
-    pub owner_stack: String,
+    /// Owner preview `Stack` (`None` until [`PreviewCluster::adopt_preview_secrets`]).
+    pub owner_stack: Option<String>,
     pub labels: BTreeMap<String, String>,
     pub data: BTreeMap<String, Vec<u8>>,
 }
@@ -1179,6 +1297,16 @@ impl InMemoryPreviewCluster {
     /// Makes subsequent `apply_preview` calls fail (e.g. simulated admission denial).
     pub fn fail_applies_with(&self, message: impl Into<String>) {
         self.lock().apply_error = Some(message.into());
+    }
+
+    /// Makes subsequent `adopt_preview_secrets` calls fail.
+    pub fn fail_adoption_with(&self, message: impl Into<String>) {
+        self.lock().adopt_error = Some(message.into());
+    }
+
+    /// Mutating calls recorded so far, in order (see [`InMemoryState`]).
+    pub fn operations(&self) -> Vec<String> {
+        self.lock().operations.clone()
     }
 
     /// Replaces `status` on a stored preview `Stack` (simulates PKO progress).
@@ -1256,6 +1384,7 @@ impl PreviewCluster for InMemoryPreviewCluster {
     async fn apply_preview(&self, stack: &Value) -> Result<(), KubeError> {
         let stack_name = validate_preview_doc(stack, "Stack")?;
         let mut st = self.lock();
+        st.operations.push(format!("apply:{stack_name}"));
         if let Some(err) = st.apply_error.clone() {
             return Err(KubeError::InvalidInput(err));
         }
@@ -1332,11 +1461,14 @@ impl PreviewCluster for InMemoryPreviewCluster {
 
     async fn delete_preview_object(&self, kind: &str, name: &str) -> Result<bool, KubeError> {
         let mut st = self.lock();
+        st.operations.push(format!("delete:{kind}/{name}"));
         Ok(match kind {
             "Stack" => {
                 st.reports.remove(name);
-                // Simulates ownerReference garbage collection of the Secret copies.
-                st.preview_secrets.retain(|_, s| s.owner_stack != name);
+                // Simulates ownerReference garbage collection of the adopted Secret copies
+                // (copies never adopted are left behind, like on a real cluster).
+                st.preview_secrets
+                    .retain(|_, s| s.owner_stack.as_deref() != Some(name));
                 st.stacks.remove(name).is_some()
             }
             "GitRepository" => st.repos.remove(name).is_some(),
@@ -1352,44 +1484,93 @@ impl PreviewCluster for InMemoryPreviewCluster {
     async fn copy_preview_secrets(
         &self,
         tenant: &str,
-        stack_name: &str,
+        pr_id: &str,
         copies: &[PreviewSecretCopy],
     ) -> Result<Vec<String>, KubeError> {
         tenant_namespace(tenant)?;
+        let pr_label = preview_pr_label(pr_id)?;
         if copies.is_empty() {
             return Ok(Vec::new());
         }
         let mut st = self.lock();
-        let Some(stack) = st.stacks.get(stack_name) else {
-            return Err(KubeError::InvalidInput(format!(
-                "preview Stack `{stack_name}` not found"
-            )));
-        };
-        let pr_id = stack
-            .pointer("/metadata/labels/keel.io~1pr-id")
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        let mut staged = Vec::new();
+        // Written one by one like the live cluster, so a failure leaves a partial prefix.
+        let mut created = Vec::new();
         for copy in copies {
             let live = st
                 .tenant_secrets
                 .get(&(tenant.to_string(), copy.source_name.clone()));
             let data = preview_copy_payload(copy, live)?;
-            staged.push((copy.target_name.clone(), data));
-        }
-        let mut created = Vec::new();
-        for (name, data) in staged {
+            st.operations.push(format!("copy:{}", copy.target_name));
+            let owner_stack = st
+                .preview_secrets
+                .get(&copy.target_name)
+                .and_then(|s| s.owner_stack.clone());
             st.preview_secrets.insert(
-                name.clone(),
+                copy.target_name.clone(),
                 InMemoryPreviewSecret {
-                    owner_stack: stack_name.to_string(),
-                    labels: preview_copy_labels(tenant, pr_id.as_deref()),
+                    owner_stack,
+                    labels: preview_copy_labels(tenant, &pr_label),
                     data,
                 },
             );
-            created.push(name);
+            created.push(copy.target_name.clone());
         }
         Ok(created)
+    }
+
+    async fn adopt_preview_secrets(
+        &self,
+        stack_name: &str,
+        secret_names: &[String],
+    ) -> Result<(), KubeError> {
+        if secret_names.is_empty() {
+            return Ok(());
+        }
+        let mut st = self.lock();
+        if let Some(err) = st.adopt_error.clone() {
+            return Err(KubeError::InvalidInput(err));
+        }
+        if !st.stacks.contains_key(stack_name) {
+            return Err(KubeError::InvalidInput(format!(
+                "preview Stack `{stack_name}` not found"
+            )));
+        }
+        for name in secret_names {
+            st.operations.push(format!("adopt:{name}"));
+            let Some(secret) = st.preview_secrets.get_mut(name) else {
+                return Err(KubeError::InvalidInput(format!(
+                    "preview Secret `{name}` not found"
+                )));
+            };
+            secret.owner_stack = Some(stack_name.to_string());
+        }
+        Ok(())
+    }
+
+    async fn delete_preview_secrets(&self, pr_id: &str) -> Result<usize, KubeError> {
+        let pr_label = preview_pr_label(pr_id)?;
+        let mut st = self.lock();
+        st.operations.push(format!("delete-secrets:{pr_label}"));
+        let before = st.preview_secrets.len();
+        st.preview_secrets.retain(|_, s| {
+            s.labels.get("keel.io/secret-kind").map(String::as_str)
+                != Some(PREVIEW_PROVIDER_SECRET_KIND)
+                || s.labels.get("keel.io/pr-id") != Some(&pr_label)
+        });
+        Ok(before - st.preview_secrets.len())
+    }
+
+    async fn list_preview_secret_pr_ids(&self) -> Result<BTreeSet<String>, KubeError> {
+        Ok(self
+            .lock()
+            .preview_secrets
+            .values()
+            .filter(|s| {
+                s.labels.get("keel.io/secret-kind").map(String::as_str)
+                    == Some(PREVIEW_PROVIDER_SECRET_KIND)
+            })
+            .filter_map(|s| s.labels.get("keel.io/pr-id").cloned())
+            .collect())
     }
 }
 
@@ -2233,14 +2414,12 @@ spec:
             ],
         );
         cluster.put_tenant_secret("acme", "never-referenced", &[("k", "v")]);
-        let mut stack = stack_doc("preview-stack-pr-5", true);
-        stack["metadata"]["labels"] = json!({ "keel.io/pr-id": "5" });
-        cluster.apply_preview(&stack).await.unwrap();
 
+        // Copies are created before the preview Stack exists (PKO resolves `gitAuth` at once).
         let created = cluster
             .copy_preview_secrets(
                 "acme",
-                "preview-stack-pr-5",
+                "#5",
                 &[copy(
                     "vm1-secrets",
                     "keel-preview-5-vm1-secrets",
@@ -2254,7 +2433,7 @@ spec:
         let copied = cluster
             .preview_secret("keel-preview-5-vm1-secrets")
             .unwrap();
-        assert_eq!(copied.owner_stack, "preview-stack-pr-5");
+        assert_eq!(copied.owner_stack, None);
         assert_eq!(
             copied.data.keys().cloned().collect::<Vec<_>>(),
             vec!["awsAccessKeyId", "awsSecretAccessKey"]
@@ -2266,15 +2445,57 @@ spec:
             PREVIEW_PROVIDER_SECRET_KIND
         );
 
-        // Proposed (PR) values win over the live tenant Secret.
+        // Adoption needs the live Stack.
+        assert!(
+            cluster
+                .adopt_preview_secrets("preview-stack-pr-5", &created)
+                .await
+                .is_err()
+        );
+        let mut stack = stack_doc("preview-stack-pr-5", true);
+        stack["metadata"]["labels"] = json!({ "keel.io/pr-id": "5" });
+        cluster.apply_preview(&stack).await.unwrap();
+        cluster
+            .adopt_preview_secrets("preview-stack-pr-5", &created)
+            .await
+            .unwrap();
+        assert_eq!(
+            cluster
+                .preview_secret("keel-preview-5-vm1-secrets")
+                .unwrap()
+                .owner_stack
+                .as_deref(),
+            Some("preview-stack-pr-5")
+        );
+
+        // Proposed (PR) values win over the live tenant Secret; re-copying keeps the owner.
         let mut proposed = copy("new-secrets", "keel-preview-5-new-secrets", &["token"]);
         proposed.proposed_data = Some(BTreeMap::from([("token".to_string(), "t".to_string())]));
         cluster
-            .copy_preview_secrets("acme", "preview-stack-pr-5", &[proposed])
+            .copy_preview_secrets("acme", "5", &[proposed])
             .await
             .unwrap();
+        cluster
+            .copy_preview_secrets(
+                "acme",
+                "5",
+                &[copy(
+                    "vm1-secrets",
+                    "keel-preview-5-vm1-secrets",
+                    &["awsAccessKeyId"],
+                )],
+            )
+            .await
+            .unwrap();
+        assert!(
+            cluster
+                .preview_secret("keel-preview-5-vm1-secrets")
+                .unwrap()
+                .owner_stack
+                .is_some()
+        );
 
-        // Missing sources/keys and foreign names fail closed.
+        // Missing sources/keys, foreign names and label-unsafe PR ids fail closed.
         for bad in [
             copy("absent", "keel-preview-5-absent", &["k"]),
             copy("vm1-secrets", "keel-preview-5-vm1-secrets", &["missingKey"]),
@@ -2282,7 +2503,19 @@ spec:
         ] {
             assert!(
                 cluster
-                    .copy_preview_secrets("acme", "preview-stack-pr-5", &[bad])
+                    .copy_preview_secrets("acme", "5", &[bad])
+                    .await
+                    .is_err()
+            );
+        }
+        for bad_pr in ["", "5,keel.io/tenant!=x", "a b"] {
+            assert!(
+                cluster
+                    .copy_preview_secrets(
+                        "acme",
+                        bad_pr,
+                        &[copy("vm1-secrets", "keel-preview-5-x", &["awsAccessKeyId"])]
+                    )
                     .await
                     .is_err()
             );
@@ -2292,18 +2525,203 @@ spec:
             cluster
                 .copy_preview_secrets(
                     "other",
-                    "preview-stack-pr-5",
+                    "5",
                     &[copy("vm1-secrets", "keel-preview-5-x", &["awsAccessKeyId"])]
                 )
                 .await
                 .is_err()
         );
+        assert_eq!(
+            cluster.list_preview_secret_pr_ids().await.unwrap(),
+            BTreeSet::from(["5".to_string()])
+        );
 
-        // Deleting the owner Stack garbage-collects every copy.
+        // Deleting the owner Stack garbage-collects every adopted copy.
+        cluster
+            .adopt_preview_secrets(
+                "preview-stack-pr-5",
+                &["keel-preview-5-new-secrets".to_string()],
+            )
+            .await
+            .unwrap();
         cluster
             .delete_preview_object("Stack", "preview-stack-pr-5")
             .await
             .unwrap();
         assert!(cluster.preview_secret_names().is_empty());
+    }
+
+    #[tokio::test]
+    async fn in_memory_orphan_copies_are_deleted_by_pr_label() {
+        let cluster = InMemoryPreviewCluster::new();
+        cluster.put_tenant_secret("acme", "vm1-secrets", &[("k", "v")]);
+        for pr in ["6", "7"] {
+            cluster
+                .copy_preview_secrets(
+                    "acme",
+                    pr,
+                    &[copy(
+                        "vm1-secrets",
+                        &format!("keel-preview-{pr}-vm1-secrets"),
+                        &["k"],
+                    )],
+                )
+                .await
+                .unwrap();
+        }
+        // Never adopted (e.g. the Stack apply failed or keel-server stopped in between): Stack
+        // deletion cannot GC them, the label-based sweep does.
+        assert!(
+            !cluster
+                .delete_preview_object("Stack", "preview-stack-pr-6")
+                .await
+                .unwrap()
+        );
+        assert_eq!(cluster.preview_secret_names().len(), 2);
+        assert_eq!(cluster.delete_preview_secrets("#6").await.unwrap(), 1);
+        assert_eq!(
+            cluster.preview_secret_names(),
+            vec!["keel-preview-7-vm1-secrets".to_string()]
+        );
+        assert_eq!(cluster.delete_preview_secrets("6").await.unwrap(), 0);
+        assert!(cluster.delete_preview_secrets("6,x").await.is_err());
+    }
+
+    #[test]
+    fn preview_pr_labels_are_normalized_dns_labels() {
+        assert_eq!(preview_pr_label(" #42 ").unwrap(), "42");
+        assert_eq!(preview_pr_label("PR-7").unwrap(), "pr-7");
+        for bad in ["", "#", "-1", "1-", "a,b", "a=b", "a b", &"9".repeat(64)] {
+            assert!(preview_pr_label(bad).is_err(), "{bad}");
+        }
+    }
+
+    const PREVIEW_SECRETS: &str = "/api/v1/namespaces/keel-previews/secrets";
+    const PREVIEW_STACKS: &str = "/apis/pulumi.com/v1/namespaces/keel-previews/stacks";
+
+    #[tokio::test]
+    async fn live_copies_are_written_without_an_owner_and_adopted_after_the_stack_exists() {
+        let source = git_secret(
+            "vm1-secrets",
+            None,
+            &[("awsAccessKeyId", "AKIA"), ("unrelated", "x")],
+        );
+        let recorded = Recorded::default();
+        let cluster = KubePreviewCluster::new(mock_client(
+            vec![
+                secret_route("tenant-acme", &source),
+                (
+                    format!("GET {PREVIEW_STACKS}/preview-stack-pr-5"),
+                    200,
+                    json!({
+                        "apiVersion": "pulumi.com/v1",
+                        "kind": "Stack",
+                        "metadata": {
+                            "name": "preview-stack-pr-5",
+                            "namespace": KEEL_PREVIEWS_NAMESPACE,
+                            "uid": "stack-uid-5"
+                        }
+                    }),
+                ),
+            ],
+            recorded.clone(),
+        ));
+        let created = cluster
+            .copy_preview_secrets(
+                "acme",
+                "5",
+                &[copy(
+                    "vm1-secrets",
+                    "keel-preview-5-vm1-secrets",
+                    &["awsAccessKeyId"],
+                )],
+            )
+            .await
+            .unwrap();
+        // Copying never reads the (not yet applied) preview Stack.
+        assert_eq!(
+            recorded.lock().unwrap().clone(),
+            vec![
+                "GET /api/v1/namespaces/tenant-acme/secrets/vm1-secrets".to_string(),
+                format!("PATCH {PREVIEW_SECRETS}/keel-preview-5-vm1-secrets"),
+            ]
+        );
+        cluster
+            .adopt_preview_secrets("preview-stack-pr-5", &created)
+            .await
+            .unwrap();
+        let seen = recorded.lock().unwrap().clone();
+        assert_eq!(
+            seen[2..],
+            [
+                format!("GET {PREVIEW_STACKS}/preview-stack-pr-5"),
+                format!("PATCH {PREVIEW_SECRETS}/keel-preview-5-vm1-secrets"),
+            ]
+        );
+
+        // A Stack without a UID (or a missing Stack) is never used as an owner.
+        let cluster = KubePreviewCluster::new(mock_client(vec![], Recorded::default()));
+        assert!(
+            cluster
+                .adopt_preview_secrets("preview-stack-pr-5", &created)
+                .await
+                .is_err()
+        );
+        assert!(preview_stack_owner("s", None).is_err());
+        assert!(preview_stack_owner("s", Some(String::new())).is_err());
+        let owner = preview_stack_owner("s", Some("u".to_string())).unwrap();
+        assert_eq!(
+            (owner.api_version.as_str(), owner.kind.as_str()),
+            ("pulumi.com/v1", "Stack")
+        );
+    }
+
+    #[tokio::test]
+    async fn live_orphan_copies_are_selected_by_kind_and_pr_labels() {
+        let meta_list = json!({
+            "apiVersion": "meta.k8s.io/v1",
+            "kind": "PartialObjectMetadataList",
+            "metadata": {},
+            "items": [{
+                "apiVersion": "meta.k8s.io/v1",
+                "kind": "PartialObjectMetadata",
+                "metadata": {
+                    "name": "keel-preview-6-git-credentials",
+                    "namespace": KEEL_PREVIEWS_NAMESPACE,
+                    "labels": {
+                        "keel.io/secret-kind": PREVIEW_PROVIDER_SECRET_KIND,
+                        "keel.io/pr-id": "6"
+                    }
+                }
+            }]
+        });
+        let recorded = Recorded::default();
+        let cluster = KubePreviewCluster::new(mock_client(
+            vec![
+                (format!("GET {PREVIEW_SECRETS}"), 200, meta_list),
+                deleted_route(&format!("{PREVIEW_SECRETS}/keel-preview-6-git-credentials")),
+            ],
+            recorded.clone(),
+        ));
+        assert_eq!(
+            cluster.list_preview_secret_pr_ids().await.unwrap(),
+            BTreeSet::from(["6".to_string()])
+        );
+        assert_eq!(cluster.delete_preview_secrets("6").await.unwrap(), 1);
+        let seen = recorded.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            vec![
+                format!("GET {PREVIEW_SECRETS}"),
+                format!("GET {PREVIEW_SECRETS}"),
+                format!("DELETE {PREVIEW_SECRETS}/keel-preview-6-git-credentials"),
+            ]
+        );
+        assert_eq!(
+            preview_secret_selector(Some("6")),
+            format!("keel.io/secret-kind={PREVIEW_PROVIDER_SECRET_KIND},keel.io/pr-id=6")
+        );
+        // Selector injection is impossible: the PR id must be a DNS label.
+        assert!(cluster.delete_preview_secrets("6,keel.io/x").await.is_err());
     }
 }

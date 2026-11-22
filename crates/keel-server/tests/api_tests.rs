@@ -5252,7 +5252,31 @@ async fn test_pko_preview_lifecycle_is_applied_published_and_gced_from_cluster_s
     let copy = cluster
         .preview_secret(&git_copy)
         .expect("per-preview Git credential copy");
-    assert_eq!(copy.owner_stack, stack_name);
+    assert_eq!(copy.owner_stack.as_deref(), Some(stack_name.as_str()));
+    // PKO resolves `gitAuth` as soon as it sees the Stack and stalls (`SpecInvalid`, never
+    // retried) when the Secret is missing: every copy is written before the Stack is applied,
+    // and only then adopted by it.
+    let ops = cluster.operations();
+    let apply_at = ops
+        .iter()
+        .position(|o| o == &format!("apply:{stack_name}"))
+        .expect("Stack applied");
+    let copies: Vec<usize> = ops
+        .iter()
+        .enumerate()
+        .filter(|(_, o)| o.starts_with("copy:"))
+        .map(|(i, _)| i)
+        .collect();
+    let adoptions: Vec<usize> = ops
+        .iter()
+        .enumerate()
+        .filter(|(_, o)| o.starts_with("adopt:"))
+        .map(|(i, _)| i)
+        .collect();
+    assert!(ops.contains(&format!("copy:{git_copy}")), "{ops:?}");
+    assert!(copies.iter().all(|&i| i < apply_at), "{ops:?}");
+    assert_eq!(copies.len(), adoptions.len(), "{ops:?}");
+    assert!(adoptions.iter().all(|&i| i > apply_at), "{ops:?}");
     assert_eq!(
         copy.data.keys().cloned().collect::<Vec<_>>(),
         vec!["password".to_string(), "username".to_string()]
@@ -5329,12 +5353,94 @@ async fn test_pko_preview_lifecycle_is_applied_published_and_gced_from_cluster_s
         }),
     );
 
-    // Closing the PR out-of-band (not via the API) is still GC'd by the reconciler.
+    // A copy never adopted by a Stack (e.g. keel-server stopped between copying and applying)
+    // is found by its labels; an open PR's copies are never swept (a launch may be in progress).
+    cluster.put_tenant_secret("acme", "orphan-source", &[("k", "v")]);
+    let orphan = format!("keel-preview-{pr_id}-orphan-source");
+    cluster
+        .copy_preview_secrets(
+            "acme",
+            &pr_id,
+            &[keel_pko::PreviewSecretCopy {
+                source_name: "orphan-source".to_string(),
+                target_name: orphan.clone(),
+                keys: ["k".to_string()].into(),
+                proposed_data: None,
+            }],
+        )
+        .await
+        .unwrap();
+    let outcome = keel_server::preview_lifecycle::reconcile_previews_once(&restarted).await;
+    assert_eq!(outcome.deleted, 0, "{outcome:?}");
+    assert!(cluster.preview_secret(&orphan).is_some());
+
+    // Closing the PR out-of-band (not via the API) is still GC'd by the reconciler: the Stack,
+    // the legacy GitRepository, the adopted copies (with their owner) and the orphan copy.
     restarted.forge.close_pull_request(&pr_id).await.unwrap();
     let outcome = keel_server::preview_lifecycle::reconcile_previews_once(&restarted).await;
-    assert_eq!(outcome.deleted, 2, "{outcome:?}");
+    assert_eq!(outcome.deleted, 3, "{outcome:?}");
     assert!(cluster.stack_names().is_empty());
     assert!(cluster.git_repository_names().is_empty());
+    assert!(cluster.preview_secret_names().is_empty());
+}
+
+/// Launch failures never leave a Stack pointing at missing Secrets nor stray credential copies:
+/// a failed copy applies nothing, and a failed adoption tears the preview down.
+#[tokio::test]
+async fn test_pko_preview_launch_failures_clean_up_secret_copies() {
+    use keel_kube::{InMemoryPreviewCluster, PreviewPrerequisites};
+
+    let prereqs = PreviewPrerequisites {
+        git_url: Some("http://forgejo.keel-system.svc:3000/keel/infra-gitops.git".to_string()),
+        git_secret: Some("git-credentials".to_string()),
+        git_secret_keys: ["password".to_string(), "username".to_string()].into(),
+        ..PreviewPrerequisites::default()
+    };
+
+    // 1. The passphrase source is missing: the Git copy may already be written, but no Stack is
+    //    applied and the partial copies are removed.
+    let fixture = setup_fixture().await;
+    let cluster = InMemoryPreviewCluster::new().with_prerequisites(prereqs.clone());
+    cluster.put_tenant_secret(
+        "acme",
+        "git-credentials",
+        &[("username", "git"), ("password", "ro-token")],
+    );
+    let body = post_infra_proposal_with_cluster(&fixture, cluster.clone(), "vm-no-pass").await;
+    assert_eq!(body["report"]["run"]["phase"], "notExecuted", "{body}");
+    assert!(cluster.stack_names().is_empty());
+    assert!(cluster.preview_secret_names().is_empty());
+    assert!(
+        !cluster.operations().iter().any(|o| o.starts_with("apply:")),
+        "{:?}",
+        cluster.operations()
+    );
+
+    // 2. Adoption fails after the apply: Stack and copies are deleted, nothing keeps running.
+    let fixture = setup_fixture().await;
+    let cluster = InMemoryPreviewCluster::new().with_prerequisites(prereqs);
+    cluster.put_tenant_secret(
+        "acme",
+        "git-credentials",
+        &[("username", "git"), ("password", "ro-token")],
+    );
+    cluster.put_tenant_secret(
+        "acme",
+        "keel-pulumi-passphrase",
+        &[("passphrase", "tenant-pass")],
+    );
+    cluster.fail_adoption_with("conflict");
+    let body = post_infra_proposal_with_cluster(&fixture, cluster.clone(), "vm-no-adopt").await;
+    assert_eq!(body["report"]["run"]["phase"], "notExecuted", "{body}");
+    assert!(
+        body["report"]["run"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("could not be attached"),
+        "{body}"
+    );
+    assert!(cluster.stack_names().is_empty());
+    assert!(cluster.preview_secret_names().is_empty());
 }
 
 /// A rejected preview apply (e.g. Kyverno admission denial) is reported honestly as `failed`, and
@@ -5348,6 +5454,11 @@ async fn test_pko_preview_apply_failure_is_reported_honestly() {
         git_url: Some("http://forgejo.keel-system.svc:3000/keel/infra-gitops.git".to_string()),
         ..PreviewPrerequisites::default()
     });
+    cluster.put_tenant_secret(
+        "acme",
+        "keel-pulumi-passphrase",
+        &[("passphrase", "tenant-pass")],
+    );
     cluster.fail_applies_with("admission webhook denied: restrict-pulumi-providers");
     let state = fixture
         .state
@@ -5387,6 +5498,20 @@ async fn test_pko_preview_apply_failure_is_reported_honestly() {
     );
     assert!(body["report"]["run"]["stack"].is_null());
     assert!(cluster.stack_names().is_empty());
+    // The copies written before the rejected apply are removed again.
+    assert!(cluster.preview_secret_names().is_empty());
+    let ops = cluster.operations();
+    let apply_at = ops.iter().position(|o| o.starts_with("apply:")).unwrap();
+    assert!(
+        ops[..apply_at].iter().any(|o| o.starts_with("copy:")),
+        "{ops:?}"
+    );
+    assert!(
+        ops[apply_at..]
+            .iter()
+            .any(|o| o.starts_with("delete-secrets:")),
+        "{ops:?}"
+    );
 }
 
 /// Posts the `proxmox-vm` infra proposal used by the fail-closed preview source tests.
@@ -5672,7 +5797,7 @@ async fn test_preview_uses_tenant_backend_and_copies_only_referenced_provider_se
         ]
     );
     let copied = cluster.preview_secret(&copy_name).unwrap();
-    assert_eq!(copied.owner_stack, stack_name);
+    assert_eq!(copied.owner_stack.as_deref(), Some(stack_name.as_str()));
     assert_eq!(copied.labels["keel.io/pr-id"], pr.as_str());
     assert_eq!(copied.labels["keel.io/tenant"], "acme");
     assert_eq!(
@@ -5861,7 +5986,7 @@ async fn test_tenant_stacks_use_tenant_passphrase_secret_and_fail_closed_without
     let copy = cluster
         .preview_secret(&copy_name)
         .expect("tenant passphrase copied into keel-previews");
-    assert_eq!(copy.owner_stack, format!("preview-stack-pr-{pr}"));
+    assert_eq!(copy.owner_stack, Some(format!("preview-stack-pr-{pr}")));
     assert_eq!(copy.labels["keel.io/tenant"], "acme");
     assert!(
         copy.data["passphrase"] == tenant_pass.as_bytes(),
