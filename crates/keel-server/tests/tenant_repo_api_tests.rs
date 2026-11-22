@@ -649,7 +649,7 @@ async fn forgejo_tenant_creation_provisions_repository_stub_and_credentials() {
     assert_eq!(fx.log.minted.load(Ordering::SeqCst), 1);
     assert!(
         !raw.contains("s3cr3t"),
-        "credentials never leave the cluster: {raw}"
+        "credentials never leave the cluster"
     );
 
     // Secret lost: re-run mints a fresh credential and revokes the one nobody holds any more.
@@ -822,7 +822,7 @@ fn git(dir: &std::path::Path, args: &[&str]) {
         .unwrap();
     assert!(
         out.status.success(),
-        "git {args:?}: {}",
+        "git command failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
 }
@@ -835,7 +835,7 @@ fn push_change(
     content: &str,
     tmp: &std::path::Path,
 ) {
-    let work = tmp.join(format!("push-{}", uuid_like()));
+    let work = tmp.join(format!("push-{}", unique_suffix()));
     git(
         tmp,
         &["clone", bare.to_str().unwrap(), work.to_str().unwrap()],
@@ -863,7 +863,7 @@ fn push_change(
     );
 }
 
-fn uuid_like() -> u128 {
+fn unique_suffix() -> u128 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()

@@ -509,7 +509,10 @@ async fn manifest_app_secrets_are_encrypted_into_the_tenant_repository() {
         &format!("{branch}:tenants/acme/apps/rauthy/config/secrets.enc.yaml"),
     )
     .expect("encrypted secret in the tenant repository");
-    assert!(secret.contains("ENC["), "{secret}");
+    assert!(
+        secret.contains("ENC["),
+        "secrets.enc.yaml must be SOPS-encrypted"
+    );
     assert!(!secret.contains("Sample-Admin#Passw0rd!"));
     let index = git_show(&acme, &format!("{branch}:tenants/acme/kustomization.yaml")).unwrap();
     assert!(

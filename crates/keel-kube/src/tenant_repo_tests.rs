@@ -71,7 +71,10 @@ fn source_accepts_only_https_and_ssh_urls_with_a_path() {
     }
     assert!(TenantRepoSource::new("Bad_Tenant", FORGEJO_URL).is_err());
     let err = TenantRepoSource::new("acme", "ssh://git:hunter2@github.com/o/r.git").unwrap_err();
-    assert!(!err.to_string().contains("hunter2"), "{err}");
+    assert!(
+        !err.to_string().contains("hunter2"),
+        "the SSH password must be redacted from the error"
+    );
     // Other plain SSH users (self-hosted forges) are fine.
     TenantRepoSource::new("acme", "ssh://deploy_user-1@forge.example/o/r.git").unwrap();
 }
@@ -296,7 +299,7 @@ fn https_credentials_secret_has_the_flux_and_pko_keys() {
         };
         assert!(
             build_tenant_gitops_credentials_secret(&https(), &c).is_err(),
-            "{username}"
+            "an invalid HTTPS credential must be refused"
         );
     }
     // Transport must match the URL.
@@ -422,7 +425,10 @@ fn credential_debug_never_prints_secret_material() {
     let err = build_tenant_gitops_credentials_secret(&self::https(), &bad)
         .unwrap_err()
         .to_string();
-    assert!(!err.contains("space-secret"), "{err}");
+    assert!(
+        !err.contains("space-secret"),
+        "the token must be redacted from the error"
+    );
 }
 
 #[test]
@@ -877,7 +883,10 @@ fn credential_status_requires_the_platform_secret_for_exactly_this_repository() 
             reason,
         } => {
             assert_eq!(credential_id.as_deref(), Some("7"));
-            assert!(!reason.contains(TOKEN), "{reason}");
+            assert!(
+                !reason.contains(TOKEN),
+                "the token must be redacted from the reason"
+            );
         }
         other => panic!("expected Invalid, got {other:?}"),
     }
@@ -925,7 +934,7 @@ fn credential_status_requires_the_platform_secret_for_exactly_this_repository() 
                 tenant_gitops_credentials_status(&ssh(), Some(&partial)),
                 TenantGitopsCredentialStatus::Invalid { ref reason, .. } if reason.contains(key)
             ),
-            "{key}"
+            "a missing SSH Secret data entry must be reported as invalid"
         );
     }
 }

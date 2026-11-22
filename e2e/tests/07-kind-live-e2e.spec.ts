@@ -180,16 +180,18 @@ function captureQuiet(bin: string, args: string[]): string {
 
 /** Decoded value of `key` in Secret `ns/name` (never logged by callers); '' when absent. */
 function secretValue(ns: string, name: string, key: string): string {
-  const res = tryCmd('kubectl', [
-    'get',
-    'secret',
-    name,
-    '-n',
-    ns,
-    '-o',
-    `jsonpath={.data.${key.replace(/\./g, '\\.')}}`,
-  ]);
-  return res.ok ? Buffer.from(res.stdout, 'base64').toString('utf-8') : '';
+  // `-o json` + a plain property lookup: no JSONPath built from `key` (dots, backslashes).
+  const res = tryCmd('kubectl', ['get', 'secret', name, '-n', ns, '-o', 'json']);
+  if (!res.ok) return '';
+  let data: unknown;
+  try {
+    data = (JSON.parse(res.stdout) as { data?: unknown }).data;
+  } catch {
+    return '';
+  }
+  if (typeof data !== 'object' || data === null || !Object.hasOwn(data, key)) return '';
+  const encoded = (data as Record<string, unknown>)[key];
+  return typeof encoded === 'string' ? Buffer.from(encoded, 'base64').toString('utf-8') : '';
 }
 
 /** Basic-auth Git identity, handed to git through GIT_ASKPASS (never on a command line). */

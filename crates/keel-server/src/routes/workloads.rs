@@ -20,7 +20,10 @@ use crate::state::{AppState, MANAGEMENT_TENANT, ReleaseSummary, StackSummary};
 
 use crate::proposal_repo::{ScopeRepo, TenantIndex};
 
-use super::{RepoReader, resolve_tenant_resource_dir, stage_commit_push_in};
+use super::{
+    RepoReader, exists_contained, remove_dir_all_contained, resolve_tenant_resource_dir,
+    stage_commit_push_in,
+};
 
 /// Query parameters for `GET /api/v1/stacks`.
 #[derive(Debug, Deserialize)]
@@ -371,14 +374,11 @@ async fn delete_gitops_resource_pr(
             .checkout_new_branch(workdir, &branch)
             .await?;
 
-        tokio::fs::remove_dir_all(workdir.join(&rel_dir)).await?;
+        remove_dir_all_contained(workdir, &workdir.join(&rel_dir)).await?;
         let mut staged_paths = vec![rel_dir.clone()];
 
         let index = TenantIndex::new(&repo, tenant);
-        if tokio::fs::try_exists(workdir.join(index.rel_path()))
-            .await
-            .unwrap_or(false)
-        {
+        if exists_contained(workdir, &workdir.join(index.rel_path())).await? {
             let prefix_in_tenants = rel_dir
                 .strip_prefix("tenants/")
                 .unwrap_or(&rel_dir)

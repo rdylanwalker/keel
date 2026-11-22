@@ -23,21 +23,125 @@ use crate::git::parse_proposal_branch_tenant;
 
 const DEFAULT_USER_AGENT: &str = "keel-git/0.1.0";
 
+/// Maximum same-origin redirects followed (e.g. GitHub's 301 for a renamed repository).
+const MAX_REDIRECTS: usize = 5;
+
+/// Follows a redirect only when it stays on the origin (scheme, host and port) of the URL it
+/// came from. Credentials are attached to every request ([`ForgeBaseUrl`]), and reqwest keeps
+/// custom headers such as GitLab's `PRIVATE-TOKEN` across cross-origin hops, so a downgrade to
+/// `http://` or a hop to another host must never be followed (`NFR-SEC-05`).
+fn same_origin_redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.previous().len() > MAX_REDIRECTS {
+            return attempt.error("too many forge redirects");
+        }
+        let same_origin = attempt
+            .previous()
+            .last()
+            .is_some_and(|prev| prev.origin() == attempt.url().origin());
+        if same_origin {
+            attempt.follow()
+        } else {
+            attempt.error("refusing cross-origin forge redirect")
+        }
+    })
+}
+
 fn build_http_client() -> Result<Client, ForgeError> {
     Ok(Client::builder()
         .user_agent(DEFAULT_USER_AGENT)
         .timeout(Duration::from_secs(30))
+        .redirect(same_origin_redirect_policy())
         .build()?)
 }
 
-fn normalize_base_url(base_url: &str) -> Result<String, ForgeError> {
-    let trimmed = base_url.trim().trim_end_matches('/');
-    if trimmed.is_empty() || !(trimmed.starts_with("https://") || trimmed.starts_with("http://")) {
-        return Err(ForgeError::InvalidInput(
-            "base_url must start with http:// or https://".to_string(),
-        ));
+/// A forge REST base URL that is safe to send credentials to (`NFR-SEC-05`).
+///
+/// Every remote provider authenticates every request (token, `PRIVATE-TOKEN` or basic auth),
+/// and every REST URL is built from this value (`api()`), so this constructor is the single
+/// guard for credential transport: `https://` is always accepted, plain `http://` only for
+/// cluster-internal or loopback hosts ([`is_private_forge_host`]), e.g. the in-cluster
+/// Forgejo `http://forgejo-http.keel-system.svc.cluster.local:3000` or a Stage 0
+/// port-forward `http://127.0.0.1:<port>`. Anything else fails at provider construction.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ForgeBaseUrl(String);
+
+impl ForgeBaseUrl {
+    pub(crate) fn parse(base_url: &str) -> Result<Self, ForgeError> {
+        let trimmed = base_url.trim().trim_end_matches('/');
+        let parsed = reqwest::Url::parse(trimmed).map_err(|_| {
+            ForgeError::InvalidInput(
+                "forge base_url must be an absolute http:// or https:// URL".to_string(),
+            )
+        })?;
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            return Err(ForgeError::InvalidInput(
+                "forge base_url must not embed credentials".to_string(),
+            ));
+        }
+        if parsed.query().is_some() || parsed.fragment().is_some() {
+            return Err(ForgeError::InvalidInput(
+                "forge base_url must not carry a query or fragment".to_string(),
+            ));
+        }
+        let Some(host) = parsed.host() else {
+            return Err(ForgeError::InvalidInput(
+                "forge base_url has no host".to_string(),
+            ));
+        };
+        match parsed.scheme() {
+            "https" => {}
+            "http" if is_private_forge_host(&host) => {}
+            "http" => {
+                return Err(ForgeError::InvalidInput(format!(
+                    "refusing to send forge credentials over plain http:// to '{host}': use https:// \
+                     (plain http is only allowed for cluster-internal hosts (*.svc, \
+                     *.svc.cluster.local, single-label service names) and loopback)"
+                )));
+            }
+            _ => {
+                return Err(ForgeError::InvalidInput(
+                    "forge base_url must start with http:// or https://".to_string(),
+                ));
+            }
+        }
+        Ok(Self(trimmed.to_string()))
     }
-    Ok(trimmed.to_string())
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for ForgeBaseUrl {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ForgeBaseUrl {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Hosts that may be reached over plain `http://` with forge credentials: loopback
+/// (`localhost`, `127.0.0.0/8`, `::1`) and cluster-internal Service names (`*.svc`,
+/// `*.svc.cluster.local`, or a single-label name resolved through the pod's search domains).
+/// Traffic to these never leaves the node / cluster network.
+pub(crate) fn is_private_forge_host(host: &url::Host<&str>) -> bool {
+    match host {
+        url::Host::Ipv4(ip) => ip.is_loopback(),
+        url::Host::Ipv6(ip) => ip.is_loopback(),
+        url::Host::Domain(name) => {
+            let name = name.to_ascii_lowercase();
+            !name.is_empty()
+                && (!name.contains('.')
+                    || name.ends_with(".svc")
+                    || name.ends_with(".svc.cluster.local"))
+        }
+    }
 }
 
 pub(crate) fn validate_slug(value: &str, field: &str) -> Result<String, ForgeError> {
@@ -255,7 +359,7 @@ pub(crate) enum ForgejoAuth {
 #[derive(Clone)]
 pub struct ForgejoGiteaProvider {
     pub(crate) client: Client,
-    pub(crate) base_url: String,
+    pub(crate) base_url: ForgeBaseUrl,
     pub(crate) owner: String,
     pub(crate) repo: String,
     pub(crate) auth: ForgejoAuth,
@@ -321,7 +425,7 @@ impl ForgejoGiteaProvider {
     ) -> Result<Self, ForgeError> {
         Ok(Self {
             client: build_http_client()?,
-            base_url: normalize_base_url(base_url.as_ref())?,
+            base_url: ForgeBaseUrl::parse(base_url.as_ref())?,
             owner: validate_slug(owner.as_ref(), "owner")?,
             repo: validate_slug(repo.as_ref(), "repo")?,
             auth,
@@ -330,7 +434,7 @@ impl ForgejoGiteaProvider {
 
     /// `{base_url}/api/v1{path}`: every Forgejo/Gitea REST URL is built here.
     pub(crate) fn api(&self, path: &str) -> String {
-        format!("{}/api/v1{path}", self.base_url)
+        format!("{}/api/v1{path}", self.base_url.as_str())
     }
 
     /// Returns the base repository API endpoint URL.
@@ -814,7 +918,7 @@ impl ForgeProvider for ForgejoGiteaProvider {
 #[derive(Clone)]
 pub struct GitHubProvider {
     pub(crate) client: Client,
-    pub(crate) base_url: String,
+    pub(crate) base_url: ForgeBaseUrl,
     pub(crate) owner: String,
     pub(crate) repo: String,
     pub(crate) token: String,
@@ -847,7 +951,7 @@ impl GitHubProvider {
         }
         Ok(Self {
             client: build_http_client()?,
-            base_url: normalize_base_url(base_url.as_ref())?,
+            base_url: ForgeBaseUrl::parse(base_url.as_ref())?,
             owner: validate_slug(owner.as_ref(), "owner")?,
             repo: validate_slug(repo.as_ref(), "repo")?,
             token,
@@ -856,7 +960,7 @@ impl GitHubProvider {
 
     /// `{base_url}{path}`: every GitHub REST URL is built here.
     pub(crate) fn api(&self, path: &str) -> String {
-        format!("{}{path}", self.base_url)
+        format!("{}{path}", self.base_url.as_str())
     }
 
     /// Returns the base repository API endpoint URL.
@@ -1110,7 +1214,7 @@ impl ForgeProvider for GitHubProvider {
 #[derive(Clone)]
 pub struct GitLabProvider {
     pub(crate) client: Client,
-    pub(crate) base_url: String,
+    pub(crate) base_url: ForgeBaseUrl,
     pub(crate) project_path: String,
     pub(crate) encoded_project: String,
     pub(crate) token: String,
@@ -1143,7 +1247,7 @@ impl GitLabProvider {
         let encoded_project = url_encode_project_path(&clean_project);
         Ok(Self {
             client: build_http_client()?,
-            base_url: normalize_base_url(base_url.as_ref())?,
+            base_url: ForgeBaseUrl::parse(base_url.as_ref())?,
             project_path: clean_project,
             encoded_project,
             token,
@@ -1152,7 +1256,7 @@ impl GitLabProvider {
 
     /// `{base_url}/api/v4{path}`: every GitLab REST URL is built here.
     pub(crate) fn api(&self, path: &str) -> String {
-        format!("{}/api/v4{path}", self.base_url)
+        format!("{}/api/v4{path}", self.base_url.as_str())
     }
 
     /// Returns the base GitLab REST v4 project API URL.
@@ -1591,6 +1695,151 @@ mod tests {
         assert!(ForgejoGiteaProvider::new("ftp://bad", "o", "r", "tok").is_err());
         assert!(GitHubProvider::new("https://api.github.com", "o", "r", " ").is_err());
         assert!(GitLabProvider::new("https://gitlab.com", "../bad", "tok").is_err());
+    }
+
+    #[test]
+    fn credentials_go_over_https_or_to_cluster_internal_and_loopback_hosts_only() {
+        for allowed in [
+            "https://api.github.com",
+            "https://gitea.example.org/",
+            "http://forgejo-http.keel-system.svc.cluster.local:3000",
+            "http://forgejo-http.keel-system.svc:3000/",
+            "http://FORGEJO-HTTP.KEEL-SYSTEM.SVC.CLUSTER.LOCAL:3000",
+            "http://forgejo-http:3000",
+            "http://localhost:3000",
+            "http://127.0.0.1:41234",
+            "http://127.5.6.7",
+            "http://[::1]:8080",
+        ] {
+            let base = ForgeBaseUrl::parse(allowed)
+                .unwrap_or_else(|e| panic!("{allowed} should be accepted: {e}"));
+            assert!(!base.as_str().ends_with('/'), "{allowed}");
+            ForgejoGiteaProvider::new(allowed, "o", "r", "tok").unwrap();
+            ForgejoGiteaProvider::with_basic_auth(allowed, "o", "r", "u", "p").unwrap();
+            GitHubProvider::new(allowed, "o", "r", "tok").unwrap();
+            GitLabProvider::new(allowed, "o/r", "tok").unwrap();
+        }
+        for refused in [
+            "http://gitea.example.org",
+            "http://forgejo.keel.local:8888",
+            "http://forgejo-http.keel-system.svc.cluster.local.evil.example:3000",
+            "http://svc.evil.example",
+            "http://localhost.evil.example",
+            "http://10.96.0.10:3000",
+            "http://192.168.1.10",
+            "http://[2001:db8::1]",
+        ] {
+            let err = ForgeBaseUrl::parse(refused).unwrap_err().to_string();
+            assert!(
+                err.contains("refusing to send forge credentials over plain http://"),
+                "{refused}: {err}"
+            );
+            assert!(ForgejoGiteaProvider::new(refused, "o", "r", "tok").is_err());
+            assert!(ForgejoGiteaProvider::with_basic_auth(refused, "o", "r", "u", "p").is_err());
+            assert!(GitHubProvider::new(refused, "o", "r", "tok").is_err());
+            assert!(GitLabProvider::new(refused, "o/r", "tok").is_err());
+        }
+        for malformed in [
+            "",
+            "gitea.example.org",
+            "ftp://gitea.example.org",
+            "https://user:pw@gitea.example.org",
+            "https://gitea.example.org/?x=1",
+            "https://gitea.example.org/#frag",
+            "file:///tmp/forge",
+        ] {
+            assert!(ForgeBaseUrl::parse(malformed).is_err(), "{malformed}");
+        }
+    }
+
+    /// Serves one canned raw response per accepted connection on `listener` and returns the
+    /// raw requests (the shared mock server cannot emit a `Location` header).
+    fn serve_raw(
+        listener: tokio::net::TcpListener,
+        responses: Vec<String>,
+    ) -> tokio::task::JoinHandle<Vec<String>> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        tokio::spawn(async move {
+            let mut seen = Vec::new();
+            for resp in responses {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buf = vec![0u8; 8192];
+                let n = stream.read(&mut buf).await.unwrap();
+                seen.push(String::from_utf8_lossy(&buf[..n]).into_owned());
+                stream.write_all(resp.as_bytes()).await.unwrap();
+                stream.shutdown().await.unwrap();
+            }
+            seen
+        })
+    }
+
+    async fn bind_local() -> (tokio::net::TcpListener, String) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        (listener, base)
+    }
+
+    fn redirect_to(location: &str) -> String {
+        format!(
+            "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+    }
+
+    #[tokio::test]
+    async fn cross_origin_redirects_are_refused_without_forwarding_credentials() {
+        // Second listener: a different origin (port) that must never receive a request.
+        let attacker = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let attacker_url = format!("http://{}/stolen", attacker.local_addr().unwrap());
+        let attacker_hits = tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_millis(500), attacker.accept())
+                .await
+                .is_ok()
+        });
+
+        let (gl_listener, gl_url) = bind_local().await;
+        let gl_handle = serve_raw(gl_listener, vec![redirect_to(&attacker_url)]);
+        let gitlab = GitLabProvider::new(&gl_url, "o/r", "glpat-secret").unwrap();
+        assert!(gitlab.get_pull_request("1").await.is_err());
+        let gl_reqs = gl_handle.await.unwrap();
+        assert_eq!(gl_reqs.len(), 1);
+        assert!(
+            gl_reqs[0].contains("glpat-secret"),
+            "first hop is authenticated"
+        );
+
+        let (gh_listener, gh_url) = bind_local().await;
+        let gh_handle = serve_raw(gh_listener, vec![redirect_to(&attacker_url)]);
+        let github = GitHubProvider::new(&gh_url, "o", "r", "ghp-secret").unwrap();
+        assert!(github.get_pull_request("1").await.is_err());
+        assert_eq!(gh_handle.await.unwrap().len(), 1);
+
+        assert!(
+            !attacker_hits.await.unwrap(),
+            "a cross-origin redirect target received a request"
+        );
+    }
+
+    #[tokio::test]
+    async fn same_origin_redirects_are_followed() {
+        let pr_json = r#"{"number": 7, "title": "t", "state": "open", "merged": false,
+            "head": {"ref": "keel/acme/x-1", "sha": "abc"}, "base": {"ref": "main", "sha": "000"},
+            "html_url": "http://forge.local/pulls/7",
+            "created_at": "2026-11-14T10:00:00Z", "updated_at": "2026-11-14T10:00:00Z"}"#;
+        let ok = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{pr_json}",
+            pr_json.len()
+        );
+        // The redirect target is the same listener, so the hop is same-origin.
+        let (listener, url) = bind_local().await;
+        let moved = format!("{url}/repos/o/renamed/pulls/7");
+        let handle = serve_raw(listener, vec![redirect_to(&moved), ok]);
+        let github = GitHubProvider::new(&url, "o", "r", "tok").unwrap();
+        assert_eq!(github.get_pull_request("7").await.unwrap().id, "7");
+        let reqs = handle.await.unwrap();
+        assert_eq!(
+            request_line(&reqs[1]),
+            "GET /repos/o/renamed/pulls/7 HTTP/1.1"
+        );
     }
 
     #[tokio::test]

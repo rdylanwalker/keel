@@ -8,6 +8,7 @@ license.workspace = true
 tokio.workspace = true
 async-trait.workspace = true
 reqwest.workspace = true
+url.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 serde.workspace = true

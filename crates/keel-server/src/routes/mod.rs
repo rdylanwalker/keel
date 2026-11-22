@@ -204,6 +204,33 @@ pub(crate) async fn create_dir_all_contained(root: &Path, path: &Path) -> Result
     Ok(tokio::fs::create_dir_all(resolved).await?)
 }
 
+/// `true` when `path` exists, after [`resolve_contained_path`] confirms it stays inside `root`
+/// (`Forbidden` when it escapes, so a committed symlink never answers an existence probe for a
+/// file outside the worktree).
+pub(crate) async fn exists_contained(root: &Path, path: &Path) -> Result<bool, ServerError> {
+    match resolve_contained_path(root, path).await {
+        Ok(resolved) => Ok(tokio::fs::try_exists(resolved).await.unwrap_or(false)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(contained_io_error(err)),
+    }
+}
+
+/// Removes the directory tree at `path` after [`resolve_contained_path`] confirms it stays inside
+/// `root`. A symlink at `path` (necessarily pointing inside `root`) is removed itself, never its
+/// target.
+pub(crate) async fn remove_dir_all_contained(root: &Path, path: &Path) -> Result<(), ServerError> {
+    let resolved = resolve_contained_path(root, path)
+        .await
+        .map_err(contained_io_error)?;
+    if tokio::fs::symlink_metadata(path)
+        .await
+        .is_ok_and(|m| m.file_type().is_symlink())
+    {
+        return Ok(tokio::fs::remove_file(path).await?);
+    }
+    Ok(tokio::fs::remove_dir_all(resolved).await?)
+}
+
 /// Reads an optional repository file through [`resolve_contained_path`]: `Ok(None)` when it does
 /// not exist, and a `Forbidden` error (never a silent fallback) when it escapes `root`.
 pub(crate) async fn read_contained_optional(
@@ -633,6 +660,63 @@ mod tests {
 
     use super::*;
     use crate::auth::SessionClaims;
+
+    #[tokio::test]
+    async fn contained_exists_and_remove_stay_inside_the_worktree() {
+        let outside = TempDir::new().unwrap();
+        let victim = outside.path().join("victim");
+        tokio::fs::create_dir_all(&victim).await.unwrap();
+        tokio::fs::write(victim.join("keep.txt"), "x")
+            .await
+            .unwrap();
+        let repo = TempDir::new().unwrap();
+        let tenant_dir = repo.path().join("tenants/acme");
+        tokio::fs::create_dir_all(tenant_dir.join("apps/web"))
+            .await
+            .unwrap();
+
+        assert!(exists_contained(repo.path(), &tenant_dir).await.unwrap());
+        assert!(
+            !exists_contained(repo.path(), &repo.path().join("tenants/ghost"))
+                .await
+                .unwrap()
+        );
+        assert!(
+            !exists_contained(&repo.path().join("missing-root"), &tenant_dir)
+                .await
+                .unwrap()
+        );
+        let err = exists_contained(repo.path(), &repo.path().join("../escape"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ServerError::Forbidden(_)), "{err:?}");
+
+        remove_dir_all_contained(repo.path(), &tenant_dir.join("apps/web"))
+            .await
+            .unwrap();
+        assert!(!tenant_dir.join("apps/web").exists());
+
+        #[cfg(unix)]
+        {
+            // Escaping symlinks are neither probed nor removed through.
+            let escaping = repo.path().join("tenants/evil");
+            std::os::unix::fs::symlink(&victim, &escaping).unwrap();
+            let err = exists_contained(repo.path(), &escaping).await.unwrap_err();
+            assert!(matches!(err, ServerError::Forbidden(_)), "{err:?}");
+            let err = remove_dir_all_contained(repo.path(), &escaping)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, ServerError::Forbidden(_)), "{err:?}");
+            assert!(victim.join("keep.txt").exists());
+
+            // An in-repo symlink is removed itself, never its target.
+            let inner = repo.path().join("tenants/alias");
+            std::os::unix::fs::symlink(&tenant_dir, &inner).unwrap();
+            remove_dir_all_contained(repo.path(), &inner).await.unwrap();
+            assert!(tokio::fs::symlink_metadata(&inner).await.is_err());
+            assert!(tenant_dir.exists());
+        }
+    }
 
     #[tokio::test]
     async fn contained_io_rejects_symlink_and_parent_escapes() {

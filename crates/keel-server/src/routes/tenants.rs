@@ -19,8 +19,9 @@ use crate::state::AppState;
 use crate::tenant_repos::{self, ClusterProvisioning, TenantRepoForge, TenantStubState};
 
 use super::{
-    commit_author_for_session, load_provider_registry, open_pr_for_session, pr_author_for_session,
-    read_contained_optional, serialize_tenants_kustomization, stage_commit_push_and_return_to_main,
+    commit_author_for_session, exists_contained, load_provider_registry, open_pr_for_session,
+    pr_author_for_session, read_contained_optional, remove_dir_all_contained,
+    serialize_tenants_kustomization, stage_commit_push_and_return_to_main, write_contained,
 };
 
 /// Summary of an infrastructure provider returned by `GET /api/v1/providers` and `PUT /api/v1/providers/{id}`.
@@ -332,7 +333,7 @@ async fn read_platform_tenant_stub(
     tenant: &str,
 ) -> Result<(Option<String>, bool), ServerError> {
     let dir = state.repo_workdir.join("tenants").join(tenant);
-    let dir_exists = tokio::fs::try_exists(&dir).await.unwrap_or(false);
+    let dir_exists = exists_contained(&state.repo_workdir, &dir).await?;
     let manifest =
         read_contained_optional(&state.repo_workdir, &dir.join("git-repository.yaml")).await?;
     Ok((manifest, dir_exists))
@@ -555,7 +556,7 @@ async fn ensure_tenant_repo_skeleton(
         }
     }
     let rel = format!("tenants/{tenant}/kustomization.yaml");
-    if tokio::fs::try_exists(dir.join(&rel)).await.unwrap_or(false) {
+    if exists_contained(&dir, &dir.join(&rel)).await? {
         return Ok(None);
     }
     let yaml = keel_kube::build_tenant_repo_kustomization_yaml(tenant, &[])?;
@@ -962,9 +963,11 @@ async fn create_monorepo_tenant(
             .git_runner
             .sync_branch_from_remote(&state.repo_workdir, "origin", "main")
             .await?;
-        if tokio::fs::try_exists(state.repo_workdir.join(format!("tenants/{tenant}")))
-            .await
-            .unwrap_or(false)
+        if exists_contained(
+            &state.repo_workdir,
+            &state.repo_workdir.join("tenants").join(&tenant),
+        )
+        .await?
         {
             return Err(ServerError::Conflict(format!(
                 "Tenant '{tenant}' already exists"
@@ -1084,7 +1087,7 @@ pub async fn delete_tenant(
             .git_runner
             .sync_branch_from_remote(&state.repo_workdir, "origin", "main")
             .await?;
-        if !tokio::fs::try_exists(&tenant_dir).await.unwrap_or(false) {
+        if !exists_contained(&state.repo_workdir, &tenant_dir).await? {
             return Err(ServerError::NotFound(format!("Tenant '{id}' not found")));
         }
         state
@@ -1092,17 +1095,13 @@ pub async fn delete_tenant(
             .checkout_new_branch(&state.repo_workdir, &branch)
             .await?;
 
-        tokio::fs::remove_dir_all(state.repo_workdir.join(&rel_dir)).await?;
+        remove_dir_all_contained(&state.repo_workdir, &tenant_dir).await?;
         let mut staged_paths = vec![rel_dir.clone()];
 
         let tenants_kustomization_path = state.repo_workdir.join("tenants/kustomization.yaml");
-        if tokio::fs::try_exists(&tenants_kustomization_path)
-            .await
-            .unwrap_or(false)
+        if let Some(existing) =
+            read_contained_optional(&state.repo_workdir, &tenants_kustomization_path).await?
         {
-            let existing = tokio::fs::read_to_string(&tenants_kustomization_path)
-                .await
-                .unwrap_or_default();
             let resources: Vec<String> = noyalib::from_str::<Value>(&existing)
                 .ok()
                 .and_then(|v| v.get("resources").and_then(|r| r.as_array()).cloned())
@@ -1111,7 +1110,8 @@ pub async fn delete_tenant(
                 .filter_map(|v| v.as_str().map(str::to_string))
                 .filter(|r| !r.starts_with(&format!("{id}/")))
                 .collect();
-            tokio::fs::write(
+            write_contained(
+                &state.repo_workdir,
                 &tenants_kustomization_path,
                 serialize_tenants_kustomization(&resources)?,
             )
