@@ -4,8 +4,9 @@ use axum::Json;
 use axum::extract::{Path as AxumPath, State};
 use axum::http::StatusCode;
 use keel_core::{
-    AppRuntime, CatalogManifest, ManifestEngine, SopsManager, partition_values_by_schema,
-    render_helm_values_yaml, tenant_namespace, validate_dns_label, validate_schema_values,
+    AppRuntime, CatalogManifest, ManifestEngine, SopsManager, apply_schema_defaults,
+    merge_values_patch, partition_values_by_schema, render_helm_values_yaml, tenant_namespace,
+    validate_dns_label, validate_schema_values,
 };
 use keel_kube::{
     FluxDependencyRef, HelmChartSourceKind, HelmChartSourceRef, HelmReleaseSpecInput,
@@ -225,6 +226,16 @@ pub async fn create_proposal(
         &reserved_flux_kustomization_names(&instance_name, !is_helm_app),
     )
     .await?;
+    // First install: fill the catalog schema `default`s server-side, so CLI, API and GUI installs
+    // commit the same values. An edit (the instance directory exists) submits the complete
+    // desired values (keys the user removed must not come back as defaults), unless it asks to
+    // merge a partial patch over the committed values (`mergeStoredValues`, the CLI).
+    if resolved_dir.is_none() {
+        req.values = apply_schema_defaults(schema, &req.values);
+    } else if req.merge_stored_values {
+        let stored = read_stored_values(&repo.workdir, &own_rel_dir).await?;
+        req.values = merge_values_patch(&stored, &req.values);
+    }
     // Edit: secret fields left blank keep the committed values (the UI never receives them).
     let stored_manifest_secret = if manifest_engine == Some(ManifestEngine::Flux) || is_helm_app {
         read_stored_manifest_app_secret(&repo.workdir, &own_rel_dir).await
@@ -1303,4 +1314,25 @@ pub async fn create_proposal(
         report,
     )
     .await)
+}
+
+/// The committed non-secret values of an existing instance (`<rel_dir>/values.yaml`; an absent or
+/// empty file is `{}`). Secret fields are never in it: a blank secret keeps its stored value.
+async fn read_stored_values(
+    workdir: &std::path::Path,
+    rel_dir: &str,
+) -> Result<Value, ServerError> {
+    let path = workdir.join(rel_dir).join("values.yaml");
+    let raw = match tokio::fs::read_to_string(&path).await {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(json!({})),
+        Err(e) => return Err(e.into()),
+    };
+    match noyalib::from_str::<Value>(&raw) {
+        Ok(Value::Object(map)) => Ok(Value::Object(map)),
+        Ok(Value::Null) => Ok(json!({})),
+        Ok(_) | Err(_) => Err(ServerError::Internal(format!(
+            "committed values file `{rel_dir}/values.yaml` is not a YAML mapping"
+        ))),
+    }
 }

@@ -395,6 +395,56 @@ pub async fn execute_catalog_show(
     }
 }
 
+/// Longest `MESSAGE` cell of `keel app list` (`-o json` prints the full `statusMessage`).
+const RELEASE_MESSAGE_MAX_CHARS: usize = 120;
+
+/// Formats `GET /api/v1/releases` items as a table; `MESSAGE` says why a release is not Ready.
+pub(crate) fn format_releases_table(releases: &[Value]) -> String {
+    if releases.is_empty() {
+        return "No releases found.\n".to_string();
+    }
+    let rows: Vec<Vec<String>> = releases
+        .iter()
+        .map(|r| {
+            let message = r
+                .get("statusMessage")
+                .and_then(Value::as_str)
+                .map(|m| {
+                    if m.chars().count() > RELEASE_MESSAGE_MAX_CHARS {
+                        let mut cut: String =
+                            m.chars().take(RELEASE_MESSAGE_MAX_CHARS - 1).collect();
+                        cut.push('…');
+                        cut
+                    } else {
+                        m.to_string()
+                    }
+                })
+                .unwrap_or_default();
+            vec![
+                s(r, &["namespace"]).to_string(),
+                s(r, &["name"]).to_string(),
+                s(r, &["chart"]).to_string(),
+                s(r, &["version"]).to_string(),
+                s(r, &["runtime"]).to_string(),
+                s(r, &["status", "phase", "ready"]).to_string(),
+                message,
+            ]
+        })
+        .collect();
+    render_table(
+        &[
+            "NAMESPACE",
+            "NAME",
+            "CHART",
+            "VERSION",
+            "RUNTIME",
+            "STATUS",
+            "MESSAGE",
+        ],
+        &rows,
+    )
+}
+
 /// `keel app list` (deployed releases).
 pub async fn execute_app_list(args: &AppListArgs, ctx: &CliContext) -> Result<String, CliError> {
     let base_url = normalize_server_url(&args.server)?;
@@ -415,28 +465,7 @@ pub async fn execute_app_list(args: &AppListArgs, ctx: &CliContext) -> Result<St
         .unwrap_or_default();
     match args.output {
         OutputFormat::Json => pretty(&Value::Array(releases)),
-        OutputFormat::Table => {
-            if releases.is_empty() {
-                return Ok("No releases found.\n".to_string());
-            }
-            let rows: Vec<Vec<String>> = releases
-                .iter()
-                .map(|r| {
-                    vec![
-                        s(r, &["namespace"]).to_string(),
-                        s(r, &["name"]).to_string(),
-                        s(r, &["chart"]).to_string(),
-                        s(r, &["version"]).to_string(),
-                        s(r, &["runtime"]).to_string(),
-                        s(r, &["status", "phase", "ready"]).to_string(),
-                    ]
-                })
-                .collect();
-            Ok(render_table(
-                &["NAMESPACE", "NAME", "CHART", "VERSION", "RUNTIME", "STATUS"],
-                &rows,
-            ))
-        }
+        OutputFormat::Table => Ok(format_releases_table(&releases)),
     }
 }
 
@@ -595,6 +624,31 @@ mod tests {
         }));
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[1][1], "blueprint");
+    }
+
+    #[test]
+    fn app_list_table_shows_why_a_release_is_not_ready() {
+        let long = "x".repeat(300);
+        let table = format_releases_table(&[
+            json!({"namespace": "tenant-default", "name": "podinfo", "chart": "podinfo",
+                   "version": "6.7.1", "runtime": "helm", "status": "Error",
+                   "statusMessage": "Not applied: Kustomization tenant-default/keel-tenant-root is not ready: forbidden"}),
+            json!({"namespace": "tenant-default", "name": "web", "chart": "web",
+                   "runtime": "helm", "status": "Pending", "statusMessage": long}),
+            json!({"namespace": "tenant-default", "name": "ok", "chart": "ok",
+                   "runtime": "helm", "status": "Ready"}),
+        ]);
+        let lines: Vec<&str> = table.lines().collect();
+        assert!(
+            lines[0].contains("STATUS") && lines[0].ends_with("MESSAGE"),
+            "{table}"
+        );
+        assert!(lines[1].contains("Error") && lines[1].ends_with("is not ready: forbidden"));
+        let cut = lines[2].rsplit("  ").next().unwrap();
+        assert_eq!(cut.chars().count(), RELEASE_MESSAGE_MAX_CHARS);
+        assert!(cut.ends_with('…'));
+        assert!(lines[3].ends_with("Ready"));
+        assert_eq!(format_releases_table(&[]), "No releases found.\n");
     }
 
     #[test]

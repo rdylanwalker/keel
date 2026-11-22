@@ -5231,7 +5231,8 @@ mod workload_operator_app_tests {
             seed_values["multitenancy"]["enabled"]
         );
         assert!(locked["multitenancy"].get("enabled").is_none());
-        // Keel applies no schema defaults server-side: the lockdown switch must be submitted.
+        // An edit (no schema defaults) must submit the lockdown switch; a first install that
+        // omits it gets the default (on) from the server-side schema defaults.
         let flux_app = keel_core::parse_catalog_application(STARTER_FLUX2_APP_YAML).unwrap();
         for missing in [
             serde_json::json!({}),
@@ -5241,6 +5242,9 @@ mod workload_operator_app_tests {
                 keel_core::validate_schema_values(&flux_app.spec.schema, &missing).is_err(),
                 "{missing}"
             );
+            let installed = keel_core::apply_schema_defaults(&flux_app.spec.schema, &missing);
+            assert_eq!(installed["multitenancy"]["enabled"], true, "{missing}");
+            keel_core::validate_schema_values(&flux_app.spec.schema, &installed).unwrap();
         }
         keel_core::validate_schema_values(
             &flux_app.spec.schema,

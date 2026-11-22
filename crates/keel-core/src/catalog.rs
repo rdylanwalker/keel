@@ -286,6 +286,100 @@ pub fn partition_values_by_schema(
     })
 }
 
+/// Fills the JSON Schema `default`s of `schema` into `values`: the server-side twin of the
+/// GUI's `extractSchemaDefaults` (`ui/src/lib/schemaBuilder.ts`), so a CLI/API install gets the
+/// same values as the `@rjsf/core` form (`SDD.md` §5.1).
+///
+/// - A property missing from `values` takes its `default` (scalars, arrays and objects alike);
+///   a submitted value, including an explicit `null`, is never overridden.
+/// - Object properties without a `default` are recursed into; a nested mapping is only added
+///   when it ends up non-empty.
+/// - Object items of a submitted array get their item schema's defaults.
+/// - Secret fields (`writeOnly: true` / `format: "password"`) never receive a default, and
+///   secret sub-fields of an object default are dropped: secrets must be submitted explicitly.
+///
+/// Callers apply this on first install only. An edit submits the complete desired values and
+/// must not get defaults back for keys the user removed.
+pub fn apply_schema_defaults(schema: &Value, values: &Value) -> Value {
+    match values {
+        Value::Object(map) => Value::Object(fill_object_defaults(schema, map.clone())),
+        other => other.clone(),
+    }
+}
+
+fn fill_object_defaults(schema: &Value, mut map: Map<String, Value>) -> Map<String, Value> {
+    let Some(props) = schema.get("properties").and_then(Value::as_object) else {
+        return map;
+    };
+    for (key, prop) in props {
+        if !prop.is_object() || is_secret_schema_node(prop) {
+            continue;
+        }
+        match map.get(key) {
+            None => {
+                if let Some(default) = prop.get("default") {
+                    // An object default keeps only its non-secret parts.
+                    if let (Some(normal), _) = split_node(Some(prop), default) {
+                        map.insert(key.clone(), normal);
+                    }
+                } else if prop.get("properties").is_some_and(Value::is_object) {
+                    let nested = fill_object_defaults(prop, Map::new());
+                    if !nested.is_empty() {
+                        map.insert(key.clone(), Value::Object(nested));
+                    }
+                }
+            }
+            Some(Value::Object(existing)) => {
+                let nested = fill_object_defaults(prop, existing.clone());
+                map.insert(key.clone(), Value::Object(nested));
+            }
+            Some(Value::Array(items)) => {
+                if let Some(item_schema) = prop
+                    .get("items")
+                    .filter(|s| s.is_object() && !is_secret_schema_node(s))
+                {
+                    let filled = items
+                        .iter()
+                        .map(|item| apply_schema_defaults(item_schema, item))
+                        .collect();
+                    map.insert(key.clone(), Value::Array(filled));
+                }
+            }
+            Some(_) => {}
+        }
+    }
+    map
+}
+
+/// Applies `patch` over `base` with JSON Merge Patch semantics (RFC 7386): objects merge key by
+/// key, a `null` in `patch` removes that key, and any other value (scalars, arrays) replaces the
+/// base value. Used for CLI edits (`mergeStoredValues`), which send only the keys to change on
+/// top of an instance's committed values (`SDD.md` §5.1).
+pub fn merge_values_patch(base: &Value, patch: &Value) -> Value {
+    match (base, patch) {
+        (Value::Object(base_map), Value::Object(patch_map)) => {
+            let mut merged = base_map.clone();
+            for (key, value) in patch_map {
+                if value.is_null() {
+                    merged.remove(key);
+                } else {
+                    let next = merge_values_patch(merged.get(key).unwrap_or(&Value::Null), value);
+                    merged.insert(key.clone(), next);
+                }
+            }
+            Value::Object(merged)
+        }
+        (_, Value::Object(_)) => merge_values_patch(&Value::Object(Map::new()), patch),
+        (_, other) => other.clone(),
+    }
+}
+
+/// Removes every `null` object entry, recursively (array items are kept as they are): the values
+/// a merge patch leaves once there is nothing to merge into.
+pub fn strip_null_values(values: &Value) -> Value {
+    merge_values_patch(&Value::Object(Map::new()), values)
+}
+
 fn find_property_schema<'a>(schema: &'a Value, prop_name: &str) -> Option<&'a Value> {
     let obj = schema.as_object()?;
     if let Some(prop) = obj
@@ -2487,6 +2581,140 @@ spec:
             no_parent["s3"]["httpRoute"]["parentRefs"][1]["sectionName"],
             "https"
         );
+    }
+
+    #[test]
+    fn schema_defaults_fill_missing_values_like_the_gui() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "replicaCount": { "type": "integer", "default": 1 },
+                "tags": { "type": "array", "default": ["a", "b"] },
+                "explicitNull": { "type": ["string", "null"], "default": "x" },
+                "resources": {
+                    "type": "object",
+                    "properties": {
+                        "limits": {
+                            "type": "object",
+                            "properties": { "cpu": { "type": "string", "default": "100m" } }
+                        },
+                        "empty": { "type": "object", "properties": { "x": { "type": "string" } } }
+                    }
+                },
+                "noDefaults": {
+                    "type": "object",
+                    "properties": { "x": { "type": "string" } }
+                },
+                "ports": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "port": { "type": "integer" },
+                            "protocol": { "type": "string", "default": "TCP" }
+                        }
+                    }
+                },
+                "password": { "type": "string", "writeOnly": true, "default": "changeme" },
+                "auth": {
+                    "type": "object",
+                    "default": { "user": "admin", "token": "t0ps3cret" },
+                    "properties": {
+                        "user": { "type": "string" },
+                        "token": { "type": "string", "format": "password" }
+                    }
+                },
+                "onlySecret": {
+                    "type": "object",
+                    "default": { "key": "k" },
+                    "properties": { "key": { "type": "string", "writeOnly": true } }
+                }
+            }
+        });
+        let values = json!({
+            "replicaCount": 3,
+            "explicitNull": null,
+            "resources": { "limits": {} },
+            "ports": [{ "port": 80 }, { "port": 53, "protocol": "UDP" }]
+        });
+        let filled = apply_schema_defaults(&schema, &values);
+        assert_eq!(
+            filled,
+            json!({
+                "replicaCount": 3,
+                "tags": ["a", "b"],
+                "explicitNull": null,
+                "resources": { "limits": { "cpu": "100m" } },
+                "ports": [
+                    { "port": 80, "protocol": "TCP" },
+                    { "port": 53, "protocol": "UDP" }
+                ],
+                "auth": { "user": "admin" }
+            })
+        );
+        // Idempotent, and a non-object input is returned untouched.
+        assert_eq!(apply_schema_defaults(&schema, &filled), filled);
+        assert_eq!(apply_schema_defaults(&schema, &json!("x")), json!("x"));
+        assert_eq!(apply_schema_defaults(&json!({}), &values), values);
+    }
+
+    #[test]
+    fn merge_values_patch_follows_json_merge_patch() {
+        let stored = json!({
+            "replicaCount": 1,
+            "securityContext": { "runAsNonRoot": true, "capabilities": { "drop": ["ALL"] } },
+            "tags": ["a", "b"],
+            "drop": "me"
+        });
+        let patch = json!({
+            "replicaCount": 3,
+            "securityContext": { "readOnlyRootFilesystem": true },
+            "tags": ["c"],
+            "drop": null,
+            "absent": null,
+            "added": { "x": null, "y": 1 }
+        });
+        assert_eq!(
+            merge_values_patch(&stored, &patch),
+            json!({
+                "replicaCount": 3,
+                "securityContext": {
+                    "runAsNonRoot": true,
+                    "capabilities": { "drop": ["ALL"] },
+                    "readOnlyRootFilesystem": true
+                },
+                "tags": ["c"],
+                "added": { "y": 1 }
+            })
+        );
+        // A non-object patch replaces the base; an empty patch keeps it.
+        assert_eq!(merge_values_patch(&stored, &json!("x")), json!("x"));
+        assert_eq!(merge_values_patch(&stored, &json!({})), stored);
+        assert_eq!(
+            strip_null_values(&json!({ "a": null, "b": { "c": null, "d": [null] } })),
+            json!({ "b": { "d": [null] } })
+        );
+    }
+
+    #[test]
+    fn podinfo_install_gets_the_restricted_security_context_default() {
+        let app = parse_catalog_application(include_str!(
+            "../../../deploy/catalog/apps/podinfo/catalog.yaml"
+        ))
+        .unwrap();
+        let filled = apply_schema_defaults(
+            &app.spec.schema,
+            &json!({ "ingressHost": "podinfo.keel.local", "replicaCount": 2, "apiToken": "abcdefgh" }),
+        );
+        assert_eq!(filled["apiToken"], "abcdefgh");
+        assert_eq!(filled["replicaCount"], 2);
+        assert_eq!(filled["securityContext"]["runAsNonRoot"], true);
+        assert_eq!(filled["securityContext"]["allowPrivilegeEscalation"], false);
+        assert_eq!(
+            filled["securityContext"]["capabilities"]["drop"],
+            json!(["ALL"])
+        );
+        validate_schema_values(&app.spec.schema, &filled).unwrap();
     }
 
     #[test]

@@ -113,6 +113,12 @@ pub struct ReleaseSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_synced: Option<String>,
     pub status: String,
+    /// Why the release is not Ready: its live Flux object's `Ready` condition (`Reason:
+    /// message`), a failed canary's analysis message, or the tenant root Kustomization failure
+    /// that keeps it from being applied (for a release with a live object: its latest Git
+    /// change is not applied, its own status is kept).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_message: Option<String>,
     /// `true` for a protected management-plane core add-on (never for tenant releases).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub management_addon: bool,
@@ -1133,9 +1139,46 @@ impl KubeClusterStateProvider {
         let live = self.live.release_status_details().await;
         let live_canaries = self.live.canary_statuses().await;
         for rel in &mut releases {
+            // The tenant root Kustomization applies every app of the tenant repository: while it
+            // fails, the release's latest Git change is not applied (a new release stays
+            // Pending, an applied one keeps its previous live object and status).
+            let root_failure = rel
+                .namespace
+                .starts_with("tenant-")
+                .then(|| {
+                    live.get(&(
+                        rel.namespace.clone(),
+                        keel_kube::TENANT_ROOT_KUSTOMIZATION_NAME.to_string(),
+                    ))
+                })
+                .flatten()
+                .and_then(|root| root.message.as_ref().map(|m| (root.status.clone(), m)));
             if let Some(info) = live.get(&(rel.namespace.clone(), rel.name.clone())) {
                 rel.status = Self::status_label(&info.status);
                 rel.last_synced = info.last_synced.clone();
+                rel.status_message = info.message.clone();
+                if let Some((LiveResourceStatus::Error, m)) = &root_failure {
+                    let note = format!(
+                        "Latest Git changes not applied: Kustomization {}/{} failed: {m}",
+                        rel.namespace,
+                        keel_kube::TENANT_ROOT_KUSTOMIZATION_NAME
+                    );
+                    rel.status_message = Some(match rel.status_message.take() {
+                        Some(own) => format!("{own}; {note}"),
+                        None => note,
+                    });
+                }
+            } else if let Some((root_status, m)) = &root_failure {
+                // Not applied yet and the root Kustomization is not ready: that is why it stays
+                // Pending (or fails).
+                if *root_status == LiveResourceStatus::Error {
+                    rel.status = Self::status_label(root_status);
+                }
+                rel.status_message = Some(format!(
+                    "Not applied: Kustomization {}/{} is not ready: {m}",
+                    rel.namespace,
+                    keel_kube::TENANT_ROOT_KUSTOMIZATION_NAME
+                ));
             }
             if rel.canary
                 && let Some(cinfo) = live_canaries.get(&(rel.namespace.clone(), rel.name.clone()))
@@ -1150,6 +1193,9 @@ impl KubeClusterStateProvider {
                 rel.primary_version = cinfo.primary_version.clone();
                 rel.error_rate = cinfo.error_rate;
                 rel.latency_ms = cinfo.latency_ms;
+                if cinfo.message.is_some() {
+                    rel.status_message = cinfo.message.clone();
+                }
             }
         }
         // Keep any live tenant-* release that is absent from Git `main` (awaiting Flux prune or mid-termination),
@@ -1939,6 +1985,153 @@ mod tests {
             kube_releases
                 .iter()
                 .any(|r| r.name == "podinfo" && r.canary)
+        );
+    }
+
+    struct ReleaseDetailLive(HashMap<(String, String), LiveResourceInfo>);
+
+    #[async_trait]
+    impl LiveStatusSource for ReleaseDetailLive {
+        async fn stack_statuses(&self) -> HashMap<(String, String), LiveResourceStatus> {
+            HashMap::new()
+        }
+        async fn stack_status_details(&self) -> HashMap<(String, String), LiveResourceInfo> {
+            HashMap::new()
+        }
+        async fn release_status_details(&self) -> HashMap<(String, String), LiveResourceInfo> {
+            self.0.clone()
+        }
+        async fn helm_release_status_details(&self) -> HashMap<(String, String), LiveResourceInfo> {
+            self.0.clone()
+        }
+        async fn kustomization_status_details(
+            &self,
+        ) -> HashMap<(String, String), LiveResourceInfo> {
+            HashMap::new()
+        }
+    }
+
+    /// Snag #5 (fresh-user dry run): a release reports why it is not Ready, including the
+    /// tenant root Kustomization failure that keeps it from being applied at all.
+    #[tokio::test]
+    async fn list_releases_surfaces_not_ready_reasons() {
+        let tmp = tempfile::tempdir().unwrap();
+        for (tenant, name) in [
+            ("acme", "web"),
+            ("acme", "api"),
+            ("acme", "live"),
+            ("beta", "db"),
+            ("beta", "cache"),
+            ("gamma", "ui"),
+        ] {
+            let dir = tmp.path().join(format!("tenants/{tenant}/apps/{name}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("helmrelease.yaml"),
+                format!(
+                    "apiVersion: helm.toolkit.fluxcd.io/v2\nkind: HelmRelease\nmetadata:\n  name: {name}\n  namespace: tenant-{tenant}\nspec:\n  chart:\n    spec:\n      chart: {name}\n"
+                ),
+            )
+            .unwrap();
+        }
+        let info = |status: LiveResourceStatus, message: Option<&str>| LiveResourceInfo {
+            message: message.map(str::to_owned),
+            ..LiveResourceInfo::from_status(status)
+        };
+        let root = keel_kube::TENANT_ROOT_KUSTOMIZATION_NAME.to_string();
+        let live = HashMap::from([
+            (
+                ("tenant-acme".to_string(), "web".to_string()),
+                info(
+                    LiveResourceStatus::Error,
+                    Some("InstallFailed: admission webhook denied the request"),
+                ),
+            ),
+            (
+                ("tenant-acme".to_string(), root.clone()),
+                info(
+                    LiveResourceStatus::Error,
+                    Some("ReconciliationFailed: canaries.flagger.app \"web\" is forbidden"),
+                ),
+            ),
+            (
+                ("tenant-acme".to_string(), "live".to_string()),
+                info(LiveResourceStatus::Ready, None),
+            ),
+            (
+                ("tenant-beta".to_string(), "cache".to_string()),
+                info(LiveResourceStatus::Ready, None),
+            ),
+            (
+                ("tenant-beta".to_string(), root.clone()),
+                info(
+                    LiveResourceStatus::Reconciling,
+                    Some("Progressing: reconciliation in progress"),
+                ),
+            ),
+            (
+                ("tenant-gamma".to_string(), root.clone()),
+                info(LiveResourceStatus::Ready, None),
+            ),
+        ]);
+        let provider = KubeClusterStateProvider::new(
+            RepoClusterStateProvider::new(tmp.path()),
+            Arc::new(ReleaseDetailLive(live)),
+        );
+        let releases = provider.list_releases(None).await.unwrap();
+        let by_name = |n: &str| releases.iter().find(|r| r.name == n).unwrap();
+        assert_eq!(releases.len(), 6, "the root Kustomization is not a release");
+
+        let root_failed = "Latest Git changes not applied: Kustomization \
+                           tenant-acme/keel-tenant-root failed: ReconciliationFailed: \
+                           canaries.flagger.app \"web\" is forbidden";
+        let web = by_name("web");
+        assert_eq!(web.status, "Error");
+        assert_eq!(
+            web.status_message.as_deref(),
+            Some(
+                format!("InstallFailed: admission webhook denied the request; {root_failed}")
+                    .as_str()
+            )
+        );
+        // An applied, Ready release keeps its status but says its latest change is not applied.
+        let live_rel = by_name("live");
+        assert_eq!(live_rel.status, "Ready");
+        assert_eq!(live_rel.status_message.as_deref(), Some(root_failed));
+        // A root Kustomization that is only progressing says nothing about applied releases.
+        let cache = by_name("cache");
+        assert_eq!(cache.status, "Ready");
+        assert_eq!(cache.status_message, None);
+        let api = by_name("api");
+        assert_eq!(api.status, "Error");
+        assert_eq!(
+            api.status_message.as_deref(),
+            Some(
+                "Not applied: Kustomization tenant-acme/keel-tenant-root is not ready: \
+                 ReconciliationFailed: canaries.flagger.app \"web\" is forbidden"
+            )
+        );
+        let db = by_name("db");
+        assert_eq!(db.status, "Pending");
+        assert!(
+            db.status_message
+                .as_deref()
+                .unwrap()
+                .ends_with("Progressing: reconciliation in progress")
+        );
+        let ui = by_name("ui");
+        assert_eq!(ui.status, "Pending");
+        assert_eq!(ui.status_message, None);
+        let json = serde_json::to_value(by_name("api")).unwrap();
+        assert_eq!(
+            json["statusMessage"],
+            api.status_message.as_deref().unwrap()
+        );
+        assert!(
+            serde_json::to_value(ui)
+                .unwrap()
+                .get("statusMessage")
+                .is_none()
         );
     }
 

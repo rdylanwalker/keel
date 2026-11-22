@@ -746,6 +746,37 @@ describe("DeployInstanceModal validation, secrets and server errors", () => {
     })
   })
 
+  it("refills a missing schema default when an edit opens (documented in Schema Defaults)", async () => {
+    vi.mocked(api.createProposal).mockResolvedValue({
+      id: "1",
+      title: "t",
+      branch: "b",
+      tenant: "default",
+      scope: "default",
+      status: "open",
+      createdAt: "now",
+    })
+    render(
+      <DeployInstanceModal
+        isOpen
+        onClose={vi.fn()}
+        catalogItem={sampleAppItem}
+        tenant="default"
+        isEditMode
+        initialConfig={{ name: "podinfo", values: { replicaCount: 3 } }}
+      />
+    )
+    fireEvent.click(
+      screen.getByRole("button", { name: /Submit & Open Git PR Proposal/i })
+    )
+    await waitFor(() => expect(api.createProposal).toHaveBeenCalled())
+    // The committed values lacked `nested`; the form adds its default back.
+    expect(vi.mocked(api.createProposal).mock.calls[0][0].values).toEqual({
+      replicaCount: 3,
+      nested: { enabled: true },
+    })
+  })
+
   const manifestItem: CatalogItem = {
     id: "raw",
     name: "Raw App",

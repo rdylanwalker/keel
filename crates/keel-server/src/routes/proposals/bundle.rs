@@ -4,8 +4,8 @@ use axum::Json;
 use axum::http::StatusCode;
 use keel_core::{
     AppRuntime, BundleItemKind, CatalogBundle, CatalogManifest, ManifestEngine,
-    partition_values_by_schema, render_helm_values_yaml, tenant_namespace, validate_dns_label,
-    validate_schema_values,
+    apply_schema_defaults, partition_values_by_schema, render_helm_values_yaml, tenant_namespace,
+    validate_dns_label, validate_schema_values,
 };
 use keel_kube::{
     FluxDependencyRef, FluxHealthCheckRef, FluxKustomizationSpecInput, HelmChartSourceKind,
@@ -57,7 +57,7 @@ pub(super) async fn create_bundle_proposal(
     state: AppState,
     repo: ScopeRepo,
     repo_guard: ProposalGuards,
-    req: CreateProposalRequest,
+    mut req: CreateProposalRequest,
     bundle: CatalogBundle,
 ) -> Result<(StatusCode, Json<CreateProposalResponse>), ServerError> {
     let instance_name = req
@@ -71,7 +71,21 @@ pub(super) async fn create_bundle_proposal(
 
     let action_label = format!("bundle-{}", bundle.metadata.id);
     validate_dns_label(&action_label, "action")?;
+    if req.merge_stored_values {
+        return Err(ServerError::BadRequest(
+            "mergeStoredValues is not supported for bundles: submit the complete bundle values"
+                .to_string(),
+        ));
+    }
     let bundle_rel_dir = format!("tenants/{}/bundles/{instance_name}", req.tenant);
+    // First install fills schema defaults (bundle schema here, each item's schema below); an
+    // edit submits the complete desired values, so removed keys never come back as defaults.
+    let is_new_bundle = !tokio::fs::try_exists(repo.workdir.join(&bundle_rel_dir))
+        .await
+        .unwrap_or(false);
+    if is_new_bundle {
+        req.values = apply_schema_defaults(&bundle.spec.schema, &req.values);
+    }
 
     // Edit: secret fields of committed manifest-app items left blank keep their stored values.
     let mut stored_item_secrets = std::collections::BTreeMap::new();
@@ -117,10 +131,7 @@ pub(super) async fn create_bundle_proposal(
         &reserved_names,
     )
     .await?;
-    if !tokio::fs::try_exists(repo.workdir.join(&bundle_rel_dir))
-        .await
-        .unwrap_or(false)
-    {
+    if is_new_bundle {
         for item in &bundle.spec.items {
             ensure_no_derived_name_sibling(
                 &repo.workdir,
@@ -202,6 +213,11 @@ pub(super) async fn create_bundle_proposal(
                 CatalogManifest::Bundle(b) => &b.spec.schema,
             });
 
+        let item_values = if is_new_bundle {
+            apply_schema_defaults(sub_schema, &item_values)
+        } else {
+            item_values
+        };
         let partitioned = partition_values_by_schema(sub_schema, &item_values)?;
         let values_yaml = render_helm_values_yaml(&partitioned.normal_values)?;
         let mut helm_item_tenant_resources: Vec<&'static str> = Vec::new();

@@ -381,7 +381,8 @@ test.describe('02 - Catalog Dynamic Forms & PR Proposal Generation', () => {
     expect(sharedNs.status()).toBe(400);
     expect(JSON.stringify(await sharedNs.json())).toContain('spec.placement.namespace');
 
-    // The Flux multi-tenancy lockdown switch is required (no server-side schema defaults).
+    // A first install that omits the Flux multi-tenancy lockdown switch gets its schema default
+    // (on) from the server instead of a 422 (or the chart default, off).
     const noLockdown = await api.post('/api/v1/tenants/acme/proposals', {
       data: {
         tenant: 'acme',
@@ -391,7 +392,7 @@ test.describe('02 - Catalog Dynamic Forms & PR Proposal Generation', () => {
         values: {},
       },
     });
-    expect(noLockdown.status()).toBe(422);
+    expect(noLockdown.status(), await noLockdown.text()).toBe(201);
     await api.dispose();
   });
 });

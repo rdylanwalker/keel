@@ -59,9 +59,10 @@ spec:
     crds:
       annotations:
         helm.sh/resource-policy: keep
-  # Keel applies no schema defaults server-side (only the form fills them in), so the lockdown
-  # switch is required: an API/CLI request has to opt out explicitly instead of silently getting
-  # the chart default (`multitenancy.enabled: false`) next to the locked `privileged: true`.
+  # A first install that omits the lockdown switch gets `default: true` from Keel's server-side
+  # schema defaults. `required` makes every edit send it too, so an edit can never silently drop
+  # it and fall back to the chart default (`multitenancy.enabled: false`) next to the locked
+  # `privileged: true`. (A CLI edit merges its file over the committed values, which keep it.)
   schema:
     type: object
     required:

@@ -1204,6 +1204,22 @@ spec:
             validate_application_values(&no_canary_app, &redis_vals, true).unwrap_err();
         assert!(canary_err.to_string().contains("flaggerSupported=false"));
 
+        // A required field with a schema default may be omitted: the server fills it on install.
+        let mut defaulted = app.clone();
+        defaulted.spec.schema["properties"]["adminEmail"]["default"] = json!("admin@acme.io");
+        let prepared =
+            validate_application_values(&defaulted, &json!({ "domain": "auth.acme.io" }), false)
+                .unwrap();
+        assert!(prepared.values_yaml.contains("admin@acme.io"));
+        // A `null` (remove this key on an edit) is not validated as a value.
+        let prepared = validate_application_values(
+            &defaulted,
+            &json!({ "domain": "auth.acme.io", "adminEmail": null }),
+            false,
+        )
+        .unwrap();
+        assert!(prepared.values_yaml.contains("admin@acme.io"));
+
         let bp = parse_catalog_blueprint(SAMPLE_BLUEPRINT_CATALOG_YAML).unwrap();
         assert!(
             validate_blueprint_values(

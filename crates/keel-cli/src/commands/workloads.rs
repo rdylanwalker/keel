@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use keel_core::{
     CatalogApplication, CatalogInfraBlueprint, KEEL_PREVIEWS_NAMESPACE, PreparedHelmValues,
-    prepare_helm_values, resolve_ssh_target_from_sources, validate_dns_label,
-    validate_schema_values,
+    apply_schema_defaults, prepare_helm_values, resolve_ssh_target_from_sources, strip_null_values,
+    validate_dns_label, validate_schema_values,
 };
 use keel_git::{PullRequestInfo, PullRequestState};
 use keel_kube::{CrdReconcileStatus, CrdWatchEvent};
@@ -211,7 +211,10 @@ pub fn validate_blueprint_values(
     values: &Value,
 ) -> Result<(), CliError> {
     blueprint.validate()?;
-    validate_schema_values(&blueprint.spec.schema, values)?;
+    validate_schema_values(
+        &blueprint.spec.schema,
+        &effective_values(&blueprint.spec.schema, values),
+    )?;
     Ok(())
 }
 
@@ -228,7 +231,18 @@ pub fn validate_application_values(
             app.metadata.id
         )));
     }
-    Ok(prepare_helm_values(app, values)?)
+    Ok(prepare_helm_values(
+        app,
+        &effective_values(&app.spec.schema, values),
+    )?)
+}
+
+/// What the server commits for a values file, as far as the CLI can tell without the stored
+/// values: a first install gets the schema defaults; an edit merges the file over the committed
+/// values (which hold the install's defaults), with `null` removing a key. The server validates
+/// the real result again (`SDD.md` §5.1).
+fn effective_values(schema: &Value, values: &Value) -> Value {
+    apply_schema_defaults(schema, &strip_null_values(values))
 }
 
 /// Executes `keel infra provision`: validates values against the blueprint JSONSchema and opens a PR (`AGENTS.md` §3.6).
@@ -339,6 +353,9 @@ async fn submit_proposal_request(
         "kind": kind,
         "values": values,
         "canary": canary,
+        // Re-running against an existing instance edits it: merge the file over the committed
+        // values instead of replacing them, so omitted keys (and install defaults) are kept.
+        "mergeStoredValues": true,
     });
     if let Some(eng) = action_engine
         && let Some(obj) = req_body.as_object_mut()

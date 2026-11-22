@@ -380,6 +380,11 @@ export interface ReleaseSummary {
   bundle?: string
   bundleItem?: string
   lastSynced?: string
+  /**
+   * Why the release is not Ready: its Flux object's `Ready` condition, a failed canary's
+   * analysis message, or the failing tenant root Kustomization that has not applied it yet.
+   */
+  statusMessage?: string
   canaryWeight?: number
   canaryPhase?: string
   primaryVersion?: string

@@ -489,7 +489,11 @@ export function buildReleaseColumns(
             <StatusBadge status={row.original.status} collapsible />
           </span>
         ) : (
-          <StatusBadge status={row.original.status} collapsible />
+          <StatusBadge
+            status={row.original.status}
+            detail={row.original.statusMessage}
+            collapsible
+          />
         ),
     },
     {

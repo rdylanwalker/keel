@@ -2496,6 +2496,210 @@ async fn test_proposal_supports_multiple_instances_version_and_target_namespace(
     assert_eq!(missing_cfg.status(), StatusCode::NOT_FOUND);
 }
 
+/// Snag #4 (fresh-user dry run): an API/CLI install gets the catalog schema defaults the GUI
+/// form would submit; an edit commits exactly the submitted values.
+#[tokio::test]
+async fn test_install_applies_schema_defaults_and_edit_does_not_readd_them() {
+    let fixture = setup_fixture().await;
+    let rel = "catalog/apps/secure-demo/catalog.yaml";
+    let path = fixture.state.repo_workdir.join(rel);
+    tokio::fs::create_dir_all(path.parent().unwrap())
+        .await
+        .unwrap();
+    tokio::fs::write(
+        &path,
+        r#"apiVersion: keel.io/v1alpha1
+kind: CatalogApplication
+metadata:
+  id: secure-demo
+  name: Secure Demo
+  category: demo
+  runtime: helm
+spec:
+  upstream:
+    repoURL: https://stefanprodan.github.io/podinfo
+    chart: podinfo
+    version: "6.7.1"
+  schema:
+    type: object
+    required: [replicas, mode]
+    properties:
+      replicas:
+        type: integer
+        minimum: 1
+      mode:
+        type: string
+        default: safe
+      securityContext:
+        type: object
+        default:
+          runAsNonRoot: true
+          capabilities:
+            drop: [ALL]
+        properties:
+          runAsNonRoot:
+            type: boolean
+      apiToken:
+        type: string
+        writeOnly: true
+        default: insecure-default
+"#,
+    )
+    .await
+    .unwrap();
+    let git = &fixture.state.git_runner;
+    let workdir = &fixture.state.repo_workdir;
+    git.add(workdir, [rel]).await.unwrap();
+    git.commit(
+        workdir,
+        "feat: seed secure-demo",
+        &CommitAuthor::new("Keel Seed", "seed@keel.local"),
+    )
+    .await
+    .unwrap();
+    git.push(workdir, "origin", "HEAD:refs/heads/main")
+        .await
+        .unwrap();
+
+    let cookie = login_and_get_cookie(&fixture).await;
+    let app = build_router(fixture.state.clone());
+
+    // Install: the required `mode` and the object default are filled; the secret is not.
+    let (status, created) = send_json(
+        &app,
+        Method::POST,
+        "/api/v1/tenants/acme/proposals",
+        &cookie,
+        Some(json!({ "catalogId": "secure-demo", "values": { "replicas": 2 } })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    git.checkout_branch(workdir, created["branch"].as_str().unwrap())
+        .await
+        .unwrap();
+    let values: Value = noyalib::from_str(
+        &tokio::fs::read_to_string(workdir.join("tenants/acme/apps/secure-demo/values.yaml"))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        values,
+        json!({
+            "replicas": 2,
+            "mode": "safe",
+            "securityContext": { "runAsNonRoot": true, "capabilities": { "drop": ["ALL"] } }
+        })
+    );
+    let tree = std::fs::read_dir(workdir.join("tenants/acme/apps/secure-demo"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect::<Vec<_>>();
+    for file in tree {
+        let raw = std::fs::read_to_string(&file).unwrap_or_default();
+        assert!(!raw.contains("insecure-default"), "{}", file.display());
+    }
+
+    // Edit of the existing `redis` instance: removed keys stay removed.
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    let (status, updated) = send_json(
+        &app,
+        Method::POST,
+        "/api/v1/tenants/acme/proposals",
+        &cookie,
+        Some(json!({
+            "catalogId": "secure-demo",
+            "name": "redis",
+            "values": { "replicas": 3, "mode": "fast" }
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{updated}");
+    git.checkout_branch(workdir, updated["branch"].as_str().unwrap())
+        .await
+        .unwrap();
+    let values: Value = noyalib::from_str(
+        &tokio::fs::read_to_string(workdir.join("tenants/acme/apps/redis/values.yaml"))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(values, json!({ "replicas": 3, "mode": "fast" }));
+
+    // An edit is validated as submitted: a required key with a default is not filled in.
+    let (status, body) = send_json(
+        &app,
+        Method::POST,
+        "/api/v1/tenants/acme/proposals",
+        &cookie,
+        Some(json!({
+            "catalogId": "secure-demo",
+            "name": "redis",
+            "values": { "replicas": 3 }
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(
+        body["details"][0]["message"],
+        "\"mode\" is a required property"
+    );
+
+    // A CLI re-run (`mergeStoredValues`) is an edit with a partial values file: it is merged over
+    // the committed values, so the install's defaults survive and `null` removes a key.
+    git.checkout_branch(workdir, created["branch"].as_str().unwrap())
+        .await
+        .unwrap();
+    git.push(workdir, "origin", "HEAD:refs/heads/main")
+        .await
+        .unwrap();
+    let mut expected = json!({
+        "replicas": 4,
+        "mode": "safe",
+        "securityContext": { "runAsNonRoot": true, "capabilities": { "drop": ["ALL"] } }
+    });
+    for (patch, removed) in [
+        (json!({ "replicas": 4 }), None),
+        (
+            json!({ "securityContext": { "capabilities": null } }),
+            Some("capabilities"),
+        ),
+    ] {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let (status, merged) = send_json(
+            &app,
+            Method::POST,
+            "/api/v1/tenants/acme/proposals",
+            &cookie,
+            Some(json!({
+                "catalogId": "secure-demo",
+                "values": patch,
+                "mergeStoredValues": true
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{merged}");
+        git.checkout_branch(workdir, merged["branch"].as_str().unwrap())
+            .await
+            .unwrap();
+        let values: Value = noyalib::from_str(
+            &tokio::fs::read_to_string(workdir.join("tenants/acme/apps/secure-demo/values.yaml"))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        if let Some(key) = removed {
+            expected["securityContext"]
+                .as_object_mut()
+                .unwrap()
+                .remove(key);
+            // The first merged edit was never merged to `main`: the committed values hold `2`.
+            expected["replicas"] = json!(2);
+        }
+        assert_eq!(values, expected, "{patch}");
+    }
+}
+
 #[tokio::test]
 async fn test_catalog_bundle_proposal_and_dependency_chaining() {
     let fixture = setup_fixture().await;
@@ -8558,9 +8762,10 @@ async fn test_seaweedfs_catalog_app_renders_helm_release() {
         values["global"]["seaweedfs"]["createClusterRole"], false,
         "no ClusterRole/ClusterRoleBinding in a tenant namespace"
     );
+    // The schema default (what the Deploy form submits) is filled on first install.
     assert_eq!(
         values["global"]["seaweedfs"]["serviceAccountName"],
-        Value::Null
+        "seaweedfs"
     );
     assert_eq!(values["s3"]["enableAuth"], true);
     for component in ["master", "filer", "volume", "s3"] {
@@ -9072,9 +9277,17 @@ async fn test_workload_operator_catalog_apps_render_remote_helm_releases() {
         }
         assert!(contains(values, &locked), "{id}: locked values not merged");
         assert!(contains(values, &case.values), "{id}: form values lost");
-        // values.yaml keeps only the form values.
+        // values.yaml keeps only the form values plus the schema defaults filled on install.
         let form = read_yaml(&dir.join("values.yaml"));
-        assert_eq!(form, case.values, "{id}");
+        let schema = keel_core::parse_catalog_application(case.raw)
+            .unwrap()
+            .spec
+            .schema;
+        assert_eq!(
+            form,
+            keel_core::apply_schema_defaults(&schema, &case.values),
+            "{id}"
+        );
 
         match id {
             "kyverno" => {
@@ -9114,19 +9327,29 @@ async fn test_workload_operator_catalog_apps_render_remote_helm_releases() {
         json!({ "tenant": "acme", "catalogId": "flux2", "name": "flux-gitops",
                 "targetCluster": "workload-kubeconfig", "values": values })
     };
-    let head_before = git.rev_parse(&workdir, "HEAD").await.unwrap();
-    // Keel applies no schema defaults server-side, so an API/CLI request without the Flux
-    // lockdown switch fails schema validation (422) instead of getting the chart default (lockdown off) next to
-    // the locked cluster-admin `privileged: true`.
+    // A first install without the Flux lockdown switch gets its schema default (on) from the
+    // server, never the chart default (lockdown off) next to the locked cluster-admin
+    // `privileged: true`. (An edit must send it: no defaults on edits.)
     for values in [
         json!({}),
         json!({ "logLevel": "info" }),
         json!({ "multitenancy": {} }),
     ] {
         let (status, body) = post_proposal(&fixture, &cookie, remote(values.clone())).await;
-        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{values}: {body}");
-        assert!(body.contains("is a required property"), "{body}");
+        assert_eq!(status, StatusCode::CREATED, "{values}: {body}");
+        checkout_proposal_branch(&fixture, &body).await;
+        let form = read_yaml(&workdir.join("tenants/acme/apps/flux-gitops/values.yaml"));
+        assert_eq!(form["multitenancy"]["enabled"], true, "{values}");
+        let hr = read_yaml(&workdir.join("tenants/acme/apps/flux-gitops/helmrelease.yaml"));
+        assert_eq!(
+            hr["spec"]["values"]["multitenancy"]["enabled"], true,
+            "{values}"
+        );
+        git.checkout_branch(&workdir, "main").await.unwrap();
+        // Proposal branches are timestamped per second.
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
+    let head_before = git.rev_parse(&workdir, "HEAD").await.unwrap();
     // Kyverno's PolicyException namespace is locked: neither `*`, nor empty, nor another one.
     for namespace in ["*", "", "kyverno"] {
         let (status, body) = post_proposal(

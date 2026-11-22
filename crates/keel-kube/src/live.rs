@@ -43,6 +43,9 @@ pub struct LiveResourceInfo {
     pub tenant: Option<String>,
     /// Provider from the `keel.io/provider` label or `spec.config["keel:provider"]`, if present.
     pub provider: Option<String>,
+    /// Why the object is not Ready (`Reason: message` of its `Ready` condition), see
+    /// [`extract_not_ready_message`].
+    pub message: Option<String>,
 }
 
 impl LiveResourceInfo {
@@ -57,6 +60,7 @@ impl LiveResourceInfo {
             protected: false,
             tenant: None,
             provider: None,
+            message: None,
         }
     }
 }
@@ -128,6 +132,8 @@ pub struct CanaryStatusInfo {
     pub primary_version: Option<String>,
     pub error_rate: Option<f64>,
     pub latency_ms: Option<f64>,
+    /// Why a `Failed` canary failed (its `Promoted` condition message).
+    pub message: Option<String>,
 }
 
 /// Normalized Kubernetes resource condition (`Ready`, `Reconciling`, `Stalled`).
@@ -509,6 +515,9 @@ impl KubeClusterStatusReader {
                 .or_else(|| latencies_ms.get(&prefixed_key))
                 .or_else(|| target_key.as_ref().and_then(|k| latencies_ms.get(k)))
                 .map(|v| (v * 10.0).round() / 10.0);
+            let message = (status == LiveResourceStatus::Error)
+                .then(|| condition_message(&item.data, "Promoted"))
+                .flatten();
             out.insert(
                 (namespace, name),
                 CanaryStatusInfo {
@@ -519,6 +528,7 @@ impl KubeClusterStatusReader {
                     primary_version,
                     error_rate,
                     latency_ms,
+                    message,
                 },
             );
         }
@@ -772,6 +782,7 @@ impl KubeClusterStatusReader {
                         protected: is_stack && is_stack_object_protected(labels, &item.data),
                         tenant: labels.and_then(|l| l.get("keel.io/tenant")).cloned(),
                         provider: extract_stack_provider(labels, &item.data),
+                        message: extract_not_ready_message(&item.data),
                     },
                 );
             }
@@ -1807,6 +1818,54 @@ pub fn extract_ready_status(data: &Value, is_stack: bool) -> Option<LiveResource
     }
 }
 
+/// Longest status message surfaced in listings (the full text stays in the diagnostics view).
+pub const STATUS_MESSAGE_MAX_CHARS: usize = 512;
+
+/// Why a Flux / PKO object is not Ready: `Reason: message` of its `Ready` condition when that
+/// condition is not `True`, whitespace-collapsed and capped at [`STATUS_MESSAGE_MAX_CHARS`]
+/// (e.g. `ReconciliationFailed: ... canaries.flagger.app "podinfo" is forbidden ...`).
+pub fn extract_not_ready_message(data: &Value) -> Option<String> {
+    let conditions = data.pointer("/status/conditions")?.as_array()?;
+    let ready = conditions
+        .iter()
+        .find(|c| c.get("type").and_then(Value::as_str) == Some("Ready"))?;
+    if ready.get("status").and_then(Value::as_str) == Some("True") {
+        return None;
+    }
+    condition_message(data, "Ready")
+}
+
+/// `Reason: message` of the `condition_type` condition, normalized like
+/// [`extract_not_ready_message`]; `None` when both are empty.
+fn condition_message(data: &Value, condition_type: &str) -> Option<String> {
+    let cond = data
+        .pointer("/status/conditions")?
+        .as_array()?
+        .iter()
+        .find(|c| c.get("type").and_then(Value::as_str) == Some(condition_type))?;
+    let field = |k: &str| {
+        cond.get(k)
+            .and_then(Value::as_str)
+            .map(|s| s.split_whitespace().collect::<Vec<_>>().join(" "))
+            .filter(|s| !s.is_empty())
+    };
+    let text = match (field("reason"), field("message")) {
+        (Some(r), Some(m)) => format!("{r}: {m}"),
+        (Some(one), None) | (None, Some(one)) => one,
+        (None, None) => return None,
+    };
+    Some(truncate_chars(&text, STATUS_MESSAGE_MAX_CHARS))
+}
+
+fn truncate_chars(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
 /// Extracts the most recent sync/reconciliation timestamp (RFC3339) from a Flux or PKO resource.
 pub fn extract_last_synced(data: &Value, creation_timestamp: Option<&str>) -> Option<String> {
     if let Some(ts) = data
@@ -2039,6 +2098,51 @@ pub fn force_delete_warning_suffix(data: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn not_ready_message_reports_the_ready_condition_reason() {
+        let failed = serde_json::json!({"status": {"conditions": [
+            {"type": "Reconciling", "status": "False", "reason": "x", "message": "ignored"},
+            {"type": "Ready", "status": "False", "reason": "ReconciliationFailed",
+             "message": "Canary/tenant-default/podinfo dry-run failed:\n  canaries.flagger.app \"podinfo\" is forbidden"}
+        ]}});
+        assert_eq!(
+            extract_not_ready_message(&failed).as_deref(),
+            Some(
+                "ReconciliationFailed: Canary/tenant-default/podinfo dry-run failed: \
+                 canaries.flagger.app \"podinfo\" is forbidden"
+            )
+        );
+        let ready = serde_json::json!({"status": {"conditions": [
+            {"type": "Ready", "status": "True", "reason": "Succeeded", "message": "applied"}
+        ]}});
+        assert_eq!(extract_not_ready_message(&ready), None);
+        let unknown_no_text = serde_json::json!({"status": {"conditions": [
+            {"type": "Ready", "status": "Unknown", "reason": "", "message": ""}
+        ]}});
+        assert_eq!(extract_not_ready_message(&unknown_no_text), None);
+        assert_eq!(extract_not_ready_message(&serde_json::json!({})), None);
+        let message_only = serde_json::json!({"status": {"conditions": [
+            {"type": "Ready", "status": "Unknown", "message": "reconciliation in progress"}
+        ]}});
+        assert_eq!(
+            extract_not_ready_message(&message_only).as_deref(),
+            Some("reconciliation in progress")
+        );
+        let long = serde_json::json!({"status": {"conditions": [
+            {"type": "Ready", "status": "False", "reason": "InstallFailed", "message": "é".repeat(2000)}
+        ]}});
+        let msg = extract_not_ready_message(&long).unwrap();
+        assert_eq!(msg.chars().count(), STATUS_MESSAGE_MAX_CHARS);
+        assert!(msg.starts_with("InstallFailed: é") && msg.ends_with('…'));
+        let canary = serde_json::json!({"status": {"phase": "Failed", "conditions": [
+            {"type": "Promoted", "status": "False", "reason": "Failed", "message": "Canary analysis failed, Deployment scaled to zero."}
+        ]}});
+        assert_eq!(
+            condition_message(&canary, "Promoted").as_deref(),
+            Some("Failed: Canary analysis failed, Deployment scaled to zero.")
+        );
+    }
 
     #[test]
     fn flux_workload_namespace_prefers_target_namespace_then_health_checks() {

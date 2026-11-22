@@ -54,6 +54,12 @@ pub struct CreateProposalRequest {
     pub target_namespace: Option<String>,
     #[serde(default, alias = "action_engine")]
     pub action_engine: Option<String>,
+    /// Edit only (apps and infra stacks): apply `values` as a JSON Merge Patch over the
+    /// instance's committed values instead of replacing them, so a partial values file (the
+    /// CLI) keeps every other key, including the schema defaults filled in at install; a `null`
+    /// removes a key. Ignored on a first install.
+    #[serde(default)]
+    pub merge_stored_values: bool,
 }
 
 /// Response body for `POST /api/v1/tenants/{tenant}/proposals`.

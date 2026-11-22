@@ -30,4 +30,18 @@ describe("StatusBadge", () => {
       "Live in the cluster but no longer declared in Git"
     )
   })
+
+  it("shows the status detail as tooltip", () => {
+    render(
+      <StatusBadge
+        status="Error"
+        detail="InstallFailed: admission webhook denied the request"
+        collapsible
+      />
+    )
+    expect(screen.getByText("Error").parentElement).toHaveAttribute(
+      "title",
+      "Error: InstallFailed: admission webhook denied the request"
+    )
+  })
 })

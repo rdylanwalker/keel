@@ -11,6 +11,8 @@ interface StatusBadgeProps {
    * once the container is at least `@md` (28rem). Only use inside a container-query context.
    */
   collapsible?: boolean
+  /** Why the resource is in this state (e.g. a release's `statusMessage`), shown as tooltip. */
+  detail?: string
 }
 
 export const StatusBadge: React.FC<StatusBadgeProps> = ({
@@ -18,6 +20,7 @@ export const StatusBadge: React.FC<StatusBadgeProps> = ({
   size = "sm",
   className = "",
   collapsible = false,
+  detail,
 }) => {
   const raw = status ?? ""
   const norm = raw.toLowerCase()
@@ -58,11 +61,13 @@ export const StatusBadge: React.FC<StatusBadgeProps> = ({
   return (
     <span
       title={
-        norm === "orphaned"
-          ? "Live in the cluster but no longer declared in Git"
-          : collapsible
-            ? label
-            : undefined
+        detail
+          ? `${label}: ${detail}`
+          : norm === "orphaned"
+            ? "Live in the cluster but no longer declared in Git"
+            : collapsible
+              ? label
+              : undefined
       }
       className={`inline-flex items-center whitespace-nowrap space-x-1 rounded-full font-medium border ${
         collapsible

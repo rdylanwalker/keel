@@ -62,13 +62,15 @@ v0.12.0 has no admission policy for Canaries, so this role lets every tenant adm
 
 ### Other app limitations
 
-- **The CLI does not apply schema defaults.** `keel app install` sends only the values in your file, while the web UI fills in the catalog's defaults. For `podinfo`, the default `securityContext` is then missing and Kyverno rejects the Deployment (`disallow-privileged-containers`). Copy the defaults you need into the values file; [Things to Try](../getting-started/things-to-try.md#2-deploy-an-application-with-canary-rollouts-podinfo) shows the `podinfo` file.
-- **`keel app list` hides failures.** A release that fails to reconcile stays `Pending` without a reason. Check Flux directly:
+- **v0.12.0: the CLI does not apply schema defaults.** In v0.12.0, `keel app install` sends only the values in your file, while the web UI fills in the catalog's defaults. For `podinfo`, the default `securityContext` is then missing and Kyverno rejects the Deployment (`disallow-privileged-containers`). Copy the defaults you need into the values file; [Things to Try](../getting-started/things-to-try.md#2-deploy-an-application-with-canary-rollouts-podinfo) shows the `podinfo` file. The next release fills in [schema defaults](../catalog/overview.md#schema-defaults) on the server for every first install.
+- **v0.12.0: `keel app list` hides failures.** In v0.12.0, a release that fails to reconcile stays `Pending` without a reason. Check Flux directly:
 
   ```bash
   kubectl --context kind-keel-mgmt -n tenant-default get kustomizations,helmreleases
   kubectl --context kind-keel-mgmt -n tenant-default describe kustomization keel-tenant-root
   ```
+
+  The next release shows the reason in a `MESSAGE` column (`statusMessage` in `GET /api/v1/releases`, the status tooltip in the web UI). This includes a failing tenant root Kustomization that blocks the release from being applied.
 
 - **YAML 1.1 booleans.** Keel writes YAML with a YAML 1.2 serializer, which leaves string values such as `yes`, `no`, `on`, `off`, `y` and `n` unquoted. Helm and Kustomize read YAML 1.1 and turn them into booleans. Avoid these as string values in forms, or quote them in the PR.
 - **Editing a Helm app replaces all its secrets.** When you edit a Helm app, re-enter every secret field: secrets you leave blank are dropped.

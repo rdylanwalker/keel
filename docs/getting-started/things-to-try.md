@@ -75,7 +75,7 @@ With a tenant namespace ready (such as `default` or `dev-team`), deploy **Podinf
 1. In **Catalog & Form Wizard**, select your target tenant (e.g., `default`) and choose **Podinfo Microservice** (`podinfo`).
 2. Check **Enable Flagger Canary**.
 3. Fill in the form (`Replica Count`: `2`, `Ingress Hostname`: `podinfo.keel.local`, `API Secret Token`: any 8+ character secret, and keep the pre-filled `restricted` PSS `Container Security Context` defaults).
-4. Click **Submit & Open Git PR Proposal** (or via CLI). The CLI does not fill in the form's defaults, so the values file must include the `restricted` `securityContext`; without it, Kyverno rejects the Deployment:
+4. Click **Submit & Open Git PR Proposal** (or via CLI). In v0.12.0 the CLI does not fill in the form's defaults, so the values file must include the `restricted` `securityContext`; without it, Kyverno rejects the Deployment. Later releases fill in the defaults on the server, and keeping them in the file does no harm:
 
 ```bash
 cat <<'EOF' > podinfo-values.yaml

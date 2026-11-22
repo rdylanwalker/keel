@@ -21,13 +21,14 @@ pub use bootstrap::{
     stage0_state_root, validate_kubeconfig_yaml, write_private_file,
 };
 pub use catalog::{
-    PartitionedValues, PreparedHelmValues, SchemaFieldError, changed_immutable_values,
-    extract_manifest_variables, gateway_route_hostnames, helm_secret_value_fragments,
-    is_secret_schema_node, keel_ingress_parent_refs, manifest_cluster_scoped_kinds, parse_catalog,
-    parse_catalog_application, parse_catalog_blueprint, parse_catalog_bundle,
-    partition_values_by_schema, platform_reserved_hostnames, prepare_helm_values,
-    render_helm_values_yaml, render_manifest_template, resolve_helm_gateway_routes,
-    route_hostname_matches, undeclared_value_paths, validate_k8s_manifests_yaml,
+    PartitionedValues, PreparedHelmValues, SchemaFieldError, apply_schema_defaults,
+    changed_immutable_values, extract_manifest_variables, gateway_route_hostnames,
+    helm_secret_value_fragments, is_secret_schema_node, keel_ingress_parent_refs,
+    manifest_cluster_scoped_kinds, merge_values_patch, parse_catalog, parse_catalog_application,
+    parse_catalog_blueprint, parse_catalog_bundle, partition_values_by_schema,
+    platform_reserved_hostnames, prepare_helm_values, render_helm_values_yaml,
+    render_manifest_template, resolve_helm_gateway_routes, route_hostname_matches,
+    strip_null_values, undeclared_value_paths, validate_k8s_manifests_yaml,
     validate_route_hostnames, validate_schema_values, verify_rendered_manifest_structure,
 };
 pub use crypto::{

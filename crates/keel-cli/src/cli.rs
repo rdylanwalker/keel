@@ -469,7 +469,8 @@ pub struct InfraProvisionArgs {
     #[arg(long, help = TENANT_HELP)]
     pub tenant: String,
 
-    /// Path to YAML or JSON input values file
+    /// Path to YAML or JSON input values file. On an existing stack it is merged over the
+    /// committed values (only the keys it sets change; `null` removes a key)
     #[arg(long)]
     pub values_file: PathBuf,
 
@@ -760,7 +761,8 @@ pub struct AppInstallArgs {
     #[arg(long, help = TENANT_HELP)]
     pub tenant: String,
 
-    /// Path to YAML or JSON Helm/Kustomize values override file
+    /// Path to YAML or JSON Helm/Kustomize values override file. On an existing instance it is
+    /// merged over the committed values (only the keys it sets change; `null` removes a key)
     #[arg(long)]
     pub values_file: PathBuf,
 
