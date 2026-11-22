@@ -814,7 +814,7 @@ pub(crate) async fn apply_git_credentials_secret(
             "password": password,
         },
     });
-    target.apply(&serde_yml::to_string(&creds_doc)?).await
+    target.apply(&keel_core::yaml::to_string(&creds_doc)?).await
 }
 
 /// The `keel.io/platform-owned` tenant baseline (`tenants/<id>/rbac.yaml`: Namespace,
@@ -1132,7 +1132,7 @@ fn keel_server_git_username(artifacts: &SeedControlPlaneArtifacts) -> &'static s
 
 /// Renders `clusters/management/addons/keel-server/kustomization.yaml`: the shared RBAC +
 /// Deployment, the ingress HTTPRoute and the `keel-server-config` ConfigMap (Git remote + HTTPS
-/// username; never secrets). Serialized with `serde_yml`, so the user-supplied Git URL can never
+/// username; never secrets). Serialized with `noyalib`, so the user-supplied Git URL can never
 /// inject YAML. No `images:` override: the Flux Kustomization `spec.images` is the single version
 /// source.
 fn render_keel_server_addon_kustomization(
@@ -1165,7 +1165,7 @@ fn render_keel_server_addon_kustomization(
          # (`clusters/management/core-addons/keel-server.yaml`), which pins the image tag through\n\
          # `spec.images[].newTag`. `KEEL_GIT_TOKEN` comes from the `keel-system/forge-token` Secret,\n\
          # which is never stored in Git.\n{}",
-        serde_yml::to_string(&doc)?
+        keel_core::yaml::to_string(&doc)?
     ))
 }
 
@@ -1502,7 +1502,7 @@ async fn initialize_seed_git_repo(
     for (path, yaml) in &default_tenant_files {
         keel_kube::ensure_git_safe_manifests(path, yaml)?;
     }
-    let tenants_kustomization_yaml = serde_yml::to_string(&serde_json::json!({
+    let tenants_kustomization_yaml = keel_core::yaml::to_string(&serde_json::json!({
         "apiVersion": "kustomize.config.k8s.io/v1beta1",
         "kind": "Kustomization",
         "resources": default_tenant_entries,
@@ -2272,7 +2272,7 @@ mod security_hardening_tests {
     #[test]
     fn forgejo_program_has_no_hardcoded_admin_password() {
         assert!(!CONTROL_PLANE_FORGEJO_PULUMI_YAML.contains("keel-admin-dev"));
-        let doc: Value = serde_yml::from_str(CONTROL_PLANE_FORGEJO_PULUMI_YAML).unwrap();
+        let doc: Value = noyalib::from_str(CONTROL_PLANE_FORGEJO_PULUMI_YAML).unwrap();
         let admin = &doc["resources"]["forgejo"]["properties"]["values"]["gitea"]["admin"];
         // The chart reads credentials from the Keel-managed Secret; no password in values.
         assert_eq!(admin["existingSecret"], forge::FORGEJO_ADMIN_SECRET_NAME);
@@ -2283,7 +2283,7 @@ mod security_hardening_tests {
 
     #[test]
     fn control_plane_program_enables_flux_multitenancy_and_protects_core() {
-        let doc: Value = serde_yml::from_str(CONTROL_PLANE_PULUMI_YAML).unwrap();
+        let doc: Value = noyalib::from_str(CONTROL_PLANE_PULUMI_YAML).unwrap();
         let res = &doc["resources"];
         let flux = &res["flux2"]["properties"];
         assert!(flux["version"].as_str().is_some_and(|v| !v.is_empty()));
@@ -2330,7 +2330,7 @@ mod security_hardening_tests {
 
     #[test]
     fn flux_helmreleases_adopt_stage0_releases_in_place() {
-        let program: Value = serde_yml::from_str(CONTROL_PLANE_PULUMI_YAML).unwrap();
+        let program: Value = noyalib::from_str(CONTROL_PLANE_PULUMI_YAML).unwrap();
         for (resource, file) in [
             ("flux2", SEED_CORE_ADDON_FLUX2_YAML),
             ("kyverno", SEED_CORE_ADDON_KYVERNO_YAML),
@@ -2344,7 +2344,7 @@ mod security_hardening_tests {
             let p = &program["resources"][resource]["properties"];
             let hr = file
                 .split("\n---\n")
-                .map(|d| serde_yml::from_str::<Value>(d).unwrap())
+                .map(|d| noyalib::from_str::<Value>(d).unwrap())
                 .find(|d| d["kind"] == "HelmRelease")
                 .unwrap_or_else(|| panic!("{resource}: no HelmRelease"));
             assert_eq!(
@@ -2390,7 +2390,7 @@ mod security_hardening_tests {
         // `edit`/`admin` roles; pinned in both releases so a chart default change cannot drop them.
         let pko_hr = SEED_CORE_ADDON_PKO_YAML
             .split("\n---\n")
-            .map(|d| serde_yml::from_str::<Value>(d).unwrap())
+            .map(|d| noyalib::from_str::<Value>(d).unwrap())
             .find(|d| d["kind"] == "HelmRelease")
             .unwrap();
         for values in [
@@ -2415,7 +2415,7 @@ mod security_hardening_tests {
             .unwrap()
         };
         for enabled in [true, false] {
-            let hr: Value = serde_yml::from_str(&render_seed_kyverno_helmrelease(enabled)).unwrap();
+            let hr: Value = noyalib::from_str(&render_seed_kyverno_helmrelease(enabled)).unwrap();
             assert_eq!(hr["spec"]["values"], stage0_kyverno(enabled), "kyverno");
         }
         assert_eq!(
@@ -2427,12 +2427,12 @@ mod security_hardening_tests {
             "3.10.0"
         );
 
-        let off: Value = serde_yml::from_str(&render_seed_kyverno_helmrelease(false)).unwrap();
+        let off: Value = noyalib::from_str(&render_seed_kyverno_helmrelease(false)).unwrap();
         assert_eq!(
             off["spec"]["values"]["features"]["policyExceptions"]["enabled"],
             false
         );
-        let on: Value = serde_yml::from_str(&render_seed_kyverno_helmrelease(true)).unwrap();
+        let on: Value = noyalib::from_str(&render_seed_kyverno_helmrelease(true)).unwrap();
         assert_eq!(
             on["spec"]["values"]["features"]["policyExceptions"]["enabled"],
             true
@@ -2456,7 +2456,7 @@ mod security_hardening_tests {
     #[test]
     fn core_catalog_versions_match_seed_core_addons() {
         fn catalog_version(raw: &str) -> String {
-            let doc: Value = serde_yml::from_str(raw).unwrap();
+            let doc: Value = noyalib::from_str(raw).unwrap();
             doc["spec"]["upstream"]["version"]
                 .as_str()
                 .expect("catalog upstream version")
@@ -2464,7 +2464,7 @@ mod security_hardening_tests {
         }
         let seed_version = |file: &str| -> String {
             file.split("\n---\n")
-                .map(|d| serde_yml::from_str::<Value>(d).unwrap())
+                .map(|d| noyalib::from_str::<Value>(d).unwrap())
                 .find(|d| d["kind"] == "HelmRelease")
                 .and_then(|hr| {
                     hr["spec"]["chart"]["spec"]["version"]
@@ -2526,7 +2526,7 @@ mod security_hardening_tests {
             seed_version(SEED_CORE_ADDON_FORGEJO_YAML),
             "forgejo"
         );
-        let program: Value = serde_yml::from_str(CONTROL_PLANE_FORGEJO_PULUMI_YAML).unwrap();
+        let program: Value = noyalib::from_str(CONTROL_PLANE_FORGEJO_PULUMI_YAML).unwrap();
         assert_eq!(
             program["resources"]["forgejo"]["properties"]["version"],
             forgejo.as_str(),
@@ -2535,23 +2535,23 @@ mod security_hardening_tests {
         // Rauthy is an image-based Kustomize add-on: the catalog version is the image tag pinned
         // by the Flux Kustomization `spec.images[].newTag`, the plain StatefulSet manifest and the
         // Stage 0 Pulumi StatefulSet (which Flux adopts in place).
-        let catalog: Value = serde_yml::from_str(CORE_CATALOG_RAUTHY_YAML).unwrap();
+        let catalog: Value = noyalib::from_str(CORE_CATALOG_RAUTHY_YAML).unwrap();
         let rauthy = catalog_version(CORE_CATALOG_RAUTHY_YAML);
         let image = catalog["spec"]["upstream"]["image"].as_str().unwrap();
-        let ks: Value = serde_yml::from_str(SEED_CORE_ADDON_RAUTHY_YAML).unwrap();
+        let ks: Value = noyalib::from_str(SEED_CORE_ADDON_RAUTHY_YAML).unwrap();
         let images = ks["spec"]["images"].as_array().unwrap();
         assert_eq!(images.len(), 1);
         assert_eq!(images[0]["name"], image);
         assert_eq!(images[0]["newTag"], rauthy.as_str(), "Flux newTag drift");
         assert!(images[0].get("digest").is_none());
         let pinned = format!("{image}:{rauthy}");
-        let sts: Value = serde_yml::from_str(SEED_ADDON_RAUTHY_STATEFULSET_YAML).unwrap();
+        let sts: Value = noyalib::from_str(SEED_ADDON_RAUTHY_STATEFULSET_YAML).unwrap();
         assert_eq!(
             sts["spec"]["template"]["spec"]["containers"][0]["image"],
             pinned.as_str(),
             "addons/rauthy StatefulSet image drift"
         );
-        let program: Value = serde_yml::from_str(state::CONTROL_PLANE_RAUTHY_PULUMI_YAML).unwrap();
+        let program: Value = noyalib::from_str(state::CONTROL_PLANE_RAUTHY_PULUMI_YAML).unwrap();
         assert_eq!(
             program["resources"]["rauthyStatefulSet"]["properties"]["spec"]["template"]["spec"]["containers"]
                 [0]["image"],
@@ -2566,7 +2566,7 @@ mod security_hardening_tests {
     fn keel_server_rbac_limits_exec_and_control_plane_writes() {
         let docs: Vec<Value> = KEEL_SERVER_RBAC_YAML
             .split("\n---\n")
-            .map(|d| serde_yml::from_str(d).unwrap())
+            .map(|d| noyalib::from_str(d).unwrap())
             .collect();
         let role = |ns: &str| {
             docs.iter()
@@ -2623,14 +2623,14 @@ mod security_hardening_tests {
         keel_core::validate_management_addon_version(tag).unwrap();
         let pinned = format!("{KEEL_SERVER_IMAGE}:{tag}");
 
-        let ks: Value = serde_yml::from_str(SEED_CORE_ADDON_KEEL_SERVER_YAML).unwrap();
+        let ks: Value = noyalib::from_str(SEED_CORE_ADDON_KEEL_SERVER_YAML).unwrap();
         let images = ks["spec"]["images"].as_array().unwrap();
         assert_eq!(images.len(), 1);
         assert_eq!(images[0]["name"], KEEL_SERVER_IMAGE);
         assert_eq!(images[0]["newTag"], tag, "Flux newTag drift");
         assert!(images[0].get("digest").is_none());
 
-        let catalog: Value = serde_yml::from_str(CORE_CATALOG_KEEL_SERVER_YAML).unwrap();
+        let catalog: Value = noyalib::from_str(CORE_CATALOG_KEEL_SERVER_YAML).unwrap();
         assert_eq!(catalog["spec"]["upstream"]["image"], KEEL_SERVER_IMAGE);
         assert_eq!(catalog["spec"]["upstream"]["version"], tag, "catalog drift");
 
@@ -2643,7 +2643,7 @@ mod security_hardening_tests {
             pinned.as_str(),
             "deploy/bootstrap/keel-server Deployment image drift"
         );
-        let bundle: Value = serde_yml::from_str(include_str!(
+        let bundle: Value = noyalib::from_str(include_str!(
             "../../../../deploy/bootstrap/keel-server/kustomization.yaml"
         ))
         .unwrap();
@@ -2719,7 +2719,7 @@ mod security_hardening_tests {
             let (_, catalog) = catalog.unwrap();
             let app = keel_core::parse_catalog_application(catalog).unwrap();
             assert_eq!(app.metadata.id, "keel-server");
-            let catalog_doc: Value = serde_yml::from_str(catalog).unwrap();
+            let catalog_doc: Value = noyalib::from_str(catalog).unwrap();
             assert_eq!(
                 catalog_doc["metadata"]["category"],
                 keel_core::MANAGEMENT_CORE_CATEGORY
@@ -2729,7 +2729,7 @@ mod security_hardening_tests {
                 "https://keel.corp.example:9443"
             );
             let ks: Value =
-                serde_yml::from_str(file(&files, &format!("{core}/keel-server.yaml"))).unwrap();
+                noyalib::from_str(file(&files, &format!("{core}/keel-server.yaml"))).unwrap();
             assert_eq!(ks["kind"], "Kustomization");
             assert_eq!(ks["metadata"]["name"], app.metadata.id.as_str());
             assert_eq!(ks["metadata"]["namespace"], "flux-system");
@@ -2754,7 +2754,7 @@ mod security_hardening_tests {
             assert_eq!(doc["spec"]["images"][0]["newTag"], "9.9.9");
 
             // Add-on directory: exactly the resources its kustomization lists.
-            let addon_kustomization: Value = serde_yml::from_str(file(
+            let addon_kustomization: Value = noyalib::from_str(file(
                 &files,
                 &format!("{KEEL_SERVER_ADDON_DIR}/kustomization.yaml"),
             ))
@@ -2831,7 +2831,7 @@ mod security_hardening_tests {
             .await
             .unwrap();
         let files = seed_management_files(&a).unwrap();
-        let addon: Value = serde_yml::from_str(file(
+        let addon: Value = noyalib::from_str(file(
             &files,
             &format!("{KEEL_SERVER_ADDON_DIR}/kustomization.yaml"),
         ))
@@ -3101,7 +3101,7 @@ mod security_hardening_tests {
         );
         let stub_docs: Vec<Value> = keel_core::split_yaml_documents(&stub)
             .into_iter()
-            .map(|d| serde_yml::from_str::<Value>(&d).unwrap())
+            .map(|d| noyalib::from_str::<Value>(&d).unwrap())
             .collect();
         assert!(
             stub_docs.iter().all(|d| d["kind"] != "NetworkPolicy"),
@@ -3111,7 +3111,7 @@ mod security_hardening_tests {
         let baseline = tenant_baseline_yaml("default").unwrap();
         let policy = keel_core::split_yaml_documents(&baseline)
             .into_iter()
-            .map(|d| serde_yml::from_str::<Value>(&d).unwrap())
+            .map(|d| noyalib::from_str::<Value>(&d).unwrap())
             .find(|d| d["metadata"]["name"] == "allow-pko-workspace")
             .expect("allow-pko-workspace policy");
         assert_eq!(policy["kind"], "NetworkPolicy");
@@ -3154,7 +3154,7 @@ mod security_hardening_tests {
             .await
             .unwrap();
         let rendered = render_keel_server_addon_kustomization(&a).unwrap();
-        let doc: Value = serde_yml::from_str(&rendered).unwrap();
+        let doc: Value = noyalib::from_str(&rendered).unwrap();
         assert_eq!(
             doc["configMapGenerator"][0]["literals"][0],
             format!("KEEL_GIT_URL={url}").as_str()
@@ -3208,7 +3208,7 @@ mod security_hardening_tests {
     #[test]
     fn forge_token_secret_stays_in_keel_system() {
         let doc: Value =
-            serde_yml::from_str(&forge::render_forge_token_secret_yaml("s3cr3t").unwrap()).unwrap();
+            noyalib::from_str(&forge::render_forge_token_secret_yaml("s3cr3t").unwrap()).unwrap();
         assert_eq!(doc["kind"], "Secret");
         assert_eq!(doc["metadata"]["namespace"], KEEL_SYSTEM_NAMESPACE);
         assert_eq!(doc["metadata"]["name"], FORGE_TOKEN_SECRET_NAME);
@@ -3234,12 +3234,12 @@ mod security_hardening_tests {
                 d.lines()
                     .any(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'))
             })
-            .map(|d| serde_yml::from_str::<Value>(d).unwrap())
+            .map(|d| noyalib::from_str::<Value>(d).unwrap())
             .collect()
     }
 
     fn kustomize_resources(yaml: &str) -> std::collections::BTreeSet<String> {
-        let doc: Value = serde_yml::from_str(yaml).unwrap();
+        let doc: Value = noyalib::from_str(yaml).unwrap();
         doc["resources"]
             .as_array()
             .unwrap()
@@ -3512,7 +3512,7 @@ mod security_hardening_tests {
         let hr = docs.iter().find(|d| d["kind"] == "HelmRelease").unwrap();
         assert_eq!(docs.len(), 3);
 
-        let program: Value = serde_yml::from_str(CONTROL_PLANE_FORGEJO_PULUMI_YAML).unwrap();
+        let program: Value = noyalib::from_str(CONTROL_PLANE_FORGEJO_PULUMI_YAML).unwrap();
         let release = &program["resources"]["forgejo"];
         let p = &release["properties"];
         assert_eq!(hr["metadata"]["name"], "forgejo");
@@ -3667,7 +3667,7 @@ mod security_hardening_tests {
             let (_, catalog) = catalog.unwrap();
             let app = keel_core::parse_catalog_application(catalog).unwrap();
             assert_eq!(app.metadata.id, "forgejo");
-            let doc: Value = serde_yml::from_str(catalog).unwrap();
+            let doc: Value = noyalib::from_str(catalog).unwrap();
             assert_eq!(
                 doc["spec"]["serviceUrl"],
                 "https://forgejo.corp.example:9443"
@@ -3698,7 +3698,7 @@ mod security_hardening_tests {
     fn forgejo_stack_config_reaches_the_stage0_program() {
         // Every key Stage 0 passes must be declared by the program, or Pulumi falls back to the
         // default `ROOT_URL` and Flux's in-place adoption replaces the Forgejo pod.
-        let program: Value = serde_yml::from_str(CONTROL_PLANE_FORGEJO_PULUMI_YAML).unwrap();
+        let program: Value = noyalib::from_str(CONTROL_PLANE_FORGEJO_PULUMI_YAML).unwrap();
         let ingress = Stage0Ingress::from_public_url("https://idp.corp.example:9443").unwrap();
         let config = forgejo_stack_config(&ingress);
         assert!(config.iter().any(|(k, _)| *k == "forgejoRootUrl"));
@@ -3769,7 +3769,7 @@ mod security_hardening_tests {
                 .iter()
                 .find(|(p, _)| p == "catalog/core/forgejo/catalog.yaml")
                 .unwrap();
-            let doc: Value = serde_yml::from_str(catalog).unwrap();
+            let doc: Value = noyalib::from_str(catalog).unwrap();
             assert_eq!(
                 doc["spec"]["serviceUrl"],
                 "https://forgejo.corp.example:9443"
@@ -3779,7 +3779,7 @@ mod security_hardening_tests {
 
     #[test]
     fn flux2_helmrelease_self_manages_with_remediation_and_locked_multitenancy() {
-        let hr: Value = serde_yml::from_str(SEED_CORE_ADDON_FLUX2_YAML).unwrap();
+        let hr: Value = noyalib::from_str(SEED_CORE_ADDON_FLUX2_YAML).unwrap();
         assert_eq!(hr["kind"], "HelmRelease");
         assert_eq!(hr["metadata"]["name"], "flux2");
         assert_eq!(hr["metadata"]["labels"]["keel.io/protect"], "true");
@@ -3821,7 +3821,7 @@ mod security_hardening_tests {
             .expect("flux2 HelmRepository");
         assert_eq!(repo["metadata"]["namespace"], "flux-system");
         assert_eq!(repo["spec"]["type"], "oci");
-        let program: Value = serde_yml::from_str(CONTROL_PLANE_PULUMI_YAML).unwrap();
+        let program: Value = noyalib::from_str(CONTROL_PLANE_PULUMI_YAML).unwrap();
         assert_eq!(
             program["resources"]["flux2"]["properties"]["chart"],
             format!(
@@ -3834,7 +3834,7 @@ mod security_hardening_tests {
 
         // The catalog form only offers values the management API may change: multitenancy (and
         // every other security setting) is never exposed.
-        let catalog: Value = serde_yml::from_str(CORE_CATALOG_FLUX2_YAML).unwrap();
+        let catalog: Value = noyalib::from_str(CORE_CATALOG_FLUX2_YAML).unwrap();
         assert_eq!(
             catalog["metadata"]["category"],
             keel_core::MANAGEMENT_CORE_CATEGORY
@@ -4069,7 +4069,7 @@ mod security_hardening_tests {
         assert_eq!(tenants["spec"]["dependsOn"][0]["name"], "core-addons");
         assert_eq!(tenants["spec"]["interval"], "1m");
 
-        let rauthy: Value = serde_yml::from_str(SEED_CORE_ADDON_RAUTHY_YAML).unwrap();
+        let rauthy: Value = noyalib::from_str(SEED_CORE_ADDON_RAUTHY_YAML).unwrap();
         assert_eq!(rauthy["metadata"]["namespace"], "flux-system");
         assert_eq!(rauthy["metadata"]["labels"]["keel.io/protect"], "true");
         assert_eq!(rauthy["spec"]["serviceAccountName"], "kustomize-controller");
@@ -4083,7 +4083,7 @@ mod security_hardening_tests {
 
     #[test]
     fn stage0_pulumi_does_not_revert_flux_managed_addons() {
-        let program: Value = serde_yml::from_str(CONTROL_PLANE_PULUMI_YAML).unwrap();
+        let program: Value = noyalib::from_str(CONTROL_PLANE_PULUMI_YAML).unwrap();
         for name in [
             "flux2",
             "kyverno",
@@ -4128,7 +4128,7 @@ mod security_hardening_tests {
             }
         }
 
-        let rauthy: Value = serde_yml::from_str(state::CONTROL_PLANE_RAUTHY_PULUMI_YAML).unwrap();
+        let rauthy: Value = noyalib::from_str(state::CONTROL_PLANE_RAUTHY_PULUMI_YAML).unwrap();
         let res = &rauthy["resources"];
         for name in [
             "rauthyConfigSecret",
@@ -4157,7 +4157,7 @@ mod security_hardening_tests {
             .unwrap()
         };
         let services = yaml_docs(SEED_ADDON_RAUTHY_SERVICES_YAML);
-        let sts: Value = serde_yml::from_str(SEED_ADDON_RAUTHY_STATEFULSET_YAML).unwrap();
+        let sts: Value = noyalib::from_str(SEED_ADDON_RAUTHY_STATEFULSET_YAML).unwrap();
         for (name, manifest) in [
             ("rauthyService", &services[0]),
             ("rauthyHeadlessService", &services[1]),
@@ -4642,7 +4642,7 @@ mod tenant_helm_app_tests {
     use serde_json::Value;
 
     fn yaml(raw: &str) -> Value {
-        serde_yml::from_str(raw).unwrap()
+        noyalib::from_str(raw).unwrap()
     }
 
     /// Bump the tenant app together with its catalog/core twin (and the seed HelmRelease /
@@ -4786,7 +4786,7 @@ mod workload_operator_app_tests {
     use serde_json::Value;
 
     fn yaml(raw: &str) -> Value {
-        serde_yml::from_str(raw).unwrap()
+        noyalib::from_str(raw).unwrap()
     }
 
     /// The values an untouched form submits (`default` of every leaf).
@@ -5061,7 +5061,7 @@ mod workload_operator_app_tests {
             let path = catalog.join(dir).join(id).join("catalog.yaml");
             let raw = std::fs::read_to_string(&path)
                 .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-            serde_yml::from_str(&raw).unwrap()
+            noyalib::from_str(&raw).unwrap()
         };
         for (core_id, app_id) in TWINS {
             let core = read("core", core_id);
@@ -5087,7 +5087,7 @@ mod workload_operator_app_tests {
     /// the Stage 0 Pulumi release together; any of them drifting fails here.
     #[test]
     fn workload_operator_apps_pin_their_core_chart_versions() {
-        let program: Value = serde_yml::from_str(state::CONTROL_PLANE_PULUMI_YAML).unwrap();
+        let program: Value = noyalib::from_str(state::CONTROL_PLANE_PULUMI_YAML).unwrap();
         for (id, app_raw, core_raw, seed_raw, pulumi_resource) in operator_twins() {
             let app = keel_core::parse_catalog_application(app_raw).unwrap();
             let core = keel_core::parse_catalog_application(core_raw).unwrap();
@@ -5276,7 +5276,7 @@ mod tenant_keel_server_app_tests {
     fn yaml_docs(yaml: &str) -> Vec<Value> {
         keel_core::split_yaml_documents(yaml)
             .iter()
-            .filter_map(|d| serde_yml::from_str::<Value>(d).ok())
+            .filter_map(|d| noyalib::from_str::<Value>(d).ok())
             .filter(|d| d.is_object())
             .collect()
     }
@@ -5480,7 +5480,7 @@ mod tenant_keel_server_app_tests {
             "keel-server-ingress",
             Some("keel-system"),
         );
-        let seed: Value = serde_yml::from_str(SEED_ADDON_KEEL_SERVER_HTTPROUTE_YAML).unwrap();
+        let seed: Value = noyalib::from_str(SEED_ADDON_KEEL_SERVER_HTTPROUTE_YAML).unwrap();
         assert_eq!(route["spec"]["rules"], seed["spec"]["rules"]);
         assert_eq!(
             route["spec"]["parentRefs"],

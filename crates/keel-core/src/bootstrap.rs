@@ -790,7 +790,7 @@ pub fn validate_kubeconfig_yaml(
         ));
     }
 
-    let raw: RawKubeconfig = serde_yml::from_str(yaml)?;
+    let raw: RawKubeconfig = noyalib::from_str(yaml)?;
     if raw.clusters.is_empty() {
         return Err(CoreError::Validation(
             "Kubeconfig contains no 'clusters' entries".to_string(),
@@ -963,9 +963,9 @@ users:
             let program = PulumiBootstrapTarget::new(kind)
                 .embedded_pulumi_yaml()
                 .unwrap();
-            let doc: serde_yml::Value = serde_yml::from_str(program).unwrap();
+            let doc: noyalib::Value = noyalib::from_str(program).unwrap();
             let options = &doc["resources"][resource]["options"];
-            assert_eq!(options["protect"], serde_yml::Value::Bool(true), "{kind}");
+            assert_eq!(options["protect"], noyalib::Value::Bool(true), "{kind}");
             let ignore: Vec<&str> = options["ignoreChanges"]
                 .as_sequence()
                 .unwrap_or_else(|| panic!("{kind}: {resource} lacks ignoreChanges"))

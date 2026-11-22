@@ -172,7 +172,7 @@ fn stub_contains_the_baseline_source_and_sync_and_no_secret() {
         ensure_git_safe_manifests(path, yaml).unwrap();
         // Every stub object is platform-owned (Kyverno-protected) and in the tenant namespace.
         for doc in keel_core::split_yaml_documents(yaml) {
-            let v: Value = serde_yml::from_str(&doc).unwrap();
+            let v: Value = noyalib::from_str(&doc).unwrap();
             let kind = v["kind"].as_str().unwrap().to_string();
             assert_eq!(
                 v["metadata"]["labels"][PLATFORM_OWNED_LABEL], "true",
@@ -215,7 +215,7 @@ fn credentials_secret_is_never_written_to_git() {
         (ssh(), ssh_credential(&format!("github.com {HOST_KEY}\n"))),
     ] {
         let secret = build_tenant_gitops_credentials_secret(&source, &credential).unwrap();
-        let yaml = serde_yml::to_string(&secret).unwrap();
+        let yaml = keel_core::yaml::to_string(&secret).unwrap();
         let err = ensure_git_safe_manifests("tenants/acme/git-repository.yaml", &yaml)
             .unwrap_err()
             .to_string();
@@ -236,7 +236,8 @@ fn credentials_secret_is_never_written_to_git() {
     // The monorepo-layout read-only `git-credentials` Secret too, and any plaintext Secret.
     let monorepo = crate::tenant::build_tenant_git_credentials_secret("acme", "u", "t").unwrap();
     assert!(
-        ensure_git_safe_manifests("x.yaml", &serde_yml::to_string(&monorepo).unwrap()).is_err()
+        ensure_git_safe_manifests("x.yaml", &keel_core::yaml::to_string(&monorepo).unwrap())
+            .is_err()
     );
     let plain = "apiVersion: v1\nkind: Secret\nmetadata:\n  name: app\nstringData:\n  k: v\n";
     assert!(ensure_git_safe_manifests("x.yaml", plain).is_err());
@@ -548,7 +549,7 @@ fn pko_operator_known_hosts_values_are_merged_idempotently() {
     let seed: Value =
         keel_core::split_yaml_documents(include_str!("../../../deploy/seed/core-addons/pko.yaml"))
             .iter()
-            .map(|d| serde_yml::from_str::<Value>(d).unwrap())
+            .map(|d| noyalib::from_str::<Value>(d).unwrap())
             .find(|d| d["kind"] == "HelmRelease")
             .unwrap();
     let mut values = seed["spec"]["values"].clone();
@@ -633,11 +634,11 @@ fn tenant_repo_kustomization_lists_only_tenant_resources() {
     .map(str::to_string)
     .to_vec();
     let yaml = build_tenant_repo_kustomization_yaml("acme", &resources).unwrap();
-    let v: Value = serde_yml::from_str(&yaml).unwrap();
+    let v: Value = noyalib::from_str(&yaml).unwrap();
     assert_eq!(v["kind"], "Kustomization");
     assert_eq!(v["resources"].as_array().unwrap().len(), 3);
     let empty: Value =
-        serde_yml::from_str(&build_tenant_repo_kustomization_yaml("acme", &[]).unwrap()).unwrap();
+        noyalib::from_str(&build_tenant_repo_kustomization_yaml("acme", &[]).unwrap()).unwrap();
     assert_eq!(empty["resources"], json!([]));
     assert!(build_tenant_repo_kustomization_yaml("acme", &["sync.yaml".to_string()]).is_err());
     // The builder refuses remote bases and paths outside `tenants/<id>/`.

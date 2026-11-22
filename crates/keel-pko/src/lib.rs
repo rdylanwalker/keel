@@ -55,5 +55,5 @@ pub enum PkoError {
     #[error("JSON serialization error: {0}")]
     Json(#[from] serde_json::Error),
     #[error("YAML serialization error: {0}")]
-    Yaml(#[from] serde_yml::Error),
+    Yaml(#[from] noyalib::Error),
 }

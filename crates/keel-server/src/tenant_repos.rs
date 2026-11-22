@@ -520,7 +520,7 @@ pub fn classify_tenant_stub(
     };
     let url = keel_core::split_yaml_documents(manifest)
         .into_iter()
-        .filter_map(|d| serde_yml::from_str::<Value>(&d).ok())
+        .filter_map(|d| noyalib::from_str::<Value>(&d).ok())
         .find(|v| v.get("kind").and_then(Value::as_str) == Some("GitRepository"))
         .and_then(|v| {
             v.pointer("/spec/url")
@@ -529,7 +529,7 @@ pub fn classify_tenant_stub(
         });
     let secret = keel_core::split_yaml_documents(manifest)
         .into_iter()
-        .filter_map(|d| serde_yml::from_str::<Value>(&d).ok())
+        .filter_map(|d| noyalib::from_str::<Value>(&d).ok())
         .find_map(|v| {
             v.pointer("/spec/secretRef/name")
                 .and_then(Value::as_str)
@@ -1600,9 +1600,10 @@ mod tests {
             },
         );
         let source = f.source("acme").unwrap();
-        let stub =
-            serde_yml::to_string(&keel_kube::build_tenant_repo_git_repository(&source).unwrap())
-                .unwrap();
+        let stub = keel_core::yaml::to_string(
+            &keel_kube::build_tenant_repo_git_repository(&source).unwrap(),
+        )
+        .unwrap();
         assert_eq!(
             classify_tenant_stub(Some(&stub), true, &source),
             TenantStubState::Dedicated

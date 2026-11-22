@@ -545,7 +545,7 @@ pub async fn register_catalog_app(
                 application.ensure_manifest_matches_placement(manifests)?;
             }
 
-            let catalog_yaml = serde_yml::to_string(&application)
+            let catalog_yaml = keel_core::yaml::to_string(&application)
                 .map_err(|e| ServerError::Internal(e.to_string()))?;
 
             let rel_dir = format!("catalog/apps/{}", req.id);
@@ -684,13 +684,13 @@ pub async fn register_catalog_app(
             };
             blueprint.validate()?;
 
-            let catalog_yaml = serde_yml::to_string(&blueprint)
+            let catalog_yaml = keel_core::yaml::to_string(&blueprint)
                 .map_err(|e| ServerError::Internal(e.to_string()))?;
 
             let pulumi_yaml = if let Some(custom_yaml) =
                 req.pulumi_yaml.filter(|s| !s.trim().is_empty())
             {
-                serde_yml::from_str::<Value>(&custom_yaml).map_err(|e| {
+                noyalib::from_str::<Value>(&custom_yaml).map_err(|e| {
                     ServerError::BadRequest(format!("Invalid Pulumi.yaml YAML syntax: {e}"))
                 })?;
                 if custom_yaml.ends_with('\n') {
@@ -728,7 +728,7 @@ pub async fn register_catalog_app(
                 );
                 pulumi_doc.insert("resources".to_string(), json!({}));
                 pulumi_doc.insert("outputs".to_string(), json!({}));
-                serde_yml::to_string(&Value::Object(pulumi_doc))
+                keel_core::yaml::to_string(&Value::Object(pulumi_doc))
                     .map_err(|e| ServerError::Internal(e.to_string()))?
             };
 
@@ -845,8 +845,8 @@ pub async fn register_catalog_app(
             };
             bundle.validate()?;
 
-            let catalog_yaml =
-                serde_yml::to_string(&bundle).map_err(|e| ServerError::Internal(e.to_string()))?;
+            let catalog_yaml = keel_core::yaml::to_string(&bundle)
+                .map_err(|e| ServerError::Internal(e.to_string()))?;
 
             let rel_dir = format!("catalog/bundles/{}", req.id);
             let rel_catalog = format!("{rel_dir}/catalog.yaml");
@@ -1262,8 +1262,8 @@ pub async fn update_catalog_item(
                     app.spec.schema = schema;
                 }
                 app.validate()?;
-                let yaml =
-                    serde_yml::to_string(&app).map_err(|e| ServerError::Internal(e.to_string()))?;
+                let yaml = keel_core::yaml::to_string(&app)
+                    .map_err(|e| ServerError::Internal(e.to_string()))?;
                 let name = app.metadata.name.clone();
                 let current_manifests = if let Some(ref updated_m) = validated_manifests_yaml {
                     Some(updated_m.clone())
@@ -1328,8 +1328,8 @@ pub async fn update_catalog_item(
                     bp.spec.schema = schema;
                 }
                 bp.validate()?;
-                let yaml =
-                    serde_yml::to_string(&bp).map_err(|e| ServerError::Internal(e.to_string()))?;
+                let yaml = keel_core::yaml::to_string(&bp)
+                    .map_err(|e| ServerError::Internal(e.to_string()))?;
                 let name = bp.metadata.name.clone();
                 (yaml, None, Some(bp), None, name)
             }
@@ -1364,7 +1364,7 @@ pub async fn update_catalog_item(
                         compose_bundle_schema(&state.repo_workdir, &bundle.spec.items).await?;
                 }
                 bundle.validate()?;
-                let yaml = serde_yml::to_string(&bundle)
+                let yaml = keel_core::yaml::to_string(&bundle)
                     .map_err(|e| ServerError::Internal(e.to_string()))?;
                 let name = bundle.metadata.name.clone();
                 (yaml, None, None, Some(bundle), name)
@@ -1375,7 +1375,7 @@ pub async fn update_catalog_item(
         let validated_pulumi_yaml = if normalized_kind == "infra"
             && let Some(raw_pulumi) = req.pulumi_yaml.filter(|s| !s.trim().is_empty())
         {
-            serde_yml::from_str::<Value>(&raw_pulumi).map_err(|e| {
+            noyalib::from_str::<Value>(&raw_pulumi).map_err(|e| {
                 ServerError::BadRequest(format!("Invalid Pulumi.yaml YAML syntax: {e}"))
             })?;
             Some(if raw_pulumi.ends_with('\n') {
@@ -1758,7 +1758,7 @@ fn resolve_chart_url_from_index(
     chart: &str,
     version: Option<&str>,
 ) -> Result<url::Url, ServerError> {
-    let index: Value = serde_yml::from_slice(index_raw)
+    let index: Value = noyalib::from_slice(index_raw)
         .map_err(|e| ServerError::BadRequest(format!("invalid upstream index.yaml: {e}")))?;
     let entries = index
         .get("entries")
@@ -1896,7 +1896,7 @@ fn chart_schema_from_files(
         return Ok((parsed, "values.schema.json".to_string()));
     }
     if let Some(raw) = files.values_yaml {
-        let parsed: Value = serde_yml::from_slice(&raw)
+        let parsed: Value = noyalib::from_slice(&raw)
             .map_err(|e| ServerError::Internal(format!("invalid upstream values.yaml: {e}")))?;
         return Ok((
             yaml_value_to_json_schema(&parsed),

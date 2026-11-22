@@ -329,7 +329,7 @@ pub(crate) fn serialize_tenants_kustomization(resources: &[String]) -> Result<St
         "kind": "Kustomization",
         "resources": resources,
     });
-    let mut yaml = serde_yml::to_string(&kustomization_doc).map_err(|e| {
+    let mut yaml = keel_core::yaml::to_string(&kustomization_doc).map_err(|e| {
         ServerError::Internal(format!(
             "failed to serialize tenants/kustomization.yaml: {e}"
         ))
@@ -1292,7 +1292,7 @@ spec:
         )
         .await
         .unwrap();
-        let doc: Value = serde_yml::from_str(&raw).unwrap();
+        let doc: Value = noyalib::from_str(&raw).unwrap();
         assert_eq!(doc["spec"]["chart"]["spec"]["version"], "4.54.0");
         assert_eq!(doc["spec"]["values"]["s3"]["enabled"], true);
         assert_eq!(doc["spec"]["values"]["s3"]["enableAuth"], true);
@@ -1422,7 +1422,7 @@ spec:
             "appending a new tenant entry must not alter existing lines"
         );
 
-        let parsed: serde_json::Value = serde_yml::from_str(&updated).unwrap();
+        let parsed: serde_json::Value = noyalib::from_str(&updated).unwrap();
         assert_eq!(parsed["resources"].as_array().unwrap().len(), 3);
     }
 

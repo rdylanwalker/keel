@@ -744,7 +744,7 @@ async fn test_proposal_create_preview_merge_and_stacks_releases() {
         assert!(!enc_yaml.contains("super-secret-password"));
         assert!(!app_dir.join("config").exists());
         assert!(!app_dir.join("config-kustomization.yaml").exists());
-        let hr: Value = serde_yml::from_str(
+        let hr: Value = noyalib::from_str(
             &tokio::fs::read_to_string(app_dir.join("helmrelease.yaml"))
                 .await
                 .unwrap(),
@@ -2303,13 +2303,13 @@ async fn test_builtin_dex_catalog_app_installs_from_tenant_scoped_helm_repositor
         let path = workdir.join(format!("tenants/acme/apps/dex/{name}"));
         async move { tokio::fs::read_to_string(path).await.unwrap() }
     };
-    let repo: Value = serde_yml::from_str(&read("helm-repository.yaml").await).unwrap();
+    let repo: Value = noyalib::from_str(&read("helm-repository.yaml").await).unwrap();
     assert_eq!(repo["kind"], "HelmRepository");
     assert_eq!(repo["metadata"]["name"], "dex-repo");
     assert_eq!(repo["metadata"]["namespace"], "tenant-acme");
     assert_eq!(repo["spec"]["url"], "https://charts.dexidp.io");
 
-    let hr: Value = serde_yml::from_str(&read("helmrelease.yaml").await).unwrap();
+    let hr: Value = noyalib::from_str(&read("helmrelease.yaml").await).unwrap();
     let chart = &hr["spec"]["chart"]["spec"];
     assert_eq!(chart["chart"], "dex");
     assert_eq!(chart["version"], "0.21.0");
@@ -2672,7 +2672,7 @@ spec:
     assert!(cluster_stack.contains("kubeconfigSecretName: prod-stack-cluster-kubeconfig"));
     assert!(cluster_stack.contains("kubeconfigSecretNamespace: tenant-acme"));
     // Bundle infra items clone the tenant's own source through PKO `gitSource`.
-    let cluster_stack_doc: Value = serde_yml::from_str(&cluster_stack).unwrap();
+    let cluster_stack_doc: Value = noyalib::from_str(&cluster_stack).unwrap();
     assert!(cluster_stack_doc["spec"].get("fluxSource").is_none());
     assert_eq!(cluster_stack_doc["spec"]["projectRepo"], TENANT_PKO_GIT_URL);
     assert_eq!(
@@ -3704,7 +3704,7 @@ async fn test_remote_canary_kustomization_creates_target_namespace_first() {
         .state
         .repo_workdir
         .join("tenants/acme/apps/grafana-edge");
-    let ns: Value = serde_yml::from_str(
+    let ns: Value = noyalib::from_str(
         &tokio::fs::read_to_string(app_dir.join("canary/namespace.yaml"))
             .await
             .unwrap(),
@@ -3722,7 +3722,7 @@ async fn test_remote_canary_kustomization_creates_target_namespace_first() {
         "IfNotPresent"
     );
 
-    let canary_k: Value = serde_yml::from_str(
+    let canary_k: Value = noyalib::from_str(
         &tokio::fs::read_to_string(app_dir.join("canary/kustomization.yaml"))
             .await
             .unwrap(),
@@ -3733,7 +3733,7 @@ async fn test_remote_canary_kustomization_creates_target_namespace_first() {
         json!(["namespace.yaml", "canary.yaml", "networkpolicy-canary.yaml"])
     );
 
-    let fk: Value = serde_yml::from_str(
+    let fk: Value = noyalib::from_str(
         &tokio::fs::read_to_string(app_dir.join("canary-kustomization.yaml"))
             .await
             .unwrap(),
@@ -4532,7 +4532,7 @@ async fn test_tenant_stack_uses_scoped_state_backend_and_fails_closed_without_id
         .checkout_branch(&state.repo_workdir, "main")
         .await
         .unwrap();
-    let stack: Value = serde_yml::from_str(&stack_yaml).unwrap();
+    let stack: Value = noyalib::from_str(&stack_yaml).unwrap();
     assert_eq!(
         stack["spec"]["backend"],
         "s3://pulumi-state/tenants/acme?endpoint=seaweedfs:8333&region=us-east-1&s3ForcePathStyle=true"
@@ -5953,7 +5953,7 @@ async fn test_tenant_stacks_use_tenant_passphrase_secret_and_fail_closed_without
         .unwrap()
         .expect("tenant Stack committed on the PR branch");
     assert!(!stack_yaml.contains(&tenant_pass));
-    let stack: Value = serde_yml::from_str(&stack_yaml).unwrap();
+    let stack: Value = noyalib::from_str(&stack_yaml).unwrap();
     let env = passphrase_env(&stack);
     // Never format `env` into the failure message: on regression it would hold the passphrase.
     assert!(
@@ -6266,7 +6266,7 @@ fn read_tree(dir: &std::path::Path) -> String {
 /// `remote` = `(kubeconfig secret, target namespace)` of a remote workload cluster.
 fn assert_rauthy_split_layout(dir: &std::path::Path, name: &str, remote: Option<(&str, &str)>) {
     let read = |file: &str| std::fs::read_to_string(dir.join(file)).unwrap();
-    let yaml = |file: &str| serde_yml::from_str::<Value>(&read(file)).unwrap();
+    let yaml = |file: &str| noyalib::from_str::<Value>(&read(file)).unwrap();
 
     // Old single-Kustomization layout files are gone.
     assert!(!dir.join("secrets.enc.yaml").exists());
@@ -6567,7 +6567,7 @@ async fn test_tenant_infra_stack_uses_pko_git_source_of_the_tenant() {
             .join("tenants/acme/infra/gitsrc-vm/stack.yaml"),
     )
     .unwrap();
-    let stack: Value = serde_yml::from_str(&raw).unwrap();
+    let stack: Value = noyalib::from_str(&raw).unwrap();
     assert_eq!(stack["metadata"]["namespace"], "tenant-acme");
     assert!(stack["spec"].get("fluxSource").is_none(), "{raw}");
     assert_eq!(stack["spec"]["projectRepo"], TENANT_PKO_GIT_URL);
@@ -6784,7 +6784,7 @@ fn tenants_kustomization_resources(fixture: &TestFixture) -> Vec<String> {
             .join("tenants/kustomization.yaml"),
     )
     .unwrap();
-    serde_yml::from_str::<Value>(&raw).unwrap()["resources"]
+    noyalib::from_str::<Value>(&raw).unwrap()["resources"]
         .as_array()
         .unwrap()
         .iter()
@@ -6955,7 +6955,7 @@ spec:
         .repo_workdir
         .join("tenants/acme/bundles/edge-canary/web");
     let yaml = |file: &str| {
-        serde_yml::from_str::<Value>(&std::fs::read_to_string(dir.join(file)).unwrap()).unwrap()
+        noyalib::from_str::<Value>(&std::fs::read_to_string(dir.join(file)).unwrap()).unwrap()
     };
     assert!(!dir.join("canary.yaml").exists());
     assert!(!dir.join("networkpolicy-canary.yaml").exists());
@@ -7061,7 +7061,7 @@ spec:
         assert!(!committed.contains(secret));
     }
     let fk: Value =
-        serde_yml::from_str(&std::fs::read_to_string(dir.join("flux-kustomization.yaml")).unwrap())
+        noyalib::from_str(&std::fs::read_to_string(dir.join("flux-kustomization.yaml")).unwrap())
             .unwrap();
     assert_eq!(fk["metadata"]["labels"]["keel.io/bundle"], "idp-stack");
     // Ready (and so any later item's `dependsOn`) only once the IdP workloads are healthy.
@@ -7123,7 +7123,7 @@ spec:
     assert!(!workdir.join("tenants/acme/apps/idp-stack-idp").exists());
     assert_rauthy_split_layout(&dir, "idp-stack-idp", None);
     let fk: Value =
-        serde_yml::from_str(&std::fs::read_to_string(dir.join("flux-kustomization.yaml")).unwrap())
+        noyalib::from_str(&std::fs::read_to_string(dir.join("flux-kustomization.yaml")).unwrap())
             .unwrap();
     let deps: Vec<&str> = fk["spec"]["dependsOn"]
         .as_array()
@@ -7198,7 +7198,7 @@ fn rauthy_values_without_secrets(hostname: &str) -> Value {
 
 /// `stringData` keys of a SOPS-encrypted Secret (key names stay plaintext).
 fn sops_secret_keys(ciphertext: &str) -> Vec<String> {
-    let doc: Value = serde_yml::from_str(ciphertext).unwrap();
+    let doc: Value = noyalib::from_str(ciphertext).unwrap();
     doc["stringData"]
         .as_object()
         .unwrap()
@@ -7293,7 +7293,7 @@ async fn test_manifest_app_edit_keeps_stored_secrets() {
         .decrypt_yaml(&age_key.secret_key, &rotated)
         .await
         .unwrap();
-    let doc: Value = serde_yml::from_str(&plain).unwrap();
+    let doc: Value = noyalib::from_str(&plain).unwrap();
     assert_eq!(
         doc["stringData"]["adminPassword"],
         "Rotated-Admin#Passw0rd!"
@@ -7385,7 +7385,7 @@ spec:
     assert_eq!(status, StatusCode::CREATED, "{body}");
     checkout_proposal_branch(&fixture, &body).await;
     assert_eq!(std::fs::read_to_string(&secret_path).unwrap(), stored);
-    let fk: Value = serde_yml::from_str(
+    let fk: Value = noyalib::from_str(
         &std::fs::read_to_string(
             workdir.join("tenants/acme/bundles/idp-only/idp/flux-kustomization.yaml"),
         )
@@ -8088,7 +8088,7 @@ fn seaweedfs_values() -> Value {
 }
 
 fn read_yaml(path: &std::path::Path) -> Value {
-    serde_yml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+    noyalib::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
 }
 
 async fn decrypt_tenant_secret(fixture: &TestFixture, ciphertext: &str) -> Value {
@@ -8103,7 +8103,7 @@ async fn decrypt_tenant_secret(fixture: &TestFixture, ciphertext: &str) -> Value
         .decrypt_yaml(&age_key.secret_key, ciphertext)
         .await
         .unwrap();
-    serde_yml::from_str(&plain).unwrap()
+    noyalib::from_str(&plain).unwrap()
 }
 
 /// Render test for the self-service Forgejo Helm app: the upstream chart from its OCI
@@ -8200,7 +8200,7 @@ async fn test_forgejo_catalog_app_renders_helm_release_with_encrypted_secrets() 
         secret["metadata"]["labels"]["reconcile.fluxcd.io/watch"],
         "Enabled"
     );
-    let admin: Value = serde_yml::from_str(
+    let admin: Value = noyalib::from_str(
         secret["stringData"]["gitea.admin.password"]
             .as_str()
             .unwrap(),
@@ -8208,7 +8208,7 @@ async fn test_forgejo_catalog_app_renders_helm_release_with_encrypted_secrets() 
     .unwrap();
     assert_eq!(admin["gitea"]["admin"]["password"], FORGEJO_ADMIN_PASSWORD);
     let oauth: Value =
-        serde_yml::from_str(secret["stringData"]["gitea.oauth"].as_str().unwrap()).unwrap();
+        noyalib::from_str(secret["stringData"]["gitea.oauth"].as_str().unwrap()).unwrap();
     assert_eq!(oauth["gitea"]["oauth"][0]["secret"], FORGEJO_OIDC_SECRET);
 
     let np = read_yaml(&dir.join("networkpolicy.yaml"));
@@ -8811,7 +8811,7 @@ async fn test_helm_app_secrets_in_non_default_tenant_use_root_tenants_kustomizat
     assert!(flux_kustomizations.is_empty(), "{flux_kustomizations:?}");
     assert!(!dir.join("config").exists());
     let stored = std::fs::read_to_string(dir.join("secrets.enc.yaml")).unwrap();
-    let doc: Value = serde_yml::from_str(&stored).unwrap();
+    let doc: Value = noyalib::from_str(&stored).unwrap();
     assert_eq!(doc["kind"], "Secret");
     assert_eq!(doc["metadata"]["name"], "git-secrets");
     assert_eq!(doc["metadata"]["namespace"], "tenant-acme");
@@ -8846,7 +8846,7 @@ async fn test_helm_app_secrets_in_non_default_tenant_use_root_tenants_kustomizat
         vec!["gitea.admin.password", "gitea.oauth"]
     );
     let secret = decrypt_tenant_secret(&fixture, &rotated).await;
-    let admin: Value = serde_yml::from_str(
+    let admin: Value = noyalib::from_str(
         secret["stringData"]["gitea.admin.password"]
             .as_str()
             .unwrap(),
@@ -8857,7 +8857,7 @@ async fn test_helm_app_secrets_in_non_default_tenant_use_root_tenants_kustomizat
         "Rotated-Admin#Passw0rd!"
     );
     let oauth: Value =
-        serde_yml::from_str(secret["stringData"]["gitea.oauth"].as_str().unwrap()).unwrap();
+        noyalib::from_str(secret["stringData"]["gitea.oauth"].as_str().unwrap()).unwrap();
     assert_eq!(oauth["gitea"]["oauth"][0]["secret"], FORGEJO_OIDC_SECRET);
     assert_eq!(
         read_yaml(&dir.join("helmrelease.yaml"))["spec"]["valuesFrom"]
@@ -9061,7 +9061,7 @@ async fn test_workload_operator_catalog_apps_render_remote_helm_releases() {
 
         let values = &hr["spec"]["values"];
         let locked: Value =
-            serde_yml::from_str::<Value>(case.raw).unwrap()["spec"]["lockedValues"].clone();
+            noyalib::from_str::<Value>(case.raw).unwrap()["spec"]["lockedValues"].clone();
         fn contains(haystack: &Value, needle: &Value) -> bool {
             match (haystack, needle) {
                 (Value::Object(h), Value::Object(n)) => n
@@ -9297,7 +9297,7 @@ async fn test_keel_server_catalog_app_renders_multi_namespace_remote_layout() {
 
     let dir = workdir.join("tenants/acme/apps/keel-server");
     let read = |file: &str| std::fs::read_to_string(dir.join(file)).unwrap();
-    let yaml = |file: &str| serde_yml::from_str::<Value>(&read(file)).unwrap();
+    let yaml = |file: &str| noyalib::from_str::<Value>(&read(file)).unwrap();
     let committed = read_tree(&dir);
     for field in ["oidcClientSecret", "gitToken"] {
         let secret = values[field].as_str().unwrap();
@@ -9335,7 +9335,7 @@ async fn test_keel_server_catalog_app_renders_multi_namespace_remote_layout() {
     );
     let namespaces: Vec<Value> = keel_core::split_yaml_documents(&read("namespace.yaml"))
         .iter()
-        .map(|d| serde_yml::from_str(d).unwrap())
+        .map(|d| noyalib::from_str(d).unwrap())
         .collect();
     assert_eq!(
         namespaces
@@ -9360,7 +9360,7 @@ async fn test_keel_server_catalog_app_renders_multi_namespace_remote_layout() {
     assert!(manifests.contains("team-a-platform"));
     let docs: Vec<Value> = keel_core::split_yaml_documents(&manifests)
         .iter()
-        .filter_map(|d| serde_yml::from_str::<Value>(d).ok())
+        .filter_map(|d| noyalib::from_str::<Value>(d).ok())
         .filter(Value::is_object)
         .collect();
     let role_namespaces: Vec<&str> = docs
@@ -9511,7 +9511,7 @@ async fn test_multi_namespace_manifest_app_requires_explicit_namespaces() {
     checkout_proposal_branch(&fixture, &body).await;
     let dir = workdir.join("tenants/acme/apps/multi-ns");
     let fk: Value =
-        serde_yml::from_str(&std::fs::read_to_string(dir.join("flux-kustomization.yaml")).unwrap())
+        noyalib::from_str(&std::fs::read_to_string(dir.join("flux-kustomization.yaml")).unwrap())
             .unwrap();
     assert!(fk["spec"].get("targetNamespace").is_none(), "{fk}");
     let ns_yaml = std::fs::read_to_string(dir.join("namespace.yaml")).unwrap();

@@ -396,7 +396,7 @@ async fn proposal_matches(
 
 /// `resources` of a `kustomization.yaml` (empty when missing or unparsable).
 fn kustomization_resources(yaml: Option<&str>) -> Vec<String> {
-    yaml.and_then(|y| serde_yml::from_str::<Value>(y).ok())
+    yaml.and_then(|y| noyalib::from_str::<Value>(y).ok())
         .and_then(|v| v.get("resources").and_then(|r| r.as_array()).cloned())
         .unwrap_or_default()
         .into_iter()
@@ -650,7 +650,7 @@ async fn open_platform_tenant_proposal(
         let existing = tokio::fs::read_to_string(&tenants_kustomization_path)
             .await
             .unwrap_or_default();
-        let mut resources: Vec<String> = serde_yml::from_str::<Value>(&existing)
+        let mut resources: Vec<String> = noyalib::from_str::<Value>(&existing)
             .ok()
             .and_then(|v| v.get("resources").and_then(|r| r.as_array()).cloned())
             .unwrap_or_default()
@@ -1103,7 +1103,7 @@ pub async fn delete_tenant(
             let existing = tokio::fs::read_to_string(&tenants_kustomization_path)
                 .await
                 .unwrap_or_default();
-            let resources: Vec<String> = serde_yml::from_str::<Value>(&existing)
+            let resources: Vec<String> = noyalib::from_str::<Value>(&existing)
                 .ok()
                 .and_then(|v| v.get("resources").and_then(|r| r.as_array()).cloned())
                 .unwrap_or_default()

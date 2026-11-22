@@ -311,18 +311,6 @@ pub fn tenant_repo_stub_kustomization_entries(tenant_id: &str) -> Vec<String> {
         .collect()
 }
 
-fn to_yaml_docs(docs: &[Value]) -> Result<String, KubeError> {
-    let mut rendered = Vec::with_capacity(docs.len());
-    for doc in docs {
-        let mut s = serde_yml::to_string(doc)?;
-        if !s.ends_with('\n') {
-            s.push('\n');
-        }
-        rendered.push(s);
-    }
-    Ok(rendered.join("---\n"))
-}
-
 /// Synthesizes the monorepo stub of a tenant with its own repository (`rbac.yaml`,
 /// `git-repository.yaml`, `sync.yaml`). Every file passes [`ensure_git_safe_manifests`]: the
 /// credentials Secret is applied at runtime and never part of the stub.
@@ -339,8 +327,8 @@ pub fn synthesize_tenant_repo_stub(
     }
     let tenant = source.tenant_id();
     let rbac = TenantManifestBundle::synthesize(config)?.to_multi_doc_yaml()?;
-    let git_repository = to_yaml_docs(&[build_tenant_repo_git_repository(source)?])?;
-    let sync = to_yaml_docs(&[build_tenant_root_kustomization(tenant)?])?;
+    let git_repository = keel_core::to_yaml_documents([build_tenant_repo_git_repository(source)?])?;
+    let sync = keel_core::to_yaml_documents([build_tenant_root_kustomization(tenant)?])?;
     let files: Vec<(String, String)> = TENANT_REPO_STUB_FILES
         .iter()
         .zip([rbac, git_repository, sync])
@@ -396,7 +384,7 @@ pub fn build_tenant_repo_kustomization_yaml(
             )));
         }
     }
-    Ok(serde_yml::to_string(&json!({
+    Ok(keel_core::yaml::to_string(&json!({
         "apiVersion": "kustomize.config.k8s.io/v1beta1",
         "kind": "Kustomization",
         "resources": resources,
@@ -418,7 +406,7 @@ pub fn ensure_git_safe_manifests(path: &str, yaml: &str) -> Result<(), KubeError
     };
     for doc in keel_core::split_yaml_documents(yaml) {
         let value: Value =
-            serde_yml::from_str(&doc).map_err(|_| refuse("it has an unparsable YAML document"))?;
+            noyalib::from_str(&doc).map_err(|_| refuse("it has an unparsable YAML document"))?;
         check_git_safe_object(&value, 0).map_err(refuse)?;
     }
     Ok(())

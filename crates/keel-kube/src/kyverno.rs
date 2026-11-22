@@ -1311,16 +1311,7 @@ impl KyvernoManifestBundle {
 
     /// Serializes all generated policies (and optional exception) to multi-document YAML (`---`).
     pub fn to_multi_doc_yaml(&self) -> Result<String, KubeError> {
-        let manifests = self.all_manifests();
-        let mut docs = Vec::with_capacity(manifests.len());
-        for m in manifests {
-            let mut s = serde_yml::to_string(&m)?;
-            if !s.ends_with('\n') {
-                s.push('\n');
-            }
-            docs.push(s);
-        }
-        Ok(docs.join("---\n"))
+        Ok(keel_core::to_yaml_documents(self.all_manifests())?)
     }
 }
 
@@ -1588,7 +1579,7 @@ mod tests {
 
     #[test]
     fn protect_control_plane_policy_matches_seed_and_guards_protected_flux_objects() {
-        let seed: Value = serde_yml::from_str(include_str!(
+        let seed: Value = noyalib::from_str(include_str!(
             "../../../deploy/seed/kyverno-policies/protect-control-plane.yaml"
         ))
         .unwrap();
@@ -1641,7 +1632,7 @@ mod tests {
 
     #[test]
     fn restrict_tenant_reconciler_policy_matches_seed_manifest() {
-        let seed: Value = serde_yml::from_str(include_str!(
+        let seed: Value = noyalib::from_str(include_str!(
             "../../../deploy/seed/kyverno-policies/restrict-tenant-reconciler.yaml"
         ))
         .unwrap();
@@ -2317,7 +2308,7 @@ mod tests {
         assert_eq!(docs.len(), 13);
         for doc in docs {
             let parsed: serde_json::Value =
-                serde_yml::from_str(doc).expect("each Kyverno multi-doc YAML part must parse");
+                noyalib::from_str(doc).expect("each Kyverno multi-doc YAML part must parse");
             assert!(parsed.get("kind").is_some());
         }
     }

@@ -201,7 +201,7 @@ pub async fn load_values_file(path: &Path) -> Result<Value, CliError> {
     if raw.trim().is_empty() {
         return Ok(json!({}));
     }
-    let val: Value = serde_yml::from_str(&raw).map_err(|e| {
+    let val: Value = noyalib::from_str(&raw).map_err(|e| {
         CliError::Validation(format!(
             "invalid YAML/JSON in values file '{}': {e}",
             path.display()
@@ -478,15 +478,15 @@ pub(crate) async fn resolve_local_fallback_ssh_info(
     let stack_doc = tokio::fs::read_to_string(&stack_path)
         .await
         .ok()
-        .and_then(|raw| serde_yml::from_str::<Value>(&raw).ok());
+        .and_then(|raw| noyalib::from_str::<Value>(&raw).ok());
     let values_doc = tokio::fs::read_to_string(&values_path)
         .await
         .ok()
-        .and_then(|raw| serde_yml::from_str::<Value>(&raw).ok());
+        .and_then(|raw| noyalib::from_str::<Value>(&raw).ok());
     let pulumi_doc = tokio::fs::read_to_string(&pulumi_path)
         .await
         .ok()
-        .and_then(|raw| serde_yml::from_str::<Value>(&raw).ok());
+        .and_then(|raw| noyalib::from_str::<Value>(&raw).ok());
 
     Some(resolve_ssh_target_from_sources(
         stack_name,

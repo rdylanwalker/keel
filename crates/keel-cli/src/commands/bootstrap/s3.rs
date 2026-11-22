@@ -498,7 +498,9 @@ pub(crate) async fn sync_in_cluster_s3_credentials_from_seaweedfs(
                 "secretKey": creds.secret_key.as_str(),
             },
         });
-        target.apply(&serde_yml::to_string(&secret_doc)?).await?;
+        target
+            .apply(&keel_core::yaml::to_string(&secret_doc)?)
+            .await?;
     }
     Ok(())
 }

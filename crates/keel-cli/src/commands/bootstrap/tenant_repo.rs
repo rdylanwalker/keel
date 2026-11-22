@@ -291,7 +291,7 @@ pub(crate) async fn ensure_default_tenant_age_key(
     // `kubectl create`, never `apply`: no copy of the private key in the last-applied annotation,
     // and an existing key (Git content may be encrypted to it) is never replaced.
     target
-        .write_secret_manifest(&serde_yml::to_string(&secret)?, false, None)
+        .write_secret_manifest(&keel_core::yaml::to_string(&secret)?, false, None)
         .await
 }
 
@@ -337,7 +337,7 @@ impl KubectlCredentialSecrets<'_> {
         secret: &Secret,
         replace: bool,
     ) -> Result<bool, keel_server::ServerError> {
-        let yaml = serde_yml::to_string(secret)
+        let yaml = keel_core::yaml::to_string(secret)
             .map_err(|e| keel_server::ServerError::Internal(e.to_string()))?;
         self.target
             .write_secret_manifest(&yaml, replace, self.writer.as_deref())

@@ -169,7 +169,7 @@ pub async fn list_stacks(
         )
         .await
         .ok()
-        .and_then(|raw| serde_yml::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|raw| noyalib::from_str::<serde_json::Value>(&raw).ok())
         .and_then(|v| {
             v.get("spec")
                 .and_then(|s| s.get("url"))
@@ -194,7 +194,7 @@ pub async fn list_stacks(
     let forge_provider = tokio::fs::read_to_string(state.repo_workdir.join(".keel/config.yaml"))
         .await
         .ok()
-        .and_then(|raw| serde_yml::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|raw| noyalib::from_str::<serde_json::Value>(&raw).ok())
         .and_then(|v| {
             v.get("forge")
                 .and_then(|f| f.get("provider"))
@@ -451,7 +451,7 @@ fn declares_protected_flux_object(dir: &std::path::Path) -> bool {
             return false;
         };
         keel_core::split_yaml_documents(&raw).iter().any(|doc| {
-            serde_yml::from_str::<Value>(doc).ok().is_some_and(|val| {
+            noyalib::from_str::<Value>(doc).ok().is_some_and(|val| {
                 let kind = val.get("kind").and_then(Value::as_str);
                 matches!(kind, Some("HelmRelease" | "Kustomization"))
                     && val
@@ -529,7 +529,7 @@ async fn read_stack_config(
     let dir = resolved.rel_dir;
 
     let values = match reader.read(&format!("{dir}/values.yaml")).await {
-        Some(raw) => serde_yml::from_str::<Value>(&raw).unwrap_or_else(|_| json!({})),
+        Some(raw) => noyalib::from_str::<Value>(&raw).unwrap_or_else(|_| json!({})),
         None => json!({}),
     };
 
@@ -539,7 +539,7 @@ async fn read_stack_config(
             .exists(&format!("catalog/infra/{name}/catalog.yaml"))
             .await
         && let Some(raw) = reader.read(&format!("{dir}/stack.yaml")).await
-        && let Ok(doc) = serde_yml::from_str::<Value>(&raw)
+        && let Ok(doc) = noyalib::from_str::<Value>(&raw)
         && let Some(provider) = doc
             .pointer("/metadata/labels/keel.io~1provider")
             .and_then(Value::as_str)
@@ -669,13 +669,13 @@ pub async fn get_release_config(
 
         let values = if has_values {
             let raw = tokio::fs::read_to_string(&values_path).await?;
-            match serde_yml::from_str::<Value>(&raw) {
+            match noyalib::from_str::<Value>(&raw) {
                 Ok(Value::Object(map)) => Value::Object(map),
                 _ => Value::Object(serde_json::Map::new()),
             }
         } else if has_cm {
             let raw = tokio::fs::read_to_string(&cm_path).await?;
-            serde_yml::from_str::<Value>(&raw)
+            noyalib::from_str::<Value>(&raw)
                 .ok()
                 .and_then(|d| d.get("data").cloned())
                 .filter(Value::is_object)
@@ -686,7 +686,7 @@ pub async fn get_release_config(
 
         let hr_doc = if let Some(path) = active_hr_path {
             let raw = tokio::fs::read_to_string(&path).await?;
-            serde_yml::from_str::<Value>(&raw).ok()
+            noyalib::from_str::<Value>(&raw).ok()
         } else {
             None
         };
@@ -823,7 +823,7 @@ pub async fn get_bundle_config(
         let values_path = item_path.join("values.yaml");
         let item_values = if tokio::fs::try_exists(&values_path).await.unwrap_or(false) {
             let raw = tokio::fs::read_to_string(&values_path).await?;
-            serde_yml::from_str::<Value>(&raw).unwrap_or_else(|_| json!({}))
+            noyalib::from_str::<Value>(&raw).unwrap_or_else(|_| json!({}))
         } else {
             json!({})
         };
@@ -1162,7 +1162,7 @@ async fn read_stack_ssh_docs(
         .resolve_tenant_resource_dir(tenant, "infra", name)
         .await?
         .rel_dir;
-    let parse = |raw: Option<String>| raw.and_then(|r| serde_yml::from_str::<Value>(&r).ok());
+    let parse = |raw: Option<String>| raw.and_then(|r| noyalib::from_str::<Value>(&r).ok());
     Some((
         parse(reader.read(&format!("{dir}/stack.yaml")).await),
         parse(reader.read(&format!("{dir}/values.yaml")).await),

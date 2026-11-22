@@ -395,7 +395,7 @@ impl TenantIndex {
             .ok()
             .flatten()
             .unwrap_or_default();
-        let entries: Vec<String> = serde_yml::from_str::<serde_json::Value>(&raw)
+        let entries: Vec<String> = noyalib::from_str::<serde_json::Value>(&raw)
             .ok()
             .and_then(|v| v.get("resources").and_then(|r| r.as_array()).cloned())
             .unwrap_or_default()

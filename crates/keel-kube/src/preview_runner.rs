@@ -165,7 +165,7 @@ pub fn tenant_git_source_from_manifest(
     };
     let mut repo = None;
     for doc in keel_core::split_yaml_documents(manifest) {
-        let Ok(value) = serde_yml::from_str::<Value>(&doc) else {
+        let Ok(value) = noyalib::from_str::<Value>(&doc) else {
             return Err(unavailable("has an unparsable Flux Git source manifest"));
         };
         let is_repo = value.get("kind").and_then(Value::as_str) == Some("GitRepository")

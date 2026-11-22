@@ -391,7 +391,7 @@ pub async fn execute_catalog_show(
         })?;
     match args.output {
         OutputFormat::Json => pretty(&found),
-        OutputFormat::Table => Ok(serde_yml::to_string(&found)?),
+        OutputFormat::Table => Ok(keel_core::yaml::to_string(&found)?),
     }
 }
 

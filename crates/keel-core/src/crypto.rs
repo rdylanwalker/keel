@@ -235,12 +235,12 @@ pub struct SopsConfig {
 impl SopsConfig {
     /// Parses `.sops.yaml` content.
     pub fn from_yaml(yaml: &str) -> Result<Self, CoreError> {
-        Ok(serde_yml::from_str(yaml)?)
+        Ok(noyalib::from_str(yaml)?)
     }
 
     /// Serializes `.sops.yaml` content.
     pub fn to_yaml(&self) -> Result<String, CoreError> {
-        Ok(serde_yml::to_string(self)?)
+        Ok(crate::yaml::to_string(self)?)
     }
 
     /// Returns the `.age` recipient of the first cluster rule (`path_regex` starting with
@@ -864,8 +864,8 @@ mod tests {
             .decrypt_yaml(keypair.secret_key(), &encrypted)
             .await
             .unwrap();
-        let orig_val: serde_json::Value = serde_yml::from_str(plaintext).unwrap();
-        let dec_val: serde_json::Value = serde_yml::from_str(&decrypted).unwrap();
+        let orig_val: serde_json::Value = noyalib::from_str(plaintext).unwrap();
+        let dec_val: serde_json::Value = noyalib::from_str(&decrypted).unwrap();
         assert_eq!(orig_val, dec_val);
     }
 
@@ -905,7 +905,7 @@ mod tests {
             .await
             .unwrap();
         assert!(!encrypted.contains("s3cr3t-token-value"));
-        let doc: serde_json::Value = serde_yml::from_str(&encrypted).unwrap();
+        let doc: serde_json::Value = noyalib::from_str(&encrypted).unwrap();
         assert_eq!(doc["kind"], "Secret");
         assert_eq!(doc["metadata"]["name"], "app-secrets");
         assert_eq!(doc["metadata"]["namespace"], "tenant-acme");
@@ -922,7 +922,7 @@ mod tests {
             .decrypt_yaml(keypair.secret_key(), &transformed)
             .await
             .unwrap();
-        let dec: serde_json::Value = serde_yml::from_str(&decrypted).unwrap();
+        let dec: serde_json::Value = noyalib::from_str(&decrypted).unwrap();
         assert_eq!(dec["stringData"]["apiToken"], "s3cr3t-token-value");
         assert_eq!(dec["metadata"]["namespace"], "tenant-other");
     }

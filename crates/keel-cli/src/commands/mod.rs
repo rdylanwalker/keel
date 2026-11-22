@@ -77,7 +77,7 @@ pub enum CliError {
     Json(#[from] serde_json::Error),
 
     #[error("YAML error: {0}")]
-    Yaml(#[source] serde_yml::Error),
+    Yaml(#[source] noyalib::Error),
 
     #[error("Validation error: {0}")]
     Validation(String),
@@ -95,8 +95,8 @@ pub enum CliError {
     Incomplete { output: String, message: String },
 }
 
-impl From<serde_yml::Error> for CliError {
-    fn from(err: serde_yml::Error) -> Self {
+impl From<noyalib::Error> for CliError {
+    fn from(err: noyalib::Error) -> Self {
         Self::Yaml(err)
     }
 }
@@ -2083,7 +2083,7 @@ spec:
         // (`tenants/default/rbac.yaml`), so kustomize never sees it twice.
         let docs = keel_core::split_yaml_documents(&yaml);
         assert_eq!(docs.len(), 1);
-        let first: serde_json::Value = serde_yml::from_str(&docs[0]).unwrap();
+        let first: serde_json::Value = noyalib::from_str(&docs[0]).unwrap();
         assert_eq!(first["kind"], "GitRepository");
         // The platform-written tenant-default source is Kyverno-protected from tenant edits.
         assert_eq!(

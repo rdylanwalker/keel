@@ -669,7 +669,7 @@ pub fn render_management_addon_document(
     updated: &Value,
 ) -> Result<String, CoreError> {
     let parses_to_updated =
-        |text: &str| serde_yml::from_str::<Value>(text).is_ok_and(|v| &v == updated);
+        |text: &str| noyalib::from_str::<Value>(text).is_ok_and(|v| &v == updated);
     if parses_to_updated(original_text) {
         return Ok(original_text.to_string());
     }
@@ -678,7 +678,7 @@ pub fn render_management_addon_document(
     {
         return Ok(edited);
     }
-    let serialized = serde_yml::to_string(updated)?;
+    let serialized = crate::yaml::to_string(updated)?;
     let serialized = serialized.strip_prefix("---\n").unwrap_or(&serialized);
     Ok(format!(
         "{}{serialized}",
@@ -1275,7 +1275,7 @@ mod tests {
         .unwrap();
         let seed: Value = include_str!("../../../deploy/seed/core-addons/pko.yaml")
             .split("\n---\n")
-            .map(|d| serde_yml::from_str::<Value>(d).unwrap())
+            .map(|d| noyalib::from_str::<Value>(d).unwrap())
             .find(|d| d["kind"] == "HelmRelease")
             .unwrap();
         let live = seed["spec"]["values"].clone();
@@ -1421,7 +1421,7 @@ spec:
 
     #[test]
     fn version_only_upgrade_keeps_key_order_and_comments() {
-        let mut doc: Value = serde_yml::from_str(KYVERNO_DOC).unwrap();
+        let mut doc: Value = noyalib::from_str(KYVERNO_DOC).unwrap();
         apply_management_addon_upgrade("kyverno", &mut doc, Some("3.11.0"), &Value::Null).unwrap();
         let rendered = render_management_addon_document(KYVERNO_DOC, &doc).unwrap();
         assert_eq!(
@@ -1430,14 +1430,14 @@ spec:
         );
 
         // Unchanged documents are returned verbatim.
-        let same: Value = serde_yml::from_str(KYVERNO_DOC).unwrap();
+        let same: Value = noyalib::from_str(KYVERNO_DOC).unwrap();
         assert_eq!(
             render_management_addon_document(KYVERNO_DOC, &same).unwrap(),
             KYVERNO_DOC
         );
 
         // Values changes fall back to re-serialization but keep the header comment.
-        let mut doc: Value = serde_yml::from_str(KYVERNO_DOC).unwrap();
+        let mut doc: Value = noyalib::from_str(KYVERNO_DOC).unwrap();
         apply_management_addon_upgrade(
             "kyverno",
             &mut doc,
@@ -1447,13 +1447,13 @@ spec:
         .unwrap();
         let rendered = render_management_addon_document(KYVERNO_DOC, &doc).unwrap();
         assert!(rendered.starts_with("# Kyverno admission controller.\n"));
-        assert_eq!(serde_yml::from_str::<Value>(&rendered).unwrap(), doc);
+        assert_eq!(noyalib::from_str::<Value>(&rendered).unwrap(), doc);
     }
 
     #[test]
     fn kustomization_version_upgrade_edits_every_new_tag_in_place() {
         let text = "apiVersion: kustomize.toolkit.fluxcd.io/v1\nkind: Kustomization\nmetadata:\n  name: rauthy\n  namespace: flux-system\n  labels:\n    keel.io/protect: \"true\"\nspec:\n  path: ./clusters/management/addons/rauthy # plain manifests\n  images:\n  - name: ghcr.io/sebadob/rauthy\n    newTag: 0.37.2 # app\n  - name: ghcr.io/sebadob/rauthy-init\n    newTag: '0.37.2'\n";
-        let mut doc: Value = serde_yml::from_str(text).unwrap();
+        let mut doc: Value = noyalib::from_str(text).unwrap();
         apply_management_addon_upgrade("rauthy", &mut doc, Some("0.38.0"), &Value::Null).unwrap();
         let rendered = render_management_addon_document(text, &doc).unwrap();
         assert_eq!(

@@ -591,7 +591,7 @@ pub(crate) async fn build_serve_state(
     let mgmt_stack_backend = live_mgmt_backend.or_else(|| {
         std::fs::read_to_string(repo_workdir.join("clusters/management/management-stack.yaml"))
             .ok()
-            .and_then(|raw| serde_yml::from_str::<serde_json::Value>(&raw).ok())
+            .and_then(|raw| noyalib::from_str::<serde_json::Value>(&raw).ok())
             .and_then(|v| {
                 v.get("spec")
                     .and_then(|s| s.get("backend"))

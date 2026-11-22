@@ -222,7 +222,7 @@ async fn fixture_with_ttl(ttl: Option<std::time::Duration>) -> Fx {
     write(
         &workdir,
         "tenants/kustomization.yaml",
-        &serde_yml::to_string(&json!({
+        &keel_core::yaml::to_string(&json!({
             "apiVersion": "kustomize.config.k8s.io/v1beta1",
             "kind": "Kustomization",
             "resources": entries,

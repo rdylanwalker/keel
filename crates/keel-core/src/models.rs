@@ -588,7 +588,7 @@ fn default_bootstrap_target() -> BootstrapTargetKind {
 impl KeelConfig {
     /// Parses `.keel/config.yaml` and validates required invariants.
     pub fn from_yaml(yaml: &str) -> Result<Self, CoreError> {
-        let cfg: Self = serde_yml::from_str(yaml)?;
+        let cfg: Self = noyalib::from_str(yaml)?;
         cfg.validate()?;
         Ok(cfg)
     }
@@ -596,7 +596,7 @@ impl KeelConfig {
     /// Serializes this `KeelConfig` to YAML.
     pub fn to_yaml(&self) -> Result<String, CoreError> {
         self.validate()?;
-        Ok(serde_yml::to_string(self)?)
+        Ok(crate::yaml::to_string(self)?)
     }
 
     /// Validates `KeelConfig` fields.
@@ -774,7 +774,7 @@ impl ProviderRegistry {
 
     /// Parses and validates `providers/registry.yaml`.
     pub fn from_yaml(yaml: &str) -> Result<Self, CoreError> {
-        let reg: Self = serde_yml::from_str(yaml)?;
+        let reg: Self = noyalib::from_str(yaml)?;
         reg.validate()?;
         Ok(reg)
     }
@@ -782,7 +782,7 @@ impl ProviderRegistry {
     /// Serializes `ProviderRegistry` to YAML.
     pub fn to_yaml(&self) -> Result<String, CoreError> {
         self.validate()?;
-        Ok(serde_yml::to_string(self)?)
+        Ok(crate::yaml::to_string(self)?)
     }
 
     /// Validates registry schema and uniqueness of provider IDs.
@@ -2521,7 +2521,7 @@ mod tests {
         assert_eq!(full.issuer_url, "https://login.team-a.example/realms/a");
         assert_eq!(full.client_id, "team-a-keel");
         assert_eq!(full.scopes, default_oidc_scopes());
-        assert!(!serde_yml::to_string(&full).unwrap().contains("s3cr3t"));
+        assert!(!crate::yaml::to_string(&full).unwrap().contains("s3cr3t"));
 
         // Partial override merges field by field with the repository block.
         let merged = OidcConfig::with_env_overrides(
@@ -2800,11 +2800,11 @@ mod tests {
         assert_eq!(AppRuntime::Manifest.to_string(), "manifest");
         assert!(AppRuntime::from_str("docker-compose").is_err());
 
-        let h: AppRuntime = serde_yml::from_str("Helm").unwrap();
+        let h: AppRuntime = noyalib::from_str("Helm").unwrap();
         assert_eq!(h, AppRuntime::Helm);
-        let k: AppRuntime = serde_yml::from_str("kustomize").unwrap();
+        let k: AppRuntime = noyalib::from_str("kustomize").unwrap();
         assert_eq!(k, AppRuntime::Kustomize);
-        let m: AppRuntime = serde_yml::from_str("Manifest").unwrap();
+        let m: AppRuntime = noyalib::from_str("Manifest").unwrap();
         assert_eq!(m, AppRuntime::Manifest);
     }
 
@@ -2921,14 +2921,14 @@ mod tests {
         let mut crds = helm_app.clone();
         crds.spec.crd_policy = Some(HelmCrdPolicy::CreateReplace);
         assert!(crds.validate().is_ok());
-        let yaml = serde_yml::to_string(&crds).unwrap();
+        let yaml = crate::yaml::to_string(&crds).unwrap();
         assert!(yaml.contains("crdPolicy: CreateReplace"), "{yaml}");
         assert_eq!(
-            serde_yml::from_str::<CatalogApplication>(&yaml).unwrap(),
+            noyalib::from_str::<CatalogApplication>(&yaml).unwrap(),
             crds
         );
         assert!(
-            !serde_yml::to_string(&helm_app)
+            !crate::yaml::to_string(&helm_app)
                 .unwrap()
                 .contains("crdPolicy")
         );
@@ -2940,7 +2940,7 @@ mod tests {
             assert_eq!(policy.as_str(), flux);
             assert_eq!(policy.to_string(), flux);
         }
-        assert!(serde_yml::from_str::<HelmCrdPolicy>("replace").is_err());
+        assert!(noyalib::from_str::<HelmCrdPolicy>("replace").is_err());
     }
 
     #[test]

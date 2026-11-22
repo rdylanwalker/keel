@@ -171,7 +171,7 @@ spec:
     write(
         &workdir,
         "tenants/kustomization.yaml",
-        &serde_yml::to_string(&json!({
+        &keel_core::yaml::to_string(&json!({
             "apiVersion": "kustomize.config.k8s.io/v1beta1",
             "kind": "Kustomization",
             "resources": entries,
@@ -833,7 +833,7 @@ async fn infra_previews_clone_the_tenant_repository_at_the_pr_head() {
         &format!("{branch}:tenants/acme/infra/vm1/stack.yaml"),
     )
     .unwrap();
-    let stack: Value = serde_yml::from_str(&stack).unwrap();
+    let stack: Value = noyalib::from_str(&stack).unwrap();
     // PKO `gitSource` fields are inlined into `spec`.
     let git = &stack["spec"];
     assert_eq!(git["projectRepo"], tenant_url("acme"));

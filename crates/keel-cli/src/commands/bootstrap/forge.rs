@@ -99,7 +99,7 @@ pub(crate) fn render_forge_token_secret_yaml(token: &str) -> Result<String, CliE
         "type": "Opaque",
         "stringData": { "token": token },
     });
-    Ok(serde_yml::to_string(&secret_doc)?)
+    Ok(keel_core::yaml::to_string(&secret_doc)?)
 }
 
 /// Applies [`render_forge_token_secret_yaml`].
@@ -150,7 +150,7 @@ pub(crate) fn render_forgejo_admin_secret_yaml(password: &str) -> Result<String,
             "password": password,
         },
     });
-    Ok(serde_yml::to_string(&doc)?)
+    Ok(keel_core::yaml::to_string(&doc)?)
 }
 
 /// Tenant-reader bot credentials kept in `keel-system/keel-forgejo-tenant-reader`.
@@ -238,7 +238,7 @@ pub(crate) fn render_tenant_reader_secret_yaml(
         "type": "Opaque",
         "stringData": data,
     });
-    Ok(serde_yml::to_string(&doc)?)
+    Ok(keel_core::yaml::to_string(&doc)?)
 }
 
 /// Reads the bot credentials from their Secret (stable across re-runs), else generates them.
@@ -756,7 +756,7 @@ mod tests {
     fn forgejo_admin_secret_is_stored_in_keel_system() {
         let password = generate_admin_password();
         let yaml = render_forgejo_admin_secret_yaml(&password).unwrap();
-        let doc: Value = serde_yml::from_str(&yaml).unwrap();
+        let doc: Value = noyalib::from_str(&yaml).unwrap();
         assert_eq!(doc["metadata"]["namespace"], KEEL_SYSTEM_NAMESPACE);
         assert_eq!(doc["metadata"]["name"], FORGEJO_ADMIN_SECRET_NAME);
         assert_eq!(doc["stringData"]["username"], FORGEJO_ADMIN_USERNAME);
@@ -768,7 +768,7 @@ mod tests {
         let creds = TenantReaderCredentials::generate();
         assert!(!format!("{creds:?}").contains(creds.password.as_str()));
         let doc: Value =
-            serde_yml::from_str(&render_tenant_reader_secret_yaml(&creds).unwrap()).unwrap();
+            noyalib::from_str(&render_tenant_reader_secret_yaml(&creds).unwrap()).unwrap();
         assert_eq!(doc["metadata"]["namespace"], KEEL_SYSTEM_NAMESPACE);
         assert_eq!(doc["metadata"]["name"], TENANT_REPO_READER_SECRET_NAME);
         assert_eq!(
@@ -784,7 +784,7 @@ mod tests {
             ..creds
         };
         let doc: Value =
-            serde_yml::from_str(&render_tenant_reader_secret_yaml(&recorded).unwrap()).unwrap();
+            noyalib::from_str(&render_tenant_reader_secret_yaml(&recorded).unwrap()).unwrap();
         assert_eq!(doc["stringData"]["userId"], "7");
     }
 

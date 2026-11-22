@@ -9,6 +9,7 @@ pub mod catalog;
 pub mod crypto;
 pub mod management_addon;
 pub mod models;
+pub mod yaml;
 
 use thiserror::Error;
 
@@ -28,10 +29,9 @@ pub use catalog::{
     manifest_cluster_scoped_kinds, manifest_objects_outside_namespaces, parse_catalog,
     parse_catalog_application, parse_catalog_blueprint, parse_catalog_bundle,
     partition_values_by_schema, platform_reserved_hostnames, prepare_helm_values,
-    render_helm_values_yaml, render_manifest_template, replace_yaml_document,
-    resolve_helm_gateway_routes, route_hostname_matches, split_yaml_documents,
-    undeclared_value_paths, validate_k8s_manifests_yaml, validate_route_hostnames,
-    validate_schema_values, verify_rendered_manifest_structure, yaml_leading_comments,
+    render_helm_values_yaml, render_manifest_template, resolve_helm_gateway_routes,
+    route_hostname_matches, undeclared_value_paths, validate_k8s_manifests_yaml,
+    validate_route_hostnames, validate_schema_values, verify_rendered_manifest_structure,
 };
 pub use crypto::{
     AES_256_KEY_LEN, AES_GCM_NONCE_LEN, AES_GCM_TAG_LEN, AgeKeyPair, EnvelopeCrypto, SopsConfig,
@@ -59,6 +59,9 @@ pub use models::{
     ProgressiveDeliverySpec, ProviderEntry, ProviderRegistry, StackSshInfoResponse, UpstreamSource,
     clean_candidate_ssh_host, clean_candidate_ssh_user, default_ssh_user_for_provider,
     is_private_or_internal_ssh_host, resolve_ssh_target_from_sources, validate_https_origin,
+};
+pub use yaml::{
+    replace_yaml_document, split_yaml_documents, to_yaml_documents, yaml_leading_comments,
 };
 
 /// Flux CD controllers namespace (`SDD.md` §1).
@@ -106,7 +109,7 @@ pub enum CoreError {
     Serialization(#[from] serde_json::Error),
 
     #[error("YAML error: {0}")]
-    Yaml(#[from] serde_yml::Error),
+    Yaml(#[from] noyalib::Error),
 
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),

@@ -14,6 +14,7 @@ use crate::models::{
     CATALOG_INFRA_BLUEPRINT_KIND, CatalogApplication, CatalogBundle, CatalogInfraBlueprint,
     CatalogManifest, HelmGatewayRouteSpec,
 };
+use crate::yaml::split_yaml_documents;
 
 /// Structured JSON Schema validation error tied to a specific instance field path.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -71,7 +72,7 @@ struct CatalogHeader {
 
 /// Parses a `catalog.yaml` document into either a `CatalogApplication` or `CatalogInfraBlueprint`.
 pub fn parse_catalog(yaml: &str) -> Result<CatalogManifest, CoreError> {
-    let header: CatalogHeader = serde_yml::from_str(yaml)?;
+    let header: CatalogHeader = noyalib::from_str(yaml)?;
     if header.api_version != CATALOG_API_VERSION {
         return Err(CoreError::Validation(format!(
             "Unsupported catalog apiVersion '{}', expected '{}'",
@@ -101,7 +102,7 @@ pub fn parse_catalog(yaml: &str) -> Result<CatalogManifest, CoreError> {
 
 /// Parses and validates a `CatalogApplication` from YAML, including compiling `spec.schema`.
 pub fn parse_catalog_application(yaml: &str) -> Result<CatalogApplication, CoreError> {
-    let app: CatalogApplication = serde_yml::from_str(yaml)?;
+    let app: CatalogApplication = noyalib::from_str(yaml)?;
     app.validate()?;
     compile_schema(&app.spec.schema)?;
     Ok(app)
@@ -109,7 +110,7 @@ pub fn parse_catalog_application(yaml: &str) -> Result<CatalogApplication, CoreE
 
 /// Parses and validates a `CatalogInfraBlueprint` from YAML, including compiling `spec.schema`.
 pub fn parse_catalog_blueprint(yaml: &str) -> Result<CatalogInfraBlueprint, CoreError> {
-    let bp: CatalogInfraBlueprint = serde_yml::from_str(yaml)?;
+    let bp: CatalogInfraBlueprint = noyalib::from_str(yaml)?;
     bp.validate()?;
     compile_schema(&bp.spec.schema)?;
     Ok(bp)
@@ -117,7 +118,7 @@ pub fn parse_catalog_blueprint(yaml: &str) -> Result<CatalogInfraBlueprint, Core
 
 /// Parses and validates a `CatalogBundle` from YAML, including compiling `spec.schema` and DAG checks.
 pub fn parse_catalog_bundle(yaml: &str) -> Result<CatalogBundle, CoreError> {
-    let bundle: CatalogBundle = serde_yml::from_str(yaml)?;
+    let bundle: CatalogBundle = noyalib::from_str(yaml)?;
     bundle.validate()?;
     compile_schema(&bundle.spec.schema)?;
     Ok(bundle)
@@ -387,14 +388,14 @@ fn split_node(schema: Option<&Value>, value: &Value) -> (Option<Value>, Option<V
     }
 }
 
-/// Renders an unmodified upstream Helm `values.yaml` string directly from a JSON value (`serde_yml::to_string`).
+/// Renders an unmodified upstream Helm `values.yaml` string directly from a JSON value (`crate::yaml::to_string`).
 pub fn render_helm_values_yaml(values: &Value) -> Result<String, CoreError> {
     if !values.is_object() {
         return Err(CoreError::Validation(
             "Helm values root must be a JSON/YAML mapping object".to_string(),
         ));
     }
-    Ok(serde_yml::to_string(values)?)
+    Ok(crate::yaml::to_string(values)?)
 }
 
 /// Validates form input against `app.spec.schema`, partitions secret vs. normal fields,
@@ -408,7 +409,7 @@ pub fn prepare_helm_values(
     let values_yaml = render_helm_values_yaml(&partitioned.normal_values)?;
 
     let plaintext_secrets_yaml = match partitioned.secret_values.as_object() {
-        Some(map) if !map.is_empty() => Some(serde_yml::to_string(&partitioned.secret_values)?),
+        Some(map) if !map.is_empty() => Some(crate::yaml::to_string(&partitioned.secret_values)?),
         _ => None,
     };
 
@@ -430,87 +431,6 @@ fn is_valid_manifest_var_name(name: &str) -> bool {
     chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-/// Splits single or multi-document YAML on lines matching `---` or `...`,
-/// returning all non-empty document strings.
-pub fn split_yaml_documents(raw_yaml: &str) -> Vec<String> {
-    let mut raw_docs = Vec::new();
-    let mut current = String::new();
-    for line in raw_yaml.lines() {
-        let trimmed = line.trim();
-        if trimmed == "---" || trimmed == "..." {
-            if !current.trim().is_empty() {
-                raw_docs.push(std::mem::take(&mut current));
-            }
-        } else {
-            current.push_str(line);
-            current.push('\n');
-        }
-    }
-    if !current.trim().is_empty() {
-        raw_docs.push(current);
-    }
-    raw_docs
-}
-
-fn is_yaml_document_separator(line: &str) -> bool {
-    let trimmed = line.trim();
-    trimmed == "---" || trimmed == "..."
-}
-
-/// Replaces the `index`-th non-empty document (same numbering as [`split_yaml_documents`]) with
-/// `replacement`, preserving every other document, separator line, and line ending verbatim.
-/// Returns `None` when `index` is out of range.
-pub fn replace_yaml_document(raw_yaml: &str, index: usize, replacement: &str) -> Option<String> {
-    let mut out = String::with_capacity(raw_yaml.len() + replacement.len());
-    let mut current = String::new();
-    let mut doc_index = 0usize;
-    let mut replaced = false;
-
-    let mut flush = |current: &mut String, out: &mut String| {
-        if current.trim().is_empty() {
-            out.push_str(current);
-        } else {
-            if doc_index == index {
-                out.push_str(replacement);
-                if !replacement.is_empty() && !replacement.ends_with('\n') {
-                    out.push('\n');
-                }
-                replaced = true;
-            } else {
-                out.push_str(current);
-            }
-            doc_index += 1;
-        }
-        current.clear();
-    };
-
-    for line in raw_yaml.split_inclusive('\n') {
-        if is_yaml_document_separator(line) {
-            flush(&mut current, &mut out);
-            out.push_str(line);
-        } else {
-            current.push_str(line);
-        }
-    }
-    flush(&mut current, &mut out);
-    replaced.then_some(out)
-}
-
-/// Returns the leading block of blank and `#` comment lines of a YAML document (verbatim), so
-/// callers that re-serialize a document can keep its header comments.
-pub fn yaml_leading_comments(doc: &str) -> &str {
-    let mut end = 0usize;
-    for line in doc.split_inclusive('\n') {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            end += line.len();
-        } else {
-            break;
-        }
-    }
-    &doc[..end]
-}
-
 /// Parses single or multi-document Kubernetes YAML, ensuring at least one non-empty document exists
 /// and every non-null document is a mapping with non-empty string `apiVersion`, `kind`, and `metadata.name`.
 pub fn validate_k8s_manifests_yaml(raw_yaml: &str) -> Result<Vec<Value>, CoreError> {
@@ -524,7 +444,7 @@ pub fn validate_k8s_manifests_yaml(raw_yaml: &str) -> Result<Vec<Value>, CoreErr
 
     let mut docs = Vec::new();
     for (idx, doc_str) in raw_docs.into_iter().enumerate() {
-        let doc: Value = serde_yml::from_str(&doc_str)?;
+        let doc: Value = noyalib::from_str(&doc_str)?;
         if doc.is_null() {
             continue;
         }
@@ -622,7 +542,7 @@ pub const CLUSTER_SCOPED_KINDS: &[&str] = &[
 pub fn manifest_cluster_scoped_kinds(raw_yaml: &str) -> Vec<String> {
     let mut kinds: Vec<String> = Vec::new();
     for doc_str in split_yaml_documents(raw_yaml) {
-        let Ok(doc) = serde_yml::from_str::<Value>(&doc_str) else {
+        let Ok(doc) = noyalib::from_str::<Value>(&doc_str) else {
             continue;
         };
         let Some(kind) = doc.get("kind").and_then(Value::as_str).map(str::trim) else {
@@ -642,7 +562,7 @@ pub fn manifest_cluster_scoped_kinds(raw_yaml: &str) -> Vec<String> {
 pub fn manifest_objects_outside_namespaces(raw_yaml: &str, allowed: &[String]) -> Vec<String> {
     let mut offenders = Vec::new();
     for doc_str in split_yaml_documents(raw_yaml) {
-        let Ok(doc) = serde_yml::from_str::<Value>(&doc_str) else {
+        let Ok(doc) = noyalib::from_str::<Value>(&doc_str) else {
             continue;
         };
         let Some(kind) = doc.get("kind").and_then(Value::as_str).map(str::trim) else {
@@ -860,7 +780,7 @@ pub fn verify_rendered_manifest_structure(
     })?;
     let template_docs: Vec<Value> = split_yaml_documents(template_yaml)
         .iter()
-        .map(|d| serde_yml::from_str::<Value>(d))
+        .map(|d| noyalib::from_str::<Value>(d))
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| CoreError::Validation(format!("Manifest template is not valid YAML: {e}")))?
         .into_iter()
@@ -1716,7 +1636,7 @@ spec:
             app.ensure_placement_allows(Some("workload-kubeconfig"))
                 .is_ok()
         );
-        let round_trip = serde_yml::to_string(&app).unwrap();
+        let round_trip = crate::yaml::to_string(&app).unwrap();
         assert!(!round_trip.contains("placement"));
 
         let with_scope = |scope: &str| {
@@ -1744,7 +1664,7 @@ spec:
                 .is_ok()
         );
         assert!(
-            serde_yml::to_string(&cluster)
+            crate::yaml::to_string(&cluster)
                 .unwrap()
                 .contains("scope: cluster")
         );
@@ -1880,7 +1800,7 @@ metadata:
             Some("flux-system")
         );
         assert!(
-            serde_yml::to_string(&dedicated)
+            crate::yaml::to_string(&dedicated)
                 .unwrap()
                 .contains("namespace: flux-system")
         );
@@ -1932,7 +1852,7 @@ metadata:
             vec!["keel-system", "keel-previews", "flux-system"]
         );
         assert!(
-            serde_yml::to_string(&app)
+            crate::yaml::to_string(&app)
                 .unwrap()
                 .contains("additionalNamespaces:")
         );
@@ -1944,7 +1864,7 @@ metadata:
         .unwrap();
         assert!(single.multi_namespace_placement().is_empty());
         assert!(
-            !serde_yml::to_string(&single)
+            !crate::yaml::to_string(&single)
                 .unwrap()
                 .contains("additionalNamespaces")
         );
@@ -2273,7 +2193,7 @@ spec:
             let pulumi_yaml =
                 std::fs::read_to_string(&pulumi_yaml_path).expect("Failed to read Pulumi.yaml");
 
-            let parsed_pulumi: serde_yml::Value = serde_yml::from_str(&pulumi_yaml).unwrap();
+            let parsed_pulumi: noyalib::Value = noyalib::from_str(&pulumi_yaml).unwrap();
             assert!(parsed_pulumi.is_mapping());
 
             if expects_kubeconfig_secret {
@@ -2316,44 +2236,11 @@ spec:
             }
 
             // Test protected/tenant serialization round-trips
-            let roundtrip: String = serde_yml::to_string(&bp).unwrap();
+            let roundtrip: String = crate::yaml::to_string(&bp).unwrap();
             let parsed2 = parse_catalog_blueprint(&roundtrip).unwrap();
             assert_eq!(bp.metadata.protected, parsed2.metadata.protected);
             assert_eq!(bp.metadata.tenant, parsed2.metadata.tenant);
         }
-    }
-
-    #[test]
-    fn replace_yaml_document_preserves_other_documents_verbatim() {
-        let raw =
-            "# header\napiVersion: v1\nkind: A # keep\n---\n\n# b comment\nkind: B\n---\nkind: C\n";
-        assert_eq!(split_yaml_documents(raw).len(), 3);
-        let out = replace_yaml_document(raw, 1, "kind: B2").unwrap();
-        assert_eq!(
-            out,
-            "# header\napiVersion: v1\nkind: A # keep\n---\nkind: B2\n---\nkind: C\n"
-        );
-        let out = replace_yaml_document(raw, 2, "kind: C2\n").unwrap();
-        assert!(out.starts_with(
-            "# header\napiVersion: v1\nkind: A # keep\n---\n\n# b comment\nkind: B\n---\n"
-        ));
-        assert!(out.ends_with("kind: C2\n"));
-        assert!(replace_yaml_document(raw, 3, "x").is_none());
-        // Leading separator and CRLF line endings are kept.
-        let crlf = "---\r\nkind: A\r\n---\r\nkind: B\r\n";
-        assert_eq!(
-            replace_yaml_document(crlf, 0, "kind: Z\n").unwrap(),
-            "---\r\nkind: Z\n---\r\nkind: B\r\n"
-        );
-    }
-
-    #[test]
-    fn yaml_leading_comments_returns_header_block() {
-        assert_eq!(
-            yaml_leading_comments("\n# a\n  # b\napiVersion: v1\n# c\n"),
-            "\n# a\n  # b\n"
-        );
-        assert_eq!(yaml_leading_comments("kind: A\n"), "");
     }
 
     fn image_app(runtime: &str, upstream: &str) -> String {
@@ -2376,11 +2263,15 @@ spec:
         assert_eq!(app.spec.upstream.version.as_deref(), Some("0.37.2"));
         assert!(app.spec.upstream.repo_url.is_empty());
         // Round-trips under the `image` key and omits it when unset.
-        let yaml = serde_yml::to_string(&app).unwrap();
+        let yaml = crate::yaml::to_string(&app).unwrap();
         assert!(yaml.contains("image: ghcr.io/sebadob/rauthy"));
         let authentik = parse_catalog_application(AUTHENTIK_CATALOG_YAML).unwrap();
         assert!(authentik.spec.upstream.image.is_none());
-        assert!(!serde_yml::to_string(&authentik).unwrap().contains("image:"));
+        assert!(
+            !crate::yaml::to_string(&authentik)
+                .unwrap()
+                .contains("image:")
+        );
     }
 
     #[test]
@@ -2769,12 +2660,12 @@ spec:
             fragments.keys().collect::<Vec<_>>(),
             vec!["gitea.admin.password", "gitea.oauth"]
         );
-        let admin: Value = serde_yml::from_str(&fragments["gitea.admin.password"]).unwrap();
+        let admin: Value = noyalib::from_str(&fragments["gitea.admin.password"]).unwrap();
         assert_eq!(
             admin,
             json!({ "gitea": { "admin": { "password": "p,a=s{s}\"'1" } } })
         );
-        let oauth: Value = serde_yml::from_str(&fragments["gitea.oauth"]).unwrap();
+        let oauth: Value = noyalib::from_str(&fragments["gitea.oauth"]).unwrap();
         assert_eq!(oauth["gitea"]["oauth"][0]["secret"], "s3cr3t");
         assert!(partitioned.normal_values["gitea"].get("oauth").is_none());
 

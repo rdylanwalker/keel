@@ -270,7 +270,7 @@ fn parse_documents(raw: &str) -> impl Iterator<Item = (usize, String, Value)> + 
         .into_iter()
         .enumerate()
         .filter_map(|(idx, text)| {
-            let val = serde_yml::from_str::<Value>(&text).ok()?;
+            let val = noyalib::from_str::<Value>(&text).ok()?;
             Some((idx, text, val))
         })
 }
@@ -1150,7 +1150,7 @@ spec:
         assert_eq!(after[1], before[1], "ClusterIssuer must be untouched");
         assert_eq!(after[2], before[2], "Certificate must be untouched");
         assert!(after[0].starts_with("# cert-manager core add-on"));
-        let hr: Value = serde_yml::from_str(&after[0]).unwrap();
+        let hr: Value = noyalib::from_str(&after[0]).unwrap();
         assert_eq!(hr.pointer("/spec/chart/spec/version").unwrap(), "1.19.1");
         assert_eq!(hr.pointer("/spec/values/crds/enabled").unwrap(), true);
         assert_eq!(hr.pointer("/spec/values/prometheus/enabled").unwrap(), true);
@@ -1174,7 +1174,7 @@ spec:
         assert_eq!(after[0], before[0]);
         // The ServiceAccount sharing the add-on's name is not the add-on.
         assert_eq!(after[1], before[1]);
-        let hr: Value = serde_yml::from_str(&after[2]).unwrap();
+        let hr: Value = noyalib::from_str(&after[2]).unwrap();
         assert_eq!(hr["kind"], "HelmRelease");
         assert_eq!(hr.pointer("/spec/chart/spec/version").unwrap(), "2.4.0");
         assert_eq!(
@@ -1282,7 +1282,7 @@ spec:
             after[0], before[0],
             "Service named like the add-on is untouched"
         );
-        let ks: Value = serde_yml::from_str(&after[1]).unwrap();
+        let ks: Value = noyalib::from_str(&after[1]).unwrap();
         assert_eq!(ks["kind"], "Kustomization");
         assert_eq!(ks.pointer("/spec/images/0/newTag").unwrap(), "0.38.0");
         assert_eq!(
@@ -1406,7 +1406,7 @@ spec:
         .unwrap();
         let raw = read_on_branch(&state, &workdir, &resp.branch, "cert-manager.yaml").await;
         let docs = keel_core::split_yaml_documents(&raw);
-        let hr: Value = serde_yml::from_str(&docs[0]).unwrap();
+        let hr: Value = noyalib::from_str(&docs[0]).unwrap();
         assert_eq!(hr.pointer("/spec/chart/spec/version").unwrap(), "1.18.2");
         assert_eq!(
             hr.pointer("/metadata/labels/keel.io~1protect").unwrap(),
@@ -1492,7 +1492,7 @@ spec:
         .await
         .unwrap();
         let upgraded = read_on_branch(&state, &workdir, &resp.branch, "flux2.yaml").await;
-        let doc: Value = serde_yml::from_str(&upgraded).unwrap();
+        let doc: Value = noyalib::from_str(&upgraded).unwrap();
         assert_eq!(doc.pointer("/spec/chart/spec/version").unwrap(), "2.21.0");
         assert_eq!(doc.pointer("/spec/values/logLevel").unwrap(), "debug");
         assert_eq!(
@@ -1627,9 +1627,9 @@ spec:
             after[2], before[2],
             "HTTPRoute must be written back verbatim"
         );
-        let repo: Value = serde_yml::from_str(after[0]).unwrap();
+        let repo: Value = noyalib::from_str(after[0]).unwrap();
         assert_eq!(repo["kind"], "HelmRepository");
-        let hr: Value = serde_yml::from_str(after[1]).unwrap();
+        let hr: Value = noyalib::from_str(after[1]).unwrap();
         assert_eq!(hr["kind"], "HelmRelease");
         assert_eq!(hr.pointer("/spec/chart/spec/version").unwrap(), "17.4.0");
         assert_eq!(
@@ -1649,7 +1649,7 @@ spec:
         .unwrap();
         let restored = read_on_branch(&state, &workdir, &resp.branch, "forgejo.yaml").await;
         assert_eq!(restored, seed);
-        let hr: Value = serde_yml::from_str(yaml_chunks(&restored)[1]).unwrap();
+        let hr: Value = noyalib::from_str(yaml_chunks(&restored)[1]).unwrap();
         assert_eq!(
             hr.pointer("/metadata/labels/keel.io~1protect").unwrap(),
             "true"

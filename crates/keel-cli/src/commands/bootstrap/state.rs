@@ -378,7 +378,7 @@ pub(crate) async fn store_passphrase_secret(
         "type": "Opaque",
         "stringData": { "passphrase": ctx.passphrase.expose() },
     });
-    target.apply(&serde_yml::to_string(&doc)?).await
+    target.apply(&keel_core::yaml::to_string(&doc)?).await
 }
 
 /// Ensures the Pulumi state passphrase Secret (`<namespace>/keel-pulumi-passphrase`, key

@@ -160,12 +160,12 @@ impl FluxGitRepository {
 
     /// Serializes this `GitRepository` CR to a YAML manifest string.
     pub fn to_yaml(&self) -> Result<String, PkoError> {
-        Ok(serde_yml::to_string(self)?)
+        Ok(keel_core::yaml::to_string(self)?)
     }
 
     /// Deserializes a `GitRepository` CR from a YAML manifest string.
     pub fn from_yaml(yaml: &str) -> Result<Self, PkoError> {
-        Ok(serde_yml::from_str(yaml)?)
+        Ok(noyalib::from_str(yaml)?)
     }
 }
 
@@ -1188,13 +1188,13 @@ impl PkoStack {
 
     /// Serializes this `Stack` CR to a YAML manifest string.
     pub fn to_yaml(&self) -> Result<String, PkoError> {
-        Ok(serde_yml::to_string(self)?)
+        Ok(keel_core::yaml::to_string(self)?)
     }
 
     /// Deserializes a `Stack` CR from a YAML manifest string (same Git source checks as
     /// [`PkoStack::from_json_value`]).
     pub fn from_yaml(yaml: &str) -> Result<Self, PkoError> {
-        let value: serde_json::Value = serde_yml::from_str(yaml)?;
+        let value: serde_json::Value = noyalib::from_str(yaml)?;
         Self::from_json_value(value)
     }
 
@@ -2081,7 +2081,7 @@ pub fn synthesize_k8s_manifest_pulumi_yaml(
         }),
     );
 
-    let yaml = serde_yml::to_string(&serde_json::Value::Object(doc))?;
+    let yaml = keel_core::yaml::to_string(&serde_json::Value::Object(doc))?;
     Ok(ensure_trailing_newline(&yaml))
 }
 
@@ -2527,7 +2527,7 @@ mod tests {
         let yaml =
             synthesize_k8s_manifest_pulumi_yaml("demo-manifest", raw_manifests, &props, false)
                 .expect("should synthesize Pulumi.yaml");
-        let parsed: serde_json::Value = serde_yml::from_str(&yaml).unwrap();
+        let parsed: serde_json::Value = noyalib::from_str(&yaml).unwrap();
         assert_eq!(parsed["name"], "demo-manifest");
         assert_eq!(parsed["runtime"], "yaml");
         assert_eq!(parsed["configuration"]["replicas"]["type"], "string");
@@ -2545,7 +2545,7 @@ mod tests {
         let yaml_remote =
             synthesize_k8s_manifest_pulumi_yaml("demo-manifest", raw_manifests, &props, true)
                 .expect("should synthesize remote Pulumi.yaml");
-        let parsed_remote: serde_json::Value = serde_yml::from_str(&yaml_remote).unwrap();
+        let parsed_remote: serde_json::Value = noyalib::from_str(&yaml_remote).unwrap();
         assert_eq!(
             parsed_remote["resources"]["targetCluster"]["type"],
             "pulumi:providers:kubernetes"
@@ -3332,7 +3332,7 @@ mod tests {
         assert_eq!(stack.spec.git_source.as_ref(), Some(&source));
         let yaml = stack.to_yaml().unwrap();
         assert!(!yaml.contains("fluxSource"));
-        let doc: serde_json::Value = serde_yml::from_str(&yaml).unwrap();
+        let doc: serde_json::Value = noyalib::from_str(&yaml).unwrap();
         assert_eq!(
             doc["spec"]["projectRepo"],
             "https://forgejo.keel.local:8888/keel/infra-gitops.git"

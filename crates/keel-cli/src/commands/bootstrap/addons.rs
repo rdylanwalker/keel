@@ -163,7 +163,7 @@ async fn ensure_keel_ca_bundle(target: KubeTarget<'_>) {
         let namespace = namespace.as_str();
         let applied = keel_kube::build_keel_ca_bundle_configmap(namespace, &ca)
             .map_err(CliError::from)
-            .and_then(|doc| serde_yml::to_string(&doc).map_err(CliError::from));
+            .and_then(|doc| keel_core::yaml::to_string(&doc).map_err(CliError::from));
         let result = match applied {
             Ok(yaml) => target.apply(&yaml).await,
             Err(e) => Err(e),
@@ -278,7 +278,7 @@ async fn configure_coredns_local_rewrites(target: KubeTarget<'_>, hosts: &[&str]
         "metadata": { "name": "coredns", "namespace": "kube-system" },
         "data": { "Corefile": updated },
     });
-    let applied = match serde_yml::to_string(&cm) {
+    let applied = match keel_core::yaml::to_string(&cm) {
         Ok(yaml) => target.apply(&yaml).await,
         Err(e) => Err(e.into()),
     };
@@ -595,7 +595,7 @@ mod tests {
     fn docs(yaml: &str) -> Vec<Value> {
         yaml.split("\n---\n")
             .filter(|d| !d.trim().is_empty())
-            .map(|d| serde_yml::from_str::<Value>(d).unwrap())
+            .map(|d| noyalib::from_str::<Value>(d).unwrap())
             .collect()
     }
 

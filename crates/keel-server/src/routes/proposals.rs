@@ -22,7 +22,7 @@ use keel_kube::{
     HelmValuesSecretRef, RemoteKubeConfigRef, TenantAgeKey,
     synthesize_canary_gateway_network_policy_yaml, synthesize_flagger_canary_yaml,
     synthesize_flux_kustomization_yaml, synthesize_helm_release_yaml,
-    synthesize_remote_target_namespace_yaml,
+    synthesize_remote_target_namespace, synthesize_remote_target_namespace_yaml,
 };
 use keel_pko::{
     ChangeOp, EphemeralPreviewParams, GcPlan, PkoGitAuth, PkoGitSource, PkoStack, PreviewReport,
@@ -381,7 +381,7 @@ async fn read_pulumi_project_name(
 
 fn pulumi_project_name_from_yaml(raw: Option<&str>, fallback: &str) -> String {
     let declared = raw
-        .and_then(|r| serde_yml::from_str::<serde_json::Value>(r).ok())
+        .and_then(|r| noyalib::from_str::<serde_json::Value>(r).ok())
         .and_then(|doc| {
             doc.get("name")
                 .and_then(|v| v.as_str())
@@ -824,7 +824,7 @@ fn build_infra_secret_manifest_yaml(
         "type": "Opaque",
         "stringData": string_data,
     });
-    let yaml = serde_yml::to_string(&secret_doc)
+    let yaml = keel_core::yaml::to_string(&secret_doc)
         .map_err(|e| ServerError::Internal(format!("failed to serialize secret manifest: {e}")))?;
     Ok((yaml, keys))
 }
@@ -863,13 +863,13 @@ fn build_values_configmap_manifest_yaml(
         },
         "data": data_map,
     });
-    serde_yml::to_string(&cm_doc)
+    keel_core::yaml::to_string(&cm_doc)
         .map_err(|e| ServerError::Internal(format!("failed to serialize values ConfigMap: {e}")))
 }
 
 /// Serializes a `kustomize.config.k8s.io/v1beta1` `kustomization.yaml` listing `resources`.
 fn kustomize_resources_yaml(resources: &[&str]) -> Result<String, ServerError> {
-    serde_yml::to_string(&json!({
+    keel_core::yaml::to_string(&json!({
         "apiVersion": "kustomize.config.k8s.io/v1beta1",
         "kind": "Kustomization",
         "resources": resources,
@@ -973,16 +973,12 @@ fn build_flux_manifest_app_files(
         Vec::new()
     };
     if !remote_namespaces.is_empty() {
-        let mut namespace_yaml = String::new();
-        for ns in &remote_namespaces {
-            if !namespace_yaml.is_empty() {
-                namespace_yaml.push_str("---\n");
-            }
-            namespace_yaml.push_str(&synthesize_remote_target_namespace_yaml(input.tenant, ns)?);
-            if !namespace_yaml.ends_with('\n') {
-                namespace_yaml.push('\n');
-            }
-        }
+        let namespaces = remote_namespaces
+            .iter()
+            .map(|ns| synthesize_remote_target_namespace(input.tenant, ns))
+            .collect::<Result<Vec<_>, _>>()?;
+        let namespace_yaml =
+            keel_core::to_yaml_documents(namespaces).map_err(keel_core::CoreError::from)?;
         files.push(("namespace.yaml".to_string(), namespace_yaml));
         app_resources.push("namespace.yaml");
     }
@@ -1277,7 +1273,7 @@ async fn ensure_flux_kustomization_names_unclaimed(
             let Ok(raw) = tokio::fs::read_to_string(&path).await else {
                 continue;
             };
-            let Ok(doc) = serde_yml::from_str::<Value>(&raw) else {
+            let Ok(doc) = noyalib::from_str::<Value>(&raw) else {
                 continue;
             };
             let is_flux_kustomization = doc.get("kind").and_then(Value::as_str)
@@ -1343,7 +1339,7 @@ async fn ensure_cluster_scoped_manifest_app_not_installed(
             let Ok(raw) = tokio::fs::read_to_string(&path).await else {
                 continue;
             };
-            let Ok(doc) = serde_yml::from_str::<Value>(&raw) else {
+            let Ok(doc) = noyalib::from_str::<Value>(&raw) else {
                 continue;
             };
             let same_app = doc
@@ -1396,7 +1392,7 @@ async fn read_stored_manifest_app_secret(
         dir.join(HELM_APP_SECRETS_FILE)
     };
     let ciphertext = read_contained_to_string(repo_workdir, &path).await.ok()?;
-    let doc = serde_yml::from_str::<Value>(&ciphertext).ok()?;
+    let doc = noyalib::from_str::<Value>(&ciphertext).ok()?;
     if doc.get("sops").is_none() || doc.get("kind").and_then(Value::as_str) != Some("Secret") {
         return None;
     }
@@ -1552,7 +1548,7 @@ async fn decrypt_stored_secret_string_data(
             tracing::warn!(tenant = %tenant, error = %err, "Could not decrypt stored manifest app secret");
             reenter()
         })?;
-    let doc: Value = serde_yml::from_str(&plain).map_err(|_| reenter())?;
+    let doc: Value = noyalib::from_str(&plain).map_err(|_| reenter())?;
     let mut out = std::collections::BTreeMap::new();
     if let Some(data) = doc.get("data").and_then(Value::as_object) {
         for (key, val) in data {
@@ -1747,7 +1743,7 @@ async fn ensure_route_hostnames_unclaimed_by_other_tenants(
 fn claimed_route_hostnames(file_name: &str, contents: &str) -> Vec<String> {
     if file_name == "helmrelease.yaml" || file_name == "helmrelease-canary.yaml" {
         // Helm apps record the hostnames their chart routes (`spec.gatewayRoutes`).
-        return serde_yml::from_str::<Value>(contents)
+        return noyalib::from_str::<Value>(contents)
             .ok()
             .and_then(|doc| {
                 doc.pointer("/metadata/annotations")
@@ -1909,7 +1905,7 @@ async fn ensure_helm_values_within_catalog(
     if !app.spec.immutable_values.is_empty() {
         let committed_path = input.repo.workdir.join(input.app_dir).join("values.yaml");
         if let Ok(raw) = tokio::fs::read_to_string(&committed_path).await {
-            let committed: Value = serde_yml::from_str(&raw).unwrap_or(Value::Null);
+            let committed: Value = noyalib::from_str(&raw).unwrap_or(Value::Null);
             let changed = keel_core::changed_immutable_values(
                 &app.spec.immutable_values,
                 &committed,
@@ -2042,7 +2038,7 @@ async fn read_flux_depends_on(repo_workdir: &Path, rel_path: &str) -> Vec<FluxDe
     let Ok(raw) = read_contained_to_string(repo_workdir, &repo_workdir.join(rel_path)).await else {
         return Vec::new();
     };
-    let Ok(doc) = serde_yml::from_str::<Value>(&raw) else {
+    let Ok(doc) = noyalib::from_str::<Value>(&raw) else {
         return Vec::new();
     };
     let own_config = doc
@@ -2651,7 +2647,7 @@ pub async fn create_proposal(
                     };
                 if let Some(hr_path) = existing_hr_path
                     && let Ok(raw) = read_contained_to_string(&repo.workdir, &hr_path).await
-                    && let Ok(doc) = serde_yml::from_str::<Value>(&raw)
+                    && let Ok(doc) = noyalib::from_str::<Value>(&raw)
                 {
                     if let Some(deps) = doc.pointer("/spec/dependsOn").and_then(Value::as_array) {
                         for dep in deps {
@@ -2815,7 +2811,7 @@ pub async fn create_proposal(
                     &repo.workdir.join(&rel_dir).join("stack.yaml"),
                 )
                 .await
-                && let Ok(doc) = serde_yml::from_str::<Value>(&raw)
+                && let Ok(doc) = noyalib::from_str::<Value>(&raw)
             {
                 if let Some(secret_name) = doc
                     .pointer("/spec/config/kubeconfigSecretName")
@@ -3000,7 +2996,7 @@ pub async fn create_proposal(
                     write_contained(
                         workdir,
                         &target_dir.join("kustomization.yaml"),
-                        serde_yml::to_string(&app_k_doc).map_err(|e| {
+                        keel_core::yaml::to_string(&app_k_doc).map_err(|e| {
                             ServerError::Internal(format!(
                                 "failed to serialize kustomization.yaml: {e}"
                             ))
@@ -3059,7 +3055,7 @@ pub async fn create_proposal(
                     },
                     "spec": repo_spec,
                 });
-                let helm_repo_yaml = serde_yml::to_string(&helm_repo_doc).map_err(|e| {
+                let helm_repo_yaml = keel_core::yaml::to_string(&helm_repo_doc).map_err(|e| {
                     ServerError::Internal(format!("failed to serialize helm-repository.yaml: {e}"))
                 })?;
                 let helm_repo_path = target_dir.join("helm-repository.yaml");
@@ -3224,7 +3220,7 @@ pub async fn create_proposal(
                 write_contained(
                     workdir,
                     &target_dir.join("kustomization.yaml"),
-                    serde_yml::to_string(&json!({
+                    keel_core::yaml::to_string(&json!({
                         "apiVersion": "kustomize.config.k8s.io/v1beta1",
                         "kind": "Kustomization",
                         "resources": bundle_item_kustomize_resources,
@@ -4214,11 +4210,12 @@ async fn create_bundle_proposal(
                             },
                             "spec": repo_spec,
                         });
-                        let helm_repo_yaml = serde_yml::to_string(&helm_repo_doc).map_err(|e| {
-                            ServerError::Internal(format!(
-                                "failed to serialize helm-repository.yaml: {e}"
-                            ))
-                        })?;
+                        let helm_repo_yaml =
+                            keel_core::yaml::to_string(&helm_repo_doc).map_err(|e| {
+                                ServerError::Internal(format!(
+                                    "failed to serialize helm-repository.yaml: {e}"
+                                ))
+                            })?;
                         extras.push(("helm-repository.yaml".to_string(), helm_repo_yaml));
                         item_k_res.push("helm-repository.yaml".to_string());
                     }
@@ -4290,7 +4287,7 @@ async fn create_bundle_proposal(
                     });
                     extras.push((
                         "kustomization.yaml".to_string(),
-                        serde_yml::to_string(&item_k_doc).map_err(|e| {
+                        keel_core::yaml::to_string(&item_k_doc).map_err(|e| {
                             ServerError::Internal(format!(
                                 "failed to serialize kustomization.yaml: {e}"
                             ))
@@ -4453,7 +4450,7 @@ async fn create_bundle_proposal(
                     ("Pulumi.yaml".to_string(), pulumi_yaml),
                     (
                         "kustomization.yaml".to_string(),
-                        serde_yml::to_string(&item_k_doc).map_err(|e| {
+                        keel_core::yaml::to_string(&item_k_doc).map_err(|e| {
                             ServerError::Internal(format!(
                                 "failed to serialize kustomization.yaml: {e}"
                             ))
@@ -5663,7 +5660,7 @@ fn deleted_stack_manifest_paths(deleted_files: &[String]) -> Vec<(String, String
 /// requiring `kind: Stack` and a namespace equal to the owning tenant's namespace.
 fn parse_deleted_stack_manifest(tenant: &str, raw_yaml: &str) -> Option<StackDeletion> {
     let expected_ns = tenant_namespace(tenant).ok()?;
-    let doc: Value = serde_yml::from_str(raw_yaml).ok()?;
+    let doc: Value = noyalib::from_str(raw_yaml).ok()?;
     if doc.get("kind").and_then(Value::as_str) != Some("Stack") {
         return None;
     }

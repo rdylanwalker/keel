@@ -564,16 +564,7 @@ impl TenantManifestBundle {
 
     /// Serializes all tenant isolation manifests into a multi-document YAML string (`---` separated).
     pub fn to_multi_doc_yaml(&self) -> Result<String, KubeError> {
-        let docs = self.to_json_values()?;
-        let mut rendered = Vec::with_capacity(docs.len());
-        for doc in docs {
-            let mut s = serde_yml::to_string(&doc)?;
-            if !s.ends_with('\n') {
-                s.push('\n');
-            }
-            rendered.push(s);
-        }
-        Ok(rendered.join("---\n"))
+        Ok(keel_core::to_yaml_documents(self.to_json_values()?)?)
     }
 }
 
@@ -879,7 +870,7 @@ pub fn synthesize_helm_release(input: &HelmReleaseSpecInput) -> Result<Value, Ku
 /// Synthesizes a Flux CD `HelmRelease` manifest directly as YAML.
 pub fn synthesize_helm_release_yaml(input: &HelmReleaseSpecInput) -> Result<String, KubeError> {
     let manifest = synthesize_helm_release(input)?;
-    Ok(serde_yml::to_string(&manifest)?)
+    Ok(keel_core::yaml::to_string(&manifest)?)
 }
 
 /// Input specification for synthesizing a Flagger `Canary` (`flagger.app/v1beta1`) targeting
@@ -1007,7 +998,7 @@ pub fn synthesize_flagger_canary(input: &FlaggerCanarySpecInput) -> Result<Value
 /// Synthesizes a Flagger `Canary` manifest directly as YAML.
 pub fn synthesize_flagger_canary_yaml(input: &FlaggerCanarySpecInput) -> Result<String, KubeError> {
     let manifest = synthesize_flagger_canary(input)?;
-    Ok(serde_yml::to_string(&manifest)?)
+    Ok(keel_core::yaml::to_string(&manifest)?)
 }
 
 /// Synthesizes a tenant `NetworkPolicy` allowing Envoy Gateway proxy pods (`keel-system`)
@@ -1066,7 +1057,7 @@ pub fn synthesize_canary_gateway_network_policy_yaml(
     service_port: u16,
 ) -> Result<String, KubeError> {
     let manifest = synthesize_canary_gateway_network_policy(tenant_id, release_name, service_port)?;
-    Ok(serde_yml::to_string(&manifest)?)
+    Ok(keel_core::yaml::to_string(&manifest)?)
 }
 
 /// Synthesizes a `Namespace` for a tenant workload's target namespace on a **remote** cluster.
@@ -1107,7 +1098,7 @@ pub fn synthesize_remote_target_namespace_yaml(
     namespace: &str,
 ) -> Result<String, KubeError> {
     let manifest = synthesize_remote_target_namespace(tenant_id, namespace)?;
-    Ok(serde_yml::to_string(&manifest)?)
+    Ok(keel_core::yaml::to_string(&manifest)?)
 }
 
 /// Health-check target for `Kustomization.spec.healthChecks` (e.g., waiting on a PKO `Stack` CR).
@@ -1350,7 +1341,7 @@ pub fn synthesize_flux_kustomization_yaml(
     input: &FluxKustomizationSpecInput,
 ) -> Result<String, KubeError> {
     let manifest = synthesize_flux_kustomization(input)?;
-    Ok(serde_yml::to_string(&manifest)?)
+    Ok(keel_core::yaml::to_string(&manifest)?)
 }
 
 /// Sub-directory (relative to a manifest app's directory) holding the app's substitution
@@ -1596,7 +1587,7 @@ pub fn synthesize_helm_app_network_policy_yaml(
             "egress": egress,
         }
     });
-    Ok(serde_yml::to_string(&doc)?)
+    Ok(keel_core::yaml::to_string(&doc)?)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1931,19 +1922,10 @@ pub fn build_tenant_gateway_routes_cluster_role() -> Value {
 /// Serializes [`build_tenant_reconciler_rbac`] plus
 /// [`build_tenant_gateway_routes_cluster_role`] into multi-document YAML.
 pub fn build_tenant_reconciler_rbac_yaml() -> Result<String, KubeError> {
-    let mut docs = Vec::new();
-    let reconciler = build_tenant_reconciler_rbac();
-    for doc in reconciler
-        .iter()
-        .chain(std::iter::once(&build_tenant_gateway_routes_cluster_role()))
-    {
-        let mut s = serde_yml::to_string(&doc)?;
-        if !s.ends_with('\n') {
-            s.push('\n');
-        }
-        docs.push(s);
-    }
-    Ok(docs.join("---\n"))
+    let docs = build_tenant_reconciler_rbac()
+        .into_iter()
+        .chain([build_tenant_gateway_routes_cluster_role()]);
+    Ok(keel_core::to_yaml_documents(docs)?)
 }
 
 #[cfg(test)]
@@ -1957,7 +1939,7 @@ mod tests {
             .to_multi_doc_yaml()
             .unwrap();
         for doc in keel_core::split_yaml_documents(&current) {
-            let v: Value = serde_yml::from_str(&doc).unwrap();
+            let v: Value = noyalib::from_str(&doc).unwrap();
             assert_eq!(
                 v["metadata"]["labels"][PLATFORM_OWNED_LABEL], "true",
                 "{doc}"
@@ -2123,7 +2105,7 @@ mod tests {
         let seed = include_str!("../../../deploy/seed/flux-system/tenant-reconciler-rbac.yaml");
         let docs: Vec<Value> = seed
             .split("\n---\n")
-            .map(|d| serde_yml::from_str(d).unwrap())
+            .map(|d| noyalib::from_str(d).unwrap())
             .collect();
         let [_, role, _] = build_tenant_reconciler_rbac();
         let seed_role = docs
@@ -2175,7 +2157,7 @@ mod tests {
                 path.display()
             );
             for doc in content.split("\n---\n") {
-                let Ok(value) = serde_yml::from_str::<Value>(doc) else {
+                let Ok(value) = noyalib::from_str::<Value>(doc) else {
                     continue;
                 };
                 let ns = value["metadata"]["namespace"].as_str().unwrap_or_default();
@@ -2256,7 +2238,7 @@ mod tests {
         let seed = include_str!("../../../deploy/seed/flux-system/tenant-reconciler-rbac.yaml");
         let seed_role = seed
             .split("\n---\n")
-            .map(|d| serde_yml::from_str::<Value>(d).unwrap())
+            .map(|d| noyalib::from_str::<Value>(d).unwrap())
             .find(|d| d["metadata"]["name"] == TENANT_GATEWAY_ROUTES_CLUSTER_ROLE)
             .expect("seed keel-tenant-gateway-routes ClusterRole");
         assert_eq!(seed_role["metadata"]["labels"], role["metadata"]["labels"]);
@@ -2409,7 +2391,7 @@ mod tests {
         assert!(yaml.contains("\n---\n"));
         for doc in yaml.split("\n---\n") {
             let parsed: serde_json::Value =
-                serde_yml::from_str(doc).expect("each multi-doc YAML part should be valid YAML");
+                noyalib::from_str(doc).expect("each multi-doc YAML part should be valid YAML");
             assert!(parsed.get("kind").is_some());
         }
         assert!(yaml.contains("pod-security.kubernetes.io/enforce: restricted"));
@@ -2436,7 +2418,7 @@ mod tests {
             gateway_egress: true,
             public_egress: true,
         };
-        let np: Value = serde_yml::from_str(
+        let np: Value = noyalib::from_str(
             &synthesize_helm_app_network_policy_yaml("acme", "git", "git", &full).unwrap(),
         )
         .unwrap();
@@ -2512,7 +2494,7 @@ mod tests {
         assert!(synthesize_helm_app_network_policy_yaml("acme", "git", "git", &bad_port).is_err());
 
         // Minimal: DNS egress only, no ingress at all.
-        let minimal: Value = serde_yml::from_str(
+        let minimal: Value = noyalib::from_str(
             &synthesize_helm_app_network_policy_yaml(
                 "acme",
                 "s3",
@@ -2812,7 +2794,7 @@ mod tests {
         ];
 
         let yaml = synthesize_flux_kustomization_yaml(&input).unwrap();
-        let doc: Value = serde_yml::from_str(&yaml).unwrap();
+        let doc: Value = noyalib::from_str(&yaml).unwrap();
         assert_eq!(doc["apiVersion"], "kustomize.toolkit.fluxcd.io/v1");
         assert_eq!(doc["kind"], "Kustomization");
         assert_eq!(doc["spec"]["postBuild"]["substitute"]["ENV"], "production");
@@ -2872,8 +2854,8 @@ mod tests {
             extra_labels: labels,
         };
         let (config_yaml, app_yaml) = synthesize_flux_manifest_app_kustomizations(&input).unwrap();
-        let config: Value = serde_yml::from_str(&config_yaml).unwrap();
-        let app: Value = serde_yml::from_str(&app_yaml).unwrap();
+        let config: Value = noyalib::from_str(&config_yaml).unwrap();
+        let app: Value = noyalib::from_str(&app_yaml).unwrap();
 
         assert_eq!(config["metadata"]["name"], "rauthy-config");
         assert_eq!(config["spec"]["path"], "./tenants/acme/apps/rauthy/config");
@@ -2931,8 +2913,8 @@ mod tests {
             extra_labels: BTreeMap::new(),
         };
         let (config_yaml, app_yaml) = synthesize_flux_manifest_app_kustomizations(&input).unwrap();
-        let config: Value = serde_yml::from_str(&config_yaml).unwrap();
-        let app: Value = serde_yml::from_str(&app_yaml).unwrap();
+        let config: Value = noyalib::from_str(&config_yaml).unwrap();
+        let app: Value = noyalib::from_str(&app_yaml).unwrap();
 
         assert!(config["spec"].get("kubeConfig").is_none());
         assert_eq!(config["spec"]["targetNamespace"], "tenant-acme");

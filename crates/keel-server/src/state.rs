@@ -443,7 +443,7 @@ impl RepoClusterStateProvider {
     /// the provider of the management control-plane stack.
     fn bootstrap_target(&self) -> Option<String> {
         let raw = std::fs::read_to_string(self.repo_workdir.join(".keel/config.yaml")).ok()?;
-        let doc = serde_yml::from_str::<Value>(&raw).ok()?;
+        let doc = noyalib::from_str::<Value>(&raw).ok()?;
         doc.get("bootstrapTarget")
             .and_then(Value::as_str)
             .map(str::trim)
@@ -568,7 +568,7 @@ impl RepoClusterStateProvider {
         for rel in sorted_tree_paths(&tree.files) {
             let content = &tree.files[rel];
             for doc in split_yaml_documents(content) {
-                let Ok(val) = serde_yml::from_str::<Value>(&doc) else {
+                let Ok(val) = noyalib::from_str::<Value>(&doc) else {
                     continue;
                 };
                 if val.get("kind").and_then(Value::as_str) != Some("Stack")
@@ -737,7 +737,7 @@ impl RepoClusterStateProvider {
                     .entry(parent.to_string())
                     .or_insert_with(|| {
                         let raw = files.get(&format!("{parent}/kustomization.yaml"))?;
-                        let doc = serde_yml::from_str::<Value>(raw).ok()?;
+                        let doc = noyalib::from_str::<Value>(raw).ok()?;
                         let arr = doc.get("resources")?.as_array()?;
                         Some(
                             arr.iter()
@@ -756,7 +756,7 @@ impl RepoClusterStateProvider {
             }
             let content = &files[rel];
             for doc in split_yaml_documents(content) {
-                let Ok(val) = serde_yml::from_str::<Value>(&doc) else {
+                let Ok(val) = noyalib::from_str::<Value>(&doc) else {
                     continue;
                 };
                 let api_version = val
@@ -2033,7 +2033,7 @@ mod tests {
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(
                 dir.join("sync.yaml"),
-                serde_yml::to_string(&keel_kube::build_tenant_root_kustomization(t).unwrap())
+                keel_core::yaml::to_string(&keel_kube::build_tenant_root_kustomization(t).unwrap())
                     .unwrap(),
             )
             .unwrap();

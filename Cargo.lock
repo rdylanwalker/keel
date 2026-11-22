@@ -1972,10 +1972,10 @@ dependencies = [
  "keel-kube",
  "keel-pko",
  "keel-server",
+ "noyalib",
  "reqwest",
  "serde",
  "serde_json",
- "serde_yml",
  "sha2",
  "tempfile",
  "thiserror",
@@ -1996,10 +1996,10 @@ dependencies = [
  "base64 0.23.1",
  "hex",
  "jsonschema",
+ "noyalib",
  "rand 0.10.4",
  "serde",
  "serde_json",
- "serde_yml",
  "sha2",
  "thiserror",
  "tokio",
@@ -2043,10 +2043,10 @@ dependencies = [
  "keel-core",
  "keel-pko",
  "kube",
+ "noyalib",
  "rand 0.10.4",
  "serde",
  "serde_json",
- "serde_yml",
  "sha2",
  "thiserror",
  "tokio",
@@ -2059,9 +2059,9 @@ name = "keel-pko"
 version = "0.11.0"
 dependencies = [
  "keel-core",
+ "noyalib",
  "serde",
  "serde_json",
- "serde_yml",
  "thiserror",
 ]
 
@@ -2082,13 +2082,13 @@ dependencies = [
  "keel-git",
  "keel-kube",
  "keel-pko",
+ "noyalib",
  "rand 0.10.4",
  "reqwest",
  "russh",
  "rust-embed",
  "serde",
  "serde_json",
- "serde_yml",
  "sha2",
  "tempfile",
  "thiserror",
@@ -2381,14 +2381,15 @@ checksum = "2bf50223579dc7cdcfb3bfcacf7069ff68243f8c363f62ffa99cf000a6b9c451"
 
 [[package]]
 name = "noyalib"
-version = "0.0.5"
+version = "0.0.63"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e493c05128df7a83b9676b709d590e0ebc285c7ed3152bc679668e8c1e506af5"
+checksum = "f132f5ea38d74a519b65995b2f7dc7714a8b34df53952eb744107af7c1645a87"
 dependencies = [
+ "hashbrown 0.17.1",
  "indexmap",
  "memchr",
  "rustc-hash",
- "serde",
+ "serde_core",
  "smallvec",
 ]
 
@@ -3674,16 +3675,6 @@ dependencies = [
  "form_urlencoded",
  "itoa",
  "ryu",
- "serde",
-]
-
-[[package]]
-name = "serde_yml"
-version = "0.0.13"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "909764a65f86829ccdb5eea9ab355843aa02c019a7bfd47465092953565caa05"
-dependencies = [
- "noyalib",
  "serde",
 ]
 

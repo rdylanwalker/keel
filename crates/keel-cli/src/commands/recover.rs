@@ -371,7 +371,7 @@ pub async fn execute_bootstrap_recover(
         output.push_str(&format!("[{stack}] selected\n"));
 
         if args.state_version.is_some() || args.snapshot.is_some() {
-            let project = serde_yml::from_slice::<Value>(
+            let project = noyalib::from_slice::<Value>(
                 &tokio::fs::read(program_dir.join("Pulumi.yaml")).await?,
             )?
             .get("name")
