@@ -25,7 +25,7 @@ pub use auth::{
 };
 pub use error::{ErrorResponse, ServerError};
 pub use keel_core::StackSshInfoResponse;
-pub use routes::{CatalogItemDto, CreateCatalogItemRequest, healthz as health_check};
+pub use routes::CatalogItemDto;
 pub use state::{
     AppState, CachedPreview, ClusterStateProvider, KubeClusterStateProvider, ManifestTree,
     ReleaseSummary, RepoClusterStateProvider, StackSummary, TenantManifestSource,
@@ -182,9 +182,4 @@ pub fn build_router(state: AppState) -> Router {
         ))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
-}
-
-/// Convenience constructor returning a [`Router`] backed by a default ephemeral [`AppState`].
-pub fn create_router() -> Router {
-    build_router(AppState::default_ephemeral())
 }

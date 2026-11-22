@@ -11,6 +11,30 @@ use tokio::io::AsyncWriteExt;
 use crate::commands::CliError;
 
 /// Target cluster coordinates for `kubectl` invocations (`--kubeconfig` / `--context`).
+/// Verb for [`KubeTarget::write_secret`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SecretWrite {
+    /// `kubectl create` (create-if-absent).
+    Create,
+    /// `kubectl replace` (overwrite an existing object).
+    Replace,
+}
+
+impl SecretWrite {
+    /// The `kubectl` subcommand.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Create => "create",
+            Self::Replace => "replace",
+        }
+    }
+}
+
+/// Whether `kubectl` stderr reports an `AlreadyExists` API error.
+pub(crate) fn is_already_exists(stderr: &str) -> bool {
+    stderr.contains("AlreadyExists") || stderr.contains("already exists")
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct KubeTarget<'a> {
     pub context: Option<&'a str>,
@@ -120,24 +144,51 @@ impl<'a> KubeTarget<'a> {
         replace: bool,
         as_user: Option<&str>,
     ) -> Result<bool, CliError> {
+        let verb = if replace {
+            SecretWrite::Replace
+        } else {
+            SecretWrite::Create
+        };
+        Ok(self
+            .write_secret(manifest_yaml.as_bytes(), verb, None, as_user, false)
+            .await?
+            .is_some())
+    }
+
+    /// `kubectl [-n <namespace>] create|replace -f - [-o json] [--as=<user>]` with the secret
+    /// manifest on stdin only (never argv, never `apply`). Returns the command's stdout (the stored
+    /// object when `output_json`), or `None` when `create` hit an existing object.
+    pub(crate) async fn write_secret(
+        &self,
+        manifest: &[u8],
+        verb: SecretWrite,
+        namespace: Option<&str>,
+        as_user: Option<&str>,
+        output_json: bool,
+    ) -> Result<Option<Vec<u8>>, CliError> {
         let as_arg = as_user.map(|u| format!("--as={u}"));
-        let mut args = vec![if replace { "replace" } else { "create" }, "-f", "-"];
+        let verb_str = verb.as_str();
+        let mut args = Vec::new();
+        if let Some(ns) = namespace {
+            args.extend(["-n", ns]);
+        }
+        args.extend([verb_str, "-f", "-"]);
+        if output_json {
+            args.extend(["-o", "json"]);
+        }
         if let Some(arg) = as_arg.as_deref() {
             args.push(arg);
         }
-        let output = self
-            .output_with_stdin(&args, manifest_yaml.as_bytes())
-            .await?;
+        let output = self.output_with_stdin(&args, manifest).await?;
         if output.status.success() {
-            return Ok(true);
+            return Ok(Some(output.stdout));
         }
         let stderr = String::from_utf8_lossy(&output.stderr);
-        if !replace && (stderr.contains("AlreadyExists") || stderr.contains("already exists")) {
-            return Ok(false);
+        if verb == SecretWrite::Create && is_already_exists(&stderr) {
+            return Ok(None);
         }
         Err(CliError::Execution(format!(
-            "`kubectl {}` failed: {}",
-            args[0],
+            "`kubectl {verb_str}` failed: {}",
             stderr.trim()
         )))
     }
@@ -300,4 +351,19 @@ pub(crate) async fn start_gateway_port_forward(
         8888,
     )
     .await
+}
+
+#[cfg(test)]
+mod already_exists_tests {
+    use super::*;
+
+    #[test]
+    fn detects_already_exists_errors() {
+        assert!(is_already_exists(
+            "Error from server (AlreadyExists): secrets \"s\" already exists"
+        ));
+        assert!(!is_already_exists("Error from server (Forbidden): nope"));
+        assert_eq!(SecretWrite::Create.as_str(), "create");
+        assert_eq!(SecretWrite::Replace.as_str(), "replace");
+    }
 }

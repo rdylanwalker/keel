@@ -210,16 +210,6 @@ impl KyvernoPolicyGenerator {
         self
     }
 
-    /// Creates a generator seeded with the Day-1 default allowed Pulumi providers (`keel_kube::kyverno`).
-    pub fn with_default_providers(local_dev_docker_socket_exception: bool) -> Self {
-        Self::new(
-            keel_kube::pulumi_provider_allowlist(
-                &keel_kube::kyverno::default_allowed_pulumi_providers(),
-            ),
-            local_dev_docker_socket_exception,
-        )
-    }
-
     /// Synthesizes the baseline `ValidatingPolicy` manifests and optional local-dev `PolicyException`.
     pub fn generate(&self) -> Result<KyvernoManifestBundle, CliError> {
         let cfg = KyvernoPolicyConfig {
@@ -315,17 +305,9 @@ pub struct BootstrapInitOutcome {
     pub output: String,
 }
 
-/// Synthesizes all target-agnostic Stage 0 seed control-plane manifests (`SDD.md` §2.1, `AGENTS.md` §3.1).
+/// Synthesizes all target-agnostic Stage 0 seed control-plane manifests (`SDD.md` §2.1,
+/// `AGENTS.md` §3.1) for the given Stage 0 ingress hosts (`--oidc-public-url`).
 pub async fn synthesize_seed_control_plane(
-    cfg: &BootstrapConfig,
-    repo_url_override: Option<&str>,
-) -> Result<SeedControlPlaneArtifacts, CliError> {
-    synthesize_seed_control_plane_with_ingress(cfg, repo_url_override, Stage0Ingress::default())
-        .await
-}
-
-/// [`synthesize_seed_control_plane`] with explicit Stage 0 ingress hosts (`--oidc-public-url`).
-pub async fn synthesize_seed_control_plane_with_ingress(
     cfg: &BootstrapConfig,
     repo_url_override: Option<&str>,
     ingress: Stage0Ingress,
@@ -998,14 +980,6 @@ pub(crate) fn render_seed_forgejo_helmrelease(ingress: &Stage0Ingress) -> Result
     render_manifest(&out, &ingress.template_vars())
 }
 
-/// Forgejo hardening settings (`SDD.md` §6.2) as `(section, KEY=VALUE)`.
-#[cfg(test)]
-const FORGEJO_HARDENING_SETTINGS: &[(&str, &str)] = &[
-    ("repository", "DISABLE_FORKS=true"),
-    ("service", "ALLOW_ONLY_EXTERNAL_REGISTRATION=true"),
-    ("service", "DEFAULT_ALLOW_CREATE_ORGANIZATION=false"),
-];
-
 /// Renders `clusters/management/core-addons/kustomization.yaml`, listing `rauthy.yaml` only when
 /// the built-in Rauthy IdP is enabled, `forgejo.yaml` only with `--with-forge` and
 /// `keel-server.yaml` only with `--with-keel-server` (exactly the files [`seed_core_addon_files`]
@@ -1452,14 +1426,6 @@ fn seed_core_catalog_files(artifacts: &SeedControlPlaneArtifacts) -> Vec<(String
         .collect()
 }
 
-/// Initializes a local seed GitOps repository on `main` using [`GitRunner`] (zero shell calls).
-pub async fn initialize_seed_git_repo(
-    repo_dir: &Path,
-    artifacts: &SeedControlPlaneArtifacts,
-) -> Result<SeedRepoInitResult, CliError> {
-    initialize_seed_git_repo_with_push(repo_dir, artifacts, None, None).await
-}
-
 pub(crate) fn render_default_tenant_git_repository_yaml(
     repo: &FluxGitRepository,
 ) -> Result<String, CliError> {
@@ -1480,7 +1446,9 @@ pub(crate) fn render_default_tenant_git_repository_yaml(
     Ok(repo_yaml)
 }
 
-async fn initialize_seed_git_repo_with_push(
+/// Initializes a local seed GitOps repository on `main` using [`GitRunner`] (zero shell calls),
+/// optionally pushing to `push_url_override` with `push_credentials`.
+async fn initialize_seed_git_repo(
     repo_dir: &Path,
     artifacts: &SeedControlPlaneArtifacts,
     push_url_override: Option<&str>,
@@ -1937,8 +1905,7 @@ pub async fn execute_bootstrap_init_with_target(
             .map(|p| p.to_string_lossy().into_owned())
     };
     let mut artifacts =
-        synthesize_seed_control_plane_with_ingress(&cfg, repo_url_override.as_deref(), ingress)
-            .await?;
+        synthesize_seed_control_plane(&cfg, repo_url_override.as_deref(), ingress).await?;
 
     if let Some(git_url) = args.git_url.as_deref() {
         let (kind, api_url) = infer_forge_config(
@@ -2066,7 +2033,7 @@ pub async fn execute_bootstrap_init_with_target(
 
     let seed_repo = if let Some(repo_dir) = &args.repo_dir {
         Some(
-            initialize_seed_git_repo_with_push(
+            initialize_seed_git_repo(
                 repo_dir,
                 &artifacts,
                 push_url_override.as_deref(),
@@ -2330,6 +2297,13 @@ mod security_hardening_tests {
     use serde_json::Value;
     use state::{CONTROL_PLANE_FORGEJO_PULUMI_YAML, CONTROL_PLANE_PULUMI_YAML};
 
+    /// Forgejo hardening settings (`SDD.md` §6.2) as `(section, KEY=VALUE)`.
+    const FORGEJO_HARDENING_SETTINGS: &[(&str, &str)] = &[
+        ("repository", "DISABLE_FORKS=true"),
+        ("service", "ALLOW_ONLY_EXTERNAL_REGISTRATION=true"),
+        ("service", "DEFAULT_ALLOW_CREATE_ORGANIZATION=false"),
+    ];
+
     #[test]
     fn forgejo_program_has_no_hardcoded_admin_password() {
         assert!(!CONTROL_PLANE_FORGEJO_PULUMI_YAML.contains("keel-admin-dev"));
@@ -2371,11 +2345,16 @@ mod security_hardening_tests {
 
     #[test]
     fn seed_policies_no_longer_clone_admin_credentials_into_tenants() {
-        let bundle = KyvernoPolicyGenerator::with_default_providers(false)
-            .generate()
-            .unwrap()
-            .to_multi_doc_yaml()
-            .unwrap();
+        let bundle = KyvernoPolicyGenerator::new(
+            keel_kube::pulumi_provider_allowlist(
+                &keel_kube::kyverno::default_allowed_pulumi_providers(),
+            ),
+            false,
+        )
+        .generate()
+        .unwrap()
+        .to_multi_doc_yaml()
+        .unwrap();
         // The only GeneratingPolicy copies the public CA bundle ConfigMap; no Secret is cloned.
         assert!(!bundle.contains("sync-tenant-secrets"));
         assert!(bundle.contains("sync-keel-ca-bundle"));
@@ -2883,7 +2862,9 @@ mod security_hardening_tests {
             with_keel_server: true,
             ..BootstrapConfig::new(keel_core::BootstrapTargetKind::Kubeconfig)
         };
-        let a = synthesize_seed_control_plane(&cfg, None).await.unwrap();
+        let a = synthesize_seed_control_plane(&cfg, None, Stage0Ingress::default())
+            .await
+            .unwrap();
         let files = seed_management_files(&a).unwrap();
         let addon: Value = serde_yml::from_str(file(
             &files,
@@ -2903,9 +2884,13 @@ mod security_hardening_tests {
             with_keel_server: true,
             ..BootstrapConfig::new(keel_core::BootstrapTargetKind::Kubeconfig)
         };
-        let a = synthesize_seed_control_plane(&cfg, Some("/tmp/keel-gitops.git"))
-            .await
-            .unwrap();
+        let a = synthesize_seed_control_plane(
+            &cfg,
+            Some("/tmp/keel-gitops.git"),
+            Stage0Ingress::default(),
+        )
+        .await
+        .unwrap();
         assert!(seed_management_files(&a).is_err());
     }
 
@@ -3128,7 +3113,7 @@ mod security_hardening_tests {
     async fn default_tenant_stub_is_the_tenant_stack_git_source() {
         let url = "http://forgejo-http.keel-system.svc.cluster.local:3000/keel/infra-gitops.git";
         let cfg = BootstrapConfig::new(keel_core::BootstrapTargetKind::Kubeconfig);
-        let a = synthesize_seed_control_plane(&cfg, Some(url))
+        let a = synthesize_seed_control_plane(&cfg, Some(url), Stage0Ingress::default())
             .await
             .unwrap();
         let mut repo = a.flux_git_repository.clone();
@@ -3200,7 +3185,7 @@ mod security_hardening_tests {
             with_keel_server: true,
             ..BootstrapConfig::new(keel_core::BootstrapTargetKind::Kubeconfig)
         };
-        let a = synthesize_seed_control_plane(&cfg, Some(url))
+        let a = synthesize_seed_control_plane(&cfg, Some(url), Stage0Ingress::default())
             .await
             .unwrap();
         let rendered = render_keel_server_addon_kustomization(&a).unwrap();
@@ -3217,6 +3202,7 @@ mod security_hardening_tests {
         let off = synthesize_seed_control_plane(
             &BootstrapConfig::new(keel_core::BootstrapTargetKind::Kubeconfig),
             None,
+            Stage0Ingress::default(),
         )
         .await
         .unwrap();
@@ -3226,7 +3212,9 @@ mod security_hardening_tests {
             with_keel_server: true,
             ..BootstrapConfig::new(keel_core::BootstrapTargetKind::Kubeconfig)
         };
-        let a = synthesize_seed_control_plane(&cfg, None).await.unwrap();
+        let a = synthesize_seed_control_plane(&cfg, None, Stage0Ingress::default())
+            .await
+            .unwrap();
         let notes = keel_server_addon_notes(&a, true);
         assert_eq!(notes.len(), 1, "{notes:?}");
         assert!(notes[0].contains("https://keel.keel.local:8888"));
@@ -3243,7 +3231,9 @@ mod security_hardening_tests {
             oidc_issuer: Some("https://login.example.org".to_string()),
             ..BootstrapConfig::new(keel_core::BootstrapTargetKind::Kubeconfig)
         };
-        let a = synthesize_seed_control_plane(&cfg, None).await.unwrap();
+        let a = synthesize_seed_control_plane(&cfg, None, Stage0Ingress::default())
+            .await
+            .unwrap();
         let notes = keel_server_addon_notes(&a, true);
         assert_eq!(notes.len(), 2);
         assert!(notes[1].contains("https://keel.keel.local:8888/api/v1/auth/callback"));
@@ -3313,7 +3303,7 @@ mod security_hardening_tests {
 
     async fn artifacts_for(cfg: BootstrapConfig, public_url: &str) -> SeedControlPlaneArtifacts {
         let ingress = Stage0Ingress::from_public_url(public_url).unwrap();
-        synthesize_seed_control_plane_with_ingress(
+        synthesize_seed_control_plane(
             &cfg,
             Some("https://git.example.org/keel/gitops.git"),
             ingress,
@@ -3911,8 +3901,10 @@ mod security_hardening_tests {
             with_forge: true,
             ..BootstrapConfig::new(keel_core::BootstrapTargetKind::Kubeconfig)
         };
-        let a = synthesize_seed_control_plane(&cfg, None).await.unwrap();
-        let res = initialize_seed_git_repo(&work, &a).await;
+        let a = synthesize_seed_control_plane(&cfg, None, Stage0Ingress::default())
+            .await
+            .unwrap();
+        let res = initialize_seed_git_repo(&work, &a, None, None).await;
         let res = res.unwrap_or_else(|e| {
             let _ = std::fs::remove_dir_all(&tmp);
             panic!("seed repo init failed: {e}")
@@ -3943,10 +3935,14 @@ mod security_hardening_tests {
         let work = tmp.join("work");
         let bare = default_bare_repo_for_workdir(&work);
         let cfg = BootstrapConfig::new(keel_core::BootstrapTargetKind::Kubeconfig);
-        let a = synthesize_seed_control_plane(&cfg, Some(bare.to_str().unwrap()))
-            .await
-            .unwrap();
-        let res = initialize_seed_git_repo(&work, &a)
+        let a = synthesize_seed_control_plane(
+            &cfg,
+            Some(bare.to_str().unwrap()),
+            Stage0Ingress::default(),
+        )
+        .await
+        .unwrap();
+        let res = initialize_seed_git_repo(&work, &a, None, None)
             .await
             .unwrap_or_else(|e| {
                 let _ = std::fs::remove_dir_all(&tmp);
@@ -4247,7 +4243,7 @@ mod security_hardening_tests {
             ..BootstrapConfig::new(keel_core::BootstrapTargetKind::Kubeconfig)
         };
         let ingress = Stage0Ingress::from_public_url("https://idp.corp.example:9443").unwrap();
-        let a = synthesize_seed_control_plane_with_ingress(&cfg, None, ingress)
+        let a = synthesize_seed_control_plane(&cfg, None, ingress)
             .await
             .unwrap();
         let r = a.rauthy_config.unwrap();

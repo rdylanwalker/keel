@@ -23,7 +23,7 @@ use kube::discovery::ApiResource;
 use kube::{Client, ResourceExt};
 use serde_json::{Value, json};
 
-use keel_pko::PreviewSecretCopy;
+use keel_pko::{DEFAULT_PREVIEW_SERVICE_ACCOUNT, PREVIEW_REPORT_CONFIGMAP_KEY, PreviewSecretCopy};
 
 use crate::KubeError;
 use crate::secret_store::TENANT_S3_IDENTITY_PENDING_ANNOTATION;
@@ -35,10 +35,6 @@ use crate::tenant_repo::TENANT_GITOPS_CREDENTIALS_SECRET_NAME;
 
 /// Server-side apply field manager for preview CRs.
 pub const PREVIEW_FIELD_MANAGER: &str = "keel-server-preview";
-/// Read-only ServiceAccount the preview workspace pods run as (must exist in `keel-previews`).
-pub const PREVIEW_SERVICE_ACCOUNT: &str = "keel-preview-readonly";
-/// `ConfigMap` key holding the report JSON (mirrors `keel_pko::PREVIEW_REPORT_CONFIGMAP_KEY`).
-pub const PREVIEW_REPORT_KEY: &str = "report.json";
 /// Label selecting Keel ephemeral preview objects.
 pub const PREVIEW_LABEL_SELECTOR: &str = "keel.io/ephemeral-preview=true";
 /// Tenant Flux `GitRepository` name (`tenant-<id>/keel-gitops`).
@@ -700,12 +696,15 @@ impl KubePreviewCluster {
     async fn ensure_service_account(&self) {
         let api: Api<ServiceAccount> =
             Api::namespaced(self.client.clone(), KEEL_PREVIEWS_NAMESPACE);
-        if matches!(api.get_opt(PREVIEW_SERVICE_ACCOUNT).await, Ok(Some(_))) {
+        if matches!(
+            api.get_opt(DEFAULT_PREVIEW_SERVICE_ACCOUNT).await,
+            Ok(Some(_))
+        ) {
             return;
         }
         let sa = ServiceAccount {
             metadata: ObjectMeta {
-                name: Some(PREVIEW_SERVICE_ACCOUNT.to_string()),
+                name: Some(DEFAULT_PREVIEW_SERVICE_ACCOUNT.to_string()),
                 namespace: Some(KEEL_PREVIEWS_NAMESPACE.to_string()),
                 labels: Some(BTreeMap::from([
                     (
@@ -719,7 +718,7 @@ impl KubePreviewCluster {
             ..ServiceAccount::default()
         };
         if let Err(e) = api.create(&PostParams::default(), &sa).await {
-            tracing::warn!(error = %e, "could not create keel-previews/{PREVIEW_SERVICE_ACCOUNT}");
+            tracing::warn!(error = %e, "could not create keel-previews/{DEFAULT_PREVIEW_SERVICE_ACCOUNT}");
         }
     }
 
@@ -942,7 +941,7 @@ impl PreviewCluster for KubePreviewCluster {
                 ..ObjectMeta::default()
             },
             data: Some(BTreeMap::from([(
-                PREVIEW_REPORT_KEY.to_string(),
+                PREVIEW_REPORT_CONFIGMAP_KEY.to_string(),
                 report_json.to_string(),
             )])),
             ..ConfigMap::default()
@@ -963,7 +962,7 @@ impl PreviewCluster for KubePreviewCluster {
             .get_opt(&preview_report_configmap_name(stack_name))
             .await?
             .and_then(|cm| cm.data)
-            .and_then(|d| d.get(PREVIEW_REPORT_KEY).cloned()))
+            .and_then(|d| d.get(PREVIEW_REPORT_CONFIGMAP_KEY).cloned()))
     }
 
     async fn delete_preview_object(&self, kind: &str, name: &str) -> Result<bool, KubeError> {

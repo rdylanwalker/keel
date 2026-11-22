@@ -820,63 +820,6 @@ impl Utf8StreamDecoder {
     }
 }
 
-/// Establishes a real `russh` SSH connection, authenticates with the given PEM private key,
-/// requests a PTY, and opens an interactive shell channel.
-#[cfg(test)]
-async fn connect_and_open_pty_shell(
-    host: &str,
-    port: u16,
-    user: &str,
-    key_pem: &str,
-    cols: u32,
-    rows: u32,
-) -> Result<
-    (
-        client::Handle<SshClientHandler>,
-        russh::Channel<client::Msg>,
-    ),
-    String,
-> {
-    let key_pair = Arc::new(
-        decode_secret_key(key_pem, None)
-            .map_err(|e| format!("Failed to parse SSH private key: {e}"))?,
-    );
-    let config = Arc::new(client::Config {
-        inactivity_timeout: Some(Duration::from_secs(30)),
-        ..Default::default()
-    });
-    let (handler, _observed) = SshClientHandler::new(Vec::new());
-    let mut session = client::connect(config, (host, port), handler)
-        .await
-        .map_err(|e| format!("SSH connect failed: {e}"))?;
-    let best_hash = session
-        .best_supported_rsa_hash()
-        .await
-        .ok()
-        .flatten()
-        .flatten();
-    let auth_res = session
-        .authenticate_publickey(user, PrivateKeyWithHashAlg::new(key_pair, best_hash))
-        .await
-        .map_err(|e| format!("SSH auth error: {e}"))?;
-    if !auth_res.success() {
-        return Err("SSH public-key authentication rejected".to_string());
-    }
-    let channel = session
-        .channel_open_session()
-        .await
-        .map_err(|e| format!("Failed to open session channel: {e}"))?;
-    channel
-        .request_pty(false, "dumb", cols, rows, 0, 0, &[])
-        .await
-        .map_err(|e| format!("Failed to request PTY: {e}"))?;
-    channel
-        .request_shell(false)
-        .await
-        .map_err(|e| format!("Failed to request shell: {e}"))?;
-    Ok((session, channel))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1035,72 +978,6 @@ mod tests {
             session.data(channel, reply)?;
             Ok(())
         }
-    }
-
-    #[tokio::test]
-    async fn russh_pty_session_authenticates_and_streams_arbitrary_commands() {
-        let host_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
-        let client_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
-        let client_pem = client_key
-            .to_openssh(russh::keys::ssh_key::LineEnding::LF)
-            .unwrap()
-            .to_string();
-
-        let server_cfg = Arc::new(server::Config {
-            keys: vec![host_key],
-            ..Default::default()
-        });
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-
-        let mut srv = TestSshServer {
-            expected_pubkey: client_key.public_key().clone(),
-        };
-        tokio::spawn(async move {
-            if let Ok((stream, addr)) = listener.accept().await {
-                let handler = server::Server::new_client(&mut srv, Some(addr));
-                let _ = server::run_stream(server_cfg, stream, handler).await;
-            }
-        });
-
-        let (session, mut channel) =
-            connect_and_open_pty_shell("127.0.0.1", port, "ubuntu", &client_pem, 80, 24)
-                .await
-                .expect("connect and open PTY shell");
-
-        // Expect initial prompt from shell_request
-        let first = channel.wait().await.expect("initial prompt");
-        match first {
-            ChannelMsg::Data { data } => {
-                assert!(String::from_utf8_lossy(&data).contains("ubuntu@test-vm:~$"));
-            }
-            other => panic!("unexpected channel msg: {other:?}"),
-        }
-
-        // Send arbitrary commands that previously failed in the simulated shell
-        for cmd in [
-            "touch /tmp/a\n",
-            "cat /etc/hosts\n",
-            "ip addr\n",
-            "which sh\n",
-        ] {
-            channel.data(cmd.as_bytes()).await.unwrap();
-            let msg = channel.wait().await.expect("command output");
-            match msg {
-                ChannelMsg::Data { data } => {
-                    let out = String::from_utf8_lossy(&data);
-                    assert!(out.contains(&format!("exec:{}", cmd.trim())));
-                }
-                other => panic!("unexpected channel msg: {other:?}"),
-            }
-        }
-
-        channel.window_change(120, 40, 0, 0).await.unwrap();
-        channel.eof().await.unwrap();
-        session
-            .disconnect(russh::Disconnect::ByApplication, "", "en")
-            .await
-            .unwrap();
     }
 
     struct MiniWsClient {

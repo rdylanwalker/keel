@@ -327,9 +327,6 @@ pub struct RegisterCatalogAppRequest {
     pub placement_scope: Option<PlacementScope>,
 }
 
-/// Type alias for catalog item creation requests.
-pub type CreateCatalogItemRequest = RegisterCatalogAppRequest;
-
 /// Response body for `POST /api/v1/catalog`.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]

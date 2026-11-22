@@ -12,10 +12,10 @@ use async_trait::async_trait;
 use keel_core::{
     AuthPhase, InfraResourceKind, ManagementAddonKind, OidcConfig, split_yaml_documents,
 };
-use keel_git::{ForgeProvider, GitRunner, LocalGitProvider};
+use keel_git::{ForgeProvider, GitRunner};
 use keel_kube::{
-    InMemorySecretStore, LiveResourceInfo, LiveResourceStatus, LiveStatusSource, SecretStateStore,
-    StackDiagnostics, TelemetryMux,
+    LiveResourceInfo, LiveResourceStatus, LiveStatusSource, SecretStateStore, StackDiagnostics,
+    TelemetryMux,
 };
 use keel_pko::{GcPlan, PreviewReport, PreviewResourceCandidate, PreviewStack};
 use serde::{Deserialize, Serialize};
@@ -1568,11 +1568,12 @@ impl AppState {
         self
     }
 
-    /// Creates a minimal default `AppState` for CLI smoke tests or unconfigured startup.
-    pub fn default_ephemeral() -> Self {
+    /// Creates a minimal default `AppState` for unit tests.
+    #[cfg(test)]
+    pub(crate) fn default_ephemeral() -> Self {
         let tmp_dir = std::env::temp_dir().join("keel-server-default");
-        let forge = Arc::new(LocalGitProvider::new(&tmp_dir));
-        let secret_store = Arc::new(InMemorySecretStore::new());
+        let forge = Arc::new(keel_git::LocalGitProvider::new(&tmp_dir));
+        let secret_store = Arc::new(keel_kube::InMemorySecretStore::new());
         Self::new(
             forge,
             secret_store,

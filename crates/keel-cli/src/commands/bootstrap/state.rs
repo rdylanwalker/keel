@@ -17,7 +17,7 @@ use keel_core::{
 use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt;
 
-use super::kube::KubeTarget;
+use super::kube::{KubeTarget, SecretWrite};
 use super::s3::{
     DEFAULT_S3_REGION, S3Client, S3Credentials, S3Endpoint, ensure_seaweedfs_pulumi_bucket,
     read_seaweedfs_admin_credentials, s3_backend_url, start_seaweedfs_s3_port_forward,
@@ -399,25 +399,21 @@ pub(crate) async fn ensure_pulumi_passphrase_secret(
     let passphrase = zeroize::Zeroizing::new(keel_kube::generate_pulumi_passphrase());
     let secret = keel_kube::build_pulumi_passphrase_secret(namespace, &passphrase);
     let manifest = zeroize::Zeroizing::new(serde_json::to_vec(&secret)?);
-    let output = target
-        .output_with_stdin(&["create", "-f", "-"], &manifest)
-        .await?;
-    if output.status.success() {
+    let created = target
+        .write_secret(&manifest, SecretWrite::Create, None, None, false)
+        .await
+        .map_err(|err| {
+            CliError::Execution(format!("failed to create `{namespace}/{name}`: {err}"))
+        })?;
+    if created.is_some() {
         return Ok(true);
     }
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    if stderr.contains("AlreadyExists") || stderr.contains("already exists") {
-        if read_pulumi_passphrase(target, namespace).await.is_some() {
-            return Ok(false);
-        }
-        return Err(CliError::Execution(format!(
-            "`{namespace}/{name}` exists but has no usable `{key}`; restore the original \
-             passphrase (it encrypts existing Pulumi state) instead of replacing it"
-        )));
+    if read_pulumi_passphrase(target, namespace).await.is_some() {
+        return Ok(false);
     }
     Err(CliError::Execution(format!(
-        "failed to create `{namespace}/{name}`: {}",
-        stderr.trim()
+        "`{namespace}/{name}` exists but has no usable `{key}`; restore the original \
+         passphrase (it encrypts existing Pulumi state) instead of replacing it"
     )))
 }
 

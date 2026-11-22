@@ -1,8 +1,9 @@
 //! Per-tenant SeaweedFS S3 identity provisioning (`NFR-SEC-02`, `NFR-SEC-05`).
 //!
 //! Each `tenant-<id>` namespace receives its own least-privilege SeaweedFS S3 identity scoped to
-//! `<bucket>/tenants/<id>/*` instead of the control-plane admin keys. This module is the
-//! server-side (kube-rs) counterpart of `keel bootstrap init`'s `kubectl exec` provisioning:
+//! `<bucket>/tenants/<id>/*` instead of the control-plane admin keys. The same
+//! [`provision_tenant_s3_identity_with`] flow backs `keel-server` (kube-rs, see
+//! [`SeaweedFsTenantS3Provisioner`]) and `keel bootstrap init` (a `kubectl` adapter):
 //!
 //! 1. reuse the keys in `tenant-<id>/keel-tenant-s3-credentials` if present, otherwise generate
 //!    fresh CSPRNG keys and persist them first (create-if-absent, so concurrent callers converge

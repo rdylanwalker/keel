@@ -570,7 +570,7 @@ impl KubeClusterStatusReader {
         service_name: &str,
         promql: &str,
     ) -> HashMap<(String, String), f64> {
-        let encoded = percent_encode_query(promql);
+        let encoded = keel_core::percent_encode(promql);
         let uri = format!(
             "/api/v1/namespaces/keel-system/services/http:{service_name}:80/proxy/api/v1/query?query={encoded}"
         );
@@ -1872,28 +1872,6 @@ pub fn extract_resource_count(data: &Value) -> Option<u32> {
     None
 }
 
-fn percent_encode_query(input: &str) -> String {
-    let mut out = String::with_capacity(input.len() * 2);
-    for b in input.bytes() {
-        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
-            out.push(b as char);
-        } else {
-            out.push('%');
-            out.push(
-                char::from_digit((b >> 4) as u32, 16)
-                    .unwrap_or('0')
-                    .to_ascii_uppercase(),
-            );
-            out.push(
-                char::from_digit((b & 0x0f) as u32, 16)
-                    .unwrap_or('0')
-                    .to_ascii_uppercase(),
-            );
-        }
-    }
-    out
-}
-
 fn parse_prometheus_vector_response(body: &Value) -> HashMap<(String, String), f64> {
     let mut out = HashMap::new();
     if body.get("status").and_then(Value::as_str) != Some("success") {
@@ -2318,15 +2296,6 @@ current-context: workload
             Some("2026-11-15T09:00:00Z")
         );
         assert_eq!(extract_resource_count(&flux_ks), Some(3));
-    }
-
-    #[test]
-    fn percent_encodes_promql_queries() {
-        let encoded = percent_encode_query(r#"rate(x{a="1/2"}[2m]) * 100"#);
-        assert!(!encoded.contains(' '));
-        assert!(!encoded.contains('{'));
-        assert!(!encoded.contains('"'));
-        assert!(encoded.contains("rate%28x%7Ba%3D%221%2F2%22%7D%5B2m%5D%29"));
     }
 
     #[test]

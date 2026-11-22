@@ -38,10 +38,10 @@ pub use auth::{
 pub use bootstrap::{
     BootstrapInitOutcome, KyvernoPolicyGenerator, RauthySeedConfig, SeedControlPlaneArtifacts,
     SeedRepoInitResult, default_bare_repo_for_workdir, execute_bootstrap_init,
-    execute_bootstrap_init_with_target, initialize_seed_git_repo, synthesize_seed_control_plane,
+    execute_bootstrap_init_with_target, synthesize_seed_control_plane,
 };
 pub use recover::{BootstrapRecoverOutcome, build_pulumi_recover_argv, execute_bootstrap_recover};
-pub use serve::{build_serve_state, execute_serve, execute_serve_until};
+pub use serve::{execute_serve, execute_serve_until};
 pub use workloads::{
     PreviewStatusOutcome, ProposalCommandOutcome, build_ssh_argv, execute_app_install,
     execute_infra_force_delete, execute_infra_list, execute_infra_provision, execute_infra_ssh,
@@ -163,17 +163,12 @@ pub struct CliContext {
     pub(crate) http: Client,
     pub(crate) stream_http: Client,
     credentials_path: PathBuf,
-    session_override: Option<String>,
 }
 
 impl std::fmt::Debug for CliContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CliContext")
             .field("credentials_path", &self.credentials_path)
-            .field(
-                "session_override",
-                &self.session_override.as_ref().map(|_| "[REDACTED]"),
-            )
             .finish()
     }
 }
@@ -207,14 +202,7 @@ impl CliContext {
             http,
             stream_http,
             credentials_path: credentials_path.into(),
-            session_override: None,
         }
-    }
-
-    /// Returns a copy of this context configured with an explicit in-memory session token.
-    pub fn with_session_token(mut self, session_token: impl Into<String>) -> Self {
-        self.session_override = Some(session_token.into());
-        self
     }
 
     /// Persists an opaque session token for `server_url` with `0600` file permissions (`NFR-SEC-05`).
@@ -257,9 +245,6 @@ impl CliContext {
     /// Loads the active session token for `server_url` if available. Keys are compared after
     /// normalization (`localhost` == `127.0.0.1`, default ports, case, trailing slash).
     pub fn load_session_token(&self, server_url: &str) -> Option<String> {
-        if let Some(tok) = &self.session_override {
-            return Some(tok.clone());
-        }
         let key = session_key(server_url).ok()?;
         let store = self.read_store();
         if let Some(tok) = store.sessions.get(&key) {
@@ -755,12 +740,22 @@ spec:
 
     #[test]
     fn kyverno_policy_generator_respects_docker_socket_exception_flag() {
-        let prod_gen = KyvernoPolicyGenerator::with_default_providers(false);
+        let prod_gen = KyvernoPolicyGenerator::new(
+            keel_kube::pulumi_provider_allowlist(
+                &keel_kube::kyverno::default_allowed_pulumi_providers(),
+            ),
+            false,
+        );
         let prod_bundle = prod_gen.generate().unwrap();
         assert_eq!(prod_bundle.cluster_policies.len(), 3);
         assert!(prod_bundle.policy_exception.is_none());
 
-        let kind_dev_gen = KyvernoPolicyGenerator::with_default_providers(true);
+        let kind_dev_gen = KyvernoPolicyGenerator::new(
+            keel_kube::pulumi_provider_allowlist(
+                &keel_kube::kyverno::default_allowed_pulumi_providers(),
+            ),
+            true,
+        );
         let kind_dev_bundle = kind_dev_gen.generate().unwrap();
         assert_eq!(kind_dev_bundle.cluster_policies.len(), 3);
         assert!(kind_dev_bundle.policy_exception.is_some());
@@ -885,7 +880,10 @@ spec:
             pulumi_program_dir: None,
         };
         let cfg = args.to_bootstrap_config();
-        let artifacts = synthesize_seed_control_plane(&cfg, None).await.unwrap();
+        let artifacts =
+            synthesize_seed_control_plane(&cfg, None, bootstrap::Stage0Ingress::default())
+                .await
+                .unwrap();
         let rauthy = artifacts.rauthy_config.expect("rauthy config");
         let clients: serde_json::Value = serde_json::from_str(&rauthy.clients_json).unwrap();
         let clients_arr = clients.as_array().unwrap();
@@ -1226,7 +1224,7 @@ spec:
             git_url: None,
             git_username: None,
         };
-        let (state, _) = build_serve_state(&serve_args).await.unwrap();
+        let (state, _) = serve::build_serve_state(&serve_args, false).await.unwrap();
         // Keep this test hermetic even when a developer kubeconfig points at a live Keel cluster:
         // never mirror/provision tenant S3 identities against it.
         let state = state
@@ -1704,15 +1702,18 @@ spec:
     async fn oidc_login_redirect_flow_returns_pkce_authorize_url() {
         isolate_from_ambient_kubeconfig();
         let tmp = TempTestDir::new("oidc-redirect");
-        let (mut state, _) = build_serve_state(&ServeArgs {
-            bind: "127.0.0.1:0".to_string(),
-            repo_dir: None,
-            bare_repo: None,
-            config: None,
-            git_token: None,
-            git_url: None,
-            git_username: None,
-        })
+        let (mut state, _) = serve::build_serve_state(
+            &ServeArgs {
+                bind: "127.0.0.1:0".to_string(),
+                repo_dir: None,
+                bare_repo: None,
+                config: None,
+                git_token: None,
+                git_url: None,
+                git_username: None,
+            },
+            false,
+        )
         .await
         .unwrap();
         state = state.with_oidc_config(Some(OidcConfig {
@@ -1772,17 +1773,7 @@ spec:
         isolate_from_ambient_kubeconfig();
         let tmp = TempTestDir::new("edge-cases");
 
-        // CliContext & PkceChallenge Debug secret redaction + session override
-        let default_ctx = CliContext::default();
-        let overridden_ctx = default_ctx.with_session_token("super-secret-session");
-        let ctx_dbg = format!("{overridden_ctx:?}");
-        assert!(!ctx_dbg.contains("super-secret-session"));
-        assert!(ctx_dbg.contains("[REDACTED]"));
-        assert_eq!(
-            overridden_ctx.load_session_token("http://127.0.0.1:8080"),
-            Some("super-secret-session".to_string())
-        );
-
+        // PkceChallenge Debug secret redaction
         let pkce = generate_pkce_pair();
         let pkce_dbg = format!("{pkce:?}");
         assert!(!pkce_dbg.contains(&pkce.code_verifier));
@@ -1807,15 +1798,18 @@ spec:
 
         // Invalid bind address in `build_serve_state`
         assert!(
-            build_serve_state(&ServeArgs {
-                bind: "invalid-bind-without-port".to_string(),
-                repo_dir: None,
-                bare_repo: None,
-                config: None,
-                git_token: None,
-                git_url: None,
-                git_username: None,
-            })
+            serve::build_serve_state(
+                &ServeArgs {
+                    bind: "invalid-bind-without-port".to_string(),
+                    repo_dir: None,
+                    bare_repo: None,
+                    config: None,
+                    git_token: None,
+                    git_url: None,
+                    git_username: None,
+                },
+                false
+            )
             .await
             .is_err()
         );
@@ -1828,7 +1822,7 @@ spec:
                 watch: false,
                 server: "http://127.0.0.1:8080".to_string(),
             },
-            &overridden_ctx,
+            &CliContext::with_credentials_path(tmp.path().join("creds.json")),
         )
         .await
         .unwrap_err();
@@ -1872,15 +1866,18 @@ spec:
             "./keel-gitops.git"
         );
 
-        let (_state, _token) = build_serve_state(&ServeArgs {
-            bind: "127.0.0.1:0".to_string(),
-            repo_dir: Some(work_dir.clone()),
-            bare_repo: None,
-            config: None,
-            git_token: None,
-            git_url: None,
-            git_username: None,
-        })
+        let (_state, _pf) = serve::build_serve_state(
+            &ServeArgs {
+                bind: "127.0.0.1:0".to_string(),
+                repo_dir: Some(work_dir.clone()),
+                bare_repo: None,
+                config: None,
+                git_token: None,
+                git_url: None,
+                git_username: None,
+            },
+            false,
+        )
         .await
         .unwrap();
 
@@ -1910,7 +1907,7 @@ spec:
             git_username: None,
         };
 
-        let (state, _) = build_serve_state(&args).await.unwrap();
+        let (state, _) = serve::build_serve_state(&args, false).await.unwrap();
         assert_eq!(state.remote_url, remote_url);
         assert!(!tmp.path().join("work.git").exists(), "no local bare repo");
         assert_eq!(
@@ -1942,7 +1939,7 @@ spec:
             .await
             .unwrap();
 
-        let _ = build_serve_state(&args).await.unwrap();
+        let _ = serve::build_serve_state(&args, false).await.unwrap();
         assert_eq!(git.current_head_sha(&work_dir).await.unwrap(), sha);
         assert!(work_dir.join("MARKER").exists());
 
@@ -1952,7 +1949,7 @@ spec:
             git_url: Some("https://keel:tok@forge.invalid/keel/infra.git".to_string()),
             ..args.clone()
         };
-        assert!(build_serve_state(&bad).await.is_err());
+        assert!(serve::build_serve_state(&bad, false).await.is_err());
     }
 
     #[tokio::test]
@@ -2197,15 +2194,6 @@ spec:
         );
         assert_eq!(ctx.load_session_token("https://other.local"), None);
 
-        let override_ctx =
-            CliContext::with_credentials_path(&creds_path).with_session_token("mem-tok");
-        assert_eq!(
-            override_ctx
-                .load_session_token("https://other.local")
-                .as_deref(),
-            Some("mem-tok")
-        );
-
         assert_eq!(
             default_bare_repo_for_workdir(Path::new("/tmp/keel-gitops")),
             PathBuf::from("/tmp/keel-gitops.git")
@@ -2303,8 +2291,8 @@ spec:
         });
 
         let tmp = TempTestDir::new("cli-dispatch");
-        let ctx = CliContext::with_credentials_path(tmp.path().join("creds.json"))
-            .with_session_token("test-bearer");
+        let ctx = CliContext::with_credentials_path(tmp.path().join("creds.json"));
+        ctx.save_session_token(&server_url, "test-bearer").unwrap();
 
         let cli = Cli::try_parse_from([
             "keel",

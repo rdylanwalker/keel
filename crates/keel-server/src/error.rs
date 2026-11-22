@@ -77,9 +77,6 @@ pub enum ServerError {
     #[error("Service unavailable: {0}")]
     ServiceUnavailable(String),
 
-    #[error("Schema validation failed")]
-    SchemaValidation(Vec<SchemaFieldError>),
-
     #[error("Core error: {0}")]
     Core(#[from] CoreError),
 
@@ -202,15 +199,6 @@ impl IntoResponse for ServerError {
                 Json(ErrorResponse {
                     error: msg,
                     details: None,
-                    correlation_id: None,
-                }),
-            )
-                .into_response(),
-            Self::SchemaValidation(errors) => (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                Json(ErrorResponse {
-                    error: "Payload failed JSON Schema validation".to_string(),
-                    details: Some(errors),
                     correlation_id: None,
                 }),
             )
@@ -428,10 +416,6 @@ mod tests {
             (
                 ServerError::ServiceUnavailable("down".into()),
                 StatusCode::SERVICE_UNAVAILABLE,
-            ),
-            (
-                ServerError::SchemaValidation(vec![]),
-                StatusCode::UNPROCESSABLE_ENTITY,
             ),
             (
                 ServerError::Core(CoreError::SchemaValidation(vec![])),

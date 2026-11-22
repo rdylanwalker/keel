@@ -42,9 +42,6 @@ const PREVIEW_WORKSPACE_RBAC_YAML: &str =
 const SOURCE_CONTROLLER_ARTIFACTS_POLICY_YAML: &str = include_str!(
     "../../../../../deploy/bootstrap/manifests/source-controller-artifacts-network-policy.yaml"
 );
-/// `flux-system` NetworkPolicy guarding the `source-controller` artifact server (port 9090).
-#[cfg(test)]
-pub(crate) const SOURCE_CONTROLLER_ARTIFACTS_POLICY: &str = "allow-source-controller-artifacts";
 
 /// Retries `kubectl apply` while Kyverno's admission webhook is still starting.
 async fn apply_with_webhook_retry(target: KubeTarget<'_>, yaml: &str) -> Result<(), CliError> {
@@ -522,12 +519,12 @@ pub(crate) async fn install_stage0_core_addons(
         .management_stack
         .spec
         .service_account_name
-        .clone()
-        .unwrap_or_else(|| "keel-management-pko".to_string());
+        .as_deref()
+        .unwrap_or(keel_pko::DEFAULT_MANAGEMENT_SERVICE_ACCOUNT);
     target
         .apply(&render_manifest(
             MANAGEMENT_PKO_RBAC_YAML,
-            &[("MGMT_SA", mgmt_sa_name.as_str())],
+            &[("MGMT_SA", mgmt_sa_name)],
         )?)
         .await?;
     apply_with_webhook_retry(target, &artifacts.management_stack.to_yaml()?).await?;
@@ -591,6 +588,9 @@ pub(crate) fn stage0_flux_sync_manifests(
 mod tests {
     use super::*;
     use serde_json::Value;
+
+    /// `flux-system` NetworkPolicy guarding the `source-controller` artifact server (port 9090).
+    const SOURCE_CONTROLLER_ARTIFACTS_POLICY: &str = "allow-source-controller-artifacts";
 
     fn docs(yaml: &str) -> Vec<Value> {
         yaml.split("\n---\n")

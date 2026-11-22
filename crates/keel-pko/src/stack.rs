@@ -26,8 +26,9 @@ pub const IN_CLUSTER_S3_BACKEND_URL: &str = "s3://pulumi-state?endpoint=s3-state
 
 pub use keel_core::{FLUX_SYSTEM_NAMESPACE, KEEL_PREVIEWS_NAMESPACE};
 
-/// Default outbound pull-polling interval for NAT/firewall resilience (`AGENTS.md` §3.1).
-pub const DEFAULT_FLUX_POLL_INTERVAL: &str = "1m";
+/// Default outbound pull-polling interval for NAT/firewall resilience (`AGENTS.md` §3.1); the
+/// Flux-facing name of [`keel_core::DEFAULT_POLL_INTERVAL`].
+pub const DEFAULT_FLUX_POLL_INTERVAL: &str = keel_core::DEFAULT_POLL_INTERVAL;
 /// Default read-only ServiceAccount used by ephemeral preview workspace pods (`SDD.md` §4.2).
 pub const DEFAULT_PREVIEW_SERVICE_ACCOUNT: &str = "keel-preview-readonly";
 /// Default ServiceAccount used by the seed management cluster core stack.
@@ -1240,7 +1241,6 @@ pub struct ManagementCoreStackParams {
     pub backend_url: String,
     pub git_source_name: String,
     pub repo_dir: String,
-    pub service_account_name: Option<String>,
     pub config: BTreeMap<String, String>,
     pub env_refs: BTreeMap<String, PkoEnvRef>,
     /// Namespace-local Secret holding the state passphrase (default [`PULUMI_PASSPHRASE_SECRET_NAME`]).
@@ -1260,7 +1260,6 @@ impl ManagementCoreStackParams {
             backend_url: backend_url.into(),
             git_source_name: git_source_name.into(),
             repo_dir: repo_dir.into(),
-            service_account_name: None,
             config: BTreeMap::new(),
             env_refs: BTreeMap::new(),
             passphrase_secret_name: PULUMI_PASSPHRASE_SECRET_NAME.to_string(),
@@ -1282,7 +1281,6 @@ pub struct EphemeralPreviewParams {
     pub repo_dir: String,
     pub pulumi_stack_name: String,
     pub backend_url: String,
-    pub preview_service_account: Option<String>,
     /// `keel-previews` Secret mirroring the tenant's read-only Git credentials (`gitAuth`).
     pub git_secret_name: Option<String>,
     /// Keys present in [`Self::git_secret_name`] (selects the PKO `gitAuth` mode; inferred from the
@@ -1333,7 +1331,6 @@ impl EphemeralPreviewParams {
             repo_dir: repo_dir.into(),
             pulumi_stack_name: pulumi_stack_name.into(),
             backend_url: backend_url.into(),
-            preview_service_account: None,
             git_secret_name: None,
             git_secret_keys: BTreeSet::new(),
             tenant_repo_url: None,
@@ -1608,7 +1605,6 @@ pub struct TenantStackParams {
     /// The tenant's own Git source (platform-written `tenants/<id>/git-repository.yaml`), cloned
     /// directly by the workspace pod with the tenant's read-only credentials (`gitAuth`).
     pub git_source: PkoGitSource,
-    pub service_account_name: Option<String>,
     pub config: BTreeMap<String, String>,
     pub env_refs: BTreeMap<String, PkoEnvRef>,
     pub secrets_ref: BTreeMap<String, PkoEnvRef>,
@@ -1634,7 +1630,6 @@ impl TenantStackParams {
             pulumi_stack_name: pulumi_stack_name.into(),
             backend_url: backend_url.into(),
             git_source,
-            service_account_name: None,
             config: BTreeMap::new(),
             env_refs: BTreeMap::new(),
             secrets_ref: BTreeMap::new(),
@@ -1697,14 +1692,6 @@ pub fn synthesize_management_core_stack(
     validate_repo_dir(&params.repo_dir)?;
     validate_k8s_name("passphrase_secret_name", &params.passphrase_secret_name)?;
 
-    let sa = match &params.service_account_name {
-        Some(custom) => {
-            validate_k8s_name("service_account_name", custom)?;
-            custom.clone()
-        }
-        None => DEFAULT_MANAGEMENT_SERVICE_ACCOUNT.to_string(),
-    };
-
     let mut labels = BTreeMap::new();
     labels.insert(LABEL_MANAGED_BY.to_string(), "keel".to_string());
     labels.insert(LABEL_STACK_ROLE.to_string(), "management-core".to_string());
@@ -1726,7 +1713,7 @@ pub fn synthesize_management_core_stack(
         },
         spec: PkoStackSpec {
             stack: params.pulumi_stack_name.clone(),
-            service_account_name: Some(sa),
+            service_account_name: Some(DEFAULT_MANAGEMENT_SERVICE_ACCOUNT.to_string()),
             backend: Some(params.backend_url.clone()),
             flux_source: Some(PkoFluxSource::git_repository(
                 &params.git_source_name,
@@ -1760,14 +1747,6 @@ pub fn synthesize_ephemeral_preview(
     validate_repo_dir(&params.repo_dir)?;
     validate_non_empty("pulumi_stack_name", &params.pulumi_stack_name)?;
     validate_non_empty("backend_url", &params.backend_url)?;
-
-    let preview_sa = match &params.preview_service_account {
-        Some(sa) => {
-            validate_k8s_name("preview_service_account", sa)?;
-            sa.clone()
-        }
-        None => DEFAULT_PREVIEW_SERVICE_ACCOUNT.to_string(),
-    };
 
     // Without a resolved tenant source the preview is synthesized only (never applied): leave
     // `projectRepo` unset rather than putting a placeholder (e.g. the control-plane remote) in it.
@@ -1842,7 +1821,7 @@ pub fn synthesize_ephemeral_preview(
         },
         spec: PkoStackSpec {
             stack: params.pulumi_stack_name.clone(),
-            service_account_name: Some(preview_sa),
+            service_account_name: Some(DEFAULT_PREVIEW_SERVICE_ACCOUNT.to_string()),
             // OPEN-9b: every tenant preview runs against the tenant state prefix (the only one its
             // scoped identity can reach), for existing and brand-new stacks alike.
             backend: Some(tenant_scoped_preview_backend(
@@ -1899,14 +1878,6 @@ pub fn synthesize_tenant_stack(params: &TenantStackParams) -> Result<PkoStack, P
 
     let tenant_namespace = format!("tenant-{}", params.tenant);
 
-    let service_account = match &params.service_account_name {
-        Some(sa) => {
-            validate_k8s_name("service_account_name", sa)?;
-            sa.clone()
-        }
-        None => format!("tenant-{}-sa", params.tenant),
-    };
-
     let mut labels = BTreeMap::new();
     labels.insert(LABEL_MANAGED_BY.to_string(), "keel".to_string());
     labels.insert(LABEL_STACK_ROLE.to_string(), "tenant".to_string());
@@ -1926,7 +1897,7 @@ pub fn synthesize_tenant_stack(params: &TenantStackParams) -> Result<PkoStack, P
         },
         spec: PkoStackSpec {
             stack: params.pulumi_stack_name.clone(),
-            service_account_name: Some(service_account),
+            service_account_name: Some(format!("tenant-{}-sa", params.tenant)),
             backend: Some(params.backend_url.clone()),
             flux_source: None,
             git_source: Some(params.git_source.clone()),
@@ -2268,14 +2239,6 @@ mod tests {
 
         let stack = synthesize_management_core_stack(&params).expect("valid management stack");
 
-        let mut custom_sa_params = params.clone();
-        custom_sa_params.service_account_name = Some("custom.mgmt-sa".to_string());
-        let custom_sa_stack =
-            synthesize_management_core_stack(&custom_sa_params).expect("valid custom sa stack");
-        assert_eq!(
-            custom_sa_stack.spec.service_account_name.as_deref(),
-            Some("custom.mgmt-sa")
-        );
         assert_eq!(stack.api_version, "pulumi.com/v1");
         assert_eq!(stack.kind, "Stack");
         assert_eq!(stack.metadata.name, "management-cluster-core");
@@ -2343,15 +2306,6 @@ mod tests {
         let mut params = params;
         params.repo_url = Some("https://forge.internal/keel/infra-gitops.git".to_string());
         params.git_secret_name = Some("forge-git-auth".to_string());
-
-        let mut custom_preview_params = params.clone();
-        custom_preview_params.preview_service_account = Some("preview-ro.sa".to_string());
-        let custom_preview =
-            synthesize_ephemeral_preview(&custom_preview_params).expect("valid custom preview sa");
-        assert_eq!(
-            custom_preview.stack.spec.service_account_name.as_deref(),
-            Some("preview-ro.sa")
-        );
 
         let mut labelled = params.clone();
         labelled.provider = Some("kubernetes".to_string());
@@ -2475,13 +2429,6 @@ mod tests {
         assert!(!stack.is_protected());
         assert!(!stack.is_preview());
 
-        params.service_account_name = Some("custom-analytics-sa".to_string());
-        let stack_custom_sa = synthesize_tenant_stack(&params).expect("valid tenant stack");
-        assert_eq!(
-            stack_custom_sa.spec.service_account_name.as_deref(),
-            Some("custom-analytics-sa")
-        );
-
         params.docker_host =
             Some("tcp://keel-docker-proxy.flux-system.svc.cluster.local:2375".to_string());
         let stack_docker =
@@ -2553,7 +2500,7 @@ mod tests {
         bad_preview.repo_dir = "../secrets".to_string();
         assert!(synthesize_ephemeral_preview(&bad_preview).is_err());
 
-        // Cross-namespace slash in service_account_name
+        // Reserved management stack name in tenant namespace
         let mut bad_tenant = TenantStackParams::new(
             "alpha",
             "db",
@@ -2561,11 +2508,6 @@ mod tests {
             "s3://pulumi-state",
             test_git_source("tenants/alpha/infra/db"),
         );
-        bad_tenant.service_account_name = Some("other-ns/sa".to_string());
-        assert!(synthesize_tenant_stack(&bad_tenant).is_err());
-
-        // Reserved management stack name in tenant namespace
-        bad_tenant.service_account_name = None;
         bad_tenant.name = MANAGEMENT_CORE_STACK_NAME.to_string();
         assert!(synthesize_tenant_stack(&bad_tenant).is_err());
 

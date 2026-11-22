@@ -7,21 +7,20 @@
 
 use std::time::Duration;
 
+use async_trait::async_trait;
 use hmac::{Hmac, KeyInit, Mac};
-use keel_core::{
-    FLUX_SYSTEM_NAMESPACE, KEEL_PREVIEWS_NAMESPACE, KEEL_SYSTEM_NAMESPACE, generate_admin_password,
-};
-use keel_kube::S3_CREDENTIALS_SECRET_NAME;
-use keel_kube::tenant::{
-    TENANT_S3_CREDENTIALS_SECRET_NAME, build_tenant_s3_credentials_secret,
-    seaweedfs_configure_tenant_identity_script,
+use k8s_openapi::api::core::v1::Secret;
+use keel_core::{FLUX_SYSTEM_NAMESPACE, KEEL_PREVIEWS_NAMESPACE, KEEL_SYSTEM_NAMESPACE};
+use keel_kube::secret_store::SecretBackend;
+use keel_kube::{
+    KubeError, S3_CREDENTIALS_SECRET_NAME, SeaweedFsIdentityOps, TenantS3ProvisionOutcome,
 };
 use keel_pko::IN_CLUSTER_S3_BACKEND_URL;
 use serde_json::json;
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 use zeroize::Zeroizing;
 
-use super::kube::{KubeTarget, TempPortForward, start_port_forward};
+use super::kube::{KubeTarget, SecretWrite, TempPortForward, start_port_forward};
 use crate::commands::CliError;
 
 /// Default S3 region used for SeaweedFS (matches the in-cluster PKO backend URL).
@@ -191,22 +190,12 @@ fn hmac(key: &[u8], data: &[u8]) -> Vec<u8> {
     mac.finalize().into_bytes().to_vec()
 }
 
-fn sha256_hex(data: &[u8]) -> String {
-    hex::encode(Sha256::digest(data))
-}
-
-fn uri_encode(s: &str, encode_slash: bool) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char)
-            }
-            b'/' if !encode_slash => out.push('/'),
-            _ => out.push_str(&format!("%{b:02X}")),
-        }
-    }
-    out
+/// SigV4 URI-encodes an object key: every byte except RFC 3986 unreserved characters and `/`.
+fn uri_encode_key(key: &str) -> String {
+    key.split('/')
+        .map(keel_core::percent_encode)
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// Minimal path-style S3 client (SigV4) for SeaweedFS / any S3-compatible endpoint.
@@ -253,12 +242,16 @@ impl S3Client {
         let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
         let date = now.format("%Y%m%d").to_string();
         let canonical_uri = match key {
-            Some(k) => format!("/{}/{}", uri_encode(bucket, true), uri_encode(k, false)),
-            None => format!("/{}", uri_encode(bucket, true)),
+            Some(k) => format!(
+                "/{}/{}",
+                keel_core::percent_encode(bucket),
+                uri_encode_key(k)
+            ),
+            None => format!("/{}", keel_core::percent_encode(bucket)),
         };
         let mut q: Vec<(String, String)> = query
             .iter()
-            .map(|(k, v)| (uri_encode(k, true), uri_encode(v, true)))
+            .map(|(k, v)| (keel_core::percent_encode(k), keel_core::percent_encode(v)))
             .collect();
         q.sort();
         let canonical_query = q
@@ -266,7 +259,7 @@ impl S3Client {
             .map(|(k, v)| format!("{k}={v}"))
             .collect::<Vec<_>>()
             .join("&");
-        let payload_hash = sha256_hex(&body);
+        let payload_hash = keel_core::sha256_hex(&body);
         let host = &self.endpoint.authority;
         let canonical_headers =
             format!("host:{host}\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{amz_date}\n");
@@ -278,7 +271,7 @@ impl S3Client {
         let scope = format!("{date}/{}/s3/aws4_request", self.region);
         let string_to_sign = format!(
             "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
-            sha256_hex(canonical_request.as_bytes())
+            keel_core::sha256_hex(canonical_request.as_bytes())
         );
         let k_secret = Zeroizing::new(format!("AWS4{}", self.creds.secret_key.as_str()));
         let k_date = hmac(k_secret.as_bytes(), date.as_bytes());
@@ -581,73 +574,186 @@ pub(crate) async fn start_seaweedfs_s3_port_forward(
     .await
 }
 
+/// `kubectl`-backed [`SecretBackend`] + [`SeaweedFsIdentityOps`] so Stage 0 provisions tenant S3
+/// identities through the same [`keel_kube::provision_tenant_s3_identity_with`] code path as
+/// `keel-server` (create-if-absent keys, pending annotation until SeaweedFS accepted them).
+///
+/// Secret manifests and `weed shell` scripts only ever travel over `kubectl` stdin, and Secrets
+/// are written with `create`/`replace` (never `apply`, whose last-applied annotation would copy
+/// the key material) (`NFR-SEC-05`, `NFR-SEC-06`).
+#[derive(Clone, Copy)]
+struct KubectlS3IdentityOps<'a> {
+    target: KubeTarget<'a>,
+}
+
+fn kubectl_failure(err: CliError) -> KubeError {
+    KubeError::Unavailable(err.to_string())
+}
+
+/// Parses `kubectl get secret --ignore-not-found -o json` output (empty: not found).
+fn parse_kubectl_secret(stdout: &[u8]) -> Result<Option<Secret>, KubeError> {
+    let stdout = Zeroizing::new(String::from_utf8_lossy(stdout).into_owned());
+    if stdout.trim().is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(serde_json::from_str(&stdout)?))
+}
+
+impl KubectlS3IdentityOps<'_> {
+    async fn namespace_exists_impl(&self, namespace: &str) -> Result<bool, KubeError> {
+        let out = self
+            .target
+            .output(&[
+                "get",
+                "namespace",
+                namespace,
+                "--ignore-not-found",
+                "-o",
+                "name",
+            ])
+            .await
+            .map_err(kubectl_failure)?;
+        Ok(!out.trim().is_empty())
+    }
+
+    /// `kubectl -n <namespace> create|replace -f - -o json` via [`KubeTarget::write_secret`].
+    /// Returns the stored Secret, or `None` when `create` hit an existing object.
+    async fn write_secret(
+        &self,
+        verb: SecretWrite,
+        namespace: &str,
+        secret: &Secret,
+    ) -> Result<Option<Secret>, KubeError> {
+        let manifest = Zeroizing::new(serde_json::to_vec(secret)?);
+        let Some(stdout) = self
+            .target
+            .write_secret(&manifest, verb, Some(namespace), None, true)
+            .await
+            .map_err(kubectl_failure)?
+        else {
+            return Ok(None);
+        };
+        let stdout = Zeroizing::new(stdout);
+        parse_kubectl_secret(&stdout)?.map(Some).ok_or_else(|| {
+            KubeError::Unavailable(format!("`kubectl {}` returned no Secret", verb.as_str()))
+        })
+    }
+}
+
+#[async_trait]
+impl SecretBackend for KubectlS3IdentityOps<'_> {
+    async fn get_secret(&self, namespace: &str, name: &str) -> Result<Option<Secret>, KubeError> {
+        let stdout = Zeroizing::new(
+            self.target
+                .output(&[
+                    "get",
+                    "secret",
+                    name,
+                    "-n",
+                    namespace,
+                    "--ignore-not-found",
+                    "-o",
+                    "json",
+                ])
+                .await
+                .map_err(kubectl_failure)?,
+        );
+        parse_kubectl_secret(stdout.as_bytes())
+    }
+
+    async fn upsert_secret(&self, namespace: &str, secret: Secret) -> Result<Secret, KubeError> {
+        if let Some(created) = self
+            .write_secret(SecretWrite::Create, namespace, &secret)
+            .await?
+        {
+            return Ok(created);
+        }
+        self.write_secret(SecretWrite::Replace, namespace, &secret)
+            .await?
+            .ok_or_else(|| KubeError::Unavailable("`kubectl replace` returned no Secret".into()))
+    }
+
+    async fn create_secret_if_absent(
+        &self,
+        namespace: &str,
+        secret: Secret,
+    ) -> Result<Secret, KubeError> {
+        if let Some(created) = self
+            .write_secret(SecretWrite::Create, namespace, &secret)
+            .await?
+        {
+            return Ok(created);
+        }
+        let name = secret.metadata.name.as_deref().unwrap_or_default();
+        self.get_secret(namespace, name).await?.ok_or_else(|| {
+            KubeError::Conflict(format!(
+                "`{namespace}/{name}` already existed but disappeared before it could be read"
+            ))
+        })
+    }
+
+    async fn namespace_exists(&self, namespace: &str) -> Result<bool, KubeError> {
+        self.namespace_exists_impl(namespace).await
+    }
+}
+
+#[async_trait]
+impl SeaweedFsIdentityOps for KubectlS3IdentityOps<'_> {
+    async fn namespace_exists(&self, namespace: &str) -> Result<bool, KubeError> {
+        self.namespace_exists_impl(namespace).await
+    }
+
+    async fn run_weed_shell(&self, script: &str) -> Result<(), KubeError> {
+        // The output may echo the keys: discard it.
+        run_seaweedfs_shell_script(self.target, script)
+            .await
+            .map(drop)
+            .map_err(kubectl_failure)
+    }
+}
+
 /// Provisions a least-privilege SeaweedFS identity for `tenant-<id>` scoped to
 /// `<bucket>/tenants/<id>/*` (idempotent: existing keys are reused), plus the tenant's Pulumi
-/// state passphrase (`tenant-<id>/keel-pulumi-passphrase`, created once, never rotated).
+/// state passphrase (`tenant-<id>/keel-pulumi-passphrase`, created once, never rotated), via
+/// [`keel_kube::provision_tenant_s3_identity_with`].
 pub(crate) async fn provision_tenant_s3_identity(
     target: KubeTarget<'_>,
     tenant_id: &str,
 ) -> Result<(), CliError> {
-    let tenant_ns = format!("tenant-{tenant_id}");
-    super::state::ensure_pulumi_passphrase_secret(target, &tenant_ns).await?;
-    let existing_access = target
-        .read_secret_key(&tenant_ns, TENANT_S3_CREDENTIALS_SECRET_NAME, "accessKey")
-        .await;
-    let existing_secret = target
-        .read_secret_key(&tenant_ns, TENANT_S3_CREDENTIALS_SECRET_NAME, "secretKey")
-        .await;
-    let (access_key, secret_key) = match (existing_access, existing_secret) {
-        (Some(a), Some(s)) => (a, Zeroizing::new(s)),
-        _ => (
-            format!("KEEL{}", generate_admin_password()).to_uppercase(),
-            Zeroizing::new(format!(
-                "{}{}",
-                generate_admin_password(),
-                generate_admin_password()
-            )),
-        ),
-    };
-
-    let script = Zeroizing::new(seaweedfs_configure_tenant_identity_script(
-        crate::cli::DEFAULT_S3_BUCKET,
-        tenant_id,
-        &access_key,
-        &secret_key,
-    )?);
-    run_seaweedfs_shell_script(target, &script).await?;
-
-    let scoped = build_tenant_s3_credentials_secret(
-        tenant_id,
-        &access_key,
-        &secret_key,
+    let ops = KubectlS3IdentityOps { target };
+    match keel_kube::provision_tenant_s3_identity_with(
+        &ops,
+        &ops,
         IN_CLUSTER_S3_BACKEND_URL,
-    )?;
-    target.apply(&serde_yml::to_string(&scoped)?).await?;
-
-    let mirror = json!({
-        "apiVersion": "v1",
-        "kind": "Secret",
-        "metadata": {
-            "name": S3_CREDENTIALS_SECRET_NAME,
-            "namespace": tenant_ns,
-            "labels": {
-                "app.kubernetes.io/managed-by": "keel",
-                "keel.io/secret-kind": keel_kube::tenant::TENANT_S3_CREDENTIALS_SECRET_KIND,
-                "keel.io/tenant": tenant_id,
-            },
-        },
-        "type": "Opaque",
-        "stringData": {
-            "accessKey": access_key,
-            "secretKey": secret_key.as_str(),
-        },
-    });
-    target.apply(&serde_yml::to_string(&mirror)?).await
+        tenant_id,
+    )
+    .await?
+    {
+        TenantS3ProvisionOutcome::NamespaceMissing => Err(CliError::Execution(format!(
+            "namespace `tenant-{tenant_id}` does not exist; cannot provision its S3 identity"
+        ))),
+        TenantS3ProvisionOutcome::Created | TenantS3ProvisionOutcome::Reused => Ok(()),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kubectl_secret_output_parsing() {
+        assert!(parse_kubectl_secret(b"").unwrap().is_none());
+        assert!(parse_kubectl_secret(b"  \n").unwrap().is_none());
+        let secret = parse_kubectl_secret(
+            br#"{"apiVersion":"v1","kind":"Secret","metadata":{"name":"s","namespace":"tenant-a",
+            "annotations":{"keel.io/pending":"true"}},"data":{"accessKey":"QUJD"}}"#,
+        )
+        .unwrap()
+        .expect("secret");
+        assert_eq!(secret.metadata.name.as_deref(), Some("s"));
+        assert_eq!(secret.data.unwrap()["accessKey"].0, b"ABC");
+        assert!(parse_kubectl_secret(b"not json").is_err());
+    }
 
     #[test]
     fn endpoint_parsing_and_backend_url_parity_with_in_cluster_stack() {
@@ -704,8 +810,8 @@ mod tests {
             hex::encode(k_signing),
             "f4780e2d9f65fa895f9c67b32ce1baf0b0d8a43505a000a1a9e090d414db404d"
         );
-        assert_eq!(uri_encode("a b/c~", false), "a%20b/c~");
-        assert_eq!(uri_encode("a/b", true), "a%2Fb");
+        assert_eq!(uri_encode_key("a b/c~"), "a%20b/c~");
+        assert_eq!(keel_core::percent_encode("a/b"), "a%2Fb");
         assert!(is_safe_object_key("stage0/keel-mgmt/config/Pulumi.x.yaml"));
         assert!(!is_safe_object_key("stage0/../x"));
         assert!(!is_safe_object_key("/abs"));

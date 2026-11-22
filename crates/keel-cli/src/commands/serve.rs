@@ -234,16 +234,12 @@ fn remote_bootstrap_runner(url: &str, token: Option<&str>, username: Option<&str
     }
 }
 
-/// Builds a configured stateless [`AppState`] from [`ServeArgs`] (`SDD.md` §6.3, §7.2).
-pub async fn build_serve_state(args: &ServeArgs) -> Result<(AppState, Option<String>), CliError> {
-    let (state, token, _pf) = build_serve_state_with_forward(args, false).await?;
-    Ok((state, token))
-}
-
-async fn build_serve_state_with_forward(
+/// Builds a configured stateless [`AppState`] from [`ServeArgs`] (`SDD.md` §6.3, §7.2), plus any
+/// in-cluster port-forwards that must stay alive for as long as the state is in use.
+pub(crate) async fn build_serve_state(
     args: &ServeArgs,
     enable_in_cluster_port_forward: bool,
-) -> Result<(AppState, Option<String>, Vec<TempPortForward>), CliError> {
+) -> Result<(AppState, Vec<TempPortForward>), CliError> {
     if args.bind.trim().is_empty() || !args.bind.contains(':') {
         return Err(CliError::Validation(format!(
             "bind address must be in '<host>:<port>' format, got '{}'",
@@ -708,7 +704,7 @@ async fn build_serve_state_with_forward(
         }
     }
 
-    Ok((state, None, port_forwards))
+    Ok((state, port_forwards))
 }
 
 /// Binds `keel-server` on `args.bind` and runs until `shutdown` resolves.
@@ -716,7 +712,7 @@ pub async fn execute_serve_until<F>(args: &ServeArgs, shutdown: F) -> Result<Soc
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    let (state, _unused, _forge_pf) = build_serve_state_with_forward(args, true).await?;
+    let (state, _forge_pf) = build_serve_state(args, true).await?;
     // Restart-/replica-safe preview GC + result publication driven by cluster state and forge
     // PR states (OPEN-10). No-op without a live cluster.
     let preview_reconciler = keel_server::preview_lifecycle::spawn_preview_reconciler(
