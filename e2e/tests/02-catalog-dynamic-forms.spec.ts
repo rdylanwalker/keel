@@ -129,7 +129,7 @@ test.describe('02 - Catalog Dynamic Forms & PR Proposal Generation', () => {
     );
     const hr = showFile(created.branch, `${dir}/helmrelease.yaml`);
     expect(hr).toContain('chart: podinfo');
-    expect(hr).toContain('version: "6.5.0"');
+    expect(hr).toMatch(/version: "?6\.5\.0"?/);
     expect(hr).not.toContain(secret);
     expect(hr).toContain('valuesFrom:');
     expect(hr).toContain(`name: ${name}-secrets`);
