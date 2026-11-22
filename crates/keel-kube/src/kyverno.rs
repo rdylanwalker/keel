@@ -867,6 +867,9 @@ pub struct PlatformOwnedWriter {
     /// `Some(kind)`: allowed only for objects of this kind (the identity's own finalizer and
     /// metadata writes); `None`: allowed for every platform-owned kind.
     pub kind: Option<&'static str>,
+    /// Extra CEL the request must also satisfy (only with `kind`), e.g.
+    /// [`CEL_KUSTOMIZATION_FLUX_FINALIZER_ONLY_UPDATE`]; `None`: any write to that kind.
+    pub only_if: Option<&'static str>,
     /// Why the identity needs write access (audit trail; asserted by tests).
     pub reason: &'static str,
 }
@@ -875,11 +878,12 @@ pub struct PlatformOwnedWriter {
 /// `system:masters` / `kubeadm:cluster-admins` (break-glass cluster admins) and the built-in
 /// `kube-system` controllers (garbage collection, namespace deletion).
 ///
-/// `kustomize-controller` is deliberately absent: tenant baselines are applied by `keel-tenants`
-/// impersonating `keel-tenant-reconciler`, no platform-owned `Kustomization` exists, and the
+/// `kustomize-controller` is a writer only for the per-tenant repository root `Kustomization`
+/// (`keel-tenant-root`) and only for adding or removing its own `finalizers.fluxcd.io`
+/// ([`CEL_KUSTOMIZATION_FLUX_FINALIZER_ONLY_UPDATE`]): tenant baselines are applied by `keel-tenants` impersonating `keel-tenant-reconciler`, and the
 /// Flux-managed keel-server add-on does not ship the `tenant-default/keel-server` RoleBinding. As
-/// a writer it would let every `flux-system` Kustomization (core add-ons, rauthy, keel-server, ...)
-/// rewrite or delete any tenant's baseline.
+/// an unrestricted writer it would let every `flux-system` Kustomization (core add-ons, rauthy,
+/// keel-server, ...) rewrite or delete any tenant's baseline.
 pub fn platform_owned_writers() -> Vec<PlatformOwnedWriter> {
     vec![
         PlatformOwnedWriter {
@@ -887,23 +891,33 @@ pub fn platform_owned_writers() -> Vec<PlatformOwnedWriter> {
                 "system:serviceaccount:{FLUX_SYSTEM_NAMESPACE}:{TENANT_RECONCILER_SERVICE_ACCOUNT}"
             ),
             kind: None,
-            reason: "`keel-tenants` applies and prunes `tenants/<id>/` (tenant baseline, `keel-gitops`) as this identity",
+            only_if: None,
+            reason: "`keel-tenants` applies and prunes `tenants/<id>/` (tenant baseline, `keel-gitops`, `keel-tenant-root`) as this identity",
         },
         PlatformOwnedWriter {
             username: format!(
                 "system:serviceaccount:{KEEL_SERVER_NAMESPACE}:{KEEL_SERVER_SERVICE_ACCOUNT}"
             ),
             kind: None,
+            only_if: None,
             reason: "keel-server provisions tenant baselines (tenant onboarding API)",
         },
         PlatformOwnedWriter {
             username: format!("system:serviceaccount:{FLUX_SYSTEM_NAMESPACE}:source-controller"),
             kind: Some("GitRepository"),
+            only_if: None,
             reason: "source-controller adds and removes its finalizer on the platform-owned `keel-gitops` GitRepository",
+        },
+        PlatformOwnedWriter {
+            username: format!("system:serviceaccount:{FLUX_SYSTEM_NAMESPACE}:kustomize-controller"),
+            kind: Some("Kustomization"),
+            only_if: Some(CEL_KUSTOMIZATION_FLUX_FINALIZER_ONLY_UPDATE),
+            reason: "kustomize-controller adds and removes its finalizer on the platform-owned `keel-tenant-root` Kustomization (nothing else)",
         },
         PlatformOwnedWriter {
             username: "system:kube-controller-manager".to_string(),
             kind: None,
+            only_if: None,
             reason: "garbage collection and namespace deletion",
         },
     ]
@@ -916,17 +930,36 @@ pub fn platform_owned_writers() -> Vec<PlatformOwnedWriter> {
 /// or re-parent (garbage-collection) the source.
 pub const CEL_GITREPOSITORY_RECONCILE_REQUEST_ONLY: &str = "request.operation == 'UPDATE' && request.kind.group == 'source.toolkit.fluxcd.io' && request.kind.kind == 'GitRepository' && object != null && oldObject != null && (has(object.spec) ? object.spec : {}) == (has(oldObject.spec) ? oldObject.spec : {}) && (has(object.metadata.labels) ? object.metadata.labels : {}) == (has(oldObject.metadata.labels) ? oldObject.metadata.labels : {}) && (has(object.metadata.finalizers) ? object.metadata.finalizers : []) == (has(oldObject.metadata.finalizers) ? oldObject.metadata.finalizers : []) && (has(object.metadata.ownerReferences) ? object.metadata.ownerReferences : []) == (has(oldObject.metadata.ownerReferences) ? oldObject.metadata.ownerReferences : []) && (has(object.metadata.annotations) ? object.metadata.annotations : {}).all(k, k == 'reconcile.fluxcd.io/requestedAt' || (has(oldObject.metadata.annotations) && k in oldObject.metadata.annotations && oldObject.metadata.annotations[k] == object.metadata.annotations[k])) && (has(oldObject.metadata.annotations) ? oldObject.metadata.annotations : {}).all(k, k == 'reconcile.fluxcd.io/requestedAt' || (has(object.metadata.annotations) && k in object.metadata.annotations))";
 
+/// CEL admitting an UPDATE of a platform-owned `Kustomization` (the per-tenant repository root
+/// `keel-tenant-root`) that only sets or changes `reconcile.fluxcd.io/requestedAt` (`flux
+/// reconcile kustomization keel-tenant-root -n tenant-<id>`); same rules as
+/// [`CEL_GITREPOSITORY_RECONCILE_REQUEST_ONLY`].
+pub const CEL_KUSTOMIZATION_RECONCILE_REQUEST_ONLY: &str = "request.operation == 'UPDATE' && request.kind.group == 'kustomize.toolkit.fluxcd.io' && request.kind.kind == 'Kustomization' && object != null && oldObject != null && (has(object.spec) ? object.spec : {}) == (has(oldObject.spec) ? oldObject.spec : {}) && (has(object.metadata.labels) ? object.metadata.labels : {}) == (has(oldObject.metadata.labels) ? oldObject.metadata.labels : {}) && (has(object.metadata.finalizers) ? object.metadata.finalizers : []) == (has(oldObject.metadata.finalizers) ? oldObject.metadata.finalizers : []) && (has(object.metadata.ownerReferences) ? object.metadata.ownerReferences : []) == (has(oldObject.metadata.ownerReferences) ? oldObject.metadata.ownerReferences : []) && (has(object.metadata.annotations) ? object.metadata.annotations : {}).all(k, k == 'reconcile.fluxcd.io/requestedAt' || (has(oldObject.metadata.annotations) && k in oldObject.metadata.annotations && oldObject.metadata.annotations[k] == object.metadata.annotations[k])) && (has(oldObject.metadata.annotations) ? oldObject.metadata.annotations : {}).all(k, k == 'reconcile.fluxcd.io/requestedAt' || (has(object.metadata.annotations) && k in object.metadata.annotations))";
+
+/// CEL admitting an UPDATE of a Flux `kustomize.toolkit.fluxcd.io` `Kustomization` that only
+/// adds or removes kustomize-controller's own `finalizers.fluxcd.io` finalizer: spec, labels,
+/// annotations and owner references unchanged, and every other finalizer kept as it is (the
+/// symmetric difference of the old and new finalizer lists is at most `finalizers.fluxcd.io`).
+/// A foreign finalizer could block deletion of `keel-tenant-root`; stripping someone else's (or,
+/// by anyone but kustomize-controller, Flux's) would skip its cleanup.
+pub const CEL_KUSTOMIZATION_FLUX_FINALIZER_ONLY_UPDATE: &str = "request.operation == 'UPDATE' && request.kind.group == 'kustomize.toolkit.fluxcd.io' && request.kind.kind == 'Kustomization' && object != null && oldObject != null && (has(object.spec) ? object.spec : {}) == (has(oldObject.spec) ? oldObject.spec : {}) && (has(object.metadata.labels) ? object.metadata.labels : {}) == (has(oldObject.metadata.labels) ? oldObject.metadata.labels : {}) && (has(object.metadata.annotations) ? object.metadata.annotations : {}) == (has(oldObject.metadata.annotations) ? oldObject.metadata.annotations : {}) && (has(object.metadata.ownerReferences) ? object.metadata.ownerReferences : []) == (has(oldObject.metadata.ownerReferences) ? oldObject.metadata.ownerReferences : []) && (has(object.metadata.finalizers) ? object.metadata.finalizers : []).all(f, f == 'finalizers.fluxcd.io' || f in (has(oldObject.metadata.finalizers) ? oldObject.metadata.finalizers : [])) && (has(oldObject.metadata.finalizers) ? oldObject.metadata.finalizers : []).all(f, f == 'finalizers.fluxcd.io' || f in (has(object.metadata.finalizers) ? object.metadata.finalizers : []))";
+
 /// Generates `ValidatingPolicy/protect-platform-owned-tenant-objects` (`policies.kyverno.io/v1`).
 ///
 /// Objects the platform writes for a tenant (namespace, ServiceAccount, quota, LimitRange,
-/// NetworkPolicies, RoleBindings, the `keel-gitops` GitRepository stub) carry
-/// `keel.io/platform-owned: "true"`. Creating, changing (including removing the label) or deleting
-/// such an object is reserved for `keel-tenant-reconciler`, `keel-server`, `source-controller` (its
-/// own `GitRepository` finalizer only), the `kube-system` controllers and break-glass cluster
-/// admins ([`platform_owned_writers`]); tenant identities (which hold `admin` in their namespace)
-/// and every other `flux-system` identity are denied. The one exemption is a reconcile request on
-/// the `keel-gitops` GitRepository ([`CEL_GITREPOSITORY_RECONCILE_REQUEST_ONLY`]), so `flux
-/// reconcile source git` keeps working for anyone RBAC lets patch it. Fails closed.
+/// NetworkPolicies, RoleBindings, the `keel-gitops` GitRepository stub and, for tenants with their
+/// own repository, the `keel-tenant-root` Kustomization and the cluster-only
+/// `keel-gitops-credentials` Secret) carry `keel.io/platform-owned: "true"`. Creating, changing
+/// (including removing the label) or deleting such an object is reserved for
+/// `keel-tenant-reconciler`, `keel-server`, `source-controller` (its own `GitRepository`
+/// finalizer only), `kustomize-controller` (only adding/removing `finalizers.fluxcd.io` on
+/// Flux `Kustomization`s), the
+/// `kube-system` controllers and break-glass cluster admins ([`platform_owned_writers`]); tenant
+/// identities (which hold `admin` in their namespace) and every other `flux-system` identity are
+/// denied. The exemptions are reconcile requests on the `keel-gitops` GitRepository
+/// ([`CEL_GITREPOSITORY_RECONCILE_REQUEST_ONLY`]) and the `keel-tenant-root` Kustomization
+/// ([`CEL_KUSTOMIZATION_RECONCILE_REQUEST_ONLY`]), so `flux reconcile` keeps working for anyone
+/// RBAC lets patch them. Fails closed.
 pub fn build_protect_platform_owned_tenant_objects_policy() -> Value {
     let all_writers = platform_owned_writers();
     let writers = all_writers
@@ -939,8 +972,9 @@ pub fn build_protect_platform_owned_tenant_objects_policy() -> Value {
         .iter()
         .filter_map(|w| {
             w.kind.map(|kind| {
+                let only_if = w.only_if.map(|c| format!(" && ({c})")).unwrap_or_default();
                 format!(
-                    " || (variables.username == '{}' && request.kind.kind == '{kind}')",
+                    " || (variables.username == '{}' && request.kind.kind == '{kind}'{only_if})",
                     w.username
                 )
             })
@@ -994,6 +1028,18 @@ pub fn build_protect_platform_owned_tenant_objects_policy() -> Value {
                         "apiVersions": ["*"],
                         "operations": ["CREATE", "UPDATE", "DELETE"],
                         "resources": ["gitrepositories"]
+                    },
+                    {
+                        "apiGroups": ["kustomize.toolkit.fluxcd.io"],
+                        "apiVersions": ["*"],
+                        "operations": ["CREATE", "UPDATE", "DELETE"],
+                        "resources": ["kustomizations"]
+                    },
+                    {
+                        "apiGroups": [""],
+                        "apiVersions": ["*"],
+                        "operations": ["CREATE", "UPDATE", "DELETE"],
+                        "resources": ["secrets"]
                     }
                 ]
             },
@@ -1016,10 +1062,10 @@ pub fn build_protect_platform_owned_tenant_objects_policy() -> Value {
             "validations": [
                 {
                     "expression": format!(
-                        "variables.username in [{writers}]{scoped_writers} || variables.username.startsWith('system:serviceaccount:kube-system:') || variables.groups.exists(g, g == 'system:masters' || g == 'kubeadm:cluster-admins') || ({CEL_GITREPOSITORY_RECONCILE_REQUEST_ONLY})"
+                        "variables.username in [{writers}]{scoped_writers} || variables.username.startsWith('system:serviceaccount:kube-system:') || variables.groups.exists(g, g == 'system:masters' || g == 'kubeadm:cluster-admins') || ({CEL_GITREPOSITORY_RECONCILE_REQUEST_ONLY}) || ({CEL_KUSTOMIZATION_RECONCILE_REQUEST_ONLY})"
                     ),
                     "message": format!(
-                        "Objects labelled `{PLATFORM_OWNED_LABEL}` (tenant namespace, RBAC, NetworkPolicies, the `keel-gitops` source) are managed by the platform (keel-tenant-reconciler / keel-server); change them through a GitOps PR to `tenants/<id>/` (only a `reconcile.fluxcd.io/requestedAt` reconcile request on `keel-gitops` is exempt)."
+                        "Objects labelled `{PLATFORM_OWNED_LABEL}` (tenant namespace, RBAC, NetworkPolicies, the `keel-gitops` source, the `keel-tenant-root` Kustomization, the `keel-gitops-credentials` Secret) are managed by the platform (keel-tenant-reconciler / keel-server); change them through a GitOps PR to `tenants/<id>/` of the platform repository (only a `reconcile.fluxcd.io/requestedAt` reconcile request on `keel-gitops` / `keel-tenant-root` is exempt)."
                     )
                 }
             ]
@@ -1784,6 +1830,12 @@ mod tests {
         let ks = crate::synthesize_flux_kustomization(&input).unwrap();
         let ns = ks["metadata"]["namespace"].as_str().unwrap();
         assert_eq!(ks["spec"]["serviceAccountName"], format!("{ns}-sa"));
+        // The per-tenant repository root (`tenants/<id>/sync.yaml`, applied by
+        // keel-tenant-reconciler) satisfies the same rule and only references its own namespace.
+        let root = crate::build_tenant_root_kustomization("acme").unwrap();
+        let ns = root["metadata"]["namespace"].as_str().unwrap();
+        assert_eq!(root["spec"]["serviceAccountName"], format!("{ns}-sa"));
+        assert_eq!(root["spec"]["sourceRef"]["namespace"], ns);
     }
 
     /// Every tenant HelmRelease Keel synthesizes (local and remote workload clusters) satisfies the
@@ -2008,14 +2060,50 @@ mod tests {
                 .all(|r| !r["resources"].as_array().unwrap().contains(&json!("*")))
         );
 
-        // No platform-owned Kustomization exists: kustomize-controller finalizers on tenant
-        // Kustomizations must never reach this policy.
-        assert!(rules.iter().all(|r| {
-            !r["resources"]
-                .as_array()
-                .unwrap()
-                .contains(&json!("kustomizations"))
+        // The per-tenant repository stub (`git-repository.yaml`, `sync.yaml`) is matched too.
+        let source =
+            crate::TenantRepoSource::new("acme", "https://forgejo.example/keel-tenants/r.git")
+                .unwrap();
+        let stub_docs = [
+            crate::build_tenant_repo_git_repository(&source).unwrap(),
+            crate::build_tenant_root_kustomization("acme").unwrap(),
+        ];
+        for doc in &stub_docs {
+            assert_eq!(doc["metadata"]["labels"][PLATFORM_OWNED_LABEL], "true");
+        }
+        assert!(rules.iter().any(|r| {
+            r["apiGroups"] == json!(["kustomize.toolkit.fluxcd.io"])
+                && r["resources"] == json!(["kustomizations"])
         }));
+        // The cluster-only tenant repository credential is platform-owned and matched, so a
+        // tenant admin cannot replace its `ca.crt`/`known_hosts`/token (read access stays, D1).
+        let credential = crate::TenantRepoCredential::HttpsToken {
+            username: "keel-tenant-reader".to_string(),
+            token: "t".to_string(),
+            ca_crt: None,
+        };
+        let secret = crate::build_tenant_gitops_credentials_secret(&source, &credential).unwrap();
+        assert_eq!(secret["metadata"]["labels"][PLATFORM_OWNED_LABEL], "true");
+        assert!(
+            rules
+                .iter()
+                .any(|r| { r["apiGroups"] == json!([""]) && r["resources"] == json!(["secrets"]) })
+        );
+        // Every platform-owned kind is matched by some rule.
+        for kind in crate::PLATFORM_OWNED_KINDS {
+            let resource = match kind {
+                "GitRepository" => "gitrepositories",
+                "Kustomization" => "kustomizations",
+                other => plural(other),
+            };
+            assert!(
+                rules.iter().any(|r| r["resources"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!(resource))),
+                "{kind} not matched"
+            );
+        }
 
         let exprs = expressions(&policy);
         assert_eq!(exprs.len(), 1);
@@ -2028,8 +2116,40 @@ mod tests {
         ));
         assert!(exprs[0].contains("g == 'system:masters'"));
         // kustomize-controller would let every `flux-system` Kustomization rewrite tenant
-        // baselines; it is never a writer.
-        assert!(!exprs[0].contains("kustomize-controller"));
+        // baselines: it is a writer only for finalizer-only updates of Kustomizations
+        // (`keel-tenant-root`), never in the unrestricted writer list.
+        assert!(exprs[0].contains(&format!(
+            "(variables.username == 'system:serviceaccount:flux-system:kustomize-controller' && request.kind.kind == 'Kustomization' && ({CEL_KUSTOMIZATION_FLUX_FINALIZER_ONLY_UPDATE}))"
+        )));
+        assert_eq!(exprs[0].matches("kustomize-controller").count(), 1);
+        let unrestricted = exprs[0].split(']').next().unwrap();
+        assert!(!unrestricted.contains("kustomize-controller"));
+        for needle in [
+            "request.operation == 'UPDATE'",
+            "(has(object.spec) ? object.spec : {}) == (has(oldObject.spec) ? oldObject.spec : {})",
+            "(has(object.metadata.labels) ? object.metadata.labels : {}) == (has(oldObject.metadata.labels) ? oldObject.metadata.labels : {})",
+            "(has(object.metadata.annotations) ? object.metadata.annotations : {}) == (has(oldObject.metadata.annotations) ? oldObject.metadata.annotations : {})",
+            "(has(object.metadata.ownerReferences) ? object.metadata.ownerReferences : []) == (has(oldObject.metadata.ownerReferences) ? oldObject.metadata.ownerReferences : [])",
+        ] {
+            assert!(
+                CEL_KUSTOMIZATION_FLUX_FINALIZER_ONLY_UPDATE.contains(needle),
+                "{needle}"
+            );
+        }
+        // Finalizers: only `finalizers.fluxcd.io` may be added or removed; every other finalizer
+        // must be kept in both directions (no foreign finalizer added, none stripped).
+        for needle in [
+            "request.kind.group == 'kustomize.toolkit.fluxcd.io' && request.kind.kind == 'Kustomization'",
+            "(has(object.metadata.finalizers) ? object.metadata.finalizers : []).all(f, f == 'finalizers.fluxcd.io' || f in (has(oldObject.metadata.finalizers) ? oldObject.metadata.finalizers : []))",
+            "(has(oldObject.metadata.finalizers) ? oldObject.metadata.finalizers : []).all(f, f == 'finalizers.fluxcd.io' || f in (has(object.metadata.finalizers) ? object.metadata.finalizers : []))",
+        ] {
+            assert!(
+                CEL_KUSTOMIZATION_FLUX_FINALIZER_ONLY_UPDATE.contains(needle),
+                "{needle}"
+            );
+        }
+        assert!(!CEL_KUSTOMIZATION_FLUX_FINALIZER_ONLY_UPDATE.contains("CREATE"));
+        assert!(!CEL_KUSTOMIZATION_FLUX_FINALIZER_ONLY_UPDATE.contains("DELETE"));
         // No tenant or preview identity is ever a platform writer.
         assert!(!exprs[0].contains("tenant-'"));
         assert!(!exprs[0].contains("keel-previews"));
@@ -2044,7 +2164,18 @@ mod tests {
         // `flux reconcile source git keel-gitops` stays possible for anyone RBAC allows: only an
         // UPDATE of a GitRepository whose spec, labels, finalizers, owner references and other
         // annotations are unchanged, differing at most in `reconcile.fluxcd.io/requestedAt`.
-        assert!(exprs[0].ends_with(&format!(" || ({CEL_GITREPOSITORY_RECONCILE_REQUEST_ONLY})")));
+        assert!(exprs[0].ends_with(&format!(
+            " || ({CEL_GITREPOSITORY_RECONCILE_REQUEST_ONLY}) || ({CEL_KUSTOMIZATION_RECONCILE_REQUEST_ONLY})"
+        )));
+        // `flux reconcile kustomization keel-tenant-root`: the same rule for the root
+        // Kustomization of a per-tenant repository.
+        assert_eq!(
+            CEL_KUSTOMIZATION_RECONCILE_REQUEST_ONLY,
+            CEL_GITREPOSITORY_RECONCILE_REQUEST_ONLY.replace(
+                "request.kind.group == 'source.toolkit.fluxcd.io' && request.kind.kind == 'GitRepository'",
+                "request.kind.group == 'kustomize.toolkit.fluxcd.io' && request.kind.kind == 'Kustomization'"
+            )
+        );
         let cel = CEL_GITREPOSITORY_RECONCILE_REQUEST_ONLY;
         for needle in [
             "request.operation == 'UPDATE'",
@@ -2075,9 +2206,19 @@ mod tests {
                     !w.reason.trim().is_empty(),
                     "every platform-owned writer documents a reason"
                 );
+                // A CEL restriction only narrows a kind-scoped writer.
+                assert!(w.only_if.is_none() || w.kind.is_some(), "{w:?}");
                 (w.username, w.kind)
             })
             .collect();
+        let kustomize = platform_owned_writers()
+            .into_iter()
+            .find(|w| w.username.ends_with(":kustomize-controller"))
+            .unwrap();
+        assert_eq!(
+            kustomize.only_if,
+            Some(CEL_KUSTOMIZATION_FLUX_FINALIZER_ONLY_UPDATE)
+        );
         assert_eq!(
             writers,
             vec![
@@ -2092,6 +2233,10 @@ mod tests {
                 (
                     "system:serviceaccount:flux-system:source-controller".to_string(),
                     Some("GitRepository")
+                ),
+                (
+                    "system:serviceaccount:flux-system:kustomize-controller".to_string(),
+                    Some("Kustomization")
                 ),
                 ("system:kube-controller-manager".to_string(), None),
             ]

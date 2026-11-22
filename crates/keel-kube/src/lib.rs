@@ -4,6 +4,7 @@
 //! - Stateless Kubernetes `Secret`-backed state store (`secret_store`),
 //! - Per-tenant scoped SeaweedFS S3 identity provisioning via kube-rs exec (`s3_identity`),
 //! - Multi-tenant namespace/RBAC/quota/network-policy & Flux `HelmRelease` synthesis (`tenant`),
+//! - Per-tenant repository stubs, `keel-gitops-credentials` and PKO tenant-repo sources (`tenant_repo`),
 //! - Kyverno admission policies & explicit local-dev Docker socket `PolicyException` (`kyverno`),
 //! - Real-time CRD condition normalization & SSE telemetry broadcaster (`telemetry`).
 
@@ -15,6 +16,7 @@ pub mod s3_identity;
 pub mod secret_store;
 pub mod telemetry;
 pub mod tenant;
+pub mod tenant_repo;
 
 pub use ca_bundle::{
     KEEL_CA_BUNDLE_LABEL, KEEL_CA_SECRET_NAME, build_keel_ca_bundle_configmap,
@@ -77,6 +79,19 @@ pub use tenant::{
     synthesize_helm_app_network_policy_yaml, synthesize_helm_release, synthesize_helm_release_yaml,
     synthesize_remote_target_namespace, synthesize_remote_target_namespace_yaml, tenant_namespace,
     validate_tenant_id,
+};
+pub use tenant_repo::{
+    PKO_OPERATOR_SSH_KNOWN_HOSTS_CONFIGMAP, TENANT_GITOPS_CREDENTIALS_SECRET_KIND,
+    TENANT_GITOPS_CREDENTIALS_SECRET_NAME, TENANT_REPO_STUB_FILES, TENANT_ROOT_KUSTOMIZATION_NAME,
+    TenantRepoCredential, TenantRepoSource, TenantRepoStub, TenantRepoTransport,
+    build_pko_operator_known_hosts_configmap, build_tenant_gitops_credentials_secret,
+    build_tenant_repo_git_repository, build_tenant_repo_kustomization_yaml,
+    build_tenant_root_kustomization, ensure_git_safe_manifests, is_full_commit_sha,
+    merge_pko_operator_ssh_known_hosts_values, pko_operator_needs_ssh_known_hosts,
+    synthesize_tenant_repo_stub, tenant_repo_git_auth, tenant_repo_preview_git_source,
+    tenant_repo_preview_secret_keys, tenant_repo_preview_secret_payload,
+    tenant_repo_resources_from_monorepo, tenant_repo_stack_git_source,
+    tenant_repo_stub_kustomization_entries, tenant_repo_workspace_template, validate_known_hosts,
 };
 
 #[derive(Debug, thiserror::Error)]

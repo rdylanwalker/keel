@@ -118,15 +118,16 @@ pub const PLATFORM_OWNED_LABEL: &str = "keel.io/platform-owned";
 
 /// [`tenant_common_labels`] plus `keel.io/platform-owned: "true"`, for the platform-written tenant
 /// baseline objects only (never tenant app objects, which tenant identities apply).
-fn platform_owned_labels(tenant_id: &str) -> BTreeMap<String, String> {
+pub(crate) fn platform_owned_labels(tenant_id: &str) -> BTreeMap<String, String> {
     let mut labels = tenant_common_labels(tenant_id);
     labels.insert(PLATFORM_OWNED_LABEL.to_string(), "true".to_string());
     labels
 }
 
 /// Kinds the platform writes in a tenant's baseline files and labels [`PLATFORM_OWNED_LABEL`]
-/// (all matched by Kyverno `protect-platform-owned-tenant-objects`).
-pub const PLATFORM_OWNED_KINDS: [&str; 8] = [
+/// (all matched by Kyverno `protect-platform-owned-tenant-objects`). `Kustomization` is the
+/// per-tenant repository stub's `keel-tenant-root` (`tenants/<id>/sync.yaml`).
+pub const PLATFORM_OWNED_KINDS: [&str; 9] = [
     "Namespace",
     "ServiceAccount",
     "ResourceQuota",
@@ -135,16 +136,41 @@ pub const PLATFORM_OWNED_KINDS: [&str; 8] = [
     "RoleBinding",
     "ClusterRoleBinding",
     "GitRepository",
+    "Kustomization",
 ];
 
 /// Platform-written files under `tenants/<id>/` whose objects carry [`PLATFORM_OWNED_LABEL`]:
-/// the tenant baseline and (for bootstrap-created tenants) the `keel-gitops` source stub.
-pub const PLATFORM_OWNED_TENANT_FILES: [&str; 2] = ["rbac.yaml", "git-repository.yaml"];
+/// the tenant baseline, the `keel-gitops` source stub and (per-tenant repositories) the
+/// `keel-tenant-root` sync stub ([`crate::tenant_repo::TENANT_REPO_STUB_FILES`]).
+pub const PLATFORM_OWNED_TENANT_FILES: [&str; 3] =
+    ["rbac.yaml", "git-repository.yaml", "sync.yaml"];
+
+/// `true` when `doc` is an object the platform owns in a platform-written tenant file: a
+/// [`PLATFORM_OWNED_KINDS`] kind, matched by API group where the kind name is ambiguous. A
+/// `GitRepository` must be Flux `source.toolkit.fluxcd.io`; a `Kustomization` must be the Flux
+/// `kustomize.toolkit.fluxcd.io` root `keel-tenant-root` (never a `kustomize.config.k8s.io`
+/// config file or a tenant-authored Flux Kustomization, which Kyverno would then lock).
+fn is_platform_owned_object(doc: &Value) -> bool {
+    let Some(kind) = doc.get("kind").and_then(Value::as_str) else {
+        return false;
+    };
+    let api_version = doc
+        .get("apiVersion")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    match kind {
+        "GitRepository" => api_version.starts_with("source.toolkit.fluxcd.io/"),
+        "Kustomization" => {
+            api_version.starts_with("kustomize.toolkit.fluxcd.io/")
+                && doc.pointer("/metadata/name").and_then(Value::as_str)
+                    == Some(crate::tenant_repo::TENANT_ROOT_KUSTOMIZATION_NAME)
+        }
+        other => PLATFORM_OWNED_KINDS.contains(&other),
+    }
+}
 
 fn needs_platform_owned_label(doc: &Value) -> bool {
-    doc.get("kind")
-        .and_then(Value::as_str)
-        .is_some_and(|k| PLATFORM_OWNED_KINDS.contains(&k))
+    is_platform_owned_object(doc)
         && doc.pointer(&format!(
             "/metadata/labels/{}",
             PLATFORM_OWNED_LABEL.replace('~', "~0").replace('/', "~1")
@@ -2128,6 +2154,43 @@ mod tests {
         assert!(label_platform_owned_manifests(wrong).unwrap().is_some());
         assert!(label_platform_owned_manifests("kind: [").is_err());
         assert!(platform_owned_labels_missing("kind: ["));
+    }
+
+    /// Only the Flux `keel-tenant-root` Kustomization and Flux GitRepositories are platform-owned
+    /// by kind name; kustomize config files and tenant-authored Flux Kustomizations in an
+    /// existing `sync.yaml` / `rbac.yaml` are never labelled (Kyverno would lock them).
+    #[test]
+    fn only_the_flux_tenant_root_kustomization_is_platform_owned() {
+        let root = serde_yml::to_string(
+            &crate::tenant_repo::build_tenant_root_kustomization("acme").unwrap(),
+        )
+        .unwrap();
+        assert!(!platform_owned_labels_missing(&root));
+        let unlabelled_root = root.replace("    keel.io/platform-owned: 'true'\n", "");
+        let unlabelled_root = unlabelled_root.replace("    keel.io/platform-owned: \"true\"\n", "");
+        assert_ne!(unlabelled_root, root, "label line format changed");
+        assert!(platform_owned_labels_missing(&unlabelled_root));
+        assert!(
+            label_platform_owned_manifests(&unlabelled_root)
+                .unwrap()
+                .is_some()
+        );
+
+        let kustomize_config = "apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\nresources:\n- apps/web/release.yaml\n";
+        let tenant_flux = "apiVersion: kustomize.toolkit.fluxcd.io/v1\nkind: Kustomization\nmetadata:\n  name: web\n  namespace: tenant-acme\nspec:\n  path: ./tenants/acme/apps/web\n";
+        let foreign_git_repository =
+            "apiVersion: example.com/v1\nkind: GitRepository\nmetadata:\n  name: x\n";
+        for doc in [kustomize_config, tenant_flux, foreign_git_repository] {
+            assert!(!platform_owned_labels_missing(doc), "{doc}");
+            assert_eq!(label_platform_owned_manifests(doc).unwrap(), None, "{doc}");
+        }
+        let mixed = format!("{tenant_flux}---\n{unlabelled_root}");
+        let out = label_platform_owned_manifests(&mixed).unwrap().unwrap();
+        let docs = keel_core::split_yaml_documents(&out);
+        let first: Value = serde_yml::from_str(&docs[0]).unwrap();
+        let second: Value = serde_yml::from_str(&docs[1]).unwrap();
+        assert!(first["metadata"].get("labels").is_none());
+        assert_eq!(second["metadata"]["labels"][PLATFORM_OWNED_LABEL], "true");
     }
 
     #[test]

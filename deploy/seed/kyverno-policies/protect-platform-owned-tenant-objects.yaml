@@ -2,14 +2,20 @@
 # Mirrors `keel_kube::kyverno::build_protect_platform_owned_tenant_objects_policy()`.
 # Objects the platform writes for a tenant carry `keel.io/platform-owned: "true"` (tenant
 # Namespace, ServiceAccount, quota, LimitRange, NetworkPolicies, RoleBindings, the
-# `keel-gitops` GitRepository stub). Creating, changing (including dropping the label) or deleting
+# `keel-gitops` GitRepository stub and, for tenants with their own repository, the
+# `keel-tenant-root` Kustomization of `tenants/<id>/sync.yaml` and the cluster-only
+# `keel-gitops-credentials` Secret). Creating, changing (including dropping the label) or deleting
 # them is reserved for keel-tenant-reconciler (`keel-tenants`), keel-server, source-controller (its
-# own GitRepository finalizer only), the kube-system controllers (garbage collection, namespace
-# deletion) and break-glass cluster admins (`system:masters`, `kubeadm:cluster-admins`). Tenant
-# identities, which hold `admin` in their namespace, and other flux-system identities such as
-# kustomize-controller (every flux-system Kustomization) are denied. The only exemption is an UPDATE
-# of the `keel-gitops` GitRepository that changes nothing but the `reconcile.fluxcd.io/requestedAt`
-# annotation (`flux reconcile source git keel-gitops -n tenant-<id>`). Fails closed.
+# own GitRepository finalizer only), kustomize-controller (Flux Kustomizations only, and only
+# adding or removing its own `finalizers.fluxcd.io`: spec, labels, annotations, owner references
+# and every other finalizer unchanged), the kube-system controllers (garbage collection,
+# namespace deletion) and break-glass cluster admins (`system:masters`,
+# `kubeadm:cluster-admins`). Tenant identities, which hold
+# `admin` in their namespace, and any other write by flux-system identities such as
+# kustomize-controller (every flux-system Kustomization) are denied. The only exemptions are
+# UPDATEs of the `keel-gitops` GitRepository or the `keel-tenant-root` Kustomization that change
+# nothing but the `reconcile.fluxcd.io/requestedAt` annotation (`flux reconcile source git
+# keel-gitops` / `flux reconcile kustomization keel-tenant-root -n tenant-<id>`). Fails closed.
 apiVersion: policies.kyverno.io/v1
 kind: ValidatingPolicy
 metadata:
@@ -42,6 +48,14 @@ spec:
         apiVersions: ["*"]
         operations: ["CREATE", "UPDATE", "DELETE"]
         resources: ["gitrepositories"]
+      - apiGroups: ["kustomize.toolkit.fluxcd.io"]
+        apiVersions: ["*"]
+        operations: ["CREATE", "UPDATE", "DELETE"]
+        resources: ["kustomizations"]
+      - apiGroups: [""]
+        apiVersions: ["*"]
+        operations: ["CREATE", "UPDATE", "DELETE"]
+        resources: ["secrets"]
   matchConditions:
     - name: platform-owned
       expression: >-
@@ -53,5 +67,5 @@ spec:
       expression: "has(request.userInfo.groups) ? request.userInfo.groups : []"
   validations:
     - expression: >-
-        variables.username in ['system:serviceaccount:flux-system:keel-tenant-reconciler', 'system:serviceaccount:keel-system:keel-server', 'system:kube-controller-manager'] || (variables.username == 'system:serviceaccount:flux-system:source-controller' && request.kind.kind == 'GitRepository') || variables.username.startsWith('system:serviceaccount:kube-system:') || variables.groups.exists(g, g == 'system:masters' || g == 'kubeadm:cluster-admins') || (request.operation == 'UPDATE' && request.kind.group == 'source.toolkit.fluxcd.io' && request.kind.kind == 'GitRepository' && object != null && oldObject != null && (has(object.spec) ? object.spec : {}) == (has(oldObject.spec) ? oldObject.spec : {}) && (has(object.metadata.labels) ? object.metadata.labels : {}) == (has(oldObject.metadata.labels) ? oldObject.metadata.labels : {}) && (has(object.metadata.finalizers) ? object.metadata.finalizers : []) == (has(oldObject.metadata.finalizers) ? oldObject.metadata.finalizers : []) && (has(object.metadata.ownerReferences) ? object.metadata.ownerReferences : []) == (has(oldObject.metadata.ownerReferences) ? oldObject.metadata.ownerReferences : []) && (has(object.metadata.annotations) ? object.metadata.annotations : {}).all(k, k == 'reconcile.fluxcd.io/requestedAt' || (has(oldObject.metadata.annotations) && k in oldObject.metadata.annotations && oldObject.metadata.annotations[k] == object.metadata.annotations[k])) && (has(oldObject.metadata.annotations) ? oldObject.metadata.annotations : {}).all(k, k == 'reconcile.fluxcd.io/requestedAt' || (has(object.metadata.annotations) && k in object.metadata.annotations)))
-      message: "Objects labelled `keel.io/platform-owned` (tenant namespace, RBAC, NetworkPolicies, the `keel-gitops` source) are managed by the platform (keel-tenant-reconciler / keel-server); change them through a GitOps PR to `tenants/<id>/` (only a `reconcile.fluxcd.io/requestedAt` reconcile request on `keel-gitops` is exempt)."
+        variables.username in ['system:serviceaccount:flux-system:keel-tenant-reconciler', 'system:serviceaccount:keel-system:keel-server', 'system:kube-controller-manager'] || (variables.username == 'system:serviceaccount:flux-system:source-controller' && request.kind.kind == 'GitRepository') || (variables.username == 'system:serviceaccount:flux-system:kustomize-controller' && request.kind.kind == 'Kustomization' && (request.operation == 'UPDATE' && request.kind.group == 'kustomize.toolkit.fluxcd.io' && request.kind.kind == 'Kustomization' && object != null && oldObject != null && (has(object.spec) ? object.spec : {}) == (has(oldObject.spec) ? oldObject.spec : {}) && (has(object.metadata.labels) ? object.metadata.labels : {}) == (has(oldObject.metadata.labels) ? oldObject.metadata.labels : {}) && (has(object.metadata.annotations) ? object.metadata.annotations : {}) == (has(oldObject.metadata.annotations) ? oldObject.metadata.annotations : {}) && (has(object.metadata.ownerReferences) ? object.metadata.ownerReferences : []) == (has(oldObject.metadata.ownerReferences) ? oldObject.metadata.ownerReferences : []) && (has(object.metadata.finalizers) ? object.metadata.finalizers : []).all(f, f == 'finalizers.fluxcd.io' || f in (has(oldObject.metadata.finalizers) ? oldObject.metadata.finalizers : [])) && (has(oldObject.metadata.finalizers) ? oldObject.metadata.finalizers : []).all(f, f == 'finalizers.fluxcd.io' || f in (has(object.metadata.finalizers) ? object.metadata.finalizers : [])))) || variables.username.startsWith('system:serviceaccount:kube-system:') || variables.groups.exists(g, g == 'system:masters' || g == 'kubeadm:cluster-admins') || (request.operation == 'UPDATE' && request.kind.group == 'source.toolkit.fluxcd.io' && request.kind.kind == 'GitRepository' && object != null && oldObject != null && (has(object.spec) ? object.spec : {}) == (has(oldObject.spec) ? oldObject.spec : {}) && (has(object.metadata.labels) ? object.metadata.labels : {}) == (has(oldObject.metadata.labels) ? oldObject.metadata.labels : {}) && (has(object.metadata.finalizers) ? object.metadata.finalizers : []) == (has(oldObject.metadata.finalizers) ? oldObject.metadata.finalizers : []) && (has(object.metadata.ownerReferences) ? object.metadata.ownerReferences : []) == (has(oldObject.metadata.ownerReferences) ? oldObject.metadata.ownerReferences : []) && (has(object.metadata.annotations) ? object.metadata.annotations : {}).all(k, k == 'reconcile.fluxcd.io/requestedAt' || (has(oldObject.metadata.annotations) && k in oldObject.metadata.annotations && oldObject.metadata.annotations[k] == object.metadata.annotations[k])) && (has(oldObject.metadata.annotations) ? oldObject.metadata.annotations : {}).all(k, k == 'reconcile.fluxcd.io/requestedAt' || (has(object.metadata.annotations) && k in object.metadata.annotations))) || (request.operation == 'UPDATE' && request.kind.group == 'kustomize.toolkit.fluxcd.io' && request.kind.kind == 'Kustomization' && object != null && oldObject != null && (has(object.spec) ? object.spec : {}) == (has(oldObject.spec) ? oldObject.spec : {}) && (has(object.metadata.labels) ? object.metadata.labels : {}) == (has(oldObject.metadata.labels) ? oldObject.metadata.labels : {}) && (has(object.metadata.finalizers) ? object.metadata.finalizers : []) == (has(oldObject.metadata.finalizers) ? oldObject.metadata.finalizers : []) && (has(object.metadata.ownerReferences) ? object.metadata.ownerReferences : []) == (has(oldObject.metadata.ownerReferences) ? oldObject.metadata.ownerReferences : []) && (has(object.metadata.annotations) ? object.metadata.annotations : {}).all(k, k == 'reconcile.fluxcd.io/requestedAt' || (has(oldObject.metadata.annotations) && k in oldObject.metadata.annotations && oldObject.metadata.annotations[k] == object.metadata.annotations[k])) && (has(oldObject.metadata.annotations) ? oldObject.metadata.annotations : {}).all(k, k == 'reconcile.fluxcd.io/requestedAt' || (has(object.metadata.annotations) && k in object.metadata.annotations)))
+      message: "Objects labelled `keel.io/platform-owned` (tenant namespace, RBAC, NetworkPolicies, the `keel-gitops` source, the `keel-tenant-root` Kustomization, the `keel-gitops-credentials` Secret) are managed by the platform (keel-tenant-reconciler / keel-server); change them through a GitOps PR to `tenants/<id>/` of the platform repository (only a `reconcile.fluxcd.io/requestedAt` reconcile request on `keel-gitops` / `keel-tenant-root` is exempt)."

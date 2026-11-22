@@ -69,6 +69,16 @@ pub const KEEL_SSL_CERT_DIR: &str = "/etc/ssl/certs:/etc/keel-ca";
 const SSL_CERT_DIR_ENV: &str = "SSL_CERT_DIR";
 /// PKO v2 workspace init container that clones `projectRepo` (`/share/agent init --git-url`).
 pub const PKO_FETCH_CONTAINER_NAME: &str = "fetch";
+/// Environment variable go-git (PKO `fetch` init container and operator) reads the SSH
+/// `known_hosts` file path from. PKO 2.10.1 `sshAuth` has no host-key field, so SSH Git sources
+/// need it (without it every SSH clone fails with "unable to find any valid known_hosts file").
+pub const SSH_KNOWN_HOSTS_ENV: &str = "SSH_KNOWN_HOSTS";
+/// Workspace volume holding only the `known_hosts` item of an SSH Git credentials Secret.
+pub const KEEL_SSH_KNOWN_HOSTS_VOLUME_NAME: &str = "keel-ssh-known-hosts";
+/// Read-only mount path of [`KEEL_SSH_KNOWN_HOSTS_VOLUME_NAME`] in the `fetch` init container.
+pub const KEEL_SSH_KNOWN_HOSTS_MOUNT_PATH: &str = "/etc/keel-ssh";
+/// File name of the `known_hosts` item under [`KEEL_SSH_KNOWN_HOSTS_MOUNT_PATH`].
+pub const KEEL_SSH_KNOWN_HOSTS_FILE: &str = "known_hosts";
 
 /// Standard Kubernetes `metadata` block for synthesized CRs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -343,6 +353,27 @@ impl PkoGitSource {
             repo_dir: Some(repo_dir.into()),
             git_auth: None,
             shallow: Some(true),
+        }
+    }
+
+    /// Pins `commit` of `project_repo` (previews: the reviewed PR head SHA, so a push after the
+    /// preview started never changes what it reports). Pass a full 40-/64-hex SHA: PKO/go-git
+    /// turns `spec.commit` into a full hash, so an abbreviated one never resolves ([`Self::validate`]
+    /// only checks the hex shape). Not shallow (`shallow: false`): a depth-1 fetch only has the
+    /// branch tips, so a pinned commit stops resolving as soon as a later push moves the PR
+    /// branch.
+    pub fn commit(
+        project_repo: impl Into<String>,
+        commit: impl Into<String>,
+        repo_dir: impl Into<String>,
+    ) -> Self {
+        Self {
+            project_repo: project_repo.into(),
+            branch: None,
+            commit: Some(commit.into()),
+            repo_dir: Some(repo_dir.into()),
+            git_auth: None,
+            shallow: Some(false),
         }
     }
 
@@ -719,6 +750,17 @@ pub struct WorkspaceSecretVolumeSource {
     pub secret_name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub optional: Option<bool>,
+    /// Projects only these keys (empty: every key of the Secret).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub items: Vec<WorkspaceKeyToPath>,
+}
+
+/// `corev1.KeyToPath`: projects one Secret/ConfigMap key to a file in the volume.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceKeyToPath {
+    pub key: String,
+    pub path: String,
 }
 
 /// ConfigMap volume source for mounting namespace-local ConfigMaps into a PKO workspace pod.
@@ -921,6 +963,7 @@ impl PkoWorkspaceTemplate {
             secret: Some(WorkspaceSecretVolumeSource {
                 secret_name: secret_name.into(),
                 optional: Some(true),
+                items: Vec::new(),
             }),
             config_map: None,
         });
@@ -1003,6 +1046,64 @@ impl PkoWorkspaceTemplate {
                 .retain(|m| m.name != KEEL_CA_VOLUME_NAME);
             pulumi.volume_mounts.push(mount());
         }
+        self
+    }
+
+    /// Makes the `fetch` init container (go-git clone of an SSH `projectRepo`) verify the forge's
+    /// SSH host key: mounts **only** the `known_hosts_key` item of the namespace-local Secret
+    /// `secret_name` (never its private key) read-only at
+    /// [`KEEL_SSH_KNOWN_HOSTS_MOUNT_PATH`]/[`KEEL_SSH_KNOWN_HOSTS_FILE`] and points
+    /// [`SSH_KNOWN_HOSTS_ENV`] at it. The volume is not `optional`: without host keys the pod
+    /// must not start (Keel never trusts a host on first use). Idempotent (re-pointing replaces
+    /// the previous volume, mount and variable).
+    pub fn with_ssh_known_hosts(
+        mut self,
+        secret_name: impl Into<String>,
+        known_hosts_key: impl Into<String>,
+    ) -> Self {
+        let spec = &mut self.spec.pod_template.spec;
+        spec.volumes
+            .retain(|v| v.name != KEEL_SSH_KNOWN_HOSTS_VOLUME_NAME);
+        spec.volumes.push(WorkspaceVolume {
+            name: KEEL_SSH_KNOWN_HOSTS_VOLUME_NAME.to_string(),
+            secret: Some(WorkspaceSecretVolumeSource {
+                secret_name: secret_name.into(),
+                optional: Some(false),
+                items: vec![WorkspaceKeyToPath {
+                    key: known_hosts_key.into(),
+                    path: KEEL_SSH_KNOWN_HOSTS_FILE.to_string(),
+                }],
+            }),
+            config_map: None,
+        });
+        let fetch = match spec
+            .init_containers
+            .iter_mut()
+            .find(|c| c.name == PKO_FETCH_CONTAINER_NAME)
+        {
+            Some(c) => c,
+            None => {
+                spec.init_containers.push(WorkspaceInitContainerPatch {
+                    name: PKO_FETCH_CONTAINER_NAME.to_string(),
+                    env: Vec::new(),
+                    volume_mounts: Vec::new(),
+                });
+                spec.init_containers.last_mut().expect("just pushed")
+            }
+        };
+        fetch.env.retain(|e| e.name != SSH_KNOWN_HOSTS_ENV);
+        fetch.env.push(WorkspaceEnvVar::literal(
+            SSH_KNOWN_HOSTS_ENV,
+            format!("{KEEL_SSH_KNOWN_HOSTS_MOUNT_PATH}/{KEEL_SSH_KNOWN_HOSTS_FILE}"),
+        ));
+        fetch
+            .volume_mounts
+            .retain(|m| m.name != KEEL_SSH_KNOWN_HOSTS_VOLUME_NAME);
+        fetch.volume_mounts.push(WorkspaceVolumeMount {
+            name: KEEL_SSH_KNOWN_HOSTS_VOLUME_NAME.to_string(),
+            mount_path: KEEL_SSH_KNOWN_HOSTS_MOUNT_PATH.to_string(),
+            read_only: Some(true),
+        });
         self
     }
 }
@@ -3222,6 +3323,67 @@ mod tests {
                 .init_containers
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn ssh_known_hosts_mounts_only_the_host_keys_into_fetch() {
+        let tpl = PkoWorkspaceTemplate::restricted("p")
+            .with_keel_ca_trust()
+            .with_ssh_known_hosts("old", "known_hosts")
+            .with_ssh_known_hosts("keel-gitops-credentials", "known_hosts");
+        let pod = serde_json::to_value(&tpl.spec.pod_template.spec).unwrap();
+        // Idempotent: one known_hosts volume (the last Secret) next to the CA bundle.
+        let volumes = pod["volumes"].as_array().unwrap();
+        assert_eq!(volumes.len(), 2);
+        assert!(volumes.contains(&serde_json::json!({
+            "name": "keel-ssh-known-hosts",
+            "secret": {
+                "secretName": "keel-gitops-credentials",
+                "optional": false,
+                "items": [{"key": "known_hosts", "path": "known_hosts"}]
+            }
+        })));
+        let fetch = &pod["initContainers"][0];
+        assert_eq!(fetch["name"], "fetch");
+        let env = fetch["env"].as_array().unwrap();
+        assert_eq!(env.len(), 2);
+        assert!(env.contains(&serde_json::json!({
+            "name": "SSH_KNOWN_HOSTS", "value": "/etc/keel-ssh/known_hosts"
+        })));
+        let mounts = fetch["volumeMounts"].as_array().unwrap();
+        assert_eq!(mounts.len(), 2);
+        assert!(mounts.contains(&serde_json::json!({
+            "name": "keel-ssh-known-hosts", "mountPath": "/etc/keel-ssh", "readOnly": true
+        })));
+        // The `pulumi` container never sees the credentials Secret.
+        let pulumi = pod["containers"][0].to_string();
+        assert!(!pulumi.contains("keel-ssh") && !pulumi.contains("keel-gitops-credentials"));
+        // Round-trips through the typed model.
+        let back: WorkspacePodSpec = serde_json::from_value(pod).unwrap();
+        assert_eq!(back, tpl.spec.pod_template.spec);
+    }
+
+    #[test]
+    fn commit_pinned_git_source_validates_the_sha() {
+        let pinned = PkoGitSource::commit(
+            "https://forgejo.keel.local:8888/keel-tenants/infra-gitops-tenant-acme.git",
+            "0123456789abcdef0123456789abcdef01234567",
+            "tenants/acme/infra/vm",
+        );
+        pinned.validate().unwrap();
+        assert_eq!(pinned.branch, None);
+        assert_eq!(pinned.shallow, Some(false), "a pinned commit needs history");
+        let doc = serde_json::to_value(&pinned).unwrap();
+        assert_eq!(doc["commit"], "0123456789abcdef0123456789abcdef01234567");
+        assert!(doc.get("branch").is_none());
+        for bad in ["main", "", "abc", "zzzzzzzzzz"] {
+            assert!(
+                PkoGitSource::commit("https://x.example/o/r.git", bad, "d")
+                    .validate()
+                    .is_err(),
+                "{bad}"
+            );
+        }
     }
 
     #[test]

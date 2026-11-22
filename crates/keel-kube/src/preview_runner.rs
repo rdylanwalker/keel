@@ -32,6 +32,7 @@ use crate::tenant::{
     TENANT_GIT_CREDENTIALS_SECRET_KIND, TENANT_GIT_CREDENTIALS_SECRET_NAME,
     TENANT_S3_CREDENTIALS_SECRET_NAME, tenant_namespace,
 };
+use crate::tenant_repo::TENANT_GITOPS_CREDENTIALS_SECRET_NAME;
 
 /// Server-side apply field manager for preview CRs.
 pub const PREVIEW_FIELD_MANAGER: &str = "keel-server-preview";
@@ -202,6 +203,16 @@ pub fn tenant_git_source_from_manifest(
     if let Err(e) = keel_pko::validate_flux_git_source_url(&source.url) {
         return Err(unavailable(&format!(
             "has a Flux Git source that is not a network Git URL ({e})"
+        )));
+    }
+    // A per-tenant repository stub (`crate::tenant_repo`) is synthesized but the server write
+    // paths still commit Pulumi programs and preview branches to the platform repository: a Stack
+    // or preview cloning the tenant repository would never find them. Refuse it with an
+    // actionable error until the write paths move to the tenant repository.
+    if source.secret_name.as_deref() == Some(TENANT_GITOPS_CREDENTIALS_SECRET_NAME) {
+        return Err(unavailable(&format!(
+            "uses a per-tenant repository (`{TENANT_GITOPS_CREDENTIALS_SECRET_NAME}`); Pulumi \
+             Stack proposals and previews for per-tenant repositories are not wired yet"
         )));
     }
     // The platform-written read-only `git-credentials` Secret holds HTTP(S) `username`/`password`
@@ -1942,6 +1953,52 @@ spec:
                 Err(KubeError::PreviewSourceUnavailable(m)) if m.contains("not labelled")
             ));
         }
+    }
+
+    /// Per-tenant repository stubs (`keel-gitops-credentials`) are refused for Stack proposals
+    /// and previews until the server write paths commit to the tenant repository: the program or
+    /// preview SHA would otherwise be looked up in a repository that does not contain it.
+    #[test]
+    fn per_tenant_repository_stubs_are_refused_until_write_paths_move() {
+        use crate::tenant_repo::{
+            TENANT_GITOPS_CREDENTIALS_SECRET_KIND, TENANT_GITOPS_CREDENTIALS_SECRET_NAME,
+        };
+        for url in [
+            "https://forgejo.keel.local:8888/keel-tenants/infra-gitops-tenant-acme.git",
+            "ssh://git@github.com/o/r.git",
+        ] {
+            let repo = crate::TenantRepoSource::new("acme", url).unwrap();
+            let stub = crate::synthesize_tenant_repo_stub(
+                &crate::TenantIsolationConfig::new("acme"),
+                &repo,
+            )
+            .unwrap();
+            let path = tenant_git_repository_manifest_path("acme").unwrap();
+            let (_, yaml) = stub.files.iter().find(|(p, _)| p == &path).unwrap();
+            assert!(
+                matches!(
+                    tenant_git_source_from_manifest("acme", Some(yaml)),
+                    Err(KubeError::TenantSourceUnavailable(m)) if m.contains("not wired yet")
+                ),
+                "{url}"
+            );
+        }
+        // The preview mirror never copies it either, even correctly labelled.
+        let source = acme_source(Some(TENANT_GITOPS_CREDENTIALS_SECRET_NAME));
+        let secret = git_secret(
+            TENANT_GITOPS_CREDENTIALS_SECRET_NAME,
+            Some(TENANT_GITOPS_CREDENTIALS_SECRET_KIND),
+            &[("username", "bot"), ("password", "ro")],
+        );
+        assert!(matches!(
+            tenant_git_credentials_payload(
+                "acme",
+                &source,
+                TENANT_GITOPS_CREDENTIALS_SECRET_NAME,
+                Some(&secret)
+            ),
+            Err(KubeError::PreviewSourceUnavailable(_))
+        ));
     }
 
     type Recorded = Arc<StdMutex<Vec<String>>>;
