@@ -23,8 +23,8 @@ use super::state::{
 };
 use super::{
     DEFAULT_TENANT_ID, SEED_FLUX_GOTK_SYNC_YAML, SeedControlPlaneArtifacts, Stage0Ingress,
-    TENANT_GIT_TOKEN_ENV, apply_git_credentials_secret, apply_tenant_git_credentials_secret,
-    ensure_tenant_baseline, forgejo_stack_config, render_manifest, render_rauthy_httproute,
+    apply_git_credentials_secret, ensure_tenant_baseline, forgejo_stack_config, render_manifest,
+    render_rauthy_httproute,
 };
 use crate::commands::CliError;
 
@@ -617,19 +617,9 @@ pub(crate) async fn install_stage0_core_addons(
         .any(|p| repo_url.starts_with(p))
     {
         if let Some(token) = git_token.map(str::trim).filter(|t| !t.is_empty()) {
+            // Platform `flux-system` source only; tenant-default gets its own repository-scoped
+            // credential (`bootstrap::tenant_repo`).
             apply_git_credentials_secret(target, "git", token).await?;
-            match std::env::var(TENANT_GIT_TOKEN_ENV)
-                .ok()
-                .filter(|t| !t.trim().is_empty())
-            {
-                Some(ro_token) => {
-                    apply_tenant_git_credentials_secret(target, DEFAULT_TENANT_ID, "git", ro_token.trim())
-                        .await?
-                }
-                None => notes.push(format!(
-                    "`{TENANT_GIT_TOKEN_ENV}` is unset: the operator `--git-token` is NOT shared with tenant-default; set a read-only token there if the tenant GitRepository needs authentication (tenant-default PKO previews are refused until it exists)"
-                )),
-            }
         }
         // Exactly what `clusters/management/flux-system/` holds in Git (see
         // `seed_management_files`): tenant reconciler RBAC, the root GitRepository and the root

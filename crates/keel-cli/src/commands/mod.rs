@@ -88,6 +88,12 @@ pub enum CliError {
 
     #[error("{0}")]
     Execution(String),
+
+    /// A command that did part of its work and must still show that output (for example
+    /// one-time credentials) while exiting non-zero: [`crate::run`] prints `output` to stdout,
+    /// then fails with `message`.
+    #[error("{message}")]
+    Incomplete { output: String, message: String },
 }
 
 impl From<serde_yml::Error> for CliError {
@@ -1971,6 +1977,15 @@ spec:
             infer_forge_config("https://gitlab.example.com/team/infra.git", None, None);
         assert_eq!(gl_kind, ForgeKind::GitLab);
         assert_eq!(gl_api.as_deref(), Some("https://gitlab.example.com"));
+        // A local bare repository is the development-only Local Git provider (D8).
+        assert_eq!(
+            infer_forge_config("/srv/git/infra.git", None, None),
+            (ForgeKind::Local, None)
+        );
+        assert_eq!(
+            infer_forge_config("git@github.com:acme/infra.git", None, None).0,
+            ForgeKind::GitHub
+        );
 
         let tmp = TempTestDir::new("ext-git");
         let repo_dir = tmp.path().join("ext-repo");

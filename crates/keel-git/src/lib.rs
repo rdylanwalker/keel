@@ -17,8 +17,9 @@ pub use forge::{
     BranchProtectionOutcome, CollaboratorOutcome, CreatePrRequest, DeployKeyInfo, DeployKeyOutcome,
     EnsuredDeployKey, ForgeError, ForgeProvider, ForkInfo, ForkPolicyOutcome,
     PROTECTED_MAIN_BRANCH, PullRequestComment, PullRequestInfo, PullRequestState,
-    REPO_READ_TOKEN_NAME_PREFIX, RepoCredentialKind, RepoReadToken, RepositoryEnsureOutcome,
-    RepositoryInfo, RepositoryOptions, RepositoryTarget, validate_commit_sha,
+    REPO_READ_TOKEN_NAME_PREFIX, RepoCredentialKind, RepoReadToken, RepoReadTokenInfo,
+    RepositoryEnsureOutcome, RepositoryInfo, RepositoryOptions, RepositoryTarget,
+    validate_commit_sha,
 };
 pub use forgejo_admin::{
     AccessTokenInfo, MintedAccessToken, ORG_OWNERS_TEAM, ProvisionOutcome, ServiceUser,

@@ -9,6 +9,7 @@ pub(crate) mod forge;
 pub(crate) mod kube;
 pub(crate) mod s3;
 pub(crate) mod state;
+pub(crate) mod tenant_repo;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -22,7 +23,6 @@ use keel_core::{
     generate_admin_password, stage0_cluster_dir_in, stage0_state_root,
 };
 use keel_git::{CommitAuthor, GitCredentials, GitRunner, parse_remote_repo_url};
-use keel_kube::tenant::build_tenant_git_credentials_secret;
 use keel_kube::{
     DockerSocketExceptionConfig, KyvernoManifestBundle, KyvernoPolicyConfig,
     S3_CREDENTIALS_SECRET_NAME, TenantIsolationConfig, TenantManifestBundle,
@@ -822,16 +822,12 @@ async fn is_dir_empty_or_missing(dir: &Path) -> bool {
     !matches!(entries.next_entry().await, Ok(Some(_)))
 }
 
-/// Environment variable supplying a dedicated **read-only** Git token for `tenant-default`'s
-/// Flux `GitRepository` when bootstrapping against an external forge (`--git-url`/`--git-token`).
-pub(crate) const TENANT_GIT_TOKEN_ENV: &str = "KEEL_TENANT_GIT_TOKEN";
-
 /// Default tenant provisioned during Stage 0.
 pub(crate) const DEFAULT_TENANT_ID: &str = "default";
 
 /// Applies the control-plane `flux-system/git-credentials` Secret (used only by the
-/// `flux-system` `GitRepository`). It is never cloned into tenant namespaces; tenants receive a
-/// separate read-only credential via [`apply_tenant_git_credentials_secret`].
+/// `flux-system` `GitRepository`). It is never cloned into tenant namespaces; every tenant reads
+/// its own repository with a repository-scoped credential (`tenant_repo`).
 pub(crate) async fn apply_git_credentials_secret(
     target: KubeTarget<'_>,
     username: &str,
@@ -855,23 +851,6 @@ pub(crate) async fn apply_git_credentials_secret(
         },
     });
     target.apply(&serde_yml::to_string(&creds_doc)?).await
-}
-
-/// Writes the **read-only** `git-credentials` Secret of `tenant-<id>` consumed by the tenant's Flux
-/// `GitRepository` (`keel-gitops`).
-///
-/// Only the unlabelled Secret is written once the tenant exists: the `keel.io/platform-owned`
-/// tenant baseline is created at most once, through [`ensure_tenant_baseline`], and owned by
-/// `keel-tenants` afterwards.
-pub(crate) async fn apply_tenant_git_credentials_secret(
-    target: KubeTarget<'_>,
-    tenant_id: &str,
-    username: &str,
-    read_only_token: &str,
-) -> Result<(), CliError> {
-    ensure_tenant_baseline(target, tenant_id).await?;
-    let doc = build_tenant_git_credentials_secret(tenant_id, username, read_only_token)?;
-    target.apply(&serde_yml::to_string(&doc)?).await
 }
 
 /// The `keel.io/platform-owned` tenant baseline (`tenants/<id>/rbac.yaml`: Namespace,
@@ -1210,6 +1189,33 @@ pub(crate) fn validate_keel_server_git_url(raw: &str) -> Result<(), CliError> {
 }
 
 /// Validates `--with-keel-server` against the Git mode before anything is provisioned.
+/// `tenant-default` gets its own repository on every remote forge, which needs forge API access:
+/// with an external `--git-url` (not the in-cluster Forgejo, not a local path), `--git-token`
+/// (or `KEEL_GIT_TOKEN`) is mandatory. Checked before any infrastructure is created.
+pub(crate) fn validate_tenant_default_forge_args(args: &BootstrapInitArgs) -> Result<(), CliError> {
+    if args.skip_core_install || args.with_forge {
+        return Ok(());
+    }
+    let Some(git_url) = args.git_url.as_deref().map(str::trim) else {
+        return Ok(());
+    };
+    let (kind, _) = infer_forge_config(
+        git_url,
+        args.forge_type.map(Into::into),
+        args.forge_api_url.as_deref(),
+    );
+    let has_token = args
+        .git_token
+        .as_deref()
+        .is_some_and(|t| !t.trim().is_empty());
+    if kind != ForgeKind::Local && !has_token {
+        return Err(CliError::Validation(format!(
+            "--git-url {git_url} is a {kind:?} forge: tenant-default's own repository needs forge API access; pass --git-token (or set KEEL_GIT_TOKEN)"
+        )));
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_keel_server_args(args: &BootstrapInitArgs) -> Result<(), CliError> {
     if !args.with_keel_server {
         return Ok(());
@@ -1641,22 +1647,42 @@ async fn initialize_seed_git_repo_with_push(
         git.clone(bare_str, repo_dir).await?;
     }
 
-    let default_tenant_rbac =
-        TenantManifestBundle::synthesize(&TenantIsolationConfig::new("default"))?
-            .to_multi_doc_yaml()?;
-
-    let mut default_tenant_git_repo = artifacts.flux_git_repository.clone();
-    default_tenant_git_repo.metadata.name = "keel-gitops".to_string();
-    default_tenant_git_repo.metadata.namespace = "tenant-default".to_string();
-    let default_tenant_git_repo_yaml =
-        render_default_tenant_git_repository_yaml(&default_tenant_git_repo)?;
-
-    let tenants_kustomization_yaml = "apiVersion: kustomize.config.k8s.io/v1beta1\n\
-        kind: Kustomization\n\
-        resources:\n\
-        - default/rbac.yaml\n\
-        - default/git-repository.yaml\n"
-        .to_string();
+    // tenant-default: the dedicated-repository stub on every remote forge (its content lives in
+    // `<owner>/<monorepo>-tenant-default`, provisioned by `tenant_repo`); only the
+    // development-only Local Git provider keeps it in this repository (D8).
+    let (default_tenant_files, default_tenant_entries) =
+        match tenant_repo::default_tenant_stub(&artifacts.keel_config.forge)? {
+            Some(stub) => stub,
+            None => {
+                let default_tenant_rbac =
+                    TenantManifestBundle::synthesize(&TenantIsolationConfig::new("default"))?
+                        .to_multi_doc_yaml()?;
+                let mut default_tenant_git_repo = artifacts.flux_git_repository.clone();
+                default_tenant_git_repo.metadata.name = "keel-gitops".to_string();
+                default_tenant_git_repo.metadata.namespace = "tenant-default".to_string();
+                (
+                    vec![
+                        ("tenants/default/rbac.yaml".to_string(), default_tenant_rbac),
+                        (
+                            "tenants/default/git-repository.yaml".to_string(),
+                            render_default_tenant_git_repository_yaml(&default_tenant_git_repo)?,
+                        ),
+                    ],
+                    vec![
+                        "default/rbac.yaml".to_string(),
+                        "default/git-repository.yaml".to_string(),
+                    ],
+                )
+            }
+        };
+    for (path, yaml) in &default_tenant_files {
+        keel_kube::ensure_git_safe_manifests(path, yaml)?;
+    }
+    let tenants_kustomization_yaml = serde_yml::to_string(&serde_json::json!({
+        "apiVersion": "kustomize.config.k8s.io/v1beta1",
+        "kind": "Kustomization",
+        "resources": default_tenant_entries,
+    }))?;
 
     let mut files_to_write: Vec<(String, String)> = vec![
         (
@@ -1681,15 +1707,11 @@ async fn initialize_seed_git_repo_with_push(
                 "clusters/management/Pulumi.yaml",
                 "name: management-cluster-core\nruntime: yaml\ndescription: Keel Stage 0/1 protected management cluster core stack\n".to_string(),
             ),
-            ("tenants/default/rbac.yaml", default_tenant_rbac),
-            (
-                "tenants/default/git-repository.yaml",
-                default_tenant_git_repo_yaml,
-            ),
             ("tenants/kustomization.yaml", tenants_kustomization_yaml),
         ]
         .map(|(path, contents)| (path.to_string(), contents)),
     );
+    files_to_write.extend(default_tenant_files);
 
     let apps_dir = repo_dir.join("catalog/apps");
     let infra_dir = repo_dir.join("catalog/infra");
@@ -1857,7 +1879,8 @@ async fn initialize_seed_git_repo_with_push(
     })
 }
 
-/// Infers `(ForgeKind, Option<api_url>)` from a remote `--git-url` and optional explicit overrides.
+/// Infers `(ForgeKind, Option<api_url>)` from a remote `--git-url` and optional explicit overrides
+/// (a local path is the development-only Local Git provider).
 pub(crate) fn infer_forge_config(
     git_url: &str,
     explicit_kind: Option<ForgeKind>,
@@ -1866,7 +1889,10 @@ pub(crate) fn infer_forge_config(
     let parsed_slug = parse_remote_repo_url(git_url).ok();
     let kind = explicit_kind.unwrap_or_else(|| {
         let lower = git_url.to_ascii_lowercase();
-        if lower.contains("github.com") {
+        if !git_url.contains("://") && !git_url.contains('@') {
+            // A local path (bare repository): the development-only Local Git provider (D8).
+            ForgeKind::Local
+        } else if lower.contains("github.com") {
             ForgeKind::GitHub
         } else if lower.contains("gitlab") {
             ForgeKind::GitLab
@@ -1995,6 +2021,7 @@ pub async fn execute_bootstrap_init_with_target(
     let cfg = args.to_bootstrap_config();
     cfg.validate()?;
     validate_keel_server_args(args)?;
+    validate_tenant_default_forge_args(args)?;
     let ingress = match args.oidc_public_url.as_deref() {
         Some(url) => Stage0Ingress::from_public_url(url)?,
         None => Stage0Ingress::default(),
@@ -2209,6 +2236,73 @@ pub async fn execute_bootstrap_init_with_target(
         );
     }
 
+    // tenant-default: its own repository, repository-scoped read credential and mandatory SOPS
+    // key, provisioned like an API-created tenant (the platform repository's read token is never
+    // shared with it). Failures are reported, never papered over with a shared credential.
+    let mut tenant_default_failure = None;
+    if !args.skip_core_install {
+        let provisioned = async {
+            let access = if let Some(pf) = _forgejo_pf.as_ref() {
+                let password = forge::resolve_forgejo_admin_password(kube_target).await;
+                Some(
+                    tenant_repo::in_cluster_forgejo_forge(
+                        kube_target,
+                        &artifacts.keel_config.forge,
+                        pf.local_port,
+                        forge::FORGEJO_ADMIN_USERNAME,
+                        password.as_str(),
+                    )
+                    .await?,
+                )
+            } else if args.git_url.is_some()
+                && artifacts.keel_config.forge.provider != ForgeKind::Local
+            {
+                let token = args
+                    .git_token
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|t| !t.is_empty())
+                    .ok_or_else(|| {
+                        CliError::Validation(
+                            "tenant-default's repository needs forge API access: pass --git-token"
+                                .to_string(),
+                        )
+                    })?;
+                tenant_repo::external_forge(kube_target, &artifacts.keel_config.forge, token)
+                    .await?
+            } else {
+                None
+            };
+            match access {
+                Some(access) => {
+                    tenant_repo::provision_default_tenant_repo(kube_target, &access).await
+                }
+                // Local Git provider (D8): tenant-default lives in the platform repository.
+                None => tenant_repo::ensure_default_tenant_age_key(kube_target)
+                    .await
+                    .map(|created| {
+                        format!(
+                            "tenant-default lives in the platform repository (Local Git provider, development only, no isolation); SOPS age key {}",
+                            if created { "created" } else { "kept" }
+                        )
+                    }),
+            }
+        }
+        .await;
+        match provisioned {
+            Ok(note) => notes.push(note),
+            Err(err) => {
+                let msg = format!(
+                    "ERROR: tenant-default was NOT fully provisioned ({err}); its Flux source stays unavailable until this succeeds. Re-run `keel bootstrap init` to retry"
+                );
+                tracing::error!("{msg}");
+                notes.push(msg);
+                // Escrow and the one-time credentials below still run; the command then fails.
+                tenant_default_failure = Some(err.to_string());
+            }
+        }
+    }
+
     // Escrow Stage 0 state to the in-cluster versioned S3 bucket (break-glass, NFR-REL-01).
     let mut stage0_backend_url = None;
     if !args.skip_core_install
@@ -2265,6 +2359,16 @@ pub async fn execute_bootstrap_init_with_target(
     let mut output = format_bootstrap_init_summary(&connection, &artifacts, seed_repo.as_ref());
     for note in &notes {
         output.push_str(&format!("\nNote: {note}\n"));
+    }
+
+    if let Some(reason) = tenant_default_failure {
+        // Non-zero exit, but the summary (one-time admin password, escrow notes) is still shown.
+        return Err(CliError::Incomplete {
+            output,
+            message: format!(
+                "keel bootstrap init did not complete: tenant-default was not provisioned ({reason}); fix the cause and re-run `keel bootstrap init`"
+            ),
+        });
     }
 
     Ok(BootstrapInitOutcome {
@@ -2950,6 +3054,57 @@ mod security_hardening_tests {
             .await
             .unwrap();
         assert!(seed_management_files(&a).is_err());
+    }
+
+    #[test]
+    fn external_git_url_requires_a_forge_token_up_front() {
+        let parse = |extra: &[&str]| {
+            let mut argv = vec!["keel", "bootstrap", "init", "--target", "kind"];
+            argv.extend_from_slice(extra);
+            match <crate::cli::Cli as clap::Parser>::try_parse_from(argv)
+                .unwrap()
+                .command
+            {
+                crate::cli::Commands::Bootstrap(crate::cli::BootstrapArgs {
+                    command: crate::cli::BootstrapCommands::Init(args),
+                }) => args,
+                other => panic!("unexpected command: {other:?}"),
+            }
+        };
+        // A blank token counts as missing (also overrides an ambient KEEL_GIT_TOKEN).
+        let err = validate_tenant_default_forge_args(&parse(&[
+            "--git-url",
+            "https://github.com/acme/infra.git",
+            "--git-token",
+            " ",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("--git-token"), "{err}");
+        validate_tenant_default_forge_args(&parse(&[
+            "--git-url",
+            "https://github.com/acme/infra.git",
+            "--git-token",
+            "ghp_x",
+        ]))
+        .unwrap();
+        // Local paths (Local Git provider, D8), --skip-core-install and no --git-url need none.
+        validate_tenant_default_forge_args(&parse(&[
+            "--git-url",
+            "/tmp/keel-gitops.git",
+            "--git-token",
+            " ",
+        ]))
+        .unwrap();
+        validate_tenant_default_forge_args(&parse(&[
+            "--git-url",
+            "https://github.com/acme/infra.git",
+            "--git-token",
+            " ",
+            "--skip-core-install",
+        ]))
+        .unwrap();
+        validate_tenant_default_forge_args(&parse(&[])).unwrap();
     }
 
     #[test]
@@ -3963,6 +4118,40 @@ mod security_hardening_tests {
             "catalog schema exposes a locked flux2 value"
         );
         keel_core::parse_catalog_application(CORE_CATALOG_FLUX2_YAML).unwrap();
+    }
+
+    #[tokio::test]
+    async fn seed_repo_writes_the_dedicated_tenant_default_stub_with_a_forge() {
+        let tmp = std::env::temp_dir().join(format!("keel-seed-tenant-{}", uuid::Uuid::new_v4()));
+        let work = tmp.join("work");
+        let cfg = BootstrapConfig {
+            with_forge: true,
+            ..BootstrapConfig::new(keel_core::BootstrapTargetKind::Kubeconfig)
+        };
+        let a = synthesize_seed_control_plane(&cfg, None).await.unwrap();
+        let res = initialize_seed_git_repo(&work, &a).await;
+        let res = res.unwrap_or_else(|e| {
+            let _ = std::fs::remove_dir_all(&tmp);
+            panic!("seed repo init failed: {e}")
+        });
+        let read = |p: &str| std::fs::read_to_string(res.repo_dir.join(p)).unwrap();
+        let git_repo = read("tenants/default/git-repository.yaml");
+        assert!(
+            git_repo.contains("/keel-tenants/infra-gitops-tenant-default.git"),
+            "{git_repo}"
+        );
+        assert!(git_repo.contains("keel-gitops-credentials"));
+        assert!(!git_repo.contains("name: git-credentials"));
+        assert!(read("tenants/default/sync.yaml").contains("keel-tenant-root"));
+        let k = read("tenants/kustomization.yaml");
+        for entry in [
+            "default/rbac.yaml",
+            "default/git-repository.yaml",
+            "default/sync.yaml",
+        ] {
+            assert!(k.contains(entry), "{k}");
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[tokio::test]

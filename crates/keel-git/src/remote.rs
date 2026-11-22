@@ -15,8 +15,8 @@ use crate::remote_repo::ExistingRepo;
 use crate::forge::{
     BranchProtectionOutcome, CollaboratorOutcome, CreatePrRequest, DeployKeyInfo, EnsuredDeployKey,
     ForgeError, ForgeProvider, ForkInfo, ForkPolicyOutcome, PullRequestInfo, PullRequestState,
-    RepoCredentialKind, RepoReadToken, RepositoryEnsureOutcome, RepositoryInfo, RepositoryOptions,
-    RepositoryTarget, matches_tenant, validate_commit_sha,
+    RepoCredentialKind, RepoReadToken, RepoReadTokenInfo, RepositoryEnsureOutcome, RepositoryInfo,
+    RepositoryOptions, RepositoryTarget, matches_tenant, validate_commit_sha,
 };
 use crate::git::parse_proposal_branch_tenant;
 
@@ -814,6 +814,13 @@ impl ForgeProvider for ForgejoGiteaProvider {
         self.revoke_repo_token(token_id).await
     }
 
+    async fn list_repo_read_tokens(
+        &self,
+        repo: &RepositoryTarget,
+    ) -> Result<Vec<RepoReadTokenInfo>, ForgeError> {
+        self.list_repo_tokens(repo).await
+    }
+
     async fn ensure_deploy_key(
         &self,
         repo: &RepositoryTarget,
@@ -1161,6 +1168,10 @@ impl ForgeProvider for GitHubProvider {
         username: &str,
     ) -> Result<(), ForgeError> {
         self.remove_repo_collaborator(repo, username).await
+    }
+
+    async fn ssh_host_keys(&self) -> Result<Vec<String>, ForgeError> {
+        GitHubProvider::ssh_host_keys(self).await
     }
 
     async fn list_forks(&self, repo: &RepositoryTarget) -> Result<Vec<ForkInfo>, ForgeError> {
@@ -1529,6 +1540,13 @@ impl ForgeProvider for GitLabProvider {
         token_id: &str,
     ) -> Result<(), ForgeError> {
         self.revoke_repo_token(repo, token_id).await
+    }
+
+    async fn list_repo_read_tokens(
+        &self,
+        repo: &RepositoryTarget,
+    ) -> Result<Vec<RepoReadTokenInfo>, ForgeError> {
+        self.list_repo_tokens(repo).await
     }
 
     async fn ensure_deploy_key(

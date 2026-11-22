@@ -334,6 +334,17 @@ impl fmt::Debug for RepoReadToken {
     }
 }
 
+/// Metadata of a live repository read token ([`ForgeProvider::list_repo_read_tokens`]); never
+/// the secret.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RepoReadTokenInfo {
+    /// Forge id of the token (pass to [`ForgeProvider::revoke_repo_read_token`]).
+    pub id: String,
+    /// Token name.
+    pub name: String,
+}
+
 /// A repository deploy key (public half only).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -532,6 +543,16 @@ pub trait ForgeProvider: Send + Sync {
         Err(ForgeError::unsupported("create_repo_read_token"))
     }
 
+    /// Lists the live repository read tokens that work on `repo` (Forgejo: the basic-auth bot's
+    /// tokens restricted to exactly `repo`; GitLab: the project's active deploy tokens). Fails
+    /// closed instead of truncating; never returns token secrets.
+    async fn list_repo_read_tokens(
+        &self,
+        _repo: &RepositoryTarget,
+    ) -> Result<Vec<RepoReadTokenInfo>, ForgeError> {
+        Err(ForgeError::unsupported("list_repo_read_tokens"))
+    }
+
     /// Revokes a token minted by [`Self::create_repo_read_token`]. A missing token (404) is
     /// success.
     async fn revoke_repo_read_token(
@@ -641,6 +662,14 @@ pub trait ForgeProvider: Send + Sync {
     /// Lists the forks of `repo` (fails closed instead of truncating).
     async fn list_forks(&self, _repo: &RepositoryTarget) -> Result<Vec<ForkInfo>, ForgeError> {
         Err(ForgeError::unsupported("list_forks"))
+    }
+
+    /// The forge's published SSH host public keys (one OpenSSH `<type> <base64>` line each) for
+    /// building a pinned `known_hosts` for [`RepoCredentialKind::SshDeployKey`] credentials
+    /// without trusting on first use (GitHub: `GET /meta` `ssh_keys`, fetched over
+    /// TLS-verified HTTPS).
+    async fn ssh_host_keys(&self) -> Result<Vec<String>, ForgeError> {
+        Err(ForgeError::unsupported("ssh_host_keys"))
     }
 }
 

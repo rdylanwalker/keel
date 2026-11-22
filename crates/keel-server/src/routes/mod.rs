@@ -1153,6 +1153,7 @@ spec:
             State(state.clone()),
             Json(CreateTenantRequest {
                 id: "management".to_string(),
+                adopt_existing: false,
             }),
         )
         .await
@@ -1924,6 +1925,7 @@ spec:
             State(state.clone()),
             Json(CreateTenantRequest {
                 id: "acme".to_string(),
+                adopt_existing: false,
             }),
         )
         .await
@@ -1934,7 +1936,7 @@ spec:
         let _ = merge_proposal(
             test_auth(),
             State(state.clone()),
-            AxumPath(created.proposal.id.clone()),
+            AxumPath(created.proposal.as_ref().expect("stub proposal").id.clone()),
         )
         .await
         .expect("merge create_tenant proposal");

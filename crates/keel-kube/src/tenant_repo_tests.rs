@@ -855,3 +855,104 @@ fn preview_payload_is_exactly_the_pko_keys_of_the_platform_secret() {
     let err = tenant_repo_preview_secret_payload(&https(), &elsewhere).unwrap_err();
     assert!(!err.to_string().contains(TOKEN));
 }
+
+#[test]
+fn typed_credentials_secret_folds_string_data_and_records_non_secret_metadata() {
+    let secret = tenant_gitops_credentials_secret(&https(), &https_credential(), "42").unwrap();
+    assert!(secret.string_data.is_none());
+    let data = secret.data.as_ref().unwrap();
+    assert_eq!(data["password"].0, TOKEN.as_bytes());
+    assert_eq!(data["username"].0, b"keel-tenant-reader");
+    let ann = secret.metadata.annotations.as_ref().unwrap();
+    assert_eq!(ann[CREDENTIAL_ID_ANNOTATION], "42");
+    assert_eq!(ann[CREDENTIAL_REPO_URL_ANNOTATION], FORGEJO_URL);
+    assert_eq!(ann[GIT_TRANSPORT_ANNOTATION], "https");
+    // Annotations never carry the secret.
+    assert!(!ann.values().any(|v| v.contains(TOKEN)));
+    assert_eq!(
+        secret.metadata.labels.as_ref().unwrap()["keel.io/platform-owned"],
+        "true"
+    );
+    assert!(tenant_gitops_credentials_secret(&https(), &https_credential(), "").is_err());
+    assert!(tenant_gitops_credentials_secret(&https(), &https_credential(), "4 2").is_err());
+}
+
+#[test]
+fn credential_status_requires_the_platform_secret_for_exactly_this_repository() {
+    let source = https();
+    assert_eq!(
+        tenant_gitops_credentials_status(&source, None),
+        TenantGitopsCredentialStatus::Missing
+    );
+    let secret = tenant_gitops_credentials_secret(&source, &https_credential(), "7").unwrap();
+    assert_eq!(
+        tenant_gitops_credentials_status(&source, Some(&secret)),
+        TenantGitopsCredentialStatus::Valid {
+            credential_id: Some("7".to_string())
+        }
+    );
+
+    // Issued for another repository: rotate, and remember the old id to revoke.
+    let other = TenantRepoSource::new(
+        "acme",
+        "https://forgejo.keel.local:8888/keel-tenants/other.git",
+    )
+    .unwrap();
+    match tenant_gitops_credentials_status(&other, Some(&secret)) {
+        TenantGitopsCredentialStatus::Invalid {
+            credential_id,
+            reason,
+        } => {
+            assert_eq!(credential_id.as_deref(), Some("7"));
+            assert!(!reason.contains(TOKEN), "{reason}");
+        }
+        other => panic!("expected Invalid, got {other:?}"),
+    }
+
+    // Missing key or dropped platform label.
+    let mut broken = secret.clone();
+    broken.data.as_mut().unwrap().remove("password");
+    assert!(matches!(
+        tenant_gitops_credentials_status(&source, Some(&broken)),
+        TenantGitopsCredentialStatus::Invalid { .. }
+    ));
+    let mut unlabelled = secret.clone();
+    unlabelled
+        .metadata
+        .labels
+        .as_mut()
+        .unwrap()
+        .remove("keel.io/platform-owned");
+    assert!(matches!(
+        tenant_gitops_credentials_status(&source, Some(&unlabelled)),
+        TenantGitopsCredentialStatus::Invalid { .. }
+    ));
+
+    // SSH: valid with the pinned host key, invalid for an HTTPS source of the same tenant.
+    let ssh_secret = tenant_gitops_credentials_secret(
+        &ssh(),
+        &ssh_credential(&format!("github.com {HOST_KEY}")),
+        "99",
+    )
+    .unwrap();
+    assert!(matches!(
+        tenant_gitops_credentials_status(&ssh(), Some(&ssh_secret)),
+        TenantGitopsCredentialStatus::Valid { .. }
+    ));
+    assert!(matches!(
+        tenant_gitops_credentials_status(&https(), Some(&ssh_secret)),
+        TenantGitopsCredentialStatus::Invalid { .. }
+    ));
+    // Without `identity.pub` (the deploy key to keep) or `identity` (Flux) it must be rotated.
+    for key in ["identity.pub", "identity"] {
+        let mut partial = ssh_secret.clone();
+        partial.data.as_mut().unwrap().remove(key);
+        assert!(
+            matches!(
+                tenant_gitops_credentials_status(&ssh(), Some(&partial)),
+                TenantGitopsCredentialStatus::Invalid { ref reason, .. } if reason.contains(key)
+            ),
+            "{key}"
+        );
+    }
+}

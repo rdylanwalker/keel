@@ -96,7 +96,6 @@ keel auth status
 
 Environment variables read by `bootstrap init`:
 
-- `KEEL_TENANT_GIT_TOKEN`: a read-only token for `tenant-default`'s Flux `GitRepository` when you use an external forge.
 - `KEEL_FORGEJO_ADMIN_PASSWORD`: overrides the generated Forgejo admin password.
 - `KEEL_CONFIG_DIR` / `XDG_CONFIG_HOME`: relocate the Stage 0 state directory.
 

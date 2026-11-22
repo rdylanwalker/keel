@@ -8,11 +8,12 @@ use std::time::Duration;
 
 use keel_core::{
     AuthPhase, FLUX_SYSTEM_NAMESPACE, ForgeKind, KEEL_SYSTEM_NAMESPACE, KeelConfig,
-    OIDC_CLIENT_SECRET_ENV, OidcConfig, ProviderRegistry,
+    OIDC_CLIENT_SECRET_ENV, OidcConfig, ProviderRegistry, TENANT_REPO_READER_SECRET_NAME,
+    TENANT_REPOS_ORG,
 };
 use keel_git::{
     CommitAuthor, ForgeProvider, ForgejoGiteaProvider, GitCredentials, GitHubProvider,
-    GitLabProvider, GitRunner, LocalGitProvider, parse_remote_repo_url,
+    GitLabProvider, GitRunner, LocalGitProvider, RemoteRepoSlug, parse_remote_repo_url,
 };
 use keel_kube::{
     InMemorySecretStore, K8sSecretStore, KubeClusterStatusReader, S3_CREDENTIALS_SECRET_NAME,
@@ -22,7 +23,11 @@ use keel_pko::{
     IN_CLUSTER_S3_BACKEND_URL, ManagementCoreStackParams, attach_s3_credentials_env_refs,
     synthesize_management_core_stack,
 };
-use keel_server::{AppState, KubeClusterStateProvider, RepoClusterStateProvider, build_router};
+use keel_server::{
+    AppState, KubeClusterStateProvider, RepoClusterStateProvider, TenantRepoForge,
+    TenantRepoForgeKind, TenantRepoNaming, TenantRepos, build_router,
+};
+use zeroize::Zeroizing;
 
 use crate::cli::ServeArgs;
 
@@ -89,15 +94,7 @@ fn build_forge_provider(
             )
         }
         ForgeKind::Forgejo | ForgeKind::Gitea => {
-            let api_base = effective_api
-                .map(|u| {
-                    let trimmed = u.trim_end_matches('/');
-                    trimmed
-                        .strip_suffix("/api/v1")
-                        .unwrap_or(trimmed)
-                        .to_string()
-                })
-                .unwrap_or_else(|| slug.origin_url.clone());
+            let api_base = forgejo_api_base(effective_api, &slug);
             Arc::new(
                 ForgejoGiteaProvider::new(api_base, &slug.owner, &slug.repo, token)
                     .map_err(|e| CliError::Validation(e.to_string()))?,
@@ -112,6 +109,106 @@ fn build_forge_provider(
         "Configured remote ForgeProvider"
     );
     Ok(forge)
+}
+
+/// Forgejo/Gitea API base (no `/api/v1` suffix) from `forge.apiUrl` (or an override), else the
+/// repository origin.
+fn forgejo_api_base(effective_api: Option<&str>, slug: &RemoteRepoSlug) -> String {
+    effective_api
+        .map(|u| {
+            let trimmed = u.trim_end_matches('/');
+            trimmed
+                .strip_suffix("/api/v1")
+                .unwrap_or(trimmed)
+                .to_string()
+        })
+        .unwrap_or_else(|| slug.origin_url.clone())
+}
+
+/// Inputs of [`build_tenant_repos`] (platform configuration and cluster-only Secrets).
+pub(crate) struct TenantRepoInputs<'a> {
+    pub(crate) cfg: Option<&'a KeelConfig>,
+    /// The platform forge provider (`build_forge_provider`).
+    pub(crate) admin: Arc<dyn ForgeProvider>,
+    /// `true` when `admin` talks to the configured remote forge (a token was found).
+    pub(crate) remote_forge: bool,
+    pub(crate) api_url_override: Option<&'a str>,
+    /// Forgejo tenant-reader bot (`keel-system/keel-forgejo-tenant-reader` username/password).
+    pub(crate) reader_bot: Option<(String, Zeroizing<String>)>,
+    /// Public Keel CA (`keel-system/keel-wildcard-tls` `ca.crt`).
+    pub(crate) keel_ca: Option<String>,
+}
+
+/// Per-tenant repository registry (`SDD.md` §3.2): dedicated repositories on every remote forge
+/// (Forgejo/Gitea: organisation `keel-tenants`, HTTPS bot tokens; GitLab: the platform group,
+/// deploy tokens; GitHub: the platform owner, SSH deploy keys), the monorepo layout only for the
+/// development-only Local Git provider (D8) — `forge.provider: local`, or no `.keel/config.yaml`
+/// at all (no forge configured). A remote forge Keel cannot use (no forge token) never falls
+/// back to the monorepo: tenant provisioning fails closed instead.
+pub(crate) fn build_tenant_repos(
+    inputs: TenantRepoInputs<'_>,
+    cache_root: std::path::PathBuf,
+) -> Result<TenantRepos, CliError> {
+    let Some(cfg) = inputs.cfg.filter(|c| c.forge.provider != ForgeKind::Local) else {
+        return Ok(TenantRepos::monorepo(cache_root));
+    };
+    if !inputs.remote_forge {
+        let reason = format!(
+            "`.keel/config.yaml` configures a {:?} forge but no forge token was found (--git-token, KEEL_GIT_TOKEN or {KEEL_SYSTEM_NAMESPACE}/{FORGE_TOKEN_SECRET_NAME}); configure one and restart keel-server",
+            cfg.forge.provider
+        );
+        tracing::warn!("Tenant repositories are unavailable: {reason}");
+        return Ok(TenantRepos::unavailable(reason, cache_root));
+    }
+    let Some(naming) = TenantRepoNaming::from_forge_config(&cfg.forge)
+        .map_err(|e| CliError::Validation(format!("tenant repositories: {e}")))?
+    else {
+        return Ok(TenantRepos::monorepo(cache_root));
+    };
+    let token_minter = match (naming.kind, inputs.reader_bot) {
+        (TenantRepoForgeKind::Forgejo, Some((user, password))) => {
+            let slug = parse_remote_repo_url(&cfg.forge.repo_url).map_err(|e| {
+                CliError::Validation(format!(
+                    "invalid forge.repo_url '{}': {e}",
+                    cfg.forge.repo_url
+                ))
+            })?;
+            let effective_api = inputs.api_url_override.or(cfg.forge.api_url.as_deref());
+            Some(Arc::new(
+                ForgejoGiteaProvider::with_basic_auth(
+                    forgejo_api_base(effective_api, &slug),
+                    TENANT_REPOS_ORG,
+                    &slug.repo,
+                    &user,
+                    password.as_str(),
+                )
+                .map_err(|e| CliError::Validation(e.to_string()))?,
+            ) as Arc<dyn ForgeProvider>)
+        }
+        (TenantRepoForgeKind::Forgejo, None) => {
+            tracing::warn!(
+                "keel-system/{TENANT_REPO_READER_SECRET_NAME} is missing: tenant repository credentials cannot be minted until `keel bootstrap init` provisions the tenant-reader bot"
+            );
+            None
+        }
+        _ => None,
+    };
+    let forge = TenantRepoForge {
+        // The Keel CA only fronts the in-cluster Forgejo (`forge.publicUrl`).
+        ca_crt: match naming.kind {
+            TenantRepoForgeKind::Forgejo => cfg.forge.public_url.as_ref().and(inputs.keel_ca),
+            _ => None,
+        },
+        naming,
+        admin: inputs.admin,
+        token_minter,
+    };
+    tracing::info!(
+        kind = ?forge.kind,
+        owner = %forge.owner,
+        "Tenants use dedicated repositories (<monorepo>-tenant-<id>)"
+    );
+    Ok(TenantRepos::dedicated(forge, cache_root))
 }
 
 /// Default HTTPS username paired with `KEEL_GIT_TOKEN` for `--git-url` (the Stage 0 Forgejo admin).
@@ -401,6 +498,46 @@ async fn build_serve_state_with_forward(
         api_url_override.as_deref(),
         &local_forge_repo,
     )?;
+    let remote_forge = parsed_keel_cfg
+        .as_ref()
+        .is_some_and(|c| c.forge.provider != ForgeKind::Local)
+        && resolved_token
+            .as_deref()
+            .is_some_and(|t| !t.trim().is_empty());
+    let (reader_bot, keel_ca) = match kube_reader.as_ref() {
+        Some(reader) if remote_forge => {
+            let user = reader
+                .read_secret_key(
+                    KEEL_SYSTEM_NAMESPACE,
+                    TENANT_REPO_READER_SECRET_NAME,
+                    "username",
+                )
+                .await;
+            let password = reader
+                .read_secret_key(
+                    KEEL_SYSTEM_NAMESPACE,
+                    TENANT_REPO_READER_SECRET_NAME,
+                    "password",
+                )
+                .await;
+            let ca = reader
+                .read_secret_key(KEEL_SYSTEM_NAMESPACE, "keel-wildcard-tls", "ca.crt")
+                .await;
+            (user.zip(password.map(Zeroizing::new)), ca)
+        }
+        _ => (None, None),
+    };
+    let tenant_repos = build_tenant_repos(
+        TenantRepoInputs {
+            cfg: parsed_keel_cfg.as_ref(),
+            admin: forge.clone(),
+            remote_forge,
+            api_url_override: api_url_override.as_deref(),
+            reader_bot,
+            keel_ca,
+        },
+        TenantRepos::default_cache_root(&repo_workdir),
+    )?;
 
     let git_runner =
         if remote_git_url.is_some() && !matches!(git_runner.credentials(), GitCredentials::None) {
@@ -474,7 +611,8 @@ async fn build_serve_state_with_forward(
     )
     // Tenant Stack proposals require the tenant state passphrase Secret whenever Secrets live in
     // the cluster; cluster-less local dev (in-memory store, nothing applied) skips the gate.
-    .with_require_pulumi_passphrase(cluster_secret_store);
+    .with_require_pulumi_passphrase(cluster_secret_store)
+    .with_tenant_repos(tenant_repos);
     if let Some(backend) = mgmt_stack_backend {
         state.backend_url = backend;
     }
@@ -619,4 +757,110 @@ pub async fn execute_serve(args: &ServeArgs) -> Result<String, CliError> {
     })
     .await?;
     Ok(format!("Keel server on {addr} shut down cleanly."))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg(provider: ForgeKind, repo_url: &str, public_url: Option<&str>) -> KeelConfig {
+        let mut cfg = KeelConfig::default();
+        cfg.forge.provider = provider;
+        cfg.forge.repo_url = repo_url.to_string();
+        cfg.forge.public_url = public_url.map(str::to_string);
+        cfg
+    }
+
+    fn inputs<'a>(cfg: Option<&'a KeelConfig>, remote_forge: bool) -> TenantRepoInputs<'a> {
+        TenantRepoInputs {
+            cfg,
+            admin: Arc::new(LocalGitProvider::new(std::env::temp_dir())),
+            remote_forge,
+            api_url_override: None,
+            reader_bot: Some((
+                "keel-tenant-reader".to_string(),
+                Zeroizing::new("pw".to_string()),
+            )),
+            keel_ca: Some("-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n".into()),
+        }
+    }
+
+    #[test]
+    fn only_the_local_provider_keeps_tenants_in_the_monorepo() {
+        let root = std::path::PathBuf::from("/tmp/cache");
+        assert!(
+            !build_tenant_repos(inputs(None, false), root.clone())
+                .unwrap()
+                .is_dedicated()
+        );
+        let local = cfg(ForgeKind::Local, "", None);
+        assert!(
+            !build_tenant_repos(inputs(Some(&local), true), root.clone())
+                .unwrap()
+                .is_dedicated()
+        );
+        // A remote forge without a token fails closed instead of falling back to the monorepo.
+        let gh = cfg(ForgeKind::GitHub, "https://github.com/acme/infra.git", None);
+        let repos = build_tenant_repos(inputs(Some(&gh), false), root).unwrap();
+        assert!(repos.is_dedicated());
+        assert!(repos.forge().is_none());
+        let err = repos.require_forge().unwrap_err().to_string();
+        assert!(err.contains("no forge token"), "{err}");
+    }
+
+    #[test]
+    fn remote_forges_get_dedicated_repositories_with_their_transport() {
+        let root = std::path::PathBuf::from("/tmp/cache");
+        let forgejo = cfg(
+            ForgeKind::Forgejo,
+            "http://forgejo-http.keel-system.svc.cluster.local:3000/keel/infra-gitops.git",
+            Some("https://forgejo.keel.local:8888"),
+        );
+        let repos = build_tenant_repos(inputs(Some(&forgejo), true), root.clone()).unwrap();
+        let f = repos.forge().unwrap();
+        assert_eq!(f.kind, TenantRepoForgeKind::Forgejo);
+        assert_eq!(f.owner, TENANT_REPOS_ORG);
+        assert!(f.token_minter.is_some());
+        assert!(f.ca_crt.is_some());
+        assert_eq!(
+            f.clone_url("acme").unwrap(),
+            "https://forgejo.keel.local:8888/keel-tenants/infra-gitops-tenant-acme.git"
+        );
+
+        // External Forgejo: no Keel CA, origin from the repository URL.
+        let external = cfg(
+            ForgeKind::Forgejo,
+            "https://git.example.com/ops/infra.git",
+            None,
+        );
+        let repos = build_tenant_repos(inputs(Some(&external), true), root.clone()).unwrap();
+        let f = repos.forge().unwrap();
+        assert!(f.ca_crt.is_none());
+        assert_eq!(
+            f.clone_url("acme").unwrap(),
+            "https://git.example.com/keel-tenants/infra-tenant-acme.git"
+        );
+
+        let gitlab = cfg(
+            ForgeKind::GitLab,
+            "https://gitlab.com/acme/platform/infra.git",
+            None,
+        );
+        let repos = build_tenant_repos(inputs(Some(&gitlab), true), root.clone()).unwrap();
+        let f = repos.forge().unwrap();
+        assert_eq!(f.owner, "acme/platform");
+        assert_eq!(
+            f.clone_url("web").unwrap(),
+            "https://gitlab.com/acme/platform/infra-tenant-web.git"
+        );
+
+        let github = cfg(ForgeKind::GitHub, "https://github.com/acme/infra.git", None);
+        let repos = build_tenant_repos(inputs(Some(&github), true), root).unwrap();
+        let f = repos.forge().unwrap();
+        assert_eq!(f.kind, TenantRepoForgeKind::GitHub);
+        assert_eq!(
+            f.clone_url("web").unwrap(),
+            "ssh://git@github.com/acme/infra-tenant-web.git"
+        );
+    }
 }

@@ -19,8 +19,8 @@ use reqwest::Client;
 use serde_json::json;
 use zeroize::Zeroizing;
 
+use super::apply_git_credentials_secret;
 use super::kube::KubeTarget;
-use super::{DEFAULT_TENANT_ID, apply_git_credentials_secret, apply_tenant_git_credentials_secret};
 use crate::commands::CliError;
 
 pub(crate) const FORGE_TOKEN_SECRET_NAME: &str = "forge-token";
@@ -253,6 +253,20 @@ async fn resolve_tenant_reader_credentials(target: KubeTarget<'_>) -> TenantRead
     )
 }
 
+/// Name of the in-cluster platform repository (`keel/infra-gitops`).
+const PLATFORM_REPO_NAME: &str = "infra-gitops";
+/// Name prefix of the admin's `flux-system` platform read tokens (`<prefix><unix-millis>`).
+const FLUX_READ_TOKEN_NAME_PREFIX: &str = "keel-flux-readonly-";
+
+/// Ids of earlier `flux-system` platform read tokens to revoke once `keep_id` is stored.
+pub(crate) fn stale_flux_read_tokens(tokens: &[AccessTokenInfo], keep_id: i64) -> Vec<i64> {
+    tokens
+        .iter()
+        .filter(|t| t.id != keep_id && t.name.starts_with(FLUX_READ_TOKEN_NAME_PREFIX))
+        .map(|t| t.id)
+        .collect()
+}
+
 /// `true` for a token Keel minted as the bot: named `keel-tenant-repo-*`, only
 /// `read:repository`, and restricted to repositories in [`TENANT_REPOS_ORG`]. Stage 0 deletes
 /// every other token the bot owns.
@@ -468,8 +482,13 @@ pub(crate) async fn provision_in_cluster_forgejo(
     let base = format!("http://127.0.0.1:{local_port}");
     let user = FORGEJO_ADMIN_USERNAME;
     let pass = resolve_forgejo_admin_password(target).await;
-    let admin =
-        ForgejoGiteaProvider::with_basic_auth(&base, user, "infra-gitops", user, pass.as_str())?;
+    let admin = ForgejoGiteaProvider::with_basic_auth(
+        &base,
+        user,
+        PLATFORM_REPO_NAME,
+        user,
+        pass.as_str(),
+    )?;
 
     // 1. Ensure `keel/infra-gitops` exists.
     admin.ensure_repository(true).await?;
@@ -487,30 +506,45 @@ pub(crate) async fn provision_in_cluster_forgejo(
     // API access is verified by the caller *after* the seed push: Forgejo answers 404 for
     // pull-request listings on a repository that has no commits yet.
 
-    // 3. Read-only token for Flux pulls (flux-system and tenant-default).
-    let ro_token = Zeroizing::new(
-        admin
-            .create_access_token(
-                &format!("keel-flux-readonly-{}", chrono::Utc::now().timestamp()),
-                &["read:repository"],
-            )
-            .await?,
-    );
+    // 3. Read-only token for the platform `flux-system` source only. Tenants never receive it:
+    // every tenant (tenant-default included) reads its own repository with a repository-scoped
+    // credential.
+    // Restricted to the platform repository (Forgejo 15 repository-specific token), so it cannot
+    // read any tenant repository; earlier platform read tokens are revoked once it is stored.
+    let platform_repo = keel_git::RepositoryTarget::new(user, PLATFORM_REPO_NAME)?;
+    let minted = admin
+        .create_repository_scoped_token(
+            &format!(
+                "{FLUX_READ_TOKEN_NAME_PREFIX}{}",
+                chrono::Utc::now().timestamp_millis()
+            ),
+            &["read:repository"],
+            std::slice::from_ref(&platform_repo),
+        )
+        .await?;
+    let ro_token = Zeroizing::new(minted.token.clone());
     apply_git_credentials_secret(target, user, &ro_token).await?;
-    apply_tenant_git_credentials_secret(target, DEFAULT_TENANT_ID, user, &ro_token).await?;
-
-    // 3b. Per-tenant repository foundations (org, bot user, read-only team). Not consumed by
-    // any write path yet, so a failure is reported instead of aborting the bootstrap.
-    match provision_tenant_repo_foundations(target, &admin, &base).await {
-        Ok(report) => notes.push(report.note()),
-        Err(err) => {
-            let msg = format!(
-                "Forgejo per-tenant repository foundations (organisation `{TENANT_REPOS_ORG}`, bot `{TENANT_REPO_READER_USERNAME}`, team `{TENANT_REPO_READERS_TEAM}`) were NOT set up: {err}. Re-run `keel bootstrap init` to retry"
-            );
-            tracing::warn!("{msg}");
-            notes.push(msg);
-        }
+    let stale = stale_flux_read_tokens(&admin.list_access_tokens().await?, minted.id);
+    for id in &stale {
+        admin.delete_access_token(*id).await?;
     }
+    if !stale.is_empty() {
+        tracing::info!(
+            revoked = stale.len(),
+            "Revoked earlier flux-system platform read tokens"
+        );
+    }
+
+    // 3b. Per-tenant repository foundations (org, bot user, read-only team). Every tenant,
+    // tenant-default included, depends on them, so a failure aborts the bootstrap.
+    let report = provision_tenant_repo_foundations(target, &admin, &base)
+        .await
+        .map_err(|err| {
+            CliError::Execution(format!(
+                "Forgejo per-tenant repository foundations (organisation `{TENANT_REPOS_ORG}`, bot `{TENANT_REPO_READER_USERNAME}`, team `{TENANT_REPO_READERS_TEAM}`) could not be set up: {err}. Re-run `keel bootstrap init` to retry"
+            ))
+        })?;
+    notes.push(report.note());
 
     // 4. Rauthy SSO auth source.
     if let Some(oidc_secret) = forgejo_oidc_secret {
@@ -588,7 +622,7 @@ async fn warm_up_forgejo_oidc(base: &str) {
 // External repository provisioning
 // ============================================================================
 
-fn forgejo_base(api_url: Option<&str>, origin: &str) -> String {
+pub(crate) fn forgejo_base(api_url: Option<&str>, origin: &str) -> String {
     api_url
         .map(|u| {
             let t = u.trim_end_matches('/');
@@ -1323,6 +1357,24 @@ mod tests {
                 .to_string();
         assert!(err.contains("spies"), "{err}");
         handle.abort();
+    }
+
+    #[test]
+    fn earlier_flux_read_tokens_are_stale() {
+        let token = |id: i64, name: &str| AccessTokenInfo {
+            id,
+            name: name.to_string(),
+            scopes: vec!["read:repository".to_string()],
+            repositories: None,
+        };
+        let tokens = [
+            token(1, "keel-flux-readonly-1700000000"),
+            token(2, "keel-flux-readonly-1700000000123"),
+            token(3, "keel-stage0-1700000000"),
+            token(4, "keel-flux-readonly-1800000000000"),
+        ];
+        assert_eq!(stale_flux_read_tokens(&tokens, 4), vec![1, 2]);
+        assert!(stale_flux_read_tokens(&tokens[2..3], 4).is_empty());
     }
 
     #[tokio::test]

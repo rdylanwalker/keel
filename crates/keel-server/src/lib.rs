@@ -11,6 +11,7 @@ pub mod security;
 pub mod spa;
 pub mod ssh;
 pub mod state;
+pub mod tenant_repos;
 
 use axum::Router;
 use axum::routing::{delete, get, post, put};
@@ -27,6 +28,10 @@ pub use routes::{CatalogItemDto, CreateCatalogItemRequest, healthz as health_che
 pub use state::{
     AppState, CachedPreview, ClusterStateProvider, KubeClusterStateProvider, ReleaseSummary,
     RepoClusterStateProvider, StackSummary,
+};
+pub use tenant_repos::{
+    TenantRepoCloneBase, TenantRepoForge, TenantRepoForgeKind, TenantRepoLayout, TenantRepoNaming,
+    TenantRepos,
 };
 
 /// Builds the complete stateless Axum [`Router`] with all REST, SSE, auth, and embedded SPA routes.

@@ -1168,6 +1168,9 @@ pub struct AppState {
     /// `keel-pulumi-passphrase` Secret. Defaults to `true`; only cluster-less local dev (in-memory
     /// Secret store, Stacks are never applied) turns it off.
     pub require_pulumi_passphrase: bool,
+    /// Per-tenant repository registry (layout, naming convention, clone cache, per-repository
+    /// locks). Defaults to the monorepo layout of the development-only Local Git provider.
+    pub tenant_repos: crate::tenant_repos::TenantRepos,
 }
 
 impl AppState {
@@ -1184,6 +1187,9 @@ impl AppState {
     ) -> Self {
         let repo_workdir = repo_workdir.into();
         let state_provider = Arc::new(RepoClusterStateProvider::new(&repo_workdir));
+        let tenant_repos = crate::tenant_repos::TenantRepos::monorepo(
+            crate::tenant_repos::TenantRepos::default_cache_root(&repo_workdir),
+        );
         Self {
             forge,
             secret_store,
@@ -1205,7 +1211,14 @@ impl AppState {
             preview_cache: Arc::new(RwLock::new(HashMap::new())),
             preview_cluster: None,
             require_pulumi_passphrase: true,
+            tenant_repos,
         }
+    }
+
+    /// Configures the per-tenant repository registry (dedicated repositories for remote forges).
+    pub fn with_tenant_repos(mut self, repos: crate::tenant_repos::TenantRepos) -> Self {
+        self.tenant_repos = repos;
+        self
     }
 
     /// Configures the live ephemeral PKO preview runner (`keel-previews`).

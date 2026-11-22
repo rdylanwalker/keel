@@ -110,6 +110,38 @@ impl<'a> KubeTarget<'a> {
         Ok(())
     }
 
+    /// Writes a manifest holding secret material without `kubectl apply`, which would copy the
+    /// whole payload into the `kubectl.kubernetes.io/last-applied-configuration` annotation:
+    /// `kubectl create` (create-if-absent: returns `false` when the object already exists) or
+    /// `kubectl replace` (`replace = true`), impersonating `as_user` when set.
+    pub(crate) async fn write_secret_manifest(
+        &self,
+        manifest_yaml: &str,
+        replace: bool,
+        as_user: Option<&str>,
+    ) -> Result<bool, CliError> {
+        let as_arg = as_user.map(|u| format!("--as={u}"));
+        let mut args = vec![if replace { "replace" } else { "create" }, "-f", "-"];
+        if let Some(arg) = as_arg.as_deref() {
+            args.push(arg);
+        }
+        let output = self
+            .output_with_stdin(&args, manifest_yaml.as_bytes())
+            .await?;
+        if output.status.success() {
+            return Ok(true);
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !replace && (stderr.contains("AlreadyExists") || stderr.contains("already exists")) {
+            return Ok(false);
+        }
+        Err(CliError::Execution(format!(
+            "`kubectl {}` failed: {}",
+            args[0],
+            stderr.trim()
+        )))
+    }
+
     /// Reads and base64-decodes `data.<key>` of `namespace/secret_name`, or `None`.
     pub(crate) async fn read_secret_key(
         &self,

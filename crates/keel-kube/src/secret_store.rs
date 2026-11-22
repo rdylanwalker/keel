@@ -230,6 +230,43 @@ pub trait SecretStateStore: Send + Sync {
         &self,
         target_namespace: &str,
     ) -> Result<bool, KubeError>;
+
+    /// `true` when `namespace` exists. A tenant namespace only exists once `keel-tenants` has
+    /// applied the merged tenant stub, so runtime tenant Secrets are written after that.
+    async fn namespace_exists(&self, namespace: &str) -> Result<bool, KubeError>;
+
+    /// Creates `tenant-<id>/sops-age` holding `age_key` only when the tenant has no key yet
+    /// (create-if-absent: an existing key is never replaced, because Git content may already be
+    /// encrypted to it). Returns `true` when this call created it.
+    async fn create_tenant_age_key_if_absent(
+        &self,
+        tenant_id: &str,
+        age_key: &TenantAgeKey,
+    ) -> Result<bool, KubeError>;
+
+    /// Reads the cluster-only `tenant-<id>/keel-gitops-credentials` Secret (per-tenant
+    /// repository read credential), if any. Callers must never log or return its data.
+    async fn get_tenant_gitops_credentials(
+        &self,
+        tenant_id: &str,
+    ) -> Result<Option<Secret>, KubeError>;
+
+    /// Creates or replaces `tenant-<id>/keel-gitops-credentials` with `secret` (built by
+    /// [`crate::tenant_gitops_credentials_secret`]). Refuses any other Secret.
+    async fn put_tenant_gitops_credentials(
+        &self,
+        tenant_id: &str,
+        secret: Secret,
+    ) -> Result<(), KubeError>;
+
+    /// Creates `tenant-<id>/keel-gitops-credentials` only when it does not exist yet
+    /// (create-if-absent, so concurrent writers cannot overwrite each other). Returns `true` when
+    /// this call created it. Refuses any other Secret.
+    async fn create_tenant_gitops_credentials_if_absent(
+        &self,
+        tenant_id: &str,
+        secret: Secret,
+    ) -> Result<bool, KubeError>;
 }
 
 /// Result of [`SecretStateStore::ensure_pulumi_passphrase`]. Never carries the passphrase.
@@ -325,6 +362,8 @@ pub trait SecretBackend: Send + Sync {
         namespace: &str,
         secret: Secret,
     ) -> Result<Secret, KubeError>;
+    /// `true` when `namespace` exists (in-memory stores: unless marked absent).
+    async fn namespace_exists(&self, namespace: &str) -> Result<bool, KubeError>;
 }
 
 /// Production `SecretStateStore` backed by the Kubernetes API server (`kube::Api<Secret>`).
@@ -396,12 +435,19 @@ impl SecretBackend for K8sSecretStore {
             Err(err) => Err(KubeError::Kube(err)),
         }
     }
+
+    async fn namespace_exists(&self, namespace: &str) -> Result<bool, KubeError> {
+        let api: Api<k8s_openapi::api::core::v1::Namespace> = Api::all(self.client.clone());
+        Ok(api.get_opt(namespace).await?.is_some())
+    }
 }
 
 #[derive(Default)]
 struct InMemoryState {
     secrets: HashMap<(String, String), Secret>,
     revision_counter: u64,
+    /// Namespaces reported as missing by [`SecretBackend::namespace_exists`] (tests).
+    absent_namespaces: std::collections::HashSet<String>,
 }
 
 /// In-memory `SecretStateStore` storing real `k8s_openapi::api::core::v1::Secret` objects
@@ -425,6 +471,30 @@ impl InMemorySecretStore {
             .get(&(namespace.to_string(), name.to_string()))
             .cloned()
     }
+
+    /// Marks `namespace` as missing (`present = false`) or existing for
+    /// [`SecretStateStore::namespace_exists`] (every namespace exists by default). Writes into a
+    /// missing namespace fail like on a real API server.
+    pub async fn set_namespace_present(&self, namespace: &str, present: bool) {
+        let mut guard = self.state.write().await;
+        if present {
+            guard.absent_namespaces.remove(namespace);
+        } else {
+            guard.absent_namespaces.insert(namespace.to_string());
+        }
+    }
+
+    /// Removes `namespace/name` (tests: simulate a lost Secret).
+    pub async fn remove_secret(&self, namespace: &str, name: &str) {
+        let mut guard = self.state.write().await;
+        guard
+            .secrets
+            .remove(&(namespace.to_string(), name.to_string()));
+    }
+}
+
+fn in_memory_missing_namespace(namespace: &str) -> KubeError {
+    KubeError::InvalidInput(format!("namespaces \"{namespace}\" not found"))
 }
 
 #[async_trait]
@@ -447,6 +517,9 @@ impl SecretBackend for InMemorySecretStore {
                 KubeError::InvalidInput("Secret metadata.name is required".into())
             })?;
         let mut guard = self.state.write().await;
+        if guard.absent_namespaces.contains(namespace) {
+            return Err(in_memory_missing_namespace(namespace));
+        }
         guard.revision_counter += 1;
         let rev = guard.revision_counter.to_string();
 
@@ -474,6 +547,9 @@ impl SecretBackend for InMemorySecretStore {
                 KubeError::InvalidInput("Secret metadata.name is required".into())
             })?;
         let mut guard = self.state.write().await;
+        if guard.absent_namespaces.contains(namespace) {
+            return Err(in_memory_missing_namespace(namespace));
+        }
         let key = (namespace.to_string(), name);
 
         if let Some(existing) = guard.secrets.get(&key) {
@@ -487,6 +563,15 @@ impl SecretBackend for InMemorySecretStore {
         secret.metadata.uid = Some(format!("mem-uid-{rev}"));
         guard.secrets.insert(key, secret.clone());
         Ok(secret)
+    }
+
+    async fn namespace_exists(&self, namespace: &str) -> Result<bool, KubeError> {
+        Ok(!self
+            .state
+            .read()
+            .await
+            .absent_namespaces
+            .contains(namespace))
     }
 }
 
@@ -559,6 +644,90 @@ impl<B: SecretBackend> SecretStateStore for B {
         )
         .await
     }
+
+    async fn namespace_exists(&self, namespace: &str) -> Result<bool, KubeError> {
+        SecretBackend::namespace_exists(self, namespace).await
+    }
+
+    async fn create_tenant_age_key_if_absent(
+        &self,
+        tenant_id: &str,
+        age_key: &TenantAgeKey,
+    ) -> Result<bool, KubeError> {
+        let namespace = tenant_namespace(tenant_id)?;
+        let desired = build_tenant_age_key_secret(tenant_id, age_key)?;
+        let stored = self.create_secret_if_absent(&namespace, desired).await?;
+        let created = stored
+            .data
+            .as_ref()
+            .and_then(|d| d.get(AGE_PUBLIC_KEY_FIELD))
+            .is_some_and(|v| v.0 == age_key.public_key.trim().as_bytes());
+        Ok(created)
+    }
+
+    async fn get_tenant_gitops_credentials(
+        &self,
+        tenant_id: &str,
+    ) -> Result<Option<Secret>, KubeError> {
+        let namespace = tenant_namespace(tenant_id)?;
+        self.get_secret(
+            &namespace,
+            crate::tenant_repo::TENANT_GITOPS_CREDENTIALS_SECRET_NAME,
+        )
+        .await
+    }
+
+    async fn put_tenant_gitops_credentials(
+        &self,
+        tenant_id: &str,
+        secret: Secret,
+    ) -> Result<(), KubeError> {
+        let namespace = tenant_gitops_credentials_namespace(tenant_id, &secret)?;
+        self.upsert_secret(&namespace, secret).await?;
+        Ok(())
+    }
+
+    async fn create_tenant_gitops_credentials_if_absent(
+        &self,
+        tenant_id: &str,
+        secret: Secret,
+    ) -> Result<bool, KubeError> {
+        let namespace = tenant_gitops_credentials_namespace(tenant_id, &secret)?;
+        let credential_id = |s: &Secret| {
+            s.metadata
+                .annotations
+                .as_ref()
+                .and_then(|a| a.get(crate::tenant_repo::CREDENTIAL_ID_ANNOTATION))
+                .cloned()
+        };
+        let wanted = credential_id(&secret);
+        let stored = self.create_secret_if_absent(&namespace, secret).await?;
+        Ok(wanted.is_some() && credential_id(&stored) == wanted)
+    }
+}
+
+/// Namespace of a `keel-gitops-credentials` write; refuses any other Secret.
+fn tenant_gitops_credentials_namespace(
+    tenant_id: &str,
+    secret: &Secret,
+) -> Result<String, KubeError> {
+    let namespace = tenant_namespace(tenant_id)?;
+    let meta = &secret.metadata;
+    let kind_label = meta
+        .labels
+        .as_ref()
+        .and_then(|l| l.get("keel.io/secret-kind"))
+        .map(String::as_str);
+    if meta.name.as_deref() != Some(crate::tenant_repo::TENANT_GITOPS_CREDENTIALS_SECRET_NAME)
+        || meta.namespace.as_deref() != Some(namespace.as_str())
+        || kind_label != Some(crate::tenant_repo::TENANT_GITOPS_CREDENTIALS_SECRET_KIND)
+    {
+        return Err(KubeError::InvalidInput(format!(
+            "refusing to write a Secret other than `{namespace}/{}`",
+            crate::tenant_repo::TENANT_GITOPS_CREDENTIALS_SECRET_NAME
+        )));
+    }
+    Ok(namespace)
 }
 
 fn managed_labels(secret_kind: &str) -> BTreeMap<String, String> {
@@ -773,6 +942,17 @@ async fn store_tenant_age_key_impl<B: SecretBackend>(
     age_key: &TenantAgeKey,
 ) -> Result<(), KubeError> {
     let namespace = tenant_namespace(tenant_id)?;
+    let secret = build_tenant_age_key_secret(tenant_id, age_key)?;
+    backend.upsert_secret(&namespace, secret).await?;
+    Ok(())
+}
+
+/// Builds the `tenant-<id>/sops-age` Secret (Flux `age.agekey` plus `public-key`/`secret-key`).
+pub fn build_tenant_age_key_secret(
+    tenant_id: &str,
+    age_key: &TenantAgeKey,
+) -> Result<Secret, KubeError> {
+    let namespace = tenant_namespace(tenant_id)?;
     let pub_key = age_key.public_key.trim();
     let sec_key = age_key.secret_key.trim();
     if !pub_key.starts_with("age1") {
@@ -815,9 +995,7 @@ async fn store_tenant_age_key_impl<B: SecretBackend>(
         data: Some(data),
         ..Secret::default()
     };
-
-    backend.upsert_secret(&namespace, secret).await?;
-    Ok(())
+    Ok(secret)
 }
 
 async fn get_tenant_age_key_impl<B: SecretBackend>(
@@ -1150,6 +1328,135 @@ mod tests {
 
         let res = store.get_user_git_creds("sub-mallory", &key).await;
         assert!(matches!(res, Err(KubeError::Crypto(_))));
+    }
+
+    #[tokio::test]
+    async fn tenant_age_key_is_created_once_and_never_replaced() {
+        let store = InMemorySecretStore::new();
+        let first = TenantAgeKey::new("age1first", "AGE-SECRET-KEY-1FIRST");
+        let second = TenantAgeKey::new("age1second", "AGE-SECRET-KEY-1SECOND");
+        assert!(
+            store
+                .create_tenant_age_key_if_absent("acme", &first)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .create_tenant_age_key_if_absent("acme", &second)
+                .await
+                .unwrap()
+        );
+        let kept = store.get_tenant_age_key("acme").await.unwrap().unwrap();
+        assert_eq!(kept.public_key, "age1first");
+
+        // A missing namespace fails instead of being silently skipped.
+        store.set_namespace_present("tenant-beta", false).await;
+        assert!(
+            !SecretStateStore::namespace_exists(&store, "tenant-beta")
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .create_tenant_age_key_if_absent("beta", &first)
+                .await
+                .is_err()
+        );
+        store.set_namespace_present("tenant-beta", true).await;
+        assert!(
+            SecretStateStore::namespace_exists(&store, "tenant-beta")
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn tenant_gitops_credentials_put_refuses_other_secrets() {
+        let store = InMemorySecretStore::new();
+        let source = crate::TenantRepoSource::new(
+            "acme",
+            "https://forgejo.keel.local:8888/keel-tenants/infra-gitops-tenant-acme.git",
+        )
+        .unwrap();
+        let credential = crate::TenantRepoCredential::HttpsToken {
+            username: "keel-tenant-reader".to_string(),
+            token: "tok".to_string(),
+            ca_crt: None,
+        };
+        let secret = crate::tenant_gitops_credentials_secret(&source, &credential, "1").unwrap();
+        assert!(
+            store
+                .get_tenant_gitops_credentials("acme")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        store
+            .put_tenant_gitops_credentials("acme", secret.clone())
+            .await
+            .unwrap();
+        assert!(
+            store
+                .get_tenant_gitops_credentials("acme")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        // Another tenant's namespace or another Secret kind is refused.
+        assert!(
+            store
+                .put_tenant_gitops_credentials("beta", secret.clone())
+                .await
+                .is_err()
+        );
+        let mut foreign = secret.clone();
+        foreign.metadata.labels = None;
+        assert!(
+            store
+                .put_tenant_gitops_credentials("acme", foreign.clone())
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .create_tenant_gitops_credentials_if_absent("acme", foreign)
+                .await
+                .is_err()
+        );
+
+        // Create-if-absent: the first writer wins, a later writer never overwrites it.
+        let other = crate::tenant_gitops_credentials_secret(&source, &credential, "2").unwrap();
+        assert!(
+            !store
+                .create_tenant_gitops_credentials_if_absent("acme", other.clone())
+                .await
+                .unwrap()
+        );
+        store
+            .remove_secret("tenant-acme", "keel-gitops-credentials")
+            .await;
+        assert!(
+            store
+                .create_tenant_gitops_credentials_if_absent("acme", other)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .create_tenant_gitops_credentials_if_absent("acme", secret)
+                .await
+                .unwrap()
+        );
+        let kept = store
+            .get_tenant_gitops_credentials("acme")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            kept.metadata.annotations.unwrap()[crate::tenant_repo::CREDENTIAL_ID_ANNOTATION],
+            "2"
+        );
     }
 
     #[tokio::test]

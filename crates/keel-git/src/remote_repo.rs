@@ -14,8 +14,8 @@ use serde_json::{Value, json};
 use crate::forge::{
     BranchProtectionOutcome, CollaboratorOutcome, DeployKeyInfo, DeployKeyOutcome,
     EnsuredDeployKey, ForgeError, ForgeProvider, ForkInfo, ForkPolicyOutcome,
-    PROTECTED_MAIN_BRANCH, REPO_READ_TOKEN_NAME_PREFIX, RepoReadToken, RepositoryEnsureOutcome,
-    RepositoryInfo, RepositoryOptions, RepositoryTarget,
+    PROTECTED_MAIN_BRANCH, REPO_READ_TOKEN_NAME_PREFIX, RepoReadToken, RepoReadTokenInfo,
+    RepositoryEnsureOutcome, RepositoryInfo, RepositoryOptions, RepositoryTarget,
 };
 use crate::remote::{
     ForgejoGiteaProvider, GitHubProvider, GitLabProvider, LIST_PAGE_SIZE, MAX_LIST_PAGES,
@@ -712,6 +712,33 @@ impl ForgejoGiteaProvider {
             username,
             token: minted.token.clone(),
         })
+    }
+
+    /// The bot's tokens restricted to exactly `repo` (case-insensitive `owner/name`).
+    pub(crate) async fn list_repo_tokens(
+        &self,
+        repo: &RepositoryTarget,
+    ) -> Result<Vec<RepoReadTokenInfo>, ForgeError> {
+        let wanted = format!(
+            "{}/{}",
+            single_segment(&repo.owner, "owner")?,
+            single_segment(&repo.name, "repo")?
+        )
+        .to_ascii_lowercase();
+        Ok(self
+            .list_access_tokens()
+            .await?
+            .into_iter()
+            .filter(|t| {
+                t.repositories
+                    .as_ref()
+                    .is_some_and(|r| r.len() == 1 && r[0].to_ascii_lowercase() == wanted)
+            })
+            .map(|t| RepoReadTokenInfo {
+                id: t.id.to_string(),
+                name: t.name,
+            })
+            .collect())
     }
 
     pub(crate) async fn revoke_repo_token(&self, token_id: &str) -> Result<(), ForgeError> {
@@ -1732,6 +1759,34 @@ impl GitLabProvider {
                 })
             }
         }
+    }
+
+    /// The project's active (not revoked, not expired) deploy tokens.
+    pub(crate) async fn list_repo_tokens(
+        &self,
+        repo: &RepositoryTarget,
+    ) -> Result<Vec<RepoReadTokenInfo>, ForgeError> {
+        let raw: Vec<Value> = fetch_all_pages(
+            &self.client,
+            &format!("{}/deploy_tokens?active=true", self.project_api_for(repo)?),
+            "per_page",
+            |b| self.authorized(b),
+            "deploy tokens",
+        )
+        .await?;
+        Ok(raw
+            .iter()
+            .filter(|t| {
+                !t.get("revoked").and_then(Value::as_bool).unwrap_or(false)
+                    && !t.get("expired").and_then(Value::as_bool).unwrap_or(false)
+            })
+            .filter_map(|t| {
+                Some(RepoReadTokenInfo {
+                    id: t.get("id").and_then(id_string)?,
+                    name: str_field(t, "name").unwrap_or_default(),
+                })
+            })
+            .collect())
     }
 
     pub(crate) async fn revoke_repo_token(

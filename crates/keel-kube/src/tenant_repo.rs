@@ -21,10 +21,9 @@
 //! clone the tenant repository with the same credential, plus the PKO operator `known_hosts`
 //! plumbing needed when a tenant repository is reached over SSH.
 //!
-//! Status: synthesis only. keel-server and the CLI do not write these stubs yet (tenant
-//! creation, write paths and `migrate-repo` land in a later release); the v0.10 monorepo layout
-//! (`tenants/<id>/git-repository.yaml` with `git-credentials`, as used by `tenant-default`) keeps
-//! working unchanged.
+//! keel-server (`POST /api/v1/tenants`) and `keel bootstrap init` (`tenant-default`) write these
+//! stubs and the credentials Secret (`keel_server::tenant_repos`). Only the development-only
+//! Local Git provider keeps tenants inside the monorepo (D8).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -821,6 +820,126 @@ pub fn build_tenant_gitops_credentials_secret(
         "type": "Opaque",
         "stringData": data,
     }))
+}
+
+/// Annotation of `keel-gitops-credentials` recording the forge id of the credential it holds
+/// (Forgejo/GitLab token id, GitHub deploy key id) so a rotation can revoke the previous one.
+/// Never a secret value.
+pub const CREDENTIAL_ID_ANNOTATION: &str = "keel.io/credential-id";
+/// Annotation of `keel-gitops-credentials` recording the repository URL the credential was
+/// issued for (a credential for another URL is rotated).
+pub const CREDENTIAL_REPO_URL_ANNOTATION: &str = "keel.io/repo-url";
+
+/// [`build_tenant_gitops_credentials_secret`] as a typed `Secret` ready for the Kubernetes API:
+/// `stringData` folded into `data`, plus the non-secret [`CREDENTIAL_ID_ANNOTATION`] and
+/// [`CREDENTIAL_REPO_URL_ANNOTATION`].
+pub fn tenant_gitops_credentials_secret(
+    source: &TenantRepoSource,
+    credential: &TenantRepoCredential,
+    credential_id: &str,
+) -> Result<k8s_openapi::api::core::v1::Secret, KubeError> {
+    if credential_id.is_empty() || has_control_or_space(credential_id) {
+        return Err(KubeError::InvalidInput(
+            "tenant repository credential id must be non-empty without whitespace".to_string(),
+        ));
+    }
+    let mut value = build_tenant_gitops_credentials_secret(source, credential)?;
+    let string_data = value
+        .as_object_mut()
+        .and_then(|o| o.remove("stringData"))
+        .unwrap_or_default();
+    let mut data = BTreeMap::new();
+    if let Value::Object(map) = string_data {
+        for (k, v) in map {
+            let v = v.as_str().unwrap_or_default().as_bytes().to_vec();
+            data.insert(k, k8s_openapi::ByteString(v));
+        }
+    }
+    if let Some(annotations) = value
+        .pointer_mut("/metadata/annotations")
+        .and_then(Value::as_object_mut)
+    {
+        annotations.insert(CREDENTIAL_ID_ANNOTATION.to_string(), json!(credential_id));
+        annotations.insert(
+            CREDENTIAL_REPO_URL_ANNOTATION.to_string(),
+            json!(source.url()),
+        );
+    }
+    let mut secret: k8s_openapi::api::core::v1::Secret = serde_json::from_value(value)?;
+    secret.data = Some(data);
+    secret.string_data = None;
+    Ok(secret)
+}
+
+/// State of a tenant's live `keel-gitops-credentials` Secret for `source`
+/// ([`tenant_gitops_credentials_status`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TenantGitopsCredentialStatus {
+    /// No Secret.
+    Missing,
+    /// A platform-written Secret for exactly this repository URL with every key PKO and Flux
+    /// need.
+    Valid { credential_id: Option<String> },
+    /// A Secret exists but cannot be used for this repository (wrong URL, labels, missing keys,
+    /// foreign `known_hosts`): it must be rotated. `credential_id` is the previous credential to
+    /// revoke afterwards.
+    Invalid {
+        credential_id: Option<String>,
+        reason: String,
+    },
+}
+
+/// Classifies the live `keel-gitops-credentials` Secret for `source` without exposing any value.
+pub fn tenant_gitops_credentials_status(
+    source: &TenantRepoSource,
+    secret: Option<&k8s_openapi::api::core::v1::Secret>,
+) -> TenantGitopsCredentialStatus {
+    let Some(secret) = secret else {
+        return TenantGitopsCredentialStatus::Missing;
+    };
+    let annotation = |k: &str| {
+        secret
+            .metadata
+            .annotations
+            .as_ref()
+            .and_then(|a| a.get(k))
+            .cloned()
+    };
+    let credential_id = annotation(CREDENTIAL_ID_ANNOTATION).filter(|id| !id.is_empty());
+    if annotation(CREDENTIAL_REPO_URL_ANNOTATION).as_deref() != Some(source.url()) {
+        return TenantGitopsCredentialStatus::Invalid {
+            credential_id,
+            reason: "it was issued for another repository URL".to_string(),
+        };
+    }
+    if annotation(GIT_TRANSPORT_ANNOTATION).as_deref() != Some(source.transport().as_str()) {
+        return TenantGitopsCredentialStatus::Invalid {
+            credential_id,
+            reason: format!("it is not a {} credential", source.transport()),
+        };
+    }
+    if source.transport() == TenantRepoTransport::Ssh {
+        // Flux reads `identity`; the public half identifies the deploy key to keep on the forge.
+        let data = secret.data.as_ref();
+        for key in [SSH_IDENTITY_KEY, SSH_IDENTITY_PUB_KEY] {
+            if data
+                .and_then(|d| d.get(key))
+                .is_none_or(|v| v.0.iter().all(u8::is_ascii_whitespace))
+            {
+                return TenantGitopsCredentialStatus::Invalid {
+                    credential_id,
+                    reason: format!("it has no `{key}` key"),
+                };
+            }
+        }
+    }
+    match tenant_repo_preview_secret_payload(source, secret) {
+        Ok(_) => TenantGitopsCredentialStatus::Valid { credential_id },
+        Err(e) => TenantGitopsCredentialStatus::Invalid {
+            credential_id,
+            reason: e.to_string(),
+        },
+    }
 }
 
 /// PKO `gitAuth` for a tenant repository credential Secret `secret_name` (the tenant's

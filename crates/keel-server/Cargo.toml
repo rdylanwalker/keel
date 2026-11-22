@@ -19,6 +19,7 @@ flate2 = "1"
 futures.workspace = true
 hex.workspace = true
 jsonwebtoken.workspace = true
+k8s-openapi.workspace = true
 rand.workspace = true
 reqwest.workspace = true
 russh.workspace = true
@@ -36,6 +37,5 @@ uuid.workspace = true
 
 [dev-dependencies]
 http-body-util = "0.1"
-k8s-openapi.workspace = true
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }

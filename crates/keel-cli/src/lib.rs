@@ -38,7 +38,16 @@ pub use commands::{
 /// default, full cause chain with `-v`).
 pub async fn run(cli: &Cli) -> Result<(), CliError> {
     let ctx = CliContext::new();
-    let output = dispatch(cli, &ctx).await?;
+    let output = match dispatch(cli, &ctx).await {
+        Ok(output) => output,
+        Err(CliError::Incomplete { output, message }) => {
+            if !output.is_empty() {
+                println!("{output}");
+            }
+            return Err(CliError::Execution(message));
+        }
+        Err(err) => return Err(err),
+    };
     if !output.is_empty() {
         println!("{output}");
     }

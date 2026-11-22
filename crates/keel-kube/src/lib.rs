@@ -53,7 +53,8 @@ pub use secret_store::{
     PULUMI_PASSPHRASE_SECRET_KIND, PULUMI_PASSPHRASE_SECRET_NAME, PulumiPassphraseOutcome,
     S3_CREDENTIALS_SECRET_NAME, SESSION_KEY_LEN, SESSION_KEY_SECRET_NAME, SecretStateStore,
     TENANT_SOPS_AGE_SECRET_NAME, TenantAgeKey, USER_GIT_CREDS_SECRET_PREFIX, UserGitCredentials,
-    build_pulumi_passphrase_secret, generate_pulumi_passphrase, user_git_creds_secret_name,
+    build_pulumi_passphrase_secret, build_tenant_age_key_secret, generate_pulumi_passphrase,
+    user_git_creds_secret_name,
 };
 pub use telemetry::{
     CrdReconcileStatus, CrdWatchEvent, DEFAULT_TELEMETRY_BUFFER_CAPACITY, TelemetryMux,
@@ -81,17 +82,20 @@ pub use tenant::{
     validate_tenant_id,
 };
 pub use tenant_repo::{
+    CREDENTIAL_ID_ANNOTATION, CREDENTIAL_REPO_URL_ANNOTATION,
     PKO_OPERATOR_SSH_KNOWN_HOSTS_CONFIGMAP, TENANT_GITOPS_CREDENTIALS_SECRET_KIND,
     TENANT_GITOPS_CREDENTIALS_SECRET_NAME, TENANT_REPO_STUB_FILES, TENANT_ROOT_KUSTOMIZATION_NAME,
-    TenantRepoCredential, TenantRepoSource, TenantRepoStub, TenantRepoTransport,
-    build_pko_operator_known_hosts_configmap, build_tenant_gitops_credentials_secret,
-    build_tenant_repo_git_repository, build_tenant_repo_kustomization_yaml,
-    build_tenant_root_kustomization, ensure_git_safe_manifests, is_full_commit_sha,
-    merge_pko_operator_ssh_known_hosts_values, pko_operator_needs_ssh_known_hosts,
-    synthesize_tenant_repo_stub, tenant_repo_git_auth, tenant_repo_preview_git_source,
-    tenant_repo_preview_secret_keys, tenant_repo_preview_secret_payload,
-    tenant_repo_resources_from_monorepo, tenant_repo_stack_git_source,
-    tenant_repo_stub_kustomization_entries, tenant_repo_workspace_template, validate_known_hosts,
+    TenantGitopsCredentialStatus, TenantRepoCredential, TenantRepoSource, TenantRepoStub,
+    TenantRepoTransport, build_pko_operator_known_hosts_configmap,
+    build_tenant_gitops_credentials_secret, build_tenant_repo_git_repository,
+    build_tenant_repo_kustomization_yaml, build_tenant_root_kustomization,
+    ensure_git_safe_manifests, is_full_commit_sha, merge_pko_operator_ssh_known_hosts_values,
+    pko_operator_needs_ssh_known_hosts, synthesize_tenant_repo_stub,
+    tenant_gitops_credentials_secret, tenant_gitops_credentials_status, tenant_repo_git_auth,
+    tenant_repo_preview_git_source, tenant_repo_preview_secret_keys,
+    tenant_repo_preview_secret_payload, tenant_repo_resources_from_monorepo,
+    tenant_repo_stack_git_source, tenant_repo_stub_kustomization_entries,
+    tenant_repo_workspace_template, validate_known_hosts,
 };
 
 #[derive(Debug, thiserror::Error)]

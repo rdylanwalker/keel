@@ -487,6 +487,34 @@ async fn forgejo_repo_read_token_name_reuse() {
 }
 
 #[tokio::test]
+async fn forgejo_lists_only_tokens_restricted_to_the_repository() {
+    let (url, handle) = spawn_mock_http_server(vec![r(
+        200,
+        r#"[
+            {"id":1,"name":"keel-tenant-repo-acme","scopes":["read:repository"],"repositories":[{"owner":"Keel-Tenants","name":"tenant-acme"}]},
+            {"id":2,"name":"keel-tenant-repo-other","scopes":["read:repository"],"repositories":[{"owner":"keel-tenants","name":"tenant-other"}]},
+            {"id":3,"name":"wide","scopes":["read:repository"]},
+            {"id":4,"name":"two","scopes":["read:repository"],"repositories":[{"owner":"keel-tenants","name":"tenant-acme"},{"owner":"keel-tenants","name":"tenant-other"}]}
+        ]"#,
+    )])
+    .await;
+    let bot = ForgejoGiteaProvider::with_basic_auth(&url, "o", "r", "bot", password()).unwrap();
+    let tokens = bot
+        .list_repo_read_tokens(&target("keel-tenants", "tenant-acme"))
+        .await
+        .unwrap();
+    assert_eq!(
+        tokens,
+        vec![RepoReadTokenInfo {
+            id: "1".to_string(),
+            name: "keel-tenant-repo-acme".to_string()
+        }]
+    );
+    let reqs = handle.await.unwrap();
+    assert!(request_line(&reqs[0]).starts_with("GET /api/v1/users/bot/tokens?"));
+}
+
+#[tokio::test]
 async fn forgejo_repo_read_token_fails_closed_when_not_restricted() {
     // Gitea / pre-15 Forgejo ignore `repositories`: the token is deleted and an error returned.
     let (url, handle) = spawn_mock_http_server(vec![
@@ -1118,7 +1146,9 @@ async fn github_deploy_keys_and_host_keys() {
     p.revoke_deploy_key(&repo, "11").await.unwrap();
     let host_keys = p.ssh_host_keys().await.unwrap();
     assert_eq!(host_keys.len(), 1);
-    assert!(p.ssh_host_keys().await.is_err());
+    // Through the trait (keel-server builds known_hosts from `dyn ForgeProvider`).
+    let dyn_p: &dyn ForgeProvider = &p;
+    assert!(dyn_p.ssh_host_keys().await.is_err());
     let reqs = handle.await.unwrap();
     assert!(request_line(&reqs[0]).starts_with("GET /repos/acme/tenant-a/keys?per_page=50&page=1"));
     assert_eq!(
@@ -1610,6 +1640,35 @@ async fn gitlab_deploy_tokens_are_read_repository_only() {
     assert_eq!(
         request_line(&reqs[2]),
         "DELETE /api/v4/projects/team%2Ftenants%2Ftenant-a/deploy_tokens/4 HTTP/1.1"
+    );
+}
+
+#[tokio::test]
+async fn gitlab_lists_active_deploy_tokens() {
+    let (url, handle) = spawn_mock_http_server(vec![r(
+        200,
+        r#"[
+            {"id":3,"name":"keel-tenant-repo-a","username":"gitlab+deploy-token-3","scopes":["read_repository"],"revoked":false,"expired":false},
+            {"id":4,"name":"keel-tenant-repo-a","revoked":true,"expired":false},
+            {"id":5,"name":"old","revoked":false,"expired":true},
+            {"id":6,"name":"human","revoked":false,"expired":false}
+        ]"#,
+    )])
+    .await;
+    let p = GitLabProvider::new(&url, "team/infra", "gl-tok").unwrap();
+    let tokens = p
+        .list_repo_read_tokens(&target("team/tenants", "tenant-a"))
+        .await
+        .unwrap();
+    let ids: Vec<&str> = tokens.iter().map(|t| t.id.as_str()).collect();
+    assert_eq!(ids, ["3", "6"]);
+    let reqs = handle.await.unwrap();
+    assert!(
+        request_line(&reqs[0]).starts_with(
+            "GET /api/v4/projects/team%2Ftenants%2Ftenant-a/deploy_tokens?active=true&per_page="
+        ),
+        "{}",
+        request_line(&reqs[0])
     );
 }
 

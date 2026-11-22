@@ -4509,12 +4509,20 @@ fn is_safe_repo_relative_path(path: &str) -> bool {
         && !path.split('/').any(|seg| seg == ".")
 }
 
-/// Validates that a PR's changed files are strictly scoped to `tenants/<tenant>/` (excluding `rbac.yaml`)
-/// and only tenant-scoped additions/removals in `tenants/kustomization.yaml`.
+/// Validates that a platform-repository PR's changed files are strictly scoped to
+/// `tenants/<tenant>/` and only tenant-scoped additions/removals in `tenants/kustomization.yaml`.
+///
+/// The tenant baseline (`tenants/<tenant>/rbac.yaml` and its `tenants/kustomization.yaml` entry)
+/// is always refused: `keel-tenants` applies it with platform privileges. With dedicated tenant
+/// repositories (`dedicated`) the platform repository's `tenants/<tenant>/` holds nothing but
+/// the platform-owned stub (`rbac.yaml`, `git-repository.yaml`, `sync.yaml`), so every path
+/// there and every `tenants/kustomization.yaml` change is refused. The development-only monorepo
+/// layout (D8) keeps tenant content, including its Flux source, in the platform repository.
 fn validate_tenant_admin_pr_paths(
     tenant: &str,
     changed_files: &[String],
     kustomization_diff: Option<&str>,
+    dedicated: bool,
 ) -> Result<(), ServerError> {
     if changed_files.is_empty() {
         return Err(ServerError::Forbidden(
@@ -4523,7 +4531,8 @@ fn validate_tenant_admin_pr_paths(
         ));
     }
     let tenant_prefix = format!("tenants/{tenant}/");
-    let rbac_path = format!("tenants/{tenant}/rbac.yaml");
+    let rbac_path = format!("{tenant_prefix}rbac.yaml");
+    let rbac_entry = format!("{tenant}/rbac.yaml");
     for path in changed_files {
         let trimmed = path.trim();
         if trimmed.is_empty() {
@@ -4537,6 +4546,13 @@ fn validate_tenant_admin_pr_paths(
         if trimmed == rbac_path {
             return Err(ServerError::Forbidden(format!(
                 "Tenant administrators cannot modify '{rbac_path}'"
+            )));
+        }
+        if dedicated
+            && (trimmed.starts_with(&tenant_prefix) || trimmed == "tenants/kustomization.yaml")
+        {
+            return Err(ServerError::Forbidden(format!(
+                "Tenant administrators cannot modify '{trimmed}': tenant '{tenant}' has its own repository and the platform repository only holds its platform-owned stub"
             )));
         }
         if trimmed.starts_with(&tenant_prefix) {
@@ -4576,7 +4592,10 @@ fn validate_tenant_admin_pr_paths(
                                 .to_string(),
                         ));
                     };
-                    if !is_safe_repo_relative_path(entry) || !entry.starts_with(&kustomize_prefix) {
+                    if !is_safe_repo_relative_path(entry)
+                        || !entry.starts_with(&kustomize_prefix)
+                        || entry == rbac_entry
+                    {
                         return Err(ServerError::Forbidden(format!(
                             "Tenant administrators cannot modify '{entry}' in 'tenants/kustomization.yaml'"
                         )));
@@ -4679,7 +4698,12 @@ async fn require_pr_tenant_admin_access(
         (head_sha, files, k_diff)
     };
 
-    validate_tenant_admin_pr_paths(tenant, &changed_files, kustomization_diff.as_deref())?;
+    validate_tenant_admin_pr_paths(
+        tenant,
+        &changed_files,
+        kustomization_diff.as_deref(),
+        state.tenant_repos.is_dedicated(),
+    )?;
     Ok(Some(head_sha))
 }
 
@@ -4797,6 +4821,39 @@ pub async fn merge_proposal(
                     &policy_val,
                 )
                 .await;
+        }
+    }
+
+    // A merged tenant stub makes `keel-tenants` create `tenant-<id>`; write its runtime Secrets
+    // (`sops-age`, `keel-gitops-credentials`) once it exists.
+    if let Some(tenant) = crate::tenant_repos::create_tenant_branch_tenant(&merged.source_branch)
+        && keel_core::validate_dns_label(tenant, "tenant").is_ok()
+    {
+        crate::tenant_repos::spawn_post_merge_completion(
+            state.secret_store.clone(),
+            state.tenant_repos.clone(),
+            tenant.to_string(),
+        );
+    }
+
+    // A merged tenant removal: no tenant holds a credential for its repository any more.
+    if let Some(tenant) = crate::tenant_repos::delete_tenant_branch_tenant(&merged.source_branch)
+        && keel_core::validate_dns_label(tenant, "tenant").is_ok()
+        && let Some(forge) = state.tenant_repos.forge()
+    {
+        match crate::tenant_repos::revoke_all_credentials(forge, tenant).await {
+            Ok(revoked) => tracing::info!(
+                target: "keel::audit",
+                action = "tenant.credential.revoke_all",
+                tenant,
+                revoked,
+                "Revoked the deleted tenant's repository read credentials"
+            ),
+            Err(err) => tracing::warn!(
+                tenant,
+                error = %err,
+                "Could not revoke the deleted tenant's repository read credentials; revoke them on the forge"
+            ),
         }
     }
 
@@ -5451,7 +5508,8 @@ mod tests {
             validate_tenant_admin_pr_paths(
                 "acme",
                 &files(&["tenants/acme/apps/redis/values.yaml"]),
-                None
+                None,
+                false
             )
             .is_ok()
         );
@@ -5459,20 +5517,29 @@ mod tests {
             validate_tenant_admin_pr_paths(
                 "acme",
                 &files(&["tenants/acme/../globex/apps/redis/values.yaml"]),
-                None
+                None,
+                false
             )
             .is_err()
         );
         assert!(
-            validate_tenant_admin_pr_paths("acme", &files(&["tenants/acme/rbac.yaml"]), None)
+            validate_tenant_admin_pr_paths(
+                "acme",
+                &files(&["tenants/acme/rbac.yaml"]),
+                None,
+                false
+            )
+            .is_err()
+        );
+        assert!(
+            validate_tenant_admin_pr_paths("acme", &files(&["deploy/x.yaml"]), None, false)
                 .is_err()
         );
-        assert!(validate_tenant_admin_pr_paths("acme", &files(&["deploy/x.yaml"]), None).is_err());
-        assert!(validate_tenant_admin_pr_paths("acme", &[], None).is_err());
+        assert!(validate_tenant_admin_pr_paths("acme", &[], None, false).is_err());
 
         let k = files(&["tenants/kustomization.yaml"]);
         let ok_diff = "--- a/tenants/kustomization.yaml\n+++ b/tenants/kustomization.yaml\n@@ -1 +1 @@\n+  - acme/apps/redis/flux-kustomization.yaml\n";
-        assert!(validate_tenant_admin_pr_paths("acme", &k, Some(ok_diff)).is_ok());
+        assert!(validate_tenant_admin_pr_paths("acme", &k, Some(ok_diff), false).is_ok());
         for bad_entry in [
             "acme/../globex/rbac.yaml",
             "/acme/x.yaml",
@@ -5481,10 +5548,58 @@ mod tests {
         ] {
             let diff = format!("+  - {bad_entry}\n");
             assert!(
-                validate_tenant_admin_pr_paths("acme", &k, Some(&diff)).is_err(),
+                validate_tenant_admin_pr_paths("acme", &k, Some(&diff), false).is_err(),
                 "{bad_entry:?}"
             );
         }
-        assert!(validate_tenant_admin_pr_paths("acme", &k, None).is_err());
+        assert!(validate_tenant_admin_pr_paths("acme", &k, None, false).is_err());
+    }
+
+    #[test]
+    fn tenant_admin_pr_paths_refuse_the_platform_owned_stub() {
+        // The tenant baseline and its kustomization entry are refused in every layout.
+        let k = files(&["tenants/kustomization.yaml"]);
+        for dedicated in [false, true] {
+            assert!(
+                validate_tenant_admin_pr_paths(
+                    "acme",
+                    &files(&["tenants/acme/rbac.yaml"]),
+                    None,
+                    dedicated
+                )
+                .is_err()
+            );
+            for sign in ['+', '-'] {
+                let diff = format!("{sign}  - acme/rbac.yaml\n");
+                assert!(
+                    validate_tenant_admin_pr_paths("acme", &k, Some(&diff), dedicated).is_err(),
+                    "{sign}"
+                );
+            }
+        }
+
+        // Dedicated repositories: the platform repository's tenant directory (the stub) and the
+        // tenants kustomization are entirely platform-owned.
+        for path in [
+            "tenants/acme/git-repository.yaml",
+            "tenants/acme/sync.yaml",
+            "tenants/acme/apps/redis/values.yaml",
+        ] {
+            assert!(
+                validate_tenant_admin_pr_paths("acme", &files(&[path]), None, true).is_err(),
+                "{path}"
+            );
+        }
+        for entry in [
+            "acme/git-repository.yaml",
+            "acme/sync.yaml",
+            "acme/apps/redis/flux-kustomization.yaml",
+        ] {
+            let diff = format!("+  - {entry}\n");
+            assert!(
+                validate_tenant_admin_pr_paths("acme", &k, Some(&diff), true).is_err(),
+                "{entry}"
+            );
+        }
     }
 }
