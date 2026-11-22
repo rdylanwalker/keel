@@ -1798,9 +1798,18 @@ spec:
         };
         // No stub (e.g. tenants created through `POST /api/v1/tenants`).
         let msg = refused("acme", None);
-        assert!(msg.contains("tenants/acme/git-repository.yaml"), "{msg}");
-        assert!(msg.contains("tenant-acme/keel-gitops"), "{msg}");
-        assert!(msg.contains("no fallback to the platform"), "{msg}");
+        assert!(
+            msg.contains("tenants/acme/git-repository.yaml"),
+            "refusal names the missing stub file"
+        );
+        assert!(
+            msg.contains("tenant-acme/keel-gitops"),
+            "refusal names the tenant source"
+        );
+        assert!(
+            msg.contains("no fallback to the platform"),
+            "refusal states there is no fallback"
+        );
         // Another tenant's stub never resolves (namespace must be `tenant-<id>`).
         refused("acme", Some(DEFAULT_TENANT_STUB));
         // The platform `flux-system` source is never accepted.
@@ -1819,7 +1828,10 @@ spec:
                 url,
             );
             let msg = refused("default", Some(&stub));
-            assert!(msg.contains("not a network Git URL"), "{msg}");
+            assert!(
+                msg.contains("not a network Git URL"),
+                "local/helper URL refused as non-network"
+            );
         }
         // SSH sources would need an `identity` key the platform-written Secret does not have.
         for url in [
@@ -1831,14 +1843,20 @@ spec:
                 url,
             );
             let msg = refused("default", Some(&stub));
-            assert!(msg.contains("SSH"), "{msg}");
+            assert!(
+                msg.contains("SSH"),
+                "SSH source refused until deploy keys exist"
+            );
         }
         // Only the read-only `git-credentials` Secret may authenticate tenant Stacks.
         let msg = refused(
             "default",
             Some(&DEFAULT_TENANT_STUB.replace("name: git-credentials", "name: kubeconfig")),
         );
-        assert!(msg.contains("`kubeconfig`"), "{msg}");
+        assert!(
+            msg.contains("`kubeconfig`"),
+            "refusal names the disallowed Secret"
+        );
     }
 
     fn git_secret(name: &str, kind: Option<&str>, data: &[(&str, &str)]) -> Secret {

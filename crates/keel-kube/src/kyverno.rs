@@ -1774,7 +1774,10 @@ mod tests {
         let writers: Vec<(String, Option<&str>)> = platform_owned_writers()
             .into_iter()
             .map(|w| {
-                assert!(!w.reason.trim().is_empty(), "{} has no reason", w.username);
+                assert!(
+                    !w.reason.trim().is_empty(),
+                    "every platform-owned writer documents a reason"
+                );
                 (w.username, w.kind)
             })
             .collect();
