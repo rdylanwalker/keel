@@ -2,7 +2,9 @@
 # (`gotk-sync.yaml`) under multi-tenancy lockdown (`NFR-SEC-02`, `NFR-SEC-04`).
 # Mirrors `keel_kube::tenant::build_tenant_reconciler_rbac()`.
 #
-# - Covers only the kinds Keel writes under `tenants/` (tenant onboarding + tenant workloads).
+# - Covers the kinds Keel writes under `tenants/`. With per-tenant repositories `keel-tenants` only
+#   applies the platform stubs; the workload kinds are needed by the development-only Local Git
+#   provider layout (D8), where tenant workloads stay in the platform repository.
 # - May bind only ClusterRole/admin and ClusterRole/keel-server-tenant (namespaced RoleBindings)
 #   and ClusterRole/system:auth-delegator;
 #   it cannot create Roles/ClusterRoles, escalate, or impersonate, so it cannot mint cluster-admin.

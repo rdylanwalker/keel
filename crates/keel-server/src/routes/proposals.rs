@@ -1807,15 +1807,18 @@ struct HelmAppExtrasInput<'a> {
 /// <app_dir>/networkpolicy.yaml    NetworkPolicy allow-<name>-app (spec.networkPolicy, local only)
 /// ```
 ///
-/// The `Secret` is listed directly in `tenants/kustomization.yaml`, so the root `keel-tenants`
-/// Kustomization (management cluster, SOPS decryption with the cluster key, which every tenant
-/// secret is also encrypted to) applies it for any tenant, also for bundle items.
+/// The `Secret` is listed directly in the tenant index ([`crate::proposal_repo::TenantIndex`]):
+/// the tenant repository's `tenants/<id>/kustomization.yaml`, applied on the management cluster by
+/// the tenant's `keel-tenant-root` Kustomization as `tenant-<id>-sa` (SOPS decryption with
+/// `tenant-<id>/sops-age`), also for bundle items. Only the Local Git provider (D8) lists it in
+/// the platform `tenants/kustomization.yaml`, applied by the root `keel-tenants` Kustomization.
 struct HelmAppExtras {
     /// `(relative path, contents)`, parents before children.
     files: Vec<(String, String)>,
     /// Files applied with the `HelmRelease` (tenants / bundle item `kustomization.yaml`).
     resources: Vec<&'static str>,
-    /// Files registered directly in `tenants/kustomization.yaml` (applied by `keel-tenants`).
+    /// Files registered directly in the tenant index (`keel-tenant-root`; Local Git provider:
+    /// `tenants/kustomization.yaml`, applied by `keel-tenants`).
     tenant_resources: Vec<&'static str>,
     /// Relative paths of other variants (`secrets.enc.yaml` once no secret is stored, the
     /// `NetworkPolicy` of a remote release) removed when present.

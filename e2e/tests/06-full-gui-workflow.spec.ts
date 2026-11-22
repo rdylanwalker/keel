@@ -97,8 +97,9 @@ test.describe('06 - Full Localhost GUI GitOps Workflow', () => {
     await page.getByRole('button', { name: /Merge PR/i }).click();
     await expect(page.getByText(/merged cleanly/i)).toBeVisible({ timeout: 10000 });
 
-    // 4. A tenant created through the API has no Git source of its own yet: its Pulumi Stacks
-    //    fail closed with an actionable error (never falling back to the platform repository).
+    // 4. With the development-only Local Git provider (this harness), a tenant created through the
+    //    API has no Git source of its own: its Pulumi Stacks fail closed with an actionable error
+    //    (never falling back to the platform repository).
     await page.getByRole('button', { name: /Catalog & Form Wizard/i }).click();
     const tenantSelect = page.locator('#tenant-select-catalog');
     await expect(tenantSelect.locator('option[value="e2e-team"]')).toHaveCount(1, {

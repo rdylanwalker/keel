@@ -194,23 +194,22 @@ pub fn tenant_git_source_from_manifest(
             "has a Flux Git source that is not a network Git URL ({e})"
         )));
     }
-    // A per-tenant repository stub (`crate::tenant_repo`) is synthesized but the server write
-    // paths still commit Pulumi programs and preview branches to the platform repository: a Stack
-    // or preview cloning the tenant repository would never find them. Refuse it with an
-    // actionable error until the write paths move to the tenant repository.
+    // This resolver serves only Local Git provider tenants (D8), whose source is the platform
+    // repository with the platform-written `git-credentials` Secret. Tenants with their own
+    // repository resolve their source from it (`keel-server` `tenant_repos`), never from here.
     if source.secret_name.as_deref() == Some(TENANT_GITOPS_CREDENTIALS_SECRET_NAME) {
         return Err(unavailable(&format!(
-            "uses a per-tenant repository (`{TENANT_GITOPS_CREDENTIALS_SECRET_NAME}`); Pulumi \
-             Stack proposals and previews for per-tenant repositories are not wired yet"
+            "uses a per-tenant repository credential (`{TENANT_GITOPS_CREDENTIALS_SECRET_NAME}`); \
+             Local Git provider tenants only use the platform-written \
+             `{TENANT_GIT_CREDENTIALS_SECRET_NAME}` source"
         )));
     }
-    // The platform-written read-only `git-credentials` Secret holds HTTP(S) `username`/`password`
-    // only; an SSH source would commit a Stack whose `sshAuth` key does not exist and fail at
-    // PKO runtime. Refuse it up front until per-tenant deploy keys land.
+    // The platform-written `git-credentials` Secret holds HTTP(S) `username`/`password` only; an
+    // SSH source would commit a Stack whose `sshAuth` key does not exist and fail at PKO runtime.
     if keel_pko::is_ssh_git_url(&source.url) {
         return Err(unavailable(
-            "has an SSH Flux Git source; tenant Pulumi Stacks currently clone over HTTP(S) with \
-             the read-only token (SSH deploy keys are not supported yet)",
+            "has an SSH Flux Git source; Local Git provider tenants only clone over HTTP(S) with \
+             the platform-written read-only token",
         ));
     }
     if let Some(secret) = source.secret_name.as_deref()
@@ -1806,11 +1805,10 @@ spec:
         }
     }
 
-    /// Per-tenant repository stubs (`keel-gitops-credentials`) are refused for Stack proposals
-    /// and previews until the server write paths commit to the tenant repository: the program or
-    /// preview SHA would otherwise be looked up in a repository that does not contain it.
+    /// The Local Git provider resolver refuses per-tenant repository stubs
+    /// (`keel-gitops-credentials`): those tenants resolve their source from their own repository.
     #[test]
-    fn per_tenant_repository_stubs_are_refused_until_write_paths_move() {
+    fn local_provider_source_refuses_tenant_repository_stubs() {
         use crate::tenant_repo::{
             TENANT_GITOPS_CREDENTIALS_SECRET_KIND, TENANT_GITOPS_CREDENTIALS_SECRET_NAME,
         };
@@ -1829,7 +1827,7 @@ spec:
             assert!(
                 matches!(
                     tenant_git_source_from_manifest("acme", Some(yaml)),
-                    Err(KubeError::TenantSourceUnavailable(m)) if m.contains("not wired yet")
+                    Err(KubeError::TenantSourceUnavailable(m)) if m.contains("Local Git provider")
                 ),
                 "{url}"
             );

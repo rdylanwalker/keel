@@ -27,7 +27,7 @@ The walkthroughs on this page use the Stage 0 `default` tenant. Every tenant, `d
 
 In **Catalog & Form Wizard**:
 
-1. Set **Target Tenant** to `default`.
+1. Set **Target Tenant** to `default` (or `dev-team` if you created it in Step 1; use `--tenant dev-team` in the CLI below).
 2. Select **Local kind Workload Cluster** (`kind-cluster`).
 3. Fill in the form:
    - **Cluster Name:** `workload-dev`
@@ -90,7 +90,7 @@ keel app install \
   --server http://127.0.0.1:8080
 ```
 
-5. Inspect the PR diff in **PR & Preview Inspector**—which synthesizes `helmrelease-canary.yaml`, `canary.yaml`, `networkpolicy-canary.yaml`, and, when the form's `apiToken` secret is set, the SOPS-encrypted `secrets.enc.yaml` Secret (listed in `tenants/kustomization.yaml` and merged into the release through `HelmRelease.spec.valuesFrom`)—and click **Merge PR**.
+5. Inspect the PR diff in **PR & Preview Inspector**—which synthesizes `helmrelease-canary.yaml`, `canary.yaml`, `networkpolicy-canary.yaml`, and, when the form's `apiToken` secret is set, the SOPS-encrypted `secrets.enc.yaml` Secret (listed in the tenant repository's `tenants/<id>/kustomization.yaml` and merged into the release through `HelmRelease.spec.valuesFrom`)—and click **Merge PR**.
 6. In **Topology Map**, wait for `podinfo` to reach `Ready` / `Initialized` in the **Flagger Canary Traffic Rollouts (Envoy Gateway)** panel.
 
 ### Step 2: Demonstrate a Live Canary Traffic Rollout
@@ -300,7 +300,7 @@ Try extending the self-service catalog with another provider from [Provider Blue
 Deploy raw Kubernetes YAML templates without packaging a Helm chart, choosing between Flux CD and Pulumi execution engines.
 
 ### Step 1: Deploy via the Web Portal
-1. In **Catalog & Form Wizard**, select target tenant `default`.
+1. In **Catalog & Form Wizard**, select target tenant `default`, or a tenant you created (both engines work in every tenant).
 2. Locate the **HTTP Echo Server** (`http-echo-manifest`) application blueprint.
 3. In the deploy modal, configure the parameters:
    - **Application Name:** `echo-demo`
@@ -311,7 +311,7 @@ Deploy raw Kubernetes YAML templates without packaging a Helm chart, choosing be
    - **Flux CD Kustomization (`flux`):** Generates `manifests.yaml`, non-secret substitutions in `config/values-configmap.yaml` (applied first by an `<instance>-config` Kustomization), and a Flux `Kustomization` that depends on it and uses `postBuild.substituteFrom`.
    - **Pulumi PKO Stack (`pulumi`):** Generates `Pulumi.yaml` wrapping the rendered manifests in `kubernetes:yaml/v2:ConfigGroup` with a PKO v2 `Stack` and ephemeral PR preview diffing.
 5. Click **Submit & Open Git PR Proposal**.
-6. Inspect the PR in **PR & Preview Inspector** and click **Merge PR**.
+6. Inspect the PR in **PR & Preview Inspector** and click **Merge PR**. The PR is opened in the tenant's own repository (`<platform-repo>-tenant-<id>`); the inspector shows which repository it belongs to.
 
 ### Step 2: Deploy via Keel CLI (`--engine flux` or `--engine pulumi`)
 

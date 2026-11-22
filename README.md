@@ -37,7 +37,7 @@ Building an internal platform usually forces a bad trade-off:
 * **Provider-agnostic Stage 0.** One `keel bootstrap init` gives you the same seed control plane on `kind`, an existing cluster, Proxmox VE, AWS, GCP, Azure, or Hetzner. It then escrows its own Pulumi state to versioned S3.
 * **Every change is a PR with a real pre-merge preview.** After Stage 0, Keel never commits to `main`. Pulumi-backed changes get an actual `pulumi preview` in an ephemeral PKO v2 `Stack` before merge, and simulated diffs are always labelled as such.
 * **Schema-driven forms for unmodified upstream charts.** A thin `catalog.yaml` JSON Schema becomes a form, and the form becomes a plain `values.yaml`. Upstream charts are never forked.
-* **Strict least-privilege multi-tenancy.** Each tenant gets its own namespace, a scoped S3 state identity, Flux impersonation, and Kyverno confinement. Tenants can't fetch Flux `source-controller` artifacts or change the objects the platform writes for them, and they never see control-plane credentials. Tenants with their own Git source (today the Stage 0 `default` tenant) clone it with a read-only token; tenants created through the API don't get one yet, so they can install Helm apps but not Pulumi Stacks or Flux manifest apps.
+* **Strict least-privilege multi-tenancy.** Each tenant, including the Stage 0 `default` tenant, gets its own private Git repository, read with a credential that works on that repository only, plus its own namespace, a scoped S3 state identity, Flux impersonation, and Kyverno confinement. The platform repository holds only platform content and a small stub per tenant. Tenants can't read each other's repositories, fetch Flux `source-controller` artifacts, or change the objects the platform writes for them, and they never see control-plane credentials. Remaining gaps, such as Forgejo showing other tenant repositories' names, are listed in [Security & Tenancy](./docs/operations/security-and-tenancy.md#residual-exposure).
 * **Break-glass recovery.** `keel bootstrap recover` re-applies the control plane from escrowed S3 state when Git, the forge, or the API is down.
 
 ---
@@ -65,7 +65,7 @@ Inspect connection details and access provisioned cloud or on-premises VMs with 
 
 ### 6. Safe Rollouts, Tenant Isolation & Break-Glass Recovery
 * **Progressive Delivery:** Opt-in **Flagger + Envoy Gateway** canary rollouts with Prometheus metric rollback for HTTP/gRPC workloads.
-* **Multi-Tenancy & Secret Hygiene:** Namespace-per-tenant isolation (`tenant-<id>`), Flux multitenancy lockdown, no tenant access to `source-controller` artifacts (tenant and preview Stacks clone only the tenant's own Git source), Kyverno-protected platform-owned tenant objects, egress-restricted PKO workspaces, per-tenant SeaweedFS identities scoped to `tenants/<id>/`, read-only tenant Git tokens, per-tenant `age` + SOPS encryption in Git, `AES-256-GCM` credential encryption at rest, and Kyverno `restricted` Pod Security Standards. See [Security & Tenancy](./docs/operations/security-and-tenancy.md).
+* **Multi-Tenancy & Secret Hygiene:** Repository-per-tenant and namespace-per-tenant isolation (`<repo>-tenant-<id>`, `tenant-<id>`), Flux multitenancy lockdown, no tenant access to `source-controller` artifacts (tenant and preview Stacks clone only the tenant's own Git source), Kyverno-protected platform-owned tenant objects, egress-restricted PKO workspaces, per-tenant SeaweedFS identities scoped to `tenants/<id>/`, read-only Git credentials scoped to each tenant's own repository, per-tenant `age` + SOPS encryption in Git, `AES-256-GCM` credential encryption at rest, and Kyverno `restricted` Pod Security Standards. See [Security & Tenancy](./docs/operations/security-and-tenancy.md).
 * **Anti-Lockout Protection:** Control-plane resources carry `protect: true`. Stage 0 state is escrowed to versioned S3, and `keel bootstrap recover` re-applies it if the cluster add-ons or the Git forge go down. See [Break-Glass Recovery](./docs/operations/break-glass-recovery.md).
 
 ---
@@ -142,7 +142,7 @@ keel auth login          # --no-browser prints the URL instead
 keel auth status
 ```
 
-Stage 0 creates the `default` tenant. Access is granted through IdP groups `tenant-<id>` (member) and `tenant-<id>-admin` (admin). The Stage 0 admin is in `keel-admins`.
+Stage 0 creates the `default` tenant with its own repository. Create more from the portal (**+ New Tenant**); each gets its own repository too. Access is granted through IdP groups `tenant-<id>` (member) and `tenant-<id>-admin` (admin). The Stage 0 admin is in `keel-admins`.
 
 ### 4. Provision a Workload Cluster & Deploy a Canary App (PR-Driven)
 Every mutation validates inputs against `catalog.yaml` JSON Schemas, encrypts secrets with SOPS + `age`, opens a Pull Request, and triggers a PKO v2 preview:
