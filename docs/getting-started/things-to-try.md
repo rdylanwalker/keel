@@ -14,7 +14,9 @@ These hands-on walkthroughs assume you have completed the [Stage 0 Bootstrap](bo
 
 Because the `kind` provider is enabled by default in `providers/registry.yaml`, you can spin up a second isolated Kubernetes cluster on Docker right away.
 
-### Step 1: Create a Tenant
+### Step 1 (Optional): Create a Tenant
+
+The walkthroughs on this page use the Stage 0 `default` tenant. Pulumi (PKO) blueprints and Flux-engine manifest apps need the tenant's own Git source (`tenants/<id>/git-repository.yaml`, Flux `GitRepository` `tenant-<id>/keel-gitops`), which Stage 0 writes only for `default`. Tenants created with **+ New Tenant** have none yet: Keel refuses their Pulumi proposals with `409 Conflict`, and their Flux-engine apps never reconcile. They can still install Helm apps, such as Podinfo below.
 
 1. Open `http://127.0.0.1:8080` and go to **Catalog & Form Wizard**.
 2. Click **+ New Tenant**, enter `dev-team`, and submit.
@@ -25,7 +27,7 @@ Because the `kind` provider is enabled by default in `providers/registry.yaml`, 
 
 In **Catalog & Form Wizard**:
 
-1. Set **Target Tenant** to `dev-team`.
+1. Set **Target Tenant** to `default`.
 2. Select **Local kind Workload Cluster** (`kind-cluster`).
 3. Fill in the form:
    - **Cluster Name:** `workload-dev`
@@ -44,7 +46,7 @@ EOF
 
 keel infra provision \
   --blueprint kind-cluster \
-  --tenant dev-team \
+  --tenant default \
   --values-file /tmp/workload-dev.yaml \
   --server http://127.0.0.1:8080
 ```
@@ -52,7 +54,7 @@ keel infra provision \
 ### Step 3: Inspect the Preview & Merge
 
 1. Open **PR & Preview Inspector** (or run `keel preview status --pr <PR_NUMBER> --watch --server http://127.0.0.1:8080`).
-2. Review the **Git Diff (vs. main)** (`tenants/dev-team/infra/workload-dev.yaml`) and the **Resource Diff Tree** from the PKO v2 preview (`+ Create` for `kind:index:Cluster`).
+2. Review the **Git Diff (vs. main)** (`tenants/default/infra/workload-dev.yaml`) and the **Resource Diff Tree** from the PKO v2 preview (`+ Create` for `kind:index:Cluster`).
 3. Click **Merge PR**.
 4. Once Flux CD and PKO v2 reconcile, verify the new cluster is running alongside your management cluster:
 
@@ -138,7 +140,7 @@ You can use the same management cluster to provision cloud infrastructure. This 
 
 ### Step 3: Provision with Minimal Sizing
 
-1. Select tenant `dev-team` and choose **AWS EKS Workload Cluster** (`aws-eks`).
+1. Select tenant `default` and choose **AWS EKS Workload Cluster** (`aws-eks`).
 2. Configure minimal sizing to keep costs low and provide your IAM credentials (`AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`, which are encrypted with SOPS + `age` into `secret.enc.yaml`):
    - **Cluster Name:** `eks-sandbox`
    - **AWS Region:** `us-east-1`
@@ -151,7 +153,7 @@ You can use the same management cluster to provision cloud infrastructure. This 
 
 ### Step 4: Clean Up Cloud Resources
 
-When you are done testing, open a PR that removes `tenants/dev-team/infra/eks-sandbox.yaml`. Merging that PR triggers PKO v2 to destroy the EKS cluster and VPC cleanly.
+When you are done testing, open a PR that removes `tenants/default/infra/eks-sandbox.yaml`. Merging that PR triggers PKO v2 to destroy the EKS cluster and VPC cleanly.
 
 ---
 
@@ -272,14 +274,14 @@ EOF
 
 keel infra provision \
   --blueprint gcp-free-vm \
-  --tenant dev-team \
+  --tenant default \
   --values-file /tmp/gcp-vm-values.yaml \
   --server http://127.0.0.1:8080
 
 keel preview status --pr <PR_NUMBER> --watch --server http://127.0.0.1:8080
 ```
 
-`GOOGLE_CREDENTIALS` (marked `"writeOnly": true` and `"format": "password"`) is encrypted with SOPS + `age` into `secret.enc.yaml` and bound to `Stack.spec.envRefs`, while `vmName`, `project`, and `zone` populate `Stack.spec.config`. Merge the PR to create the VM, and remove `tenants/dev-team/infra/<instance>/` via PR when done so PKO v2 runs `pulumi destroy`.
+`GOOGLE_CREDENTIALS` (marked `"writeOnly": true` and `"format": "password"`) is encrypted with SOPS + `age` into `secret.enc.yaml` and bound to `Stack.spec.envRefs`, while `vmName`, `project`, and `zone` populate `Stack.spec.config`. Merge the PR to create the VM, and remove `tenants/default/infra/<instance>/` via PR when done so PKO v2 runs `pulumi destroy`.
 
 ---
 
@@ -298,7 +300,7 @@ Try extending the self-service catalog with another provider from [Provider Blue
 Deploy raw Kubernetes YAML templates without packaging a Helm chart, choosing between Flux CD and Pulumi execution engines.
 
 ### Step 1: Deploy via the Web Portal
-1. In **Catalog & Form Wizard**, select target tenant `dev-team`.
+1. In **Catalog & Form Wizard**, select target tenant `default`.
 2. Locate the **HTTP Echo Server** (`http-echo-manifest`) application blueprint.
 3. In the deploy modal, configure the parameters:
    - **Application Name:** `echo-demo`
@@ -324,7 +326,7 @@ EOF
 # Option A: Deploy using Flux CD engine
 keel app install \
   --app http-echo-manifest \
-  --tenant dev-team \
+  --tenant default \
   --values-file /tmp/echo-values.yaml \
   --engine flux \
   --server http://127.0.0.1:8080
@@ -332,7 +334,7 @@ keel app install \
 # Option B: Deploy using Pulumi PKO v2 engine (provides pre-merge diff previews)
 keel app install \
   --app http-echo-manifest \
-  --tenant dev-team \
+  --tenant default \
   --values-file /tmp/echo-values.yaml \
   --engine pulumi \
   --server http://127.0.0.1:8080
@@ -361,16 +363,16 @@ Once an infrastructure blueprint containing virtual machines has been provisione
 
 ```bash
 # Print connection table and copyable ssh command
-keel infra ssh aws-vm --tenant dev-team --server http://127.0.0.1:8080
+keel infra ssh aws-vm --tenant default --server http://127.0.0.1:8080
 
 # Output raw command string
-keel infra ssh aws-vm --tenant dev-team --output command
+keel infra ssh aws-vm --tenant default --output command
 
 # Launch an interactive terminal session directly in your shell
-keel infra ssh aws-vm --tenant dev-team --exec
+keel infra ssh aws-vm --tenant default --exec
 
 # Launch with custom SSH identity file and port
-keel infra ssh aws-vm --tenant dev-team -i ~/.ssh/id_ed25519 --port 22 --exec
+keel infra ssh aws-vm --tenant default -i ~/.ssh/id_ed25519 --port 22 --exec
 ```
 
 ---
@@ -400,13 +402,15 @@ Choose a **Bootstrap Admin Password** of 14 to 128 characters without whitespace
 
 ### Step 2: Deploy via the Web Portal or CLI
 
-1. In **Catalog & Form Wizard**, select your tenant and choose **Rauthy OIDC Provider** (`rauthy`).
-2. Fill in a **Public Hostname** unique to your tenant (no default; for example `auth-dev-team.keel.local`), **Public HTTPS Port Suffix** (`:8888` for the local `kind` Gateway, empty when served on port 443), **Bootstrap Admin Email**, and the four secrets from Step 1. Keel rejects platform hosts (`idp.`, `keel.`, `forgejo.` under the Keel domain, and the configured IdP host) and hostnames another app already routes; the Kyverno policy `restrict-tenant-route-hostnames` enforces the platform-host rule at admission too. Keep the **Flux CD** engine (the default): Keel rejects the Pulumi engine for this app, because only Flux can substitute its secret fields.
+Rauthy is a Flux manifest app: its Kustomizations read the tenant's own Git source (`tenant-<id>/keel-gitops`, from `tenants/<id>/git-repository.yaml`), which only the Stage 0 `default` tenant has today. In tenants created through **+ New Tenant** its Kustomizations never become Ready.
+
+1. In **Catalog & Form Wizard**, select tenant `default` and choose **Rauthy OIDC Provider** (`rauthy`).
+2. Fill in a **Public Hostname** unique to your tenant (no default; for example `auth-default.keel.local`), **Public HTTPS Port Suffix** (`:8888` for the local `kind` Gateway, empty when served on port 443), **Bootstrap Admin Email**, and the four secrets from Step 1. Keel rejects platform hosts (`idp.`, `keel.`, `forgejo.` under the Keel domain, and the configured IdP host) and hostnames another app already routes; the Kyverno policy `restrict-tenant-route-hostnames` enforces the platform-host rule at admission too. Keep the **Flux CD** engine (the default): Keel rejects the Pulumi engine for this app, because only Flux can substitute its secret fields.
 3. Click **Submit & Open Git PR Proposal**, review the PR, and merge it.
 
 ```bash
 cat <<'EOF' > rauthy-values.yaml
-hostname: auth-dev-team.keel.local
+hostname: auth-default.keel.local
 publicPortSuffix: ":8888"
 adminEmail: admin@keel.local
 encKeyId: keel1
@@ -418,7 +422,7 @@ EOF
 
 keel app install \
   --app rauthy \
-  --tenant dev-team \
+  --tenant default \
   --values-file ./rauthy-values.yaml \
   --server http://127.0.0.1:8080
 ```
@@ -433,10 +437,10 @@ Only one `rauthy` instance per tenant namespace is supported, because the templa
 
 ### Step 3: Verify
 
-The app is exposed through an `HTTPRoute` on the shared `keel-ingress` Gateway (HTTPS listeners) and a NetworkPolicy that admits only the Envoy proxies in `keel-system`. Add `127.0.0.1 auth-dev-team.keel.local` to your `hosts` file (the Stage 0 wildcard certificate covers `*.keel.local`), then:
+The app is exposed through an `HTTPRoute` on the shared `keel-ingress` Gateway (HTTPS listeners) and a NetworkPolicy that admits only the Envoy proxies in `keel-system`. Add `127.0.0.1 auth-default.keel.local` to your `hosts` file (the Stage 0 wildcard certificate covers `*.keel.local`), then:
 
 ```bash
-curl -k https://auth-dev-team.keel.local:8888/auth/v1/.well-known/openid-configuration
+curl -k https://auth-default.keel.local:8888/auth/v1/.well-known/openid-configuration
 ```
 
-The `issuer` must be `https://auth-dev-team.keel.local:8888/auth/v1`. Sign in to `https://auth-dev-team.keel.local:8888/auth/v1/admin` with the bootstrap admin. **Require MFA for Admins** (`adminForceMfa`) is off by default, like Keel's own Rauthy, because browsers refuse passkeys on the untrusted local CA. Once you serve Rauthy with a browser-trusted certificate, register a passkey in the Admin UI and then set **Require MFA for Admins** through **Edit**. The pod has egress only to cluster DNS. Allow more egress with your own NetworkPolicy if Rauthy must reach SMTP or upstream identity providers.
+The `issuer` must be `https://auth-default.keel.local:8888/auth/v1`. Sign in to `https://auth-default.keel.local:8888/auth/v1/admin` with the bootstrap admin. **Require MFA for Admins** (`adminForceMfa`) is off by default, like Keel's own Rauthy, because browsers refuse passkeys on the untrusted local CA. Once you serve Rauthy with a browser-trusted certificate, register a passkey in the Admin UI and then set **Require MFA for Admins** through **Edit**. The pod has egress only to cluster DNS. Allow more egress with your own NetworkPolicy if Rauthy must reach SMTP or upstream identity providers.

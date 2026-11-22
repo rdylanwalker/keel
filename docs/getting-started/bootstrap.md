@@ -126,7 +126,7 @@ The AWS, Azure, and GCP programs install single-node `k3s` on first boot with `I
 | ServiceLB (`klipper-lb`) | Enabled | k3s — exposes the Envoy Gateway `LoadBalancer` Service on the node IP |
 | `local-path` provisioner | Enabled | k3s — default `StorageClass` for SeaweedFS, Rauthy, and Forgejo PVCs |
 | `metrics-server` | Enabled | k3s — resource metrics API |
-| CoreDNS | Enabled | k3s — Stage 0 adds Rauthy/Forgejo host rewrites |
+| CoreDNS | Enabled | k3s — Stage 0 adds rewrites that point the Forgejo host (with `--with-forge`) and the IdP host (built-in Rauthy only) at the `keel-ingress` Envoy proxy |
 
 These k3s-owned components are reconciled by k3s from `/var/lib/rancher/k3s/server/manifests`, not by Flux, and are not Keel catalog add-ons. Do not delete them, and do not install a second ingress controller on the management cluster.
 
@@ -142,7 +142,7 @@ By default, `keel bootstrap init` installs the core control-plane components wit
 - **SeaweedFS (`s3-state-backend`, chart `4.54.0`):** In-cluster S3-compatible state backend in `keel-system`, with the versioned `pulumi-state` bucket. Tenants get scoped identities limited to `tenants/<id>/*`, never the admin keys.
 - **Flux CD (`flux2`, chart `2.20.0`):** GitOps source, kustomize, and helm controllers in `flux-system`, with the multitenancy lockdown enabled (`--no-cross-namespace-refs=true`, default ServiceAccount impersonation). After Stage 0, the protected `flux-system/flux2` HelmRelease in `clusters/management/core-addons/flux2.yaml` adopts this release, so Flux upgrades and rolls back itself from Git
 - **Kyverno (chart `3.10.0`):** A single admission controller release in `keel-system`, plus Keel's seed policies (including `local-kind-docker-socket-exception` and `keel-docker-proxy` in `flux-system` when `--local-dev-docker-socket-exception` is passed)
-- **Pulumi Kubernetes Operator (PKO v2, chart `2.10.1`):** Infrastructure operator in `keel-system` plus the `management-cluster-core` `Stack`
+- **Pulumi Kubernetes Operator (PKO v2, chart `2.10.1`):** Infrastructure operator in `keel-system` plus the `management-cluster-core` `Stack`. The operator trusts the Keel CA through the public `keel-ca-bundle` ConfigMap (see [Git Repositories](git-repositories.md#how-pko-clones-the-in-cluster-forgejo)). A management add-on PR for PKO can change only the chart version, `replicaCount`, `controller.logLevel`/`controller.logFormat`, and sizing and scheduling; its CA trust settings, security contexts and RBAC are locked, so an upgrade that sets any other value (including the old `controller.replicas` or `controller.securityContext` keys) is rejected with `400`.
 - **Envoy Gateway (`envoy-gateway`):** Gateway API controller in `keel-system` with `GatewayClass` `keel-envoy` and `Gateway` `keel-ingress` (HTTP on port `80`; HTTPS on `8888` and `443` using `keel-system/keel-wildcard-tls`)
 - **Prometheus (`prometheus`) & Flagger (`flagger`):** Telemetry (`http://prometheus.keel-system:9090`) and progressive canary delivery controller (`meshProvider: gatewayapi:v1`) in `keel-system`
 - **cert-manager (`cert-manager`, chart `v1.21.3`):** Certificate controller in `keel-system` that issues the self-signed control-plane CA (`keel-ca-issuer`) and the `keel-system/keel-wildcard-tls` certificate used by the `keel-ingress` Gateway
@@ -195,7 +195,7 @@ The Stage 0 ingress (Envoy Gateway `keel-ingress`, port `8888`) serves Rauthy an
 127.0.0.1 idp.keel.local forgejo.keel.local
 ```
 
-The `forgejo.keel.local` entry is needed so PR links printed by the CLI and shown in the GUI resolve. Inside `kind`, Stage 0 adds CoreDNS rewrites so pods reach the same hostnames.
+The `forgejo.keel.local` entry is needed so PR links printed by the CLI and shown in the GUI resolve. On every target, Stage 0 also adds CoreDNS rewrites so pods reach the same hostnames through the Envoy Gateway `keel-ingress` service. It rewrites the Forgejo host whenever `--with-forge` is set, because tenant and preview PKO Stacks clone it over HTTPS (see [How PKO clones the in-cluster Forgejo](git-repositories.md#how-pko-clones-the-in-cluster-forgejo)), and the IdP host only for the built-in Rauthy. An external `--oidc-issuer` host is never rewritten.
 
 ## 3. Start the Control Plane Server
 

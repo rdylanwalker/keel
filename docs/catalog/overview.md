@@ -307,7 +307,10 @@ Operators can define `spec.defaultEngine: flux | pulumi` in `catalog.yaml` and o
 | **Generated Manifests** | `manifests.yaml`, `config/values-configmap.yaml`, `config/secrets.enc.yaml`, `config-kustomization.yaml`, `flux-kustomization.yaml` | `Pulumi.yaml` (`ConfigGroup`), `stack.yaml`, `secrets.enc.yaml` |
 | **Reconciler** | `kustomize-controller` via `postBuild.substituteFrom` | `pulumi-kubernetes-operator` (PKO v2) |
 | **Pre-Merge Previews** | Git unified diff in PR | Ephemeral PKO `Stack` (`spec.preview: true`) with exact resource-level diffs (`+`/`~`/`-`) |
+| **Tenant Git source** | Required: the app `Kustomization`s use the tenant's `tenant-<id>/keel-gitops` `GitRepository` | Required: the `Stack` clones the tenant repository named in `tenants/<id>/git-repository.yaml` (PKO `gitSource`); proposals are refused with `409 Conflict` without one |
 | **Best For** | Lightweight, direct Kubernetes reconciliation with zero IaC runner overhead | Applications requiring pre-merge Kubernetes resource diff previews or unified multi-cloud coordination |
+
+Tenants created through `POST /api/v1/tenants` don't have their own Git source yet (see [Pre-Merge PKO Previews](../getting-started/previews.md#limitations)), so they can install Helm apps but not manifest apps (either engine) or Pulumi Stacks.
 
 ## `CatalogBundle` Schema (`keel.io/v1alpha1`)
 

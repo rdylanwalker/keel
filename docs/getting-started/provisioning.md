@@ -31,8 +31,10 @@ Stage 0 creates the `default` tenant (`tenant-default`), which the examples belo
 
 1. Open **Catalog & Form Wizard**.
 2. Click **+ New Tenant**, enter a DNS-compatible tenant ID such as `platform-team`, and submit. IDs ending in `-admin` are rejected.
-3. Merge the generated PR (`tenants/platform-team/rbac.yaml`). It contains the namespace, quotas, the tenant ServiceAccount, and the `keel-server` RoleBinding. `keel-server` provisions the tenant's scoped SeaweedFS identity.
+3. Merge the generated PR (`tenants/platform-team/rbac.yaml`). It contains the namespace, the quota and LimitRange, the tenant ServiceAccount and its RoleBindings, the `keel-server` RoleBinding, and the `default-deny-all` and `allow-pko-workspace` NetworkPolicies. All of these objects are labelled `keel.io/platform-owned`, and Kyverno stops tenant identities from changing them. `keel-server` provisions the tenant's scoped SeaweedFS identity.
 4. In your IdP, create the groups `tenant-platform-team` (members) and `tenant-platform-team-admin` (tenant admins) and assign users to them. Users must sign in again to pick up new groups.
+
+> **Current limit:** a tenant created this way doesn't have its own Git source (`tenants/<id>/git-repository.yaml`, Flux `GitRepository` `tenant-<id>/keel-gitops`) yet. It can install Helm apps, but Pulumi blueprints and Pulumi-engine apps are refused with `409 Conflict`, and Flux-engine manifest apps don't reconcile. The Stage 0 `default` tenant has a source. See [Pre-Merge PKO Previews](previews.md#limitations).
 
 ## 3. Provision Infrastructure
 
