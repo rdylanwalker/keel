@@ -13,7 +13,7 @@ After Stage 0, every change Keel makes is a Pull Request. For Pulumi-backed chan
 
 ## Reading a Preview Report
 
-Every report returned by `GET /api/v1/proposals/{id}/preview`, shown by `keel preview status`, and displayed in the PR & Preview Inspector carries two fields:
+Every report returned by `GET /api/v1/tenants/{tenant}/proposals/{id}/preview`, shown by `keel preview status`, and displayed in the PR & Preview Inspector carries two fields:
 
 - **`source`**
   - `pko`: parsed from a real `pulumi preview` run in the PKO workspace pod.

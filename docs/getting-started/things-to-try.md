@@ -53,7 +53,7 @@ keel infra provision \
 
 ### Step 3: Inspect the Preview & Merge
 
-1. Open **PR & Preview Inspector** (or run `keel preview status --pr <PR_NUMBER> --watch --server http://127.0.0.1:8080`).
+1. Open **PR & Preview Inspector** (or run `keel preview status --pr <PR_NUMBER> --tenant <TENANT> --watch --server http://127.0.0.1:8080`).
 2. Review the **Git Diff (vs. main)** (`tenants/default/infra/workload-dev.yaml`) and the **Resource Diff Tree** from the PKO v2 preview (`+ Create` for `kind:index:Cluster`).
 3. Click **Merge PR**.
 4. Once Flux CD and PKO v2 reconcile, verify the new cluster is running alongside your management cluster:
@@ -278,7 +278,7 @@ keel infra provision \
   --values-file /tmp/gcp-vm-values.yaml \
   --server http://127.0.0.1:8080
 
-keel preview status --pr <PR_NUMBER> --watch --server http://127.0.0.1:8080
+keel preview status --pr <PR_NUMBER> --tenant <TENANT> --watch --server http://127.0.0.1:8080
 ```
 
 `GOOGLE_CREDENTIALS` (marked `"writeOnly": true` and `"format": "password"`) is encrypted with SOPS + `age` into `secret.enc.yaml` and bound to `Stack.spec.envRefs`, while `vmName`, `project`, and `zone` populate `Stack.spec.config`. Merge the PR to create the VM, and remove `tenants/default/infra/<instance>/` via PR when done so PKO v2 runs `pulumi destroy`.

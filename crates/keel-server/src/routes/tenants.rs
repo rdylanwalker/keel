@@ -53,7 +53,7 @@ pub struct ToggleProviderRequest {
 #[serde(rename_all = "camelCase")]
 pub struct ToggleProviderResponse {
     pub provider: ProviderStatusEntry,
-    pub proposal: PullRequestInfo,
+    pub proposal: crate::proposal_repo::ScopedProposal,
     pub branch: String,
 }
 
@@ -260,7 +260,7 @@ pub struct TenantRepositoryStatus {
     /// PR on the tenant repository adding `tenants/<id>/kustomization.yaml` (`None` once on
     /// `main`).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub skeleton_proposal: Option<PullRequestInfo>,
+    pub skeleton_proposal: Option<crate::proposal_repo::ScopedProposal>,
     /// Runtime Secrets (`sops-age`, `keel-gitops-credentials`), written once `tenant-<id>` exists.
     pub cluster: ClusterProvisioning,
     pub notes: Vec<String>,
@@ -273,7 +273,7 @@ pub struct CreateTenantResponse {
     pub tenant: TenantSummary,
     /// Platform-repository PR adding the tenant stub; `null` when the stub is already on `main`
     /// (re-run of a provisioned tenant).
-    pub proposal: Option<PullRequestInfo>,
+    pub proposal: Option<crate::proposal_repo::ScopedProposal>,
     pub branch: Option<String>,
     pub repository: TenantRepositoryStatus,
 }
@@ -613,7 +613,9 @@ async fn ensure_tenant_repo_skeleton(
     )
     .with_tenant(tenant)
     .with_author(pr_author_for_session(auth));
-    Ok(Some(provider.create_pull_request(req).await?))
+    let pr = provider.create_pull_request(req).await?;
+    state.proposal_cache.invalidate(&format!("tenant-{tenant}"));
+    Ok(Some(pr))
 }
 
 /// Writes the platform-repository tenant files on a new proposal branch, commits, pushes and
@@ -626,7 +628,7 @@ async fn open_platform_tenant_proposal(
     files: Vec<(String, String)>,
     kustomization_entries: Vec<String>,
     body_note: Option<String>,
-) -> Result<(PullRequestInfo, String, String), ServerError> {
+) -> Result<(crate::proposal_repo::ScopedProposal, String, String), ServerError> {
     let timestamp = Utc::now().timestamp().max(1) as u64;
     let branch = build_preview_branch(tenant, tenant_repos::CREATE_TENANT_ACTION, timestamp)?;
     for (path, yaml) in &files {
@@ -787,6 +789,7 @@ pub async fn create_tenant(
             ));
         }
     }
+    // The skeleton PR lives in the tenant repository (route scope: the tenant).
     let skeleton_proposal = ensure_tenant_repo_skeleton(
         &state,
         &auth,
@@ -795,7 +798,9 @@ pub async fn create_tenant(
         adopted_existing && !req.adopt_existing,
         &mut notes,
     )
-    .await?;
+    .await?
+    .map(|pr| crate::proposal_repo::ScopeRepo::for_tenant(&state, &tenant).map(|r| r.scoped(pr)))
+    .transpose()?;
     if adopted_existing {
         notes.push(format!(
             "The tenant repository `{}` already existed and was adopted{}",
@@ -822,16 +827,17 @@ pub async fn create_tenant(
             forge_state.removed_deploy_keys
         ));
     }
-    let skeleton_order_hint = |skeleton: &PullRequestInfo| {
+    let skeleton_order_hint = |skeleton: &crate::proposal_repo::ScopedProposal| {
         format!(
-            "Merge tenant repository pull request #{} in `{}`{} first (on the forge: its number belongs to the tenant repository, not to the platform repository), then the platform stub pull request; until then `keel-tenant-root` reports a missing path",
+            "Merge tenant repository pull request #{} in `{}`{} first (`POST /api/v1/tenants/{tenant}/proposals/{}/merge`; its number belongs to the tenant repository, not to the platform repository), then the platform stub pull request (scope `management`); until then `keel-tenant-root` reports a missing path",
             skeleton.id,
             forge_state.repository.target(),
             if skeleton.url.is_empty() {
                 String::new()
             } else {
                 format!(" ({})", skeleton.url)
-            }
+            },
+            skeleton.id
         )
     };
     if let Some(skeleton) = &skeleton_proposal {
@@ -843,7 +849,11 @@ pub async fn create_tenant(
         (_, Some(pr)) => {
             notes.push("Resumed the open tenant creation proposal".to_string());
             let branch = pr.source_branch.clone();
-            (StatusCode::OK, Some(pr), Some(branch))
+            (
+                StatusCode::OK,
+                Some(crate::proposal_repo::ScopeRepo::platform(&state).scoped(pr)),
+                Some(branch),
+            )
         }
         _ => {
             let entries = stub.kustomization_entries();
@@ -865,6 +875,9 @@ pub async fn create_tenant(
                 )
                 .await?
             };
+            state
+                .proposal_cache
+                .invalidate(keel_pko::PLATFORM_REPO_LABEL);
             state.telemetry.publish(CrdWatchEvent::new(
                 WatchedCrdKind::Kustomization,
                 &namespace,
@@ -1020,7 +1033,7 @@ async fn create_monorepo_tenant(
 #[serde(rename_all = "camelCase")]
 pub struct DeleteTenantResponse {
     pub id: String,
-    pub proposal: PullRequestInfo,
+    pub proposal: crate::proposal_repo::ScopedProposal,
     pub branch: String,
     /// Operator follow-ups (dedicated repositories: credential revocation, archiving).
     pub notes: Vec<String>,

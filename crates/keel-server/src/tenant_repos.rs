@@ -247,6 +247,9 @@ pub struct TenantRepos {
     layout: TenantRepoLayout,
     cache_root: PathBuf,
     locks: Arc<std::sync::Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    /// Last network sync of each tenant clone ([`Self::mark_synced`]), so read paths can reuse a
+    /// recent fetch instead of contacting the forge on every request.
+    synced: Arc<std::sync::Mutex<HashMap<String, std::time::Instant>>>,
 }
 
 impl std::fmt::Debug for TenantRepos {
@@ -279,7 +282,32 @@ impl TenantRepos {
             layout,
             cache_root: cache_root.into(),
             locks: Arc::default(),
+            synced: Arc::default(),
         }
+    }
+
+    fn synced_map(&self) -> std::sync::MutexGuard<'_, HashMap<String, std::time::Instant>> {
+        self.synced
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Records a successful network sync of `tenant`'s clone.
+    pub fn mark_synced(&self, tenant: &str) {
+        self.synced_map()
+            .insert(tenant.to_string(), std::time::Instant::now());
+    }
+
+    /// Forgets the last sync of `tenant`'s clone (after a merge), so the next read fetches.
+    pub fn mark_stale(&self, tenant: &str) {
+        self.synced_map().remove(tenant);
+    }
+
+    /// `true` when `tenant`'s clone was synced from the forge within `ttl`.
+    pub fn synced_within(&self, tenant: &str, ttl: std::time::Duration) -> bool {
+        self.synced_map()
+            .get(tenant)
+            .is_some_and(|at| at.elapsed() < ttl)
     }
 
     /// Default clone cache root for a platform working tree: the sibling directory
@@ -368,6 +396,66 @@ impl TenantRepos {
         }
         keel_git::ensure_workdir_from_remote(git, &url, &dir).await?;
         Ok(dir)
+    }
+
+    /// Read-only mirror of a tenant repository's `main` (`<cache_root>/.mirrors/<id>`), used to
+    /// check other tenants' committed content (route hostnames) while a proposal holds its own
+    /// tenant's lock. It has its own lock (`<id>#mirror`, held only for the fetch), so reading
+    /// another tenant never waits for that tenant's write lock (no lock-order deadlock between
+    /// two tenants' proposals). Disposable like every clone in the cache.
+    pub fn mirror_dir(&self, tenant: &str) -> Result<PathBuf, ServerError> {
+        keel_core::validate_dns_label(tenant, "tenant")?;
+        Ok(self.cache_root.join(".mirrors").join(tenant))
+    }
+
+    /// Clones or fetches [`Self::mirror_dir`] (bounded by `timeout`) and returns it; read
+    /// `refs/remotes/origin/main` through object reads only. Errors are returned (callers fail
+    /// closed); a clone that failed half-way is removed so the next attempt starts over.
+    pub async fn sync_mirror(
+        &self,
+        git: &GitRunner,
+        platform_remote: &str,
+        tenant: &str,
+        timeout: std::time::Duration,
+    ) -> Result<PathBuf, ServerError> {
+        let forge = self.forge().ok_or_else(|| {
+            ServerError::Conflict(format!(
+                "tenant `{tenant}` lives in the platform repository (Local Git provider)"
+            ))
+        })?;
+        let url = tenant_push_url(platform_remote, &forge.target(tenant)?)?;
+        let dir = self.mirror_dir(tenant)?;
+        let _guard = self.lock(&format!("{tenant}#mirror")).await;
+        let existing = tokio::fs::try_exists(dir.join(".git"))
+            .await
+            .unwrap_or(false);
+        let work = async {
+            if existing {
+                if git.get_remote_url(&dir, "origin").await.ok().as_deref() != Some(url.as_str()) {
+                    git.set_remote_url(&dir, "origin", &url).await?;
+                }
+                git.fetch(&dir, "origin").await
+            } else {
+                if tokio::fs::try_exists(&dir).await.unwrap_or(false) {
+                    tokio::fs::remove_dir_all(&dir).await?;
+                }
+                if let Some(parent) = dir.parent() {
+                    tokio::fs::create_dir_all(parent).await?;
+                }
+                git.clone_branch(&url, "main", &dir).await
+            }
+        };
+        let outcome = match tokio::time::timeout(timeout, work).await {
+            Ok(res) => res.map_err(ServerError::from),
+            Err(_) => Err(ServerError::ServiceUnavailable(format!(
+                "tenant `{tenant}` repository fetch timed out after {}s",
+                timeout.as_secs()
+            ))),
+        };
+        if outcome.is_err() && !existing {
+            let _ = tokio::fs::remove_dir_all(&dir).await;
+        }
+        outcome.map(|()| dir)
     }
 }
 
@@ -1152,6 +1240,29 @@ mod tests {
         assert!(!waiter.is_finished());
         drop(a);
         waiter.await.unwrap();
+    }
+
+    #[test]
+    fn sync_freshness_is_tracked_per_tenant() {
+        let repos = TenantRepos::monorepo("/tmp/cache");
+        let ttl = std::time::Duration::from_secs(10);
+        assert!(!repos.synced_within("acme", ttl));
+        repos.mark_synced("acme");
+        assert!(repos.synced_within("acme", ttl));
+        assert!(!repos.synced_within("beta", ttl));
+        assert!(!repos.synced_within("acme", std::time::Duration::ZERO));
+        repos.mark_stale("acme");
+        assert!(!repos.synced_within("acme", ttl));
+    }
+
+    #[test]
+    fn mirrors_live_outside_the_tenant_clones() {
+        let repos = TenantRepos::monorepo("/tmp/cache");
+        assert_eq!(
+            repos.mirror_dir("acme").unwrap(),
+            PathBuf::from("/tmp/cache/.mirrors/acme")
+        );
+        assert!(repos.mirror_dir("../x").is_err());
     }
 
     #[test]

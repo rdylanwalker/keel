@@ -1171,6 +1171,8 @@ pub struct AppState {
     /// Per-tenant repository registry (layout, naming convention, clone cache, per-repository
     /// locks). Defaults to the monorepo layout of the development-only Local Git provider.
     pub tenant_repos: crate::tenant_repos::TenantRepos,
+    /// Disposable TTL cache of per-repository PR listings (with forge rate-limit back-off).
+    pub proposal_cache: Arc<crate::proposal_repo::ProposalListCache>,
 }
 
 impl AppState {
@@ -1212,6 +1214,7 @@ impl AppState {
             preview_cluster: None,
             require_pulumi_passphrase: true,
             tenant_repos,
+            proposal_cache: Arc::default(),
         }
     }
 

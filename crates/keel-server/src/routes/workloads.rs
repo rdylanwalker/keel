@@ -9,7 +9,6 @@ use keel_core::{
     CatalogManifest, InfraResourceKind, StackSshInfoResponse, parse_catalog,
     resolve_ssh_target_from_sources, validate_dns_label,
 };
-use keel_git::PullRequestInfo;
 use keel_kube::StackDiagnostics;
 use keel_pko::build_preview_branch;
 use serde::{Deserialize, Serialize};
@@ -19,10 +18,9 @@ use crate::auth::AuthSession;
 use crate::error::ServerError;
 use crate::state::{AppState, MANAGEMENT_TENANT, ReleaseSummary, StackSummary};
 
-use super::{
-    RepoReader, open_pr_for_session, resolve_tenant_resource_dir, serialize_tenants_kustomization,
-    stage_commit_push_and_return_to_main,
-};
+use crate::proposal_repo::{ScopeRepo, TenantIndex};
+
+use super::{RepoReader, resolve_tenant_resource_dir, stage_commit_push_in};
 
 /// Query parameters for `GET /api/v1/stacks`.
 #[derive(Debug, Deserialize)]
@@ -172,7 +170,7 @@ pub async fn get_release_diagnostics(
 pub struct DeleteResourceResponse {
     pub id: String,
     pub namespace: String,
-    pub proposal: PullRequestInfo,
+    pub proposal: crate::proposal_repo::ScopedProposal,
     pub branch: String,
 }
 
@@ -236,22 +234,21 @@ async fn delete_gitops_resource_pr(
         "release"
     };
 
+    let repo = ScopeRepo::for_tenant(&state, tenant)?;
     let (commit_sha, removed_rel_dir) = {
-        let _guard = state.git_lock.lock().await;
-        state
-            .git_runner
-            .sync_branch_from_remote(&state.repo_workdir, "origin", "main")
-            .await?;
+        let _guard = repo.lock(&state).await;
+        repo.sync_main(&state).await?;
+        crate::routes::proposals::ensure_tenant_repo_initialised(&repo).await?;
+        let workdir = repo.workdir.as_path();
 
-        let Some(resolved) =
-            resolve_tenant_resource_dir(&state.repo_workdir, tenant, subdir, &name).await
+        let Some(resolved) = resolve_tenant_resource_dir(workdir, tenant, subdir, &name).await
         else {
             return Err(ServerError::NotFound(format!(
                 "Resource '{name}' not found in tenant '{tenant}'"
             )));
         };
         let rel_dir = resolved.rel_dir;
-        if subdir == "apps" && declares_protected_flux_object(&state.repo_workdir.join(&rel_dir)) {
+        if subdir == "apps" && declares_protected_flux_object(&workdir.join(&rel_dir)) {
             return Err(ServerError::Forbidden(format!(
                 "Release '{name}' in '{namespace}' is labelled `keel.io/protect: \"true\"` and \
                  cannot be deleted via the API; remove the label in Git first"
@@ -260,63 +257,49 @@ async fn delete_gitops_resource_pr(
 
         state
             .git_runner
-            .checkout_new_branch(&state.repo_workdir, &branch)
+            .checkout_new_branch(workdir, &branch)
             .await?;
 
-        tokio::fs::remove_dir_all(state.repo_workdir.join(&rel_dir)).await?;
+        tokio::fs::remove_dir_all(workdir.join(&rel_dir)).await?;
         let mut staged_paths = vec![rel_dir.clone()];
 
-        let tenants_kustomization_path = state.repo_workdir.join("tenants/kustomization.yaml");
-        if tokio::fs::try_exists(&tenants_kustomization_path)
+        let index = TenantIndex::new(&repo, tenant);
+        if tokio::fs::try_exists(workdir.join(index.rel_path()))
             .await
             .unwrap_or(false)
         {
-            let existing = tokio::fs::read_to_string(&tenants_kustomization_path)
-                .await
-                .unwrap_or_default();
             let prefix_in_tenants = rel_dir
                 .strip_prefix("tenants/")
                 .unwrap_or(&rel_dir)
                 .to_string();
-            let resources: Vec<String> = serde_yml::from_str::<Value>(&existing)
-                .ok()
-                .and_then(|v| v.get("resources").and_then(|r| r.as_array()).cloned())
-                .unwrap_or_default()
+            let resources: Vec<String> = index
+                .load(workdir)
+                .await
                 .into_iter()
-                .filter_map(|v| v.as_str().map(str::to_string))
                 .filter(|r| !r.starts_with(&format!("{prefix_in_tenants}/")))
                 .collect();
-            tokio::fs::write(
-                &tenants_kustomization_path,
-                serialize_tenants_kustomization(&resources)?,
-            )
-            .await?;
-            staged_paths.push("tenants/kustomization.yaml".to_string());
+            staged_paths.push(index.store(workdir, &resources).await?);
         }
 
         let commit_msg = format!("feat({tenant}): delete {kind_label} {name}");
-        let sha = stage_commit_push_and_return_to_main(
-            &state,
-            &auth,
-            &branch,
-            &commit_msg,
-            &staged_paths,
-        )
-        .await?;
+        let sha = stage_commit_push_in(&state, workdir, &auth, &branch, &commit_msg, &staged_paths)
+            .await?;
         (sha, rel_dir)
     };
 
-    let proposal = open_pr_for_session(
-        &state,
-        &auth,
-        tenant,
-        &branch,
-        format!("chore({tenant}): delete {kind_label} {name}"),
-        format!(
-            "Automated decommission proposal for `{name}` in `{namespace}`\n\n- Commit: `{commit_sha}`\n- Removed: `{removed_rel_dir}`"
-        ),
-    )
-    .await?;
+    let proposal = repo
+        .open_pull_request(
+            &auth,
+            tenant,
+            &branch,
+            format!("chore({tenant}): delete {kind_label} {name}"),
+            format!(
+                "Automated decommission proposal for `{name}` in `{namespace}`\n\n- Commit: `{commit_sha}`\n- Removed: `{removed_rel_dir}`"
+            ),
+        )
+        .await?;
+    state.proposal_cache.invalidate(&repo.repository().label);
+    let proposal = repo.scoped(proposal);
 
     Ok(Json(DeleteResourceResponse {
         id: name,
@@ -324,6 +307,15 @@ async fn delete_gitops_resource_pr(
         proposal,
         branch,
     }))
+}
+
+/// The tenant's own repository when tenants have dedicated repositories (`None` for the Local
+/// Git provider, whose tenants live in the platform repository).
+fn tenant_repository(state: &AppState, tenant: &str) -> Result<Option<ScopeRepo>, ServerError> {
+    if !state.tenant_repos.is_dedicated() {
+        return Ok(None);
+    }
+    Ok(Some(ScopeRepo::for_tenant(state, tenant)?))
 }
 
 /// `true` when any Flux `HelmRelease` / `Kustomization` manifest under `dir` carries the
@@ -375,6 +367,20 @@ pub async fn get_stack_config(
     let tenant = namespace.strip_prefix("tenant-").unwrap_or(&namespace);
     auth.require_tenant_access(tenant)?;
 
+    let not_found =
+        || ServerError::NotFound(format!("Stack '{name}' not found in tenant '{tenant}'"));
+    // A tenant's own repository: its committed `main`, read from the synced clone.
+    if let Some(repo) = tenant_repository(&state, tenant)? {
+        let _guard = repo.lock(&state).await;
+        repo.sync_main_for_read(&state).await?;
+        let reader = RepoReader::committed_in(&state, &repo.workdir)
+            .await
+            .ok_or_else(not_found)?;
+        return read_stack_config(&reader, tenant, &name)
+            .await
+            .map(Json)
+            .ok_or_else(not_found);
+    }
     // Prefer committed `origin/main` state read without touching the shared worktree (`OPEN-13`).
     if let Some(reader) = RepoReader::committed(&state).await
         && let Some(resp) = read_stack_config(&reader, tenant, &name).await
@@ -485,19 +491,19 @@ pub async fn get_release_config(
 
     let tenant = namespace.strip_prefix("tenant-").unwrap_or(&namespace);
     auth.require_tenant_access(tenant)?;
-    let app_dir =
-        match resolve_tenant_resource_dir(&state.repo_workdir, tenant, "apps", &name).await {
-            Some(resolved) => state.repo_workdir.join(&resolved.rel_dir),
-            None => state
-                .repo_workdir
-                .join("tenants")
-                .join(tenant)
-                .join("apps")
-                .join(&name),
-        };
+    // The tenant's repository (its own clone, or the platform checkout for the Local Git
+    // provider), read under its lock so mutating handlers cannot interleave.
+    let repo = ScopeRepo::for_tenant(&state, tenant)?;
+    let repo_guard = repo.lock(&state).await;
+    repo.sync_main_for_read(&state).await?;
+    let root = repo.workdir.as_path();
+    let app_dir = match resolve_tenant_resource_dir(root, tenant, "apps", &name).await {
+        Some(resolved) => root.join(&resolved.rel_dir),
+        None => root.join("tenants").join(tenant).join("apps").join(&name),
+    };
 
     let (values, hr_doc, is_canary, action_engine) = {
-        let _guard = state.git_lock.lock().await;
+        let _guard = repo_guard;
         let values_path = app_dir.join("values.yaml");
         let hr_path = app_dir.join("helmrelease.yaml");
         let hr_canary_path = app_dir.join("helmrelease-canary.yaml");
@@ -670,8 +676,11 @@ pub async fn get_bundle_config(
 
     let tenant = namespace.strip_prefix("tenant-").unwrap_or(&namespace);
     auth.require_tenant_access(tenant)?;
-    let bundle_dir = state
-        .repo_workdir
+    let repo = ScopeRepo::for_tenant(&state, tenant)?;
+    let _repo_guard = repo.lock(&state).await;
+    repo.sync_main_for_read(&state).await?;
+    let bundle_dir = repo
+        .workdir
         .join("tenants")
         .join(tenant)
         .join("bundles")
@@ -1094,9 +1103,25 @@ async fn resolve_stack_ssh_info(
     let live_outputs = state.state_provider.stack_outputs(namespace, name).await;
 
     // Prefer committed `origin/main` (no worktree access); fall back to the worktree under `git_lock`.
-    let committed = match RepoReader::committed(state).await {
-        Some(reader) => read_stack_ssh_docs(&reader, tenant, name).await,
-        None => None,
+    let committed = match tenant_repository(state, tenant).map_err(SshInfoError::from)? {
+        Some(repo) => {
+            let _guard = repo.lock(state).await;
+            repo.sync_main_for_read(state)
+                .await
+                .map_err(SshInfoError::from)?;
+            match RepoReader::committed_in(state, &repo.workdir).await {
+                Some(reader) => Some(
+                    read_stack_ssh_docs(&reader, tenant, name)
+                        .await
+                        .unwrap_or((None, None, None)),
+                ),
+                None => Some((None, None, None)),
+            }
+        }
+        None => match RepoReader::committed(state).await {
+            Some(reader) => read_stack_ssh_docs(&reader, tenant, name).await,
+            None => None,
+        },
     };
     let (stack_doc, values_doc, pulumi_doc) = match committed {
         Some(docs) => docs,

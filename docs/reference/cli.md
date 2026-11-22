@@ -33,11 +33,11 @@ keel auth status
 
 | Command | Description |
 | :--- | :--- |
-| `keel proposal list [--tenant <id>] [--status open\|merged\|closed\|all] [--output table\|json]` | Lists proposals. Defaults to `--status open`. |
-| `keel proposal show <PR> [--output table\|json]` | Shows one proposal. |
-| `keel proposal merge <PR> [--output ...]` | Merges an open proposal. The server pins the merge to the head SHA it reviewed, so the merge is refused if the branch moved after verification. Requires cluster admin or `tenant-<id>-admin`. |
-| `keel proposal close <PR> [--output ...]` | Closes (rejects) an open proposal. Its ephemeral preview is garbage-collected. |
-| `keel preview status --pr <PR> [--watch]` | Renders the preview diff (`+` create, `~` update, `-` delete, `!` replace) and whether it came from a real PKO run or was simulated. `--watch` streams SSE progress until the preview finishes. |
+| `keel proposal list [--tenant <id>] [--status open\|merged\|closed\|all] [--output table\|json]` | Lists proposals with their tenant and repository. Without `--tenant`, lists every repository you can see (cluster admins: the platform repository and every tenant repository); repositories the forge could not list are reported on stderr. Defaults to `--status open`. |
+| `keel proposal show <PR> --tenant <id> [--output table\|json]` | Shows one proposal. PR numbers are per repository: `--tenant` is the tenant whose repository holds the PR, or `management` for platform-repository PRs (catalog, management add-ons, tenant stubs). |
+| `keel proposal merge <PR> --tenant <id> [--output ...]` | Merges an open proposal in the `--tenant` repository. The server pins the merge to the head SHA it reviewed, so the merge is refused if the branch moved after verification. Requires cluster admin or `tenant-<id>-admin` (tenant repository PRs whose changes stay under `tenants/<id>/`). |
+| `keel proposal close <PR> --tenant <id> [--output ...]` | Closes (rejects) an open proposal. Its ephemeral preview is garbage-collected. |
+| `keel preview status --pr <PR> --tenant <id> [--watch]` | Renders the preview diff (`+` create, `~` update, `-` delete, `!` replace) and whether it came from a real PKO run or was simulated. `--watch` streams SSE progress until the preview finishes. |
 
 ## Catalog, Applications & Infrastructure
 

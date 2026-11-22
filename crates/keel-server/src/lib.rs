@@ -6,6 +6,7 @@
 pub mod auth;
 pub mod error;
 pub mod preview_lifecycle;
+pub mod proposal_repo;
 pub mod routes;
 pub mod security;
 pub mod spa;
@@ -75,24 +76,27 @@ pub fn build_router(state: AppState) -> Router {
             "/api/v1/tenants/{id}/baseline/migrate",
             post(routes::migrate_tenant_baseline),
         )
+        // Proposals are scoped to a tenant (its own repository) or `management` (the platform
+        // repository); PR ids are per repository. `GET /api/v1/proposals` aggregates.
+        .route("/api/v1/proposals", get(routes::list_proposals))
         .route(
-            "/api/v1/proposals",
-            get(routes::list_proposals).post(routes::create_proposal),
+            "/api/v1/tenants/{id}/proposals",
+            get(routes::list_scope_proposals).post(routes::create_proposal),
         )
         .route(
-            "/api/v1/proposals/{pr_id}/preview",
+            "/api/v1/tenants/{id}/proposals/{pr_id}/preview",
             get(routes::get_proposal_preview),
         )
         .route(
-            "/api/v1/proposals/{pr_id}/merge",
+            "/api/v1/tenants/{id}/proposals/{pr_id}/merge",
             post(routes::merge_proposal),
         )
         .route(
-            "/api/v1/proposals/{pr_id}/reject",
+            "/api/v1/tenants/{id}/proposals/{pr_id}/reject",
             post(routes::reject_proposal),
         )
         .route(
-            "/api/v1/proposals/{pr_id}/reopen",
+            "/api/v1/tenants/{id}/proposals/{pr_id}/reopen",
             post(routes::reopen_proposal),
         )
         .route("/api/v1/stacks", get(routes::list_stacks))

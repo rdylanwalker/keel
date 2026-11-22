@@ -19,7 +19,6 @@ use keel_core::{
     management_addon_ref, render_management_addon_document, replace_yaml_document,
     validate_dns_label, validate_management_addon_document,
 };
-use keel_git::PullRequestInfo;
 use keel_kube::{CrdWatchEvent, UserGitCredentials, user_git_creds_secret_name};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -451,7 +450,7 @@ pub struct UpgradeManagementAddonRequest {
 #[serde(rename_all = "camelCase")]
 pub struct ManagementAddonProposalResponse {
     pub id: String,
-    pub proposal: PullRequestInfo,
+    pub proposal: crate::proposal_repo::ScopedProposal,
     pub branch: String,
 }
 

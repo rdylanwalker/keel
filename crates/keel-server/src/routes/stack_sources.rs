@@ -13,7 +13,6 @@ use axum::Json;
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::StatusCode;
 use keel_core::validate_dns_label;
-use keel_git::PullRequestInfo;
 use keel_pko::{FluxSourceMigration, build_preview_branch, migrate_legacy_flux_source_stack};
 use serde::{Deserialize, Serialize};
 
@@ -54,7 +53,7 @@ pub struct MigrateStackSourcesResponse {
     /// Legacy `fluxSource` Stacks left unchanged (with a secret-free reason).
     pub skipped: Vec<SkippedStackSource>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub proposal: Option<PullRequestInfo>,
+    pub proposal: Option<crate::proposal_repo::ScopedProposal>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
 }
@@ -125,6 +124,7 @@ pub async fn migrate_stack_sources(
         };
         match migrate_legacy_flux_source_stack(&content, &id, |dir| {
             tenant_stack_git_source(&source, dir)
+                .map_err(|e| keel_pko::PkoError::Validation(e.to_string()))
         }) {
             Ok(FluxSourceMigration::Migrated(yaml)) => migrated.push((rel, yaml)),
             Ok(FluxSourceMigration::Unchanged) => {}

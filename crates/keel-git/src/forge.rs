@@ -155,6 +155,14 @@ pub enum ForgeError {
     #[error("Forge REST API error (HTTP {status}): {message}")]
     Api { status: u16, message: String },
 
+    /// The forge throttled the request (HTTP 429, or a 403 carrying `Retry-After` /
+    /// `X-RateLimit-Remaining: 0`). `retry_after` is the forge-advertised wait, when it sent one.
+    #[error("Forge rate limit exceeded (HTTP {status}); retry after {}", retry_after.map(|d| format!("{}s", d.as_secs())).unwrap_or_else(|| "a while".to_string()))]
+    RateLimited {
+        status: u16,
+        retry_after: Option<std::time::Duration>,
+    },
+
     #[error("Serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
 

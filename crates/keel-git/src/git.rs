@@ -718,6 +718,35 @@ impl GitRunner {
         Ok(())
     }
 
+    /// Local-only counterpart of [`GitRunner::sync_branch_from_remote`]: discards local changes,
+    /// checks out `branch` and resets it to the already fetched `<remote>/<branch>` (when that
+    /// ref exists). No network access.
+    pub async fn reset_branch_to_remote_ref(
+        &self,
+        work_dir: &Path,
+        remote: &str,
+        branch: &str,
+    ) -> Result<(), GitError> {
+        validate_git_ref(remote, "remote")?;
+        validate_git_ref(branch, "branch")?;
+        let _ = self
+            .exec(Some(work_dir), "reset", &["reset", "--hard"], &[])
+            .await;
+        let _ = self
+            .exec(Some(work_dir), "clean", &["clean", "-fd"], &[])
+            .await;
+        self.checkout_branch(work_dir, branch).await?;
+        let remote_ref = format!("refs/remotes/{remote}/{branch}");
+        if self.ref_exists(work_dir, &remote_ref).await? {
+            let target = format!("{remote}/{branch}");
+            self.exec(Some(work_dir), "reset", &["reset", "--hard", &target], &[])
+                .await?;
+        }
+        self.exec(Some(work_dir), "clean", &["clean", "-fd"], &[])
+            .await?;
+        Ok(())
+    }
+
     /// Creates and checks out a new branch (`git checkout -b <branch>`).
     pub async fn checkout_new_branch(&self, work_dir: &Path, branch: &str) -> Result<(), GitError> {
         validate_git_ref(branch, "branch")?;
@@ -1125,6 +1154,36 @@ impl GitRunner {
         repo_rel_dir: &str,
     ) -> Result<Vec<String>, GitError> {
         self.list_tree_names(repo_dir, rev, repo_rel_dir).await
+    }
+
+    /// Lists every file path (repository-relative, recursive) under `repo_rel_dir` at `rev`
+    /// without touching the worktree (`git ls-tree -r --name-only`). Empty when absent.
+    pub async fn list_files_at_ref(
+        &self,
+        repo_dir: &Path,
+        rev: &str,
+        repo_rel_dir: &str,
+    ) -> Result<Vec<String>, GitError> {
+        validate_git_ref(rev, "rev")?;
+        validate_repo_rel_path(repo_rel_dir, "repo_rel_dir")?;
+        match self
+            .exec(
+                Some(repo_dir),
+                "ls-tree",
+                &["ls-tree", "-r", "--name-only", rev, "--", repo_rel_dir],
+                &[],
+            )
+            .await
+        {
+            Ok(out) => Ok(out
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(ToOwned::to_owned)
+                .collect()),
+            Err(GitError::CommandFailed { .. }) => Ok(Vec::new()),
+            Err(e) => Err(e),
+        }
     }
 
     /// Returns `true` when `<rev>:<repo_rel_path>` exists (file or directory) without touching
@@ -1800,6 +1859,21 @@ mod tests {
             "# Infra GitOps\n"
         );
 
+        // The local-only reset discards changes and returns to `origin/main` from a branch.
+        runner.checkout_branch(&work_b, &branch).await.unwrap();
+        tokio::fs::write(work_b.join("untracked.txt"), "dirty\n")
+            .await
+            .unwrap();
+        runner
+            .reset_branch_to_remote_ref(&work_b, "origin", "main")
+            .await
+            .unwrap();
+        assert!(!work_b.join("untracked.txt").exists());
+        assert_eq!(
+            runner.current_head_sha(&work_b).await.unwrap(),
+            runner.rev_parse(&work_b, "origin/main").await.unwrap()
+        );
+
         let authed = GitRunner::default().with_credentials(GitCredentials::HttpsBasic {
             username: "git".to_string(),
             password_or_token: "secret".to_string(),
@@ -1917,6 +1991,21 @@ mod tests {
                 .await
                 .unwrap(),
             vec!["db".to_string()]
+        );
+        let files = runner
+            .list_files_at_ref(&work, &mb, "tenants/acme")
+            .await
+            .unwrap();
+        assert!(
+            files.iter().all(|f| f.starts_with("tenants/acme/")) && !files.is_empty(),
+            "{files:?}"
+        );
+        assert!(
+            runner
+                .list_files_at_ref(&work, &mb, "tenants/missing")
+                .await
+                .unwrap()
+                .is_empty()
         );
 
         let first_parent = runner.diff_first_parent(&work, &head_sha).await.unwrap();

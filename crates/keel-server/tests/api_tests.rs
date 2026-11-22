@@ -663,7 +663,7 @@ async fn test_proposal_create_preview_merge_and_stacks_releases() {
         .oneshot(
             Request::builder()
                 .method(Method::POST)
-                .uri("/api/v1/proposals")
+                .uri("/api/v1/tenants/acme/proposals")
                 .header(COOKIE, &cookie)
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
@@ -687,7 +687,7 @@ async fn test_proposal_create_preview_merge_and_stacks_releases() {
         .oneshot(
             Request::builder()
                 .method(Method::POST)
-                .uri("/api/v1/proposals")
+                .uri("/api/v1/tenants/acme/proposals")
                 .header(COOKIE, &cookie)
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
@@ -784,7 +784,7 @@ async fn test_proposal_create_preview_merge_and_stacks_releases() {
         .oneshot(
             Request::builder()
                 .method(Method::POST)
-                .uri("/api/v1/proposals")
+                .uri("/api/v1/tenants/acme/proposals")
                 .header(COOKIE, &cookie)
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
@@ -819,7 +819,7 @@ async fn test_proposal_create_preview_merge_and_stacks_releases() {
         .clone()
         .oneshot(
             Request::builder()
-                .uri("/api/v1/proposals?tenant=acme")
+                .uri("/api/v1/tenants/acme/proposals")
                 .header(COOKIE, &cookie)
                 .body(Body::empty())
                 .unwrap(),
@@ -844,7 +844,9 @@ async fn test_proposal_create_preview_merge_and_stacks_releases() {
         .clone()
         .oneshot(
             Request::builder()
-                .uri(format!("/api/v1/proposals/{pr_id}/preview"))
+                .uri(format!(
+                    "/api/v1/tenants/management/proposals/{pr_id}/preview"
+                ))
                 .header(COOKIE, &cookie)
                 .body(Body::empty())
                 .unwrap(),
@@ -865,7 +867,9 @@ async fn test_proposal_create_preview_merge_and_stacks_releases() {
         .oneshot(
             Request::builder()
                 .method(Method::POST)
-                .uri(format!("/api/v1/proposals/{pr_id}/merge"))
+                .uri(format!(
+                    "/api/v1/tenants/management/proposals/{pr_id}/merge"
+                ))
                 .header(COOKIE, &cookie)
                 .body(Body::empty())
                 .unwrap(),
@@ -1659,7 +1663,9 @@ spec:
         .oneshot(
             Request::builder()
                 .method(Method::POST)
-                .uri(format!("/api/v1/proposals/{catalog_pr_id}/merge"))
+                .uri(format!(
+                    "/api/v1/tenants/management/proposals/{catalog_pr_id}/merge"
+                ))
                 .header(COOKIE, &cookie)
                 .body(Body::empty())
                 .unwrap(),
@@ -1673,7 +1679,7 @@ spec:
         .oneshot(
             Request::builder()
                 .method(Method::POST)
-                .uri("/api/v1/proposals")
+                .uri("/api/v1/tenants/acme/proposals")
                 .header(COOKIE, &cookie)
                 .header("content-type", "application/json")
                 .body(Body::from(
@@ -2085,7 +2091,9 @@ async fn test_blueprint_merge_visibility_and_proposal_status_history() {
         .oneshot(
             Request::builder()
                 .method(Method::POST)
-                .uri(format!("/api/v1/proposals/{pr1_id}/merge"))
+                .uri(format!(
+                    "/api/v1/tenants/management/proposals/{pr1_id}/merge"
+                ))
                 .header(COOKIE, &cookie)
                 .body(Body::empty())
                 .unwrap(),
@@ -2152,7 +2160,9 @@ async fn test_blueprint_merge_visibility_and_proposal_status_history() {
         .oneshot(
             Request::builder()
                 .method(Method::POST)
-                .uri(format!("/api/v1/proposals/{pr2_id}/reject"))
+                .uri(format!(
+                    "/api/v1/tenants/management/proposals/{pr2_id}/reject"
+                ))
                 .header(COOKIE, &cookie)
                 .body(Body::empty())
                 .unwrap(),
@@ -2189,7 +2199,9 @@ async fn test_blueprint_merge_visibility_and_proposal_status_history() {
         .oneshot(
             Request::builder()
                 .method(Method::POST)
-                .uri(format!("/api/v1/proposals/{pr2_id}/reopen"))
+                .uri(format!(
+                    "/api/v1/tenants/management/proposals/{pr2_id}/reopen"
+                ))
                 .header(COOKIE, &cookie)
                 .body(Body::empty())
                 .unwrap(),
@@ -2207,7 +2219,9 @@ async fn test_blueprint_merge_visibility_and_proposal_status_history() {
         .oneshot(
             Request::builder()
                 .method(Method::POST)
-                .uri(format!("/api/v1/proposals/{pr2_id}/reopen"))
+                .uri(format!(
+                    "/api/v1/tenants/management/proposals/{pr2_id}/reopen"
+                ))
                 .header(COOKIE, &cookie)
                 .body(Body::empty())
                 .unwrap(),
@@ -2251,7 +2265,7 @@ async fn test_builtin_dex_catalog_app_installs_from_tenant_scoped_helm_repositor
         build_router(fixture.state.clone()).oneshot(
             Request::builder()
                 .method(Method::POST)
-                .uri("/api/v1/proposals")
+                .uri(proposals_uri(&body))
                 .header(COOKIE, &cookie)
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(body.to_string()))
@@ -2320,7 +2334,7 @@ async fn test_proposal_supports_multiple_instances_version_and_target_namespace(
         .oneshot(
             Request::builder()
                 .method(Method::POST)
-                .uri("/api/v1/proposals")
+                .uri("/api/v1/tenants/acme/proposals")
                 .header(COOKIE, &cookie)
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
@@ -2345,7 +2359,7 @@ async fn test_proposal_supports_multiple_instances_version_and_target_namespace(
         .oneshot(
             Request::builder()
                 .method(Method::POST)
-                .uri("/api/v1/proposals")
+                .uri("/api/v1/tenants/acme/proposals")
                 .header(COOKIE, &cookie)
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
@@ -2413,7 +2427,7 @@ async fn test_proposal_supports_multiple_instances_version_and_target_namespace(
         .oneshot(
             Request::builder()
                 .method(Method::POST)
-                .uri("/api/v1/proposals")
+                .uri("/api/v1/tenants/acme/proposals")
                 .header(COOKIE, &cookie)
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
@@ -2589,7 +2603,7 @@ spec:
         .oneshot(
             Request::builder()
                 .method(Method::POST)
-                .uri("/api/v1/proposals")
+                .uri("/api/v1/tenants/acme/proposals")
                 .header(COOKIE, &cookie)
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
@@ -2793,7 +2807,7 @@ spec:
         .oneshot(
             Request::builder()
                 .method(Method::POST)
-                .uri("/api/v1/proposals")
+                .uri("/api/v1/tenants/acme/proposals")
                 .header(COOKIE, &cookie)
                 .header("content-type", "application/json")
                 .body(Body::from(
@@ -2868,7 +2882,7 @@ spec:
         .oneshot(
             Request::builder()
                 .method(Method::POST)
-                .uri("/api/v1/proposals")
+                .uri("/api/v1/tenants/acme/proposals")
                 .header(COOKIE, &cookie)
                 .header("content-type", "application/json")
                 .body(Body::from(
@@ -2972,7 +2986,7 @@ async fn test_tenant_admin_scoped_merge_reject_reopen_and_escalation_guards() {
         .oneshot(
             Request::builder()
                 .method(Method::POST)
-                .uri("/api/v1/proposals")
+                .uri("/api/v1/tenants/acme/proposals")
                 .header(COOKIE, &acme_dev_cookie)
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
@@ -3000,7 +3014,7 @@ async fn test_tenant_admin_scoped_merge_reject_reopen_and_escalation_guards() {
         .oneshot(
             Request::builder()
                 .method(Method::POST)
-                .uri(format!("/api/v1/proposals/{acme_pr_id}/merge"))
+                .uri(format!("/api/v1/tenants/acme/proposals/{acme_pr_id}/merge"))
                 .header(COOKIE, &acme_dev_cookie)
                 .body(Body::empty())
                 .unwrap(),
@@ -3015,7 +3029,9 @@ async fn test_tenant_admin_scoped_merge_reject_reopen_and_escalation_guards() {
         .oneshot(
             Request::builder()
                 .method(Method::POST)
-                .uri(format!("/api/v1/proposals/{acme_pr_id}/reject"))
+                .uri(format!(
+                    "/api/v1/tenants/acme/proposals/{acme_pr_id}/reject"
+                ))
                 .header(COOKIE, &acme_admin_cookie)
                 .body(Body::empty())
                 .unwrap(),
@@ -3029,7 +3045,9 @@ async fn test_tenant_admin_scoped_merge_reject_reopen_and_escalation_guards() {
         .oneshot(
             Request::builder()
                 .method(Method::POST)
-                .uri(format!("/api/v1/proposals/{acme_pr_id}/reopen"))
+                .uri(format!(
+                    "/api/v1/tenants/acme/proposals/{acme_pr_id}/reopen"
+                ))
                 .header(COOKIE, &acme_admin_cookie)
                 .body(Body::empty())
                 .unwrap(),
@@ -3043,7 +3061,7 @@ async fn test_tenant_admin_scoped_merge_reject_reopen_and_escalation_guards() {
         .oneshot(
             Request::builder()
                 .method(Method::POST)
-                .uri(format!("/api/v1/proposals/{acme_pr_id}/merge"))
+                .uri(format!("/api/v1/tenants/acme/proposals/{acme_pr_id}/merge"))
                 .header(COOKIE, &acme_admin_cookie)
                 .body(Body::empty())
                 .unwrap(),
@@ -3118,7 +3136,10 @@ async fn test_tenant_admin_scoped_merge_reject_reopen_and_escalation_guards() {
         .oneshot(
             Request::builder()
                 .method(Method::POST)
-                .uri(format!("/api/v1/proposals/{}/merge", rbac_pr.id))
+                .uri(format!(
+                    "/api/v1/tenants/acme/proposals/{}/merge",
+                    rbac_pr.id
+                ))
                 .header(COOKIE, &acme_admin_cookie)
                 .body(Body::empty())
                 .unwrap(),
@@ -3132,7 +3153,10 @@ async fn test_tenant_admin_scoped_merge_reject_reopen_and_escalation_guards() {
         .oneshot(
             Request::builder()
                 .method(Method::POST)
-                .uri(format!("/api/v1/proposals/{}/merge", rbac_pr.id))
+                .uri(format!(
+                    "/api/v1/tenants/acme/proposals/{}/merge",
+                    rbac_pr.id
+                ))
                 .header(COOKIE, &cluster_admin_cookie)
                 .body(Body::empty())
                 .unwrap(),
@@ -3551,7 +3575,7 @@ spec:
         .oneshot(
             Request::builder()
                 .method(Method::POST)
-                .uri("/api/v1/proposals")
+                .uri("/api/v1/tenants/acme/proposals")
                 .header(COOKIE, &cookie)
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
@@ -3645,7 +3669,7 @@ async fn test_remote_canary_kustomization_creates_target_namespace_first() {
         .oneshot(
             Request::builder()
                 .method(Method::POST)
-                .uri("/api/v1/proposals")
+                .uri("/api/v1/tenants/acme/proposals")
                 .header(COOKIE, &cookie)
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
@@ -3751,7 +3775,7 @@ async fn test_app_proposal_with_flagger_canary_stages_canary_yaml() {
         .oneshot(
             Request::builder()
                 .method(Method::POST)
-                .uri("/api/v1/proposals")
+                .uri("/api/v1/tenants/acme/proposals")
                 .header(COOKIE, &cookie)
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
@@ -3827,12 +3851,13 @@ async fn test_app_proposal_with_flagger_canary_stages_canary_yaml() {
         .await
         .unwrap();
 
-    // App with flaggerSupported: false must reject canary=true
-    let no_canary_dir = fixture.state.repo_workdir.join("catalog/apps/redis");
-    tokio::fs::create_dir_all(&no_canary_dir).await.unwrap();
-    tokio::fs::write(
-        no_canary_dir.join("catalog.yaml"),
-        r#"apiVersion: keel.io/v1alpha1
+    // App with flaggerSupported: false must reject canary=true (merged to `main`: proposals
+    // read the catalog from freshly synced `main`).
+    commit_to_main(
+        &fixture,
+        &[(
+            "catalog/apps/redis/catalog.yaml",
+            r#"apiVersion: keel.io/v1alpha1
 kind: CatalogApplication
 metadata:
   id: redis
@@ -3853,15 +3878,16 @@ spec:
       replicas:
         type: integer
 "#,
+        )],
+        "chore: add redis catalog entry",
     )
-    .await
-    .unwrap();
+    .await;
 
     let bad_res = app
         .oneshot(
             Request::builder()
                 .method(Method::POST)
-                .uri("/api/v1/proposals")
+                .uri("/api/v1/tenants/acme/proposals")
                 .header(COOKIE, &cookie)
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
@@ -3938,7 +3964,7 @@ async fn test_toggling_canary_on_bundle_item_removes_stale_manifests_and_avoids_
         .oneshot(
             Request::builder()
                 .method(Method::POST)
-                .uri("/api/v1/proposals")
+                .uri("/api/v1/tenants/acme/proposals")
                 .header(COOKIE, &cookie)
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
@@ -4040,7 +4066,7 @@ async fn test_toggling_canary_on_bundle_item_removes_stale_manifests_and_avoids_
         .oneshot(
             Request::builder()
                 .method(Method::POST)
-                .uri("/api/v1/proposals")
+                .uri("/api/v1/tenants/acme/proposals")
                 .header(COOKIE, &cookie)
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
@@ -4195,7 +4221,7 @@ async fn test_security_ssrf_rbac_csrf_and_open_redirect_guards() {
         .oneshot(
             Request::builder()
                 .method(Method::POST)
-                .uri("/api/v1/proposals")
+                .uri("/api/v1/tenants/acme/proposals")
                 .header(COOKIE, &tenant_cookie)
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
@@ -4329,7 +4355,7 @@ data:
     let propose = |values: Value, name: &str| {
         Request::builder()
             .method(Method::POST)
-            .uri("/api/v1/proposals")
+            .uri("/api/v1/tenants/acme/proposals")
             .header(COOKIE, &cookie)
             .header(CONTENT_TYPE, "application/json")
             .body(Body::from(
@@ -4405,7 +4431,7 @@ async fn test_tenant_stack_uses_scoped_state_backend_and_fails_closed_without_id
     let propose = |name: &str| {
         Request::builder()
             .method(Method::POST)
-            .uri("/api/v1/proposals")
+            .uri("/api/v1/tenants/acme/proposals")
             .header(COOKIE, &cookie)
             .header(CONTENT_TYPE, "application/json")
             .body(Body::from(
@@ -4574,7 +4600,7 @@ async fn test_tenant_stack_lazily_provisions_scoped_identity() {
     let propose = |name: &str| {
         Request::builder()
             .method(Method::POST)
-            .uri("/api/v1/proposals")
+            .uri("/api/v1/tenants/acme/proposals")
             .header(COOKIE, &cookie)
             .header(CONTENT_TYPE, "application/json")
             .body(Body::from(
@@ -4895,7 +4921,7 @@ async fn test_pr_diff_is_merge_base_and_merge_deletes_stacks_from_diff() {
     let (status, merged) = send_json(
         &app,
         Method::POST,
-        &format!("/api/v1/proposals/{pr1_id}/merge"),
+        &format!("/api/v1/tenants/acme/proposals/{pr1_id}/merge"),
         &cookie,
         None,
     )
@@ -4929,7 +4955,7 @@ async fn test_pr_diff_is_merge_base_and_merge_deletes_stacks_from_diff() {
     let (status, preview) = send_json(
         &app,
         Method::GET,
-        &format!("/api/v1/proposals/{pr2_id}/preview"),
+        &format!("/api/v1/tenants/acme/proposals/{pr2_id}/preview"),
         &cookie,
         None,
     )
@@ -4944,7 +4970,7 @@ async fn test_pr_diff_is_merge_base_and_merge_deletes_stacks_from_diff() {
     let (status, preview) = send_json(
         &app,
         Method::GET,
-        &format!("/api/v1/proposals/{pr1_id}/preview"),
+        &format!("/api/v1/tenants/acme/proposals/{pr1_id}/preview"),
         &cookie,
         None,
     )
@@ -4976,7 +5002,7 @@ async fn test_reject_response_is_camel_case_and_titles_are_conventional() {
     let (status, rejected) = send_json(
         &app,
         Method::POST,
-        &format!("/api/v1/proposals/{pr_id}/reject"),
+        &format!("/api/v1/tenants/acme/proposals/{pr_id}/reject"),
         &cookie,
         None,
     )
@@ -4992,7 +5018,7 @@ async fn test_reject_response_is_camel_case_and_titles_are_conventional() {
     let (status, created) = send_json(
         &app,
         Method::POST,
-        "/api/v1/proposals",
+        "/api/v1/tenants/acme/proposals",
         &cookie,
         Some(json!({
             "tenant": "acme",
@@ -5052,7 +5078,7 @@ async fn test_auth_hardening_csrf_group_mapping_and_fetch_schema_rbac() {
     let (status, _) = send_json(
         &app,
         Method::GET,
-        "/api/v1/proposals?tenant=acme",
+        "/api/v1/tenants/acme/proposals",
         &bare,
         None,
     )
@@ -5062,7 +5088,7 @@ async fn test_auth_hardening_csrf_group_mapping_and_fetch_schema_rbac() {
     let (status, _) = send_json(
         &app,
         Method::GET,
-        "/api/v1/proposals?tenant=acme",
+        "/api/v1/tenants/acme/proposals",
         &member,
         None,
     )
@@ -5162,7 +5188,7 @@ async fn test_pko_preview_lifecycle_is_applied_published_and_gced_from_cluster_s
         .oneshot(
             Request::builder()
                 .method(Method::POST)
-                .uri("/api/v1/proposals")
+                .uri("/api/v1/tenants/acme/proposals")
                 .header(COOKIE, &cookie)
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
@@ -5314,7 +5340,9 @@ async fn test_pko_preview_lifecycle_is_applied_published_and_gced_from_cluster_s
     let res = build_router(restarted.clone())
         .oneshot(
             Request::builder()
-                .uri(format!("/api/v1/proposals/{pr_id}/preview"))
+                .uri(format!(
+                    "/api/v1/tenants/management/proposals/{pr_id}/preview"
+                ))
                 .header(COOKIE, &cookie)
                 .body(Body::empty())
                 .unwrap(),
@@ -5469,7 +5497,7 @@ async fn test_pko_preview_apply_failure_is_reported_honestly() {
         .oneshot(
             Request::builder()
                 .method(Method::POST)
-                .uri("/api/v1/proposals")
+                .uri("/api/v1/tenants/acme/proposals")
                 .header(COOKIE, &cookie)
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
@@ -5529,7 +5557,7 @@ async fn post_infra_proposal_with_cluster(
         .oneshot(
             Request::builder()
                 .method(Method::POST)
-                .uri("/api/v1/proposals")
+                .uri("/api/v1/tenants/acme/proposals")
                 .header(COOKIE, &cookie)
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
@@ -5681,7 +5709,7 @@ async fn propose_infra(
         .oneshot(
             Request::builder()
                 .method(Method::POST)
-                .uri("/api/v1/proposals")
+                .uri("/api/v1/tenants/acme/proposals")
                 .header(COOKIE, cookie)
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
@@ -5832,7 +5860,7 @@ async fn test_tenant_stacks_use_tenant_passphrase_secret_and_fail_closed_without
     let propose = |cookie: &str, name: &str| {
         Request::builder()
             .method(Method::POST)
-            .uri("/api/v1/proposals")
+            .uri("/api/v1/tenants/acme/proposals")
             .header(COOKIE, cookie)
             .header(CONTENT_TYPE, "application/json")
             .body(Body::from(
@@ -6134,7 +6162,7 @@ spec:
         .oneshot(
             Request::builder()
                 .method(Method::POST)
-                .uri("/api/v1/proposals")
+                .uri("/api/v1/tenants/acme/proposals")
                 .header(COOKIE, &cookie)
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
@@ -6198,7 +6226,7 @@ async fn test_rauthy_catalog_app_proposal_keeps_secrets_out_of_git() {
         .oneshot(
             Request::builder()
                 .method(Method::POST)
-                .uri("/api/v1/proposals")
+                .uri("/api/v1/tenants/acme/proposals")
                 .header(COOKIE, &cookie)
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
@@ -6406,13 +6434,23 @@ async fn seed_rauthy_catalog(fixture: &TestFixture) {
         .unwrap();
 }
 
-/// `POST /api/v1/proposals` returning `(status, body)`.
+/// `POST /api/v1/tenants/{tenant}/proposals` for the body's `tenant`.
+fn proposals_uri(body: &Value) -> String {
+    format!(
+        "/api/v1/tenants/{}/proposals",
+        body["tenant"]
+            .as_str()
+            .expect("proposal body names its tenant")
+    )
+}
+
+/// `POST /api/v1/tenants/{tenant}/proposals` returning `(status, body)`.
 async fn post_proposal(fixture: &TestFixture, cookie: &str, body: Value) -> (StatusCode, String) {
     let res = build_router(fixture.state.clone())
         .oneshot(
             Request::builder()
                 .method(Method::POST)
-                .uri("/api/v1/proposals")
+                .uri(proposals_uri(&body))
                 .header(COOKIE, cookie)
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(body.to_string()))
@@ -6496,6 +6534,8 @@ async fn test_rauthy_catalog_app_rejects_unsupported_engine_and_hostnames() {
     )
     .await
     .unwrap();
+    // Proposals validate against the committed `origin/main` they are built on.
+    git.push(workdir, "origin", "main").await.unwrap();
     let head_before = git.rev_parse(workdir, "HEAD").await.unwrap();
     let (status, body) = post_proposal(
         &fixture,
@@ -7174,7 +7214,9 @@ async fn test_deleting_manifest_app_removes_config_and_app_kustomizations() {
         .oneshot(
             Request::builder()
                 .method(Method::POST)
-                .uri(format!("/api/v1/proposals/{pr_id}/merge"))
+                .uri(format!(
+                    "/api/v1/tenants/management/proposals/{pr_id}/merge"
+                ))
                 .header(COOKIE, &cookie)
                 .body(Body::empty())
                 .unwrap(),
@@ -7403,7 +7445,9 @@ spec:
         .oneshot(
             Request::builder()
                 .method(Method::POST)
-                .uri(format!("/api/v1/proposals/{pr_id}/merge"))
+                .uri(format!(
+                    "/api/v1/tenants/management/proposals/{pr_id}/merge"
+                ))
                 .header(COOKIE, &cookie)
                 .body(Body::empty())
                 .unwrap(),
@@ -7469,7 +7513,9 @@ async fn merge_proposal_and_sync(fixture: &TestFixture, cookie: &str, body: &str
         .oneshot(
             Request::builder()
                 .method(Method::POST)
-                .uri(format!("/api/v1/proposals/{pr_id}/merge"))
+                .uri(format!(
+                    "/api/v1/tenants/management/proposals/{pr_id}/merge"
+                ))
                 .header(COOKIE, cookie)
                 .body(Body::empty())
                 .unwrap(),
@@ -7960,7 +8006,7 @@ spec:
                 .oneshot(
                     Request::builder()
                         .method(Method::POST)
-                        .uri("/api/v1/proposals")
+                        .uri(proposals_uri(&body))
                         .header(COOKIE, &cookie)
                         .header(CONTENT_TYPE, "application/json")
                         .body(Body::from(body.to_string()))
@@ -8220,7 +8266,7 @@ spec:
         &fixture,
         &cookie,
         Method::POST,
-        "/api/v1/proposals",
+        "/api/v1/tenants/acme/proposals",
         json!({ "tenant": "acme", "catalogId": "sneaky", "values": {} }),
     )
     .await;

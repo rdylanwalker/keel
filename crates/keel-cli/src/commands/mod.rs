@@ -1409,6 +1409,8 @@ spec:
             "status",
             "--pr",
             "1",
+            "--tenant",
+            "acme",
             "--server",
             &server_url,
         ])
@@ -1437,6 +1439,8 @@ spec:
             "status",
             "--pr",
             "1",
+            "--tenant",
+            "acme",
             "--watch",
             "--server",
             &server_url,
@@ -1448,8 +1452,9 @@ spec:
 
         // 7. Merge PR #1 and verify `keel infra list` shows the merged stack in Table & JSON modes
         let merge_resp = attach_auth(
-            ctx.http
-                .post(format!("{server_url}/api/v1/proposals/1/merge")),
+            ctx.http.post(format!(
+                "{server_url}/api/v1/tenants/acme/proposals/1/merge"
+            )),
             &ctx,
             &server_url,
         )
@@ -1836,6 +1841,7 @@ spec:
         let err_pr = execute_preview_status(
             &PreviewStatusArgs {
                 pr: "../etc".to_string(),
+                tenant: "acme".to_string(),
                 watch: false,
                 server: "http://127.0.0.1:8080".to_string(),
             },
@@ -2288,7 +2294,7 @@ spec:
                 }),
             )
             .route(
-                "/api/v1/proposals/42/preview",
+                "/api/v1/tenants/acme/proposals/42/preview",
                 axum::routing::get(|| async {
                     axum::Json(json!({
                         "prId": "42",
@@ -2345,6 +2351,8 @@ spec:
             "status",
             "--pr",
             "42",
+            "--tenant",
+            "acme",
             "--server",
             &server_url,
         ])

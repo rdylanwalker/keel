@@ -33,12 +33,18 @@ pub const PREVIEW_WATCH_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 /// Default background reconciler interval (jittered by up to +25%).
 pub const PREVIEW_RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
 
-/// Deterministic preview `Stack` name for a PR id (`preview-stack-pr-<id>`).
-pub fn preview_stack_name(pr_id: &str) -> String {
-    format!(
-        "preview-stack-pr-{}",
-        pr_id.trim().trim_start_matches('#').to_ascii_lowercase()
-    )
+/// Deterministic preview `Stack` name for a repository-scoped preview key
+/// ([`keel_pko::preview_key`]: `preview-stack-pr-<key>`, hash-shortened when long).
+pub fn preview_stack_name(preview_key: &str) -> String {
+    keel_pko::preview_stack_name(preview_key).unwrap_or_else(|_| {
+        format!(
+            "preview-stack-pr-{}",
+            preview_key
+                .trim()
+                .trim_start_matches('#')
+                .to_ascii_lowercase()
+        )
+    })
 }
 
 fn telemetry_status(phase: PreviewPhase) -> CrdReconcileStatus {
@@ -50,8 +56,21 @@ fn telemetry_status(phase: PreviewPhase) -> CrdReconcileStatus {
     }
 }
 
+/// `PR #<number> in <repository>` of a repository-scoped preview key (`platform` or
+/// `tenant-<id>`), the repository identity carried by preview SSE events.
+pub fn preview_pr_label(preview_key: &str) -> String {
+    match keel_pko::parse_preview_key(preview_key) {
+        (Some(tenant), number) => format!("PR #{number} in tenant-{tenant}"),
+        (None, number) => format!("PR #{number} in {}", keel_pko::PLATFORM_REPO_LABEL),
+    }
+}
+
 fn publish_phase(state: &AppState, pr_id: &str, stack_name: &str, run: &PreviewRunStatus) {
-    let mut message = format!("PKO preview {} for PR #{pr_id}", run.phase.label());
+    let mut message = format!(
+        "PKO preview {} for {}",
+        run.phase.label(),
+        preview_pr_label(pr_id)
+    );
     if let Some(m) = &run.message {
         message.push_str(": ");
         message.push_str(m);
@@ -277,9 +296,17 @@ async fn publish_results(
         }
         Err(e) => tracing::warn!(error = %e, "could not serialize preview report"),
     }
-    let markdown = format_markdown_report(&report, pr_id);
-    if let Err(e) = state.forge.post_preview_comment(pr_id, &markdown).await {
-        tracing::warn!(pr_id, error = %e, "failed to post PKO preview comment");
+    // `pr_id` is the repository-scoped preview key: comment on the PR in its own repository.
+    match crate::proposal_repo::forge_for_preview_key(state, pr_id) {
+        Ok((forge, number)) => {
+            let markdown = format_markdown_report(&report, &number);
+            if let Err(e) = forge.post_preview_comment(&number, &markdown).await {
+                tracing::warn!(pr_id, error = %e, "failed to post PKO preview comment");
+            }
+        }
+        Err(e) => {
+            tracing::warn!(pr_id, error = %e, "cannot resolve the PR repository of a preview")
+        }
     }
     if let Some(entry) = state.preview_cache.write().await.get_mut(pr_id) {
         entry.report = report.clone();
@@ -350,8 +377,8 @@ async fn execute_gc(state: &AppState, cluster: &dyn PreviewCluster, plan: &GcPla
                         &target.name,
                         CrdReconcileStatus::Deleted,
                         format!(
-                            "Garbage-collected ephemeral preview for {reason} PR #{}",
-                            target.pr_id
+                            "Garbage-collected ephemeral preview for {reason} {}",
+                            preview_pr_label(&target.pr_id)
                         ),
                         None,
                     ));
@@ -453,7 +480,18 @@ pub async fn reconcile_previews_once(state: &AppState) -> PreviewReconcileOutcom
         .collect();
     let mut pr_states: BTreeMap<String, PrLifecycle> = BTreeMap::new();
     for id in pr_ids {
-        match state.forge.get_pull_request(&id).await {
+        // Preview keys are repository-scoped (`<tenant>-<n>` for a tenant's own repository):
+        // resolve each PR in its own repository; an unresolvable repository leaves the preview
+        // untouched (never GC on a configuration error).
+        let (forge, number) = match crate::proposal_repo::forge_for_preview_key(state, &id) {
+            Ok(resolved) => resolved,
+            Err(e) => {
+                outcome.unknown_prs += 1;
+                tracing::debug!(pr_id = %id, error = %e, "preview repository unresolvable; skipping preview");
+                continue;
+            }
+        };
+        match forge.get_pull_request(&number).await {
             Ok(pr) => {
                 let lifecycle = match pr.state {
                     PullRequestState::Open => PrLifecycle::Open {
@@ -582,6 +620,10 @@ mod tests {
     fn stack_names_and_jitter_are_deterministic_and_bounded() {
         assert_eq!(preview_stack_name("#12"), "preview-stack-pr-12");
         assert_eq!(preview_stack_name(" 7 "), "preview-stack-pr-7");
+        assert_eq!(preview_stack_name("acme-7"), "preview-stack-pr-acme-7");
+        assert!(preview_stack_name(&format!("{}-7", "t".repeat(50))).len() <= 50);
+        assert_eq!(preview_pr_label("acme-7"), "PR #7 in tenant-acme");
+        assert_eq!(preview_pr_label("7"), "PR #7 in platform");
         let j = jitter(Duration::from_secs(60));
         assert!(j >= Duration::from_secs(60) && j <= Duration::from_secs(75));
         assert_eq!(

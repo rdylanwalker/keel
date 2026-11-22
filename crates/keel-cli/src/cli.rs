@@ -55,6 +55,10 @@ impl Cli {
 pub const TENANT_HELP: &str =
     "Tenant ID as a bare id (e.g. `default`); a `tenant-` prefix is stripped";
 
+/// Help text for the proposal scope (`--tenant` of `keel proposal show|merge|close` and
+/// `keel preview status`).
+pub const PROPOSAL_SCOPE_HELP: &str = "Tenant whose repository holds the proposal (bare id, e.g. `default`), or `management` for platform-repository proposals; PR ids are per repository";
+
 /// Top-level subcommand groups for `keel`.
 #[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
 #[allow(clippy::large_enum_variant)]
@@ -630,8 +634,9 @@ impl ProposalStatusArg {
 /// Arguments for `keel proposal list`.
 #[derive(Args, Debug, Clone, PartialEq, Eq)]
 pub struct ProposalListArgs {
-    /// Filter by tenant (bare id, e.g. `default`; a `tenant-` prefix is stripped)
-    #[arg(long, help = TENANT_HELP)]
+    /// Only this tenant's repository (or `management` for the platform repository); without it,
+    /// every repository you can see
+    #[arg(long, help = PROPOSAL_SCOPE_HELP)]
     pub tenant: Option<String>,
 
     /// Status filter
@@ -650,8 +655,12 @@ pub struct ProposalListArgs {
 /// Arguments for `keel proposal show|close|merge`.
 #[derive(Args, Debug, Clone, PartialEq, Eq)]
 pub struct ProposalRefArgs {
-    /// Pull request / proposal id
+    /// Pull request / proposal id (within the `--tenant` repository)
     pub pr: String,
+
+    /// Repository scope of the proposal
+    #[arg(long, help = PROPOSAL_SCOPE_HELP)]
+    pub tenant: String,
 
     /// Output format (`table|json`)
     #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
@@ -832,9 +841,13 @@ pub enum PreviewCommands {
 /// Arguments for `keel preview status` (`SDD.md` §7.2).
 #[derive(Args, Debug, Clone, PartialEq, Eq)]
 pub struct PreviewStatusArgs {
-    /// Pull Request / proposal identifier
+    /// Pull Request / proposal identifier (within the `--tenant` repository)
     #[arg(long)]
     pub pr: String,
+
+    /// Repository scope of the proposal
+    #[arg(long, help = PROPOSAL_SCOPE_HELP)]
+    pub tenant: String,
 
     /// Stream real-time SSE reconciliation events until preview completion
     #[arg(long, default_value_t = false)]
@@ -1256,6 +1269,8 @@ mod tests {
             "status",
             "--pr",
             "42",
+            "--tenant",
+            "acme",
             "--watch",
             "--server",
             "http://127.0.0.1:8080",
@@ -1268,7 +1283,21 @@ mod tests {
             panic!("expected preview status");
         };
         assert_eq!(prev_args.pr, "42");
+        assert_eq!(prev_args.tenant, "acme");
         assert!(prev_args.watch);
+        // PR ids are per repository: the scope is mandatory.
+        assert!(Cli::try_parse_from(["keel", "preview", "status", "--pr", "42"]).is_err());
+        assert!(Cli::try_parse_from(["keel", "proposal", "merge", "42"]).is_err());
+        let merge =
+            Cli::try_parse_from(["keel", "proposal", "merge", "42", "--tenant", "management"])
+                .unwrap();
+        let Commands::Proposal(ProposalArgs {
+            command: ProposalCommands::Merge(merge_args),
+        }) = merge.command
+        else {
+            panic!("expected proposal merge");
+        };
+        assert_eq!(merge_args.tenant, "management");
         assert_eq!(prev_cli.server.as_deref(), Some("http://127.0.0.1:8080"));
     }
 }

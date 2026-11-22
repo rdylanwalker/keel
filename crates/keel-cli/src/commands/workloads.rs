@@ -343,9 +343,9 @@ async fn submit_proposal_request(
     canary: bool,
     action_engine: Option<&str>,
 ) -> Result<ProposalCommandOutcome, CliError> {
-    let endpoint = format!("{base_url}/api/v1/proposals");
+    keel_core::validate_dns_label(tenant, "tenant")?;
+    let endpoint = format!("{base_url}/api/v1/tenants/{tenant}/proposals");
     let mut req_body = json!({
-        "tenant": tenant,
         "catalogId": catalog_id,
         "kind": kind,
         "values": values,
@@ -378,6 +378,11 @@ async fn submit_proposal_request(
         created.branch, created.proposal.target_branch
     ));
     output.push_str(&format!("PR URL:        {}\n", created.proposal.url));
+    // PR numbers are per repository: the tenant names the repository holding this PR.
+    output.push_str(&format!(
+        "Next:          keel preview status --pr {id} --tenant {tenant} --watch; keel proposal merge {id} --tenant {tenant}\n",
+        id = created.proposal.id
+    ));
     output.push('\n');
     output.push_str(&format_preview_table(&created.report));
 
@@ -668,6 +673,9 @@ pub async fn execute_infra_unlock(
 #[serde(rename_all = "camelCase")]
 struct ProposalPreviewApiResponse {
     pr_id: String,
+    /// Repository-scoped preview key (absent from older servers: the PR id).
+    #[serde(default)]
+    preview_key: Option<String>,
     url: String,
     state: PullRequestState,
     source_branch: String,
@@ -793,7 +801,7 @@ pub fn format_preview_table(report: &PreviewReport) -> String {
     out
 }
 
-/// Executes `keel preview status` fetching `/api/v1/proposals/{pr}/preview` and optionally watching SSE updates.
+/// Executes `keel preview status` fetching `/api/v1/tenants/{tenant}/proposals/{pr}/preview` and optionally watching SSE updates.
 pub async fn execute_preview_status(
     args: &PreviewStatusArgs,
     ctx: &CliContext,
@@ -806,8 +814,12 @@ pub async fn execute_preview_status(
         )));
     }
 
+    let scope = super::api::proposal_scope(&args.tenant)?;
     let base_url = normalize_server_url(&args.server)?;
-    let preview_endpoint = format!("{base_url}/api/v1/proposals/{}/preview", args.pr.trim());
+    let preview_endpoint = format!(
+        "{base_url}/api/v1/tenants/{scope}/proposals/{}/preview",
+        args.pr.trim()
+    );
     let resp = attach_auth(ctx.http.get(&preview_endpoint), ctx, &base_url)
         .send()
         .await?;
@@ -832,8 +844,13 @@ pub async fn execute_preview_status(
         } else {
             Duration::from_secs(60)
         };
+        // SSE events carry the repository-scoped preview key (`preview-stack-pr-<key>`).
+        let key = preview
+            .preview_key
+            .clone()
+            .unwrap_or_else(|| args.pr.trim().to_string());
         watched_events =
-            watch_preview_sse(&base_url, &args.pr, ctx, watch_timeout, pko_in_flight).await?;
+            watch_preview_sse(&base_url, &key, ctx, watch_timeout, pko_in_flight).await?;
 
         let refresh_resp = attach_auth(ctx.http.get(&preview_endpoint), ctx, &base_url)
             .send()
@@ -897,6 +914,11 @@ async fn watch_preview_sse(
     let mut collected = Vec::new();
     let mut buffer = String::new();
     let pr_marker = format!("pr-{pr_id}");
+    // Server events name the PR's repository: `PR #<n> in tenant-<id>` / `PR #<n> in platform`.
+    let pr_label = match keel_pko::parse_preview_key(pr_id) {
+        (Some(tenant), number) => format!("PR #{number} in tenant-{tenant}"),
+        (None, number) => format!("PR #{number} in {}", keel_pko::PLATFORM_REPO_LABEL),
+    };
     let deadline = tokio::time::Instant::now() + watch_timeout;
 
     loop {
@@ -925,8 +947,9 @@ async fn watch_preview_sse(
                 continue;
             }
             if let Ok(ev) = serde_json::from_str::<CrdWatchEvent>(json_trimmed) {
-                let matches_pr =
-                    ev.name.contains(&pr_marker) || ev.message.contains(&format!("#{pr_id}"));
+                let matches_pr = ev.name.contains(&pr_marker)
+                    || ev.message.contains(&pr_label)
+                    || ev.message.contains(&format!("#{pr_id}"));
                 // While a PKO preview is in flight, only the control plane's own "PKO preview ..."
                 // result event (published after the report is persisted) ends the watch; generic
                 // Stack watcher events can arrive before the results are collected.

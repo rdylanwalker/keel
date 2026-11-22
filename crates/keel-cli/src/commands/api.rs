@@ -121,7 +121,13 @@ pub(crate) fn format_proposals_table(proposals: &[Value]) -> String {
             vec![
                 format!("#{}", s(p, &["id"])),
                 s(p, &["state"]).to_string(),
-                p.get("tenant")
+                p.get("scope")
+                    .or_else(|| p.get("tenant"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("-")
+                    .to_string(),
+                p.pointer("/repository/fullName")
+                    .or_else(|| p.pointer("/repository/label"))
                     .and_then(Value::as_str)
                     .unwrap_or("-")
                     .to_string(),
@@ -132,7 +138,15 @@ pub(crate) fn format_proposals_table(proposals: &[Value]) -> String {
         })
         .collect();
     render_table(
-        &["ID", "STATE", "TENANT", "TITLE", "BRANCH", "UPDATED"],
+        &[
+            "ID",
+            "STATE",
+            "TENANT",
+            "REPOSITORY",
+            "TITLE",
+            "BRANCH",
+            "UPDATED",
+        ],
         &rows,
     )
 }
@@ -141,7 +155,7 @@ fn format_proposal_detail(p: &Value) -> String {
     let mut out = format!("Proposal #{}: {}\n", s(p, &["id"]), s(p, &["title"]));
     for (label, keys) in [
         ("State", &["state"][..]),
-        ("Tenant", &["tenant"][..]),
+        ("Tenant", &["scope", "tenant"][..]),
         ("Branch", &["sourceBranch", "source_branch"][..]),
         ("Target", &["targetBranch", "target_branch"][..]),
         ("Head SHA", &["headSha", "head_sha"][..]),
@@ -167,6 +181,13 @@ fn format_proposal_detail(p: &Value) -> String {
     out
 }
 
+/// Validated proposal scope of `--tenant` (a tenant id or `management`).
+pub(crate) fn proposal_scope(raw: &str) -> Result<String, CliError> {
+    let scope = normalize_tenant_arg(raw);
+    keel_core::validate_dns_label(&scope, "tenant")?;
+    Ok(scope)
+}
+
 /// `keel proposal list`.
 pub async fn execute_proposal_list(
     args: &ProposalListArgs,
@@ -177,11 +198,24 @@ pub async fn execute_proposal_list(
     if let Some(t) = &tenant {
         keel_core::validate_dns_label(t, "tenant")?;
     }
-    let mut query = vec![("status", args.status.as_str())];
-    if let Some(t) = tenant.as_deref() {
-        query.push(("tenant", t));
+    let query = [("status", args.status.as_str())];
+    let path = match tenant.as_deref() {
+        Some(t) => format!("/api/v1/tenants/{t}/proposals"),
+        None => "/api/v1/proposals".to_string(),
+    };
+    let payload = get_json(ctx, &base_url, &path, &query).await?;
+    if let Some(unavailable) = payload.get("unavailable").and_then(Value::as_array) {
+        for repo in unavailable {
+            eprintln!(
+                "warning: proposals of {} ({}) may be missing: {}",
+                s(repo, &["scope"]),
+                repo.pointer("/repository/label")
+                    .and_then(Value::as_str)
+                    .unwrap_or("-"),
+                s(repo, &["reason"])
+            );
+        }
     }
-    let payload = get_json(ctx, &base_url, "/api/v1/proposals", &query).await?;
     let proposals = payload
         .get("proposals")
         .and_then(Value::as_array)
@@ -199,8 +233,15 @@ pub async fn execute_proposal_show(
     ctx: &CliContext,
 ) -> Result<String, CliError> {
     let pr = validate_pr_id(&args.pr)?;
+    let scope = proposal_scope(&args.tenant)?;
     let base_url = normalize_server_url(&args.server)?;
-    let payload = get_json(ctx, &base_url, "/api/v1/proposals", &[("status", "all")]).await?;
+    let payload = get_json(
+        ctx,
+        &base_url,
+        &format!("/api/v1/tenants/{scope}/proposals"),
+        &[("status", "all")],
+    )
+    .await?;
     let found = payload
         .get("proposals")
         .and_then(Value::as_array)
@@ -211,7 +252,9 @@ pub async fn execute_proposal_show(
         .cloned()
         .ok_or_else(|| CliError::Api {
             status: 404,
-            message: format!("proposal #{pr} not found (or not visible to you)"),
+            message: format!(
+                "proposal #{pr} not found in the `{scope}` repository (or not visible to you)"
+            ),
         })?;
     match args.output {
         OutputFormat::Json => pretty(&found),
@@ -226,8 +269,14 @@ async fn act_on_proposal(
     verb: &str,
 ) -> Result<String, CliError> {
     let pr = validate_pr_id(&args.pr)?;
+    let scope = proposal_scope(&args.tenant)?;
     let base_url = normalize_server_url(&args.server)?;
-    let payload = post_json(ctx, &base_url, &format!("/api/v1/proposals/{pr}/{action}")).await?;
+    let payload = post_json(
+        ctx,
+        &base_url,
+        &format!("/api/v1/tenants/{scope}/proposals/{pr}/{action}"),
+    )
+    .await?;
     if args.output == OutputFormat::Json {
         return pretty(&payload);
     }

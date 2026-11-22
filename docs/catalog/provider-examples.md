@@ -1362,7 +1362,7 @@ outputs:
 
 ### 2. Merge & Provision
 
-1. Merge the catalog registration PR in **PR Previews** (or `POST /api/v1/proposals/<pr_id>/merge`).
+1. Merge the catalog registration PR in **PR Previews** (or `POST /api/v1/tenants/management/proposals/<pr_id>/merge`).
 2. In **Catalog & Form Wizard**, click **Deploy** on **Random Pet Generator** (or run `keel infra provision --blueprint random-pet --tenant default --values-file values.yaml`).
 3. Inspect the ephemeral PKO preview in **PR Previews**, then click **Approve & Merge**.
 4. Flux CD creates `Stack/random-pet` in `tenant-default`, PKO v2 downloads the `terraform-provider` bridge for `hashicorp/random`, and `kubectl -n tenant-default get stack random-pet` reports `READY: True` with the generated `petId` output.

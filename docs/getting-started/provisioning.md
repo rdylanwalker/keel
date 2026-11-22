@@ -85,7 +85,7 @@ The namespace and ServiceAccount need not exist on the workload cluster; RBAC ma
 In **PR & Preview Inspector** (or via CLI):
 
 ```bash
-keel preview status --pr 1 --watch --server http://127.0.0.1:8080
+keel preview status --pr 1 --tenant default --watch --server http://127.0.0.1:8080
 ```
 
 - Review the **Git Diff** (the exact YAML manifests proposed under `tenants/<tenant>/infra/`, `tenants/<tenant>/apps/`, or `tenants/<tenant>/bundles/`).

@@ -225,6 +225,26 @@ impl IntoResponse for ServerError {
                 }),
             )
                 .into_response(),
+            Self::Forge(ForgeError::RateLimited { retry_after, .. }) => {
+                let mut response = (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(ErrorResponse {
+                        error: "The Git forge is rate limiting Keel; retry later".to_string(),
+                        details: None,
+                        correlation_id: None,
+                    }),
+                )
+                    .into_response();
+                if let Some(wait) = retry_after
+                    && let Ok(value) =
+                        axum::http::HeaderValue::from_str(&wait.as_secs().to_string())
+                {
+                    response
+                        .headers_mut()
+                        .insert(axum::http::header::RETRY_AFTER, value);
+                }
+                response
+            }
             Self::Forge(err) => opaque_error_response(StatusCode::BAD_GATEWAY, "forge", &err),
             Self::Git(GitError::InvalidArgument { field, reason }) => (
                 StatusCode::BAD_REQUEST,

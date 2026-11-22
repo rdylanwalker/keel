@@ -164,12 +164,54 @@ fn build_slug(scheme: &str, host_port: &str, raw_path: &str) -> Result<RemoteRep
     })
 }
 
+/// `Some(wait)` when a failed response is a forge rate limit: HTTP 429, or a 403 with
+/// `Retry-After` or `X-RateLimit-Remaining: 0` (GitHub primary/secondary limits). `wait` is the
+/// `Retry-After` seconds (or the `X-RateLimit-Reset` epoch distance), capped at one hour.
+pub(crate) fn rate_limit_wait(
+    status: StatusCode,
+    headers: &reqwest::header::HeaderMap,
+) -> Option<Option<std::time::Duration>> {
+    const MAX_WAIT: u64 = 3600;
+    let header = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+    };
+    let retry_after = header("retry-after").and_then(|v| v.parse::<u64>().ok());
+    let exhausted = header("x-ratelimit-remaining") == Some("0");
+    let limited = status == StatusCode::TOO_MANY_REQUESTS
+        || (status == StatusCode::FORBIDDEN && (retry_after.is_some() || exhausted));
+    if !limited {
+        return None;
+    }
+    let reset_wait = || {
+        let reset = header("x-ratelimit-reset")?.parse::<u64>().ok()?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_secs();
+        Some(reset.saturating_sub(now))
+    };
+    Some(
+        retry_after
+            .or_else(reset_wait)
+            .map(|s| std::time::Duration::from_secs(s.min(MAX_WAIT))),
+    )
+}
+
 pub(crate) async fn map_error_response(
     resp: reqwest::Response,
     pr_id_hint: Option<&str>,
     is_merge: bool,
 ) -> ForgeError {
     let status = resp.status();
+    if let Some(retry_after) = rate_limit_wait(status, resp.headers()) {
+        return ForgeError::RateLimited {
+            status: status.as_u16(),
+            retry_after,
+        };
+    }
     let body = resp
         .text()
         .await
@@ -1615,6 +1657,48 @@ mod tests {
     use super::*;
     use crate::test_http::{request_line, spawn_mock_http_server};
     use base64::Engine as _;
+
+    #[test]
+    fn rate_limits_are_recognised_with_their_advertised_wait() {
+        use reqwest::header::{HeaderMap, HeaderValue};
+        let mut h = HeaderMap::new();
+        assert_eq!(
+            rate_limit_wait(StatusCode::TOO_MANY_REQUESTS, &h),
+            Some(None)
+        );
+        assert_eq!(rate_limit_wait(StatusCode::FORBIDDEN, &h), None);
+        assert_eq!(rate_limit_wait(StatusCode::INTERNAL_SERVER_ERROR, &h), None);
+        h.insert("retry-after", HeaderValue::from_static("30"));
+        assert_eq!(
+            rate_limit_wait(StatusCode::FORBIDDEN, &h),
+            Some(Some(std::time::Duration::from_secs(30)))
+        );
+        h.insert("retry-after", HeaderValue::from_static("999999"));
+        assert_eq!(
+            rate_limit_wait(StatusCode::TOO_MANY_REQUESTS, &h),
+            Some(Some(std::time::Duration::from_secs(3600)))
+        );
+        let mut gh = HeaderMap::new();
+        gh.insert("x-ratelimit-remaining", HeaderValue::from_static("0"));
+        let reset = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 120;
+        gh.insert(
+            "x-ratelimit-reset",
+            HeaderValue::from_str(&reset.to_string()).unwrap(),
+        );
+        let wait = rate_limit_wait(StatusCode::FORBIDDEN, &gh)
+            .unwrap()
+            .unwrap();
+        assert!(wait.as_secs() >= 115 && wait.as_secs() <= 120, "{wait:?}");
+        let err = ForgeError::RateLimited {
+            status: 429,
+            retry_after: Some(std::time::Duration::from_secs(7)),
+        };
+        assert!(err.to_string().contains("7s"), "{err}");
+    }
 
     /// Per-run random Basic-auth password so no credential literal lives in the test source.
     fn random_test_password() -> String {

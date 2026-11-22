@@ -47,6 +47,17 @@ pub const LABEL_EPHEMERAL_PREVIEW: &str = "keel.io/ephemeral-preview";
 pub const LABEL_PR_ID: &str = "keel.io/pr-id";
 pub const LABEL_TENANT: &str = "keel.io/tenant";
 pub const ANNOTATION_BRANCH: &str = "keel.io/branch";
+/// Repository the PR behind a preview lives in: [`PLATFORM_REPO_LABEL`] or `tenant-<id>` (the
+/// tenant's own repository). Platform-written; preview GC resolves PR states per repository.
+pub const LABEL_REPO: &str = "keel.io/repo";
+/// [`LABEL_REPO`] value of the platform repository (also every tenant of the development-only
+/// Local Git provider, whose tenants live in the platform repository).
+pub const PLATFORM_REPO_LABEL: &str = "platform";
+/// Longest preview `Stack` name. PKO names the workspace `StatefulSet` `<stack>-workspace`; the
+/// StatefulSet controller labels its pods `controller-revision-hash: <sts>-<hash>` (hash up to 10
+/// characters), and label values are at most 63 characters. So the StatefulSet name may have at
+/// most 52 characters and the Stack name 42 (52 minus `-workspace`).
+pub const MAX_PREVIEW_STACK_NAME_LEN: usize = 42;
 /// Provider label enforced by Kyverno `restrict-pulumi-providers` on `tenant-*`/`keel-previews` Stacks.
 pub const LABEL_PROVIDER: &str = "keel.io/provider";
 
@@ -1319,6 +1330,12 @@ pub struct EphemeralPreviewParams {
     pub provider: Option<String>,
     /// PR head commit SHA recorded as `keel.io/head-sha` so restarts/replicas can detect new pushes.
     pub head_sha: Option<String>,
+    /// [`LABEL_REPO`] of the repository the PR lives in (`None`: unlabelled, platform repository).
+    pub repo: Option<String>,
+    /// Explicit `gitSource` (a tenant repository preview pinned to the PR head commit, see
+    /// `keel_kube::tenant_repo_preview_git_source`). Takes precedence over
+    /// [`Self::repo_url`]/[`Self::branch`]/[`Self::git_secret_name`].
+    pub git_source: Option<PkoGitSource>,
 }
 
 impl EphemeralPreviewParams {
@@ -1354,6 +1371,8 @@ impl EphemeralPreviewParams {
             docker_host: None,
             provider: None,
             head_sha: None,
+            repo: None,
+            git_source: None,
         })
     }
 }
@@ -1496,6 +1515,63 @@ impl std::fmt::Debug for PreviewSecretCopy {
     }
 }
 
+/// Repository-scoped preview key of a PR (the `keel.io/pr-id` label, preview `Stack` and Secret
+/// copy names): the forge PR number for the platform repository (`tenant_repo: None`), and
+/// `<tenant>-<number>` for a PR in a tenant's own repository, so equal PR numbers of different
+/// repositories never share a preview. See [`parse_preview_key`].
+pub fn preview_key(tenant_repo: Option<&str>, pr_number: &str) -> Result<String, PkoError> {
+    let number = pr_number.trim().trim_start_matches('#');
+    if number.is_empty() || !number.chars().all(|c| c.is_ascii_digit()) {
+        return Err(PkoError::Validation(format!(
+            "pull request number `{pr_number}` must be numeric"
+        )));
+    }
+    let key = match tenant_repo {
+        Some(tenant) => {
+            validate_k8s_dns_label("tenant", tenant)?;
+            format!("{tenant}-{number}")
+        }
+        None => number.to_string(),
+    };
+    sanitize_pr_id(&key)
+}
+
+/// Splits a [`preview_key`] into `(tenant repository, PR number)`; `None` for platform keys.
+pub fn parse_preview_key(key: &str) -> (Option<&str>, &str) {
+    match key.rsplit_once('-') {
+        Some((tenant, number))
+            if !tenant.is_empty()
+                && !number.is_empty()
+                && number.chars().all(|c| c.is_ascii_digit()) =>
+        {
+            (Some(tenant), number)
+        }
+        _ => (None, key),
+    }
+}
+
+/// Preview `Stack` name of a [`preview_key`]: `preview-stack-pr-<key>`, shortened with a stable
+/// hash suffix to at most [`MAX_PREVIEW_STACK_NAME_LEN`] characters.
+pub fn preview_stack_name(key: &str) -> Result<String, PkoError> {
+    let key = sanitize_pr_id(key)?;
+    let full = format!("preview-stack-pr-{key}");
+    if full.len() <= MAX_PREVIEW_STACK_NAME_LEN {
+        return Ok(full);
+    }
+    let suffix = format!("{:010x}", fnv1a(&full) & 0xff_ffff_ffff);
+    let head = full[..MAX_PREVIEW_STACK_NAME_LEN - suffix.len() - 1].trim_end_matches('-');
+    Ok(format!("{head}-{suffix}"))
+}
+
+fn fnv1a(s: &str) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in s.as_bytes() {
+        hash ^= u64::from(*b);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    hash
+}
+
 /// Deterministic per-preview Secret copy name: `keel-preview-<pr>-<source>`, shortened with a
 /// stable hash suffix when it would exceed a DNS label (63 chars).
 pub fn preview_secret_copy_name(pr_id: &str, source_name: &str) -> Result<String, PkoError> {
@@ -1507,11 +1583,7 @@ pub fn preview_secret_copy_name(pr_id: &str, source_name: &str) -> Result<String
         return Ok(full);
     }
     // FNV-1a keeps the shortened name stable across replicas/restarts.
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in full.as_bytes() {
-        hash ^= u64::from(*b);
-        hash = hash.wrapping_mul(0x0100_0000_01b3);
-    }
+    let hash = fnv1a(&full);
     let suffix = format!("{:010x}", hash & 0xff_ffff_ffff);
     let head = full[..63 - suffix.len() - 1].trim_end_matches('-');
     let name = format!("{head}-{suffix}");
@@ -1730,8 +1802,12 @@ pub fn synthesize_ephemeral_preview(
 
     // Without a resolved tenant source the preview is synthesized only (never applied): leave
     // `projectRepo` unset rather than putting a placeholder (e.g. the control-plane remote) in it.
-    let git_source = match &params.repo_url {
-        Some(url) => {
+    let git_source = match (&params.git_source, &params.repo_url) {
+        (Some(explicit), _) => {
+            explicit.validate()?;
+            Some(explicit.clone())
+        }
+        (None, Some(url)) => {
             let git_auth = match &params.git_secret_name {
                 Some(secret) => Some(PkoGitAuth::from_flux_secret(
                     secret,
@@ -1745,11 +1821,11 @@ pub fn synthesize_ephemeral_preview(
             source.validate()?;
             Some(source)
         }
-        None => None,
+        (None, None) => None,
     };
 
     let passphrase_copy = params.passphrase_secret_copy_name()?;
-    let stack_name = format!("preview-stack-pr-{normalized_pr_id}");
+    let stack_name = preview_stack_name(&normalized_pr_id)?;
 
     let mut labels = BTreeMap::new();
     labels.insert(LABEL_MANAGED_BY.to_string(), "keel".to_string());
@@ -1760,6 +1836,10 @@ pub fn synthesize_ephemeral_preview(
     );
     labels.insert(LABEL_PR_ID.to_string(), normalized_pr_id.clone());
     labels.insert(LABEL_TENANT.to_string(), params.tenant.clone());
+    if let Some(repo) = params.repo.as_deref() {
+        validate_k8s_dns_label("repo", repo)?;
+        labels.insert(LABEL_REPO.to_string(), repo.to_string());
+    }
     if let Some(provider) = params
         .provider
         .as_deref()
@@ -2320,6 +2400,80 @@ mod tests {
 
     fn test_git_source(repo_dir: &str) -> PkoGitSource {
         PkoGitSource::branch("https://forge.internal/keel/infra.git", "main", repo_dir)
+    }
+
+    #[test]
+    fn preview_keys_are_repository_scoped_and_names_stay_dns_safe() {
+        assert_eq!(preview_key(None, "#12").unwrap(), "12");
+        assert_eq!(preview_key(Some("acme"), "3").unwrap(), "acme-3");
+        assert!(preview_key(Some("acme"), "x3").is_err());
+        assert!(preview_key(Some("Bad_Id"), "3").is_err());
+        assert_eq!(parse_preview_key("acme-3"), (Some("acme"), "3"));
+        assert_eq!(parse_preview_key("team-a-12"), (Some("team-a"), "12"));
+        assert_eq!(parse_preview_key("12"), (None, "12"));
+        assert_ne!(
+            preview_key(Some("acme"), "3").unwrap(),
+            preview_key(Some("beta"), "3").unwrap()
+        );
+        assert_eq!(preview_stack_name("7").unwrap(), "preview-stack-pr-7");
+        let long_tenant = "t".repeat(45);
+        let key = preview_key(Some(&long_tenant), "123").unwrap();
+        let name = preview_stack_name(&key).unwrap();
+        assert!(name.len() <= MAX_PREVIEW_STACK_NAME_LEN, "{name}");
+        // `controller-revision-hash` of the PKO workspace pods: `<stack>-workspace-<hash ≤10>`.
+        assert!(format!("{name}-workspace").len() + 11 <= 63, "{name}");
+        assert_eq!(name, preview_stack_name(&key).unwrap());
+        // Every name up to the bound is kept verbatim; one longer is shortened to the bound.
+        let at_bound = "a".repeat(MAX_PREVIEW_STACK_NAME_LEN - "preview-stack-pr-".len());
+        assert_eq!(
+            preview_stack_name(&at_bound).unwrap(),
+            format!("preview-stack-pr-{at_bound}")
+        );
+        let over = format!("{at_bound}b");
+        let shortened = preview_stack_name(&over).unwrap();
+        assert_eq!(shortened.len(), MAX_PREVIEW_STACK_NAME_LEN, "{shortened}");
+        assert!(format!("{shortened}-workspace").len() + 11 <= 63);
+        let other = preview_stack_name(&preview_key(Some(&long_tenant), "124").unwrap()).unwrap();
+        assert_ne!(name, other);
+    }
+
+    #[test]
+    fn tenant_repository_previews_carry_the_repo_label_and_an_explicit_git_source() {
+        let mut params = EphemeralPreviewParams::for_action(
+            "acme-3",
+            "acme",
+            "infra-db",
+            1_700_000_000,
+            "tenants/acme/infra/db",
+            "organization/db/acme-db",
+            "s3://pulumi-state/tenants/acme",
+        )
+        .unwrap();
+        params.repo = Some("tenant-acme".to_string());
+        params.repo_url = Some("https://forge.internal/keel/infra.git".to_string());
+        let sha = "a".repeat(40);
+        params.git_source = Some(PkoGitSource::commit(
+            "https://forge.internal/keel-tenants/infra-tenant-acme.git",
+            &sha,
+            "tenants/acme/infra/db",
+        ));
+        let preview = synthesize_ephemeral_preview(&params).unwrap();
+        let labels = &preview.stack.metadata.labels;
+        assert_eq!(
+            labels.get(LABEL_REPO).map(String::as_str),
+            Some("tenant-acme")
+        );
+        assert_eq!(labels.get(LABEL_PR_ID).map(String::as_str), Some("acme-3"));
+        assert_eq!(preview.stack.metadata.name, "preview-stack-pr-acme-3");
+        let git = preview.stack.spec.git_source.as_ref().unwrap();
+        assert_eq!(
+            git.project_repo,
+            "https://forge.internal/keel-tenants/infra-tenant-acme.git"
+        );
+        assert_eq!(git.commit.as_deref(), Some(sha.as_str()));
+        assert_eq!(git.branch, None);
+        params.repo = Some("Not A Label".to_string());
+        assert!(synthesize_ephemeral_preview(&params).is_err());
     }
 
     #[test]

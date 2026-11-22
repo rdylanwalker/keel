@@ -4521,7 +4521,7 @@ mod tenant_rauthy_app_tests {
         keel_core::parse_catalog_application(STARTER_RAUTHY_APP_YAML).unwrap()
     }
 
-    /// Renders the template exactly like `POST /api/v1/proposals` (Flux engine): only the
+    /// Renders the template exactly like `POST /api/v1/tenants/{tenant}/proposals` (Flux engine): only the
     /// non-secret partition is substituted at proposal time.
     fn render(values: &Value) -> (String, Value, Vec<Value>) {
         let app = app();
@@ -5557,7 +5557,7 @@ mod tenant_keel_server_app_tests {
         keel_core::parse_catalog_application(STARTER_KEEL_SERVER_APP_YAML).unwrap()
     }
 
-    /// Renders the template like `POST /api/v1/proposals` (Flux engine): only the non-secret
+    /// Renders the template like `POST /api/v1/tenants/{tenant}/proposals` (Flux engine): only the non-secret
     /// partition is substituted at proposal time.
     fn render(values: &Value) -> (String, Value, Vec<Value>) {
         let app = app();

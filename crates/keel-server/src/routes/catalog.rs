@@ -16,7 +16,6 @@ use keel_core::{
     UpstreamSource, extract_manifest_variables, parse_catalog_application, parse_catalog_blueprint,
     parse_catalog_bundle, validate_dns_label, validate_k8s_manifests_yaml,
 };
-use keel_git::PullRequestInfo;
 use keel_pko::build_preview_branch;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -330,7 +329,7 @@ pub struct RegisterCatalogAppResponse {
     pub blueprint: Option<CatalogInfraBlueprint>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bundle: Option<CatalogBundle>,
-    pub proposal: PullRequestInfo,
+    pub proposal: crate::proposal_repo::ScopedProposal,
     pub branch: String,
 }
 
@@ -921,7 +920,7 @@ pub async fn register_catalog_app(
 /// Rejects a bundle `kind: app` item that references a `spec.placement.scope: cluster` app without
 /// `targetClusterFrom`, or that sets a `targetNamespace` other than the app's dedicated
 /// `spec.placement.namespace`. GUI bundle deploys never send a request `targetCluster`, so such an item
-/// could only ever be proposed onto the management cluster, which `POST /api/v1/proposals` rejects.
+/// could only ever be proposed onto the management cluster, which `POST /api/v1/tenants/{tenant}/proposals` rejects.
 fn ensure_bundle_item_placement(
     item: &CatalogBundleItem,
     app: &CatalogApplication,
@@ -2052,7 +2051,7 @@ pub async fn fetch_catalog_schema(
 pub struct DeleteCatalogItemResponse {
     pub id: String,
     pub kind: String,
-    pub proposal: PullRequestInfo,
+    pub proposal: crate::proposal_repo::ScopedProposal,
     pub branch: String,
 }
 

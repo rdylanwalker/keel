@@ -161,11 +161,12 @@ keel infra provision \
   --values-file ./workload-values.yaml
 
 # Watch the pre-merge PKO resource diff (+ Create / ~ Update / - Delete)
-keel preview status --pr 1 --watch
+keel preview status --pr 1 --tenant default --watch
 
-# Merge (requires keel-admins or tenant-default-admin; pinned to the reviewed head SHA)
+# Merge (requires keel-admins or tenant-default-admin; pinned to the reviewed head SHA).
+# PR numbers are per repository: --tenant names the repository (`management` = platform).
 keel proposal list
-keel proposal merge 1
+keel proposal merge 1 --tenant default
 
 # Install podinfo with canary delivery:
 cat <<'EOF' > podinfo-values.yaml

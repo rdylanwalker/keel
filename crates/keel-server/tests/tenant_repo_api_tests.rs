@@ -581,6 +581,11 @@ async fn forgejo_tenant_creation_provisions_repository_stub_and_credentials() {
     .unwrap();
     assert!(k.contains("resources: []"), "{k}");
     assert!(git_show(&tenant_bare, "main:tenants/acme/kustomization.yaml").is_none());
+    // Each PR names the scope its routes live under (PR ids are per repository).
+    assert_eq!(body["proposal"]["scope"], "management");
+    assert_eq!(body["proposal"]["repository"]["label"], "platform");
+    assert_eq!(skeleton["scope"], "acme");
+    assert_eq!(skeleton["repository"]["label"], "tenant-acme");
 
     // Re-run before merge: resumes both PRs, reuses the repository.
     let (status, again, _) = create(&fx.state, "acme").await;
@@ -593,13 +598,28 @@ async fn forgejo_tenant_creation_provisions_repository_stub_and_credentials() {
         skeleton["id"]
     );
 
+    // Merge the skeleton in the tenant repository through its tenant scope.
+    let (status, merged, _) = send(
+        &fx.state,
+        Method::POST,
+        &format!(
+            "/api/v1/tenants/acme/proposals/{}/merge",
+            skeleton["id"].as_str().unwrap()
+        ),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{merged}");
+    assert_eq!(merged["proposal"]["repository"]["label"], "tenant-acme");
+    assert!(git_show(&tenant_bare, "main:tenants/acme/kustomization.yaml").is_some());
+
     // Merge the stub; the namespace appears; the post-merge task writes the runtime Secrets.
     fx.store.set_namespace_present("tenant-acme", true).await;
     let pr_id = body["proposal"]["id"].as_str().unwrap();
     let (status, merged, _) = send(
         &fx.state,
         Method::POST,
-        &format!("/api/v1/proposals/{pr_id}/merge"),
+        &format!("/api/v1/tenants/management/proposals/{pr_id}/merge"),
         None,
     )
     .await;
@@ -885,7 +905,7 @@ async fn deleted_tenant_credentials_are_revoked_and_its_repository_is_not_silent
     let (status, merged, _) = send(
         &fx.state,
         Method::POST,
-        &format!("/api/v1/proposals/{pr}/merge"),
+        &format!("/api/v1/tenants/management/proposals/{pr}/merge"),
         None,
     )
     .await;
@@ -920,7 +940,7 @@ async fn deleted_tenant_credentials_are_revoked_and_its_repository_is_not_silent
     let (status, merged, _) = send(
         &fx.state,
         Method::POST,
-        &format!("/api/v1/proposals/{pr}/merge"),
+        &format!("/api/v1/tenants/management/proposals/{pr}/merge"),
         None,
     )
     .await;

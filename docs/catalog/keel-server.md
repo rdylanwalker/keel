@@ -102,11 +102,10 @@ The app only supports the Flux engine (`actionEngine: pulumi` is rejected with `
 
 ## Install
 
-From **Catalog & Form Wizard**, pick **Keel Control Plane (Workload Cluster)**, choose the tenant's workload cluster, fill in the form and open the PR. `keel app install` has no target-cluster option, so for automation call the API directly: `POST /api/v1/proposals` with `"catalogId": "keel-server"`, `"targetCluster": "<kubeconfig Secret>"` and the form values, for example:
+From **Catalog & Form Wizard**, pick **Keel Control Plane (Workload Cluster)**, choose the tenant's workload cluster, fill in the form and open the PR. `keel app install` has no target-cluster option, so for automation call the API directly: `POST /api/v1/tenants/<tenant>/proposals` (here `team-a`) with `"catalogId": "keel-server"`, `"targetCluster": "<kubeconfig Secret>"` and the form values, for example:
 
 ```json
 {
-  "tenant": "team-a",
   "catalogId": "keel-server",
   "targetCluster": "team-a-cluster-kubeconfig",
   "values": {

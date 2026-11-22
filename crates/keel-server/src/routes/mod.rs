@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 
 use chrono::Utc;
 use keel_core::{CatalogManifest, ProviderRegistry, SopsConfig, parse_catalog};
-use keel_git::{CommitAuthor, CreatePrRequest, PullRequestInfo};
+use keel_git::CommitAuthor;
 
 use crate::auth::AuthSession;
 use crate::error::ServerError;
@@ -308,6 +308,25 @@ pub(crate) async fn load_catalog_manifest(
     Ok(parse_catalog(&yaml)?)
 }
 
+/// [`load_catalog_manifest`] for an install into `tenant`: a tenant-scoped catalog item
+/// (`metadata.tenant`) of another tenant is reported exactly like a missing one (`404`), so a
+/// proposal can neither copy another tenant's private catalog content into its own repository
+/// nor probe whether such an item exists.
+pub(crate) async fn load_catalog_manifest_for_tenant(
+    repo_workdir: &Path,
+    catalog_id: &str,
+    kind_hint: Option<&str>,
+    tenant: &str,
+) -> Result<CatalogManifest, ServerError> {
+    let manifest = load_catalog_manifest(repo_workdir, catalog_id, kind_hint).await?;
+    if manifest.tenant().is_some_and(|owner| owner != tenant) {
+        return Err(ServerError::NotFound(format!(
+            "Catalog item '{catalog_id}' not found"
+        )));
+    }
+    Ok(manifest)
+}
+
 pub(crate) fn serialize_tenants_kustomization(resources: &[String]) -> Result<String, ServerError> {
     let kustomization_doc = serde_json::json!({
         "apiVersion": "kustomize.config.k8s.io/v1beta1",
@@ -339,6 +358,8 @@ pub(crate) const COMMITTED_GITOPS_REF: &str = "origin/main";
 pub(crate) enum RepoReader<'a> {
     AtRef {
         state: &'a AppState,
+        /// Working tree whose objects are read (the platform checkout or a tenant clone).
+        dir: &'a Path,
         rev: &'static str,
     },
     Worktree {
@@ -347,24 +368,32 @@ pub(crate) enum RepoReader<'a> {
 }
 
 impl<'a> RepoReader<'a> {
-    /// Returns a committed-ref reader for `origin/main` when that ref exists locally.
+    /// Returns a committed-ref reader for the platform repository's `origin/main` when that ref
+    /// exists locally.
     pub(crate) async fn committed(state: &'a AppState) -> Option<Self> {
+        Self::committed_in(state, &state.repo_workdir).await
+    }
+
+    /// Committed-ref reader for `origin/main` of the working tree `dir` (a tenant repository
+    /// clone synced by its caller).
+    pub(crate) async fn committed_in(state: &'a AppState, dir: &'a Path) -> Option<Self> {
         let exists = state
             .git_runner
-            .ref_exists(&state.repo_workdir, "refs/remotes/origin/main")
+            .ref_exists(dir, "refs/remotes/origin/main")
             .await
             .unwrap_or(false);
         exists.then_some(Self::AtRef {
             state,
+            dir,
             rev: COMMITTED_GITOPS_REF,
         })
     }
 
     pub(crate) async fn read(&self, rel: &str) -> Option<String> {
         match self {
-            Self::AtRef { state, rev } => state
+            Self::AtRef { state, dir, rev } => state
                 .git_runner
-                .read_file_at_ref(&state.repo_workdir, rev, rel)
+                .read_file_at_ref(dir, rev, rel)
                 .await
                 .ok()
                 .flatten(),
@@ -374,9 +403,9 @@ impl<'a> RepoReader<'a> {
 
     pub(crate) async fn exists(&self, rel: &str) -> bool {
         match self {
-            Self::AtRef { state, rev } => state
+            Self::AtRef { state, dir, rev } => state
                 .git_runner
-                .path_exists_at_ref(&state.repo_workdir, rev, rel)
+                .path_exists_at_ref(dir, rev, rel)
                 .await
                 .unwrap_or(false),
             Self::Worktree { root } => tokio::fs::try_exists(root.join(rel)).await.unwrap_or(false),
@@ -386,9 +415,9 @@ impl<'a> RepoReader<'a> {
     /// Lists entry names (files and directories) directly under `rel`.
     pub(crate) async fn list_dir(&self, rel: &str) -> Vec<String> {
         match self {
-            Self::AtRef { state, rev } => state
+            Self::AtRef { state, dir, rev } => state
                 .git_runner
-                .list_dir_at_ref(&state.repo_workdir, rev, rel)
+                .list_dir_at_ref(dir, rev, rel)
                 .await
                 .unwrap_or_default(),
             Self::Worktree { root } => {
@@ -534,26 +563,48 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<Path>,
 {
-    state
-        .git_runner
-        .add(&state.repo_workdir, staged_paths)
-        .await?;
-    let author = commit_author_for_session(auth);
-    let sha = state
-        .git_runner
-        .commit(&state.repo_workdir, commit_msg, &author)
-        .await?;
-    state
-        .git_runner
-        .push(&state.repo_workdir, "origin", branch)
-        .await?;
-    let _ = state
-        .git_runner
-        .checkout_branch(&state.repo_workdir, "main")
-        .await;
-    Ok(sha)
+    stage_commit_push_in(
+        state,
+        &state.repo_workdir,
+        auth,
+        branch,
+        commit_msg,
+        staged_paths,
+    )
+    .await
 }
 
+/// Stages `staged_paths` in the working tree `workdir` (the platform checkout or a tenant
+/// repository clone), commits as the session user, pushes `branch` to `origin` and checks out
+/// `main` again (also on failure). Callers hold the repository's lock.
+pub(crate) async fn stage_commit_push_in<I, S>(
+    state: &AppState,
+    workdir: &Path,
+    auth: &AuthSession,
+    branch: &str,
+    commit_msg: &str,
+    staged_paths: I,
+) -> Result<String, ServerError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<Path>,
+{
+    let result = async {
+        state.git_runner.add(workdir, staged_paths).await?;
+        let author = commit_author_for_session(auth);
+        let sha = state
+            .git_runner
+            .commit(workdir, commit_msg, &author)
+            .await?;
+        state.git_runner.push(workdir, "origin", branch).await?;
+        Ok::<String, ServerError>(sha)
+    }
+    .await;
+    let _ = state.git_runner.checkout_branch(workdir, "main").await;
+    result
+}
+
+/// Opens a platform-repository PR (scope `management`) for `branch`.
 pub(crate) async fn open_pr_for_session(
     state: &AppState,
     auth: &AuthSession,
@@ -561,11 +612,13 @@ pub(crate) async fn open_pr_for_session(
     branch: &str,
     title: String,
     body: String,
-) -> Result<PullRequestInfo, ServerError> {
-    let pr_req = CreatePrRequest::new(title, body, branch)
-        .with_tenant(tenant)
-        .with_author(pr_author_for_session(auth));
-    Ok(state.forge.create_pull_request(pr_req).await?)
+) -> Result<crate::proposal_repo::ScopedProposal, ServerError> {
+    let repo = crate::proposal_repo::ScopeRepo::platform(state);
+    let pr = repo
+        .open_pull_request(auth, tenant, branch, title, body)
+        .await?;
+    state.proposal_cache.invalidate(&repo.repository().label);
+    Ok(repo.scoped(pr))
 }
 
 #[cfg(test)]
@@ -1130,6 +1183,7 @@ spec:
         let err = create_proposal(
             test_auth(),
             State(state.clone()),
+            AxumPath("management".to_string()),
             Json(CreateProposalRequest {
                 tenant: "management".to_string(),
                 catalog_id: "s3-state-backend".to_string(),
@@ -1443,7 +1497,7 @@ spec:
         let _ = merge_proposal(
             test_auth(),
             State(state.clone()),
-            AxumPath(reg_resp.proposal.id),
+            AxumPath(("management".to_string(), reg_resp.proposal.id.clone())),
         )
         .await
         .expect("merge catalog PR");
@@ -1484,10 +1538,14 @@ spec:
             target_namespace: None,
             action_engine: Some("flux".to_string()),
         };
-        let (p_status, Json(flux_prop_resp)) =
-            create_proposal(test_auth(), State(state.clone()), Json(flux_prop_req))
-                .await
-                .expect("create flux manifest proposal");
+        let (p_status, Json(flux_prop_resp)) = create_proposal(
+            test_auth(),
+            State(state.clone()),
+            AxumPath(flux_prop_req.tenant.clone()),
+            Json(flux_prop_req),
+        )
+        .await
+        .expect("create flux manifest proposal");
         assert_eq!(p_status, StatusCode::CREATED);
         assert_eq!(
             flux_prop_resp.report.resources[0].resource_type,
@@ -1497,7 +1555,7 @@ spec:
         let _ = merge_proposal(
             test_auth(),
             State(state.clone()),
-            AxumPath(flux_prop_resp.proposal.id),
+            AxumPath(("default".to_string(), flux_prop_resp.proposal.pr.id)),
         )
         .await
         .expect("merge flux manifest PR");
@@ -1546,10 +1604,14 @@ spec:
             target_namespace: None,
             action_engine: Some("pulumi".to_string()),
         };
-        let (p2_status, Json(pulumi_prop_resp)) =
-            create_proposal(test_auth(), State(state.clone()), Json(pulumi_prop_req))
-                .await
-                .expect("create pulumi manifest proposal");
+        let (p2_status, Json(pulumi_prop_resp)) = create_proposal(
+            test_auth(),
+            State(state.clone()),
+            AxumPath(pulumi_prop_req.tenant.clone()),
+            Json(pulumi_prop_req),
+        )
+        .await
+        .expect("create pulumi manifest proposal");
         assert_eq!(p2_status, StatusCode::CREATED);
         assert!(
             pulumi_prop_resp
@@ -1569,7 +1631,7 @@ spec:
         let _ = merge_proposal(
             test_auth(),
             State(state.clone()),
-            AxumPath(pulumi_prop_resp.proposal.id),
+            AxumPath(("default".to_string(), pulumi_prop_resp.proposal.pr.id)),
         )
         .await
         .expect("merge pulumi manifest PR");
@@ -1649,7 +1711,7 @@ data:
         let _ = merge_proposal(
             test_auth(),
             State(state.clone()),
-            AxumPath(up_resp.proposal.id),
+            AxumPath(("management".to_string(), up_resp.proposal.id.clone())),
         )
         .await
         .expect("merge catalog update PR");
@@ -1936,7 +1998,10 @@ spec:
         let _ = merge_proposal(
             test_auth(),
             State(state.clone()),
-            AxumPath(created.proposal.as_ref().expect("stub proposal").id.clone()),
+            AxumPath((
+                "management".to_string(),
+                created.proposal.as_ref().expect("stub proposal").id.clone(),
+            )),
         )
         .await
         .expect("merge create_tenant proposal");
@@ -1989,24 +2054,29 @@ spec:
             State(state.clone()),
             axum::extract::Query(ListProposalsQuery {
                 status: Some("open".to_string()),
-                tenant: None,
             }),
         )
         .await
         .expect("list_proposals");
-        assert!(open_list.proposals.iter().any(|p| p.id == pr_id));
+        assert!(open_list.proposals.iter().any(|p| p.pr.id == pr_id));
 
-        let Json(rejected) =
-            reject_proposal(test_auth(), State(state.clone()), AxumPath(pr_id.clone()))
-                .await
-                .expect("reject_proposal");
-        assert_eq!(rejected.proposal.state, PullRequestState::Closed);
+        let Json(rejected) = reject_proposal(
+            test_auth(),
+            State(state.clone()),
+            AxumPath(("management".to_string(), pr_id.clone())),
+        )
+        .await
+        .expect("reject_proposal");
+        assert_eq!(rejected.proposal.pr.state, PullRequestState::Closed);
 
-        let Json(reopened) =
-            reopen_proposal(test_auth(), State(state.clone()), AxumPath(pr_id.clone()))
-                .await
-                .expect("reopen_proposal");
-        assert_eq!(reopened.proposal.state, PullRequestState::Open);
+        let Json(reopened) = reopen_proposal(
+            test_auth(),
+            State(state.clone()),
+            AxumPath(("management".to_string(), pr_id.clone())),
+        )
+        .await
+        .expect("reopen_proposal");
+        assert_eq!(reopened.proposal.pr.state, PullRequestState::Open);
 
         // Profile Git credentials
         let Json(creds_resp) = put_git_credentials(
@@ -2272,7 +2342,7 @@ spec:
         )
         .await
         .expect("delete_release");
-        assert!(!del_rel.proposal.id.is_empty());
+        assert!(!del_rel.proposal.pr.id.is_empty());
 
         // 4. events_stream SSE endpoint
         let sse_resp = events_stream(
@@ -2403,13 +2473,11 @@ spec:
             Err(ServerError::Forbidden(_))
         ));
         assert!(matches!(
-            list_proposals(
+            list_scope_proposals(
                 alpha_user,
                 State(state),
-                Query(ListProposalsQuery {
-                    tenant: Some("default".to_string()),
-                    status: None,
-                }),
+                AxumPath("default".to_string()),
+                Query(ListProposalsQuery { status: None }),
             )
             .await,
             Err(ServerError::Forbidden(_))
@@ -2622,6 +2690,7 @@ spec:
             let (status, Json(prop)) = create_proposal(
                 global_admin.clone(),
                 State(state.clone()),
+                AxumPath("default".to_string()),
                 Json(CreateProposalRequest {
                     tenant: "default".to_string(),
                     catalog_id: catalog_id.to_string(),

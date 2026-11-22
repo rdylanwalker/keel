@@ -14,7 +14,6 @@ use axum::Json;
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::StatusCode;
 use keel_core::validate_dns_label;
-use keel_git::PullRequestInfo;
 use keel_kube::{
     PLATFORM_OWNED_TENANT_FILES, ensure_tenant_pko_workspace_network_policy,
     label_platform_owned_manifests, platform_owned_labels_missing,
@@ -48,7 +47,7 @@ pub struct MigrateBaselineResponse {
     /// Repository paths whose platform-written objects gain `keel.io/platform-owned`.
     pub labelled: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub proposal: Option<PullRequestInfo>,
+    pub proposal: Option<crate::proposal_repo::ScopedProposal>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
 }

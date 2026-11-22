@@ -388,6 +388,23 @@ pub trait PreviewCluster: Send + Sync {
         tenant: &str,
     ) -> Result<PreviewPrerequisites, KubeError>;
 
+    /// Preview prerequisites of a tenant with its own repository (`source`, derived by keel-server
+    /// from the platform forge configuration, never from the tenant-editable `keel-gitops`
+    /// object): validates the platform-written `tenant-<id>/keel-gitops-credentials` Secret
+    /// ([`crate::tenant_repo_preview_secret_payload`]) and mirrors the tenant-scoped state
+    /// identity. `git_secret` is that Secret, `git_secret_keys` exactly the keys a preview copies
+    /// (HTTPS `username`/`password`, SSH `sshPrivateKey`/`known_hosts`) and `git_url` the tenant
+    /// repository URL. Fails closed with [`KubeError::PreviewSourceUnavailable`].
+    async fn ensure_tenant_repo_preview_prerequisites(
+        &self,
+        source: &crate::TenantRepoSource,
+    ) -> Result<PreviewPrerequisites, KubeError> {
+        Err(KubeError::PreviewSourceUnavailable(format!(
+            "tenant `{}` repository previews are not supported by this preview runner",
+            source.tenant_id()
+        )))
+    }
+
     /// One-off sweep (run at `keel-server` start-up): deletes `keel-previews` Git credential
     /// mirrors (`keel.io/secret-kind=preview-tenant-git-credentials`) that no longer match the
     /// tenant's own read-only `tenant-<id>/git-credentials` Secret, e.g. platform credentials
@@ -786,6 +803,32 @@ impl KubePreviewCluster {
 
     /// Resolves the tenant Git source and (when it references one) the validated, allow-listed
     /// read-only credentials payload. Performs reads only.
+    /// Mirrors the tenant's scoped S3 identity into `keel-previews` (fail closed: never the
+    /// control-plane admin keys); `None` while the tenant has no (finished) identity.
+    async fn mirror_tenant_s3_identity(&self, tenant: &str) -> Result<Option<String>, KubeError> {
+        let tenant_ns = tenant_namespace(tenant)?;
+        let secrets: Api<Secret> = Api::namespaced(self.client.clone(), &tenant_ns);
+        let Some(scoped) = secrets.get_opt(TENANT_S3_CREDENTIALS_SECRET_NAME).await? else {
+            return Ok(None);
+        };
+        if scoped
+            .annotations()
+            .contains_key(TENANT_S3_IDENTITY_PENDING_ANNOTATION)
+        {
+            return Ok(None);
+        }
+        let name = preview_s3_secret_name(tenant)?;
+        self.mirror_secret(
+            &scoped,
+            &name,
+            tenant,
+            PREVIEW_S3_SECRET_KIND,
+            Some(&["accessKey", "secretKey"]),
+        )
+        .await?;
+        Ok(Some(name))
+    }
+
     async fn resolve_tenant_git(
         &self,
         tenant: &str,
@@ -866,7 +909,7 @@ impl PreviewCluster for KubePreviewCluster {
         &self,
         tenant: &str,
     ) -> Result<PreviewPrerequisites, KubeError> {
-        let tenant_ns = tenant_namespace(tenant)?;
+        tenant_namespace(tenant)?;
         let git_mirror = preview_git_secret_name(tenant)?;
 
         // Tenant-owned Git source only (fail closed: never the platform `flux-system` source).
@@ -887,26 +930,10 @@ impl PreviewCluster for KubePreviewCluster {
 
         self.ensure_service_account().await;
         self.ensure_preview_ca_bundle().await;
-        let mut out = PreviewPrerequisites::default();
-
-        // Tenant-scoped S3 identity only (fail closed: never fall back to admin keys).
-        let secrets: Api<Secret> = Api::namespaced(self.client.clone(), &tenant_ns);
-        if let Some(scoped) = secrets.get_opt(TENANT_S3_CREDENTIALS_SECRET_NAME).await?
-            && !scoped
-                .annotations()
-                .contains_key(TENANT_S3_IDENTITY_PENDING_ANNOTATION)
-        {
-            let name = preview_s3_secret_name(tenant)?;
-            self.mirror_secret(
-                &scoped,
-                &name,
-                tenant,
-                PREVIEW_S3_SECRET_KIND,
-                Some(&["accessKey", "secretKey"]),
-            )
-            .await?;
-            out.s3_secret = Some(name);
-        }
+        let mut out = PreviewPrerequisites {
+            s3_secret: self.mirror_tenant_s3_identity(tenant).await?,
+            ..PreviewPrerequisites::default()
+        };
 
         match git_payload {
             Some(data) => {
@@ -925,6 +952,40 @@ impl PreviewCluster for KubePreviewCluster {
         }
         out.git_url = Some(source.url);
         Ok(out)
+    }
+
+    async fn ensure_tenant_repo_preview_prerequisites(
+        &self,
+        source: &crate::TenantRepoSource,
+    ) -> Result<PreviewPrerequisites, KubeError> {
+        let tenant = source.tenant_id();
+        let tenant_ns = source.namespace();
+        let secrets: Api<Secret> = Api::namespaced(self.client.clone(), &tenant_ns);
+        let secret = secrets
+            .get_opt(TENANT_GITOPS_CREDENTIALS_SECRET_NAME)
+            .await?
+            .ok_or_else(|| {
+                KubeError::PreviewSourceUnavailable(format!(
+                    "tenant `{tenant}` has no repository read credential `{tenant_ns}/{TENANT_GITOPS_CREDENTIALS_SECRET_NAME}`; re-run tenant provisioning (POST /api/v1/tenants)"
+                ))
+            })?;
+        let payload = crate::tenant_repo_preview_secret_payload(source, &secret)?;
+        self.ensure_service_account().await;
+        self.ensure_preview_ca_bundle().await;
+        // The per-tenant mirror of the former shared credential is never used by a tenant
+        // repository preview (each preview copies its own keys).
+        if let Err(e) = self
+            .delete_preview_git_mirror(&preview_git_secret_name(tenant)?)
+            .await
+        {
+            tracing::warn!(tenant, error = %e, "could not delete a stale preview Git credential mirror");
+        }
+        Ok(PreviewPrerequisites {
+            s3_secret: self.mirror_tenant_s3_identity(tenant).await?,
+            git_url: Some(source.url().to_string()),
+            git_secret: Some(TENANT_GITOPS_CREDENTIALS_SECRET_NAME.to_string()),
+            git_secret_keys: payload.into_keys().collect(),
+        })
     }
 
     async fn purge_stale_preview_git_credentials(&self) -> Result<usize, KubeError> {
@@ -1390,6 +1451,33 @@ impl PreviewCluster for InMemoryPreviewCluster {
             tenant_git_source_from_repository(tenant, None)?;
         }
         Ok(self.prerequisites.clone())
+    }
+
+    async fn ensure_tenant_repo_preview_prerequisites(
+        &self,
+        source: &crate::TenantRepoSource,
+    ) -> Result<PreviewPrerequisites, KubeError> {
+        let tenant = source.tenant_id();
+        let keys = crate::tenant_repo_preview_secret_keys(source.transport());
+        let present = self
+            .lock()
+            .tenant_secrets
+            .get(&(
+                tenant.to_string(),
+                TENANT_GITOPS_CREDENTIALS_SECRET_NAME.to_string(),
+            ))
+            .is_some_and(|data| keys.iter().all(|k| data.contains_key(k)));
+        if self.missing_tenant_source || !present {
+            return Err(KubeError::PreviewSourceUnavailable(format!(
+                "tenant `{tenant}` has no usable repository read credential `tenant-{tenant}/{TENANT_GITOPS_CREDENTIALS_SECRET_NAME}`"
+            )));
+        }
+        Ok(PreviewPrerequisites {
+            s3_secret: self.prerequisites.s3_secret.clone(),
+            git_url: Some(source.url().to_string()),
+            git_secret: Some(TENANT_GITOPS_CREDENTIALS_SECRET_NAME.to_string()),
+            git_secret_keys: keys,
+        })
     }
 
     async fn apply_preview(&self, stack: &Value) -> Result<(), KubeError> {
@@ -2354,6 +2442,42 @@ spec:
                 .any(|r| r.starts_with("DELETE ") && r.ends_with("keel-preview-git-default"))
         );
         assert_never_flux_system(&seen);
+    }
+
+    #[tokio::test]
+    async fn in_memory_tenant_repo_prerequisites_require_the_platform_credential() {
+        let source = crate::TenantRepoSource::new(
+            "acme",
+            "https://forgejo.keel.local:8888/keel-tenants/infra-tenant-acme.git",
+        )
+        .unwrap();
+        let cluster = InMemoryPreviewCluster::new();
+        let err = cluster
+            .ensure_tenant_repo_preview_prerequisites(&source)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, KubeError::PreviewSourceUnavailable(_)),
+            "{err}"
+        );
+        cluster.put_tenant_secret(
+            "acme",
+            TENANT_GITOPS_CREDENTIALS_SECRET_NAME,
+            &[("username", "reader"), ("password", "t")],
+        );
+        let prereqs = cluster
+            .ensure_tenant_repo_preview_prerequisites(&source)
+            .await
+            .unwrap();
+        assert_eq!(prereqs.git_url.as_deref(), Some(source.url()));
+        assert_eq!(
+            prereqs.git_secret.as_deref(),
+            Some(TENANT_GITOPS_CREDENTIALS_SECRET_NAME)
+        );
+        assert_eq!(
+            prereqs.git_secret_keys,
+            BTreeSet::from(["password".to_string(), "username".to_string()])
+        );
     }
 
     #[tokio::test]
