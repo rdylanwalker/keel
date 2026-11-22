@@ -1996,20 +1996,32 @@ fn extract_stack_unlock_params(
         .ok_or_else(|| KubeError::InvalidInput("Stack spec.stack is missing or empty".to_string()))?
         .to_string();
 
-    let flux_dir = stack_obj
+    // Flux sources (`spec.fluxSource.dir`, the management Stack) and PKO Git sources
+    // (`spec.repoDir`, tenant/preview Stacks) are both checked out under `/share/source`.
+    let (field, flux_dir) = match stack_obj
         .data
         .pointer("/spec/fluxSource/dir")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(str::to_string);
+    {
+        Some(dir) => ("spec.fluxSource.dir", Some(dir.to_string())),
+        None => (
+            "spec.repoDir",
+            stack_obj
+                .data
+                .pointer("/spec/repoDir")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
+        ),
+    };
 
     if let Some(ref dir) = flux_dir
         && (dir.starts_with('/') || dir.split('/').any(|seg| seg == ".."))
     {
-        return Err(KubeError::InvalidInput(format!(
-            "Invalid spec.fluxSource.dir: {dir}"
-        )));
+        return Err(KubeError::InvalidInput(format!("Invalid {field}: {dir}")));
     }
 
     Ok((backend, stack_name, flux_dir))
@@ -2462,6 +2474,44 @@ current-context: workload
         }))
         .unwrap();
         assert!(extract_stack_unlock_params(&traversal_dir).is_err());
+
+        let git_traversal: DynamicObject = serde_json::from_value(json!({
+            "apiVersion": "pulumi.com/v1",
+            "kind": "Stack",
+            "metadata": { "name": "test" },
+            "spec": {
+                "backend": "s3://pulumi-state",
+                "stack": "org/proj/dev",
+                "projectRepo": "https://forge.example/x.git",
+                "repoDir": "tenants/../../etc"
+            }
+        }))
+        .unwrap();
+        assert!(extract_stack_unlock_params(&git_traversal).is_err());
+    }
+
+    #[test]
+    fn unlock_params_use_repo_dir_of_pko_git_sources() {
+        let stack: DynamicObject = serde_json::from_value(json!({
+            "apiVersion": "pulumi.com/v1",
+            "kind": "Stack",
+            "metadata": { "name": "kind", "namespace": "tenant-default" },
+            "spec": {
+                "backend": "s3://pulumi-state/tenants/default",
+                "stack": "organization/kind-cluster/default-kind",
+                "projectRepo": "http://forgejo-http.keel-system.svc.cluster.local:3000/keel/infra-gitops.git",
+                "branch": "main",
+                "repoDir": "tenants/default/infra/kind"
+            }
+        }))
+        .unwrap();
+        let (_, stack_name, dir) = extract_stack_unlock_params(&stack).unwrap();
+        assert_eq!(dir.as_deref(), Some("tenants/default/infra/kind"));
+        let args = build_pulumi_cancel_args(&stack_name, dir.as_deref());
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some("/share/source/tenants/default/infra/kind")
+        );
     }
 
     #[test]

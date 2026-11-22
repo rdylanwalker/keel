@@ -25,9 +25,9 @@ use keel_kube::{
     synthesize_remote_target_namespace_yaml,
 };
 use keel_pko::{
-    ChangeOp, EphemeralPreviewParams, GcPlan, PkoStack, PreviewReport, PreviewResourceCandidate,
-    PreviewRunStatus, PreviewSecretCopy, PreviewSource, PreviewSummary, ResourceDiff,
-    TenantStackParams, attach_github_token_env_ref, attach_s3_credentials_env_refs,
+    ChangeOp, EphemeralPreviewParams, GcPlan, PkoGitAuth, PkoGitSource, PkoStack, PreviewReport,
+    PreviewResourceCandidate, PreviewRunStatus, PreviewSecretCopy, PreviewSource, PreviewSummary,
+    ResourceDiff, TenantStackParams, attach_github_token_env_ref, attach_s3_credentials_env_refs,
     build_preview_branch, format_markdown_report, synthesize_ephemeral_preview,
     synthesize_k8s_manifest_pulumi_yaml, synthesize_tenant_stack,
 };
@@ -40,7 +40,7 @@ use crate::preview_lifecycle::launch_pko_preview;
 use crate::state::{AppState, CachedPreview};
 
 use super::{
-    attach_infra_secret_refs, create_dir_all_contained, load_catalog_manifest,
+    RepoReader, attach_infra_secret_refs, create_dir_all_contained, load_catalog_manifest,
     load_provider_registry, next_unique_branch_timestamp, open_pr_for_session,
     read_contained_optional, read_contained_to_string, resolve_sops_recipients,
     resolve_tenant_resource_dir, safe_relative_path, serialize_tenants_kustomization,
@@ -227,6 +227,68 @@ fn tenant_stack_backend_url(state: &AppState, tenant: &str) -> Result<String, Se
             "cannot derive tenant state backend for `{tenant}`: {e}"
         ))
     })
+}
+
+/// Resolves the tenant's own Git source that its PKO `Stack`s clone (`gitSource`) from the
+/// platform-written `tenants/<id>/git-repository.yaml` on the committed GitOps `main` (never the
+/// live, tenant-editable `keel-gitops` object, and never the platform `flux-system` source).
+///
+/// Fails closed with `409 Conflict` and an actionable message when the tenant has no usable
+/// source (e.g. tenants created through `POST /api/v1/tenants` before per-tenant repositories),
+/// so no Stack that could only work through whole-repository access is ever committed.
+pub(crate) async fn resolve_tenant_stack_source(
+    state: &AppState,
+    tenant: &str,
+) -> Result<keel_kube::TenantGitSource, ServerError> {
+    match read_tenant_stack_source(state, tenant).await {
+        Ok(source) => Ok(source),
+        Err(keel_kube::KubeError::TenantSourceUnavailable(reason)) => {
+            tracing::warn!(
+                tenant,
+                audit = "stack-source-denied",
+                reason = %reason,
+                "Pulumi Stack proposal refused: tenant has no usable Git source"
+            );
+            Err(ServerError::Conflict(reason))
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Reads and validates the platform-written tenant Git source (see
+/// [`resolve_tenant_stack_source`]) without logging.
+async fn read_tenant_stack_source(
+    state: &AppState,
+    tenant: &str,
+) -> Result<keel_kube::TenantGitSource, keel_kube::KubeError> {
+    let rel = keel_kube::tenant_git_repository_manifest_path(tenant)?;
+    let manifest = match RepoReader::committed(state).await {
+        Some(reader) => reader.read(&rel).await,
+        None => {
+            let _guard = state.git_lock.lock().await;
+            read_contained_optional(&state.repo_workdir, &state.repo_workdir.join(&rel))
+                .await
+                .ok()
+                .flatten()
+        }
+    };
+    keel_kube::tenant_git_source_from_manifest(tenant, manifest.as_deref())
+}
+
+/// PKO `gitSource` for a tenant Stack in `repo_dir`: the tenant source URL and branch, with
+/// `gitAuth` referencing the tenant's read-only `git-credentials` Secret in its own namespace.
+pub(crate) fn tenant_stack_git_source(
+    source: &keel_kube::TenantGitSource,
+    repo_dir: &str,
+) -> Result<PkoGitSource, keel_pko::PkoError> {
+    let auth = source
+        .secret_name
+        .as_deref()
+        .map(|secret| {
+            PkoGitAuth::from_flux_secret(secret, &source.url, &std::collections::BTreeSet::new())
+        })
+        .transpose()?;
+    Ok(PkoGitSource::branch(&source.url, source.branch_or_default(), repo_dir).with_auth(auth))
 }
 
 /// Ensures `tenant_ns` holds the tenant's state credentials before a Pulumi Stack is committed:
@@ -2039,8 +2101,10 @@ pub async fn create_proposal(
                             req.tenant
                         ),
                         tenant_stack_backend_url(&state, &req.tenant)?,
-                        "keel-gitops",
-                        &rel_dir,
+                        tenant_stack_git_source(
+                            &resolve_tenant_stack_source(&state, &req.tenant).await?,
+                            &rel_dir,
+                        )?,
                     );
                     stack_params
                         .config
@@ -2244,8 +2308,10 @@ pub async fn create_proposal(
                     req.tenant
                 ),
                 tenant_stack_backend_url(&state, &req.tenant)?,
-                "keel-gitops",
-                &rel_dir,
+                tenant_stack_git_source(
+                    &resolve_tenant_stack_source(&state, &req.tenant).await?,
+                    &rel_dir,
+                )?,
             );
             stack_params
                 .config
@@ -2900,7 +2966,6 @@ pub async fn create_proposal(
         &req.tenant,
         &action_label,
         timestamp,
-        &state.remote_url,
         &rel_dir,
         format!("organization/{instance_name}-pr-{}/{}", pr.id, req.tenant),
         &state.backend_url,
@@ -2940,8 +3005,13 @@ pub async fn create_proposal(
         {
             preview_secret_copies.push(passphrase_copy);
         }
-        preview_blocker =
-            attach_preview_cluster_inputs(&state, &req.tenant, &mut preview_params).await;
+        preview_blocker = attach_preview_cluster_inputs(
+            &state,
+            &req.tenant,
+            &mut preview_params,
+            &mut preview_secret_copies,
+        )
+        .await;
     }
     let preview_stack = synthesize_ephemeral_preview(&preview_params)?;
     let run = match (pko_backed, preview_blocker) {
@@ -2996,6 +3066,7 @@ async fn attach_preview_cluster_inputs(
     state: &AppState,
     tenant: &str,
     params: &mut EphemeralPreviewParams,
+    secret_copies: &mut Vec<PreviewSecretCopy>,
 ) -> Option<String> {
     let Some(cluster) = state.preview_cluster.clone() else {
         return Some("No live cluster connected: PKO preview not executed".to_string());
@@ -3033,8 +3104,83 @@ async fn attach_preview_cluster_inputs(
             "Tenant `{tenant}` has no Flux Git source (`tenant-{tenant}/keel-gitops`); previews never fall back to the platform repository: PKO preview not executed"
         ));
     };
-    params.repo_url = url;
-    params.git_secret_name = prereqs.git_secret;
+    // The preview clones the same platform-written source as the tenant Stack it previews
+    // (`gitSource.projectRepo` committed by keel-server) or, for a brand-new/unparsable Stack, the
+    // platform-written `tenants/<id>/git-repository.yaml` on `origin/main`; never the live,
+    // tenant-editable `keel-gitops` `spec.url` (the cluster source only supplies the read-only
+    // credentials) and never the control-plane remote.
+    let platform_url = match params.tenant_repo_url.clone() {
+        Some(u) => u,
+        None => match read_tenant_stack_source(state, tenant).await {
+            Ok(source) => source.url,
+            Err(e) => {
+                tracing::warn!(
+                    tenant,
+                    audit = "preview-source-denied",
+                    pr_id = %params.pr_id,
+                    "PKO preview refused: tenant has no platform-written Git source"
+                );
+                let reason = match e {
+                    keel_kube::KubeError::TenantSourceUnavailable(reason) => reason,
+                    _ => format!("Tenant `{tenant}` Git source could not be resolved"),
+                };
+                return Some(format!("{reason}: PKO preview not executed"));
+            }
+        },
+    };
+    if let Err(e) = keel_pko::validate_git_source_url(&platform_url) {
+        tracing::warn!(tenant, pr_id = %params.pr_id, error = %e, "preview Git source URL refused");
+        return Some(format!(
+            "Tenant `{tenant}` Git source cannot be cloned by PKO ({e}): PKO preview not executed"
+        ));
+    }
+    if platform_url != url {
+        tracing::warn!(
+            tenant,
+            audit = "preview-source-mismatch",
+            pr_id = %params.pr_id,
+            "live tenant Git source URL differs from the platform-written source; the preview clones the platform-written one"
+        );
+    }
+    // Each preview gets its own copy of only the allow-listed read-only Git keys, owned by the
+    // preview Stack (GC'd with it); no long-lived per-tenant credential in `keel-previews`.
+    let git_copy = match prereqs.git_secret.as_deref() {
+        Some(source_secret) => {
+            let target = match keel_pko::preview_secret_copy_name(&params.pr_id, source_secret) {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::warn!(tenant, pr_id = %params.pr_id, error = %e, "preview Git credential copy name refused");
+                    return Some(format!(
+                        "Tenant `{tenant}` read-only Git credentials cannot be staged for the preview: PKO preview not executed"
+                    ));
+                }
+            };
+            // An unusable credential (e.g. an SSH source with a token-only Secret) must not fail
+            // the proposal after its PR was opened: report the preview as not executed instead.
+            if let Err(e) =
+                PkoGitAuth::from_flux_secret(&target, &platform_url, &prereqs.git_secret_keys)
+            {
+                tracing::warn!(tenant, pr_id = %params.pr_id, error = %e, "preview Git credentials unusable");
+                return Some(format!(
+                    "Tenant `{tenant}` read-only Git credentials cannot authenticate its Git source ({e}): PKO preview not executed"
+                ));
+            }
+            Some(PreviewSecretCopy {
+                source_name: source_secret.to_string(),
+                target_name: target,
+                keys: prereqs.git_secret_keys.clone(),
+                proposed_data: None,
+            })
+        }
+        None => None,
+    };
+    params.repo_url = Some(platform_url);
+    params.git_secret_name = git_copy.as_ref().map(|c| c.target_name.clone());
+    params.git_secret_keys = prereqs.git_secret_keys;
+    if let Some(copy) = git_copy {
+        secret_copies.retain(|c| c.target_name != copy.target_name);
+        secret_copies.push(copy);
+    }
     if params.backend_url.starts_with("s3://") {
         match prereqs.s3_secret {
             Some(secret) => attach_s3_credentials_env_refs(&mut params.env_refs, &secret),
@@ -3644,8 +3790,10 @@ async fn create_bundle_proposal(
                         req.tenant
                     ),
                     tenant_stack_backend_url(&state, &req.tenant)?,
-                    "keel-gitops",
-                    &item_rel_dir,
+                    tenant_stack_git_source(
+                        &resolve_tenant_stack_source(&state, &req.tenant).await?,
+                        &item_rel_dir,
+                    )?,
                 );
                 stack_params
                     .config
@@ -3980,7 +4128,6 @@ async fn create_bundle_proposal(
         &req.tenant,
         &action_label,
         timestamp,
-        &state.remote_url,
         &bundle_rel_dir,
         format!("organization/{instance_name}-pr-{}/{}", pr.id, req.tenant),
         &state.backend_url,

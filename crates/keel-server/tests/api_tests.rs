@@ -24,6 +24,16 @@ struct TestFixture {
 }
 
 /// Fixture for a provisioned tenant `acme` (its Pulumi state passphrase Secret exists).
+/// Cluster-reachable GitOps URL used by the platform-written tenant source stubs.
+const TENANT_GIT_URL: &str =
+    "http://forgejo-http.keel-system.svc.cluster.local:3000/keel/infra-gitops.git";
+
+fn tenant_git_source_stub(tenant: &str) -> String {
+    format!(
+        "apiVersion: source.toolkit.fluxcd.io/v1\nkind: GitRepository\nmetadata:\n  name: keel-gitops\n  namespace: tenant-{tenant}\nspec:\n  interval: 1m\n  url: {TENANT_GIT_URL}\n  ref:\n    branch: main\n  secretRef:\n    name: git-credentials\n"
+    )
+}
+
 async fn setup_fixture() -> TestFixture {
     let fixture = setup_fixture_without_tenant_passphrase().await;
     SecretStateStore::ensure_pulumi_passphrase(fixture.secret_store.as_ref(), "tenant-acme")
@@ -33,9 +43,18 @@ async fn setup_fixture() -> TestFixture {
 }
 
 async fn setup_fixture_without_tenant_passphrase() -> TestFixture {
+    setup_fixture_at("remote.git", "workdir").await
+}
+
+/// Fixture whose bare remote / working tree live at `bare_name` / `workdir_name` inside the
+/// temporary directory (e.g. paths containing spaces, as on `keel serve --repo-dir`).
+async fn setup_fixture_at(bare_name: &str, workdir_name: &str) -> TestFixture {
     let temp_dir = tempfile::tempdir().expect("create tempdir");
-    let bare_repo = temp_dir.path().join("remote.git");
-    let workdir = temp_dir.path().join("workdir");
+    let bare_repo = temp_dir.path().join(bare_name);
+    let workdir = temp_dir.path().join(workdir_name);
+    if let Some(parent) = bare_repo.parent() {
+        tokio::fs::create_dir_all(parent).await.unwrap();
+    }
 
     let git = GitRunner::new();
     git.init_bare(&bare_repo).await.expect("init bare repo");
@@ -203,6 +222,20 @@ spec:
     )
     .await
     .unwrap();
+
+    // Platform-written tenant Git source stubs (`tenants/<id>/git-repository.yaml`): tenant PKO
+    // Stacks clone only their tenant's own source (fail closed without one).
+    for tenant in ["acme", "default"] {
+        tokio::fs::create_dir_all(workdir.join(format!("tenants/{tenant}")))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            workdir.join(format!("tenants/{tenant}/git-repository.yaml")),
+            tenant_git_source_stub(tenant),
+        )
+        .await
+        .unwrap();
+    }
 
     git.add(&workdir, ["."]).await.unwrap();
     git.commit(
@@ -837,7 +870,8 @@ async fn test_proposal_create_preview_merge_and_stacks_releases() {
     let merge_json: Value =
         serde_json::from_slice(&merge_res.into_body().collect().await.unwrap().to_bytes()).unwrap();
     assert_eq!(merge_json["proposal"]["state"], "merged");
-    assert_eq!(merge_json["gcPlan"]["targets"].as_array().unwrap().len(), 2);
+    // Only the preview Stack: previews clone through PKO `gitSource` (no Flux GitRepository).
+    assert_eq!(merge_json["gcPlan"]["targets"].as_array().unwrap().len(), 1);
 
     // 7. Stacks & Releases endpoints
     let stacks_res = app
@@ -2617,6 +2651,18 @@ spec:
     .unwrap();
     assert!(cluster_stack.contains("kubeconfigSecretName: prod-stack-cluster-kubeconfig"));
     assert!(cluster_stack.contains("kubeconfigSecretNamespace: tenant-acme"));
+    // Bundle infra items clone the tenant's own source through PKO `gitSource`.
+    let cluster_stack_doc: Value = serde_yml::from_str(&cluster_stack).unwrap();
+    assert!(cluster_stack_doc["spec"].get("fluxSource").is_none());
+    assert_eq!(cluster_stack_doc["spec"]["projectRepo"], TENANT_GIT_URL);
+    assert_eq!(
+        cluster_stack_doc["spec"]["repoDir"],
+        "tenants/acme/bundles/prod-stack/cluster"
+    );
+    assert_eq!(
+        cluster_stack_doc["spec"]["gitAuth"]["basicAuth"]["password"]["secret"]["name"],
+        "git-credentials"
+    );
 
     let app_fk = tokio::fs::read_to_string(
         fixture
@@ -5081,8 +5127,18 @@ async fn test_pko_preview_lifecycle_is_applied_published_and_gced_from_cluster_s
     let cluster = InMemoryPreviewCluster::new().with_prerequisites(PreviewPrerequisites {
         s3_secret: Some("keel-preview-s3-acme".to_string()),
         git_url: Some("http://forgejo.keel-system.svc:3000/keel/infra-gitops.git".to_string()),
-        git_secret: Some("keel-preview-git-acme".to_string()),
+        git_secret: Some("git-credentials".to_string()),
+        git_secret_keys: ["password".to_string(), "username".to_string()].into(),
     });
+    cluster.put_tenant_secret(
+        "acme",
+        "git-credentials",
+        &[
+            ("username", "git"),
+            ("password", "ro-token"),
+            ("other", "never"),
+        ],
+    );
     cluster.put_tenant_secret(
         "acme",
         "keel-pulumi-passphrase",
@@ -5157,15 +5213,45 @@ async fn test_pko_preview_lifecycle_is_applied_published_and_gced_from_cluster_s
             .unwrap()
             .ends_with("/acme-vm-preview")
     );
-    let repos = cluster.list_preview_git_repositories().await.unwrap();
-    assert_eq!(
-        repos[0]["spec"]["url"],
-        "http://forgejo.keel-system.svc:3000/keel/infra-gitops.git"
+    // PKO `gitSource`: the preview clones the PR branch of the platform-written tenant source
+    // (the tenant Stack's `projectRepo`, not the live `keel-gitops` URL) with the mirrored
+    // read-only credentials; no Flux GitRepository / source-controller artifact is involved.
+    assert!(
+        cluster
+            .list_preview_git_repositories()
+            .await
+            .unwrap()
+            .is_empty()
     );
-    assert_eq!(
-        repos[0]["spec"]["secretRef"]["name"],
-        "keel-preview-git-acme"
+    assert!(applied["spec"].get("fluxSource").is_none());
+    assert_eq!(applied["spec"]["projectRepo"], TENANT_GIT_URL);
+    assert!(
+        applied["spec"]["branch"]
+            .as_str()
+            .unwrap()
+            .starts_with("keel/acme/")
     );
+    assert_eq!(applied["spec"]["repoDir"], "tenants/acme/infra/vm-preview");
+    let git_copy = format!("keel-preview-{pr_id}-git-credentials");
+    assert_eq!(
+        applied["spec"]["gitAuth"],
+        json!({ "basicAuth": {
+            "userName": { "type": "Secret", "secret": { "name": git_copy, "key": "username" } },
+            "password": { "type": "Secret", "secret": { "name": git_copy, "key": "password" } }
+        }})
+    );
+    assert_eq!(applied["spec"]["shallow"], true);
+    // The read-only Git credential is copied per preview (only the auth keys), owned by the
+    // preview Stack and garbage-collected with it; no long-lived per-tenant mirror.
+    let copy = cluster
+        .preview_secret(&git_copy)
+        .expect("per-preview Git credential copy");
+    assert_eq!(copy.owner_stack, stack_name);
+    assert_eq!(
+        copy.data.keys().cloned().collect::<Vec<_>>(),
+        vec!["password".to_string(), "username".to_string()]
+    );
+    assert!(cluster.preview_secret("keel-preview-git-acme").is_none());
 
     // PKO finishes the preview; a *fresh* server state (restart: empty in-memory cache) collects
     // and publishes the real plan from cluster state only.
@@ -5219,6 +5305,22 @@ async fn test_pko_preview_lifecycle_is_applied_published_and_gced_from_cluster_s
             .iter()
             .any(|c| c.to_string().contains("PKO preview:** Succeeded")),
         "{comments:?}"
+    );
+
+    // A preview `GitRepository` left by a release before previews used PKO `gitSource` is still
+    // garbage-collected with its PR.
+    let legacy_repo = format!("preview-source-pr-{pr_id}");
+    cluster.put_legacy_git_repository(
+        &legacy_repo,
+        json!({
+            "apiVersion": "source.toolkit.fluxcd.io/v1",
+            "kind": "GitRepository",
+            "metadata": {
+                "name": legacy_repo,
+                "namespace": "keel-previews",
+                "labels": { "keel.io/pr-id": pr_id, "keel.io/ephemeral-preview": "true" }
+            }
+        }),
     );
 
     // Closing the PR out-of-band (not via the API) is still GC'd by the reconciler.
@@ -5485,8 +5587,18 @@ async fn test_preview_uses_tenant_backend_and_copies_only_referenced_provider_se
     let cluster = InMemoryPreviewCluster::new().with_prerequisites(PreviewPrerequisites {
         s3_secret: Some("keel-preview-s3-acme".to_string()),
         git_url: Some("http://forgejo.keel-system.svc:3000/keel/infra-gitops.git".to_string()),
-        git_secret: Some("keel-preview-git-acme".to_string()),
+        git_secret: Some("git-credentials".to_string()),
+        git_secret_keys: ["password".to_string(), "username".to_string()].into(),
     });
+    cluster.put_tenant_secret(
+        "acme",
+        "git-credentials",
+        &[
+            ("username", "git"),
+            ("password", "ro-token"),
+            ("other", "never"),
+        ],
+    );
     cluster.put_tenant_secret("acme", "unrelated-secret", &[("k", "v")]);
     cluster.put_tenant_secret(
         "acme",
@@ -5549,6 +5661,7 @@ async fn test_preview_uses_tenant_backend_and_copies_only_referenced_provider_se
         this_pr_copies,
         vec![
             copy_name.clone(),
+            format!("keel-preview-{pr}-git-credentials"),
             format!("keel-preview-{pr}-keel-pulumi-passphrase")
         ]
     );
@@ -5662,8 +5775,18 @@ async fn test_tenant_stacks_use_tenant_passphrase_secret_and_fail_closed_without
     let cluster = InMemoryPreviewCluster::new().with_prerequisites(PreviewPrerequisites {
         s3_secret: Some("keel-preview-s3-acme".to_string()),
         git_url: Some("http://forgejo.keel-system.svc:3000/keel/infra-gitops.git".to_string()),
-        git_secret: Some("keel-preview-git-acme".to_string()),
+        git_secret: Some("git-credentials".to_string()),
+        git_secret_keys: ["password".to_string(), "username".to_string()].into(),
     });
+    cluster.put_tenant_secret(
+        "acme",
+        "git-credentials",
+        &[
+            ("username", "git"),
+            ("password", "ro-token"),
+            ("other", "never"),
+        ],
+    );
     cluster.put_tenant_secret(
         "acme",
         "keel-pulumi-passphrase",
@@ -6259,6 +6382,362 @@ async fn commit_to_main(fixture: &TestFixture, files: &[(&str, &str)], message: 
     git.commit(
         workdir,
         message,
+        &CommitAuthor::new("Keel Seed", "seed@keel.local"),
+    )
+    .await
+    .unwrap();
+    git.push(workdir, "origin", "HEAD:refs/heads/main")
+        .await
+        .unwrap();
+}
+
+/// Tenant PKO Stacks clone the tenant's own platform-written Git source through PKO `gitSource`
+/// (`projectRepo`/`branch`/`repoDir`/`gitAuth` on the tenant's read-only `git-credentials`),
+/// never a Flux artifact downloaded from `source-controller`.
+#[tokio::test]
+async fn test_tenant_infra_stack_uses_pko_git_source_of_the_tenant() {
+    let fixture = setup_fixture().await;
+    let cookie = login_and_get_cookie(&fixture).await;
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "proxmox-vm", "kind": "infra",
+                "name": "gitsrc-vm", "values": { "cores": 2 } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    checkout_proposal_branch(&fixture, &body).await;
+    let raw = std::fs::read_to_string(
+        fixture
+            .state
+            .repo_workdir
+            .join("tenants/acme/infra/gitsrc-vm/stack.yaml"),
+    )
+    .unwrap();
+    let stack: Value = serde_yml::from_str(&raw).unwrap();
+    assert_eq!(stack["metadata"]["namespace"], "tenant-acme");
+    assert!(stack["spec"].get("fluxSource").is_none(), "{raw}");
+    assert_eq!(stack["spec"]["projectRepo"], TENANT_GIT_URL);
+    assert_eq!(stack["spec"]["branch"], "main");
+    assert!(stack["spec"].get("commit").is_none());
+    assert_eq!(stack["spec"]["repoDir"], "tenants/acme/infra/gitsrc-vm");
+    assert_eq!(
+        stack["spec"]["gitAuth"],
+        json!({ "basicAuth": {
+            "userName": { "type": "Secret", "secret": { "name": "git-credentials", "key": "username" } },
+            "password": { "type": "Secret", "secret": { "name": "git-credentials", "key": "password" } }
+        }})
+    );
+}
+
+/// A tenant without a platform-written Git source (e.g. created through `POST /api/v1/tenants`)
+/// cannot get a Pulumi Stack: `409` with an actionable message, no branch, commit or PR, and no
+/// fallback to the platform repository. Flux-only changes for the same tenant still work.
+#[tokio::test]
+async fn test_stack_proposal_fails_closed_without_tenant_git_source() {
+    let fixture = setup_fixture().await;
+    let cookie = login_and_get_cookie(&fixture).await;
+    remove_tenant_git_source_stub(&fixture, "acme").await;
+    let before = fixture
+        .state
+        .forge
+        .list_pull_requests(None, None)
+        .await
+        .unwrap()
+        .len();
+
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "proxmox-vm", "kind": "infra",
+                "name": "nosrc-vm", "values": { "cores": 2 } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    let err: Value = serde_json::from_str(&body).unwrap();
+    let msg = err["error"].as_str().unwrap();
+    assert!(msg.contains("tenants/acme/git-repository.yaml"), "{msg}");
+    assert!(msg.contains("tenant-acme/keel-gitops"), "{msg}");
+    assert!(
+        msg.contains("no fallback to the platform repository"),
+        "{msg}"
+    );
+    assert!(!msg.contains("flux-system/flux-system"), "{msg}");
+    assert_eq!(
+        fixture
+            .state
+            .forge
+            .list_pull_requests(None, None)
+            .await
+            .unwrap()
+            .len(),
+        before
+    );
+    assert!(
+        !fixture
+            .state
+            .repo_workdir
+            .join("tenants/acme/infra/nosrc-vm")
+            .exists()
+    );
+
+    // Helm apps (Flux only, no PKO Stack) are unaffected.
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "grafana", "name": "dash",
+                "values": { "replicas": 1 } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+}
+
+/// `keel serve --repo-dir` paths may contain spaces: the control-plane remote (a local bare repo)
+/// is never used as a preview clone URL, so Helm and Pulumi proposals still open (201) and the
+/// returned preview Stack never exposes the server's filesystem path.
+#[tokio::test]
+async fn test_proposals_work_when_the_local_repo_path_has_spaces() {
+    let fixture = setup_fixture_at("My Repos/remote gitops.git", "work dir").await;
+    SecretStateStore::ensure_pulumi_passphrase(fixture.secret_store.as_ref(), "tenant-acme")
+        .await
+        .unwrap();
+    let cookie = login_and_get_cookie(&fixture).await;
+    assert!(fixture.state.remote_url.contains(' '));
+
+    for body in [
+        json!({ "tenant": "acme", "catalogId": "grafana", "name": "dash",
+                "values": { "replicas": 1 } }),
+        json!({ "tenant": "acme", "catalogId": "proxmox-vm", "kind": "infra",
+                "name": "space-vm", "values": { "cores": 2 } }),
+    ] {
+        let (status, raw) = post_proposal(&fixture, &cookie, body).await;
+        assert_eq!(status, StatusCode::CREATED, "{raw}");
+        let parsed: Value = serde_json::from_str(&raw).unwrap();
+        let preview = parsed["previewStack"].to_string();
+        assert!(
+            !preview.contains("My Repos"),
+            "server path in the preview Stack: {preview}"
+        );
+        // Synthesized-only preview (no live cluster): no clone URL at all.
+        assert!(
+            parsed["previewStack"]["spec"].get("projectRepo").is_none(),
+            "{raw}"
+        );
+        assert!(
+            parsed["previewStack"]["spec"].get("fluxSource").is_none(),
+            "{raw}"
+        );
+        assert_eq!(parsed["report"]["run"]["phase"], "notExecuted", "{raw}");
+    }
+}
+
+/// Commits `content` at `rel` on `main` (simulating manifests written by earlier releases).
+async fn commit_on_main(fixture: &TestFixture, rel: &str, content: &str) {
+    let git = &fixture.state.git_runner;
+    let workdir = &fixture.state.repo_workdir;
+    let path = workdir.join(rel);
+    tokio::fs::create_dir_all(path.parent().unwrap())
+        .await
+        .unwrap();
+    tokio::fs::write(&path, content).await.unwrap();
+    git.add(workdir, [rel]).await.unwrap();
+    git.commit(
+        workdir,
+        &format!("chore: seed {rel}"),
+        &CommitAuthor::new("Keel Seed", "seed@keel.local"),
+    )
+    .await
+    .unwrap();
+    git.push(workdir, "origin", "HEAD:refs/heads/main")
+        .await
+        .unwrap();
+}
+
+async fn post_stack_source_migration(
+    fixture: &TestFixture,
+    cookie: &str,
+    tenant: &str,
+    dry_run: bool,
+) -> (StatusCode, Value) {
+    let uri = if dry_run {
+        format!("/api/v1/tenants/{tenant}/stack-sources/migrate?dryRun=true")
+    } else {
+        format!("/api/v1/tenants/{tenant}/stack-sources/migrate")
+    };
+    let res = build_router(fixture.state.clone())
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(uri)
+                .header(COOKIE, cookie)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = res.status();
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    (
+        status,
+        serde_json::from_slice(&bytes)
+            .unwrap_or_else(|_| json!({ "raw": String::from_utf8_lossy(&bytes) })),
+    )
+}
+
+const LEGACY_ACME_STACK: &str = "apiVersion: pulumi.com/v1
+kind: Stack
+metadata:
+  name: legacy-vm
+  namespace: tenant-acme
+  labels:
+    keel.io/provider: proxmox
+spec:
+  stack: organization/proxmox-vm/acme-legacy-vm
+  backend: s3://pulumi-state/tenants/acme
+  fluxSource:
+    sourceRef:
+      apiVersion: source.toolkit.fluxcd.io/v1
+      kind: GitRepository
+      name: keel-gitops
+    dir: tenants/acme/infra/legacy-vm
+  config:
+    cores: '2'
+  resyncFrequencySeconds: 300
+";
+
+/// Stacks committed by earlier releases (`fluxSource` → `tenant-<id>/keel-gitops`, which needs
+/// `source-controller` artifacts on port 9090) are moved to PKO `gitSource` through one reviewed
+/// PR (never a direct commit to `main`), before that port is closed to tenant namespaces.
+#[tokio::test]
+async fn test_legacy_flux_source_stacks_migrate_to_git_source_through_one_pr() {
+    let fixture = setup_fixture().await;
+    let admin = login_and_get_cookie(&fixture).await;
+    commit_on_main(
+        &fixture,
+        "tenants/acme/infra/legacy-vm/stack.yaml",
+        LEGACY_ACME_STACK,
+    )
+    .await;
+    // A Stack in another namespace is reported, never rewritten.
+    commit_on_main(
+        &fixture,
+        "tenants/acme/infra/odd/stack.yaml",
+        &LEGACY_ACME_STACK.replace("namespace: tenant-acme", "namespace: flux-system"),
+    )
+    .await;
+    let prs_before = fixture
+        .state
+        .forge
+        .list_pull_requests(None, None)
+        .await
+        .unwrap()
+        .len();
+
+    // Non-admins cannot run it.
+    let tenant_admin =
+        login_with_groups(&fixture, "admin@acme.local", vec!["tenant-acme-admin"]).await;
+    let (status, _) = post_stack_source_migration(&fixture, &tenant_admin, "acme", false).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // Dry run: lists, opens nothing.
+    let (status, body) = post_stack_source_migration(&fixture, &admin, "acme", true).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["migrated"],
+        json!(["tenants/acme/infra/legacy-vm/stack.yaml"])
+    );
+    assert_eq!(
+        body["skipped"][0]["path"],
+        "tenants/acme/infra/odd/stack.yaml"
+    );
+    assert!(body.get("proposal").is_none(), "{body}");
+
+    let (status, body) = post_stack_source_migration(&fixture, &admin, "acme", false).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert!(
+        body["branch"]
+            .as_str()
+            .unwrap()
+            .starts_with("keel/acme/migrate-stack-sources-")
+    );
+    assert_eq!(
+        fixture
+            .state
+            .forge
+            .list_pull_requests(None, None)
+            .await
+            .unwrap()
+            .len(),
+        prs_before + 1
+    );
+    // `main` is untouched until the PR is merged.
+    let on_main = std::fs::read_to_string(
+        fixture
+            .state
+            .repo_workdir
+            .join("tenants/acme/infra/legacy-vm/stack.yaml"),
+    )
+    .unwrap();
+    assert!(on_main.contains("fluxSource"));
+
+    checkout_proposal_branch(&fixture, &body.to_string()).await;
+    let raw = std::fs::read_to_string(
+        fixture
+            .state
+            .repo_workdir
+            .join("tenants/acme/infra/legacy-vm/stack.yaml"),
+    )
+    .unwrap();
+    let stack: Value = serde_yml::from_str(&raw).unwrap();
+    assert!(stack["spec"].get("fluxSource").is_none(), "{raw}");
+    assert_eq!(stack["spec"]["projectRepo"], TENANT_GIT_URL);
+    assert_eq!(stack["spec"]["branch"], "main");
+    assert_eq!(stack["spec"]["repoDir"], "tenants/acme/infra/legacy-vm");
+    assert_eq!(stack["spec"]["shallow"], true);
+    assert_eq!(
+        stack["spec"]["gitAuth"]["basicAuth"]["password"]["secret"]["name"],
+        "git-credentials"
+    );
+    // Programs, config and identity are unchanged.
+    assert_eq!(
+        stack["spec"]["stack"],
+        "organization/proxmox-vm/acme-legacy-vm"
+    );
+    assert_eq!(stack["spec"]["config"]["cores"], "2");
+    assert_eq!(stack["metadata"]["labels"]["keel.io/provider"], "proxmox");
+    let odd = std::fs::read_to_string(
+        fixture
+            .state
+            .repo_workdir
+            .join("tenants/acme/infra/odd/stack.yaml"),
+    )
+    .unwrap();
+    assert!(odd.contains("fluxSource"), "{odd}");
+    fixture
+        .state
+        .git_runner
+        .checkout_branch(&fixture.state.repo_workdir, "main")
+        .await
+        .unwrap();
+
+    // Without a platform-written source the migration fails closed (409), like new Stacks.
+    remove_tenant_git_source_stub(&fixture, "acme").await;
+    let (status, body) = post_stack_source_migration(&fixture, &admin, "acme", false).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+}
+
+/// Deletes the platform-written `tenants/<tenant>/git-repository.yaml` stub on `main`
+/// (tenants created through `POST /api/v1/tenants` have none yet).
+async fn remove_tenant_git_source_stub(fixture: &TestFixture, tenant: &str) {
+    let git = &fixture.state.git_runner;
+    let workdir = &fixture.state.repo_workdir;
+    let rel = format!("tenants/{tenant}/git-repository.yaml");
+    tokio::fs::remove_file(workdir.join(&rel)).await.unwrap();
+    git.add(workdir, [rel.as_str()]).await.unwrap();
+    git.commit(
+        workdir,
+        &format!("chore: drop {tenant} Git source"),
         &CommitAuthor::new("Keel Seed", "seed@keel.local"),
     )
     .await
@@ -8419,6 +8898,7 @@ async fn test_helm_app_secrets_in_non_default_tenant_use_root_tenants_kustomizat
     let fixture = setup_fixture().await;
     let cookie = login_and_get_cookie(&fixture).await;
     seed_builtin_helm_catalog(&fixture, "forgejo", FORGEJO_APP_CATALOG).await;
+    remove_tenant_git_source_stub(&fixture, "acme").await;
     let workdir = fixture.state.repo_workdir.clone();
     assert!(!workdir.join("tenants/acme/git-repository.yaml").exists());
     let dir = workdir.join("tenants/acme/apps/git");

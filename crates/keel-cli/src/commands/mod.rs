@@ -29,6 +29,7 @@ use crate::cli::{
 pub use api::{
     execute_app_list, execute_catalog_list, execute_catalog_show, execute_proposal_close,
     execute_proposal_list, execute_proposal_merge, execute_proposal_show,
+    execute_tenant_migrate_stack_sources,
 };
 pub use auth::{
     AuthLoginOutcome, PkceChallenge, execute_auth_login, execute_auth_logout, execute_auth_status,
@@ -551,6 +552,9 @@ pub async fn dispatch(cli: &Cli, ctx: &CliContext) -> Result<String, CliError> {
                         .await?
                         .render(),
                 )
+            }
+            TenantCommands::MigrateStackSources(args) => {
+                execute_tenant_migrate_stack_sources(&with_server!(args), ctx).await
             }
         },
     }
@@ -1259,6 +1263,17 @@ spec:
         .await
         .unwrap();
 
+        // Platform-written tenant Git source: tenant PKO Stacks clone only their own source.
+        tokio::fs::create_dir_all(work_dir.join("tenants/acme"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            work_dir.join("tenants/acme/git-repository.yaml"),
+            "apiVersion: source.toolkit.fluxcd.io/v1\nkind: GitRepository\nmetadata:\n  name: keel-gitops\n  namespace: tenant-acme\nspec:\n  interval: 1m\n  url: https://forge.example/keel/infra-gitops.git\n  ref:\n    branch: main\n  secretRef:\n    name: git-credentials\n",
+        )
+        .await
+        .unwrap();
+
         let git = GitRunner::new();
         git.add(
             &work_dir,
@@ -1266,6 +1281,7 @@ spec:
                 "providers/registry.yaml",
                 "catalog/apps/authentik/catalog.yaml",
                 "catalog/infra/postgres-managed/catalog.yaml",
+                "tenants/acme/git-repository.yaml",
             ],
         )
         .await

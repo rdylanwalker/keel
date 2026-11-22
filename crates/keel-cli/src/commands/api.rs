@@ -7,6 +7,7 @@ use serde_json::Value;
 
 use crate::cli::{
     AppListArgs, CatalogListArgs, CatalogShowArgs, OutputFormat, ProposalListArgs, ProposalRefArgs,
+    TenantMigrateStackSourcesArgs,
 };
 
 use super::{
@@ -80,9 +81,19 @@ async fn get_json(
 }
 
 async fn post_json(ctx: &CliContext, base_url: &str, path: &str) -> Result<Value, CliError> {
+    post_json_query(ctx, base_url, path, &[]).await
+}
+
+async fn post_json_query(
+    ctx: &CliContext,
+    base_url: &str,
+    path: &str,
+    query: &[(&str, &str)],
+) -> Result<Value, CliError> {
     let resp = attach_auth(
         ctx.http
             .post(format!("{base_url}{path}"))
+            .query(query)
             .json(&serde_json::json!({})),
         ctx,
         base_url,
@@ -384,6 +395,91 @@ pub async fn execute_app_list(args: &AppListArgs, ctx: &CliContext) -> Result<St
     }
 }
 
+/// Renders the `POST /api/v1/tenants/{id}/stack-sources/migrate` response.
+pub(crate) fn format_stack_source_migration(payload: &Value) -> String {
+    let tenant = s(payload, &["tenant"]);
+    let strings = |field: &str| -> Vec<String> {
+        payload
+            .get(field)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect()
+    };
+    let migrated = strings("migrated");
+    let dry_run = payload
+        .get("dryRun")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let mut out = if migrated.is_empty() {
+        format!("Tenant `{tenant}`: no Stacks use fluxSource; nothing to migrate.\n")
+    } else if dry_run {
+        format!(
+            "Tenant `{tenant}`: {} Stack(s) would move to PKO gitSource (dry run):\n",
+            migrated.len()
+        )
+    } else {
+        format!(
+            "Tenant `{tenant}`: opened a PR moving {} Stack(s) to PKO gitSource:\n",
+            migrated.len()
+        )
+    };
+    for path in &migrated {
+        out.push_str(&format!("  {path}\n"));
+    }
+    if let Some(pr) = payload.get("proposal").filter(|p| !p.is_null()) {
+        out.push_str(&format!(
+            "Proposal #{}: {} ({})\nReview and merge it (`keel proposal merge {}`).\n",
+            s(pr, &["id"]),
+            s(pr, &["title"]),
+            s(pr, &["url"]),
+            s(pr, &["id"])
+        ));
+    }
+    if let Some(skipped) = payload
+        .get("skipped")
+        .and_then(Value::as_array)
+        .filter(|a| !a.is_empty())
+    {
+        out.push_str("Not migrated (review manually):\n");
+        for item in skipped {
+            out.push_str(&format!(
+                "  {}: {}\n",
+                s(item, &["path"]),
+                s(item, &["reason"])
+            ));
+        }
+    }
+    out
+}
+
+/// `keel tenant migrate-stack-sources --tenant <id> [--dry-run]`.
+pub async fn execute_tenant_migrate_stack_sources(
+    args: &TenantMigrateStackSourcesArgs,
+    ctx: &CliContext,
+) -> Result<String, CliError> {
+    let tenant = normalize_tenant_arg(&args.tenant);
+    keel_core::validate_dns_label(&tenant, "tenant")?;
+    let base_url = normalize_server_url(&args.server)?;
+    let query: &[(&str, &str)] = if args.dry_run {
+        &[("dryRun", "true")]
+    } else {
+        &[]
+    };
+    let payload = post_json_query(
+        ctx,
+        &base_url,
+        &format!("/api/v1/tenants/{tenant}/stack-sources/migrate"),
+        query,
+    )
+    .await?;
+    match args.output {
+        OutputFormat::Json => pretty(&payload),
+        OutputFormat::Table => Ok(format_stack_source_migration(&payload)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -407,5 +503,30 @@ mod tests {
         }));
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[1][1], "blueprint");
+    }
+
+    #[test]
+    fn stack_source_migration_output() {
+        let opened = format_stack_source_migration(&json!({
+            "tenant": "default", "dryRun": false,
+            "migrated": ["tenants/default/infra/kind/stack.yaml"],
+            "skipped": [{"path": "tenants/default/x/stack.yaml", "reason": "fluxSource is not the tenant's own GitRepository"}],
+            "proposal": {"id": "12", "title": "fix(default): clone tenant PKO Stacks with gitSource", "url": "http://forge/pr/12"}
+        }));
+        assert!(opened.contains("opened a PR moving 1 Stack(s)"), "{opened}");
+        assert!(opened.contains("tenants/default/infra/kind/stack.yaml"));
+        assert!(opened.contains("keel proposal merge 12"));
+        assert!(opened.contains("Not migrated"));
+        let dry = format_stack_source_migration(&json!({
+            "tenant": "acme", "dryRun": true, "migrated": ["tenants/acme/infra/vm/stack.yaml"], "skipped": []
+        }));
+        assert!(
+            dry.contains("would move to PKO gitSource (dry run)"),
+            "{dry}"
+        );
+        let none = format_stack_source_migration(
+            &json!({"tenant": "acme", "migrated": [], "skipped": []}),
+        );
+        assert!(none.contains("nothing to migrate"), "{none}");
     }
 }

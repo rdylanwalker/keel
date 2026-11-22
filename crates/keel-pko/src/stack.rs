@@ -164,6 +164,316 @@ impl PkoFluxSource {
     }
 }
 
+/// Flux `GitRepository` Secret keys understood by [`PkoGitAuth::from_flux_secret`].
+const FLUX_SECRET_IDENTITY_KEY: &str = "identity";
+const FLUX_SECRET_USERNAME_KEY: &str = "username";
+const FLUX_SECRET_PASSWORD_KEY: &str = "password";
+const FLUX_SECRET_BEARER_TOKEN_KEY: &str = "bearerToken";
+
+/// SSH private-key authentication for a PKO v2 Git source (`spec.gitAuth.sshAuth`).
+///
+/// Schema: PKO 2.10.1 `stacks.pulumi.com` CRD (chart
+/// `oci://ghcr.io/pulumi/helm-charts/pulumi-kubernetes-operator` 2.10.1, `helm show crds`):
+/// `sshAuth.sshPrivateKey` (required) and `sshAuth.password` (optional), both `ResourceRef`s.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PkoGitSshAuth {
+    pub ssh_private_key: PkoEnvRef,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<PkoEnvRef>,
+}
+
+/// Basic authentication for a PKO v2 Git source (`spec.gitAuth.basicAuth`); PKO 2.10.1 requires
+/// both `userName` and `password` (`ResourceRef`s).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PkoGitBasicAuth {
+    pub user_name: PkoEnvRef,
+    pub password: PkoEnvRef,
+}
+
+/// PKO v2 `spec.gitAuth` (PKO 2.10.1 CRD: `sshAuth`, `basicAuth`, `accessToken`, `githubApp`).
+///
+/// Every reference is a `{type: Secret, secret: {name, key}}` `ResourceRef` to a Secret in the
+/// Stack's own namespace (PKO namespace isolation rejects a `secret.namespace`). PKO prefers SSH,
+/// then the access token, then basic auth; Keel only ever sets one of them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PkoGitAuth {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh_auth: Option<PkoGitSshAuth>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub basic_auth: Option<PkoGitBasicAuth>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_token: Option<PkoEnvRef>,
+}
+
+impl PkoGitAuth {
+    /// Maps a Flux `GitRepository` credentials Secret (`secretRef`) to PKO `gitAuth` referencing the
+    /// same Secret (no copy): `identity` (+ optional `password` passphrase) becomes `sshAuth`,
+    /// `username` + `password` becomes `basicAuth`, and a lone `password` or `bearerToken` becomes
+    /// `accessToken`.
+    ///
+    /// `keys` are the keys present in the Secret. When unknown (empty), they are inferred from the
+    /// URL the way Flux does: SSH URLs use `identity`, HTTP(S) URLs `username`/`password` (the
+    /// layout of the platform-written read-only `git-credentials` Secret).
+    pub fn from_flux_secret(
+        secret_name: &str,
+        repo_url: &str,
+        keys: &BTreeSet<String>,
+    ) -> Result<Self, PkoError> {
+        validate_k8s_name("git_secret_name", secret_name)?;
+        let ssh = is_ssh_git_url(repo_url);
+        let inferred: BTreeSet<String>;
+        let keys = if keys.is_empty() {
+            inferred = if ssh {
+                BTreeSet::from([FLUX_SECRET_IDENTITY_KEY.to_string()])
+            } else {
+                BTreeSet::from([
+                    FLUX_SECRET_USERNAME_KEY.to_string(),
+                    FLUX_SECRET_PASSWORD_KEY.to_string(),
+                ])
+            };
+            &inferred
+        } else {
+            keys
+        };
+        let has = |k: &str| keys.contains(k);
+        let secret_ref = |k: &str| PkoEnvRef::from_secret(secret_name, k);
+        if has(FLUX_SECRET_IDENTITY_KEY) {
+            return Ok(Self {
+                ssh_auth: Some(PkoGitSshAuth {
+                    ssh_private_key: secret_ref(FLUX_SECRET_IDENTITY_KEY),
+                    password: has(FLUX_SECRET_PASSWORD_KEY)
+                        .then(|| secret_ref(FLUX_SECRET_PASSWORD_KEY)),
+                }),
+                ..Self::default()
+            });
+        }
+        if ssh {
+            return Err(PkoError::Validation(format!(
+                "Git credentials Secret '{secret_name}' has no `identity` key for SSH URL '{repo_url}'"
+            )));
+        }
+        if has(FLUX_SECRET_USERNAME_KEY) && has(FLUX_SECRET_PASSWORD_KEY) {
+            return Ok(Self {
+                basic_auth: Some(PkoGitBasicAuth {
+                    user_name: secret_ref(FLUX_SECRET_USERNAME_KEY),
+                    password: secret_ref(FLUX_SECRET_PASSWORD_KEY),
+                }),
+                ..Self::default()
+            });
+        }
+        for token_key in [FLUX_SECRET_PASSWORD_KEY, FLUX_SECRET_BEARER_TOKEN_KEY] {
+            if has(token_key) {
+                return Ok(Self {
+                    access_token: Some(secret_ref(token_key)),
+                    ..Self::default()
+                });
+            }
+        }
+        Err(PkoError::Validation(format!(
+            "Git credentials Secret '{secret_name}' has no usable Git auth key (expected \
+             `identity`, `username`+`password`, `password` or `bearerToken`)"
+        )))
+    }
+
+    /// Names of the Secrets referenced by this `gitAuth`.
+    pub fn secret_names(&self) -> BTreeSet<String> {
+        let mut refs: Vec<&PkoEnvRef> = Vec::new();
+        if let Some(ssh) = &self.ssh_auth {
+            refs.push(&ssh.ssh_private_key);
+            refs.extend(ssh.password.as_ref());
+        }
+        if let Some(basic) = &self.basic_auth {
+            refs.push(&basic.user_name);
+            refs.push(&basic.password);
+        }
+        refs.extend(self.access_token.as_ref());
+        refs.into_iter().map(|r| r.secret.name.clone()).collect()
+    }
+}
+
+/// PKO v2 Git source fields of a `Stack` spec (`projectRepo`, `branch` | `commit`, `repoDir`,
+/// `gitAuth`), flattened into [`PkoStackSpec`]. The workspace pod clones `projectRepo` directly,
+/// so tenant and preview Stacks never download a Flux artifact from `source-controller`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PkoGitSource {
+    pub project_repo: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_dir: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_auth: Option<PkoGitAuth>,
+    /// PKO `spec.shallow`: shallow (depth 1) checkout instead of cloning the full history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shallow: Option<bool>,
+}
+
+impl PkoGitSource {
+    /// Tracks `branch` of `project_repo` (PKO polls it every `resyncFrequencySeconds`) with a
+    /// shallow checkout (`shallow: true`): workspaces only need the tip, not the repository history.
+    pub fn branch(
+        project_repo: impl Into<String>,
+        branch: impl Into<String>,
+        repo_dir: impl Into<String>,
+    ) -> Self {
+        Self {
+            project_repo: project_repo.into(),
+            branch: Some(branch.into()),
+            commit: None,
+            repo_dir: Some(repo_dir.into()),
+            git_auth: None,
+            shallow: Some(true),
+        }
+    }
+
+    /// Sets `gitAuth`.
+    pub fn with_auth(mut self, auth: Option<PkoGitAuth>) -> Self {
+        self.git_auth = auth;
+        self
+    }
+
+    /// Validates the source: a network Git URL (`https://`, `http://`, `ssh://` or scp-like
+    /// `user@host:path`, never a local path, `file://` or a git remote helper such as `ext::`),
+    /// exactly one of `branch`/`commit`, a contained `repoDir` and well-formed Secret names.
+    pub fn validate(&self) -> Result<(), PkoError> {
+        validate_git_source_url(&self.project_repo)?;
+        match (&self.branch, &self.commit) {
+            (Some(b), None) => validate_git_ref_name("branch", b)?,
+            (None, Some(c)) => {
+                if c.len() < 7 || !c.chars().all(|ch| ch.is_ascii_hexdigit()) {
+                    return Err(PkoError::Validation(format!(
+                        "commit '{c}' must be a hexadecimal Git commit SHA"
+                    )));
+                }
+            }
+            _ => {
+                return Err(PkoError::Validation(
+                    "a PKO Git source needs exactly one of branch or commit".to_string(),
+                ));
+            }
+        }
+        if let Some(dir) = &self.repo_dir {
+            validate_repo_dir(dir)?;
+            if dir.starts_with('/') {
+                return Err(PkoError::Validation(format!(
+                    "repo_dir '{dir}' must be relative to the repository root"
+                )));
+            }
+        }
+        if let Some(auth) = &self.git_auth {
+            for name in auth.secret_names() {
+                validate_k8s_name("git_auth_secret", &name)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// `true` for `ssh://` and scp-like (`user@host:path`) Git URLs.
+pub fn is_ssh_git_url(url: &str) -> bool {
+    let url = url.trim();
+    if url.starts_with("ssh://") {
+        return true;
+    }
+    !url.contains("://")
+        && url
+            .split_once(':')
+            .is_some_and(|(host, _)| host.contains('@') && !host.contains('/'))
+}
+
+/// Accepts only network Git URLs PKO workspace pods can clone: `https://`, `http://`, `ssh://`
+/// or scp-like `user@host:path`. Rejects local paths, `file://`, git remote helpers (`ext::`,
+/// `fd::`), option-like values and whitespace/control characters.
+pub fn validate_git_source_url(url: &str) -> Result<(), PkoError> {
+    // Never echo embedded credentials (`https://user:token@host/...`) into errors or logs.
+    let shown = match url.split_once("://") {
+        Some((scheme, rest)) if rest.split('/').next().unwrap_or_default().contains('@') => {
+            let host = rest.split_once('@').map(|(_, h)| h).unwrap_or_default();
+            format!("{scheme}://***@{host}")
+        }
+        _ => url.to_string(),
+    };
+    let invalid = |why: &str| {
+        Err(PkoError::Validation(format!(
+            "Git source URL '{shown}' {why}; PKO Stacks clone only network Git URLs \
+             (https://, http://, ssh:// or user@host:path)"
+        )))
+    };
+    if url.is_empty() || url.trim() != url {
+        return invalid("is empty or has surrounding whitespace");
+    }
+    if url.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return invalid("contains whitespace or control characters");
+    }
+    if url.starts_with('-') || is_git_remote_helper_url(url) {
+        return invalid("is not allowed");
+    }
+    let lower = url.to_ascii_lowercase();
+    if let Some(rest) = ["https://", "http://"]
+        .iter()
+        .find_map(|scheme| lower.strip_prefix(scheme))
+        && rest.split('/').next().unwrap_or_default().contains('@')
+    {
+        // Credentials belong in the `gitAuth` Secret, never in a committed URL.
+        return invalid("embeds credentials");
+    }
+    let host_part = if let Some(rest) = ["https://", "http://", "ssh://"]
+        .iter()
+        .find_map(|scheme| lower.strip_prefix(scheme))
+    {
+        rest
+    } else if is_ssh_git_url(url) {
+        lower.split_once('@').map(|(_, h)| h).unwrap_or_default()
+    } else {
+        return invalid("is not a network Git URL");
+    };
+    let host = host_part
+        .split(['/', ':'])
+        .next()
+        .unwrap_or_default()
+        .rsplit('@')
+        .next()
+        .unwrap_or_default();
+    if host.is_empty() {
+        return invalid("has no host");
+    }
+    Ok(())
+}
+
+/// `true` for git remote-helper URLs (`<transport>::<address>`, e.g. `ext::`, `fd::`), which can
+/// run arbitrary commands. Bracketed IPv6 hosts (`http://[::1]/...`) are not helpers.
+fn is_git_remote_helper_url(url: &str) -> bool {
+    url.split_once("::")
+        .is_some_and(|(transport, _)| !transport.contains('/') && !transport.contains('['))
+}
+
+fn validate_git_ref_name(field: &str, value: &str) -> Result<(), PkoError> {
+    let ok = !value.is_empty()
+        && !value.starts_with('-')
+        && !value.starts_with('/')
+        && !value.ends_with('/')
+        && !value.ends_with(".lock")
+        && !value.contains("..")
+        && !value.contains("//")
+        && !value.contains("@{")
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/'));
+    if ok {
+        Ok(())
+    } else {
+        Err(PkoError::Validation(format!(
+            "{field} '{value}' is not a valid Git branch name"
+        )))
+    }
+}
+
 /// Secret key selector for environment variable injection in PKO workspace pods.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -497,6 +807,10 @@ pub struct PkoStackSpec {
     pub backend: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub flux_source: Option<PkoFluxSource>,
+    /// PKO Git source (`projectRepo`/`branch`/`commit`/`repoDir`/`gitAuth`), used by tenant and
+    /// preview Stacks instead of `fluxSource` (only the `flux-system` management Stack keeps that).
+    #[serde(flatten)]
+    pub git_source: Option<PkoGitSource>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub preview: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -548,8 +862,19 @@ impl PkoStack {
     }
 
     /// Deserializes a `Stack` CR from a `serde_json::Value`.
+    ///
+    /// A spec carrying `projectRepo` must parse into a complete [`PkoGitSource`]: the flattened
+    /// `Option` would otherwise silently drop a malformed Git source (e.g. a bad `gitAuth`).
     pub fn from_json_value(value: serde_json::Value) -> Result<Self, PkoError> {
-        Ok(serde_json::from_value(value)?)
+        let has_project_repo = value.pointer("/spec/projectRepo").is_some();
+        let stack: Self = serde_json::from_value(value)?;
+        if has_project_repo && stack.spec.git_source.is_none() {
+            return Err(PkoError::Validation(format!(
+                "Stack '{}' has a malformed Git source (spec.projectRepo/branch/commit/repoDir/gitAuth)",
+                stack.metadata.name
+            )));
+        }
+        Ok(stack)
     }
 
     /// Serializes this `Stack` CR to a YAML manifest string.
@@ -557,9 +882,11 @@ impl PkoStack {
         Ok(serde_yml::to_string(self)?)
     }
 
-    /// Deserializes a `Stack` CR from a YAML manifest string.
+    /// Deserializes a `Stack` CR from a YAML manifest string (same Git source checks as
+    /// [`PkoStack::from_json_value`]).
     pub fn from_yaml(yaml: &str) -> Result<Self, PkoError> {
-        Ok(serde_yml::from_str(yaml)?)
+        let value: serde_json::Value = serde_yml::from_str(yaml)?;
+        Self::from_json_value(value)
     }
 
     /// Returns `true` if anti-lockout protection is active on this stack.
@@ -588,34 +915,25 @@ impl PkoStack {
     }
 }
 
-/// Synthesized bundle of ephemeral PR preview CRs in `keel-previews` (`SDD.md` §4.2).
+/// Synthesized ephemeral PR preview `Stack` in `keel-previews` (`SDD.md` §4.2). The Stack clones
+/// the PR branch directly through PKO `gitSource` (no Flux `GitRepository`/artifact involved).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PreviewStack {
     pub pr_id: String,
     pub tenant: String,
     pub branch: String,
-    pub git_repository: FluxGitRepository,
     pub stack: PkoStack,
 }
 
 impl PreviewStack {
-    /// Renders both the Flux `GitRepository` and PKO `Stack` as a multi-document YAML manifest.
-    pub fn to_multi_doc_yaml(&self) -> Result<String, PkoError> {
-        let repo_yaml = self.git_repository.to_yaml()?;
-        let stack_yaml = self.stack.to_yaml()?;
-        Ok(format!(
-            "---\n{}---\n{}",
-            ensure_trailing_newline(&repo_yaml),
-            stack_yaml
-        ))
+    /// Renders the preview PKO `Stack` as a YAML manifest.
+    pub fn to_yaml(&self) -> Result<String, PkoError> {
+        self.stack.to_yaml()
     }
 
-    /// Converts both the Flux `GitRepository` and PKO `Stack` into `(GitRepository, Stack)` JSON values.
-    pub fn to_json_values(&self) -> Result<(serde_json::Value, serde_json::Value), PkoError> {
-        Ok((
-            self.git_repository.to_json_value()?,
-            self.stack.to_json_value()?,
-        ))
+    /// Converts the preview PKO `Stack` into a JSON value.
+    pub fn to_json_value(&self) -> Result<serde_json::Value, PkoError> {
+        self.stack.to_json_value()
     }
 }
 
@@ -661,12 +979,23 @@ pub struct EphemeralPreviewParams {
     pub pr_id: String,
     pub tenant: String,
     pub branch: String,
-    pub repo_url: String,
+    /// Git URL the preview `Stack` clones (`spec.projectRepo`). Only ever the tenant's own
+    /// platform-written source, set once the preview is going to be applied; `None` leaves
+    /// `projectRepo` unset (synthesized-only previews are never applied and never carry the
+    /// control-plane remote).
+    pub repo_url: Option<String>,
     pub repo_dir: String,
     pub pulumi_stack_name: String,
     pub backend_url: String,
     pub preview_service_account: Option<String>,
+    /// `keel-previews` Secret mirroring the tenant's read-only Git credentials (`gitAuth`).
     pub git_secret_name: Option<String>,
+    /// Keys present in [`Self::git_secret_name`] (selects the PKO `gitAuth` mode; inferred from the
+    /// URL when empty, see [`PkoGitAuth::from_flux_secret`]).
+    pub git_secret_keys: BTreeSet<String>,
+    /// Git URL of the tenant `Stack` being previewed (its platform-written `gitSource.projectRepo`),
+    /// set by [`EphemeralPreviewParams::inherit_tenant_stack`].
+    pub tenant_repo_url: Option<String>,
     pub config: BTreeMap<String, String>,
     pub env_refs: BTreeMap<String, PkoEnvRef>,
     /// Pulumi config secrets (`spec.secretsRef`), only ever pointing at per-preview Secret copies
@@ -688,7 +1017,6 @@ impl EphemeralPreviewParams {
         tenant: impl Into<String>,
         action: impl Into<String>,
         timestamp: u64,
-        repo_url: impl Into<String>,
         repo_dir: impl Into<String>,
         pulumi_stack_name: impl Into<String>,
         backend_url: impl Into<String>,
@@ -700,12 +1028,14 @@ impl EphemeralPreviewParams {
             pr_id: pr_id.into(),
             tenant: tenant_str,
             branch,
-            repo_url: repo_url.into(),
+            repo_url: None,
             repo_dir: repo_dir.into(),
             pulumi_stack_name: pulumi_stack_name.into(),
             backend_url: backend_url.into(),
             preview_service_account: None,
             git_secret_name: None,
+            git_secret_keys: BTreeSet::new(),
+            tenant_repo_url: None,
             config: BTreeMap::new(),
             env_refs: BTreeMap::new(),
             secrets_ref: BTreeMap::new(),
@@ -741,6 +1071,9 @@ impl EphemeralPreviewParams {
         }
         if let Some(provider) = tenant_stack.metadata.labels.get(LABEL_PROVIDER) {
             self.provider = Some(provider.clone());
+        }
+        if let Some(src) = &tenant_stack.spec.git_source {
+            self.tenant_repo_url = Some(src.project_repo.clone());
         }
     }
 
@@ -911,8 +1244,9 @@ pub struct TenantStackParams {
     pub name: String,
     pub pulumi_stack_name: String,
     pub backend_url: String,
-    pub git_source_name: String,
-    pub repo_dir: String,
+    /// The tenant's own Git source (platform-written `tenants/<id>/git-repository.yaml`), cloned
+    /// directly by the workspace pod with the tenant's read-only credentials (`gitAuth`).
+    pub git_source: PkoGitSource,
     pub service_account_name: Option<String>,
     pub output_secret_name: Option<String>,
     pub config: BTreeMap<String, String>,
@@ -932,16 +1266,14 @@ impl TenantStackParams {
         name: impl Into<String>,
         pulumi_stack_name: impl Into<String>,
         backend_url: impl Into<String>,
-        git_source_name: impl Into<String>,
-        repo_dir: impl Into<String>,
+        git_source: PkoGitSource,
     ) -> Self {
         Self {
             tenant: tenant.into(),
             name: name.into(),
             pulumi_stack_name: pulumi_stack_name.into(),
             backend_url: backend_url.into(),
-            git_source_name: git_source_name.into(),
-            repo_dir: repo_dir.into(),
+            git_source,
             service_account_name: None,
             output_secret_name: None,
             config: BTreeMap::new(),
@@ -1041,6 +1373,7 @@ pub fn synthesize_management_core_stack(
                 &params.git_source_name,
                 &params.repo_dir,
             )),
+            git_source: None,
             preview: None,
             destroy_on_finalize: Some(false),
             continue_resync_on_commit_match: Some(true),
@@ -1056,16 +1389,16 @@ pub fn synthesize_management_core_stack(
     })
 }
 
-/// Synthesizes an ephemeral Flux `GitRepository` pinned to `keel/<tenant>/<action>-<timestamp>`
-/// and a PKO v2 `Stack` CR with `preview: true` in `keel-previews` using a read-only preview
-/// ServiceAccount (`SDD.md` §4.2, `NFR-REL-02`).
+/// Synthesizes a PKO v2 `Stack` CR with `preview: true` in `keel-previews` that clones the PR
+/// branch `keel/<tenant>/<action>-<timestamp>` through PKO `gitSource` (authenticated with the
+/// tenant's mirrored read-only credentials) and runs as a read-only preview ServiceAccount
+/// (`SDD.md` §4.2, `NFR-REL-02`).
 pub fn synthesize_ephemeral_preview(
     params: &EphemeralPreviewParams,
 ) -> Result<PreviewStack, PkoError> {
     let normalized_pr_id = sanitize_pr_id(&params.pr_id)?;
     validate_k8s_dns_label("tenant", &params.tenant)?;
     validate_preview_branch(&params.tenant, &params.branch)?;
-    validate_non_empty("repo_url", &params.repo_url)?;
     validate_repo_dir(&params.repo_dir)?;
     validate_non_empty("pulumi_stack_name", &params.pulumi_stack_name)?;
     validate_non_empty("backend_url", &params.backend_url)?;
@@ -1078,18 +1411,27 @@ pub fn synthesize_ephemeral_preview(
         None => DEFAULT_PREVIEW_SERVICE_ACCOUNT.to_string(),
     };
 
-    let secret_ref = match &params.git_secret_name {
-        Some(secret) => {
-            validate_k8s_name("git_secret_name", secret)?;
-            Some(LocalObjectReference {
-                name: secret.clone(),
-            })
+    // Without a resolved tenant source the preview is synthesized only (never applied): leave
+    // `projectRepo` unset rather than putting a placeholder (e.g. the control-plane remote) in it.
+    let git_source = match &params.repo_url {
+        Some(url) => {
+            let git_auth = match &params.git_secret_name {
+                Some(secret) => Some(PkoGitAuth::from_flux_secret(
+                    secret,
+                    url,
+                    &params.git_secret_keys,
+                )?),
+                None => None,
+            };
+            let source =
+                PkoGitSource::branch(url, &params.branch, &params.repo_dir).with_auth(git_auth);
+            source.validate()?;
+            Some(source)
         }
         None => None,
     };
 
     let passphrase_copy = params.passphrase_secret_copy_name()?;
-    let git_repo_name = format!("preview-source-pr-{normalized_pr_id}");
     let stack_name = format!("preview-stack-pr-{normalized_pr_id}");
 
     let mut labels = BTreeMap::new();
@@ -1123,28 +1465,6 @@ pub fn synthesize_ephemeral_preview(
         annotations.insert(crate::run::ANNOTATION_HEAD_SHA.to_string(), sha.to_string());
     }
 
-    let git_repository = FluxGitRepository {
-        api_version: FLUX_GIT_REPO_API_VERSION.to_string(),
-        kind: FLUX_GIT_REPO_KIND.to_string(),
-        metadata: CrObjectMeta {
-            name: git_repo_name.clone(),
-            namespace: KEEL_PREVIEWS_NAMESPACE.to_string(),
-            labels: labels.clone(),
-            annotations: annotations.clone(),
-        },
-        spec: FluxGitRepositorySpec {
-            interval: DEFAULT_FLUX_POLL_INTERVAL.to_string(),
-            url: params.repo_url.clone(),
-            git_ref: FluxGitRepositoryRef {
-                branch: Some(params.branch.clone()),
-                tag: None,
-                commit: None,
-            },
-            secret_ref,
-            timeout: Some("60s".to_string()),
-        },
-    };
-
     let stack = PkoStack {
         api_version: PKO_STACK_API_VERSION.to_string(),
         kind: PKO_STACK_KIND.to_string(),
@@ -1163,10 +1483,8 @@ pub fn synthesize_ephemeral_preview(
                 &params.backend_url,
                 &params.tenant,
             )),
-            flux_source: Some(PkoFluxSource::git_repository(
-                &git_repo_name,
-                &params.repo_dir,
-            )),
+            flux_source: None,
+            git_source,
             preview: Some(true),
             destroy_on_finalize: Some(false),
             continue_resync_on_commit_match: Some(false),
@@ -1189,9 +1507,112 @@ pub fn synthesize_ephemeral_preview(
         pr_id: normalized_pr_id,
         tenant: params.tenant.clone(),
         branch: params.branch.clone(),
-        git_repository,
         stack,
     })
+}
+
+/// Name of the tenant Flux source (`tenant-<id>/keel-gitops`) referenced by the `fluxSource` of
+/// tenant `Stack`s written by releases before tenant Stacks moved to PKO `gitSource`.
+pub const LEGACY_TENANT_FLUX_SOURCE_NAME: &str = "keel-gitops";
+
+/// Outcome of [`migrate_legacy_flux_source_stack`] for one `stack.yaml`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FluxSourceMigration {
+    /// Not a legacy tenant `Stack` (already on PKO `gitSource`, no `fluxSource`, not a `Stack`).
+    Unchanged,
+    /// The rewritten manifest (`fluxSource` replaced by `gitSource`, everything else kept).
+    Migrated(String),
+    /// A `fluxSource` Keel does not rewrite automatically (reason, secret-free).
+    Skipped(String),
+}
+
+/// Rewrites a tenant `Stack` manifest written by earlier releases (`spec.fluxSource` →
+/// `tenant-<id>/keel-gitops`, which needs `source-controller` artifacts on port 9090) to PKO
+/// `gitSource`: `fluxSource` is removed and `projectRepo`/`branch`/`repoDir`/`gitAuth`/`shallow`
+/// from `git_source_for_dir(dir)` are added; every other field is kept verbatim (no program or
+/// config change). Only `Stack`s in `tenant-<tenant>` whose `fluxSource` is the tenant's own
+/// `keel-gitops` `GitRepository` with a `dir` under `tenants/<tenant>/` are rewritten; anything
+/// else is [`FluxSourceMigration::Skipped`] (the protected `flux-system` management Stack is
+/// never touched).
+pub fn migrate_legacy_flux_source_stack(
+    yaml: &str,
+    tenant: &str,
+    git_source_for_dir: impl FnOnce(&str) -> Result<PkoGitSource, PkoError>,
+) -> Result<FluxSourceMigration, PkoError> {
+    validate_k8s_dns_label("tenant", tenant)?;
+    let mut doc: serde_yml::Value = serde_yml::from_str(yaml)?;
+    let str_at = |v: &serde_yml::Value, path: &[&str]| -> Option<String> {
+        let mut cur = v;
+        for key in path {
+            cur = cur.get(*key)?;
+        }
+        cur.as_str().map(str::to_string)
+    };
+    let is_stack = str_at(&doc, &["kind"]).as_deref() == Some(PKO_STACK_KIND)
+        && str_at(&doc, &["apiVersion"]).is_some_and(|v| v.starts_with("pulumi.com/"));
+    if !is_stack || doc.get("spec").and_then(|s| s.get("fluxSource")).is_none() {
+        return Ok(FluxSourceMigration::Unchanged);
+    }
+    let expected_ns = format!("tenant-{tenant}");
+    let namespace = str_at(&doc, &["metadata", "namespace"]).unwrap_or_default();
+    if namespace != expected_ns {
+        return Ok(FluxSourceMigration::Skipped(format!(
+            "Stack namespace `{namespace}` is not `{expected_ns}`"
+        )));
+    }
+    if doc.get("spec").and_then(|s| s.get("projectRepo")).is_some() {
+        return Ok(FluxSourceMigration::Skipped(
+            "Stack sets both fluxSource and projectRepo".to_string(),
+        ));
+    }
+    let source_kind = str_at(&doc, &["spec", "fluxSource", "sourceRef", "kind"]);
+    let source_name = str_at(&doc, &["spec", "fluxSource", "sourceRef", "name"]);
+    if source_kind.as_deref() != Some(FLUX_GIT_REPO_KIND)
+        || source_name.as_deref() != Some(LEGACY_TENANT_FLUX_SOURCE_NAME)
+    {
+        return Ok(FluxSourceMigration::Skipped(format!(
+            "fluxSource is not the tenant's own GitRepository `{LEGACY_TENANT_FLUX_SOURCE_NAME}`"
+        )));
+    }
+    let dir = str_at(&doc, &["spec", "fluxSource", "dir"])
+        .map(|d| d.trim().trim_end_matches('/').to_string())
+        .unwrap_or_default();
+    let tenant_prefix = format!("tenants/{tenant}/");
+    if !dir.starts_with(&tenant_prefix) || validate_repo_dir(&dir).is_err() {
+        return Ok(FluxSourceMigration::Skipped(format!(
+            "fluxSource.dir `{dir}` is not under `{tenant_prefix}`"
+        )));
+    }
+    let source = git_source_for_dir(&dir)?;
+    source.validate()?;
+    if source.repo_dir.as_deref() != Some(dir.as_str()) {
+        return Err(PkoError::Validation(format!(
+            "migrated Git source must keep repoDir `{dir}`"
+        )));
+    }
+    let serde_yml::Value::Mapping(fields) = serde_yml::to_value(&source)? else {
+        return Err(PkoError::Synthesis(
+            "PKO Git source did not serialize to a mapping".to_string(),
+        ));
+    };
+    let Some(serde_yml::Value::Mapping(spec)) = doc.get_mut("spec") else {
+        return Ok(FluxSourceMigration::Skipped(
+            "Stack spec is not a mapping".to_string(),
+        ));
+    };
+    spec.remove("fluxSource");
+    for (key, value) in fields {
+        spec.insert(key, value);
+    }
+    let out = serde_yml::to_string(&doc)?;
+    // The rewritten manifest must still be a well-formed Stack with a complete Git source.
+    let parsed = PkoStack::from_yaml(&out)?;
+    if parsed.spec.git_source.is_none() || parsed.spec.flux_source.is_some() {
+        return Err(PkoError::Synthesis(
+            "migrated Stack lost its Git source".to_string(),
+        ));
+    }
+    Ok(FluxSourceMigration::Migrated(out))
 }
 
 /// Synthesizes a tenant PKO v2 `Stack` CR strictly isolated to `tenant-<tenant>` with optional
@@ -1201,8 +1622,12 @@ pub fn synthesize_tenant_stack(params: &TenantStackParams) -> Result<PkoStack, P
     validate_k8s_name("name", &params.name)?;
     validate_non_empty("pulumi_stack_name", &params.pulumi_stack_name)?;
     validate_non_empty("backend_url", &params.backend_url)?;
-    validate_k8s_name("git_source_name", &params.git_source_name)?;
-    validate_repo_dir(&params.repo_dir)?;
+    params.git_source.validate()?;
+    if params.git_source.repo_dir.is_none() {
+        return Err(PkoError::Validation(
+            "tenant stack Git source needs a repo_dir".to_string(),
+        ));
+    }
 
     validate_k8s_name("passphrase_secret_name", &params.passphrase_secret_name)?;
 
@@ -1251,10 +1676,8 @@ pub fn synthesize_tenant_stack(params: &TenantStackParams) -> Result<PkoStack, P
             stack: params.pulumi_stack_name.clone(),
             service_account_name: Some(service_account),
             backend: Some(params.backend_url.clone()),
-            flux_source: Some(PkoFluxSource::git_repository(
-                &params.git_source_name,
-                &params.repo_dir,
-            )),
+            flux_source: None,
+            git_source: Some(params.git_source.clone()),
             preview: None,
             destroy_on_finalize: Some(true),
             continue_resync_on_commit_match: Some(true),
@@ -1495,6 +1918,10 @@ pub(crate) fn sanitize_pr_id(pr_id: &str) -> Result<String, PkoError> {
 mod tests {
     use super::*;
 
+    fn test_git_source(repo_dir: &str) -> PkoGitSource {
+        PkoGitSource::branch("https://forge.internal/keel/infra.git", "main", repo_dir)
+    }
+
     #[test]
     fn management_core_stack_enforces_protect_true_and_anti_lockout() {
         let mut params = ManagementCoreStackParams::new(
@@ -1582,7 +2009,6 @@ mod tests {
             "payments",
             "provision-postgres",
             1_763_100_000,
-            "https://forge.internal/keel/infra-gitops.git",
             "tenants/payments/infra/postgres",
             "keel/payments-postgres/prod",
             "s3://pulumi-state",
@@ -1590,6 +2016,7 @@ mod tests {
         .expect("valid preview params");
 
         let mut params = params;
+        params.repo_url = Some("https://forge.internal/keel/infra-gitops.git".to_string());
         params.git_secret_name = Some("forge-git-auth".to_string());
 
         let mut custom_preview_params = params.clone();
@@ -1631,22 +2058,6 @@ mod tests {
         assert_eq!(bundle.pr_id, "42");
         assert_eq!(bundle.branch, "keel/payments/provision-postgres-1763100000");
 
-        // Verify Flux GitRepository CR
-        let repo = &bundle.git_repository;
-        assert_eq!(repo.api_version, "source.toolkit.fluxcd.io/v1");
-        assert_eq!(repo.kind, "GitRepository");
-        assert_eq!(repo.metadata.name, "preview-source-pr-42");
-        assert_eq!(repo.metadata.namespace, "keel-previews");
-        assert_eq!(repo.spec.interval, "1m");
-        assert_eq!(
-            repo.spec.git_ref.branch.as_deref(),
-            Some("keel/payments/provision-postgres-1763100000")
-        );
-        assert_eq!(
-            repo.spec.secret_ref.as_ref().map(|r| r.name.as_str()),
-            Some("forge-git-auth")
-        );
-
         // Verify PKO v2 Stack CR
         let stack = &bundle.stack;
         assert_eq!(stack.api_version, "pulumi.com/v1");
@@ -1660,29 +2071,63 @@ mod tests {
             stack.spec.service_account_name.as_deref(),
             Some(DEFAULT_PREVIEW_SERVICE_ACCOUNT)
         );
-        let flux_src = stack.spec.flux_source.as_ref().expect("flux source");
-        assert_eq!(flux_src.source_ref.name, "preview-source-pr-42");
-        assert_eq!(flux_src.dir, "tenants/payments/infra/postgres");
-
-        // Verify JSON & YAML roundtrips
-        let (repo_json, stack_json) = bundle.to_json_values().expect("json values");
+        // PKO gitSource: clones the PR branch directly, authenticated with the mirrored Secret.
+        assert!(stack.spec.flux_source.is_none());
+        let src = stack.spec.git_source.as_ref().expect("git source");
         assert_eq!(
-            FluxGitRepository::from_json_value(repo_json).unwrap(),
-            *repo
+            src.project_repo,
+            "https://forge.internal/keel/infra-gitops.git"
         );
+        assert_eq!(
+            src.branch.as_deref(),
+            Some("keel/payments/provision-postgres-1763100000")
+        );
+        assert!(src.commit.is_none());
+        assert_eq!(
+            src.repo_dir.as_deref(),
+            Some("tenants/payments/infra/postgres")
+        );
+        let basic = src
+            .git_auth
+            .as_ref()
+            .and_then(|a| a.basic_auth.as_ref())
+            .expect("basic auth inferred from the HTTPS URL");
+        assert_eq!(basic.user_name.secret.name, "forge-git-auth");
+        assert_eq!(basic.user_name.secret.key, "username");
+        assert_eq!(basic.password.secret.key, "password");
+
+        // Verify JSON & YAML roundtrips (flattened PKO field names)
+        let stack_json = bundle.to_json_value().expect("json value");
         assert_eq!(stack_json["spec"]["preview"], true);
         assert_eq!(
             stack_json["spec"]["serviceAccountName"],
             "keel-preview-readonly"
         );
+        assert!(stack_json["spec"].get("fluxSource").is_none());
+        assert_eq!(
+            stack_json["spec"]["projectRepo"],
+            "https://forge.internal/keel/infra-gitops.git"
+        );
+        assert_eq!(
+            stack_json["spec"]["branch"],
+            "keel/payments/provision-postgres-1763100000"
+        );
+        assert_eq!(
+            stack_json["spec"]["repoDir"],
+            "tenants/payments/infra/postgres"
+        );
+        assert_eq!(stack_json["spec"]["shallow"], true);
+        assert_eq!(
+            stack_json["spec"]["gitAuth"]["basicAuth"]["userName"],
+            serde_json::json!({"type": "Secret", "secret": {"name": "forge-git-auth", "key": "username"}})
+        );
+        assert_eq!(PkoStack::from_json_value(stack_json).unwrap(), *stack);
 
-        let repo_yaml = repo.to_yaml().expect("repo yaml");
-        assert_eq!(FluxGitRepository::from_yaml(&repo_yaml).unwrap(), *repo);
-
-        let multi_doc = bundle.to_multi_doc_yaml().expect("multi-doc yaml");
-        assert!(multi_doc.contains("kind: GitRepository"));
-        assert!(multi_doc.contains("kind: Stack"));
-        assert!(multi_doc.contains("preview: true"));
+        let yaml = bundle.to_yaml().expect("yaml");
+        assert!(!yaml.contains("kind: GitRepository"));
+        assert!(yaml.contains("kind: Stack"));
+        assert!(yaml.contains("preview: true"));
+        assert_eq!(PkoStack::from_yaml(&yaml).unwrap(), *stack);
     }
 
     #[test]
@@ -1692,8 +2137,7 @@ mod tests {
             "postgres-managed",
             "keel/analytics-postgres/prod",
             "s3://pulumi-state",
-            "tenant-git-source",
-            "tenants/analytics/infra/postgres-managed",
+            test_git_source("tenants/analytics/infra/postgres-managed"),
         );
         params.output_secret_name = Some("postgres-companion-outputs".to_string());
 
@@ -1787,7 +2231,6 @@ mod tests {
             "alpha",
             "deploy",
             1_700_000_000,
-            "https://git.example/repo.git",
             "tenants/alpha/infra/vm",
             "keel/vm/prod",
             "s3://pulumi-state",
@@ -1812,8 +2255,7 @@ mod tests {
             "db",
             "keel/db/prod",
             "s3://pulumi-state",
-            "source",
-            "tenants/alpha/infra/db",
+            test_git_source("tenants/alpha/infra/db"),
         );
         bad_tenant.output_secret_name = Some("other-ns/secret".to_string());
         assert!(synthesize_tenant_stack(&bad_tenant).is_err());
@@ -1880,8 +2322,7 @@ mod tests {
             "web",
             "organization/web/acme-web",
             "s3://pulumi-state/tenants/acme?region=us-east-1",
-            "keel-gitops",
-            "tenants/acme/apps/web",
+            test_git_source("tenants/acme/apps/web"),
         );
         tparams
             .config
@@ -1897,7 +2338,6 @@ mod tests {
             "acme",
             "deploy",
             1_700_000_000,
-            "https://forge/x.git",
             "tenants/acme/apps/web",
             "organization/web-pr-9/acme",
             "s3://pulumi-state",
@@ -1930,8 +2370,7 @@ mod tests {
             "vm1",
             "organization/aws-vm/acme-vm1",
             backend,
-            "keel-gitops",
-            "tenants/acme/infra/vm1",
+            test_git_source("tenants/acme/infra/vm1"),
         );
         tparams
             .config
@@ -1962,7 +2401,6 @@ mod tests {
             "acme",
             "provision",
             1_700_000_000,
-            "https://forge/x.git",
             "tenants/acme/infra/vm1",
             format!("organization/vm1-pr-{pr}/acme"),
             "s3://pulumi-state?region=us-east-1&endpoint=seaweedfs",
@@ -2140,8 +2578,7 @@ mod tests {
             "vm1",
             "organization/vm1/acme-vm1",
             "s3://pulumi-state/tenants/acme",
-            "keel-gitops",
-            "tenants/acme/infra/vm1",
+            test_git_source("tenants/acme/infra/vm1"),
         );
         tparams.docker_host = Some("tcp://proxy:2375".to_string());
         let tenant = synthesize_tenant_stack(&tparams).unwrap();
@@ -2218,8 +2655,7 @@ mod tests {
             "vm1",
             "organization/vm1/acme-vm1",
             "s3://pulumi-state/tenants/acme",
-            "keel-gitops",
-            "tenants/acme/infra/vm1",
+            test_git_source("tenants/acme/infra/vm1"),
         );
         tparams.passphrase_secret_name = String::new();
         assert!(synthesize_tenant_stack(&tparams).is_err());
@@ -2230,5 +2666,420 @@ mod tests {
         );
         mparams.passphrase_secret_name = "Bad Name".to_string();
         assert!(synthesize_management_core_stack(&mparams).is_err());
+    }
+
+    fn keys(k: &[&str]) -> BTreeSet<String> {
+        k.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn git_auth_maps_flux_secret_keys_to_pko_auth_modes() {
+        let https = "https://forge.example/keel/gitops.git";
+        // Platform-written read-only `git-credentials` (username/password) -> basicAuth.
+        let basic = PkoGitAuth::from_flux_secret("git-credentials", https, &BTreeSet::new())
+            .unwrap()
+            .basic_auth
+            .expect("basic auth");
+        assert_eq!(
+            basic.user_name,
+            PkoEnvRef::from_secret("git-credentials", "username")
+        );
+        assert_eq!(
+            basic.password,
+            PkoEnvRef::from_secret("git-credentials", "password")
+        );
+
+        // SSH deploy key -> sshAuth (with optional passphrase), inferred or explicit.
+        let ssh_url = "ssh://git@forge.example:22/keel/gitops.git";
+        let ssh =
+            PkoGitAuth::from_flux_secret("git-credentials", ssh_url, &BTreeSet::new()).unwrap();
+        assert_eq!(
+            ssh.ssh_auth.as_ref().unwrap().ssh_private_key,
+            PkoEnvRef::from_secret("git-credentials", "identity")
+        );
+        assert!(ssh.basic_auth.is_none() && ssh.access_token.is_none());
+        let ssh_pw = PkoGitAuth::from_flux_secret(
+            "git-credentials",
+            "git@forge.example:keel/gitops.git",
+            &keys(&["identity", "identity.pub", "known_hosts", "password"]),
+        )
+        .unwrap();
+        assert_eq!(
+            ssh_pw.ssh_auth.unwrap().password,
+            Some(PkoEnvRef::from_secret("git-credentials", "password"))
+        );
+
+        // Token-only Secrets -> accessToken.
+        let token = PkoGitAuth::from_flux_secret("c", https, &keys(&["bearerToken"])).unwrap();
+        assert_eq!(
+            token.access_token,
+            Some(PkoEnvRef::from_secret("c", "bearerToken"))
+        );
+        let pat = PkoGitAuth::from_flux_secret("c", https, &keys(&["password", "ca.crt"])).unwrap();
+        assert_eq!(
+            pat.access_token,
+            Some(PkoEnvRef::from_secret("c", "password"))
+        );
+
+        // Unusable Secrets and bad names fail closed.
+        assert!(PkoGitAuth::from_flux_secret("c", https, &keys(&["ca.crt"])).is_err());
+        assert!(
+            PkoGitAuth::from_flux_secret("c", ssh_url, &keys(&["username", "password"])).is_err()
+        );
+        assert!(PkoGitAuth::from_flux_secret("Bad/Name", https, &BTreeSet::new()).is_err());
+
+        let json = serde_json::to_value(
+            PkoGitAuth::from_flux_secret("git-credentials", https, &BTreeSet::new()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"basicAuth": {
+                "userName": {"type": "Secret", "secret": {"name": "git-credentials", "key": "username"}},
+                "password": {"type": "Secret", "secret": {"name": "git-credentials", "key": "password"}}
+            }})
+        );
+    }
+
+    #[test]
+    fn git_source_urls_must_be_network_git_urls() {
+        for ok in [
+            "https://forge.example/keel/gitops.git",
+            "http://forgejo-http.keel-system.svc.cluster.local:3000/keel/infra-gitops.git",
+            "ssh://git@forge.example:2222/keel/gitops.git",
+            "git@github.com:acme/gitops.git",
+            "http://[::1]:3000/keel/gitops.git",
+        ] {
+            assert!(validate_git_source_url(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "",
+            " https://forge.example/x.git",
+            "/tmp/keel-gitops.git",
+            "./keel-gitops.git",
+            "file:///tmp/keel-gitops.git",
+            "ext::sh -c touch% /tmp/pwned",
+            "fd::17",
+            "-uhttps://x",
+            "https://",
+            "https://forge.example/x.git\nevil",
+            "forge.example:keel/gitops.git",
+            "https://keel:token@forge.example/keel/gitops.git",
+        ] {
+            assert!(validate_git_source_url(bad).is_err(), "{bad}");
+        }
+        let err = validate_git_source_url("https://keel:s3cr3t-token@forge.example/x.git")
+            .unwrap_err()
+            .to_string();
+        assert!(!err.contains("s3cr3t-token"), "{err}");
+        assert!(is_ssh_git_url("git@github.com:acme/gitops.git"));
+        assert!(!is_ssh_git_url("https://github.com/acme/gitops.git"));
+
+        let mut src = test_git_source("tenants/acme/infra/vm");
+        assert!(src.validate().is_ok());
+        src.branch = Some("main..evil".to_string());
+        assert!(src.validate().is_err());
+        src.branch = None;
+        assert!(src.validate().is_err(), "needs branch or commit");
+        src.commit = Some("0123456789abcdef0123456789abcdef01234567".to_string());
+        assert!(src.validate().is_ok());
+        src.branch = Some("main".to_string());
+        assert!(src.validate().is_err(), "branch and commit are exclusive");
+        let mut traversal = test_git_source("tenants/acme/../beta");
+        assert!(traversal.validate().is_err());
+        traversal.repo_dir = Some("/etc".to_string());
+        assert!(traversal.validate().is_err());
+    }
+
+    #[test]
+    fn tenant_stacks_clone_their_git_source_and_management_keeps_flux_source() {
+        let source = PkoGitSource::branch(
+            "http://forgejo-http.keel-system.svc.cluster.local:3000/keel/infra-gitops.git",
+            "main",
+            "tenants/default/infra/kind",
+        )
+        .with_auth(Some(
+            PkoGitAuth::from_flux_secret(
+                "git-credentials",
+                "http://forgejo-http.keel-system.svc.cluster.local:3000/keel/infra-gitops.git",
+                &BTreeSet::new(),
+            )
+            .unwrap(),
+        ));
+        let stack = synthesize_tenant_stack(&TenantStackParams::new(
+            "default",
+            "kind",
+            "organization/kind-cluster/default-kind",
+            "s3://pulumi-state/tenants/default",
+            source.clone(),
+        ))
+        .unwrap();
+        assert!(stack.spec.flux_source.is_none());
+        assert_eq!(stack.spec.git_source.as_ref(), Some(&source));
+        let yaml = stack.to_yaml().unwrap();
+        assert!(!yaml.contains("fluxSource"));
+        let doc: serde_json::Value = serde_yml::from_str(&yaml).unwrap();
+        assert_eq!(
+            doc["spec"]["projectRepo"],
+            "http://forgejo-http.keel-system.svc.cluster.local:3000/keel/infra-gitops.git"
+        );
+        assert_eq!(doc["spec"]["repoDir"], "tenants/default/infra/kind");
+        assert_eq!(doc["spec"]["branch"], "main");
+        assert_eq!(
+            doc["spec"]["shallow"], true,
+            "shallow clone of the tenant source"
+        );
+        assert_eq!(
+            doc["spec"]["gitAuth"]["basicAuth"]["password"]["secret"]["name"],
+            "git-credentials"
+        );
+        assert_eq!(PkoStack::from_yaml(&yaml).unwrap(), stack);
+
+        // Local paths / helpers are never committed into a tenant Stack.
+        let mut local = TenantStackParams::new(
+            "default",
+            "kind",
+            "organization/kind-cluster/default-kind",
+            "s3://pulumi-state/tenants/default",
+            PkoGitSource::branch("/tmp/keel-gitops.git", "main", "tenants/default/infra/kind"),
+        );
+        assert!(synthesize_tenant_stack(&local).is_err());
+        local.git_source.repo_dir = None;
+        local.git_source.project_repo = "https://forge.example/x.git".to_string();
+        assert!(
+            synthesize_tenant_stack(&local).is_err(),
+            "repo_dir is required"
+        );
+
+        // The flux-system management Stack keeps its same-namespace Flux source.
+        let mgmt = synthesize_management_core_stack(&ManagementCoreStackParams::new(
+            "s3://pulumi-state",
+            "flux-system",
+            "clusters/management",
+        ))
+        .unwrap();
+        assert!(mgmt.spec.git_source.is_none());
+        assert_eq!(
+            mgmt.spec
+                .flux_source
+                .as_ref()
+                .map(|f| f.source_ref.name.as_str()),
+            Some("flux-system")
+        );
+        let mgmt_yaml = mgmt.to_yaml().unwrap();
+        assert!(!mgmt_yaml.contains("projectRepo"));
+        assert_eq!(PkoStack::from_yaml(&mgmt_yaml).unwrap(), mgmt);
+
+        // Stacks committed by earlier releases (fluxSource) still parse, without a Git source.
+        let legacy = PkoStack::from_yaml(
+            "apiVersion: pulumi.com/v1\nkind: Stack\nmetadata:\n  name: vm\n  namespace: tenant-default\nspec:\n  stack: organization/vm/default-vm\n  fluxSource:\n    sourceRef:\n      apiVersion: source.toolkit.fluxcd.io/v1\n      kind: GitRepository\n      name: keel-gitops\n    dir: tenants/default/infra/vm\n  resyncFrequencySeconds: 300\n",
+        )
+        .unwrap();
+        assert!(legacy.spec.git_source.is_none());
+        assert_eq!(legacy.spec.resync_frequency_seconds, Some(300));
+    }
+
+    #[test]
+    fn preview_inherits_the_tenant_stack_repo_and_mirrors_ssh_auth() {
+        let tenant_stack = synthesize_tenant_stack(&TenantStackParams::new(
+            "acme",
+            "vm1",
+            "organization/aws-vm/acme-vm1",
+            "s3://pulumi-state/tenants/acme",
+            PkoGitSource::branch(
+                "ssh://git@forge.example/acme/gitops.git",
+                "main",
+                "tenants/acme/infra/vm1",
+            ),
+        ))
+        .unwrap();
+        let mut params = base_preview_params("31");
+        params.inherit_tenant_stack(&tenant_stack);
+        assert_eq!(
+            params.tenant_repo_url.as_deref(),
+            Some("ssh://git@forge.example/acme/gitops.git")
+        );
+        params.repo_url = params.tenant_repo_url.clone();
+        params.git_secret_name = Some("keel-preview-31-git-credentials".to_string());
+        params.git_secret_keys = keys(&["identity", "known_hosts"]);
+        let preview = synthesize_ephemeral_preview(&params).unwrap();
+        let src = preview.stack.spec.git_source.unwrap();
+        assert_eq!(src.project_repo, "ssh://git@forge.example/acme/gitops.git");
+        assert_eq!(src.branch.as_deref(), Some(params.branch.as_str()));
+        assert_eq!(src.shallow, Some(true));
+        assert_eq!(
+            src.git_auth.unwrap().ssh_auth.unwrap().ssh_private_key,
+            PkoEnvRef::from_secret("keel-preview-31-git-credentials", "identity")
+        );
+
+        // Public source: no gitAuth at all.
+        let mut public = base_preview_params("32");
+        public.repo_url = Some("https://forge.example/acme/gitops.git".to_string());
+        public.git_secret_name = None;
+        let public = synthesize_ephemeral_preview(&public).unwrap();
+        assert!(public.stack.spec.git_source.unwrap().git_auth.is_none());
+
+        // An applied preview URL is validated strictly: no remote helpers, local paths, file://.
+        for bad in [
+            "ext::sh -c id",
+            "/srv/keel/gitops.git",
+            "file:///srv/gitops.git",
+        ] {
+            let mut helper = base_preview_params("33");
+            helper.repo_url = Some(bad.to_string());
+            assert!(synthesize_ephemeral_preview(&helper).is_err(), "{bad}");
+        }
+    }
+
+    /// Synthesized-only previews (no cluster, Flux-only changes, bundles) never carry a
+    /// placeholder clone URL such as the control-plane remote or a local bare-repo path.
+    #[test]
+    fn unapplied_previews_leave_project_repo_unset() {
+        let mut params = base_preview_params("34");
+        params.git_secret_name = Some("keel-preview-34-git-credentials".to_string());
+        let preview = synthesize_ephemeral_preview(&params).unwrap();
+        assert!(preview.stack.spec.git_source.is_none());
+        assert!(preview.stack.spec.flux_source.is_none());
+        let json = preview.to_json_value().unwrap();
+        assert!(json["spec"].get("projectRepo").is_none(), "{json}");
+        assert!(json["spec"].get("gitAuth").is_none(), "{json}");
+    }
+
+    #[test]
+    fn malformed_git_sources_are_rejected_instead_of_silently_dropped() {
+        let yaml = "apiVersion: pulumi.com/v1\nkind: Stack\nmetadata:\n  name: vm\n  namespace: tenant-acme\nspec:\n  stack: organization/vm/acme-vm\n  projectRepo: https://forge.example/acme.git\n  branch: main\n  repoDir: tenants/acme/infra/vm\n  gitAuth:\n    basicAuth: not-a-mapping\n";
+        let err = PkoStack::from_yaml(yaml).unwrap_err().to_string();
+        assert!(err.contains("malformed Git source"), "{err}");
+        let ok = yaml.replace("  gitAuth:\n    basicAuth: not-a-mapping\n", "");
+        assert!(PkoStack::from_yaml(&ok).unwrap().spec.git_source.is_some());
+    }
+
+    const LEGACY_TENANT_STACK: &str = "apiVersion: pulumi.com/v1
+kind: Stack
+metadata:
+  name: kind
+  namespace: tenant-default
+  labels:
+    keel.io/provider: kind
+spec:
+  stack: organization/kind-cluster/default-kind
+  backend: s3://pulumi-state/tenants/default
+  fluxSource:
+    sourceRef:
+      apiVersion: source.toolkit.fluxcd.io/v1
+      kind: GitRepository
+      name: keel-gitops
+    dir: tenants/default/infra/kind
+  config:
+    clusterName: wl
+  resyncFrequencySeconds: 300
+  destroyOnFinalize: true
+";
+
+    fn default_tenant_source(dir: &str) -> Result<PkoGitSource, PkoError> {
+        let url = "http://forgejo-http.keel-system.svc.cluster.local:3000/keel/infra-gitops.git";
+        Ok(
+            PkoGitSource::branch(url, "main", dir).with_auth(Some(PkoGitAuth::from_flux_secret(
+                "git-credentials",
+                url,
+                &BTreeSet::new(),
+            )?)),
+        )
+    }
+
+    #[test]
+    fn legacy_flux_source_tenant_stacks_migrate_to_git_source_verbatim() {
+        let FluxSourceMigration::Migrated(out) =
+            migrate_legacy_flux_source_stack(LEGACY_TENANT_STACK, "default", default_tenant_source)
+                .unwrap()
+        else {
+            panic!("expected a migration");
+        };
+        assert!(!out.contains("fluxSource"), "{out}");
+        let stack = PkoStack::from_yaml(&out).unwrap();
+        let src = stack.spec.git_source.as_ref().unwrap();
+        assert_eq!(src.repo_dir.as_deref(), Some("tenants/default/infra/kind"));
+        assert_eq!(src.branch.as_deref(), Some("main"));
+        assert_eq!(src.shallow, Some(true));
+        assert!(src.git_auth.as_ref().unwrap().basic_auth.is_some());
+        // Everything else is kept (no program/config change).
+        assert_eq!(stack.spec.stack, "organization/kind-cluster/default-kind");
+        assert_eq!(
+            stack.spec.config.get("clusterName").map(String::as_str),
+            Some("wl")
+        );
+        assert_eq!(stack.spec.resync_frequency_seconds, Some(300));
+        assert_eq!(stack.spec.destroy_on_finalize, Some(true));
+        assert_eq!(
+            stack
+                .metadata
+                .labels
+                .get(LABEL_PROVIDER)
+                .map(String::as_str),
+            Some("kind")
+        );
+
+        // Idempotent: a migrated (or freshly synthesized) Stack is unchanged.
+        assert_eq!(
+            migrate_legacy_flux_source_stack(&out, "default", default_tenant_source).unwrap(),
+            FluxSourceMigration::Unchanged
+        );
+    }
+
+    #[test]
+    fn legacy_flux_source_migration_only_rewrites_the_tenants_own_stacks() {
+        let skipped = |yaml: &str, tenant: &str| match migrate_legacy_flux_source_stack(
+            yaml,
+            tenant,
+            default_tenant_source,
+        )
+        .unwrap()
+        {
+            FluxSourceMigration::Skipped(reason) => reason,
+            other => panic!("expected Skipped, got {other:?}"),
+        };
+        // Another tenant's Stack / namespace.
+        skipped(LEGACY_TENANT_STACK, "acme");
+        // The flux-system management Stack is never touched.
+        skipped(
+            &LEGACY_TENANT_STACK.replace("namespace: tenant-default", "namespace: flux-system"),
+            "default",
+        );
+        // A different Flux source, or a dir outside the tenant tree.
+        skipped(
+            &LEGACY_TENANT_STACK.replace("name: keel-gitops", "name: flux-system"),
+            "default",
+        );
+        skipped(
+            &LEGACY_TENANT_STACK.replace(
+                "dir: tenants/default/infra/kind",
+                "dir: tenants/acme/infra/kind",
+            ),
+            "default",
+        );
+        skipped(
+            &LEGACY_TENANT_STACK.replace(
+                "dir: tenants/default/infra/kind",
+                "dir: tenants/default/../acme",
+            ),
+            "default",
+        );
+        // Non-Stack documents are left alone.
+        assert_eq!(
+            migrate_legacy_flux_source_stack(
+                "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: x\n",
+                "default",
+                default_tenant_source
+            )
+            .unwrap(),
+            FluxSourceMigration::Unchanged
+        );
+        // A source that cannot be cloned fails instead of writing a broken Stack.
+        assert!(
+            migrate_legacy_flux_source_stack(LEGACY_TENANT_STACK, "default", |dir| Ok(
+                PkoGitSource::branch("/tmp/local.git", "main", dir)
+            ))
+            .is_err()
+        );
     }
 }

@@ -93,12 +93,20 @@ pub async fn launch_pko_preview(
             bundle.tenant
         ));
     }
-    let (repo, stack) = match bundle.to_json_values() {
-        Ok(docs) => docs,
+    // Defense in depth: only previews whose Git source was resolved from the tenant's own
+    // platform-written source are ever applied (never one without `projectRepo`).
+    if bundle.stack.spec.git_source.is_none() {
+        return PreviewRunStatus::not_executed(format!(
+            "Tenant `{}` has no resolved Git source for the preview: PKO preview not executed",
+            bundle.tenant
+        ));
+    }
+    let stack = match bundle.to_json_value() {
+        Ok(doc) => doc,
         Err(e) => return PreviewRunStatus::apply_failed(format!("preview synthesis failed: {e}")),
     };
     let stack_name = bundle.stack.metadata.name.clone();
-    if let Err(e) = cluster.apply_preview(&repo, &stack).await {
+    if let Err(e) = cluster.apply_preview(&stack).await {
         tracing::warn!(pr_id = %bundle.pr_id, error = %e, "failed to apply ephemeral preview Stack");
         let run = PreviewRunStatus::apply_failed(format!("Applying preview Stack failed: {e}"));
         publish_phase(state, &bundle.pr_id, &stack_name, &run);
@@ -109,11 +117,7 @@ pub async fn launch_pko_preview(
         .await
     {
         tracing::warn!(pr_id = %bundle.pr_id, error = %e, "failed to copy preview provider credentials");
-        let repo_name = bundle.git_repository.metadata.name.clone();
         let _ = cluster.delete_preview_object("Stack", &stack_name).await;
-        let _ = cluster
-            .delete_preview_object("GitRepository", &repo_name)
-            .await;
         let run = PreviewRunStatus::not_executed(format!(
             "Provider credentials for the preview are unavailable ({e}): PKO preview not executed"
         ));
@@ -456,6 +460,7 @@ pub fn spawn_preview_reconciler(
             Ok(n) => tracing::info!(deleted = n, "purged stale preview Git credential mirrors"),
             Err(e) => tracing::warn!(error = %e, "stale preview Git credential sweep failed"),
         }
+        report_legacy_stack_sources(cluster.as_ref()).await;
         loop {
             tokio::time::sleep(jitter(interval)).await;
             let outcome = reconcile_previews_once(&state).await;
@@ -464,6 +469,31 @@ pub fn spawn_preview_reconciler(
             }
         }
     }))
+}
+
+/// Start-up audit: logs every tenant `Stack` still on `spec.fluxSource` (committed by earlier
+/// releases), which keeps depending on `source-controller` artifacts until it is migrated to PKO
+/// `gitSource` (`POST /api/v1/tenants/{id}/stack-sources/migrate`,
+/// `keel tenant migrate-stack-sources`). Secret-free: only namespaces and names are logged.
+pub async fn report_legacy_stack_sources(cluster: &dyn PreviewCluster) -> Vec<(String, String)> {
+    match cluster.list_legacy_flux_source_tenant_stacks().await {
+        Ok(stacks) => {
+            for (namespace, name) in &stacks {
+                tracing::warn!(
+                    namespace = %namespace,
+                    stack = %name,
+                    audit = "legacy-stack-source",
+                    "tenant Stack still uses fluxSource (source-controller artifacts); run `keel tenant migrate-stack-sources --tenant {}` and merge the PR",
+                    namespace.strip_prefix("tenant-").unwrap_or(namespace)
+                );
+            }
+            stacks
+        }
+        Err(e) => {
+            tracing::debug!(error = %e, "could not list tenant Stacks for the legacy source audit");
+            Vec::new()
+        }
+    }
 }
 
 /// Convenience: wraps a concrete runner for [`AppState::with_preview_cluster`].

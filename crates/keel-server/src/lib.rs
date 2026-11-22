@@ -63,6 +63,10 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/api/v1/tenants/{id}", delete(routes::delete_tenant))
         .route(
+            "/api/v1/tenants/{id}/stack-sources/migrate",
+            post(routes::migrate_stack_sources),
+        )
+        .route(
             "/api/v1/proposals",
             get(routes::list_proposals).post(routes::create_proposal),
         )

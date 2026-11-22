@@ -89,26 +89,38 @@ test.describe('06 - Full Localhost GUI GitOps Workflow', () => {
     await page.getByRole('button', { name: /Merge PR/i }).click();
     await expect(page.getByText(/merged cleanly/i)).toBeVisible({ timeout: 10000 });
 
-    // 4. Create a new kind cluster via GitOps for tenant `e2e-team`
+    // 4. A tenant created through the API has no Git source of its own yet: its Pulumi Stacks
+    //    fail closed with an actionable error (never falling back to the platform repository).
     await page.getByRole('button', { name: /Catalog & Form Wizard/i }).click();
     const tenantSelect = page.locator('#tenant-select-catalog');
     await expect(tenantSelect.locator('option[value="e2e-team"]')).toHaveCount(1, {
       timeout: 10000,
     });
     await tenantSelect.selectOption('e2e-team');
-
-    await page
+    const kindCard = page
       .getByTestId('catalog-list')
-      .locator('.p-5', { hasText: 'Local kind Cluster' })
-      .getByRole('button', { name: 'Create' })
-      .click();
+      .locator('.p-5', { hasText: 'Local kind Cluster' });
+    await kindCard.getByRole('button', { name: 'Create' }).click();
+    await page.getByRole('button', { name: /Submit & Open Git PR Proposal/i }).click();
+    await expect(page.getByText(/no platform-written Flux Git source/i)).toBeVisible({
+      timeout: 10000,
+    });
+    const deployModal = page.getByTestId('deploy-instance-modal');
+    await deployModal.getByRole('button', { name: 'Cancel', exact: true }).click();
+    await expect(deployModal).toHaveCount(0);
+
+    //    Create the kind cluster via GitOps in `default`, which has its platform-written source
+    //    (PKO `gitSource`).
+    await expect(tenantSelect.locator('option[value="default"]')).toHaveCount(1);
+    await tenantSelect.selectOption('default');
+    await kindCard.getByRole('button', { name: 'Create' }).click();
     await page.getByRole('button', { name: /Submit & Open Git PR Proposal/i }).click();
     await expectProposalOpened();
 
     // Inspect PKO v2 preview diff & merge the kind-cluster PR
     await page.getByRole('button', { name: /PR & Preview Inspector/i }).click();
     await expect(
-      page.getByRole('heading', { name: /feat\(e2e-team\): \w+ kind-cluster/i }),
+      page.getByRole('heading', { name: /feat\(default\): \w+ kind-cluster/i }),
     ).toBeVisible({
       timeout: 10000,
     });

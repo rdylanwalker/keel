@@ -581,6 +581,29 @@ spec:
 `,
   );
 
+  // Platform-written tenant Git source stubs (`tenants/<id>/git-repository.yaml`): tenant PKO
+  // Stacks and previews clone only the tenant's own source and fail closed without one.
+  for (const tenant of ['acme', 'default']) {
+    const tenantDir = path.join(workDir, 'tenants', tenant);
+    fs.mkdirSync(tenantDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(tenantDir, 'git-repository.yaml'),
+      `apiVersion: source.toolkit.fluxcd.io/v1
+kind: GitRepository
+metadata:
+  name: keel-gitops
+  namespace: tenant-${tenant}
+spec:
+  interval: 1m
+  url: http://forgejo-http.keel-system.svc.cluster.local:3000/keel/infra-gitops.git
+  ref:
+    branch: main
+  secretRef:
+    name: git-credentials
+`,
+    );
+  }
+
   spawnSync('git', ['add', '.'], { cwd: workDir });
   spawnSync(
     'git',

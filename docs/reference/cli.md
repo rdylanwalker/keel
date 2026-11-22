@@ -58,6 +58,7 @@ keel auth status
 | Command | Description |
 | :--- | :--- |
 | `keel tenant migrate-state --tenant <id> [--dry-run] [--kubeconfig <file>] [--context <ctx>]` | Moves a tenant's Pulumi stack state from the bucket root to `tenants/<id>/`. Talks directly to the management cluster (not the API) and needs `kubectl` and `pulumi` on `PATH`. It is idempotent: stacks already under the tenant prefix are skipped, and the copies at the bucket root are left in place for you to remove after checking. |
+| `keel tenant migrate-stack-sources --tenant <id> [--dry-run] [--output table\|json]` | Platform admin only. Opens one PR that moves the tenant's PKO Stacks written by earlier releases (`spec.fluxSource`, which downloads whole-repository artifacts from `source-controller`) to PKO `gitSource` on the tenant's own platform-written Git source. Only the source changes; programs and config stay the same. `--dry-run` lists the Stacks without opening a PR. Run it for every tenant, and merge the PRs, after upgrading. |
 
 ## Server
 

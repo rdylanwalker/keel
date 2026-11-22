@@ -2813,6 +2813,49 @@ mod security_hardening_tests {
         }
     }
 
+    /// The bootstrap-written `tenants/default/git-repository.yaml` is the platform-written source
+    /// keel-server resolves for tenant-default PKO Stacks (`gitSource`), and its
+    /// `allow-pko-workspace` policy lets the workspace pods clone it from the forge.
+    #[tokio::test]
+    async fn default_tenant_stub_is_the_tenant_stack_git_source() {
+        let url = "http://forgejo-http.keel-system.svc.cluster.local:3000/keel/infra-gitops.git";
+        let cfg = BootstrapConfig::new(keel_core::BootstrapTargetKind::Kubeconfig);
+        let a = synthesize_seed_control_plane(&cfg, Some(url))
+            .await
+            .unwrap();
+        let mut repo = a.flux_git_repository.clone();
+        repo.metadata.name = "keel-gitops".to_string();
+        repo.metadata.namespace = "tenant-default".to_string();
+        repo.spec.secret_ref = Some(LocalObjectReference {
+            name: "git-credentials".to_string(),
+        });
+        let stub = render_default_tenant_git_repository_yaml(&repo).unwrap();
+        let source = keel_kube::tenant_git_source_from_manifest("default", Some(&stub)).unwrap();
+        assert_eq!(source.url, url);
+        assert_eq!(source.branch_or_default(), "main");
+        assert_eq!(source.secret_name.as_deref(), Some("git-credentials"));
+
+        let policy = keel_core::split_yaml_documents(&stub)
+            .into_iter()
+            .map(|d| serde_yml::from_str::<Value>(&d).unwrap())
+            .find(|d| d["kind"] == "NetworkPolicy")
+            .expect("allow-pko-workspace policy");
+        assert_eq!(policy["metadata"]["name"], "allow-pko-workspace");
+        assert_eq!(
+            policy["spec"]["podSelector"]["matchLabels"]["auto.pulumi.com/component"],
+            "workspace"
+        );
+        // Unrestricted egress (in-cluster Forgejo in keel-system and external forges on 443).
+        assert!(
+            policy["spec"]["egress"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|rule| rule.as_object().is_some_and(|o| o.is_empty())),
+            "{stub}"
+        );
+    }
+
     #[tokio::test]
     async fn keel_server_git_url_is_serialized_not_interpolated() {
         let url = "https://git.example.org/keel/gitops.git#main: x";

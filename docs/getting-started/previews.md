@@ -30,7 +30,7 @@ Every report returned by `GET /api/v1/proposals/{id}/preview`, shown by `keel pr
 ## Lifecycle
 
 1. The proposal is pushed to `keel/<tenant>/<action>-<timestamp>` and a PR is opened. The PR title is a Conventional Commit, such as `feat(<tenant>): provision <name>`.
-2. `keel-server` server-side-applies a preview `GitRepository` and `Stack` into `keel-previews`, pinned to the proposal commit.
+2. `keel-server` server-side-applies a preview `Stack` into `keel-previews`. The workspace pod makes a shallow clone of the proposal branch directly from the forge (PKO `gitSource`). It authenticates with a per-preview copy of the tenant's read-only Git credential, which is deleted together with the preview. No Flux `GitRepository` or `source-controller` artifact is involved. The repository URL is the one in the platform-written `tenants/<id>/git-repository.yaml`, the same source the tenant's own Stacks clone.
 3. Keel immediately posts a **provisional** PR comment ("Provisional diff — PKO preview running"), synthesized from the proposed manifests.
 4. PKO runs `pulumi preview`. Keel follows the `Stack` status and the `auto.pulumi.com` `Update` object, then parses the plan from the workspace pod's `pulumi` log. PKO doesn't store per-resource preview steps anywhere else.
 5. Keel stores the report in a `ConfigMap` owned by the preview `Stack` and records the commit it covers. It then posts the **real** results as a follow-up PR comment and pushes progress over SSE (`keel preview status --watch`, GUI).
@@ -41,13 +41,15 @@ Every report returned by `GET /api/v1/proposals/{id}/preview`, shown by `keel pr
 Previews never receive control-plane credentials:
 
 - The workspace pod runs as `keel-previews/keel-preview-readonly`, which has TokenReview and read-only `view` access but **no Secret access**.
-- The preview mirrors the tenant's **scoped** SeaweedFS identity (limited to `pulumi-state/tenants/<id>/*`) and the tenant's **read-only** Git credential into `keel-previews`. If the tenant has no scoped identity, the preview is not executed (`notExecuted`) instead of falling back to admin keys.
+- The preview mirrors the tenant's **scoped** SeaweedFS identity (limited to `pulumi-state/tenants/<id>/*`) into `keel-previews`. It gets its own copy of the tenant's **read-only** Git credential (`keel-preview-<pr>-git-credentials`, auth keys only), owned by the preview `Stack` and deleted with it. If the tenant has no scoped identity, the preview is not executed (`notExecuted`) instead of falling back to admin keys.
 - Every preview `Stack` uses the tenant state backend `s3://<bucket>/tenants/<id>`, both for changes to existing stacks and for brand-new blueprints. Keel pins the backend when it synthesizes the preview and refuses to launch a preview whose backend is outside the tenant prefix.
 - **Cloud provider credentials.** Keel copies exactly the Secrets that the tenant `Stack` references through `envRefs` / `secretsRef`, and only the keys it references. They go into `keel-previews` as `keel-preview-<pr>-<name>`, labelled `keel.io/pr-id` and `keel.io/tenant`. Each copy has an `ownerReference` to the preview `Stack`, so Kubernetes deletes it when the preview is garbage-collected. The preview `Stack`'s refs are rewritten to point at the copies. For a new stack, the `<instance>-secrets` values come from the PR itself, because Flux has not decrypted them into the tenant namespace yet. Secrets that the Stack doesn't reference are never copied. The read-only preview ServiceAccount still can't read Secrets through the API: the kubelet injects the referenced values into the workspace pod. If a referenced Secret or key is missing, the preview is torn down and reported as `notExecuted`.
 
 ## Limitations
 
 - The PR comment table and GUI show only what PKO prints in its workspace log, up to the last 4000 lines.
+- A tenant needs its own Git source (`tenants/<id>/git-repository.yaml`, Flux `GitRepository` `tenant-<id>/keel-gitops`, plus the read-only `git-credentials` Secret). Without one, Pulumi-backed proposals for that tenant are refused with `409 Conflict` and an actionable message; Keel never falls back to the platform repository. Tenants created through `POST /api/v1/tenants` don't get a source yet, so they can use Helm and Flux apps but not Pulumi Stacks until per-tenant repositories land.
+- Tenant Stacks created by earlier releases still use `fluxSource`, and `keel-server` logs a `legacy-stack-source` warning for each of them at start-up. Move them to `gitSource` with `keel tenant migrate-stack-sources --tenant <id>` (one PR per tenant), then merge the PR.
 
 ## Deep Links
 

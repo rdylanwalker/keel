@@ -721,6 +721,28 @@ pub struct TenantArgs {
 pub enum TenantCommands {
     /// Move a tenant's Pulumi stack state from the bucket root to `tenants/<id>/` (idempotent)
     MigrateState(TenantMigrateStateArgs),
+    /// Open one PR moving a tenant's legacy `fluxSource` PKO Stacks to PKO `gitSource` (idempotent)
+    MigrateStackSources(TenantMigrateStackSourcesArgs),
+}
+
+/// Arguments for `keel tenant migrate-stack-sources` (calls keel-server; platform admin only).
+#[derive(Args, Debug, Clone, PartialEq, Eq)]
+pub struct TenantMigrateStackSourcesArgs {
+    /// Tenant (bare id, e.g. `default`; a `tenant-` prefix is stripped)
+    #[arg(long, help = TENANT_HELP)]
+    pub tenant: String,
+
+    /// List the Stacks that would be rewritten without opening a PR
+    #[arg(long, default_value_t = false)]
+    pub dry_run: bool,
+
+    /// Output format (`table|json`)
+    #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+    pub output: OutputFormat,
+
+    /// Keel server base URL (set via global `--server` / `KEEL_SERVER`)
+    #[arg(skip = DEFAULT_SERVER_URL.to_string())]
+    pub server: String,
 }
 
 /// Arguments for `keel tenant migrate-state` (talks to the cluster via kubectl, not keel-server).

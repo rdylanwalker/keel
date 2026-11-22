@@ -1141,6 +1141,57 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
       ]);
     });
 
+    await test.step('5b. Tenant Stacks clone their own Git source (PKO gitSource, no fluxSource)', async () => {
+      // `<name>\t<projectRepo>\t<fluxSource name>` per tenant-default Stack.
+      const stackSources = () =>
+        tryCmd('kubectl', [
+          'get',
+          'stacks.pulumi.com',
+          '-n',
+          'tenant-default',
+          '-o',
+          'jsonpath={range .items[*]}{.metadata.name}{"\\t"}{.spec.projectRepo}{"\\t"}{.spec.fluxSource.sourceRef.name}{"\\n"}{end}',
+        ])
+          .stdout.split('\n')
+          .filter((line) => line.trim() !== '')
+          .map((line) => {
+            const [name, projectRepo = '', fluxSource = ''] = line.split('\t');
+            return { name, projectRepo, fluxSource };
+          });
+      const legacy = () => stackSources().filter((s) => s.fluxSource !== '');
+
+      if (legacy().length > 0) {
+        // Reused cluster whose Stacks were committed by an earlier release: migrate them through
+        // one reviewed PR (never a direct commit to main), exactly as an upgraded install would.
+        logStep(
+          `Legacy fluxSource Stacks found (${legacy()
+            .map((s) => s.name)
+            .join(', ')}); running \`keel tenant migrate-stack-sources\`...`,
+        );
+        const migrate = runCmdAll(
+          KEEL_BIN,
+          ['tenant', 'migrate-stack-sources', '--tenant', 'default', '--output', 'json'],
+          cliEnv,
+        );
+        expect(migrate.ok, migrate.out).toBe(true);
+        const prId = String(JSON.parse(migrate.out).proposal?.id ?? '');
+        expect(prId, migrate.out).not.toBe('');
+        const merge = runCmdAll(KEEL_BIN, ['proposal', 'merge', prId], cliEnv);
+        expect(merge.ok, merge.out).toBe(true);
+        await expect
+          .poll(() => legacy().map((s) => s.name), { timeout: 300_000, intervals: [10_000] })
+          .toEqual([]);
+        await waitForK8sReady('stack', `${WORKLOAD_CLUSTER}-cluster`, 'tenant-default', 480_000);
+        logStep(`Migrated tenant-default Stacks to PKO gitSource (PR #${prId})`);
+      }
+
+      const cluster = stackSources().find((s) => s.name === `${WORKLOAD_CLUSTER}-cluster`);
+      expect(cluster, JSON.stringify(stackSources())).toBeTruthy();
+      expect(cluster!.projectRepo).not.toBe('');
+      expect(cluster!.fluxSource).toBe('');
+      expect(legacy()).toEqual([]);
+    });
+
     const workloadAppName = `${WORKLOAD_CLUSTER}-podinfo`;
     await test.step('6. GUI Standalone App: Deploy canary podinfo onto workload cluster', async () => {
       const existingApp = tryCmd('kubectl', [
@@ -1431,6 +1482,20 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
         'jsonpath={.spec.preview}',
       ]).stdout;
       expect(isPreview).toBe('true');
+      // The preview clones the PR branch itself (PKO gitSource) with a per-preview copy of the
+      // tenant's read-only credential; no Flux GitRepository / source-controller artifact.
+      const source = tryCmd('kubectl', [
+        'get',
+        'stacks.pulumi.com',
+        name,
+        '-n',
+        'keel-previews',
+        '-o',
+        'jsonpath={.spec.projectRepo}|{.spec.fluxSource.sourceRef.name}|{.spec.gitAuth.basicAuth.password.secret.name}',
+      ]).stdout.split('|');
+      expect(source[0], source.join('|')).not.toBe('');
+      expect(source[1], source.join('|')).toBe('');
+      expect(source[2], source.join('|')).toBe(`keel-preview-${prId}-git-credentials`);
     });
 
     await test.step('3. GUI: PKO preview badge + SSE "PKO preview" event', async () => {

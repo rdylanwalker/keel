@@ -273,6 +273,15 @@ impl IntoResponse for ServerError {
                 }),
             )
                 .into_response(),
+            Self::Kube(KubeError::TenantSourceUnavailable(msg)) => (
+                StatusCode::CONFLICT,
+                Json(ErrorResponse {
+                    error: msg,
+                    details: None,
+                    correlation_id: None,
+                }),
+            )
+                .into_response(),
             Self::Kube(KubeError::Unavailable(msg)) => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(ErrorResponse {

@@ -74,12 +74,11 @@ impl PreviewResourceCandidate {
         }
     }
 
-    /// Builds both `(Stack, GitRepository)` candidates from a synthesized `PreviewStack` bundle.
-    pub fn from_preview_bundle(bundle: &PreviewStack) -> [Self; 2] {
-        [
-            Self::from_stack(&bundle.stack),
-            Self::from_git_repository(&bundle.git_repository),
-        ]
+    /// Builds the `Stack` candidate of a synthesized `PreviewStack`. Previews clone through PKO
+    /// `gitSource`; `GitRepository` candidates only remain for previews created by older releases
+    /// (`preview-source-pr-<id>`), which are still garbage-collected.
+    pub fn from_preview_bundle(bundle: &PreviewStack) -> [Self; 1] {
+        [Self::from_stack(&bundle.stack)]
     }
 
     /// Extracts a candidate from an unstructured Kubernetes resource JSON object (`DynamicObject`).
@@ -291,13 +290,38 @@ mod tests {
             tenant,
             "provision-vm",
             ts,
-            "https://forge.internal/keel/infra.git",
             "tenants/acme/infra/vm",
             "keel/acme-vm/prod",
             "s3://pulumi-state",
         )
         .expect("valid params");
         synthesize_ephemeral_preview(&params).expect("valid preview bundle")
+    }
+
+    /// `GitRepository` written by releases before previews moved to PKO `gitSource`.
+    fn legacy_preview_git_repository(pr_id: &str) -> PreviewResourceCandidate {
+        PreviewResourceCandidate::from_json_value(&serde_json::json!({
+            "apiVersion": "source.toolkit.fluxcd.io/v1",
+            "kind": "GitRepository",
+            "metadata": {
+                "name": format!("preview-source-pr-{pr_id}"),
+                "namespace": "keel-previews",
+                "labels": {
+                    "keel.io/pr-id": pr_id,
+                    "keel.io/ephemeral-preview": "true"
+                }
+            }
+        }))
+        .expect("candidate")
+    }
+
+    #[test]
+    fn preview_bundles_no_longer_carry_a_flux_git_repository() {
+        let bundle = make_preview("21", "acme", 1_700_000_021);
+        let candidates = PreviewResourceCandidate::from_preview_bundle(&bundle);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].kind, PreviewResourceKind::Stack);
+        assert_eq!(candidates[0].name, "preview-stack-pr-21");
     }
 
     #[test]
@@ -318,18 +342,22 @@ mod tests {
             "prod-db",
             "keel/acme-db/prod",
             "s3://pulumi-state",
-            "tenant-source",
-            "tenants/acme/infra/db",
+            crate::stack::PkoGitSource::branch(
+                "https://forge.internal/keel/infra.git",
+                "main",
+                "tenants/acme/infra/db",
+            ),
         ))
         .unwrap();
 
-        let mut candidates = Vec::new();
-        // Deliberately insert GitRepository before Stack and include duplicates to test ordering & dedup
-        candidates.push(PreviewResourceCandidate::from_git_repository(
-            &pr_12.git_repository,
-        ));
-        candidates.push(PreviewResourceCandidate::from_stack(&pr_12.stack));
-        candidates.push(PreviewResourceCandidate::from_stack(&pr_12.stack));
+        // Deliberately insert (legacy) GitRepositories before Stacks and include duplicates to test
+        // ordering & dedup.
+        let mut candidates = vec![
+            legacy_preview_git_repository("12"),
+            legacy_preview_git_repository("10"),
+            PreviewResourceCandidate::from_stack(&pr_12.stack),
+            PreviewResourceCandidate::from_stack(&pr_12.stack),
+        ];
         candidates.extend(PreviewResourceCandidate::from_preview_bundle(&pr_10));
         candidates.extend(PreviewResourceCandidate::from_preview_bundle(&pr_11));
         candidates.push(PreviewResourceCandidate::from_stack(&mgmt));

@@ -3,12 +3,14 @@
 pub mod catalog;
 pub mod management;
 pub mod proposals;
+pub mod stack_sources;
 pub mod tenants;
 pub mod workloads;
 
 pub use catalog::*;
 pub use management::*;
 pub use proposals::*;
+pub use stack_sources::*;
 pub use tenants::*;
 pub use workloads::*;
 
@@ -778,6 +780,21 @@ spec:
         )
         .await
         .unwrap();
+
+        // Platform-written tenant Git source stub: tenant PKO Stacks clone only their own source.
+        for tenant in ["default"] {
+            tokio::fs::create_dir_all(workdir.join(format!("tenants/{tenant}")))
+                .await
+                .unwrap();
+            tokio::fs::write(
+                workdir.join(format!("tenants/{tenant}/git-repository.yaml")),
+                format!(
+                    "apiVersion: source.toolkit.fluxcd.io/v1\nkind: GitRepository\nmetadata:\n  name: keel-gitops\n  namespace: tenant-{tenant}\nspec:\n  interval: 1m\n  url: https://forge.example/keel/infra-gitops.git\n  ref:\n    branch: main\n  secretRef:\n    name: git-credentials\n"
+                ),
+            )
+            .await
+            .unwrap();
+        }
 
         git.add(&workdir, ["."]).await.unwrap();
         git.commit(

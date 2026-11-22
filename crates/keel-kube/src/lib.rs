@@ -28,9 +28,10 @@ pub use live::{
     is_stack_manifest_protected, is_stack_object_protected,
 };
 pub use preview_runner::{
-    InMemoryPreviewCluster, InMemoryPreviewSecret, KubePreviewCluster,
+    DEFAULT_TENANT_GIT_BRANCH, InMemoryPreviewCluster, InMemoryPreviewSecret, KubePreviewCluster,
     PREVIEW_PROVIDER_SECRET_KIND, PreviewCluster, PreviewPrerequisites, TenantGitSource,
-    preview_git_secret_name, preview_report_configmap_name, preview_s3_secret_name,
+    legacy_flux_source_tenant_stacks, preview_git_secret_name, preview_report_configmap_name,
+    preview_s3_secret_name, tenant_git_repository_manifest_path, tenant_git_source_from_manifest,
     tenant_git_source_from_repository,
 };
 pub use s3_identity::{
@@ -96,6 +97,11 @@ pub enum KubeError {
     /// never fall back to the platform `flux-system` whole-repository source).
     #[error("Preview source unavailable: {0}")]
     PreviewSourceUnavailable(String),
+
+    /// The tenant has no usable platform-written Git source for its PKO `Stack`s (fail closed:
+    /// Stacks clone only the tenant's own source, never the platform repository; maps to 409).
+    #[error("Tenant Git source unavailable: {0}")]
+    TenantSourceUnavailable(String),
 
     #[error("Cryptographic operation failed: {0}")]
     Crypto(String),
