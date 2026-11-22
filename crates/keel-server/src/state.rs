@@ -371,6 +371,8 @@ fn single_scope(tenant: Option<&str>) -> Option<[String; 1]> {
     tenant.map(|t| [t.to_string()])
 }
 
+/// Resource kind of a Stack: the `keel.io/resource-kind` label, which proposals stamp from the
+/// blueprint's `metadata.resourceKind`, else a name/provider heuristic for unlabelled Stacks.
 fn infer_stack_resource_kind(
     name: &str,
     namespace: &str,
@@ -405,8 +407,6 @@ fn infer_stack_resource_kind(
     } else if is_manifest_runtime
         || provider == Some("kubernetes")
         || provider == Some("cloudflare")
-        || catalog_id == Some("postgres-managed")
-        || catalog_id == Some("canary-gateway-config")
         || name.contains("postgres")
         || name.contains("db")
         || name.contains("gateway")
@@ -663,7 +663,6 @@ impl RepoClusterStateProvider {
                 let has_kubeconfig_secret =
                     val.pointer("/spec/config/kubeconfigSecretName").is_some()
                         && doc_provider.as_deref() != Some("kubernetes")
-                        && catalog_id.as_deref() != Some("canary-gateway-config")
                         && !name.contains("gateway");
 
                 let label_resource_kind = val

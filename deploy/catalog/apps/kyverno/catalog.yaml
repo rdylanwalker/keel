@@ -2,8 +2,8 @@
 # Self-service twin of `catalog/core/kyverno` (Keel's own admission controller in `keel-system`):
 # same chart and version (a drift test in `keel-cli` fails when they differ), reusing the seed
 # install config of `deploy/seed/core-addons/kyverno.yaml` (CEL `policies.kyverno.io` CRDs only).
-# The management-only parts (the `keel-system` PolicyException namespace and the Keel policies in
-# `deploy/seed/kyverno-policies`) are not installed; tenants bring their own policies. The release
+# The management-only parts (the `keel-system` PolicyException namespace and the Keel policies that
+# `keel bootstrap init` renders from `keel_kube::KyvernoManifestBundle`) are not installed; tenants bring their own policies. The release
 # always installs into `kyverno` (`spec.placement.namespace`), which also holds PolicyExceptions.
 apiVersion: keel.io/v1alpha1
 kind: CatalogApplication

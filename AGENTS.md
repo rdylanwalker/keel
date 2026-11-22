@@ -36,7 +36,7 @@ keel/
 │   ├── bootstrap/<target>/     # Stage 0 Pulumi YAML programs (kind, proxmox, aws, gcp, azure, hetzner, control-plane*)
 │   ├── bootstrap/manifests/    # Stage 0 raw manifests (preview RBAC, local CA, gateway, tenants kustomization, ...)
 │   ├── bootstrap/keel-server/  # Kustomize bundle for in-cluster keel-server (least-privilege RBAC + Deployment)
-│   ├── seed/                   # Flux-managed core add-ons, flux-system sync/RBAC, Kyverno policies, providers
+│   ├── seed/                   # Flux-managed core add-ons, flux-system sync + tenant-reconciler RBAC, manual-apply copies of two Kyverno policies
 │   └── catalog/                # Built-in catalog apps, infra blueprints, bundles
 ├── docs/                       # mdBook user & operations docs (SUMMARY.md, getting-started/, operations/, reference/)
 ├── ui/                         # React + TypeScript + Shadcn UI (ui/components.json, ui/src/components/ui) + Tailwind + @rjsf/core

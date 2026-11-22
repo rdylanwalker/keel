@@ -43,9 +43,8 @@ serve-demo:
     git init --bare "$tmp_dir/bare.git" >/dev/null
     git clone "$tmp_dir/bare.git" "$tmp_dir/work" >/dev/null 2>&1
     git -C "$tmp_dir/work" checkout -b main >/dev/null 2>&1
-    mkdir -p "$tmp_dir/work/.keel" "$tmp_dir/work/providers" "$tmp_dir/work/catalog"
+    mkdir -p "$tmp_dir/work/.keel" "$tmp_dir/work/catalog"
     cp -r deploy/catalog/* "$tmp_dir/work/catalog/"
-    cp deploy/seed/providers/registry.yaml "$tmp_dir/work/providers/registry.yaml"
     printf 'apiVersion: keel.io/v1alpha1\nkind: KeelConfig\nclusterName: keel-demo\nbootstrapTarget: kind\nforge:\n  provider: local\n  repoUrl: ""\n' > "$tmp_dir/work/.keel/config.yaml"
     git -C "$tmp_dir/work" add -A
     git -C "$tmp_dir/work" -c user.name="Keel Demo" -c user.email="demo@keel.io" commit -m "chore(demo): seed catalog and providers" >/dev/null

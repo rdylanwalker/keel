@@ -1,4 +1,7 @@
 # Kyverno ValidatingPolicy: protect-control-plane (NFR-REL-01, NFR-SEC-04)
+# Mirrors `keel_kube::kyverno::build_protect_control_plane_policy()` (drift-tested), which is what
+# `keel bootstrap init` applies. This copy is kept for operators applying it by hand (see
+# `docs/catalog/keel-server.md`).
 apiVersion: policies.kyverno.io/v1
 kind: ValidatingPolicy
 metadata:

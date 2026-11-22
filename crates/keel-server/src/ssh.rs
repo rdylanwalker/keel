@@ -32,19 +32,19 @@ const NON_SSH_PROVIDERS: &[&str] = &[
 ];
 
 /// Returns `true` if the given infrastructure stack/provider supports SSH access.
+///
+/// Stacks whose blueprint declares a non-VM `metadata.resourceKind` (stamped as the
+/// `keel.io/resource-kind` label) are already refused by `resolve_stack_ssh_info`; this only
+/// screens providers that never expose an SSH endpoint.
 pub fn is_ssh_supported_infra(provider: &str, stack_name: &str) -> bool {
     let p = provider.trim().to_ascii_lowercase();
     if NON_SSH_PROVIDERS.contains(&p.as_str()) {
         return false;
     }
-    let name = stack_name.trim().to_ascii_lowercase();
-    if name == "management-cluster-core" && p.is_empty() {
-        return false;
-    }
-    if matches!(name.as_str(), "postgres-managed" | "canary-gateway-config") {
-        return false;
-    }
-    true
+    !(p.is_empty()
+        && stack_name
+            .trim()
+            .eq_ignore_ascii_case("management-cluster-core"))
 }
 
 #[derive(Debug, Deserialize)]

@@ -626,36 +626,65 @@ pub fn default_bare_repo_for_workdir(repo_dir: &Path) -> PathBuf {
     repo_dir.with_file_name(format!("{dir_name}.git"))
 }
 
-const STARTER_KIND_CLUSTER_CATALOG_YAML: &str =
-    include_str!("../../../../deploy/catalog/infra/kind-cluster/catalog.yaml");
-const STARTER_KIND_CLUSTER_PULUMI_YAML: &str =
-    include_str!("../../../../deploy/catalog/infra/kind-cluster/Pulumi.yaml");
-const STARTER_AWS_EKS_CLUSTER_CATALOG_YAML: &str =
-    include_str!("../../../../deploy/catalog/infra/aws-eks-cluster/catalog.yaml");
-const STARTER_AWS_EKS_CLUSTER_PULUMI_YAML: &str =
-    include_str!("../../../../deploy/catalog/infra/aws-eks-cluster/Pulumi.yaml");
-const STARTER_GCP_GKE_CLUSTER_CATALOG_YAML: &str =
-    include_str!("../../../../deploy/catalog/infra/gcp-gke-cluster/catalog.yaml");
-const STARTER_GCP_GKE_CLUSTER_PULUMI_YAML: &str =
-    include_str!("../../../../deploy/catalog/infra/gcp-gke-cluster/Pulumi.yaml");
-const STARTER_AZURE_AKS_CLUSTER_CATALOG_YAML: &str =
-    include_str!("../../../../deploy/catalog/infra/azure-aks-cluster/catalog.yaml");
-const STARTER_AZURE_AKS_CLUSTER_PULUMI_YAML: &str =
-    include_str!("../../../../deploy/catalog/infra/azure-aks-cluster/Pulumi.yaml");
-const STARTER_AWS_VM_CATALOG_YAML: &str =
-    include_str!("../../../../deploy/catalog/infra/aws-vm/catalog.yaml");
-const STARTER_AWS_VM_PULUMI_YAML: &str =
-    include_str!("../../../../deploy/catalog/infra/aws-vm/Pulumi.yaml");
-const STARTER_AZURE_VM_CATALOG_YAML: &str =
-    include_str!("../../../../deploy/catalog/infra/azure-vm/catalog.yaml");
-const STARTER_AZURE_VM_PULUMI_YAML: &str =
-    include_str!("../../../../deploy/catalog/infra/azure-vm/Pulumi.yaml");
-const STARTER_GCP_VM_CATALOG_YAML: &str =
-    include_str!("../../../../deploy/catalog/infra/gcp-vm/catalog.yaml");
-const STARTER_GCP_VM_PULUMI_YAML: &str =
-    include_str!("../../../../deploy/catalog/infra/gcp-vm/Pulumi.yaml");
-const STARTER_PODINFO_CATALOG_YAML: &str =
-    include_str!("../../../../deploy/catalog/apps/podinfo/catalog.yaml");
+// `BUILT_IN_CATALOG_FILES`: every `deploy/catalog/{apps,infra,bundles}` file (`build.rs`).
+include!(concat!(env!("OUT_DIR"), "/built_in_catalog.rs"));
+
+/// Contents of the built-in catalog file at repository path `path`; a missing path fails to compile.
+#[cfg(test)]
+const fn built_in_catalog_file(path: &str) -> &'static str {
+    const fn str_eq(a: &str, b: &str) -> bool {
+        let (a, b) = (a.as_bytes(), b.as_bytes());
+        if a.len() != b.len() {
+            return false;
+        }
+        let mut i = 0;
+        while i < a.len() {
+            if a[i] != b[i] {
+                return false;
+            }
+            i += 1;
+        }
+        true
+    }
+    let mut i = 0;
+    while i < BUILT_IN_CATALOG_FILES.len() {
+        if str_eq(BUILT_IN_CATALOG_FILES[i].0, path) {
+            return BUILT_IN_CATALOG_FILES[i].1;
+        }
+        i += 1;
+    }
+    panic!("not a built-in catalog file")
+}
+
+/// Self-service twins of the management add-ons and starter apps checked by the drift tests.
+#[cfg(test)]
+const STARTER_DEX_APP_YAML: &str = built_in_catalog_file("catalog/apps/dex/catalog.yaml");
+#[cfg(test)]
+const STARTER_CERT_MANAGER_APP_YAML: &str =
+    built_in_catalog_file("catalog/apps/cert-manager/catalog.yaml");
+#[cfg(test)]
+const STARTER_RAUTHY_APP_YAML: &str = built_in_catalog_file("catalog/apps/rauthy/catalog.yaml");
+#[cfg(test)]
+const STARTER_RAUTHY_APP_MANIFESTS_YAML: &str =
+    built_in_catalog_file("catalog/apps/rauthy/manifests.yaml");
+#[cfg(test)]
+const STARTER_FORGEJO_APP_YAML: &str = built_in_catalog_file("catalog/apps/forgejo/catalog.yaml");
+#[cfg(test)]
+const STARTER_SEAWEEDFS_APP_YAML: &str =
+    built_in_catalog_file("catalog/apps/seaweedfs/catalog.yaml");
+#[cfg(test)]
+const STARTER_KYVERNO_APP_YAML: &str = built_in_catalog_file("catalog/apps/kyverno/catalog.yaml");
+#[cfg(test)]
+const STARTER_PKO_APP_YAML: &str =
+    built_in_catalog_file("catalog/apps/pulumi-kubernetes-operator/catalog.yaml");
+#[cfg(test)]
+const STARTER_FLUX2_APP_YAML: &str = built_in_catalog_file("catalog/apps/flux2/catalog.yaml");
+#[cfg(test)]
+const STARTER_KEEL_SERVER_APP_YAML: &str =
+    built_in_catalog_file("catalog/apps/keel-server/catalog.yaml");
+#[cfg(test)]
+const STARTER_KEEL_SERVER_APP_MANIFESTS_YAML: &str =
+    built_in_catalog_file("catalog/apps/keel-server/manifests.yaml");
 
 const SEED_CORE_ADDON_KUSTOMIZATION_YAML: &str =
     include_str!("../../../../deploy/seed/core-addons/kustomization.yaml");
@@ -741,42 +770,6 @@ const CORE_CATALOG_RAUTHY_YAML: &str =
     include_str!("../../../../deploy/catalog/core/rauthy/catalog.yaml");
 const CORE_CATALOG_FORGEJO_YAML: &str =
     include_str!("../../../../deploy/catalog/core/forgejo/catalog.yaml");
-/// Self-service starter app (end users may install Dex even though Keel itself uses Rauthy).
-const STARTER_DEX_APP_YAML: &str = include_str!("../../../../deploy/catalog/apps/dex/catalog.yaml");
-const STARTER_CERT_MANAGER_APP_YAML: &str =
-    include_str!("../../../../deploy/catalog/apps/cert-manager/catalog.yaml");
-/// Self-service tenant Rauthy IdP (`runtime: manifest`), distinct from Keel's own management
-/// Rauthy ([`CORE_CATALOG_RAUTHY_YAML`]); both pin the same `ghcr.io/sebadob/rauthy` tag.
-const STARTER_RAUTHY_APP_YAML: &str =
-    include_str!("../../../../deploy/catalog/apps/rauthy/catalog.yaml");
-const STARTER_RAUTHY_APP_MANIFESTS_YAML: &str =
-    include_str!("../../../../deploy/catalog/apps/rauthy/manifests.yaml");
-/// Self-service tenant Forgejo (`runtime: helm`), distinct from Keel's own management forge
-/// ([`CORE_CATALOG_FORGEJO_YAML`], `--with-forge`); both pin the same chart version.
-const STARTER_FORGEJO_APP_YAML: &str =
-    include_str!("../../../../deploy/catalog/apps/forgejo/catalog.yaml");
-/// Self-service tenant SeaweedFS S3 storage (`runtime: helm`), distinct from Keel's own state
-/// backend ([`CORE_CATALOG_S3_STATE_BACKEND_YAML`]); both pin the same chart version.
-const STARTER_SEAWEEDFS_APP_YAML: &str =
-    include_str!("../../../../deploy/catalog/apps/seaweedfs/catalog.yaml");
-/// Self-service workload-cluster Kyverno (`runtime: helm`, `scope: cluster`), twin of Keel's own
-/// admission controller ([`CORE_CATALOG_KYVERNO_YAML`]); both pin the same chart version.
-const STARTER_KYVERNO_APP_YAML: &str =
-    include_str!("../../../../deploy/catalog/apps/kyverno/catalog.yaml");
-/// Self-service workload-cluster PKO v2 (`runtime: helm`, `scope: cluster`), twin of Keel's own
-/// operator ([`CORE_CATALOG_PKO_YAML`]); both pin the same chart version.
-const STARTER_PKO_APP_YAML: &str =
-    include_str!("../../../../deploy/catalog/apps/pulumi-kubernetes-operator/catalog.yaml");
-/// Self-service workload-cluster Flux (`runtime: helm`, `scope: cluster`), twin of Keel's own
-/// Flux ([`CORE_CATALOG_FLUX2_YAML`]); both pin the same chart version.
-const STARTER_FLUX2_APP_YAML: &str =
-    include_str!("../../../../deploy/catalog/apps/flux2/catalog.yaml");
-/// Self-service workload-cluster keel-server (`runtime: manifest`, `scope: cluster`), twin of the
-/// management add-on ([`CORE_CATALOG_KEEL_SERVER_YAML`]); both pin [`KEEL_SERVER_IMAGE_TAG`].
-const STARTER_KEEL_SERVER_APP_YAML: &str =
-    include_str!("../../../../deploy/catalog/apps/keel-server/catalog.yaml");
-const STARTER_KEEL_SERVER_APP_MANIFESTS_YAML: &str =
-    include_str!("../../../../deploy/catalog/apps/keel-server/manifests.yaml");
 const CORE_CATALOG_ENVOY_GATEWAY_YAML: &str =
     include_str!("../../../../deploy/catalog/core/envoy-gateway/catalog.yaml");
 const CORE_CATALOG_PROMETHEUS_YAML: &str =
@@ -1546,114 +1539,18 @@ async fn initialize_seed_git_repo(
 
     let apps_dir = repo_dir.join("catalog/apps");
     let infra_dir = repo_dir.join("catalog/infra");
-    if is_dir_empty_or_missing(&infra_dir).await && is_dir_empty_or_missing(&apps_dir).await {
-        files_to_write.push((
-            "catalog/infra/kind-cluster/catalog.yaml".to_string(),
-            STARTER_KIND_CLUSTER_CATALOG_YAML.to_string(),
-        ));
-        files_to_write.push((
-            "catalog/infra/kind-cluster/Pulumi.yaml".to_string(),
-            STARTER_KIND_CLUSTER_PULUMI_YAML.to_string(),
-        ));
-        files_to_write.push((
-            "catalog/infra/aws-eks-cluster/catalog.yaml".to_string(),
-            STARTER_AWS_EKS_CLUSTER_CATALOG_YAML.to_string(),
-        ));
-        files_to_write.push((
-            "catalog/infra/aws-eks-cluster/Pulumi.yaml".to_string(),
-            STARTER_AWS_EKS_CLUSTER_PULUMI_YAML.to_string(),
-        ));
-        files_to_write.push((
-            "catalog/infra/gcp-gke-cluster/catalog.yaml".to_string(),
-            STARTER_GCP_GKE_CLUSTER_CATALOG_YAML.to_string(),
-        ));
-        files_to_write.push((
-            "catalog/infra/gcp-gke-cluster/Pulumi.yaml".to_string(),
-            STARTER_GCP_GKE_CLUSTER_PULUMI_YAML.to_string(),
-        ));
-        files_to_write.push((
-            "catalog/infra/azure-aks-cluster/catalog.yaml".to_string(),
-            STARTER_AZURE_AKS_CLUSTER_CATALOG_YAML.to_string(),
-        ));
-        files_to_write.push((
-            "catalog/infra/azure-aks-cluster/Pulumi.yaml".to_string(),
-            STARTER_AZURE_AKS_CLUSTER_PULUMI_YAML.to_string(),
-        ));
-        files_to_write.push((
-            "catalog/infra/aws-vm/catalog.yaml".to_string(),
-            STARTER_AWS_VM_CATALOG_YAML.to_string(),
-        ));
-        files_to_write.push((
-            "catalog/infra/aws-vm/Pulumi.yaml".to_string(),
-            STARTER_AWS_VM_PULUMI_YAML.to_string(),
-        ));
-        files_to_write.push((
-            "catalog/infra/azure-vm/catalog.yaml".to_string(),
-            STARTER_AZURE_VM_CATALOG_YAML.to_string(),
-        ));
-        files_to_write.push((
-            "catalog/infra/azure-vm/Pulumi.yaml".to_string(),
-            STARTER_AZURE_VM_PULUMI_YAML.to_string(),
-        ));
-        files_to_write.push((
-            "catalog/infra/gcp-vm/catalog.yaml".to_string(),
-            STARTER_GCP_VM_CATALOG_YAML.to_string(),
-        ));
-        files_to_write.push((
-            "catalog/infra/gcp-vm/Pulumi.yaml".to_string(),
-            STARTER_GCP_VM_PULUMI_YAML.to_string(),
-        ));
-        files_to_write.push((
-            "catalog/apps/podinfo/catalog.yaml".to_string(),
-            STARTER_PODINFO_CATALOG_YAML.to_string(),
-        ));
-        files_to_write.push((
-            "catalog/apps/dex/catalog.yaml".to_string(),
-            STARTER_DEX_APP_YAML.to_string(),
-        ));
-        files_to_write.push((
-            "catalog/apps/cert-manager/catalog.yaml".to_string(),
-            STARTER_CERT_MANAGER_APP_YAML.to_string(),
-        ));
-        files_to_write.push((
-            "catalog/apps/rauthy/catalog.yaml".to_string(),
-            STARTER_RAUTHY_APP_YAML.to_string(),
-        ));
-        files_to_write.push((
-            "catalog/apps/rauthy/manifests.yaml".to_string(),
-            STARTER_RAUTHY_APP_MANIFESTS_YAML.to_string(),
-        ));
-        files_to_write.push((
-            "catalog/apps/forgejo/catalog.yaml".to_string(),
-            STARTER_FORGEJO_APP_YAML.to_string(),
-        ));
-        files_to_write.push((
-            "catalog/apps/seaweedfs/catalog.yaml".to_string(),
-            STARTER_SEAWEEDFS_APP_YAML.to_string(),
-        ));
-        // Workload-cluster twins of the management operators (`scope: cluster`).
-        for (path, contents) in [
-            (
-                "catalog/apps/kyverno/catalog.yaml",
-                STARTER_KYVERNO_APP_YAML,
-            ),
-            (
-                "catalog/apps/pulumi-kubernetes-operator/catalog.yaml",
-                STARTER_PKO_APP_YAML,
-            ),
-            ("catalog/apps/flux2/catalog.yaml", STARTER_FLUX2_APP_YAML),
-            // A team's own Keel control plane on a workload cluster.
-            (
-                "catalog/apps/keel-server/catalog.yaml",
-                STARTER_KEEL_SERVER_APP_YAML,
-            ),
-            (
-                "catalog/apps/keel-server/manifests.yaml",
-                STARTER_KEEL_SERVER_APP_MANIFESTS_YAML,
-            ),
-        ] {
-            files_to_write.push((path.to_string(), contents.to_string()));
-        }
+    let bundles_dir = repo_dir.join("catalog/bundles");
+    // The whole built-in self-service catalog (apps, infra blueprints, bundles), unless the
+    // repository already carries its own catalog.
+    if is_dir_empty_or_missing(&infra_dir).await
+        && is_dir_empty_or_missing(&apps_dir).await
+        && is_dir_empty_or_missing(&bundles_dir).await
+    {
+        files_to_write.extend(
+            BUILT_IN_CATALOG_FILES
+                .iter()
+                .map(|(path, contents)| (path.to_string(), contents.to_string())),
+        );
     }
 
     let mut written_files = Vec::with_capacity(files_to_write.len());
@@ -2288,6 +2185,74 @@ fn format_bootstrap_init_summary(
         ));
     }
     out
+}
+
+#[cfg(test)]
+mod built_in_catalog_tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    /// Every seeded catalog entry parses, every blueprint/app ships the files it points at, and
+    /// every bundle item references an entry that bootstrap seeds alongside it.
+    #[test]
+    fn built_in_catalog_entries_parse_and_bundles_resolve() {
+        let paths: BTreeSet<&str> = BUILT_IN_CATALOG_FILES.iter().map(|(p, _)| *p).collect();
+        assert_eq!(paths.len(), BUILT_IN_CATALOG_FILES.len());
+        let (mut apps, mut infra, mut bundles) = (BTreeSet::new(), BTreeSet::new(), Vec::new());
+        for (path, contents) in BUILT_IN_CATALOG_FILES {
+            let Some(rest) = path.strip_suffix("/catalog.yaml") else {
+                continue;
+            };
+            let (kind, id) = rest
+                .strip_prefix("catalog/")
+                .and_then(|r| r.split_once('/'))
+                .unwrap_or_else(|| panic!("unexpected catalog path {path}"));
+            let parsed_id = match kind {
+                "apps" => {
+                    let app = keel_core::parse_catalog_application(contents)
+                        .unwrap_or_else(|e| panic!("{path}: {e}"));
+                    apps.insert(id);
+                    app.metadata.id
+                }
+                "infra" => {
+                    let bp = keel_core::parse_catalog_blueprint(contents)
+                        .unwrap_or_else(|e| panic!("{path}: {e}"));
+                    let program = format!("catalog/infra/{id}/Pulumi.yaml");
+                    assert!(paths.contains(program.as_str()), "{program} missing");
+                    infra.insert(id);
+                    bp.metadata.id
+                }
+                "bundles" => {
+                    let bundle = keel_core::parse_catalog_bundle(contents)
+                        .unwrap_or_else(|e| panic!("{path}: {e}"));
+                    let bundle_id = bundle.metadata.id.clone();
+                    bundles.push(bundle);
+                    bundle_id
+                }
+                other => panic!("unexpected catalog kind {other} in {path}"),
+            };
+            assert_eq!(
+                parsed_id, id,
+                "{path}: metadata.id must match its directory"
+            );
+        }
+        assert!(!apps.is_empty() && !infra.is_empty() && !bundles.is_empty());
+        for bundle in &bundles {
+            for item in &bundle.spec.items {
+                let seeded = match item.kind {
+                    keel_core::BundleItemKind::App => &apps,
+                    keel_core::BundleItemKind::Infra => &infra,
+                };
+                assert!(
+                    seeded.contains(item.catalog_ref.as_str()),
+                    "bundle {} references unseeded {:?} {}",
+                    bundle.metadata.id,
+                    item.kind,
+                    item.catalog_ref
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -5593,10 +5558,7 @@ mod tenant_keel_server_app_tests {
 
     /// Keel's Kyverno `protect-control-plane` rule confining keel-server's reconcile requests.
     fn protect_control_plane_keel_server_rule() -> String {
-        let policy: Value = serde_yml::from_str(include_str!(
-            "../../../../deploy/seed/kyverno-policies/protect-control-plane.yaml"
-        ))
-        .unwrap();
+        let policy = keel_kube::build_protect_control_plane_policy();
         policy["spec"]["validations"]
             .as_array()
             .unwrap()

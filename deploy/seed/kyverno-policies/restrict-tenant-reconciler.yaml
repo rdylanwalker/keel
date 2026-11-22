@@ -1,5 +1,7 @@
 # Kyverno ValidatingPolicy: restrict-tenant-reconciler (NFR-SEC-02, NFR-SEC-04)
-# Mirrors `keel_kube::kyverno::build_restrict_tenant_reconciler_policy()`.
+# Mirrors `keel_kube::kyverno::build_restrict_tenant_reconciler_policy()` (drift-tested), which is
+# what `keel bootstrap init` applies. This copy is kept for operators applying it by hand (see
+# `docs/catalog/keel-server.md`).
 # Confines `flux-system/keel-tenant-reconciler` (impersonated by the root tenants Flux
 # Kustomization) to `tenant-*` namespaces. Fails closed.
 apiVersion: policies.kyverno.io/v1

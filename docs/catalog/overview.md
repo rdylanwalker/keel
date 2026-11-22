@@ -18,7 +18,7 @@ catalog/
 
 ## Built-in Starter Applications
 
-On a fresh repository, `keel bootstrap init` seeds these self-service apps into `catalog/apps/`. Any tenant can install them from **Catalog & Form Wizard**:
+On a fresh repository (one without its own `catalog/apps/`, `catalog/infra/` or `catalog/bundles/`), `keel bootstrap init` seeds the whole built-in catalog shipped in the Keel source tree under `deploy/catalog/`: every app below into `catalog/apps/`, every infrastructure blueprint into `catalog/infra/` and every bundle into `catalog/bundles/`. Any tenant can install the apps from **Catalog & Form Wizard**:
 
 | ID | Name | Runtime | Notes |
 | :--- | :--- | :--- | :--- |
@@ -31,7 +31,14 @@ On a fresh repository, `keel bootstrap init` seeds these self-service apps into 
 | `kyverno` | Kyverno Policy Engine | `helm` | Workload clusters only (`scope: cluster`). Kyverno for the cluster's own policies, CEL `policies.kyverno.io` CRDs only |
 | `pulumi-kubernetes-operator` | Pulumi Kubernetes Operator | `helm` | Workload clusters only (`scope: cluster`). PKO v2 for the cluster's own Pulumi `Stack`s |
 | `flux2` | Flux CD | `helm` | Workload clusters only (`scope: cluster`). Flux for a cluster that runs its own GitOps, multi-tenancy lockdown on by default |
+| `envoy-gateway` | Envoy Gateway | `helm` | Workload clusters only (`scope: cluster`). Gateway API implementation used for canary traffic shifting |
+| `prometheus` | Prometheus | `helm` | Workload clusters only (`scope: cluster`). Metrics for Flagger canary analysis |
+| `flagger` | Flagger Progressive Delivery | `helm` | Workload clusters only (`scope: cluster`). Canary controller (Envoy Gateway + Prometheus) |
+| `authentik` | Authentik Identity Provider | `helm` | Tenant-owned authentik. Workload clusters only (`scope: cluster`): the chart renders a `ClusterRole`/`ClusterRoleBinding` |
+| `http-echo-manifest` | HTTP Echo Raw Manifest | `manifest` | Parameterized raw Kubernetes manifest template, deployable with the Flux or Pulumi engine ([walkthrough](../getting-started/things-to-try.md#6-deploy-a-parameterized-kubernetes-manifest-template-http-echo-manifest)) |
 | `keel-server` | Keel Control Plane (Workload Cluster) | `manifest` (Flux) | Workload clusters only (`scope: cluster`). A separate Keel (API, portal, PR + preview workflow) for a team's own GitOps repository, OIDC client and admin group. Git token and OIDC client secret are SOPS-encrypted. See [Keel Control Plane for a Workload Cluster](keel-server.md) |
+
+The seeded infrastructure blueprints are `kind-cluster`, `proxmox-k3s-cluster`, `aws-eks-cluster`, `gcp-gke-cluster`, `azure-aks-cluster`, `aws-vm`, `gcp-vm`, `azure-vm`, `postgres-managed` and `canary-gateway-config`. A blueprint only appears in the catalog once its provider is enabled (see [How Provider Blueprints Work](#how-provider-blueprints-work)); blueprints using the built-in `kubernetes` provider, such as `canary-gateway-config`, are always listed. The seeded bundles are `kind-with-podinfo`, `kind-canary-platform` and `canary-core-addons`.
 
 The tenant `rauthy`, `forgejo` and `seaweedfs` apps are separate from Keel's own management plane. `catalog/core/rauthy`, `catalog/core/forgejo` and `catalog/core/s3-state-backend` describe the protected management-plane IdP, forge and state backend in `keel-system`. Admins manage them from the Topology Map, and they never appear in the tenant catalog. Each tenant app reuses its management twin's known-good install config, adapted for a `restricted` tenant namespace, and pins the same version (`ghcr.io/sebadob/rauthy` tag, `forgejo` chart `17.3.3`, `seaweedfs` chart `4.54.0`). Tests fail when a pair drifts, so a version bump updates `catalog/core/<id>`, `catalog/apps/<id>`, the seed Flux object in `deploy/seed/core-addons/` and the Stage 0 Pulumi program together.
 

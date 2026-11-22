@@ -3,6 +3,9 @@
 # `NFR-SEC-02`) is configured on the Flux controllers themselves through the flux2 Helm chart
 # `multitenancy` values in `deploy/bootstrap/control-plane/Pulumi.yaml`; the controller
 # Deployments are not part of this kustomization, so no patches are applied here.
+# `keel bootstrap init` writes this file verbatim to `clusters/management/flux-system/`. The listed
+# `git-repository.yaml` and `tenant-reconciler-rbac.yaml` are generated at bootstrap (the Flux
+# `GitRepository` from `--git-url`, the RBAC from `keel_kube::tenant::build_tenant_reconciler_rbac`).
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:

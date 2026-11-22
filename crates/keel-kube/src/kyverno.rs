@@ -1537,32 +1537,10 @@ mod tests {
             build_restrict_tenant_pulumi_objects_policy(),
             build_protect_platform_owned_tenant_objects_policy(),
         ];
-        for seed in [
-            include_str!("../../../deploy/seed/kyverno-policies/restrict-tenant-flux-sources.yaml"),
-            include_str!(
-                "../../../deploy/seed/kyverno-policies/restrict-tenant-flux-source-status.yaml"
-            ),
-            include_str!(
-                "../../../deploy/seed/kyverno-policies/restrict-tenant-pulumi-objects.yaml"
-            ),
-            include_str!(
-                "../../../deploy/seed/kyverno-policies/protect-platform-owned-tenant-objects.yaml"
-            ),
-            include_str!(
-                "../../../deploy/seed/kyverno-policies/restrict-tenant-route-hostnames.yaml"
-            ),
-            include_str!("../../../deploy/seed/kyverno-policies/restrict-pulumi-providers.yaml"),
-            include_str!(
-                "../../../deploy/seed/kyverno-policies/disallow-privileged-containers.yaml"
-            ),
-            include_str!(
-                "../../../deploy/seed/kyverno-policies/local-kind-docker-socket-exception.yaml"
-            ),
-            include_str!("../../../deploy/seed/kyverno-policies/protect-control-plane.yaml"),
-            include_str!("../../../deploy/seed/kyverno-policies/restrict-tenant-reconciler.yaml"),
-        ] {
-            docs.push(serde_yml::from_str(seed).unwrap());
-        }
+        docs.push(
+            build_local_kind_docker_socket_exception(&DockerSocketExceptionConfig::default())
+                .unwrap(),
+        );
         docs.extend(build_sync_keel_ca_bundle_manifests());
         for doc in docs {
             let text = doc.to_string();
@@ -1578,15 +1556,8 @@ mod tests {
     }
 
     #[test]
-    fn sync_keel_ca_bundle_matches_seed_and_copies_only_the_public_ca() {
-        let seed: Vec<Value> = keel_core::split_yaml_documents(include_str!(
-            "../../../deploy/seed/kyverno-policies/sync-keel-ca-bundle.yaml"
-        ))
-        .iter()
-        .map(|d| serde_yml::from_str(d).unwrap())
-        .collect();
+    fn sync_keel_ca_bundle_copies_only_the_public_ca() {
         let generated = build_sync_keel_ca_bundle_manifests();
-        assert_eq!(seed, generated);
         let policy = &generated[2];
         assert_eq!(policy["kind"], "GeneratingPolicy");
         assert_eq!(policy["metadata"]["name"], POLICY_SYNC_KEEL_CA_BUNDLE);
@@ -1695,14 +1666,8 @@ mod tests {
     }
 
     #[test]
-    fn restrict_tenant_flux_sources_policy_matches_seed_and_closes_artifact_paths() {
+    fn restrict_tenant_flux_sources_policy_closes_artifact_paths() {
         let policy = build_restrict_tenant_flux_sources_policy();
-        let seed: Value = serde_yml::from_str(include_str!(
-            "../../../deploy/seed/kyverno-policies/restrict-tenant-flux-sources.yaml"
-        ))
-        .unwrap();
-        assert_eq!(seed["spec"], policy["spec"]);
-        assert_eq!(seed["metadata"], policy["metadata"]);
         assert_eq!(policy["spec"]["failurePolicy"], "Fail");
         assert_eq!(policy["spec"]["validationActions"], json!(["Deny"]));
 
@@ -1780,14 +1745,8 @@ mod tests {
     }
 
     #[test]
-    fn restrict_tenant_flux_source_status_policy_matches_seed_and_filters_on_tenant_subjects() {
+    fn restrict_tenant_flux_source_status_policy_filters_on_tenant_subjects() {
         let policy = build_restrict_tenant_flux_source_status_policy();
-        let seed: Value = serde_yml::from_str(include_str!(
-            "../../../deploy/seed/kyverno-policies/restrict-tenant-flux-source-status.yaml"
-        ))
-        .unwrap();
-        assert_eq!(seed["spec"], policy["spec"]);
-        assert_eq!(seed["metadata"], policy["metadata"]);
         assert_eq!(
             policy["metadata"]["name"],
             POLICY_RESTRICT_TENANT_FLUX_SOURCE_STATUS
@@ -1873,14 +1832,8 @@ mod tests {
     }
 
     #[test]
-    fn restrict_tenant_pulumi_objects_policy_matches_seed_and_filters_on_tenant_subjects() {
+    fn restrict_tenant_pulumi_objects_policy_filters_on_tenant_subjects() {
         let policy = build_restrict_tenant_pulumi_objects_policy();
-        let seed: Value = serde_yml::from_str(include_str!(
-            "../../../deploy/seed/kyverno-policies/restrict-tenant-pulumi-objects.yaml"
-        ))
-        .unwrap();
-        assert_eq!(seed["spec"], policy["spec"]);
-        assert_eq!(seed["metadata"], policy["metadata"]);
         assert_eq!(
             policy["metadata"]["name"],
             POLICY_RESTRICT_TENANT_PULUMI_OBJECTS
@@ -2011,14 +1964,8 @@ mod tests {
     }
 
     #[test]
-    fn protect_platform_owned_policy_matches_seed_and_allows_only_platform_writers() {
+    fn protect_platform_owned_policy_allows_only_platform_writers() {
         let policy = build_protect_platform_owned_tenant_objects_policy();
-        let seed: Value = serde_yml::from_str(include_str!(
-            "../../../deploy/seed/kyverno-policies/protect-platform-owned-tenant-objects.yaml"
-        ))
-        .unwrap();
-        assert_eq!(seed["spec"], policy["spec"]);
-        assert_eq!(seed["metadata"], policy["metadata"]);
         assert_eq!(policy["spec"]["failurePolicy"], "Fail");
 
         // Matches by label on the new or the old object, so dropping the label is also guarded,
@@ -2257,7 +2204,7 @@ mod tests {
 
     /// Requests that reach `restrict-tenant-flux-source-status` (its `matchConditions` are exactly
     /// `cel_tenant_subject`, mirrored by [`is_tenant_subject`]; pinned by
-    /// [`restrict_tenant_flux_source_status_policy_matches_seed_and_filters_on_tenant_subjects`]).
+    /// [`restrict_tenant_flux_source_status_policy_filters_on_tenant_subjects`]).
     #[test]
     fn flux_source_status_policy_only_sees_tenant_requesters() {
         let sc = "system:serviceaccount:flux-system:source-controller";
@@ -2396,7 +2343,7 @@ mod tests {
     }
 
     #[test]
-    fn restrict_tenant_route_hostnames_policy_denies_platform_hosts_and_matches_seed() {
+    fn restrict_tenant_route_hostnames_policy_denies_platform_hosts() {
         let policy = build_restrict_tenant_route_hostnames_policy(&[
             "idp.corp.example",
             "keel.corp.example",
@@ -2422,15 +2369,5 @@ mod tests {
         // CEL-injection guard: only DNS hostnames are accepted.
         assert!(build_restrict_tenant_route_hostnames_policy(&["x' || true || '"]).is_err());
         assert!(build_restrict_tenant_route_hostnames_policy(&["Bad_Host"]).is_err());
-
-        let seed: Value = serde_yml::from_str(include_str!(
-            "../../../deploy/seed/kyverno-policies/restrict-tenant-route-hostnames.yaml"
-        ))
-        .unwrap();
-        let generated =
-            build_restrict_tenant_route_hostnames_policy(&default_reserved_route_hostnames())
-                .unwrap();
-        assert_eq!(seed["spec"], generated["spec"]);
-        assert_eq!(seed["metadata"], generated["metadata"]);
     }
 }

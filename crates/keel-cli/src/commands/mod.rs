@@ -831,25 +831,46 @@ spec:
                 .exists()
         );
         assert!(repo_dir.join("tenants/default/rbac.yaml").exists());
-        assert!(
-            repo_dir
-                .join("catalog/infra/kind-cluster/catalog.yaml")
-                .exists()
-        );
-        assert!(repo_dir.join("catalog/infra/aws-vm/catalog.yaml").exists());
-        assert!(repo_dir.join("catalog/infra/aws-vm/Pulumi.yaml").exists());
-        assert!(
-            repo_dir
-                .join("catalog/infra/azure-vm/catalog.yaml")
-                .exists()
-        );
-        assert!(repo_dir.join("catalog/infra/azure-vm/Pulumi.yaml").exists());
-        assert!(repo_dir.join("catalog/infra/gcp-vm/catalog.yaml").exists());
-        assert!(repo_dir.join("catalog/infra/gcp-vm/Pulumi.yaml").exists());
-        assert!(repo_dir.join("catalog/apps/podinfo/catalog.yaml").exists());
+        // Bootstrap seeds every built-in catalog file (apps, infra blueprints, bundles) verbatim.
+        let deploy_catalog =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy/catalog");
+        let mut built_in = Vec::new();
+        for kind in ["apps", "infra", "bundles"] {
+            collect_files(&deploy_catalog.join(kind), &mut built_in);
+        }
+        assert!(built_in.len() > 40, "{built_in:?}");
+        for src in built_in {
+            let rel = src.strip_prefix(&deploy_catalog).unwrap();
+            let seeded = repo_dir.join("catalog").join(rel);
+            assert_eq!(
+                std::fs::read_to_string(&seeded)
+                    .unwrap_or_else(|e| panic!("{} not seeded: {e}", seeded.display())),
+                std::fs::read_to_string(&src).unwrap(),
+                "{}",
+                rel.display()
+            );
+        }
 
         let git = GitRunner::new();
         assert!(git.ref_exists(&repo_dir, "refs/heads/main").await.unwrap());
+    }
+
+    fn collect_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            // build.rs never embeds hidden entries (editor swap files, `.DS_Store`, ...).
+            if path
+                .file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with('.'))
+            {
+                continue;
+            }
+            if path.is_dir() {
+                collect_files(&path, out);
+            } else {
+                out.push(path);
+            }
+        }
     }
 
     #[tokio::test]
