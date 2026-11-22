@@ -2989,8 +2989,9 @@ pub async fn create_proposal(
 
 /// Resolves cluster-side preview inputs for `tenant` (OPEN-9): the tenant's **scoped** S3 state
 /// identity mirrored into `keel-previews` (never the control-plane admin keys) and the tenant's
-/// cluster-reachable Flux Git source + read-only credentials. Returns a human-readable reason
-/// when the PKO preview cannot run (rendered as `notExecuted`).
+/// cluster-reachable Flux Git source (`tenant-<id>/keel-gitops` only, never the platform
+/// `flux-system` source) + read-only credentials. Returns a human-readable reason when the PKO
+/// preview cannot run (rendered as `notExecuted`); a missing tenant source fails closed.
 async fn attach_preview_cluster_inputs(
     state: &AppState,
     tenant: &str,
@@ -3001,6 +3002,17 @@ async fn attach_preview_cluster_inputs(
     };
     let prereqs = match cluster.ensure_preview_prerequisites(tenant).await {
         Ok(p) => p,
+        // Fail closed with the actionable (secret-free) reason: no tenant-owned Git source.
+        Err(keel_kube::KubeError::PreviewSourceUnavailable(reason)) => {
+            tracing::warn!(
+                tenant,
+                audit = "preview-source-denied",
+                pr_id = %params.pr_id,
+                reason = %reason,
+                "PKO preview refused: tenant has no usable Git source"
+            );
+            return Some(format!("{reason}: PKO preview not executed"));
+        }
         Err(e) => {
             tracing::warn!(tenant, error = %e, "preview prerequisites unavailable");
             return Some(format!(
@@ -3008,10 +3020,21 @@ async fn attach_preview_cluster_inputs(
             ));
         }
     };
-    if let Some(url) = prereqs.git_url {
-        params.repo_url = url;
-        params.git_secret_name = prereqs.git_secret;
-    }
+    // Previews read only the tenant's own Flux source; never fall back to the control-plane
+    // remote (which grants whole-repository read) when the cluster reports none.
+    let Some(url) = prereqs.git_url else {
+        tracing::warn!(
+            tenant,
+            audit = "preview-source-denied",
+            pr_id = %params.pr_id,
+            "PKO preview refused: tenant has no Git source"
+        );
+        return Some(format!(
+            "Tenant `{tenant}` has no Flux Git source (`tenant-{tenant}/keel-gitops`); previews never fall back to the platform repository: PKO preview not executed"
+        ));
+    };
+    params.repo_url = url;
+    params.git_secret_name = prereqs.git_secret;
     if params.backend_url.starts_with("s3://") {
         match prereqs.s3_secret {
             Some(secret) => attach_s3_credentials_env_refs(&mut params.env_refs, &secret),

@@ -29,8 +29,9 @@ pub use live::{
 };
 pub use preview_runner::{
     InMemoryPreviewCluster, InMemoryPreviewSecret, KubePreviewCluster,
-    PREVIEW_PROVIDER_SECRET_KIND, PreviewCluster, PreviewPrerequisites, preview_git_secret_name,
-    preview_report_configmap_name, preview_s3_secret_name,
+    PREVIEW_PROVIDER_SECRET_KIND, PreviewCluster, PreviewPrerequisites, TenantGitSource,
+    preview_git_secret_name, preview_report_configmap_name, preview_s3_secret_name,
+    tenant_git_source_from_repository,
 };
 pub use s3_identity::{
     SeaweedFsIdentityOps, SeaweedFsTenantS3Provisioner, TenantS3IdentityProvisioner,
@@ -90,6 +91,11 @@ pub enum KubeError {
     /// A live cluster connection is required but unavailable (maps to HTTP 503).
     #[error("Service unavailable: {0}")]
     Unavailable(String),
+
+    /// The tenant has no usable Git source for an ephemeral PKO preview (fail closed: previews
+    /// never fall back to the platform `flux-system` whole-repository source).
+    #[error("Preview source unavailable: {0}")]
+    PreviewSourceUnavailable(String),
 
     #[error("Cryptographic operation failed: {0}")]
     Crypto(String),

@@ -5233,10 +5233,13 @@ async fn test_pko_preview_lifecycle_is_applied_published_and_gced_from_cluster_s
 /// Flux-only proposals are labelled `notExecuted` instead of claiming a preview Stack.
 #[tokio::test]
 async fn test_pko_preview_apply_failure_is_reported_honestly() {
-    use keel_kube::InMemoryPreviewCluster;
+    use keel_kube::{InMemoryPreviewCluster, PreviewPrerequisites};
 
     let fixture = setup_fixture().await;
-    let cluster = InMemoryPreviewCluster::new();
+    let cluster = InMemoryPreviewCluster::new().with_prerequisites(PreviewPrerequisites {
+        git_url: Some("http://forgejo.keel-system.svc:3000/keel/infra-gitops.git".to_string()),
+        ..PreviewPrerequisites::default()
+    });
     cluster.fail_applies_with("admission webhook denied: restrict-pulumi-providers");
     let state = fixture
         .state
@@ -5276,6 +5279,80 @@ async fn test_pko_preview_apply_failure_is_reported_honestly() {
     );
     assert!(body["report"]["run"]["stack"].is_null());
     assert!(cluster.stack_names().is_empty());
+}
+
+/// Posts the `proxmox-vm` infra proposal used by the fail-closed preview source tests.
+async fn post_infra_proposal_with_cluster(
+    fixture: &TestFixture,
+    cluster: keel_kube::InMemoryPreviewCluster,
+    name: &str,
+) -> Value {
+    let state = fixture
+        .state
+        .clone()
+        .with_preview_cluster(Some(Arc::new(cluster)));
+    let cookie = login_and_get_cookie(fixture).await;
+    let res = build_router(state)
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/proposals")
+                .header(COOKIE, &cookie)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "tenant": "acme",
+                        "catalogId": "proxmox-vm",
+                        "kind": "infra",
+                        "name": name,
+                        "values": { "cores": 2 }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap()
+}
+
+/// A tenant without its own `tenant-<id>/keel-gitops` source must fail closed: no preview Stack
+/// or GitRepository is applied (so nothing can read the platform `flux-system` whole-repository
+/// source), and the report/PR comment carry an actionable `notExecuted` reason.
+#[tokio::test]
+async fn test_pko_preview_fails_closed_without_tenant_git_source() {
+    use keel_kube::{InMemoryPreviewCluster, PreviewCluster};
+
+    let fixture = setup_fixture().await;
+    let cluster = InMemoryPreviewCluster::new().without_tenant_source();
+    let body = post_infra_proposal_with_cluster(&fixture, cluster.clone(), "vm-no-source").await;
+    assert_eq!(body["report"]["run"]["phase"], "notExecuted");
+    let message = body["report"]["run"]["message"].as_str().unwrap();
+    assert!(message.contains("tenant-acme/keel-gitops"), "{message}");
+    assert!(message.contains("PKO preview not executed"), "{message}");
+    assert!(body["report"]["run"]["stack"].is_null());
+    assert!(cluster.stack_names().is_empty());
+    assert!(
+        cluster
+            .list_preview_git_repositories()
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // A cluster that reports no Git URL (defense in depth) is refused too, never falling back to
+    // the control-plane remote.
+    let no_url = InMemoryPreviewCluster::new();
+    let body = post_infra_proposal_with_cluster(&fixture, no_url.clone(), "vm-no-url").await;
+    assert_eq!(body["report"]["run"]["phase"], "notExecuted");
+    assert!(
+        body["report"]["run"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("never fall back to the platform repository")
+    );
+    assert!(no_url.stack_names().is_empty());
 }
 
 /// Seeds a provider-credential infra blueprint (`writeOnly` GOOGLE_CREDENTIALS) on `main`.

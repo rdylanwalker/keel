@@ -447,8 +447,15 @@ pub fn spawn_preview_reconciler(
     state: AppState,
     interval: Duration,
 ) -> Option<tokio::task::JoinHandle<()>> {
-    state.preview_cluster.as_ref()?;
+    let cluster = state.preview_cluster.clone()?;
     Some(tokio::spawn(async move {
+        // One-off migration sweep: drop `keel-previews` Git credential mirrors that are not the
+        // tenant's own read-only credential (e.g. left by the former `flux-system` fallback).
+        match cluster.purge_stale_preview_git_credentials().await {
+            Ok(0) => {}
+            Ok(n) => tracing::info!(deleted = n, "purged stale preview Git credential mirrors"),
+            Err(e) => tracing::warn!(error = %e, "stale preview Git credential sweep failed"),
+        }
         loop {
             tokio::time::sleep(jitter(interval)).await;
             let outcome = reconcile_previews_once(&state).await;

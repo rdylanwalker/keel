@@ -472,7 +472,7 @@ pub(crate) async fn install_stage0_core_addons(
                         .await?
                 }
                 None => notes.push(format!(
-                    "`{TENANT_GIT_TOKEN_ENV}` is unset: the operator `--git-token` is NOT shared with tenant-default; set a read-only token there if the tenant GitRepository needs authentication"
+                    "`{TENANT_GIT_TOKEN_ENV}` is unset: the operator `--git-token` is NOT shared with tenant-default; set a read-only token there if the tenant GitRepository needs authentication (tenant-default PKO previews are refused until it exists)"
                 )),
             }
         }
