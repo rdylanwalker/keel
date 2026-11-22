@@ -14,7 +14,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::KubeError;
-use crate::tenant::{TENANT_RECONCILER_SERVICE_ACCOUNT, validate_resource_name};
+use crate::tenant::{
+    KEEL_SERVER_NAMESPACE, KEEL_SERVER_SERVICE_ACCOUNT, PLATFORM_OWNED_LABEL,
+    TENANT_RECONCILER_SERVICE_ACCOUNT, validate_resource_name,
+};
 
 pub const POLICY_DISALLOW_PRIVILEGED: &str = "disallow-privileged-containers";
 pub const POLICY_PROTECT_CONTROL_PLANE: &str = "protect-control-plane";
@@ -26,7 +29,71 @@ pub const POLICY_SYNC_TENANT_SECRETS: &str = "sync-tenant-secrets";
 pub const RETIRED_SYNC_TENANT_SECRETS_RBAC: &str = "keel-kyverno-tenant-secret-sync";
 pub const POLICY_RESTRICT_TENANT_RECONCILER: &str = "restrict-tenant-reconciler";
 pub const POLICY_RESTRICT_TENANT_ROUTE_HOSTNAMES: &str = "restrict-tenant-route-hostnames";
+pub const POLICY_RESTRICT_TENANT_FLUX_SOURCES: &str = "restrict-tenant-flux-sources";
+pub const POLICY_RESTRICT_TENANT_FLUX_SOURCE_STATUS: &str = "restrict-tenant-flux-source-status";
+pub const POLICY_PROTECT_PLATFORM_OWNED_TENANT_OBJECTS: &str =
+    "protect-platform-owned-tenant-objects";
 pub const EXCEPTION_LOCAL_KIND_DOCKER_SOCKET: &str = "local-kind-docker-socket-exception";
+
+/// Requesting usernames treated as tenant subjects (prefix match): `ServiceAccount`s of `tenant-*`
+/// namespaces (tenant Flux/PKO identities, workspace pods) and the `keel-previews` preview identity.
+const TENANT_SUBJECT_USER_PREFIXES: [&str; 2] = [
+    "system:serviceaccount:tenant-",
+    "system:serviceaccount:keel-previews:",
+];
+/// Requesting groups treated as tenant subjects (prefix match): OIDC tenant groups and the
+/// `ServiceAccount` groups of `tenant-*` namespaces.
+const TENANT_SUBJECT_GROUP_PREFIXES: [&str; 2] = ["tenant-", "system:serviceaccounts:tenant-"];
+/// Requesting groups treated as tenant subjects (exact match).
+const TENANT_SUBJECT_GROUPS: [&str; 1] = ["system:serviceaccounts:keel-previews"];
+
+/// CEL: `true` when the request comes from a tenant subject (see the `TENANT_SUBJECT_*` lists),
+/// given CEL expressions for the requesting `username` (string) and `groups` (list). Matches the
+/// requesting user, never the target namespace, so Flux controllers writing tenant objects are
+/// not affected. Mirrored by [`is_tenant_subject`].
+fn cel_tenant_subject(username: &str, groups: &str) -> String {
+    let users = TENANT_SUBJECT_USER_PREFIXES
+        .iter()
+        .map(|p| format!("{username}.startsWith('{p}')"));
+    let group_terms = TENANT_SUBJECT_GROUP_PREFIXES
+        .iter()
+        .map(|p| format!("g.startsWith('{p}')"))
+        .chain(TENANT_SUBJECT_GROUPS.iter().map(|g| format!("g == '{g}'")))
+        .collect::<Vec<_>>()
+        .join(" || ");
+    users
+        .chain(std::iter::once(format!(
+            "{groups}.exists(g, {group_terms})"
+        )))
+        .collect::<Vec<_>>()
+        .join(" || ")
+}
+
+/// Rust mirror of [`cel_tenant_subject`] (same lists), for callers and tests that need to know
+/// whether a requester is a tenant subject without a CEL evaluator.
+pub fn is_tenant_subject(username: &str, groups: &[&str]) -> bool {
+    TENANT_SUBJECT_USER_PREFIXES
+        .iter()
+        .any(|p| username.starts_with(p))
+        || groups.iter().any(|g| {
+            TENANT_SUBJECT_GROUP_PREFIXES
+                .iter()
+                .any(|p| g.starts_with(p))
+                || TENANT_SUBJECT_GROUPS.contains(g)
+        })
+}
+
+/// CEL for the requesting username / groups in `matchConditions` (which cannot use `variables`).
+const CEL_REQUEST_USERNAME: &str =
+    "(has(request.userInfo.username) ? request.userInfo.username : '')";
+const CEL_REQUEST_GROUPS: &str = "(has(request.userInfo.groups) ? request.userInfo.groups : [])";
+/// CEL for the request namespace (`''` for cluster-scoped objects).
+const CEL_REQUEST_NAMESPACE: &str = "(has(request.namespace) ? request.namespace : '')";
+
+/// CEL: an `UPDATE` that leaves `spec` unchanged (finalizer removal, labels, reconcile
+/// annotations) or touches an object that is already being deleted. Such updates must always pass
+/// so controllers can finish deleting objects (and tenant namespaces never hang in `Terminating`).
+const CEL_SPEC_PRESERVING_UPDATE: &str = "(request.operation == 'UPDATE' && (has(object.metadata.deletionTimestamp) || (has(object.spec) ? object.spec : {}) == (has(oldObject.spec) ? oldObject.spec : {})))";
 
 pub const RULE_DISALLOW_PRIVILEGED: &str = "disallow-privileged";
 pub const RULE_DISALLOW_HOST_PATH_AND_DOCKER_SOCKET: &str = "disallow-host-path-and-docker-socket";
@@ -522,6 +589,314 @@ pub fn build_restrict_tenant_reconciler_policy() -> Value {
     })
 }
 
+/// Generates `ValidatingPolicy/restrict-tenant-flux-sources` (`policies.kyverno.io/v1`).
+///
+/// Closes the Flux source paths that would let a tenant republish or substitute repository
+/// content it does not own (`NFR-SEC-02`). Fails closed (`failurePolicy: Fail`). The
+/// `matchConditions` limit the webhook to writes in `tenant-*` namespaces, so every platform
+/// namespace write (`flux-system` included) never reaches Kyverno (anti-lockout, `NFR-REL-01`).
+/// Status writes are handled by [`build_restrict_tenant_flux_source_status_policy`].
+///
+/// * `ExternalArtifact` (`source.toolkit.fluxcd.io`) and every `source.extensions.fluxcd.io` kind
+///   (`ArtifactGenerator`) are denied in `tenant-*` namespaces for every requester: they would
+///   republish another source's artifact (the whole GitOps repository) into the tenant namespace.
+///   Updates that leave `spec` unchanged and objects being deleted pass (finalizer removal), and
+///   deletions are never matched.
+/// * Flux `Kustomization`s in `tenant-<id>` must impersonate `tenant-<id>-sa`
+///   (`spec.serviceAccountName`). Updates that leave `spec` unchanged (finalizer removal, reconcile
+///   annotations) and objects being deleted are always allowed.
+pub fn build_restrict_tenant_flux_sources_policy() -> Value {
+    json!({
+        "apiVersion": "policies.kyverno.io/v1",
+        "kind": "ValidatingPolicy",
+        "metadata": {
+            "name": POLICY_RESTRICT_TENANT_FLUX_SOURCES,
+            "labels": {
+                "app.kubernetes.io/managed-by": "keel",
+                "keel.io/policy-tier": "tenant-isolation"
+            }
+        },
+        "spec": {
+            "validationActions": ["Deny"],
+            "failurePolicy": "Fail",
+            "evaluation": {
+                "background": {
+                    "enabled": false
+                }
+            },
+            "matchConstraints": {
+                "resourceRules": [
+                    {
+                        "apiGroups": ["source.toolkit.fluxcd.io"],
+                        "apiVersions": ["*"],
+                        "operations": ["CREATE", "UPDATE"],
+                        "resources": ["externalartifacts"]
+                    },
+                    {
+                        "apiGroups": ["source.extensions.fluxcd.io"],
+                        "apiVersions": ["*"],
+                        "operations": ["CREATE", "UPDATE"],
+                        "resources": ["*"]
+                    },
+                    {
+                        "apiGroups": ["kustomize.toolkit.fluxcd.io"],
+                        "apiVersions": ["*"],
+                        "operations": ["CREATE", "UPDATE"],
+                        "resources": ["kustomizations"]
+                    }
+                ]
+            },
+            "matchConditions": [
+                {
+                    "name": "tenant-namespace",
+                    "expression": format!("{CEL_REQUEST_NAMESPACE}.startsWith('tenant-')")
+                }
+            ],
+            "variables": [
+                {
+                    "name": "ns",
+                    "expression": CEL_REQUEST_NAMESPACE
+                }
+            ],
+            "validations": [
+                {
+                    "expression": format!("!((request.kind.group == 'source.toolkit.fluxcd.io' && request.kind.kind == 'ExternalArtifact') || request.kind.group == 'source.extensions.fluxcd.io') || {CEL_SPEC_PRESERVING_UPDATE}"),
+                    "message": "ExternalArtifact and ArtifactGenerator objects are not allowed in tenant namespaces: they would republish another source's artifact (whole-repository read). Tenants only use their own GitRepository `keel-gitops`."
+                },
+                {
+                    "expression": format!("!(request.kind.group == 'kustomize.toolkit.fluxcd.io' && request.kind.kind == 'Kustomization') || (has(object.spec) && has(object.spec.serviceAccountName) && object.spec.serviceAccountName == variables.ns + '-sa') || {CEL_SPEC_PRESERVING_UPDATE}"),
+                    "message": "Flux Kustomizations in a tenant namespace `tenant-<id>` must set `spec.serviceAccountName: tenant-<id>-sa` (multi-tenancy lockdown, NFR-SEC-02)."
+                }
+            ]
+        }
+    })
+}
+
+/// Generates `ValidatingPolicy/restrict-tenant-flux-source-status` (`policies.kyverno.io/v1`).
+///
+/// Denies tenant subjects (`tenant-*` ServiceAccounts and groups, the `keel-previews` identity;
+/// see [`is_tenant_subject`]) every write to `*/status` of `source.toolkit.fluxcd.io` /
+/// `source.extensions.fluxcd.io` objects, in any namespace: a forged `status.artifact` would make
+/// kustomize-controller apply another source's artifact (`NFR-SEC-02`). Fails closed.
+///
+/// The tenant-subject test sits inline in `matchConditions` (which cannot use `variables`), so
+/// the API server only sends tenant requests to Kyverno: `source-controller`'s own status writes
+/// never reach the webhook and an unavailable Kyverno cannot stall Flux artifact production
+/// (anti-lockout, `NFR-REL-01`). Every request that reaches the policy is denied.
+pub fn build_restrict_tenant_flux_source_status_policy() -> Value {
+    json!({
+        "apiVersion": "policies.kyverno.io/v1",
+        "kind": "ValidatingPolicy",
+        "metadata": {
+            "name": POLICY_RESTRICT_TENANT_FLUX_SOURCE_STATUS,
+            "labels": {
+                "app.kubernetes.io/managed-by": "keel",
+                "keel.io/policy-tier": "tenant-isolation"
+            }
+        },
+        "spec": {
+            "validationActions": ["Deny"],
+            "failurePolicy": "Fail",
+            "evaluation": {
+                "background": {
+                    "enabled": false
+                }
+            },
+            "matchConstraints": {
+                "resourceRules": [
+                    {
+                        "apiGroups": ["source.toolkit.fluxcd.io", "source.extensions.fluxcd.io"],
+                        "apiVersions": ["*"],
+                        "operations": ["UPDATE"],
+                        "resources": ["*/status"]
+                    }
+                ]
+            },
+            "matchConditions": [
+                {
+                    "name": "tenant-subject",
+                    "expression": cel_tenant_subject(CEL_REQUEST_USERNAME, CEL_REQUEST_GROUPS)
+                }
+            ],
+            "validations": [
+                {
+                    "expression": "(has(request.subResource) ? request.subResource : '') != 'status'",
+                    "message": "Tenant identities may not write the status of Flux source objects (a forged `status.artifact` would make Flux apply another source's content); only source-controller writes source status."
+                }
+            ]
+        }
+    })
+}
+
+/// An identity allowed to change `keel.io/platform-owned` objects
+/// ([`build_protect_platform_owned_tenant_objects_policy`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlatformOwnedWriter {
+    /// Requesting username (`request.userInfo.username`).
+    pub username: String,
+    /// `Some(kind)`: allowed only for objects of this kind (the identity's own finalizer and
+    /// metadata writes); `None`: allowed for every platform-owned kind.
+    pub kind: Option<&'static str>,
+    /// Why the identity needs write access (audit trail; asserted by tests).
+    pub reason: &'static str,
+}
+
+/// Identities allowed to change `keel.io/platform-owned` objects, besides members of
+/// `system:masters` / `kubeadm:cluster-admins` (break-glass cluster admins) and the built-in
+/// `kube-system` controllers (garbage collection, namespace deletion).
+///
+/// `kustomize-controller` is deliberately absent: tenant baselines are applied by `keel-tenants`
+/// impersonating `keel-tenant-reconciler`, no platform-owned `Kustomization` exists, and the
+/// Flux-managed keel-server add-on does not ship the `tenant-default/keel-server` RoleBinding. As
+/// a writer it would let every `flux-system` Kustomization (core add-ons, rauthy, keel-server, ...)
+/// rewrite or delete any tenant's baseline.
+pub fn platform_owned_writers() -> Vec<PlatformOwnedWriter> {
+    vec![
+        PlatformOwnedWriter {
+            username: format!(
+                "system:serviceaccount:{FLUX_SYSTEM_NAMESPACE}:{TENANT_RECONCILER_SERVICE_ACCOUNT}"
+            ),
+            kind: None,
+            reason: "`keel-tenants` applies and prunes `tenants/<id>/` (tenant baseline, `keel-gitops`) as this identity",
+        },
+        PlatformOwnedWriter {
+            username: format!(
+                "system:serviceaccount:{KEEL_SERVER_NAMESPACE}:{KEEL_SERVER_SERVICE_ACCOUNT}"
+            ),
+            kind: None,
+            reason: "keel-server provisions tenant baselines (tenant onboarding API)",
+        },
+        PlatformOwnedWriter {
+            username: format!("system:serviceaccount:{FLUX_SYSTEM_NAMESPACE}:source-controller"),
+            kind: Some("GitRepository"),
+            reason: "source-controller adds and removes its finalizer on the platform-owned `keel-gitops` GitRepository",
+        },
+        PlatformOwnedWriter {
+            username: "system:kube-controller-manager".to_string(),
+            kind: None,
+            reason: "garbage collection and namespace deletion",
+        },
+    ]
+}
+
+/// CEL admitting an UPDATE of a platform-owned `GitRepository` (the tenant `keel-gitops` source)
+/// that only sets or changes the `reconcile.fluxcd.io/requestedAt` annotation, i.e. `flux
+/// reconcile source git keel-gitops -n tenant-<id>`. Spec, labels, finalizers, owner references
+/// and every other annotation must be unchanged, so the exemption cannot repoint, unlabel, orphan
+/// or re-parent (garbage-collection) the source.
+pub const CEL_GITREPOSITORY_RECONCILE_REQUEST_ONLY: &str = "request.operation == 'UPDATE' && request.kind.group == 'source.toolkit.fluxcd.io' && request.kind.kind == 'GitRepository' && object != null && oldObject != null && (has(object.spec) ? object.spec : {}) == (has(oldObject.spec) ? oldObject.spec : {}) && (has(object.metadata.labels) ? object.metadata.labels : {}) == (has(oldObject.metadata.labels) ? oldObject.metadata.labels : {}) && (has(object.metadata.finalizers) ? object.metadata.finalizers : []) == (has(oldObject.metadata.finalizers) ? oldObject.metadata.finalizers : []) && (has(object.metadata.ownerReferences) ? object.metadata.ownerReferences : []) == (has(oldObject.metadata.ownerReferences) ? oldObject.metadata.ownerReferences : []) && (has(object.metadata.annotations) ? object.metadata.annotations : {}).all(k, k == 'reconcile.fluxcd.io/requestedAt' || (has(oldObject.metadata.annotations) && k in oldObject.metadata.annotations && oldObject.metadata.annotations[k] == object.metadata.annotations[k])) && (has(oldObject.metadata.annotations) ? oldObject.metadata.annotations : {}).all(k, k == 'reconcile.fluxcd.io/requestedAt' || (has(object.metadata.annotations) && k in object.metadata.annotations))";
+
+/// Generates `ValidatingPolicy/protect-platform-owned-tenant-objects` (`policies.kyverno.io/v1`).
+///
+/// Objects the platform writes for a tenant (namespace, ServiceAccount, quota, LimitRange,
+/// NetworkPolicies, RoleBindings, the `keel-gitops` GitRepository stub) carry
+/// `keel.io/platform-owned: "true"`. Creating, changing (including removing the label) or deleting
+/// such an object is reserved for `keel-tenant-reconciler`, `keel-server`, `source-controller` (its
+/// own `GitRepository` finalizer only), the `kube-system` controllers and break-glass cluster
+/// admins ([`platform_owned_writers`]); tenant identities (which hold `admin` in their namespace)
+/// and every other `flux-system` identity are denied. The one exemption is a reconcile request on
+/// the `keel-gitops` GitRepository ([`CEL_GITREPOSITORY_RECONCILE_REQUEST_ONLY`]), so `flux
+/// reconcile source git` keeps working for anyone RBAC lets patch it. Fails closed.
+pub fn build_protect_platform_owned_tenant_objects_policy() -> Value {
+    let all_writers = platform_owned_writers();
+    let writers = all_writers
+        .iter()
+        .filter(|w| w.kind.is_none())
+        .map(|w| format!("'{}'", w.username))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let scoped_writers: String = all_writers
+        .iter()
+        .filter_map(|w| {
+            w.kind.map(|kind| {
+                format!(
+                    " || (variables.username == '{}' && request.kind.kind == '{kind}')",
+                    w.username
+                )
+            })
+        })
+        .collect();
+    let labelled = |obj: &str| {
+        format!(
+            "({obj} != null && has({obj}.metadata) && has({obj}.metadata.labels) && '{PLATFORM_OWNED_LABEL}' in {obj}.metadata.labels)"
+        )
+    };
+    json!({
+        "apiVersion": "policies.kyverno.io/v1",
+        "kind": "ValidatingPolicy",
+        "metadata": {
+            "name": POLICY_PROTECT_PLATFORM_OWNED_TENANT_OBJECTS,
+            "labels": {
+                "app.kubernetes.io/managed-by": "keel",
+                "keel.io/policy-tier": "tenant-isolation"
+            }
+        },
+        "spec": {
+            "validationActions": ["Deny"],
+            "failurePolicy": "Fail",
+            "evaluation": {
+                "background": {
+                    "enabled": false
+                }
+            },
+            "matchConstraints": {
+                "resourceRules": [
+                    {
+                        "apiGroups": [""],
+                        "apiVersions": ["*"],
+                        "operations": ["CREATE", "UPDATE", "DELETE"],
+                        "resources": ["namespaces", "serviceaccounts", "resourcequotas", "limitranges"]
+                    },
+                    {
+                        "apiGroups": ["networking.k8s.io"],
+                        "apiVersions": ["*"],
+                        "operations": ["CREATE", "UPDATE", "DELETE"],
+                        "resources": ["networkpolicies"]
+                    },
+                    {
+                        "apiGroups": ["rbac.authorization.k8s.io"],
+                        "apiVersions": ["*"],
+                        "operations": ["CREATE", "UPDATE", "DELETE"],
+                        "resources": ["rolebindings", "clusterrolebindings"]
+                    },
+                    {
+                        "apiGroups": ["source.toolkit.fluxcd.io"],
+                        "apiVersions": ["*"],
+                        "operations": ["CREATE", "UPDATE", "DELETE"],
+                        "resources": ["gitrepositories"]
+                    }
+                ]
+            },
+            "matchConditions": [
+                {
+                    "name": "platform-owned",
+                    "expression": format!("{} || {}", labelled("object"), labelled("oldObject"))
+                }
+            ],
+            "variables": [
+                {
+                    "name": "username",
+                    "expression": "has(request.userInfo.username) ? request.userInfo.username : ''"
+                },
+                {
+                    "name": "groups",
+                    "expression": "has(request.userInfo.groups) ? request.userInfo.groups : []"
+                }
+            ],
+            "validations": [
+                {
+                    "expression": format!(
+                        "variables.username in [{writers}]{scoped_writers} || variables.username.startsWith('system:serviceaccount:kube-system:') || variables.groups.exists(g, g == 'system:masters' || g == 'kubeadm:cluster-admins') || ({CEL_GITREPOSITORY_RECONCILE_REQUEST_ONLY})"
+                    ),
+                    "message": format!(
+                        "Objects labelled `{PLATFORM_OWNED_LABEL}` (tenant namespace, RBAC, NetworkPolicies, the `keel-gitops` source) are managed by the platform (keel-tenant-reconciler / keel-server); change them through a GitOps PR to `tenants/<id>/` (only a `reconcile.fluxcd.io/requestedAt` reconcile request on `keel-gitops` is exempt)."
+                    )
+                }
+            ]
+        }
+    })
+}
+
 /// Generates `ValidatingPolicy/restrict-tenant-route-hostnames` (`policies.kyverno.io/v1`).
 ///
 /// Tenant `HTTPRoute`/`GRPCRoute`/`TLSRoute`s attach to the shared `keel-system/keel-ingress`
@@ -639,6 +1014,9 @@ impl KyvernoManifestBundle {
         let supporting_manifests = vec![
             build_restrict_tenant_reconciler_policy(),
             build_restrict_tenant_route_hostnames_policy(&config.reserved_route_hostnames)?,
+            build_restrict_tenant_flux_sources_policy(),
+            build_restrict_tenant_flux_source_status_policy(),
+            build_protect_platform_owned_tenant_objects_policy(),
         ];
 
         let policy_exception = if config.local_dev_docker_socket_exception {
@@ -692,9 +1070,9 @@ mod tests {
 
         let bundle = KyvernoManifestBundle::generate(&cfg).unwrap();
         assert_eq!(bundle.cluster_policies.len(), 3);
-        assert_eq!(bundle.supporting_manifests.len(), 2);
+        assert_eq!(bundle.supporting_manifests.len(), 5);
         assert!(bundle.policy_exception.is_none());
-        assert_eq!(bundle.all_manifests().len(), 5);
+        assert_eq!(bundle.all_manifests().len(), 8);
         assert!(
             !bundle
                 .to_multi_doc_yaml()
@@ -737,7 +1115,7 @@ mod tests {
         };
 
         let bundle = KyvernoManifestBundle::generate(&cfg).unwrap();
-        assert_eq!(bundle.all_manifests().len(), 6);
+        assert_eq!(bundle.all_manifests().len(), 9);
 
         let exc = bundle
             .policy_exception
@@ -863,8 +1241,18 @@ mod tests {
             build_restrict_tenant_reconciler_policy(),
             build_restrict_tenant_route_hostnames_policy(&default_reserved_route_hostnames())
                 .unwrap(),
+            build_restrict_tenant_flux_sources_policy(),
+            build_restrict_tenant_flux_source_status_policy(),
+            build_protect_platform_owned_tenant_objects_policy(),
         ];
         for seed in [
+            include_str!("../../../deploy/seed/kyverno-policies/restrict-tenant-flux-sources.yaml"),
+            include_str!(
+                "../../../deploy/seed/kyverno-policies/restrict-tenant-flux-source-status.yaml"
+            ),
+            include_str!(
+                "../../../deploy/seed/kyverno-policies/protect-platform-owned-tenant-objects.yaml"
+            ),
             include_str!(
                 "../../../deploy/seed/kyverno-policies/restrict-tenant-route-hostnames.yaml"
             ),
@@ -963,6 +1351,373 @@ mod tests {
         );
     }
 
+    fn expressions(policy: &Value) -> Vec<String> {
+        policy["spec"]["validations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["expression"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn restrict_tenant_flux_sources_policy_matches_seed_and_closes_artifact_paths() {
+        let policy = build_restrict_tenant_flux_sources_policy();
+        let seed: Value = serde_yml::from_str(include_str!(
+            "../../../deploy/seed/kyverno-policies/restrict-tenant-flux-sources.yaml"
+        ))
+        .unwrap();
+        assert_eq!(seed["spec"], policy["spec"]);
+        assert_eq!(seed["metadata"], policy["metadata"]);
+        assert_eq!(policy["spec"]["failurePolicy"], "Fail");
+        assert_eq!(policy["spec"]["validationActions"], json!(["Deny"]));
+
+        let rules = policy["spec"]["matchConstraints"]["resourceRules"]
+            .as_array()
+            .unwrap();
+        let covers = |group: &str, resource: &str, op: &str| {
+            rules.iter().any(|r| {
+                r["apiGroups"].as_array().unwrap().contains(&json!(group))
+                    && r["resources"]
+                        .as_array()
+                        .unwrap()
+                        .contains(&json!(resource))
+                    && r["operations"].as_array().unwrap().contains(&json!(op))
+            })
+        };
+        assert!(covers(
+            "source.toolkit.fluxcd.io",
+            "externalartifacts",
+            "CREATE"
+        ));
+        assert!(covers("source.extensions.fluxcd.io", "*", "CREATE"));
+        assert!(covers(
+            "kustomize.toolkit.fluxcd.io",
+            "kustomizations",
+            "CREATE"
+        ));
+        // Status writes live in their own policy (requester-filtered matchConditions).
+        assert!(rules.iter().all(|r| {
+            r["resources"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|res| !res.as_str().unwrap().contains('/'))
+        }));
+        // Deletion of tenant Flux objects is never blocked (cleanup must always work).
+        assert!(rules.iter().all(|r| {
+            !r["operations"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("DELETE"))
+        }));
+        // Only writes in tenant namespaces reach Kyverno (flux-system never does).
+        let conds = policy["spec"]["matchConditions"].as_array().unwrap();
+        assert_eq!(conds.len(), 1);
+        assert_eq!(
+            conds[0]["expression"],
+            "(has(request.namespace) ? request.namespace : '').startsWith('tenant-')"
+        );
+
+        let exprs = expressions(&policy);
+        assert_eq!(exprs.len(), 2);
+        // 1: artifact republishing kinds denied for every requester in tenant namespaces.
+        assert!(exprs[0].contains("request.kind.kind == 'ExternalArtifact'"));
+        assert!(exprs[0].contains("request.kind.group == 'source.extensions.fluxcd.io'"));
+        assert!(!exprs[0].contains("userInfo"));
+        // Finalizer removal / deletion of pre-existing objects is never blocked.
+        for expr in &exprs {
+            assert!(expr.ends_with(&format!(" || {CEL_SPEC_PRESERVING_UPDATE}")));
+        }
+        assert!(CEL_SPEC_PRESERVING_UPDATE.contains("has(object.metadata.deletionTimestamp)"));
+        assert!(CEL_SPEC_PRESERVING_UPDATE.contains(
+            "(has(object.spec) ? object.spec : {}) == (has(oldObject.spec) ? oldObject.spec : {})"
+        ));
+        // 2: tenant Kustomizations impersonate `tenant-<id>-sa`.
+        assert!(exprs[1].contains("object.spec.serviceAccountName == variables.ns + '-sa'"));
+    }
+
+    #[test]
+    fn restrict_tenant_flux_source_status_policy_matches_seed_and_filters_on_tenant_subjects() {
+        let policy = build_restrict_tenant_flux_source_status_policy();
+        let seed: Value = serde_yml::from_str(include_str!(
+            "../../../deploy/seed/kyverno-policies/restrict-tenant-flux-source-status.yaml"
+        ))
+        .unwrap();
+        assert_eq!(seed["spec"], policy["spec"]);
+        assert_eq!(seed["metadata"], policy["metadata"]);
+        assert_eq!(
+            policy["metadata"]["name"],
+            POLICY_RESTRICT_TENANT_FLUX_SOURCE_STATUS
+        );
+        assert_eq!(policy["spec"]["failurePolicy"], "Fail");
+        assert_eq!(
+            policy["spec"]["matchConstraints"]["resourceRules"],
+            json!([{
+                "apiGroups": ["source.toolkit.fluxcd.io", "source.extensions.fluxcd.io"],
+                "apiVersions": ["*"],
+                "operations": ["UPDATE"],
+                "resources": ["*/status"]
+            }])
+        );
+        // The tenant-subject test is inline (matchConditions cannot use variables), keyed on the
+        // requesting user only: source-controller status writes never reach the webhook.
+        let conds = policy["spec"]["matchConditions"].as_array().unwrap();
+        assert_eq!(conds.len(), 1);
+        let subject = conds[0]["expression"].as_str().unwrap();
+        assert_eq!(
+            subject,
+            cel_tenant_subject(CEL_REQUEST_USERNAME, CEL_REQUEST_GROUPS)
+        );
+        assert!(!subject.contains("variables."));
+        assert!(!subject.contains("request.namespace"));
+        assert!(!subject.contains("flux-system"));
+        for needle in [
+            "'system:serviceaccount:tenant-'",
+            "'system:serviceaccount:keel-previews:'",
+            "g.startsWith('tenant-')",
+        ] {
+            assert!(subject.contains(needle), "{needle}");
+        }
+        assert!(policy["spec"].get("variables").is_none());
+        let exprs = expressions(&policy);
+        assert_eq!(
+            exprs,
+            vec!["(has(request.subResource) ? request.subResource : '') != 'status'".to_string()]
+        );
+        assert!(
+            policy["spec"]["validations"][0]["message"]
+                .as_str()
+                .unwrap()
+                .contains("may not write the status of Flux source objects")
+        );
+    }
+
+    /// Every tenant Kustomization Keel synthesizes satisfies the `serviceAccountName` rule.
+    #[test]
+    fn synthesized_tenant_kustomizations_use_the_tenant_service_account() {
+        let input = crate::FluxKustomizationSpecInput::new("acme", "app", "keel-gitops", "./x");
+        let ks = crate::synthesize_flux_kustomization(&input).unwrap();
+        let ns = ks["metadata"]["namespace"].as_str().unwrap();
+        assert_eq!(ks["spec"]["serviceAccountName"], format!("{ns}-sa"));
+    }
+
+    #[test]
+    fn protect_platform_owned_policy_matches_seed_and_allows_only_platform_writers() {
+        let policy = build_protect_platform_owned_tenant_objects_policy();
+        let seed: Value = serde_yml::from_str(include_str!(
+            "../../../deploy/seed/kyverno-policies/protect-platform-owned-tenant-objects.yaml"
+        ))
+        .unwrap();
+        assert_eq!(seed["spec"], policy["spec"]);
+        assert_eq!(seed["metadata"], policy["metadata"]);
+        assert_eq!(policy["spec"]["failurePolicy"], "Fail");
+
+        // Matches by label on the new or the old object, so dropping the label is also guarded,
+        // and null-guards both (`object` is null on DELETE, `oldObject` on CREATE).
+        let cond = policy["spec"]["matchConditions"][0]["expression"]
+            .as_str()
+            .unwrap();
+        for needle in [
+            "object != null && has(object.metadata) && has(object.metadata.labels) && 'keel.io/platform-owned' in object.metadata.labels",
+            "oldObject != null && has(oldObject.metadata) && has(oldObject.metadata.labels) && 'keel.io/platform-owned' in oldObject.metadata.labels",
+        ] {
+            assert!(cond.contains(needle), "{needle}");
+        }
+
+        // Every kind the platform labels is matched (and nothing cluster-wide like `*`).
+        let bundle =
+            crate::TenantManifestBundle::synthesize(&crate::TenantIsolationConfig::new("acme"))
+                .unwrap();
+        let rules = policy["spec"]["matchConstraints"]["resourceRules"]
+            .as_array()
+            .unwrap();
+        let plural = |kind: &str| match kind {
+            "Namespace" => "namespaces",
+            "ServiceAccount" => "serviceaccounts",
+            "ResourceQuota" => "resourcequotas",
+            "LimitRange" => "limitranges",
+            "NetworkPolicy" => "networkpolicies",
+            "RoleBinding" => "rolebindings",
+            "ClusterRoleBinding" => "clusterrolebindings",
+            other => panic!("unexpected platform-owned kind {other}"),
+        };
+        for doc in bundle.to_json_values().unwrap() {
+            assert_eq!(doc["metadata"]["labels"][PLATFORM_OWNED_LABEL], "true");
+            let resource = plural(doc["kind"].as_str().unwrap());
+            assert!(
+                rules.iter().any(|r| r["resources"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!(resource))),
+                "{resource} not matched"
+            );
+        }
+        assert!(
+            rules
+                .iter()
+                .any(|r| r["resources"] == json!(["gitrepositories"]))
+        );
+        assert!(
+            rules
+                .iter()
+                .all(|r| !r["resources"].as_array().unwrap().contains(&json!("*")))
+        );
+
+        // No platform-owned Kustomization exists: kustomize-controller finalizers on tenant
+        // Kustomizations must never reach this policy.
+        assert!(rules.iter().all(|r| {
+            !r["resources"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("kustomizations"))
+        }));
+
+        let exprs = expressions(&policy);
+        assert_eq!(exprs.len(), 1);
+        assert!(exprs[0].contains(
+            "variables.username in ['system:serviceaccount:flux-system:keel-tenant-reconciler', 'system:serviceaccount:keel-system:keel-server', 'system:kube-controller-manager']"
+        ));
+        // source-controller only for its own GitRepository finalizer.
+        assert!(exprs[0].contains(
+            "(variables.username == 'system:serviceaccount:flux-system:source-controller' && request.kind.kind == 'GitRepository')"
+        ));
+        assert!(exprs[0].contains("g == 'system:masters'"));
+        // kustomize-controller would let every `flux-system` Kustomization rewrite tenant
+        // baselines; it is never a writer.
+        assert!(!exprs[0].contains("kustomize-controller"));
+        // No tenant or preview identity is ever a platform writer.
+        assert!(!exprs[0].contains("tenant-'"));
+        assert!(!exprs[0].contains("keel-previews"));
+        for writer in platform_owned_writers() {
+            assert!(
+                exprs[0].contains(&format!("'{}'", writer.username)),
+                "{writer:?}"
+            );
+            assert!(!is_tenant_subject(&writer.username, &[]), "{writer:?}");
+        }
+
+        // `flux reconcile source git keel-gitops` stays possible for anyone RBAC allows: only an
+        // UPDATE of a GitRepository whose spec, labels, finalizers, owner references and other
+        // annotations are unchanged, differing at most in `reconcile.fluxcd.io/requestedAt`.
+        assert!(exprs[0].ends_with(&format!(" || ({CEL_GITREPOSITORY_RECONCILE_REQUEST_ONLY})")));
+        let cel = CEL_GITREPOSITORY_RECONCILE_REQUEST_ONLY;
+        for needle in [
+            "request.operation == 'UPDATE'",
+            "request.kind.group == 'source.toolkit.fluxcd.io' && request.kind.kind == 'GitRepository'",
+            "object != null && oldObject != null",
+            "(has(object.spec) ? object.spec : {}) == (has(oldObject.spec) ? oldObject.spec : {})",
+            "(has(object.metadata.labels) ? object.metadata.labels : {}) == (has(oldObject.metadata.labels) ? oldObject.metadata.labels : {})",
+            "(has(object.metadata.finalizers) ? object.metadata.finalizers : []) == (has(oldObject.metadata.finalizers) ? oldObject.metadata.finalizers : [])",
+            "(has(object.metadata.ownerReferences) ? object.metadata.ownerReferences : []) == (has(oldObject.metadata.ownerReferences) ? oldObject.metadata.ownerReferences : [])",
+            "k == 'reconcile.fluxcd.io/requestedAt' || (has(oldObject.metadata.annotations) && k in oldObject.metadata.annotations && oldObject.metadata.annotations[k] == object.metadata.annotations[k])",
+            "k == 'reconcile.fluxcd.io/requestedAt' || (has(object.metadata.annotations) && k in object.metadata.annotations)",
+        ] {
+            assert!(cel.contains(needle), "{needle}");
+        }
+        // Only the Flux reconcile annotation, never PKO's or a wildcard.
+        assert_eq!(cel.matches("k == '").count(), 2);
+        assert!(!cel.contains("pulumi.com/reconcile-request"));
+        assert!(!cel.contains("CREATE") && !cel.contains("DELETE"));
+    }
+
+    /// The exact writer allowlist, each with the reason it needs write access.
+    #[test]
+    fn platform_owned_writers_are_exactly_the_platform_identities() {
+        let writers: Vec<(String, Option<&str>)> = platform_owned_writers()
+            .into_iter()
+            .map(|w| {
+                assert!(!w.reason.trim().is_empty(), "{} has no reason", w.username);
+                (w.username, w.kind)
+            })
+            .collect();
+        assert_eq!(
+            writers,
+            vec![
+                (
+                    "system:serviceaccount:flux-system:keel-tenant-reconciler".to_string(),
+                    None
+                ),
+                (
+                    "system:serviceaccount:keel-system:keel-server".to_string(),
+                    None
+                ),
+                (
+                    "system:serviceaccount:flux-system:source-controller".to_string(),
+                    Some("GitRepository")
+                ),
+                ("system:kube-controller-manager".to_string(), None),
+            ]
+        );
+    }
+
+    /// Requests that reach `restrict-tenant-flux-source-status` (its `matchConditions` are exactly
+    /// `cel_tenant_subject`, mirrored by [`is_tenant_subject`]; pinned by
+    /// [`restrict_tenant_flux_source_status_policy_matches_seed_and_filters_on_tenant_subjects`]).
+    #[test]
+    fn flux_source_status_policy_only_sees_tenant_requesters() {
+        let sc = "system:serviceaccount:flux-system:source-controller";
+        let sc_groups = [
+            "system:serviceaccounts",
+            "system:serviceaccounts:flux-system",
+            "system:authenticated",
+        ];
+        // Flux controllers (and admins) never reach Kyverno for status writes.
+        assert!(!is_tenant_subject(sc, &sc_groups));
+        assert!(!is_tenant_subject(
+            "system:serviceaccount:flux-system:kustomize-controller",
+            &sc_groups
+        ));
+        assert!(!is_tenant_subject(
+            "kubernetes-admin",
+            &["kubeadm:cluster-admins"]
+        ));
+        // Tenant service accounts, tenant OIDC groups and the preview identity do (any namespace).
+        assert!(is_tenant_subject(
+            "system:serviceaccount:tenant-default:tenant-default-sa",
+            &[]
+        ));
+        assert!(is_tenant_subject(
+            "system:serviceaccount:keel-previews:keel-preview-readonly",
+            &[]
+        ));
+        assert!(is_tenant_subject("alice", &["tenant-acme"]));
+    }
+
+    #[test]
+    fn tenant_subject_cel_and_rust_mirror_agree_on_the_lists() {
+        assert_eq!(
+            cel_tenant_subject("variables.username", "variables.groups"),
+            "variables.username.startsWith('system:serviceaccount:tenant-') || variables.username.startsWith('system:serviceaccount:keel-previews:') || variables.groups.exists(g, g.startsWith('tenant-') || g.startsWith('system:serviceaccounts:tenant-') || g == 'system:serviceaccounts:keel-previews')"
+        );
+        assert!(is_tenant_subject(
+            "system:serviceaccount:tenant-acme:tenant-acme-sa",
+            &[]
+        ));
+        assert!(is_tenant_subject(
+            "system:serviceaccount:keel-previews:keel-preview-readonly",
+            &[]
+        ));
+        assert!(is_tenant_subject("bob", &["tenant-acme"]));
+        assert!(is_tenant_subject(
+            "x",
+            &["system:serviceaccounts:tenant-acme"]
+        ));
+        assert!(is_tenant_subject(
+            "x",
+            &["system:serviceaccounts:keel-previews"]
+        ));
+        assert!(!is_tenant_subject(
+            "system:serviceaccount:flux-system:source-controller",
+            &["system:serviceaccounts:flux-system"]
+        ));
+        assert!(!is_tenant_subject(
+            "system:serviceaccount:keel-system:keel-server",
+            &[]
+        ));
+        assert!(!is_tenant_subject("admin", &["system:masters"]));
+    }
+
     #[test]
     fn disallow_privileged_covers_all_container_types_and_host_namespaces() {
         let policy = build_disallow_privileged_containers_policy();
@@ -1008,7 +1763,7 @@ mod tests {
             }
         }
         let docs: Vec<&str> = yaml.split("\n---\n").collect();
-        assert_eq!(docs.len(), 6);
+        assert_eq!(docs.len(), 9);
         for doc in docs {
             let parsed: serde_json::Value =
                 serde_yml::from_str(doc).expect("each Kyverno multi-doc YAML part must parse");

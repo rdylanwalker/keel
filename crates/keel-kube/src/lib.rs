@@ -16,10 +16,12 @@ pub mod telemetry;
 pub mod tenant;
 
 pub use kyverno::{
-    DockerSocketExceptionConfig, KyvernoManifestBundle, KyvernoPolicyConfig,
+    DockerSocketExceptionConfig, KyvernoManifestBundle, KyvernoPolicyConfig, PlatformOwnedWriter,
     build_disallow_privileged_containers_policy, build_local_kind_docker_socket_exception,
-    build_protect_control_plane_policy, build_restrict_pulumi_providers_policy,
-    build_restrict_pulumi_providers_policy_for_registry, pulumi_provider_allowlist,
+    build_protect_control_plane_policy, build_protect_platform_owned_tenant_objects_policy,
+    build_restrict_pulumi_providers_policy, build_restrict_pulumi_providers_policy_for_registry,
+    build_restrict_tenant_flux_source_status_policy, build_restrict_tenant_flux_sources_policy,
+    is_tenant_subject, platform_owned_writers, pulumi_provider_allowlist,
 };
 pub use live::{
     CanaryStatusInfo, ClusterEventSummary, KubeClusterStatusReader, LiveResourceInfo,
@@ -30,9 +32,9 @@ pub use live::{
 pub use preview_runner::{
     DEFAULT_TENANT_GIT_BRANCH, InMemoryPreviewCluster, InMemoryPreviewSecret, KubePreviewCluster,
     PREVIEW_PROVIDER_SECRET_KIND, PreviewCluster, PreviewPrerequisites, TenantGitSource,
-    legacy_flux_source_tenant_stacks, preview_git_secret_name, preview_report_configmap_name,
-    preview_s3_secret_name, tenant_git_repository_manifest_path, tenant_git_source_from_manifest,
-    tenant_git_source_from_repository,
+    legacy_flux_source_stacks, legacy_flux_source_tenant_stacks, preview_git_secret_name,
+    preview_report_configmap_name, preview_s3_secret_name, tenant_git_repository_manifest_path,
+    tenant_git_source_from_manifest, tenant_git_source_from_repository,
 };
 pub use s3_identity::{
     SeaweedFsIdentityOps, SeaweedFsTenantS3Provisioner, TenantS3IdentityProvisioner,
@@ -53,12 +55,14 @@ pub use tenant::{
     FlaggerCanarySpecInput, FluxDependencyRef, FluxHealthCheckRef, FluxKustomizationSpecInput,
     FluxManifestAppInput, FluxSubstituteReference, HelmChartSourceKind, HelmChartSourceRef,
     HelmReleaseSpecInput, HelmValuesSecretRef, KEEL_SERVER_TENANT_CLUSTER_ROLE,
-    MANIFEST_APP_CONFIG_DIR, ROUTE_HOSTNAMES_ANNOTATION, RemoteKubeConfigRef,
+    MANIFEST_APP_CONFIG_DIR, PLATFORM_OWNED_KINDS, PLATFORM_OWNED_LABEL,
+    PLATFORM_OWNED_TENANT_FILES, ROUTE_HOSTNAMES_ANNOTATION, RemoteKubeConfigRef,
     TENANT_NAMESPACE_PREFIX, TenantIsolationConfig, TenantManifestBundle, TenantQuotaSpec,
     build_keel_server_tenant_role_binding, build_tenant_default_deny_network_policy,
     build_tenant_namespace, build_tenant_resource_quota, build_tenant_service_account,
-    generate_flux_kustomization_manifest, manifest_app_config_kustomization_name,
-    manifest_app_secrets_name, manifest_app_values_configmap_name,
+    generate_flux_kustomization_manifest, label_platform_owned_manifests,
+    manifest_app_config_kustomization_name, manifest_app_secrets_name,
+    manifest_app_values_configmap_name, platform_owned_labels_missing,
     synthesize_canary_gateway_network_policy, synthesize_canary_gateway_network_policy_yaml,
     synthesize_flagger_canary, synthesize_flagger_canary_yaml, synthesize_flux_kustomization,
     synthesize_flux_kustomization_yaml, synthesize_flux_manifest_app_kustomizations,

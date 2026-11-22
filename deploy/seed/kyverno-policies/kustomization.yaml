@@ -12,3 +12,6 @@ resources:
   - restrict-pulumi-providers.yaml
   - restrict-tenant-reconciler.yaml
   - restrict-tenant-route-hostnames.yaml
+  - restrict-tenant-flux-sources.yaml
+  - restrict-tenant-flux-source-status.yaml
+  - protect-platform-owned-tenant-objects.yaml

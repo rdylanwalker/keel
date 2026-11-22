@@ -3,6 +3,10 @@ kind: NetworkPolicy
 metadata:
   name: allow-pko-workspace
   namespace: tenant-default
+  labels:
+    app.kubernetes.io/managed-by: keel
+    keel.io/tenant: default
+    keel.io/platform-owned: "true"
 spec:
   podSelector:
     matchLabels:

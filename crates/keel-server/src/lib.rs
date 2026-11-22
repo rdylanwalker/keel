@@ -67,6 +67,10 @@ pub fn build_router(state: AppState) -> Router {
             post(routes::migrate_stack_sources),
         )
         .route(
+            "/api/v1/tenants/{id}/baseline/migrate",
+            post(routes::migrate_tenant_baseline),
+        )
+        .route(
             "/api/v1/proposals",
             get(routes::list_proposals).post(routes::create_proposal),
         )

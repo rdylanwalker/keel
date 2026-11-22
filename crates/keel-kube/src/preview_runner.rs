@@ -211,17 +211,28 @@ pub fn tenant_git_source_from_manifest(
 /// working once that port is closed to tenant namespaces; migrate them first with
 /// `keel tenant migrate-stack-sources`. The `flux-system` management Stack is never listed.
 pub fn legacy_flux_source_tenant_stacks(stacks: &[Value]) -> Vec<(String, String)> {
+    legacy_flux_source_stacks(stacks, |ns| ns.starts_with("tenant-"))
+}
+
+/// Returns `(namespace, name)` (sorted, deduplicated) of `Stack`s whose namespace satisfies
+/// `in_scope` and that set a non-null `spec.fluxSource`. Shared by the tenant audit
+/// ([`legacy_flux_source_tenant_stacks`]) and the Stage 0 `source-controller` artifact gate, which
+/// treats every `fluxSource` Stack outside `flux-system` as blocking.
+pub fn legacy_flux_source_stacks(
+    stacks: &[Value],
+    in_scope: impl Fn(&str) -> bool,
+) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = stacks
         .iter()
         .filter(|s| s.pointer("/spec/fluxSource").is_some_and(|f| !f.is_null()))
         .filter_map(|s| {
             let ns = s.pointer("/metadata/namespace").and_then(Value::as_str)?;
             let name = s.pointer("/metadata/name").and_then(Value::as_str)?;
-            ns.starts_with("tenant-")
-                .then(|| (ns.to_string(), name.to_string()))
+            in_scope(ns).then(|| (ns.to_string(), name.to_string()))
         })
         .collect();
     out.sort();
+    out.dedup();
     out
 }
 

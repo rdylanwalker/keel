@@ -29,7 +29,7 @@ use crate::cli::{
 pub use api::{
     execute_app_list, execute_catalog_list, execute_catalog_show, execute_proposal_close,
     execute_proposal_list, execute_proposal_merge, execute_proposal_show,
-    execute_tenant_migrate_stack_sources,
+    execute_tenant_migrate_baseline, execute_tenant_migrate_stack_sources,
 };
 pub use auth::{
     AuthLoginOutcome, PkceChallenge, execute_auth_login, execute_auth_logout, execute_auth_status,
@@ -555,6 +555,9 @@ pub async fn dispatch(cli: &Cli, ctx: &CliContext) -> Result<String, CliError> {
             }
             TenantCommands::MigrateStackSources(args) => {
                 execute_tenant_migrate_stack_sources(&with_server!(args), ctx).await
+            }
+            TenantCommands::MigrateBaseline(args) => {
+                execute_tenant_migrate_baseline(&with_server!(args), ctx).await
             }
         },
     }
@@ -2066,6 +2069,20 @@ spec:
         let second: serde_json::Value = serde_yml::from_str(docs[1]).unwrap();
         assert_eq!(first["kind"], "GitRepository");
         assert_eq!(second["kind"], "NetworkPolicy");
+        // Both platform-written tenant-default objects are Kyverno-protected from tenant edits.
+        for doc in [&first, &second] {
+            assert_eq!(
+                doc["metadata"]["labels"][keel_kube::PLATFORM_OWNED_LABEL],
+                "true"
+            );
+        }
+        // The caller's object is not mutated.
+        assert!(
+            !repo
+                .metadata
+                .labels
+                .contains_key(keel_kube::PLATFORM_OWNED_LABEL)
+        );
     }
 
     #[test]

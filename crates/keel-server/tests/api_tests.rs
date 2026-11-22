@@ -9837,3 +9837,101 @@ async fn test_keel_server_catalog_app_installs_once_per_cluster() {
     assert_eq!(status, StatusCode::CREATED, "{body}");
     git.checkout_branch(&workdir, "main").await.unwrap();
 }
+
+async fn post_baseline_migration(
+    fixture: &TestFixture,
+    cookie: &str,
+    tenant: &str,
+    dry_run: bool,
+) -> (StatusCode, Value) {
+    let uri = if dry_run {
+        format!("/api/v1/tenants/{tenant}/baseline/migrate?dryRun=true")
+    } else {
+        format!("/api/v1/tenants/{tenant}/baseline/migrate")
+    };
+    let res = build_router(fixture.state.clone())
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(uri)
+                .header(COOKIE, cookie)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = res.status();
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    (
+        status,
+        serde_json::from_slice(&bytes)
+            .unwrap_or_else(|_| json!({ "raw": String::from_utf8_lossy(&bytes) })),
+    )
+}
+
+/// Tenants created before `keel.io/platform-owned` existed get the label through one reviewed PR
+/// (never a direct commit to `main`) that only touches the platform-written baseline files, and
+/// the start-up audit names them until it is merged.
+#[tokio::test]
+async fn test_legacy_tenant_baseline_is_labelled_platform_owned_through_one_pr() {
+    let fixture = setup_fixture().await;
+    let admin = login_and_get_cookie(&fixture).await;
+    let current =
+        keel_kube::TenantManifestBundle::synthesize(&keel_kube::TenantIsolationConfig::new("acme"))
+            .unwrap()
+            .to_multi_doc_yaml()
+            .unwrap();
+    let legacy = current.replace("    keel.io/platform-owned: \"true\"\n", "");
+    assert_ne!(legacy, current);
+    commit_on_main(&fixture, "tenants/acme/rbac.yaml", &legacy).await;
+    let root = fixture.state.repo_workdir.clone();
+    assert!(
+        keel_server::routes::report_unlabelled_tenant_baselines(&root)
+            .await
+            .contains(&"acme".to_string())
+    );
+
+    // Non-admins cannot run it; unknown tenants are 404.
+    let tenant_admin =
+        login_with_groups(&fixture, "admin@acme.local", vec!["tenant-acme-admin"]).await;
+    let (status, _) = post_baseline_migration(&fixture, &tenant_admin, "acme", false).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = post_baseline_migration(&fixture, &admin, "ghost", false).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let (status, body) = post_baseline_migration(&fixture, &admin, "acme", true).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body["labelled"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("tenants/acme/rbac.yaml")),
+        "{body}"
+    );
+    assert!(body.get("proposal").is_none(), "{body}");
+
+    let (status, body) = post_baseline_migration(&fixture, &admin, "acme", false).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert!(
+        body["branch"]
+            .as_str()
+            .unwrap()
+            .starts_with("keel/acme/migrate-baseline-")
+    );
+    // `main` is untouched until the PR is merged.
+    let on_main = std::fs::read_to_string(root.join("tenants/acme/rbac.yaml")).unwrap();
+    assert_eq!(on_main, legacy);
+
+    checkout_proposal_branch(&fixture, &body.to_string()).await;
+    let labelled = std::fs::read_to_string(root.join("tenants/acme/rbac.yaml")).unwrap();
+    assert!(!keel_kube::platform_owned_labels_missing(&labelled));
+    let repo = std::fs::read_to_string(root.join("tenants/acme/git-repository.yaml")).unwrap();
+    assert!(!keel_kube::platform_owned_labels_missing(&repo), "{repo}");
+    fixture
+        .state
+        .git_runner
+        .checkout_branch(&root, "main")
+        .await
+        .unwrap();
+}

@@ -110,6 +110,98 @@ impl TenantIsolationConfig {
     }
 }
 
+/// Label marking objects the platform writes for a tenant (`tenants/<id>/rbac.yaml`, the
+/// `keel-gitops` GitRepository stub and its NetworkPolicy). Kyverno
+/// (`protect-platform-owned-tenant-objects`) reserves changes to them for `keel-tenant-reconciler`
+/// and `keel-server`, so tenant identities (namespace `admin`) cannot edit or delete them.
+pub const PLATFORM_OWNED_LABEL: &str = "keel.io/platform-owned";
+
+/// [`tenant_common_labels`] plus `keel.io/platform-owned: "true"`, for the platform-written tenant
+/// baseline objects only (never tenant app objects, which tenant identities apply).
+fn platform_owned_labels(tenant_id: &str) -> BTreeMap<String, String> {
+    let mut labels = tenant_common_labels(tenant_id);
+    labels.insert(PLATFORM_OWNED_LABEL.to_string(), "true".to_string());
+    labels
+}
+
+/// Kinds the platform writes in a tenant's baseline files and labels [`PLATFORM_OWNED_LABEL`]
+/// (all matched by Kyverno `protect-platform-owned-tenant-objects`).
+pub const PLATFORM_OWNED_KINDS: [&str; 8] = [
+    "Namespace",
+    "ServiceAccount",
+    "ResourceQuota",
+    "LimitRange",
+    "NetworkPolicy",
+    "RoleBinding",
+    "ClusterRoleBinding",
+    "GitRepository",
+];
+
+/// Platform-written files under `tenants/<id>/` whose objects carry [`PLATFORM_OWNED_LABEL`]:
+/// the tenant baseline and (for bootstrap-created tenants) the `keel-gitops` source stub.
+pub const PLATFORM_OWNED_TENANT_FILES: [&str; 2] = ["rbac.yaml", "git-repository.yaml"];
+
+fn needs_platform_owned_label(doc: &Value) -> bool {
+    doc.get("kind")
+        .and_then(Value::as_str)
+        .is_some_and(|k| PLATFORM_OWNED_KINDS.contains(&k))
+        && doc.pointer(&format!(
+            "/metadata/labels/{}",
+            PLATFORM_OWNED_LABEL.replace('~', "~0").replace('/', "~1")
+        )) != Some(&json!("true"))
+}
+
+/// `true` when some object of a platform-written tenant file ([`PLATFORM_OWNED_TENANT_FILES`])
+/// lacks `keel.io/platform-owned: "true"` (written by a release before the label existed).
+/// Unparsable documents count as unlabelled.
+pub fn platform_owned_labels_missing(yaml: &str) -> bool {
+    keel_core::split_yaml_documents(yaml).iter().any(|doc| {
+        match serde_yml::from_str::<Value>(doc) {
+            Ok(value) => needs_platform_owned_label(&value),
+            Err(_) => true,
+        }
+    })
+}
+
+/// Adds `keel.io/platform-owned: "true"` to every [`PLATFORM_OWNED_KINDS`] object of a
+/// platform-written tenant file, leaving every other document (and already labelled ones)
+/// byte-for-byte unchanged. Returns `None` when nothing changes. Used by the tenant baseline
+/// migration (`keel tenant migrate-baseline`) for tenants created before the label existed.
+pub fn label_platform_owned_manifests(yaml: &str) -> Result<Option<String>, KubeError> {
+    let docs = keel_core::split_yaml_documents(yaml);
+    let mut out = yaml.to_string();
+    let mut changed = false;
+    for (index, doc) in docs.iter().enumerate() {
+        let mut value: Value = serde_yml::from_str(doc)?;
+        if !needs_platform_owned_label(&value) {
+            continue;
+        }
+        let meta = value
+            .get_mut("metadata")
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| {
+                KubeError::InvalidInput("platform-owned object without metadata".to_string())
+            })?;
+        let labels = meta
+            .entry("labels")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+            .ok_or_else(|| KubeError::InvalidInput("metadata.labels is not a map".to_string()))?;
+        labels.insert(PLATFORM_OWNED_LABEL.to_string(), json!("true"));
+        // Keep the document's header comments; the object itself is re-serialized.
+        let rendered = format!(
+            "{}{}",
+            keel_core::yaml_leading_comments(doc),
+            serde_yml::to_string(&value)?
+        );
+        out = keel_core::replace_yaml_document(&out, index, &rendered).ok_or_else(|| {
+            KubeError::InvalidInput("YAML document index out of range".to_string())
+        })?;
+        changed = true;
+    }
+    Ok(changed.then_some(out))
+}
+
 fn tenant_common_labels(tenant_id: &str) -> BTreeMap<String, String> {
     BTreeMap::from([
         (
@@ -136,7 +228,7 @@ fn restricted_pod_security_labels() -> [(String, String); 4] {
 /// Pod Security Standards (`NFR-SEC-02`, `NFR-SEC-03`).
 pub fn build_tenant_namespace(tenant_id: &str) -> Result<Namespace, KubeError> {
     let ns_name = tenant_namespace(tenant_id)?;
-    let mut labels = tenant_common_labels(tenant_id);
+    let mut labels = platform_owned_labels(tenant_id);
     labels.extend(restricted_pod_security_labels());
 
     Ok(Namespace {
@@ -161,7 +253,7 @@ pub fn build_tenant_service_account(
         metadata: ObjectMeta {
             name: Some(sa_name),
             namespace: Some(ns_name),
-            labels: Some(tenant_common_labels(&config.tenant_id)),
+            labels: Some(platform_owned_labels(&config.tenant_id)),
             ..ObjectMeta::default()
         },
         automount_service_account_token: Some(true),
@@ -208,7 +300,7 @@ pub fn build_tenant_resource_quota(
         metadata: ObjectMeta {
             name: Some(config.quota_name.clone()),
             namespace: Some(ns_name),
-            labels: Some(tenant_common_labels(&config.tenant_id)),
+            labels: Some(platform_owned_labels(&config.tenant_id)),
             ..ObjectMeta::default()
         },
         spec: Some(ResourceQuotaSpec {
@@ -230,7 +322,7 @@ pub fn build_tenant_default_deny_network_policy(
         metadata: ObjectMeta {
             name: Some("default-deny-all".to_string()),
             namespace: Some(ns_name),
-            labels: Some(tenant_common_labels(tenant_id)),
+            labels: Some(platform_owned_labels(tenant_id)),
             ..ObjectMeta::default()
         },
         spec: Some(NetworkPolicySpec {
@@ -259,7 +351,7 @@ pub fn build_tenant_limit_range(tenant_id: &str) -> Result<LimitRange, KubeError
         metadata: ObjectMeta {
             name: Some("default-container-resources".to_string()),
             namespace: Some(ns_name),
-            labels: Some(tenant_common_labels(tenant_id)),
+            labels: Some(platform_owned_labels(tenant_id)),
             ..ObjectMeta::default()
         },
         spec: Some(LimitRangeSpec {
@@ -286,7 +378,7 @@ pub fn build_tenant_admin_role_binding(
         metadata: ObjectMeta {
             name: Some(binding_name),
             namespace: Some(ns_name.clone()),
-            labels: Some(tenant_common_labels(&config.tenant_id)),
+            labels: Some(platform_owned_labels(&config.tenant_id)),
             ..ObjectMeta::default()
         },
         role_ref: RoleRef {
@@ -320,7 +412,7 @@ pub fn build_keel_server_tenant_role_binding(tenant_id: &str) -> Result<RoleBind
         metadata: ObjectMeta {
             name: Some(KEEL_SERVER_SERVICE_ACCOUNT.to_string()),
             namespace: Some(ns_name),
-            labels: Some(tenant_common_labels(tenant_id)),
+            labels: Some(platform_owned_labels(tenant_id)),
             ..ObjectMeta::default()
         },
         role_ref: RoleRef {
@@ -349,7 +441,7 @@ pub fn build_tenant_auth_delegator_binding(
     Ok(ClusterRoleBinding {
         metadata: ObjectMeta {
             name: Some(binding_name),
-            labels: Some(tenant_common_labels(&config.tenant_id)),
+            labels: Some(platform_owned_labels(&config.tenant_id)),
             ..ObjectMeta::default()
         },
         role_ref: RoleRef {
@@ -1816,6 +1908,54 @@ mod tests {
     use super::*;
 
     #[test]
+    fn legacy_tenant_baselines_get_the_platform_owned_label() {
+        // A baseline written before the label existed (labels stripped from the current one).
+        let current = TenantManifestBundle::synthesize(&TenantIsolationConfig::new("acme"))
+            .unwrap()
+            .to_multi_doc_yaml()
+            .unwrap();
+        assert!(!platform_owned_labels_missing(&current));
+        assert_eq!(label_platform_owned_manifests(&current).unwrap(), None);
+        let legacy = current.replace("    keel.io/platform-owned: \"true\"\n", "");
+        assert_ne!(legacy, current, "label line format changed");
+        assert!(platform_owned_labels_missing(&legacy));
+        let labelled = label_platform_owned_manifests(&legacy).unwrap().unwrap();
+        assert!(!platform_owned_labels_missing(&labelled));
+        let docs = keel_core::split_yaml_documents(&labelled);
+        assert_eq!(docs.len(), keel_core::split_yaml_documents(&current).len());
+        for doc in docs {
+            let v: Value = serde_yml::from_str(&doc).unwrap();
+            assert_eq!(
+                v["metadata"]["labels"][PLATFORM_OWNED_LABEL], "true",
+                "{doc}"
+            );
+            // Everything else is preserved.
+            assert_eq!(v["metadata"]["labels"]["keel.io/tenant"], "acme", "{doc}");
+        }
+        // Idempotent.
+        assert_eq!(label_platform_owned_manifests(&labelled).unwrap(), None);
+
+        // Comments, other kinds and already-labelled documents stay byte-for-byte.
+        let stub = "# platform-written source\napiVersion: source.toolkit.fluxcd.io/v1\nkind: GitRepository\nmetadata:\n  name: keel-gitops\n  namespace: tenant-acme\nspec:\n  url: https://forge.example/keel.git\n---\n# kept\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: x\n";
+        let out = label_platform_owned_manifests(stub).unwrap().unwrap();
+        assert!(out.starts_with("# platform-written source\n"), "{out}");
+        assert!(
+            out.ends_with("---\n# kept\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: x\n"),
+            "{out}"
+        );
+        let repo: Value = serde_yml::from_str(&keel_core::split_yaml_documents(&out)[0]).unwrap();
+        assert_eq!(repo["metadata"]["labels"][PLATFORM_OWNED_LABEL], "true");
+        assert_eq!(repo["spec"]["url"], "https://forge.example/keel.git");
+
+        // A label set to anything but "true" is corrected; unparsable YAML is an error.
+        let wrong = "apiVersion: v1\nkind: ServiceAccount\nmetadata:\n  name: s\n  labels:\n    keel.io/platform-owned: 'false'\n";
+        assert!(platform_owned_labels_missing(wrong));
+        assert!(label_platform_owned_manifests(wrong).unwrap().is_some());
+        assert!(label_platform_owned_manifests("kind: [").is_err());
+        assert!(platform_owned_labels_missing("kind: ["));
+    }
+
+    #[test]
     fn remote_target_namespace_never_prunes_or_overwrites() {
         let ns = synthesize_remote_target_namespace("default", "staging-obs").unwrap();
         assert_eq!(ns["apiVersion"], "v1");
@@ -1826,8 +1966,13 @@ mod tests {
         // Same `restricted` PSS enforcement as the management-cluster tenant namespace.
         let tenant_ns = build_tenant_namespace("default").unwrap();
         for (key, value) in tenant_ns.metadata.labels.unwrap() {
+            if key == PLATFORM_OWNED_LABEL {
+                continue;
+            }
             assert_eq!(ns["metadata"]["labels"][&key], value.as_str(), "{key}");
         }
+        // Applied by the tenant's own Kustomization on the workload cluster: never platform-owned.
+        assert!(ns["metadata"]["labels"].get(PLATFORM_OWNED_LABEL).is_none());
         assert_eq!(
             ns["metadata"]["labels"]["pod-security.kubernetes.io/enforce"],
             "restricted"
@@ -1995,34 +2140,50 @@ mod tests {
         assert_eq!(subjects[0].namespace.as_deref(), Some("keel-system"));
         assert!(build_keel_server_tenant_role_binding("Bad_ID").is_err());
 
-        // Must match the static tenant-default binding shipped with keel-server.
-        let shipped = include_str!("../../../deploy/bootstrap/keel-server/rbac.yaml");
-        let shipped_rb: Value = serde_yml::from_str(include_str!(
-            "../../../deploy/bootstrap/keel-server/tenant-default-rolebinding.yaml"
-        ))
-        .unwrap();
-        assert_eq!(shipped_rb["kind"], "RoleBinding");
-        assert_eq!(shipped_rb["metadata"]["namespace"], "tenant-default");
         // The shared bundle never binds a tenant itself (the tenant RBAC bundle owns those).
-        assert!(
-            shipped
-                .split("\n---\n")
-                .map(|d| serde_yml::from_str::<Value>(d).unwrap())
-                .all(|d| d["kind"] != "RoleBinding"
-                    || !d["metadata"]["namespace"]
-                        .as_str()
-                        .is_some_and(|ns| ns.starts_with("tenant-")))
-        );
-        let generated =
-            serde_json::to_value(build_keel_server_tenant_role_binding("default").unwrap())
-                .unwrap();
-        assert_eq!(
-            shipped_rb["metadata"]["name"],
-            generated["metadata"]["name"]
-        );
-        assert_eq!(shipped_rb["roleRef"], generated["roleRef"]);
-        assert_eq!(shipped_rb["subjects"], generated["subjects"]);
+        let shipped = include_str!("../../../deploy/bootstrap/keel-server/rbac.yaml");
         assert!(shipped.contains(&format!("name: {KEEL_SERVER_TENANT_CLUSTER_ROLE}")));
+    }
+
+    #[test]
+    fn keel_server_install_bundle_ships_no_tenant_objects() {
+        // `tenant-<id>` objects are `keel.io/platform-owned` and owned by `keel-tenants`; the
+        // manual `kubectl apply -k deploy/bootstrap/keel-server` install must never touch one, or
+        // Kyverno `protect-platform-owned-tenant-objects` denies it for managed-cluster admins.
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../deploy/bootstrap/keel-server");
+        let mut checked = 0;
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|e| e.to_str()) != Some("yaml") {
+                continue;
+            }
+            let content = std::fs::read_to_string(&path).unwrap();
+            assert!(
+                !content.contains("tenant-default-rolebinding"),
+                "{} references the removed tenant-default binding",
+                path.display()
+            );
+            for doc in content.split("\n---\n") {
+                let Ok(value) = serde_yml::from_str::<Value>(doc) else {
+                    continue;
+                };
+                let ns = value["metadata"]["namespace"].as_str().unwrap_or_default();
+                assert!(
+                    !ns.starts_with("tenant-"),
+                    "{} ships {ns}/{}",
+                    path.display(),
+                    value["metadata"]["name"]
+                );
+                assert!(
+                    value["metadata"]["labels"]["keel.io/platform-owned"].is_null(),
+                    "{} ships a platform-owned object",
+                    path.display()
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked >= 3, "only {checked} documents checked");
     }
 
     #[test]

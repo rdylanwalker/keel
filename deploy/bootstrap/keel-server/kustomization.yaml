@@ -7,6 +7,11 @@
 #   `flux-system/keel-server` Flux Kustomization (`catalog/core/keel-server`).
 # - Manual: `kubectl apply -k deploy/bootstrap/keel-server` after Stage 0.
 #
+# Neither ships a `tenant-<id>` object: the `tenant-<id>/keel-server` RoleBinding is part of each
+# tenant baseline (`tenants/<id>/rbac.yaml`, created by Stage 0 and owned by the `keel-tenants`
+# Flux Kustomization) and is `keel.io/platform-owned`, so re-applying it from here would be denied
+# by Kyverno `protect-platform-owned-tenant-objects` for managed-cluster admins.
+#
 # The `ghcr.io/rdylanwalker/keel` image is pinned to the release matching this checkout (the
 # workspace crate version, bumped by semantic-release together with `deployment.yaml`); never
 # `latest`. Pin another release or mirror with
@@ -15,7 +20,6 @@ apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
   - rbac.yaml
-  - tenant-default-rolebinding.yaml
   - deployment.yaml
 # Server configuration consumed via `envFrom` (hash-suffixed, so edits roll the Deployment).
 # Point `KEEL_GIT_URL` at an external forge with a kustomize overlay, e.g.

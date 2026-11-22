@@ -16,8 +16,8 @@ pub use cli::{
     DEFAULT_BIND_ADDR, DEFAULT_S3_BUCKET, DEFAULT_SERVER_URL, InfraArgs, InfraCommands,
     InfraListArgs, InfraProvisionArgs, InfraSshArgs, OutputFormat, PreviewArgs, PreviewCommands,
     PreviewStatusArgs, ProposalArgs, ProposalCommands, ProposalListArgs, ProposalRefArgs,
-    ProposalStatusArg, ServeArgs, TenantArgs, TenantCommands, TenantMigrateStackSourcesArgs,
-    TenantMigrateStateArgs,
+    ProposalStatusArg, ServeArgs, TenantArgs, TenantCommands, TenantMigrateBaselineArgs,
+    TenantMigrateStackSourcesArgs, TenantMigrateStateArgs,
 };
 pub use commands::{
     AuthLoginOutcome, BootstrapInitOutcome, BootstrapRecoverOutcome, CliContext, CliError,

@@ -1,0 +1,35 @@
+# Kyverno ValidatingPolicy: restrict-tenant-flux-source-status (NFR-SEC-02, NFR-SEC-04)
+# Mirrors `keel_kube::kyverno::build_restrict_tenant_flux_source_status_policy()`.
+# Tenant identities (`tenant-*` ServiceAccounts and groups, the `keel-previews` identity) may not
+# write `*/status` of Flux source objects in any namespace: a forged `status.artifact` would make
+# kustomize-controller apply another source's content. Fails closed.
+# The tenant-subject test is inline in `matchConditions`, so only tenant requests reach Kyverno:
+# source-controller's own status writes never do, and an unavailable Kyverno cannot stall Flux
+# artifact production (anti-lockout, NFR-REL-01). Every request that matches is denied.
+apiVersion: policies.kyverno.io/v1
+kind: ValidatingPolicy
+metadata:
+  name: restrict-tenant-flux-source-status
+  labels:
+    app.kubernetes.io/managed-by: keel
+    keel.io/policy-tier: tenant-isolation
+spec:
+  validationActions:
+    - Deny
+  failurePolicy: Fail
+  evaluation:
+    background:
+      enabled: false
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["source.toolkit.fluxcd.io", "source.extensions.fluxcd.io"]
+        apiVersions: ["*"]
+        operations: ["UPDATE"]
+        resources: ["*/status"]
+  matchConditions:
+    - name: tenant-subject
+      expression: >-
+        (has(request.userInfo.username) ? request.userInfo.username : '').startsWith('system:serviceaccount:tenant-') || (has(request.userInfo.username) ? request.userInfo.username : '').startsWith('system:serviceaccount:keel-previews:') || (has(request.userInfo.groups) ? request.userInfo.groups : []).exists(g, g.startsWith('tenant-') || g.startsWith('system:serviceaccounts:tenant-') || g == 'system:serviceaccounts:keel-previews')
+  validations:
+    - expression: "(has(request.subResource) ? request.subResource : '') != 'status'"
+      message: "Tenant identities may not write the status of Flux source objects (a forged `status.artifact` would make Flux apply another source's content); only source-controller writes source status."

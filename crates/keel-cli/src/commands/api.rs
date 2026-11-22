@@ -7,7 +7,7 @@ use serde_json::Value;
 
 use crate::cli::{
     AppListArgs, CatalogListArgs, CatalogShowArgs, OutputFormat, ProposalListArgs, ProposalRefArgs,
-    TenantMigrateStackSourcesArgs,
+    TenantMigrateBaselineArgs, TenantMigrateStackSourcesArgs,
 };
 
 use super::{
@@ -454,6 +454,76 @@ pub(crate) fn format_stack_source_migration(payload: &Value) -> String {
     out
 }
 
+/// Human-readable summary of `POST /api/v1/tenants/{id}/baseline/migrate`.
+pub(crate) fn format_baseline_migration(payload: &Value) -> String {
+    let tenant = s(payload, &["tenant"]);
+    let labelled: Vec<String> = payload
+        .get("labelled")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect();
+    let dry_run = payload
+        .get("dryRun")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let mut out = if labelled.is_empty() {
+        format!(
+            "Tenant `{tenant}`: baseline already labelled keel.io/platform-owned; nothing to do.\n"
+        )
+    } else if dry_run {
+        format!(
+            "Tenant `{tenant}`: {} file(s) would be labelled keel.io/platform-owned (dry run):\n",
+            labelled.len()
+        )
+    } else {
+        format!(
+            "Tenant `{tenant}`: opened a PR labelling {} file(s) keel.io/platform-owned:\n",
+            labelled.len()
+        )
+    };
+    for path in &labelled {
+        out.push_str(&format!("  {path}\n"));
+    }
+    if let Some(pr) = payload.get("proposal").filter(|p| !p.is_null()) {
+        out.push_str(&format!(
+            "Proposal #{}: {} ({})\nReview and merge it (`keel proposal merge {}`).\n",
+            s(pr, &["id"]),
+            s(pr, &["title"]),
+            s(pr, &["url"]),
+            s(pr, &["id"])
+        ));
+    }
+    out
+}
+
+/// `keel tenant migrate-baseline --tenant <id> [--dry-run]`.
+pub async fn execute_tenant_migrate_baseline(
+    args: &TenantMigrateBaselineArgs,
+    ctx: &CliContext,
+) -> Result<String, CliError> {
+    let tenant = normalize_tenant_arg(&args.tenant);
+    keel_core::validate_dns_label(&tenant, "tenant")?;
+    let base_url = normalize_server_url(&args.server)?;
+    let query: &[(&str, &str)] = if args.dry_run {
+        &[("dryRun", "true")]
+    } else {
+        &[]
+    };
+    let payload = post_json_query(
+        ctx,
+        &base_url,
+        &format!("/api/v1/tenants/{tenant}/baseline/migrate"),
+        query,
+    )
+    .await?;
+    match args.output {
+        OutputFormat::Json => pretty(&payload),
+        OutputFormat::Table => Ok(format_baseline_migration(&payload)),
+    }
+}
+
 /// `keel tenant migrate-stack-sources --tenant <id> [--dry-run]`.
 pub async fn execute_tenant_migrate_stack_sources(
     args: &TenantMigrateStackSourcesArgs,
@@ -503,6 +573,29 @@ mod tests {
         }));
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[1][1], "blueprint");
+    }
+
+    #[test]
+    fn baseline_migration_output() {
+        let opened = format_baseline_migration(&json!({
+            "tenant": "acme", "dryRun": false,
+            "labelled": ["tenants/acme/rbac.yaml"],
+            "proposal": {"id": "9", "title": "fix(acme): protect the platform-owned tenant baseline", "url": "http://forge/pr/9"}
+        }));
+        assert!(
+            opened.contains("opened a PR labelling 1 file(s)"),
+            "{opened}"
+        );
+        assert!(opened.contains("tenants/acme/rbac.yaml"));
+        assert!(opened.contains("keel proposal merge 9"));
+        let dry = format_baseline_migration(&json!({
+            "tenant": "acme", "dryRun": true, "labelled": ["tenants/acme/rbac.yaml"]
+        }));
+        assert!(dry.contains("(dry run)"), "{dry}");
+        assert!(!dry.contains("Proposal"));
+        let none =
+            format_baseline_migration(&json!({"tenant": "acme", "dryRun": false, "labelled": []}));
+        assert!(none.contains("nothing to do"), "{none}");
     }
 
     #[test]

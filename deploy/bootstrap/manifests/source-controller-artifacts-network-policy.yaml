@@ -1,0 +1,45 @@
+# Flux `source-controller` artifact server (port 9090) access (`SDD.md` tenant isolation, `NFR-SEC-02`).
+#
+# Every artifact is a tarball of the whole platform GitOps repository (or of a tenant source), so
+# it must only be reachable from `flux-system`: kustomize-/helm-controller and the protected
+# `management-cluster-core` PKO Stack workspace (`fluxSource` -> `flux-system/flux-system`).
+# Tenant and preview PKO Stacks clone their own Git source through PKO `gitSource` and never need
+# port 9090; keel-server and the PKO controller (`keel-system`) never download artifacts.
+#
+# Earlier releases allowed port 9090 from every namespace (`namespaceSelector: {}`). Re-running
+# `keel bootstrap init` replaces that rule in place with this one, but only once no PKO Stack
+# outside `flux-system` still uses `fluxSource` (live, or committed under `tenants/` on
+# `origin/main`; `keel tenant migrate-stack-sources`). Until then bootstrap applies this object
+# with the 9090 peer widened to `flux-system` plus exactly the blocking Stacks' namespaces
+# (`kubernetes.io/metadata.name In [...]`), also on fresh clusters where the flux2 chart's
+# `allow-egress` would otherwise close 9090 to them, and the bootstrap summary lists them.
+#
+# The flux2 chart's own policies (`allow-egress`: ingress from `flux-system` pods,
+# `allow-scraping`: port 8080 from any namespace) still apply; the metrics rule below only keeps
+# scraping working if those chart policies are ever disabled.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-source-controller-artifacts
+  namespace: flux-system
+  labels:
+    app.kubernetes.io/managed-by: keel
+spec:
+  podSelector:
+    matchLabels:
+      app: source-controller
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: flux-system
+      ports:
+        - protocol: TCP
+          port: 9090
+    - from:
+        - namespaceSelector: {}
+      ports:
+        - protocol: TCP
+          port: 8080

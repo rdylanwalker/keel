@@ -723,6 +723,28 @@ pub enum TenantCommands {
     MigrateState(TenantMigrateStateArgs),
     /// Open one PR moving a tenant's legacy `fluxSource` PKO Stacks to PKO `gitSource` (idempotent)
     MigrateStackSources(TenantMigrateStackSourcesArgs),
+    /// Open one PR labelling a tenant's platform-written baseline `keel.io/platform-owned` (idempotent)
+    MigrateBaseline(TenantMigrateBaselineArgs),
+}
+
+/// Arguments for `keel tenant migrate-baseline` (calls keel-server; platform admin only).
+#[derive(Args, Debug, Clone, PartialEq, Eq)]
+pub struct TenantMigrateBaselineArgs {
+    /// Tenant (bare id, e.g. `default`; a `tenant-` prefix is stripped)
+    #[arg(long, help = TENANT_HELP)]
+    pub tenant: String,
+
+    /// List the files that would be labelled without opening a PR
+    #[arg(long, default_value_t = false)]
+    pub dry_run: bool,
+
+    /// Output format (`table|json`)
+    #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+    pub output: OutputFormat,
+
+    /// Keel server base URL (set via global `--server` / `KEEL_SERVER`)
+    #[arg(skip = DEFAULT_SERVER_URL.to_string())]
+    pub server: String,
 }
 
 /// Arguments for `keel tenant migrate-stack-sources` (calls keel-server; platform admin only).

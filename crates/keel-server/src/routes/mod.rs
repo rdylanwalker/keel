@@ -4,6 +4,7 @@ pub mod catalog;
 pub mod management;
 pub mod proposals;
 pub mod stack_sources;
+pub mod tenant_baseline;
 pub mod tenants;
 pub mod workloads;
 
@@ -11,6 +12,7 @@ pub use catalog::*;
 pub use management::*;
 pub use proposals::*;
 pub use stack_sources::*;
+pub use tenant_baseline::*;
 pub use tenants::*;
 pub use workloads::*;
 

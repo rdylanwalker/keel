@@ -5,9 +5,9 @@
 # `keel-system`, `keel-previews` and `flux-system`. Tenant namespaces are dynamic, so per-tenant
 # access is a RoleBinding (`keel-server`) to the `keel-server-tenant` ClusterRole created in each
 # `tenant-<id>` namespace. Every tenant RBAC bundle (`tenants/<id>/rbac.yaml`, reconciled by the
-# `keel-tenants` Flux Kustomization) carries that binding; the `tenant-default` copy for manual
-# `kubectl apply -k` installs lives in `tenant-default-rolebinding.yaml`, which the Flux-managed
-# `keel-server` add-on omits so the binding has exactly one Flux owner (`keel-tenants`).
+# `keel-tenants` Flux Kustomization, and created for `tenant-default` by Stage 0) carries that
+# binding, labelled `keel.io/platform-owned`, so neither this bundle nor the Flux-managed
+# `keel-server` add-on ships a copy: the binding has exactly one owner (`keel-tenants`).
 apiVersion: v1
 kind: ServiceAccount
 metadata:

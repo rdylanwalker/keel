@@ -66,7 +66,7 @@ Secrets are never written to Git:
 
 Open the server at `https://keel.<domain>[:port]` (add the host to `/etc/hosts` for the local ingress), or run `kubectl -n keel-system port-forward svc/keel-server 8080:8080`.
 
-The add-on omits `tenant-default-rolebinding.yaml`, because `tenants/default/rbac.yaml` (owned by the `keel-tenants` Flux Kustomization) already carries that binding. The Flux Kustomization has no `targetNamespace`, because the bundle spans `keel-system`, `keel-previews`, `flux-system` and cluster-scoped RBAC.
+Neither the add-on nor the manual bundle ships the `tenant-default/keel-server` RoleBinding. Stage 0 creates it with the `tenant-default` baseline, and `tenants/default/rbac.yaml` (owned by the `keel-tenants` Flux Kustomization) keeps it. It is labelled `keel.io/platform-owned`, so re-applying it as a managed-cluster admin would be denied by Kyverno `protect-platform-owned-tenant-objects`. The Flux Kustomization has no `targetNamespace`, because the bundle spans `keel-system`, `keel-previews`, `flux-system` and cluster-scoped RBAC.
 
 ## Manual Deploy
 
@@ -84,7 +84,6 @@ The bundle contains:
 - `ServiceAccount` `keel-system/keel-server`.
 - `Deployment` `keel-system/keel-server`: one replica, `restricted` Pod Security (non-root UID `65532`, read-only root filesystem, every capability dropped, `RuntimeDefault` seccomp). It runs `keel serve --bind 0.0.0.0:8080 --repo-dir /var/lib/keel/work` with `KEEL_GIT_URL`/`KEEL_GIT_USERNAME` from `ConfigMap/keel-server-config` and `KEEL_GIT_TOKEN` from `Secret/forge-token`, plus `/healthz` readiness and liveness probes.
 - `Service` `keel-system/keel-server` on port `8080`.
-- `RoleBinding` `tenant-default/keel-server` (`tenant-default-rolebinding.yaml`, manual install only).
 
 Expose the Service through your Envoy Gateway `HTTPRoute` or ingress of choice. The OIDC redirect URI is derived from the request `Host`, so register that external origin as a redirect URI on the IdP client.
 

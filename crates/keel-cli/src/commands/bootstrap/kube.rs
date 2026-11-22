@@ -83,8 +83,22 @@ impl<'a> KubeTarget<'a> {
 
     /// `kubectl apply -f -` with the manifest supplied on stdin.
     pub(crate) async fn apply(&self, manifest_yaml: &str) -> Result<(), CliError> {
+        self.apply_as(manifest_yaml, None).await
+    }
+
+    /// `kubectl apply -f -` (manifest on stdin), impersonating `as_user` (`--as`) when set.
+    pub(crate) async fn apply_as(
+        &self,
+        manifest_yaml: &str,
+        as_user: Option<&str>,
+    ) -> Result<(), CliError> {
+        let as_arg = as_user.map(|u| format!("--as={u}"));
+        let mut args = vec!["apply", "-f", "-"];
+        if let Some(arg) = as_arg.as_deref() {
+            args.push(arg);
+        }
         let output = self
-            .output_with_stdin(&["apply", "-f", "-"], manifest_yaml.as_bytes())
+            .output_with_stdin(&args, manifest_yaml.as_bytes())
             .await?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);

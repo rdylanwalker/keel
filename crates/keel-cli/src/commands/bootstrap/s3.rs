@@ -11,11 +11,11 @@ use hmac::{Hmac, KeyInit, Mac};
 use keel_core::{
     FLUX_SYSTEM_NAMESPACE, KEEL_PREVIEWS_NAMESPACE, KEEL_SYSTEM_NAMESPACE, generate_admin_password,
 };
+use keel_kube::S3_CREDENTIALS_SECRET_NAME;
 use keel_kube::tenant::{
     TENANT_S3_CREDENTIALS_SECRET_NAME, build_tenant_s3_credentials_secret,
     seaweedfs_configure_tenant_identity_script,
 };
-use keel_kube::{S3_CREDENTIALS_SECRET_NAME, TenantIsolationConfig, TenantManifestBundle};
 use keel_pko::IN_CLUSTER_S3_BACKEND_URL;
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -479,11 +479,9 @@ pub(crate) async fn read_seaweedfs_admin_credentials(
 pub(crate) async fn sync_in_cluster_s3_credentials_from_seaweedfs(
     target: KubeTarget<'_>,
 ) -> Result<(), CliError> {
+    // The `tenant-default` baseline is applied by the caller before the Kyverno bundle
+    // (`ensure_tenant_baseline`), never here.
     let creds = read_seaweedfs_admin_credentials(target).await?;
-    let default_tenant_rbac =
-        TenantManifestBundle::synthesize(&TenantIsolationConfig::new("default"))?
-            .to_multi_doc_yaml()?;
-    target.apply(&default_tenant_rbac).await?;
 
     for ns in [
         KEEL_SYSTEM_NAMESPACE,

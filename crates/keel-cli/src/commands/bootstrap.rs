@@ -848,19 +848,130 @@ pub(crate) async fn apply_git_credentials_secret(
     target.apply(&serde_yml::to_string(&creds_doc)?).await
 }
 
-/// Ensures `tenant-<id>` exists and writes its **read-only** `git-credentials` Secret consumed by
-/// the tenant's Flux `GitRepository` (`keel-gitops`).
+/// Writes the **read-only** `git-credentials` Secret of `tenant-<id>` consumed by the tenant's Flux
+/// `GitRepository` (`keel-gitops`).
+///
+/// Only the unlabelled Secret is written once the tenant exists: the `keel.io/platform-owned`
+/// tenant baseline is created at most once, through [`ensure_tenant_baseline`], and owned by
+/// `keel-tenants` afterwards.
 pub(crate) async fn apply_tenant_git_credentials_secret(
     target: KubeTarget<'_>,
     tenant_id: &str,
     username: &str,
     read_only_token: &str,
 ) -> Result<(), CliError> {
-    let tenant_rbac = TenantManifestBundle::synthesize(&TenantIsolationConfig::new(tenant_id))?
-        .to_multi_doc_yaml()?;
-    target.apply(&tenant_rbac).await?;
+    ensure_tenant_baseline(target, tenant_id).await?;
     let doc = build_tenant_git_credentials_secret(tenant_id, username, read_only_token)?;
     target.apply(&serde_yml::to_string(&doc)?).await
+}
+
+/// The `keel.io/platform-owned` tenant baseline (`tenants/<id>/rbac.yaml`: Namespace,
+/// ServiceAccount, quota, LimitRange, NetworkPolicy, RoleBindings, auth-delegator binding).
+pub(crate) fn tenant_baseline_yaml(tenant_id: &str) -> Result<String, CliError> {
+    Ok(
+        TenantManifestBundle::synthesize(&TenantIsolationConfig::new(tenant_id))?
+            .to_multi_doc_yaml()?,
+    )
+}
+
+/// How Stage 0 handles the `keel.io/platform-owned` baseline of a tenant
+/// ([`tenant_baseline_action`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TenantBaselineAction {
+    /// The tenant namespace exists: never re-apply the baseline. `keel-tenants`
+    /// (`keel-tenant-reconciler`) owns it from Git (`tenants/<id>/rbac.yaml`), and an operator
+    /// re-apply would be denied by Kyverno `protect-platform-owned-tenant-objects` for managed
+    /// cluster admins outside `system:masters` / `kubeadm:cluster-admins` (EKS access entries,
+    /// GKE IAM, AKS Entra ID).
+    Skip,
+    /// First bootstrap: the namespace is missing and the policy is not installed yet, so the
+    /// operator's kubeconfig identity creates the baseline.
+    ApplyAsOperator,
+    /// The namespace is missing but the policy already exists (e.g. the tenant namespace was
+    /// deleted): create the baseline impersonating this identity, the same confined
+    /// `keel-tenant-reconciler` that `keel-tenants` uses for these objects.
+    ApplyAs(String),
+}
+
+/// Pure decision for [`ensure_tenant_baseline`]: Stage 0 never writes a platform-owned object as
+/// the operator once `protect-platform-owned-tenant-objects` is installed, and never re-applies an
+/// existing baseline.
+pub(crate) fn tenant_baseline_action(
+    namespace_exists: bool,
+    policy_installed: bool,
+) -> TenantBaselineAction {
+    match (namespace_exists, policy_installed) {
+        (true, _) => TenantBaselineAction::Skip,
+        (false, false) => TenantBaselineAction::ApplyAsOperator,
+        (false, true) => TenantBaselineAction::ApplyAs(format!(
+            "system:serviceaccount:{FLUX_SYSTEM_NAMESPACE}:{}",
+            keel_kube::tenant::TENANT_RECONCILER_SERVICE_ACCOUNT
+        )),
+    }
+}
+
+/// `true` when `kubectl get <args> --ignore-not-found -o name` finds the object; a missing
+/// resource type (CRD not installed yet) counts as absent, any other error is returned.
+async fn kube_object_exists(
+    target: KubeTarget<'_>,
+    kind: &str,
+    name: &str,
+) -> Result<bool, CliError> {
+    match target
+        .output(&["get", kind, name, "--ignore-not-found", "-o", "name"])
+        .await
+    {
+        Ok(out) => Ok(!out.trim().is_empty()),
+        Err(err)
+            if err
+                .to_string()
+                .contains("the server doesn't have a resource type") =>
+        {
+            Ok(false)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// Creates the `keel.io/platform-owned` baseline of `tenant-<id>` only when the tenant namespace
+/// does not exist yet ([`tenant_baseline_action`]). Stage 0 calls this before applying the Kyverno
+/// bundle, so on a first bootstrap the operator creates it before the policy exists; afterwards
+/// only the unlabelled tenant Secrets are written by Stage 0.
+pub(crate) async fn ensure_tenant_baseline(
+    target: KubeTarget<'_>,
+    tenant_id: &str,
+) -> Result<TenantBaselineAction, CliError> {
+    let namespace = keel_kube::tenant_namespace(tenant_id)?;
+    let namespace_exists = kube_object_exists(target, "namespace", &namespace).await?;
+    let policy_installed = !namespace_exists
+        && kube_object_exists(
+            target,
+            "validatingpolicies.policies.kyverno.io",
+            keel_kube::kyverno::POLICY_PROTECT_PLATFORM_OWNED_TENANT_OBJECTS,
+        )
+        .await?;
+    let action = tenant_baseline_action(namespace_exists, policy_installed);
+    match &action {
+        TenantBaselineAction::Skip => {}
+        TenantBaselineAction::ApplyAsOperator => {
+            target.apply(&tenant_baseline_yaml(tenant_id)?).await?;
+        }
+        TenantBaselineAction::ApplyAs(identity) => {
+            target
+                .apply_as(&tenant_baseline_yaml(tenant_id)?, Some(identity))
+                .await
+                .map_err(|err| {
+                    CliError::Execution(format!(
+                        "creating the `{namespace}` baseline as `{identity}` failed ({err}); \
+                         Kyverno `{}` only admits keel-tenant-reconciler, keel-server and cluster \
+                         admins in `system:masters`/`kubeadm:cluster-admins`, and the current \
+                         kubeconfig identity needs `impersonate` on that ServiceAccount",
+                        keel_kube::kyverno::POLICY_PROTECT_PLATFORM_OWNED_TENANT_OBJECTS
+                    ))
+                })?;
+        }
+    }
+    Ok(action)
 }
 
 /// Renders the Flux `HelmRelease` that adopts the Stage 0 Kyverno release in place, keeping
@@ -1343,6 +1454,13 @@ pub async fn initialize_seed_git_repo(
 pub(crate) fn render_default_tenant_git_repository_yaml(
     repo: &FluxGitRepository,
 ) -> Result<String, CliError> {
+    // Platform-written tenant source: only keel-tenant-reconciler / keel-server may change it
+    // (Kyverno `protect-platform-owned-tenant-objects`).
+    let mut repo = repo.clone();
+    repo.metadata.labels.insert(
+        keel_kube::PLATFORM_OWNED_LABEL.to_string(),
+        "true".to_string(),
+    );
     let mut repo_yaml = repo.to_yaml()?;
     if !repo_yaml.ends_with('\n') {
         repo_yaml.push('\n');
@@ -1829,6 +1947,7 @@ pub async fn execute_bootstrap_init_with_target(
                 stage0,
                 cfg.with_forge,
                 args.git_token.as_deref(),
+                args.repo_dir.as_deref(),
             )
             .await?,
         );
