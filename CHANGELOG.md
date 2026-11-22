@@ -1,3 +1,48 @@
+## [0.11.0](https://github.com/rdylanwalker/keel/compare/v0.10.0...v0.11.0) (2026-11-22)
+
+### ⚠ BREAKING CHANGES
+
+* existing installations are not upgraded; re-run
+`keel bootstrap init` on a fresh cluster with new GitOps and tenant
+repositories. Removed migration-only API routes and CLI commands.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+* **server:** the flat proposal routes /api/v1/proposals/{id}[...]
+and POST /api/v1/proposals are removed. Use
+/api/v1/tenants/{tenant}/proposals[/{id}/preview|merge|reject|reopen]
+(`management` for the platform repository). PR ids are per repository.
+GET /api/v1/proposals remains as an aggregated read-only listing.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+* **server:** tenant-default and every new tenant live in their own
+repository; KEEL_TENANT_GIT_TOKEN and the shared tenant git-credentials Secret
+are gone, an external --git-url requires --git-token, keel bootstrap init exits
+non-zero when tenant-default cannot be provisioned, and tenant administrators
+can no longer merge platform-repository PRs under tenants/<id>/ for tenants
+with their own repository. Start from a fresh bootstrap.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+### Features
+
+* **catalog:** substitute the http-echo apiToken into a workload Secret ([75c71df](https://github.com/rdylanwalker/keel/commit/75c71df16eb51d049772da668c04fd67921f6854))
+* **cli:** provision a Forgejo bot user and keel-tenants organisation for tenant repositories ([eaa3833](https://github.com/rdylanwalker/keel/commit/eaa38338b8c48a82c3db0cad3aadd90c09814172))
+* **git:** add per-repository ForgeProvider operations for tenant repositories ([48899cf](https://github.com/rdylanwalker/keel/commit/48899cfa19e2b0cf23336715007e6f9a60fac589))
+* **kube:** synthesize per-tenant repository stubs and credentials ([2802627](https://github.com/rdylanwalker/keel/commit/28026276d770f50f9c86c360dfe0d7cfdbc1bc15))
+* **server:** provision a dedicated repository and read credential for new tenants ([4e90f28](https://github.com/rdylanwalker/keel/commit/4e90f286b5fa40cacb358a08804c080ae58e7435))
+* **server:** route tenant proposals through per-tenant repositories ([c4ae9d7](https://github.com/rdylanwalker/keel/commit/c4ae9d70f761a2458489a742f26ba623a7186e17))
+* **ui:** show per-tenant repositories and tenant-scoped proposals ([c7840e6](https://github.com/rdylanwalker/keel/commit/c7840e6370affac37ff74571ec20508474de20d8))
+
+### Bug Fixes
+
+* **deploy:** deny tenant writes to PKO workspaces, updates, stack status and protect labels ([ba5d5d8](https://github.com/rdylanwalker/keel/commit/ba5d5d8c122995268e4e2519ed991fc5b11de27c))
+* **git:** align Forgejo tenant-repo provisioning with the Forgejo 15 API ([47ecca2](https://github.com/rdylanwalker/keel/commit/47ecca295d591774f66b18de80579fc573276e36))
+* **server:** enforce tenant scoping on every tenant read endpoint ([1b7622c](https://github.com/rdylanwalker/keel/commit/1b7622cf95974c2a9fb3a1a7e67446f4207ebd02))
+
+### Code Refactoring
+
+* drop upgrade and migration paths for the alpha ([9a054da](https://github.com/rdylanwalker/keel/commit/9a054da94ddf1eede3d533638efe5d3a7164a32b))
+
 ## [0.10.0](https://github.com/rdylanwalker/keel/compare/v0.9.0...v0.10.0) (2026-11-22)
 
 ### Features

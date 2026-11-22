@@ -39,7 +39,7 @@ spec:
     name: flux-system
   images:
     - name: ghcr.io/rdylanwalker/keel
-      newTag: "0.10.0"
+      newTag: "0.11.0"
   # Health is reported on this object only; `core-addons` does not wait on it.
   wait: false
   timeout: 5m
