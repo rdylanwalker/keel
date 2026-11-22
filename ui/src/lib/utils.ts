@@ -10,8 +10,9 @@ import { stringify as stringifyYaml } from "yaml"
  * "DEMO DATA" banner.
  */
 export function isDemoModeAllowed(): boolean {
-  const env = import.meta.env ?? {}
-  return Boolean(env.DEV) || env.VITE_ENABLE_DEMO === "true"
+  // Read `import.meta.env` keys directly so Vite folds the gate to a constant and drops the
+  // demo fixture chunk from builds without `VITE_ENABLE_DEMO` (see `lib/demo.ts`).
+  return import.meta.env.DEV || import.meta.env.VITE_ENABLE_DEMO === "true"
 }
 
 export function isDemoMode(): boolean {
@@ -56,81 +57,19 @@ const NON_SSH_PROVIDERS = new Set([
   "kubeconfig",
 ])
 
-export function classifyStackResourceKind(stack: {
-  name?: string
-  namespace?: string
-  provider?: string
-  type?: string
-  resourceKind?: string
-  catalogId?: string
-}): "vm" | "cluster" | "service" {
-  if (
-    stack.resourceKind === "vm" ||
-    stack.resourceKind === "cluster" ||
-    stack.resourceKind === "service"
-  ) {
-    return stack.resourceKind
-  }
-
-  const name = (stack.name || "").toLowerCase()
-  const provider = (stack.provider || "").toLowerCase()
-  const catalogId = (stack.catalogId || "").toLowerCase()
-
-  if (
-    name === "management-cluster-core" ||
-    stack.namespace === "flux-system" ||
-    stack.type === "management" ||
-    provider === "kind" ||
-    catalogId.includes("cluster") ||
-    catalogId.includes("eks") ||
-    catalogId.includes("gke") ||
-    catalogId.includes("aks") ||
-    catalogId.includes("k3s") ||
-    name.includes("cluster") ||
-    name.includes("eks") ||
-    name.includes("gke") ||
-    name.includes("aks") ||
-    name.includes("k3s")
-  ) {
-    return "cluster"
-  }
-
-  if (
-    provider === "kubernetes" ||
-    provider === "k8s" ||
-    provider === "helm" ||
-    provider === "manifest" ||
-    provider === "kustomize" ||
-    provider === "flux" ||
-    provider === "pulumi-k8s" ||
-    provider === "cloudflare" ||
-    name === "postgres-managed" ||
-    name === "canary-gateway-config" ||
-    name.includes("postgres") ||
-    name.includes("db") ||
-    name.includes("gateway") ||
-    name.endsWith("-net") ||
-    name === "net"
-  ) {
-    return "service"
-  }
-
-  return "vm"
-}
-
+/**
+ * Whether the stack exposes an SSH target. The server classifies every stack
+ * (`resourceKind`); only VM stacks of SSH-capable providers qualify.
+ */
 export function isStackSshSupported(stack: {
-  name?: string
-  namespace?: string
   provider?: string
-  type?: string
   resourceKind?: string
-  catalogId?: string
 }): boolean {
   const provider = (stack.provider || "").trim().toLowerCase()
   if (NON_SSH_PROVIDERS.has(provider)) {
     return false
   }
-  return classifyStackResourceKind(stack) === "vm"
+  return stack.resourceKind === "vm"
 }
 
 export function cn(...inputs: ClassValue[]) {

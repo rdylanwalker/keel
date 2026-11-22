@@ -105,7 +105,6 @@ describe("DeployInstanceModal component", () => {
       title: "deploy podinfo",
       branch: "keel/acme/podinfo",
       status: "open",
-      author: "admin@keel.local",
       tenant: "acme",
       scope: "acme",
       createdAt: "2026-11-15T12:00:00Z",
@@ -126,6 +125,7 @@ describe("DeployInstanceModal component", () => {
             provider: "kind",
             type: "workload",
             status: "synced",
+            resourceKind: "cluster",
           },
         ]}
         onProposalCreated={onProposalCreated}
@@ -162,7 +162,6 @@ describe("DeployInstanceModal component", () => {
       id: "43",
       title: "deploy podinfo canary",
       branch: "keel/acme/app-podinfo-43",
-      author: "tester",
       tenant: "acme",
       scope: "acme",
       status: "open",
@@ -208,7 +207,6 @@ describe("DeployInstanceModal component", () => {
       id: "44",
       title: "deploy bundle",
       branch: "keel/beta/bundle-44",
-      author: "tester",
       tenant: "beta",
       scope: "beta",
       status: "open",
@@ -315,7 +313,6 @@ describe("DeployInstanceModal component", () => {
       title: "Upgrade kyverno",
       branch: "keel/mgmt/upgrade-kyverno",
       status: "open",
-      author: "admin@keel.local",
       tenant: "keel-system",
       scope: "management",
       createdAt: "2026-11-16T12:00:00Z",
@@ -396,7 +393,6 @@ describe("DeployInstanceModal component", () => {
       id: "99",
       title: "Deploy custom-manifest",
       branch: "keel/acme/custom-manifest-99",
-      author: "user",
       tenant: "acme",
       scope: "acme",
       status: "open",
@@ -461,7 +457,6 @@ describe("DeployInstanceModal component", () => {
       id: "100",
       title: "Deploy manifest app",
       branch: "keel/acme/manifest-100",
-      author: "user",
       tenant: "acme",
       scope: "acme",
       status: "open",
@@ -543,6 +538,7 @@ describe("DeployInstanceModal component", () => {
         provider: "kind",
         type: "workload",
         status: "synced",
+        resourceKind: "cluster",
       },
       {
         id: "aws-eks",
@@ -551,6 +547,7 @@ describe("DeployInstanceModal component", () => {
         provider: "aws",
         type: "cloud",
         status: "synced",
+        resourceKind: "cluster",
       },
       {
         id: "vm-stack",
@@ -559,6 +556,7 @@ describe("DeployInstanceModal component", () => {
         provider: "aws",
         type: "workload",
         status: "synced",
+        resourceKind: "vm",
       },
       {
         id: "service-stack",
@@ -567,6 +565,7 @@ describe("DeployInstanceModal component", () => {
         provider: "kubernetes",
         type: "workload",
         status: "synced",
+        resourceKind: "service",
       },
       {
         id: "mgmt-stack",
@@ -575,6 +574,7 @@ describe("DeployInstanceModal component", () => {
         provider: "kind",
         type: "management",
         status: "synced",
+        resourceKind: "cluster",
       },
     ]
 
@@ -696,7 +696,6 @@ describe("DeployInstanceModal validation, secrets and server errors", () => {
       id: "1",
       title: "t",
       branch: "b",
-      author: "a",
       tenant: "default",
       scope: "default",
       status: "open",
@@ -871,6 +870,7 @@ describe("DeployInstanceModal cluster-scoped placement", () => {
     provider: "kind",
     type: "workload",
     status: "synced",
+    resourceKind: "cluster",
   }
   const submit = () =>
     fireEvent.click(
@@ -883,7 +883,6 @@ describe("DeployInstanceModal cluster-scoped placement", () => {
       id: "77",
       title: "deploy cert-manager",
       branch: "keel/acme/cert-manager",
-      author: "tester",
       tenant: "acme",
       scope: "acme",
       status: "open",

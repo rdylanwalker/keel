@@ -75,14 +75,20 @@ describe("formatForgeProvider utility", () => {
 
 describe("isStackSshSupported utility", () => {
   it("identifies SSH-capable VM stacks vs non-VM stacks", () => {
-    expect(isStackSshSupported({ name: "vm-1", provider: "azure" })).toBe(true)
-    expect(isStackSshSupported({ name: "vm-2", provider: "kind" })).toBe(false)
+    expect(isStackSshSupported({ provider: "azure", resourceKind: "vm" })).toBe(
+      true
+    )
+    // Non-SSH providers never qualify, even when classified as a VM.
+    expect(isStackSshSupported({ provider: "kind", resourceKind: "vm" })).toBe(
+      false
+    )
     expect(
-      isStackSshSupported({ name: "management-cluster-core", provider: "" })
+      isStackSshSupported({ provider: "proxmox", resourceKind: "cluster" })
     ).toBe(false)
-    expect(isStackSshSupported({ name: "x", type: "management" })).toBe(false)
-    expect(isStackSshSupported({ name: "postgres-managed" })).toBe(false)
-    expect(isStackSshSupported({ name: "canary-gateway-config" })).toBe(false)
+    expect(
+      isStackSshSupported({ provider: "aws", resourceKind: "service" })
+    ).toBe(false)
+    expect(isStackSshSupported({ provider: "aws" })).toBe(false)
   })
 })
 

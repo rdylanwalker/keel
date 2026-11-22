@@ -114,7 +114,6 @@ describe("TenantProvisioningSummary", () => {
             id: "12",
             title: "create tenant acme",
             branch: "keel/acme/create-tenant-12",
-            author: "admin",
             tenant: "acme",
             scope: "management",
             status: "open",

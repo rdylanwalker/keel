@@ -7,7 +7,6 @@ import {
   getAuthStatus,
   getTenants,
   logout,
-  setStoredToken,
   startOidcLogin,
 } from "./lib/api"
 import { isDemoMode } from "./lib/utils"
@@ -179,7 +178,6 @@ export const App: React.FC = () => {
   }
 
   const handleLogout = async () => {
-    setStoredToken(null)
     setAuthStatus({ authenticated: false, phase: "oidc-active" })
     setTenants([])
     setSelectedTenant("")

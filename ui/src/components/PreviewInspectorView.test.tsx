@@ -42,7 +42,6 @@ const mockProposals: Proposal[] = [
     id: "101",
     title: "Deploy Redis Cache",
     branch: "keel/tenant-acme/redis-101",
-    author: "dev@acme.com",
     tenant: "acme",
     scope: "acme",
     repository: {
@@ -53,7 +52,6 @@ const mockProposals: Proposal[] = [
     status: "open",
     createdAt: "5 mins ago",
     prUrl: "https://git.internal/pr/101",
-    previewStatus: "ready",
   },
 ]
 
@@ -805,7 +803,7 @@ describe("PreviewInspectorView component", () => {
     expect(api.createEventSourceStream).not.toHaveBeenCalled()
   })
 
-  it("filters PRs via client-side search query by title, branch, ID, tenant, or author", async () => {
+  it("filters PRs via client-side search query by title, branch, ID, or tenant", async () => {
     const multiPRs: Proposal[] = [
       {
         ...mockProposals[0],
@@ -815,7 +813,6 @@ describe("PreviewInspectorView component", () => {
         tenant: "tenant-a",
         scope: "a",
         repository: { label: "tenant-a" },
-        author: "alice",
       },
       {
         ...mockProposals[0],
@@ -825,7 +822,6 @@ describe("PreviewInspectorView component", () => {
         tenant: "tenant-b",
         scope: "b",
         repository: { label: "tenant-b" },
-        author: "bob",
       },
       {
         ...mockProposals[0],
@@ -835,7 +831,6 @@ describe("PreviewInspectorView component", () => {
         tenant: "tenant-a",
         scope: "a",
         repository: { label: "tenant-a" },
-        author: "charlie",
       },
     ]
     vi.mocked(api.getProposals).mockResolvedValue(multiPRs)

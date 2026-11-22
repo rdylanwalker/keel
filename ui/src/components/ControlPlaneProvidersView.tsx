@@ -17,10 +17,7 @@ import {
 import { errorMessage, visibleLoadError } from "../lib/errors"
 import { formatForgeProvider, isDemoMode } from "../lib/utils"
 import { useAuthz } from "../lib/authz-context"
-import {
-  DEFAULT_PROVIDERS,
-  DEMO_MANAGEMENT_ADDON_STATUSES,
-} from "../lib/demoFixtures"
+import { demoFixtures } from "../lib/demo"
 import { PrNotificationBanner } from "./PrNotificationBanner"
 import { Badge } from "./ui/badge"
 import { Button } from "./ui/button"
@@ -119,11 +116,11 @@ export const ControlPlaneProvidersView: React.FC<
   const demo = isDemoMode()
   const [clusterMeta, setClusterMeta] = useState<ClusterMeta>({})
   const [providers, setProviders] = useState<ProviderRegistryEntry[]>(() =>
-    demo ? DEFAULT_PROVIDERS : []
+    demo ? demoFixtures().DEFAULT_PROVIDERS : []
   )
   const [addonStatuses, setAddonStatuses] = useState<
     ManagementAddonStatus[] | null
-  >(() => (demo ? DEMO_MANAGEMENT_ADDON_STATUSES : null))
+  >(() => (demo ? demoFixtures().DEMO_MANAGEMENT_ADDON_STATUSES : null))
   const [liveStatusAvailable, setLiveStatusAvailable] = useState(demo)
   const [pendingProviderPrs, setPendingProviderPrs] = useState<
     Record<string, PendingProviderPr>

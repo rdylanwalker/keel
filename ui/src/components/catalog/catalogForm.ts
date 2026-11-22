@@ -1,13 +1,11 @@
 import type { RJSFSchema } from "@rjsf/utils"
 
-import { DEFAULT_STARTER_MANIFEST } from "@/lib/demoFixtures"
+import { DEFAULT_STARTER_MANIFEST } from "@/lib/starterManifest"
 import {
   CatalogBundleItem,
   CatalogItem,
   CreateCatalogItemPayload,
 } from "@/types/api"
-
-export type CatalogKind = "app" | "infra" | "bundle"
 
 export function emptyCatalogForm(): CreateCatalogItemPayload {
   return {
@@ -34,17 +32,9 @@ export function emptyCatalogForm(): CreateCatalogItemPayload {
   }
 }
 
-export function normalizeCatalogKind(type: string): CatalogKind {
-  return type === "infrastructure" || type === "infra"
-    ? "infra"
-    : type === "bundle"
-      ? "bundle"
-      : "app"
-}
-
 /** Populates the catalog editor form from an existing catalog item. */
 export function catalogItemToForm(item: CatalogItem): CreateCatalogItemPayload {
-  const kind = normalizeCatalogKind(item.type)
+  const kind = item.type
   return {
     kind,
     id: item.id,
@@ -259,8 +249,7 @@ export function toUpdatePayload(
   }
 }
 
-export const isInfraItem = (c: CatalogItem) =>
-  c.type === "infra" || c.type === "infrastructure"
+export const isInfraItem = (c: CatalogItem) => c.type === "infra"
 
 /** Default first step when switching a new catalog item to the bundle kind. */
 export function defaultBundleStep(catalog: CatalogItem[]): CatalogBundleItem {

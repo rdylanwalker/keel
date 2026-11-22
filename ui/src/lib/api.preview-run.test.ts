@@ -77,21 +77,6 @@ describe("preview run + camelCase PullRequestInfo normalization", () => {
     ])
   })
 
-  it("falls back to a top-level run field", async () => {
-    stubJson({
-      report: {
-        source: "pko",
-        summary: { create: 0, update: 0, delete: 0, replace: 0, same: 0 },
-      },
-      run: { phase: "notExecuted", message: "no infra changes" },
-    })
-    const preview = await getProposalPreview({ scope: "acme", id: "9" })
-    expect(preview.run).toEqual({
-      phase: "notExecuted",
-      message: "no infra changes",
-    })
-  })
-
   it("normalizes camelCase PullRequestInfo from the forge", async () => {
     stubJson({
       proposals: [
@@ -100,7 +85,6 @@ describe("preview run + camelCase PullRequestInfo normalization", () => {
           title: "feat(acme): deploy podinfo",
           scope: "acme",
           sourceBranch: "keel/acme/podinfo-12",
-          author: "alice",
           state: "open",
           createdAt: "2026-11-20T10:00:00Z",
           url: "https://forge/pr/12",

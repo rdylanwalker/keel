@@ -20,8 +20,6 @@ export function AlertDialog({
   )
 }
 
-export const AlertDialogTrigger = AlertDialogPrimitive.Trigger
-
 export const AlertDialogContent = React.forwardRef<
   React.ComponentRef<typeof AlertDialogPrimitive.Content>,
   React.ComponentPropsWithoutRef<typeof AlertDialogPrimitive.Content>

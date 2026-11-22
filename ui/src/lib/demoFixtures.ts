@@ -10,39 +10,6 @@ import {
   TenantSummary,
 } from "../types/api"
 
-export const DEFAULT_STARTER_MANIFEST = `apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: \${appName}
-  labels:
-    app: \${appName}
-spec:
-  replicas: \${replicas:=2}
-  selector:
-    matchLabels:
-      app: \${appName}
-  template:
-    metadata:
-      labels:
-        app: \${appName}
-    spec:
-      containers:
-        - name: app
-          image: nginx:alpine
-          ports:
-            - containerPort: 80
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: \${appName}
-spec:
-  selector:
-    app: \${appName}
-  ports:
-    - port: 80
-      targetPort: 80`
-
 export const DEMO_TENANTS: TenantSummary[] = [
   { id: "default", namespace: "tenant-default" },
   { id: "acme", namespace: "tenant-acme" },
@@ -1096,12 +1063,10 @@ export const DEFAULT_PROPOSALS: Proposal[] = [
     title:
       "Provision Managed PostgreSQL Instance (postgres-managed) for tenant-acme",
     branch: "keel/acme/postgres-managed-7",
-    author: "dylan@acme.internal",
     tenant: "acme",
     status: "open",
     createdAt: "10 minutes ago",
     prUrl: "https://git.internal/keel-tenants/infra-tenant-acme/pulls/7",
-    previewStatus: "ready",
     scope: "acme",
     repository: {
       label: "tenant-acme",
@@ -1114,12 +1079,10 @@ export const DEFAULT_PROPOSALS: Proposal[] = [
     title:
       "Resize pve-workload-cluster-prod (proxmox-k3s-cluster) to 8 vCPU cores",
     branch: "keel/acme/proxmox-k3s-cluster-8",
-    author: "infra-bot",
     tenant: "acme",
     status: "open",
     createdAt: "25 minutes ago",
     prUrl: "https://git.internal/keel-tenants/infra-tenant-acme/pulls/8",
-    previewStatus: "ready",
     scope: "acme",
     repository: {
       label: "tenant-acme",
@@ -1131,12 +1094,10 @@ export const DEFAULT_PROPOSALS: Proposal[] = [
     id: "7",
     title: "Install podinfo (podinfo) for tenant-globex",
     branch: "keel/globex/podinfo-7",
-    author: "ops@globex.internal",
     tenant: "globex",
     status: "open",
     createdAt: "40 minutes ago",
     prUrl: "https://git.internal/keel-tenants/infra-tenant-globex/pulls/7",
-    previewStatus: "ready",
     scope: "globex",
     repository: {
       label: "tenant-globex",
@@ -1148,12 +1109,10 @@ export const DEFAULT_PROPOSALS: Proposal[] = [
     id: "42",
     title: "chore(tenants): create tenant stark",
     branch: "keel/stark/create-tenant-42",
-    author: "platform-admin",
     tenant: "stark",
     status: "open",
     createdAt: "1 hour ago",
     prUrl: "https://git.internal/keel-io/infra/pulls/42",
-    previewStatus: "ready",
     scope: "management",
     repository: { label: "platform" },
     repoUrl: "https://git.internal/keel-io/infra",

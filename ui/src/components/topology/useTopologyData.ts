@@ -8,11 +8,7 @@ import {
 } from "../../lib/api"
 import { visibleLoadError } from "../../lib/errors"
 import { isDemoMode } from "../../lib/utils"
-import {
-  DEFAULT_EVENTS,
-  DEFAULT_STACKS,
-  DEMO_MANAGEMENT_ADDON_RELEASES,
-} from "../../lib/demoFixtures"
+import { demoFixtures } from "../../lib/demo"
 
 /** Live-update transport state shown in the topology header (UI-17). */
 export type StreamState = "demo" | "paused" | "connecting" | "live" | "polling"
@@ -79,13 +75,13 @@ export function useTopologyData(
 ): TopologyData {
   const demo = isDemoMode()
   const [stacks, setStacks] = useState<StackSummary[]>(() =>
-    demo ? DEFAULT_STACKS : []
+    demo ? demoFixtures().DEFAULT_STACKS : []
   )
   const [releases, setReleases] = useState<ReleaseSummary[]>(() =>
-    demo ? DEMO_MANAGEMENT_ADDON_RELEASES : []
+    demo ? demoFixtures().DEMO_MANAGEMENT_ADDON_RELEASES : []
   )
   const [events, setEvents] = useState<CrdWatchEvent[]>(() =>
-    demo ? DEFAULT_EVENTS : []
+    demo ? demoFixtures().DEFAULT_EVENTS : []
   )
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)

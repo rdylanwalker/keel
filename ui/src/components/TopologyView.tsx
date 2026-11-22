@@ -9,6 +9,7 @@ import {
 } from "lucide-react"
 
 import {
+  InfraResourceKind,
   Proposal,
   ProposalRef,
   ReleaseSummary,
@@ -21,7 +22,7 @@ import {
   reconcileStack,
 } from "../lib/api"
 import { errorMessage } from "../lib/errors"
-import { classifyStackResourceKind, isDemoMode } from "../lib/utils"
+import { isDemoMode } from "../lib/utils"
 import { useAuthz } from "../lib/authz-context"
 import { CatalogKindFilter } from "../lib/routes"
 import { StackInspectorModal } from "./StackInspectorModal"
@@ -71,6 +72,7 @@ interface InspectTarget {
   kind?: "stack" | "release"
   tenant?: string
   provider?: string
+  resourceKind?: InfraResourceKind
 }
 
 interface SshTarget {
@@ -132,6 +134,7 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
           name: stack.name,
           tenant: stack.tenant,
           provider: stack.provider,
+          resourceKind: stack.resourceKind,
         }),
       onReconcile: async (stack: StackSummary) => {
         const ns = stackNamespace(stack)
@@ -297,7 +300,7 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
       vm: [] as StackSummary[],
       service: [] as StackSummary[],
     }
-    for (const s of stacks) groups[classifyStackResourceKind(s)].push(s)
+    for (const s of stacks) groups[s.resourceKind ?? "vm"].push(s)
     return groups
   }, [stacks])
 
@@ -500,7 +503,17 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
         isStreamPaused={data.paused}
         onToggleStreamPaused={() => data.setPaused(!data.paused)}
         onClearEvents={data.clearEvents}
-        onInspectStack={(namespace, name) => setInspected({ namespace, name })}
+        onInspectStack={(namespace, name) => {
+          const stack = stacks.find(
+            (s) => s.name === name && stackNamespace(s) === namespace
+          )
+          setInspected({
+            namespace,
+            name,
+            provider: stack?.provider,
+            resourceKind: stack?.resourceKind,
+          })
+        }}
       />
 
       {canaries.length === 0 && (
@@ -524,6 +537,7 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
           kind={inspected.kind}
           tenant={inspected.tenant}
           provider={inspected.provider}
+          resourceKind={inspected.resourceKind}
           onClose={() => setInspected(null)}
           onRestarted={() => void data.refresh()}
           onForceDeleted={() => void data.refresh()}

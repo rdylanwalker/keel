@@ -17,7 +17,7 @@ import { errorMessage } from "../lib/errors"
 import { toErrorSchema } from "../lib/formErrors"
 import { validateManifestValues } from "../lib/manifestVars"
 import { extractSchemaDefaults } from "../lib/schemaBuilder"
-import { jsonToYaml, classifyStackResourceKind } from "../lib/utils"
+import { jsonToYaml } from "../lib/utils"
 import {
   buildSecretAwareUiSchema,
   maskSecretValues,
@@ -180,9 +180,7 @@ const DeployInstanceModalBody: React.FC<DeployInstanceModalProps> = (props) => {
     )
   })
   const clusterStacks = stacks.filter(
-    (s) =>
-      classifyStackResourceKind(s) === "cluster" &&
-      s.name !== "management-cluster-core"
+    (s) => s.resourceKind === "cluster" && s.name !== "management-cluster-core"
   )
   const [target, setTarget] = useState<DeployTargetState>(() =>
     initialTargetState(props, resolvedCatalogItem, clusterStacks)

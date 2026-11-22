@@ -15,7 +15,7 @@ import {
   ChevronDown,
   ChevronRight,
 } from "lucide-react"
-import { StackDiagnostics } from "../types/api"
+import { InfraResourceKind, StackDiagnostics } from "../types/api"
 import {
   forceDeleteStack,
   getReleaseDiagnostics,
@@ -74,6 +74,8 @@ export interface StackInspectorModalProps {
   kind?: "stack" | "release"
   tenant?: string
   provider?: string
+  /** Server classification of the stack; only `vm` stacks offer SSH. */
+  resourceKind?: InfraResourceKind
   onClose: () => void
   onRestarted?: () => void
   onForceDeleted?: () => void
@@ -87,6 +89,7 @@ export const StackInspectorModal: React.FC<StackInspectorModalProps> = ({
   kind = "stack",
   tenant,
   provider,
+  resourceKind,
   onClose,
   onRestarted,
   onForceDeleted,
@@ -349,7 +352,10 @@ export const StackInspectorModal: React.FC<StackInspectorModalProps> = ({
             </Button>
             {kind === "stack" &&
               (() => {
-                const sshSupported = isStackSshSupported({ name, provider })
+                const sshSupported = isStackSshSupported({
+                  provider,
+                  resourceKind,
+                })
                 return (
                   <button
                     type="button"

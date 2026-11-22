@@ -1,7 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest"
 import {
-  setStoredToken,
-  getStoredToken,
   getAuthStatus,
   logout,
   getCatalog,
@@ -27,7 +25,6 @@ import {
   getReleaseConfig,
   deleteStack,
   deleteRelease,
-  getBundleConfig,
   restartStackWorkspace,
   reconcileStack,
   forceDeleteStack,
@@ -43,23 +40,34 @@ import {
   startOidcLogin,
 } from "./api"
 
+/** A wire proposal as the server sends it (`ScopedProposal`: forge PR + scope + repository). */
+function wireProposal(overrides: Record<string, unknown> = {}) {
+  return {
+    id: "1",
+    title: "PR",
+    body: "",
+    state: "open",
+    sourceBranch: "keel/branch",
+    targetBranch: "main",
+    headSha: "0000000",
+    tenant: null,
+    url: "local:///tmp/remote.git/.keel/proposals/1.json",
+    createdAt: "2026-01-01T00:00:00Z",
+    updatedAt: "2026-01-01T00:00:00Z",
+    comments: [],
+    scope: "management",
+    repository: { label: "platform" },
+    ...overrides,
+  }
+}
+
 describe("api client module", () => {
   beforeEach(() => {
-    setStoredToken(null)
     vi.restoreAllMocks()
   })
 
   afterEach(() => {
     vi.restoreAllMocks()
-  })
-
-  it("handles stored token in memory without persisting to localStorage", () => {
-    expect(getStoredToken()).toBeNull()
-    setStoredToken("test-token-123")
-    expect(getStoredToken()).toBe("test-token-123")
-    expect(localStorage.getItem("keel_bootstrap_token")).toBeNull()
-    setStoredToken(null)
-    expect(getStoredToken()).toBeNull()
   })
 
   it("throws error on API HTTP failure with text response", async () => {
@@ -92,8 +100,7 @@ describe("api client module", () => {
     )
   })
 
-  it("fetches auth status with Authorization header if token exists", async () => {
-    setStoredToken("bearer-secret")
+  it("fetches auth status relying on the session cookie (no Authorization header)", async () => {
     const mockStatus = { authenticated: true, phase: "oidc-active" }
     vi.stubGlobal(
       "fetch",
@@ -106,10 +113,7 @@ describe("api client module", () => {
     const status = await getAuthStatus()
     expect(status).toEqual(mockStatus)
     expect(fetch).toHaveBeenCalledWith("/api/v1/auth/status", {
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: "Bearer bearer-secret",
-      },
+      headers: { "Content-Type": "application/json" },
     })
   })
 
@@ -131,32 +135,39 @@ describe("api client module", () => {
   })
 
   it("fetches catalog", async () => {
-    const mockCatalog = [{ id: "app-1", name: "Test App" }]
     vi.stubGlobal(
       "fetch",
       vi.fn().mockResolvedValue({
         ok: true,
-        json: async () => mockCatalog,
+        json: async () => ({
+          applications: [],
+          blueprints: [],
+          bundles: [],
+          enabledProviders: [],
+        }),
       })
     )
 
     const catalog = await getCatalog()
-    expect(catalog).toEqual(mockCatalog)
+    expect(catalog).toEqual([])
     expect(fetch).toHaveBeenCalledWith("/api/v1/catalog", expect.any(Object))
   })
 
   it("fetches the aggregated listing or one tenant's proposals", async () => {
-    const mockProposals = [{ id: "10", title: "Prop 1", scope: "acme" }]
     vi.stubGlobal(
       "fetch",
       vi.fn().mockResolvedValue({
         ok: true,
-        json: async () => mockProposals,
+        json: async () => ({
+          proposals: [
+            wireProposal({ id: "10", title: "Prop 1", scope: "acme" }),
+          ],
+        }),
       })
     )
 
     const res1 = await getProposals()
-    expect(res1).toMatchObject(mockProposals)
+    expect(res1).toMatchObject([{ id: "10", title: "Prop 1", scope: "acme" }])
     expect(fetch).toHaveBeenCalledWith("/api/v1/proposals", expect.any(Object))
 
     await getProposals("acme", "all")
@@ -262,17 +273,30 @@ describe("api client module", () => {
       tenant: "tenant-acme",
       values: { replicaCount: 3 },
     }
-    const mockRes = { id: "100", title: "Deploy app", scope: "tenant-acme" }
     vi.stubGlobal(
       "fetch",
       vi.fn().mockResolvedValue({
         ok: true,
-        json: async () => mockRes,
+        json: async () => ({
+          proposal: wireProposal({
+            id: "100",
+            title: "Deploy app",
+            scope: "tenant-acme",
+            sourceBranch: "keel/tenant-acme/podinfo-1",
+          }),
+          branch: "keel/tenant-acme/podinfo-1",
+        }),
       })
     )
 
     const res = await createProposal(payload)
-    expect(res).toMatchObject(mockRes)
+    expect(res).toMatchObject({
+      id: "100",
+      title: "Deploy app",
+      scope: "tenant-acme",
+      branch: "keel/tenant-acme/podinfo-1",
+      status: "open",
+    })
     expect(fetch).toHaveBeenCalledWith(
       "/api/v1/tenants/tenant-acme/proposals",
       {
@@ -284,38 +308,6 @@ describe("api client module", () => {
   })
 
   it("fetches proposal preview and merges proposal", async () => {
-    const mockPreview = { resources: [], summary: { create: 1 } }
-    vi.stubGlobal(
-      "fetch",
-      vi.fn().mockResolvedValue({
-        ok: true,
-        json: async () => mockPreview,
-      })
-    )
-
-    const preview = await getProposalPreview({ scope: "acme", id: "42" })
-    expect(preview).toEqual(mockPreview)
-    expect(fetch).toHaveBeenCalledWith(
-      "/api/v1/tenants/acme/proposals/42/preview",
-      expect.any(Object)
-    )
-
-    const mockMerge = { success: true }
-    vi.stubGlobal(
-      "fetch",
-      vi.fn().mockResolvedValue({
-        ok: true,
-        json: async () => mockMerge,
-      })
-    )
-
-    const mergeRes = await mergeProposal({ scope: "management", id: "42" })
-    expect(mergeRes).toEqual(mockMerge)
-    expect(fetch).toHaveBeenCalledWith(
-      "/api/v1/tenants/management/proposals/42/merge",
-      expect.objectContaining({ method: "POST" })
-    )
-
     vi.stubGlobal(
       "fetch",
       vi.fn().mockImplementation((url: string) => {
@@ -339,6 +331,10 @@ describe("api client module", () => {
     )
 
     const wrappedPreview = await getProposalPreview({ scope: "acme", id: "7" })
+    expect(fetch).toHaveBeenCalledWith(
+      "/api/v1/tenants/acme/proposals/7/preview",
+      expect.any(Object)
+    )
     expect(wrappedPreview.prUrl).toBe("https://git.local/pr/7")
     expect(wrappedPreview.resources).toEqual([])
     // Absent policy status must not be reported as "passed".
@@ -346,7 +342,14 @@ describe("api client module", () => {
     expect(wrappedPreview.source).toBe("synthesized")
 
     const wrappedMerge = await mergeProposal({ scope: "acme", id: "7" })
-    expect(wrappedMerge.success).toBe(true)
+    expect(wrappedMerge).toEqual({
+      success: true,
+      message: "PR #7 merged cleanly!",
+    })
+    expect(fetch).toHaveBeenCalledWith(
+      "/api/v1/tenants/acme/proposals/7/merge",
+      expect.objectContaining({ method: "POST" })
+    )
 
     vi.stubGlobal(
       "fetch",
@@ -369,30 +372,6 @@ describe("api client module", () => {
     expect(wrappedReopen.success).toBe(true)
   })
 
-  it("fetches stacks and releases", async () => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn().mockImplementation((url: string) => {
-        if (url.includes("/stacks")) {
-          return Promise.resolve({
-            ok: true,
-            json: async () => [{ id: "stack-1" }],
-          })
-        }
-        return Promise.resolve({
-          ok: true,
-          json: async () => [{ id: "rel-1" }],
-        })
-      })
-    )
-
-    const stacks = await getStacks()
-    expect(stacks).toEqual([{ id: "stack-1" }])
-
-    const releases = await getReleases()
-    expect(releases).toEqual([{ id: "rel-1" }])
-  })
-
   it("handles tenant management API operations and createCatalogApp", async () => {
     vi.stubGlobal(
       "fetch",
@@ -402,12 +381,11 @@ describe("api client module", () => {
             ok: true,
             json: async () => ({
               tenant: { id: "acme", namespace: "tenant-acme" },
-              proposal: {
+              proposal: wireProposal({
                 id: "101",
                 title: "Create Tenant PR",
-                scope: "management",
-                repository: { label: "platform" },
-              },
+                sourceBranch: "keel/acme/create-tenant-1",
+              }),
               branch: "keel/acme/create-tenant-1",
               repository: {
                 layout: "dedicated",
@@ -415,12 +393,18 @@ describe("api client module", () => {
                 name: "infra-tenant-acme",
                 webUrl: "javascript:alert(1)",
                 transport: "https",
-                skeletonProposal: {
+                skeletonProposal: wireProposal({
                   id: "1",
                   title: "skeleton",
                   scope: "acme",
+                  tenant: "acme",
+                  repository: {
+                    label: "tenant-acme",
+                    fullName: "keel-tenants/infra-tenant-acme",
+                  },
                   url: "https://forge.example/keel-tenants/infra-tenant-acme/pulls/1",
-                },
+                }),
+                notes: [],
                 cluster: {
                   namespaceReady: false,
                   sopsAge: "pendingNamespace",
@@ -435,11 +419,11 @@ describe("api client module", () => {
             ok: true,
             json: async () => ({
               id: "acme",
-              proposal: {
+              proposal: wireProposal({
                 id: "102",
                 title: "Delete Tenant PR",
-                scope: "management",
-              },
+                sourceBranch: "keel/acme/delete-tenant-2",
+              }),
               branch: "keel/acme/delete-tenant-2",
               notes: ["revoke credentials"],
             }),
@@ -457,11 +441,11 @@ describe("api client module", () => {
           return Promise.resolve({
             ok: true,
             json: async () => ({
-              proposal: {
+              proposal: wireProposal({
                 id: "103",
                 title: "Add Catalog App PR",
-                scope: "management",
-              },
+              }),
+              branch: "keel/branch",
             }),
           })
         }
@@ -533,7 +517,7 @@ describe("api client module", () => {
     expect(createdApp).toMatchObject({ id: "103", title: "Add Catalog App PR" })
   })
 
-  it("fetches providers and toggles provider enable state with wrapped and unwrapped payloads", async () => {
+  it("fetches providers and toggles provider enable state", async () => {
     vi.stubGlobal(
       "fetch",
       vi.fn().mockImplementation((url: string, init?: RequestInit) => {
@@ -541,23 +525,13 @@ describe("api client module", () => {
           return Promise.resolve({
             ok: true,
             json: async () => ({
-              proposal: {
+              provider: { id: "aws", enabled: false },
+              proposal: wireProposal({
                 id: "201",
                 title: "Toggle AWS Provider",
-                scope: "management",
-                branch: "feature/toggle-aws",
-              },
-            }),
-          })
-        }
-        if (url.includes("/providers/gcp") && init?.method === "PUT") {
-          return Promise.resolve({
-            ok: true,
-            json: async () => ({
-              id: "202",
-              title: "Toggle GCP Provider",
-              scope: "management",
-              branch: "feature/toggle-gcp",
+                sourceBranch: "feature/toggle-aws",
+              }),
+              branch: "feature/toggle-aws",
             }),
           })
         }
@@ -598,35 +572,6 @@ describe("api client module", () => {
       branch: "feature/toggle-aws",
       scope: "management",
     })
-
-    const proposal2 = await toggleProvider("gcp", true)
-    expect(proposal2).toMatchObject({
-      id: "202",
-      title: "Toggle GCP Provider",
-      branch: "feature/toggle-gcp",
-    })
-
-    // Array response for getProviders
-    vi.stubGlobal(
-      "fetch",
-      vi.fn().mockResolvedValue({
-        ok: true,
-        json: async () => [{ id: "hetzner", enabled: true }],
-      })
-    )
-    const arrayProviders = await getProviders()
-    expect(arrayProviders).toEqual([{ id: "hetzner", enabled: true }])
-
-    // Empty object response fallback for getProviders
-    vi.stubGlobal(
-      "fetch",
-      vi.fn().mockResolvedValue({
-        ok: true,
-        json: async () => ({}),
-      })
-    )
-    const emptyProviders = await getProviders()
-    expect(emptyProviders).toEqual([])
   })
 
   it("maps spec.placement.scope: cluster onto placementScope", async () => {
@@ -712,7 +657,12 @@ describe("api client module", () => {
           return Promise.resolve({
             ok: true,
             json: async () => ({
-              proposal: { id: "99", title: "Wrapped PR", scope: "acme" },
+              proposal: wireProposal({
+                id: "99",
+                title: "Wrapped PR",
+                scope: "acme",
+              }),
+              branch: "keel/branch",
             }),
           })
         }
@@ -720,7 +670,9 @@ describe("api client module", () => {
           return Promise.resolve({
             ok: true,
             json: async () => ({
-              proposals: [{ id: "99", title: "Wrapped", scope: "acme" }],
+              proposals: [
+                wireProposal({ id: "99", title: "Wrapped", scope: "acme" }),
+              ],
             }),
           })
         }
@@ -770,9 +722,6 @@ describe("api client module", () => {
       url: string
       constructor(url: string) {
         this.url = url
-      }
-      set onmessage(fn: (e: MessageEvent) => void) {
-        messageHandler = fn
       }
       set onerror(fn: (e: Event) => void) {
         errorHandler = fn
@@ -827,18 +776,17 @@ describe("api client module", () => {
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,
       json: async () => ({
-        proposal: {
+        proposal: wireProposal({
           id: "305",
           title: "feat(catalog): update infra kind-cluster",
-          scope: "management",
           sourceBranch: "keel/catalog/update-kind-cluster-305",
-          state: "open",
-        },
+        }),
+        branch: "keel/catalog/update-kind-cluster-305",
       }),
     })
     vi.stubGlobal("fetch", fetchMock)
 
-    const proposal = await updateCatalogItem("infrastructure", "kind-cluster", {
+    const proposal = await updateCatalogItem("infra", "kind-cluster", {
       name: "kind Cluster v2",
       category: "Infrastructure",
       description: "Updated kind blueprint",
@@ -861,12 +809,14 @@ describe("api client module", () => {
     })
   })
 
-  it("calls stack, release, bundle, and schema diagnostic/config/lifecycle endpoints", async () => {
+  it("calls stack, release, and schema diagnostic/config/lifecycle endpoints", async () => {
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,
       json: async () => ({
-        ok: true,
-        proposal: { id: "1", title: "delete", scope: "acme" },
+        id: "x",
+        namespace: "tenant-acme",
+        branch: "keel/acme/delete",
+        proposal: wireProposal({ id: "1", title: "delete", scope: "acme" }),
       }),
     })
     vi.stubGlobal("fetch", fetchMock)
@@ -882,14 +832,13 @@ describe("api client module", () => {
     await getReleaseConfig("tenant-acme", "podinfo")
     await deleteStack("tenant-acme", "dev-kind")
     await deleteRelease("tenant-acme", "podinfo")
-    await getBundleConfig("tenant-acme", "kind-with-podinfo")
     await restartStackWorkspace("tenant-acme", "dev-kind")
     await forceDeleteStack("tenant-acme", "dev-kind")
     await unlockStack("tenant-acme", "dev-kind")
     await reconcileStack("tenant-acme", "dev-kind")
     await reconcileRelease("tenant-acme", "podinfo")
 
-    expect(fetchMock).toHaveBeenCalledTimes(13)
+    expect(fetchMock).toHaveBeenCalledTimes(12)
     expect(fetchMock).toHaveBeenCalledWith(
       "/api/v1/stacks/tenant-acme/dev-kind/unlock",
       expect.objectContaining({ method: "POST" })
@@ -934,7 +883,7 @@ describe("api client module", () => {
     window.removeEventListener("keel:unauthorized", onUnauthorized)
   })
 
-  it("fetches coreAddons and core_addons from /api/v1/catalog", async () => {
+  it("fetches coreAddons from /api/v1/catalog", async () => {
     vi.stubGlobal(
       "fetch",
       vi
@@ -959,24 +908,8 @@ describe("api client module", () => {
         })
         .mockResolvedValueOnce({
           ok: true,
-          json: async () => ({
-            core_addons: [
-              {
-                metadata: { id: "flagger", name: "Flagger" },
-                spec: {
-                  upstream: {
-                    repoURL: "https://flagger.app",
-                    chart: "flagger",
-                    version: "1.40.0",
-                  },
-                },
-              },
-            ],
-          }),
-        })
-        .mockResolvedValueOnce({
-          ok: true,
-          json: async () => [],
+          // `coreAddons` is omitted when empty.
+          json: async () => ({ applications: [], blueprints: [], bundles: [] }),
         })
     )
 
@@ -991,28 +924,20 @@ describe("api client module", () => {
     })
 
     const addons2 = await getCoreAddons()
-    expect(addons2).toHaveLength(1)
-    expect(addons2[0]).toMatchObject({
-      id: "flagger",
-      chart: "flagger",
-      version: "1.40.0",
-    })
-
-    const addons3 = await getCoreAddons()
-    expect(addons3).toEqual([])
+    expect(addons2).toEqual([])
   })
 
   it("calls upgradeManagementAddon and rollbackManagementAddon endpoints", async () => {
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,
       json: async () => ({
-        proposal: {
+        id: "kyverno",
+        proposal: wireProposal({
           id: "401",
           title: "chore(mgmt): upgrade kyverno",
-          scope: "management",
-          branch: "keel/mgmt/upgrade-kyverno",
-          state: "open",
-        },
+          sourceBranch: "keel/mgmt/upgrade-kyverno",
+        }),
+        branch: "keel/mgmt/upgrade-kyverno",
       }),
     })
     vi.stubGlobal("fetch", fetchMock)
@@ -1075,19 +1000,11 @@ describe("api client module", () => {
     expect(info).toEqual(mockSshInfo)
   })
 
-  it("handles rejectProposal and reopenProposal direct success responses and fetchStackSshInfo demo mode", async () => {
+  it("maps reject/reopen proposal states and fetchStackSshInfo demo mode", async () => {
     vi.stubGlobal(
       "fetch",
       vi
         .fn()
-        .mockResolvedValueOnce({
-          ok: true,
-          json: async () => ({ success: true, message: "Rejected directly" }),
-        })
-        .mockResolvedValueOnce({
-          ok: true,
-          json: async () => ({ success: true, message: "Reopened directly" }),
-        })
         .mockResolvedValueOnce({
           ok: true,
           json: async () => ({ proposal: { id: "9", state: "open" } }),
@@ -1098,14 +1015,6 @@ describe("api client module", () => {
         })
     )
 
-    await expect(rejectProposal({ scope: "acme", id: "9" })).resolves.toEqual({
-      success: true,
-      message: "Rejected directly",
-    })
-    await expect(reopenProposal({ scope: "acme", id: "9" })).resolves.toEqual({
-      success: true,
-      message: "Reopened directly",
-    })
     await expect(reopenProposal({ scope: "acme", id: "9" })).resolves.toEqual({
       success: true,
       message: "PR #9 reopened.",

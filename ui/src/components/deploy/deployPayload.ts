@@ -85,10 +85,7 @@ export function buildDeployProposalPayload(
       : {}),
     ...(targetNs ? { targetNamespace: targetNs } : {}),
     title: `Deploy ${isCustomName ? name : item.name} for ${target.tenant}`,
-    kind:
-      item.type === "infrastructure"
-        ? "infra"
-        : (item.type as "app" | "infra" | "bundle"),
+    kind: item.type,
     ...(resolvedTargetCluster ? { targetCluster: resolvedTargetCluster } : {}),
     ...(item.type === "app" && item.flaggerSupported && target.enableCanary
       ? { canary: true }

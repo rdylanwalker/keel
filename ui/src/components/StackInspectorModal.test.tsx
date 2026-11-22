@@ -300,6 +300,8 @@ describe("StackInspectorModal component", () => {
         namespace="tenant-acme"
         name="prod-vm"
         kind="stack"
+        provider="proxmox"
+        resourceKind="vm"
         onClose={onClose}
         onOpenSsh={onOpenSsh}
       />
@@ -320,6 +322,7 @@ describe("StackInspectorModal component", () => {
         name="management-cluster-core"
         kind="stack"
         provider="kind"
+        resourceKind="cluster"
         onClose={onClose}
       />
     )

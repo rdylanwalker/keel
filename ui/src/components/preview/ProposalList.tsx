@@ -21,7 +21,6 @@ export function matchesProposalQuery(pr: Proposal, query: string): boolean {
     pr.title,
     pr.id,
     pr.branch,
-    pr.author,
     pr.tenant,
     pr.scope,
     proposalRepositoryName(pr),

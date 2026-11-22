@@ -3,7 +3,7 @@ import { useCallback, useEffect, useMemo, useState } from "react"
 import { CatalogItem, Proposal, ReleaseSummary } from "../../types/api"
 import { getCoreAddons, rollbackManagementAddon } from "../../lib/api"
 import { errorMessage } from "../../lib/errors"
-import { DEFAULT_CORE_ADDONS } from "../../lib/demoFixtures"
+import { demoFixtures } from "../../lib/demo"
 
 /** `catalog/core` id of a management add-on release (falls back to the Flux object name). */
 export function managementAddonId(release: ReleaseSummary): string {
@@ -59,7 +59,7 @@ export function useManagementAddonActions({
   onError,
 }: ManagementAddonActionsOptions): ManagementAddonActions {
   const [coreAddons, setCoreAddons] = useState<CatalogItem[]>(() =>
-    demo ? DEFAULT_CORE_ADDONS : []
+    demo ? demoFixtures().DEFAULT_CORE_ADDONS : []
   )
   const [selectedAddon, setSelectedAddon] = useState<CatalogItem | null>(null)
   const [confirmRollbackId, setConfirmRollbackId] = useState<string | null>(

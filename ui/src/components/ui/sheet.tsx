@@ -7,10 +7,7 @@ import { Dialog } from "./dialog"
 
 /** Shadcn UI Sheet (side drawer) on Radix Dialog; used for the mobile navigation drawer. */
 export const Sheet = Dialog
-export const SheetTrigger = DialogPrimitive.Trigger
-export const SheetClose = DialogPrimitive.Close
 export const SheetTitle = DialogPrimitive.Title
-export const SheetDescription = DialogPrimitive.Description
 
 export const SheetContent = React.forwardRef<
   React.ComponentRef<typeof DialogPrimitive.Content>,

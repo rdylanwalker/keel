@@ -19,12 +19,6 @@ import { Textarea } from "./textarea"
 import { NativeSelect } from "./native-select"
 import { Label } from "./label"
 import { Checkbox } from "./checkbox"
-import {
-  Tooltip,
-  TooltipContent,
-  TooltipProvider,
-  TooltipTrigger,
-} from "./tooltip"
 
 function DialogHarness({ onClose }: { onClose: () => void }) {
   const [open, setOpen] = useState(true)
@@ -103,7 +97,7 @@ describe("shadcn ui primitives", () => {
   it("renders form primitives", () => {
     const onChecked = vi.fn()
     render(
-      <TooltipProvider>
+      <>
         <Label htmlFor="t">Label</Label>
         <Textarea id="t" />
         <NativeSelect aria-label="pick" defaultValue="b">
@@ -115,11 +109,7 @@ describe("shadcn ui primitives", () => {
         <Button asChild variant="link">
           <a href="#x">link</a>
         </Button>
-        <Tooltip open>
-          <TooltipTrigger>tip</TooltipTrigger>
-          <TooltipContent>Tooltip text</TooltipContent>
-        </Tooltip>
-      </TooltipProvider>
+      </>
     )
     expect(screen.getByLabelText("Label")).toBeInTheDocument()
     expect(screen.getByLabelText("pick")).toHaveValue("b")
@@ -130,6 +120,5 @@ describe("shadcn ui primitives", () => {
       "href",
       "#x"
     )
-    expect(screen.getAllByText("Tooltip text").length).toBeGreaterThan(0)
   })
 })

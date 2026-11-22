@@ -4,7 +4,7 @@ import { Checkbox } from "@/components/ui/checkbox"
 import { Input } from "@/components/ui/input"
 import { NativeSelect } from "@/components/ui/native-select"
 import { Textarea } from "@/components/ui/textarea"
-import { DEFAULT_STARTER_MANIFEST } from "@/lib/demoFixtures"
+import { DEFAULT_STARTER_MANIFEST } from "@/lib/starterManifest"
 import { CheckboxRow, Field } from "./Field"
 import { CatalogFormSectionProps } from "./types"
 

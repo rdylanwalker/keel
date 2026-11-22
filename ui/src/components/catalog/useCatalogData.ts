@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react"
 
 import { getCatalog, getReleases, getStacks, getTenants } from "@/lib/api"
-import { DEFAULT_CATALOG, DEMO_TENANTS } from "@/lib/demoFixtures"
+import { demoFixtures } from "@/lib/demo"
 import { visibleLoadError } from "@/lib/errors"
 import { isDemoMode } from "@/lib/utils"
 import {
@@ -28,10 +28,10 @@ export function useCatalogData(
 ) {
   const demo = isDemoMode()
   const [catalog, setCatalog] = useState<CatalogItem[]>(() =>
-    demo ? DEFAULT_CATALOG : []
+    demo ? demoFixtures().DEFAULT_CATALOG : []
   )
   const [tenants, setTenants] = useState<TenantSummary[]>(() =>
-    demo ? DEMO_TENANTS : FALLBACK_TENANTS
+    demo ? demoFixtures().DEMO_TENANTS : FALLBACK_TENANTS
   )
   const [stacks, setStacks] = useState<StackSummary[]>([])
   const [releases, setReleases] = useState<ReleaseSummary[]>([])

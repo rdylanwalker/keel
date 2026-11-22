@@ -21,7 +21,7 @@ import {
 import { isDemoMode } from "../lib/utils"
 import { errorMessage, visibleLoadError } from "../lib/errors"
 import { useAuthz } from "../lib/authz-context"
-import { DEFAULT_PREVIEW, DEFAULT_PROPOSALS } from "../lib/demoFixtures"
+import { demoFixtures } from "../lib/demo"
 import {
   PolicyStatusBanner,
   shouldShowPolicyBanner,
@@ -109,18 +109,20 @@ export const PreviewInspectorView: React.FC<PreviewInspectorViewProps> = ({
   const demo = isDemoMode()
   const authz = useAuthz()
   const [proposals, setProposals] = useState<Proposal[]>(() =>
-    demo ? DEFAULT_PROPOSALS : []
+    demo ? demoFixtures().DEFAULT_PROPOSALS : []
   )
   const [unavailable, setUnavailable] = useState<UnavailableRepository[]>([])
   const [manualSelected, setManualSelected] = useState<ProposalRef | null>(null)
   const [previewState, setPreviewState] = useState<{
     key: string
     report: PreviewReport | null
-  } | null>(() =>
-    demo && DEFAULT_PROPOSALS[0]
+  } | null>(() => {
+    if (!demo) return null
+    const { DEFAULT_PROPOSALS, DEFAULT_PREVIEW } = demoFixtures()
+    return DEFAULT_PROPOSALS[0]
       ? { key: proposalKey(DEFAULT_PROPOSALS[0]), report: DEFAULT_PREVIEW }
       : null
-  )
+  })
   const [loadingPRs, setLoadingPRs] = useState(!demo)
   const [searchQuery, setSearchQuery] = useState("")
   const [pending, setPending] = useState<ProposalAction | null>(null)
@@ -365,7 +367,6 @@ export const PreviewInspectorView: React.FC<PreviewInspectorViewProps> = ({
                     value: selectedPR.branch,
                     valueClassName: "text-indigo-400",
                   },
-                  { label: "Author", value: selectedPR.author },
                 ]}
                 actions={
                   <ProposalActions

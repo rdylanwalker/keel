@@ -2,7 +2,7 @@ import React, { useState } from "react"
 import type { RJSFSchema } from "@rjsf/utils"
 
 import { createCatalogApp, updateCatalogItem } from "@/lib/api"
-import { DEFAULT_STARTER_MANIFEST } from "@/lib/demoFixtures"
+import { DEFAULT_STARTER_MANIFEST } from "@/lib/starterManifest"
 import { errorMessage } from "@/lib/errors"
 import {
   SchemaFieldDraft,

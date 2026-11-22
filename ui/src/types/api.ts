@@ -14,8 +14,11 @@ export interface ProviderRegistryEntry {
 
 export type InfraResourceKind = "vm" | "cluster" | "service"
 
+/** Catalog entry kind (`/api/v1/catalog/{kind}/{id}`). */
+export type CatalogKind = "app" | "infra" | "bundle"
+
 export interface CreateCatalogItemPayload {
-  kind?: "app" | "infra" | "bundle"
+  kind?: CatalogKind
   id: string
   name: string
   category: string
@@ -42,8 +45,6 @@ export interface CreateCatalogItemPayload {
   schema?: RJSFSchema
 }
 
-export type CreateCatalogAppPayload = CreateCatalogItemPayload
-
 export interface CatalogBundleItem {
   id: string
   kind: "infra" | "app"
@@ -64,7 +65,7 @@ export interface CatalogItem {
   id: string
   name: string
   description: string
-  type: "app" | "infrastructure" | "bundle" | string
+  type: CatalogKind
   category: string
   version: string
   provider?: string
@@ -113,12 +114,10 @@ export interface Proposal {
   id: string
   title: string
   branch: string
-  author: string
   tenant: string
   status: "open" | "merged" | "closed"
   createdAt: string
   prUrl?: string
-  previewStatus?: "pending" | "ready" | "failed"
   /** Route scope: a tenant id (`/api/v1/tenants/{scope}/proposals/{id}`) or {@link PLATFORM_SCOPE}. */
   scope: string
   repository?: ProposalRepository
@@ -287,7 +286,8 @@ export interface StackSummary {
   lastSynced?: string
   bundle?: string
   bundleItem?: string
-  resourceKind?: InfraResourceKind
+  /** Server classification (always set); drives grouping and SSH availability. */
+  resourceKind: InfraResourceKind
   catalogId?: string
 }
 

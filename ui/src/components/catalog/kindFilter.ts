@@ -1,5 +1,4 @@
 import type { CatalogKindFilter } from "@/lib/routes"
-import { classifyStackResourceKind } from "@/lib/utils"
 import { CatalogItem } from "@/types/api"
 
 export const KIND_FILTER_LABELS: Record<CatalogKindFilter, string> = {
@@ -10,8 +9,8 @@ export const KIND_FILTER_LABELS: Record<CatalogKindFilter, string> = {
 }
 
 /**
- * Whether a catalog item belongs to the "+ Deploy <kind>" pre-filter. Infra blueprints use
- * `resourceKind` (falling back to id/provider inference); apps match `app`. Bundles provision
+ * Whether a catalog item belongs to the "+ Deploy <kind>" pre-filter. Infra blueprints use the
+ * server-resolved `resourceKind`; apps match `app`. Bundles provision
  * clusters + apps, so they are listed under `cluster` and `app`.
  */
 export function matchesKindFilter(
@@ -21,14 +20,5 @@ export function matchesKindFilter(
   if (!kind) return true
   if (item.type === "bundle") return kind === "cluster" || kind === "app"
   if (item.type === "app") return kind === "app"
-  if (item.type === "infra" || item.type === "infrastructure") {
-    const resolved = classifyStackResourceKind({
-      name: item.id,
-      provider: item.provider,
-      resourceKind: item.resourceKind,
-      catalogId: item.id,
-    })
-    return resolved === kind
-  }
-  return false
+  return item.type === "infra" && item.resourceKind === kind
 }

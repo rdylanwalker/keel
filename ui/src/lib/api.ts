@@ -3,6 +3,7 @@ import {
   AuthStatus,
   CatalogBundleItem,
   CatalogItem,
+  CatalogKind,
   CreateCatalogItemPayload,
   CreateProposalPayload,
   CreateTenantResult,
@@ -33,28 +34,9 @@ import { isDemoMode } from "./utils"
 import { repositoryWebUrl, safeHttpUrl } from "./forgeLinks"
 import { DemoModeError, parseApiError } from "./errors"
 
-let inMemoryToken: string | null = null
-
-export function getStoredToken(): string | null {
-  return inMemoryToken
-}
-
-export function setStoredToken(token: string | null): void {
-  inMemoryToken = token ? token : null
-}
-
-function getHeaders(
-  customHeaders?: Record<string, string>
-): Record<string, string> {
-  const headers: Record<string, string> = {
-    "Content-Type": "application/json",
-    ...customHeaders,
-  }
-  const token = getStoredToken()
-  if (token) {
-    headers["Authorization"] = `Bearer ${token}`
-  }
-  return headers
+/** Request headers; authentication rides on the HttpOnly session cookie. */
+function getHeaders(): Record<string, string> {
+  return { "Content-Type": "application/json" }
 }
 
 export { DemoModeError }
@@ -178,7 +160,6 @@ interface RawCatalogResponse {
   blueprints?: RawCatalogEntry[]
   bundles?: RawCatalogEntry[]
   coreAddons?: RawCatalogEntry[]
-  core_addons?: RawCatalogEntry[]
   pulumiYaml?: Record<string, string>
 }
 
@@ -220,10 +201,7 @@ export async function getCatalog(): Promise<CatalogItem[]> {
   const res = await apiFetch("/api/v1/catalog", {
     headers: getHeaders(),
   })
-  const raw = await handleResponse<CatalogItem[] | RawCatalogResponse>(res)
-  if (Array.isArray(raw)) {
-    return raw
-  }
+  const raw = await handleResponse<RawCatalogResponse>(res)
   const apps: CatalogItem[] = (raw.applications ?? []).map(
     mapCatalogApplication
   )
@@ -273,12 +251,8 @@ export async function getCoreAddons(): Promise<CatalogItem[]> {
   const res = await apiFetch("/api/v1/catalog", {
     headers: getHeaders(),
   })
-  const raw = await handleResponse<CatalogItem[] | RawCatalogResponse>(res)
-  if (Array.isArray(raw)) {
-    return []
-  }
-  const coreAddons = raw.coreAddons ?? raw.core_addons ?? []
-  return coreAddons.map(mapCatalogApplication)
+  const raw = await handleResponse<RawCatalogResponse>(res)
+  return (raw.coreAddons ?? []).map(mapCatalogApplication)
 }
 
 export async function upgradeManagementAddon(
@@ -293,10 +267,8 @@ export async function upgradeManagementAddon(
       body: JSON.stringify(payload),
     }
   )
-  const raw = await handleResponse<
-    RawProposal | { proposal: RawProposal; branch?: string }
-  >(res)
-  return unwrapProposalResponse(raw)
+  const raw = await handleResponse<{ proposal: RawProposal }>(res)
+  return normalizeProposal(raw.proposal)
 }
 
 export async function rollbackManagementAddon(id: string): Promise<Proposal> {
@@ -307,10 +279,8 @@ export async function rollbackManagementAddon(id: string): Promise<Proposal> {
       headers: getHeaders(),
     }
   )
-  const raw = await handleResponse<
-    RawProposal | { proposal: RawProposal; branch?: string }
-  >(res)
-  return unwrapProposalResponse(raw)
+  const raw = await handleResponse<{ proposal: RawProposal }>(res)
+  return normalizeProposal(raw.proposal)
 }
 
 export async function fetchCatalogSchema(payload: {
@@ -326,21 +296,17 @@ export async function fetchCatalogSchema(payload: {
   return handleResponse<{ schema: RJSFSchema; source: string }>(res)
 }
 
+/** Wire proposal (`ScopedProposal`: the forge `PullRequestInfo` plus scope and repository). */
 interface RawProposal {
   id: string
   title: string
-  branch?: string
-  sourceBranch?: string
-  author?: string | null
+  sourceBranch: string
   tenant?: string | null
-  status?: "open" | "merged" | "closed"
-  state?: "open" | "merged" | "closed"
-  createdAt?: string
-  prUrl?: string
-  url?: string
-  previewStatus?: "pending" | "ready" | "failed"
+  state: "open" | "merged" | "closed"
+  createdAt: string
+  url: string
   scope: string
-  repository?: ProposalRepository
+  repository: ProposalRepository
 }
 
 /**
@@ -354,22 +320,20 @@ function proposalScope(raw: RawProposal): string {
   return raw.scope
 }
 
-export function normalizeProposal(raw: RawProposal): Proposal {
+function normalizeProposal(raw: RawProposal): Proposal {
   const scope = proposalScope(raw)
-  const prUrl = raw.prUrl ?? raw.url
+  const prUrl = raw.url
   const proposal: Proposal = {
     id: raw.id,
     title: raw.title,
-    branch: raw.branch ?? raw.sourceBranch ?? "",
-    author: raw.author || "keel",
+    branch: raw.sourceBranch,
     tenant: raw.tenant || scope,
-    status: raw.status ?? raw.state ?? "open",
-    createdAt: raw.createdAt ?? "just now",
+    status: raw.state,
+    createdAt: raw.createdAt,
     prUrl,
-    previewStatus: raw.previewStatus ?? "ready",
     scope,
+    repository: raw.repository,
   }
-  if (raw.repository) proposal.repository = raw.repository
   const repoUrl = repositoryWebUrl(prUrl)
   if (repoUrl) proposal.repoUrl = repoUrl
   return proposal
@@ -405,14 +369,13 @@ export async function getProposalListing(
   const res = await apiFetch(qs ? `${base}?${qs}` : base, {
     headers: getHeaders(),
   })
-  const raw = await handleResponse<
-    | RawProposal[]
-    | { proposals?: RawProposal[]; unavailable?: UnavailableRepository[] }
-  >(res)
-  const list = Array.isArray(raw) ? raw : (raw.proposals ?? [])
+  const raw = await handleResponse<{
+    proposals: RawProposal[]
+    unavailable?: UnavailableRepository[]
+  }>(res)
   return {
-    proposals: list.map(normalizeProposal),
-    unavailable: Array.isArray(raw) ? [] : (raw.unavailable ?? []),
+    proposals: raw.proposals.map(normalizeProposal),
+    unavailable: raw.unavailable ?? [],
   }
 }
 
@@ -422,18 +385,6 @@ export async function getProposals(
 ): Promise<Proposal[]> {
   const { proposals } = await getProposalListing(tenant, status)
   return proposals
-}
-
-function unwrapProposalResponse(
-  raw: RawProposal | { proposal: RawProposal; branch?: string }
-): Proposal {
-  if ("proposal" in raw) {
-    return normalizeProposal({
-      ...raw.proposal,
-      branch: raw.proposal.branch ?? raw.branch,
-    })
-  }
-  return normalizeProposal(raw)
 }
 
 /** `POST /api/v1/tenants/{tenant}/proposals`: opens the PR in the tenant's repository. */
@@ -448,10 +399,8 @@ export async function createProposal(
       body: JSON.stringify(payload),
     }
   )
-  const raw = await handleResponse<
-    RawProposal | { proposal: RawProposal; branch?: string }
-  >(res)
-  return unwrapProposalResponse(raw)
+  const raw = await handleResponse<{ proposal: RawProposal }>(res)
+  return normalizeProposal(raw.proposal)
 }
 
 /** Maps a wire (camelCase) resource diff to the UI shape. */
@@ -475,54 +424,38 @@ export async function getProposalPreview(
   const res = await apiFetch(proposalPath(ref, "preview"), {
     headers: getHeaders(),
   })
-  const raw = await handleResponse<
-    | RawPreviewReport
-    | {
-        url?: string
-        report?: RawPreviewReport
-        gitDiff?: string
-        run?: PreviewReport["run"]
-      }
-  >(res)
-  if ("report" in raw && raw.report) {
-    return {
-      prUrl: raw.url,
-      // Never default to "passed": absent status means policy was not evaluated.
-      policyStatus: raw.report.policyStatus,
-      source: raw.report.source,
-      run: raw.report.run ?? ("run" in raw ? raw.run : undefined),
-      summary: raw.report.summary,
-      resources: (raw.report.resources ?? []).map(normalizeResourceDiff),
-      gitDiff: raw.gitDiff,
-    }
-  }
-  const flat = raw as RawPreviewReport
+  const raw = await handleResponse<{
+    url: string
+    report: RawPreviewReport
+    gitDiff?: string
+  }>(res)
   return {
-    ...flat,
-    resources: (flat.resources ?? []).map(normalizeResourceDiff),
+    prUrl: raw.url,
+    // Never default to "passed": absent status means policy was not evaluated.
+    policyStatus: raw.report.policyStatus,
+    source: raw.report.source,
+    run: raw.report.run,
+    summary: raw.report.summary,
+    resources: (raw.report.resources ?? []).map(normalizeResourceDiff),
+    gitDiff: raw.gitDiff,
   }
 }
 
 export async function mergeProposal(
   ref: ProposalRef
 ): Promise<{ success: boolean; message?: string }> {
-  const { id } = ref
   const res = await apiFetch(proposalPath(ref, "merge"), {
     method: "POST",
     headers: getHeaders(),
   })
-  const raw = await handleResponse<
-    | { success: boolean; message?: string }
-    | { proposal?: { id?: string; state?: string } }
-  >(res)
-  if ("success" in raw) {
-    return raw
-  }
-  const merged = raw.proposal?.state === "merged"
+  const raw = await handleResponse<{ proposal: { id: string; state: string } }>(
+    res
+  )
+  const merged = raw.proposal.state === "merged"
   return {
     success: merged,
     message: merged
-      ? `PR #${raw.proposal?.id ?? id} merged cleanly!`
+      ? `PR #${raw.proposal.id} merged cleanly!`
       : "Failed to merge PR proposal",
   }
 }
@@ -530,23 +463,18 @@ export async function mergeProposal(
 export async function rejectProposal(
   ref: ProposalRef
 ): Promise<{ success: boolean; message?: string }> {
-  const { id } = ref
   const res = await apiFetch(proposalPath(ref, "reject"), {
     method: "POST",
     headers: getHeaders(),
   })
-  const raw = await handleResponse<
-    | { success: boolean; message?: string }
-    | { proposal?: { id?: string; state?: string } }
-  >(res)
-  if ("success" in raw) {
-    return raw
-  }
-  const closed = raw.proposal?.state === "closed"
+  const raw = await handleResponse<{ proposal: { id: string; state: string } }>(
+    res
+  )
+  const closed = raw.proposal.state === "closed"
   return {
     success: closed,
     message: closed
-      ? `PR #${raw.proposal?.id ?? id} rejected and closed.`
+      ? `PR #${raw.proposal.id} rejected and closed.`
       : "Failed to reject PR proposal",
   }
 }
@@ -554,23 +482,18 @@ export async function rejectProposal(
 export async function reopenProposal(
   ref: ProposalRef
 ): Promise<{ success: boolean; message?: string }> {
-  const { id } = ref
   const res = await apiFetch(proposalPath(ref, "reopen"), {
     method: "POST",
     headers: getHeaders(),
   })
-  const raw = await handleResponse<
-    | { success: boolean; message?: string }
-    | { proposal?: { id?: string; state?: string } }
-  >(res)
-  if ("success" in raw) {
-    return raw
-  }
-  const reopened = raw.proposal?.state === "open"
+  const raw = await handleResponse<{ proposal: { id: string; state: string } }>(
+    res
+  )
+  const reopened = raw.proposal.state === "open"
   return {
     success: reopened,
     message: reopened
-      ? `PR #${raw.proposal?.id ?? id} reopened.`
+      ? `PR #${raw.proposal.id} reopened.`
       : "Failed to reopen PR proposal",
   }
 }
@@ -589,20 +512,9 @@ export async function getStacksWithMeta(
   const res = await apiFetch(`/api/v1/stacks${qs}`, {
     headers: getHeaders(),
   })
-  const raw = await handleResponse<
-    | StackSummary[]
-    | {
-        stacks?: StackSummary[]
-        gitRepoUrl?: string
-        forgeProvider?: string
-        stateBackend?: string
-      }
-  >(res)
-  if (Array.isArray(raw)) {
-    return { stacks: raw }
-  }
+  const raw = await handleResponse<StacksWithMeta>(res)
   return {
-    stacks: raw.stacks ?? [],
+    stacks: raw.stacks,
     gitRepoUrl: raw.gitRepoUrl,
     forgeProvider: raw.forgeProvider,
     stateBackend: raw.stateBackend,
@@ -752,23 +664,6 @@ export async function deleteRelease(
   }
 }
 
-export async function getBundleConfig(
-  namespace: string,
-  name: string
-): Promise<{ tenant: string; name: string; values: Record<string, unknown> }> {
-  const res = await apiFetch(
-    `/api/v1/bundles/${encodeURIComponent(namespace)}/${encodeURIComponent(name)}/config`,
-    {
-      headers: getHeaders(),
-    }
-  )
-  return handleResponse<{
-    tenant: string
-    name: string
-    values: Record<string, unknown>
-  }>(res)
-}
-
 export async function restartStackWorkspace(
   namespace: string,
   name: string
@@ -864,30 +759,24 @@ export async function getReleases(tenant?: string): Promise<ReleaseSummary[]> {
   const res = await apiFetch(`/api/v1/releases${qs}`, {
     headers: getHeaders(),
   })
-  const raw = await handleResponse<
-    ReleaseSummary[] | { releases?: ReleaseSummary[] }
-  >(res)
-  return Array.isArray(raw) ? raw : (raw.releases ?? [])
+  const raw = await handleResponse<{ releases: ReleaseSummary[] }>(res)
+  return raw.releases
 }
 
 export async function getTenants(): Promise<TenantSummary[]> {
   const res = await apiFetch("/api/v1/tenants", {
     headers: getHeaders(),
   })
-  const raw = await handleResponse<
-    TenantSummary[] | { tenants?: TenantSummary[] }
-  >(res)
-  return Array.isArray(raw) ? raw : (raw.tenants ?? [])
+  const raw = await handleResponse<{ tenants: TenantSummary[] }>(res)
+  return raw.tenants
 }
 
 export async function getProviders(): Promise<ProviderRegistryEntry[]> {
   const res = await apiFetch("/api/v1/providers", {
     headers: getHeaders(),
   })
-  const raw = await handleResponse<
-    ProviderRegistryEntry[] | { providers?: ProviderRegistryEntry[] }
-  >(res)
-  return Array.isArray(raw) ? raw : (raw.providers ?? [])
+  const raw = await handleResponse<{ providers: ProviderRegistryEntry[] }>(res)
+  return raw.providers
 }
 
 export async function toggleProvider(
@@ -899,8 +788,8 @@ export async function toggleProvider(
     headers: getHeaders(),
     body: JSON.stringify({ enabled }),
   })
-  const raw = await handleResponse<RawProposal | { proposal: RawProposal }>(res)
-  return normalizeProposal("proposal" in raw ? raw.proposal : raw)
+  const raw = await handleResponse<{ proposal: RawProposal }>(res)
+  return normalizeProposal(raw.proposal)
 }
 
 interface RawCreateTenantResponse {
@@ -942,12 +831,7 @@ export async function createTenant(
   }
   return {
     tenant: raw.tenant,
-    proposal: raw.proposal
-      ? normalizeProposal({
-          ...raw.proposal,
-          branch: raw.proposal.branch ?? raw.branch ?? undefined,
-        })
-      : undefined,
+    proposal: raw.proposal ? normalizeProposal(raw.proposal) : undefined,
     branch: raw.branch ?? undefined,
     repository,
   }
@@ -960,20 +844,16 @@ export async function deleteTenant(id: string): Promise<DeleteTenantResult> {
     headers: getHeaders(),
   })
   const raw = await handleResponse<{
-    id?: string
+    id: string
     proposal: RawProposal
-    branch?: string
-    notes?: string[]
+    branch: string
+    notes: string[]
   }>(res)
   return {
-    id: raw.id ?? id,
-    proposal: normalizeProposal({
-      ...raw.proposal,
-      branch: raw.proposal.branch ?? raw.branch,
-    }),
-    branch:
-      raw.branch ?? raw.proposal.branch ?? raw.proposal.sourceBranch ?? "",
-    notes: raw.notes ?? [],
+    id: raw.id,
+    proposal: normalizeProposal(raw.proposal),
+    branch: raw.branch,
+    notes: raw.notes,
   }
 }
 
@@ -985,35 +865,25 @@ export async function createCatalogApp(
     headers: getHeaders(),
     body: JSON.stringify(payload),
   })
-  const raw = await handleResponse<
-    RawProposal | { proposal: RawProposal; branch?: string }
-  >(res)
-  return unwrapProposalResponse(raw)
+  const raw = await handleResponse<{ proposal: RawProposal }>(res)
+  return normalizeProposal(raw.proposal)
 }
 
 export async function updateCatalogItem(
-  kind: "app" | "infra" | "bundle" | string,
+  kind: CatalogKind,
   id: string,
   payload: Omit<CreateCatalogItemPayload, "kind" | "id">
 ): Promise<Proposal> {
-  const normalizedKind =
-    kind === "infrastructure" || kind === "infra"
-      ? "infra"
-      : kind === "bundle"
-        ? "bundle"
-        : "app"
   const res = await apiFetch(
-    `/api/v1/catalog/${normalizedKind}/${encodeURIComponent(id)}`,
+    `/api/v1/catalog/${kind}/${encodeURIComponent(id)}`,
     {
       method: "PUT",
       headers: getHeaders(),
       body: JSON.stringify(payload),
     }
   )
-  const raw = await handleResponse<
-    RawProposal | { proposal: RawProposal; branch?: string }
-  >(res)
-  return unwrapProposalResponse(raw)
+  const raw = await handleResponse<{ proposal: RawProposal }>(res)
+  return normalizeProposal(raw.proposal)
 }
 
 export function createEventSourceStream(
@@ -1029,10 +899,7 @@ export function createEventSourceStream(
       // Ignore invalid JSON events
     }
   }
-  if (typeof es.addEventListener === "function") {
-    es.addEventListener("crd-watch", handleFrame as EventListener)
-  }
-  es.onmessage = handleFrame
+  es.addEventListener("crd-watch", handleFrame as EventListener)
   if (onError) {
     es.onerror = onError
   }
@@ -1040,26 +907,18 @@ export function createEventSourceStream(
 }
 
 export async function deleteCatalogItem(
-  kind: "app" | "infra" | "infrastructure" | "bundle" | string,
+  kind: CatalogKind,
   id: string
 ): Promise<Proposal> {
-  const normalizedKind =
-    kind === "infrastructure" || kind === "infra"
-      ? "infra"
-      : kind === "bundle"
-        ? "bundle"
-        : "app"
   const res = await apiFetch(
-    `/api/v1/catalog/${encodeURIComponent(normalizedKind)}/${encodeURIComponent(id)}`,
+    `/api/v1/catalog/${kind}/${encodeURIComponent(id)}`,
     {
       method: "DELETE",
       headers: getHeaders(),
     }
   )
-  const raw = await handleResponse<
-    RawProposal | { proposal: RawProposal; branch?: string }
-  >(res)
-  return unwrapProposalResponse(raw)
+  const raw = await handleResponse<{ proposal: RawProposal }>(res)
+  return normalizeProposal(raw.proposal)
 }
 
 /** `GET /api/v1/management/addons` — admin-only live status of management core add-ons. */

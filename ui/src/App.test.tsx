@@ -22,7 +22,6 @@ vi.mock("./lib/api", () => ({
   getStackConfig: vi.fn(),
   startOidcLogin: vi.fn(),
   logout: vi.fn(),
-  setStoredToken: vi.fn(),
   consumePostLoginLocation: vi.fn(),
 }))
 
@@ -114,7 +113,6 @@ vi.mock("./components/DeployInstanceModal", () => ({
               id: "55",
               title: "t",
               branch: "feat/x",
-              author: "a",
               tenant: "acme",
               scope: "acme",
               status: "open",
@@ -301,7 +299,6 @@ describe("App shell", () => {
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: "Logout" }))
     })
-    expect(api.setStoredToken).toHaveBeenCalledWith(null)
     expect(api.logout).toHaveBeenCalled()
     expect(screen.getByText("Authentication Required")).toBeInTheDocument()
   })
