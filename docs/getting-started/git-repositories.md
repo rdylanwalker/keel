@@ -6,7 +6,7 @@ Keel stores all desired cluster state, tenant definitions, and catalog blueprint
 | :--- | :--- | :--- | :--- |
 | **External Git (GitHub / GitLab / Forgejo)** | Yes (outbound `1m` poll) | Yes | Real deployments & local `kind` behind NAT |
 | **In-Cluster Forge (`--with-forge`)** | Yes (cluster-internal HTTP) | Ephemeral on `kind` | Self-contained local testing with real PRs |
-| **Local Filesystem (`--repo-dir` only)** | No (pods cannot read host paths) | Local disk only | Offline UI/PR workflow testing |
+| **Local Filesystem (`--repo-dir` only)** | No (pods cannot read host paths) | Local disk only | Offline UI testing only: merged changes are never deployed, and there is no tenant isolation |
 
 ---
 

@@ -2,18 +2,27 @@
 
 Stage 0 initializes the seed management cluster and GitOps repository layout (`clusters/management/`, `providers/registry.yaml`, `catalog/`, and `tenants/default/`).
 
-All Stage 0 targets produce the same seed control-plane layout (Flux CD, PKO v2, S3 state backend, SOPS/`age`, Kyverno, cert-manager, Envoy Gateway, Prometheus, Flagger, and the in-cluster Rauthy IdP unless you pass `--oidc-issuer` or `--oidc-provider none`) regardless of where the management cluster runs. After Stage 0, Flux adopts these components as protected management add-ons under `clusters/management/core-addons/`, so you upgrade and roll them back through Git.
+Every Stage 0 target that ends with a reachable cluster installs the same seed control-plane layout (Flux CD, PKO v2, S3 state backend, SOPS/`age`, Kyverno, cert-manager, Envoy Gateway, Prometheus, Flagger, and the in-cluster Rauthy IdP unless you pass `--oidc-issuer` or `--oidc-provider none`) regardless of where the management cluster runs. After Stage 0, Flux adopts these components as protected management add-ons under `clusters/management/core-addons/`, so you upgrade and roll them back through Git.
 
 > **Alpha: no upgrade path between breaking releases.** Keel is alpha. A release marked as breaking (a `!` / `BREAKING CHANGE` entry in the changelog) does not migrate existing clusters, GitOps repositories or tenant repositories: start over with a fresh `keel bootstrap init` on a new cluster and a new repository.
 
+## Requirements
+
+For a local `kind` management cluster plus one workload `kind` cluster (measured with v0.12.0):
+
+- **Host:** 8 CPU cores (4 minimum), 16 GB RAM with about 12 GB free, 30 GB free disk. The management node peaks at about 7 GiB of memory, holds about 17 GB of container images, and the first PKO preview pulls the 3.5 GB `pulumi/pulumi` image.
+- **OS:** Linux x86_64 or WSL2 (tested).
+- **Tools on `PATH`:** `docker`, `pulumi`, `helm`, `kubectl`, `git`, `sops` and `age-keygen` (from `age`); `keel serve` calls `sops` and `age-keygen`. `kind` is only needed to list or delete clusters.
+- **Free host ports:** `8080` (`keel serve`), `8888` (HTTPS ingress) and `3000` (Forgejo port-forward with `--with-forge`).
+
 ## Supported Targets
 
-| Target | Flag | Use Case |
+| Target | Flag | Status |
 | :--- | :--- | :--- |
-| Local `kind` | `--target kind` | Local development on Docker |
-| Existing cluster | `--target kubeconfig` | Existing `k3s`, `Talos`, or managed Kubernetes cluster |
-| Proxmox VE | `--target proxmox` | On-premises hypervisor cluster |
-| AWS / GCP / Azure / Hetzner | `--target aws\|gcp\|azure\|hetzner` | Public cloud management cluster |
+| Local `kind` | `--target kind` | Tested in live E2E (with `--with-forge`) |
+| Existing cluster | `--target kubeconfig` | Experimental: existing `k3s`, `k3d`, `Talos`, or managed Kubernetes cluster; not covered by E2E |
+| AWS / GCP / Azure | `--target aws\|gcp\|azure` | Experimental and untested: single-node `k3s` on a 4 GB VM |
+| Proxmox VE / Hetzner | `--target proxmox\|hetzner` | VM only: creates the VM, installs no Kubernetes, then stops with an error (see below) |
 
 ## 1. Initialize the Management Cluster
 
@@ -26,8 +35,11 @@ keel bootstrap init \
   --target kind \
   --cluster-name keel-mgmt \
   --local-dev-docker-socket-exception \
+  --with-forge \
   --repo-dir ./keel-gitops
 ```
+
+This takes about 3 minutes on a host that already has the `kindest/node` image. `--with-forge` installs an in-cluster Forgejo so Flux can pull the repository and PRs work; without it (or a network `--git-url`), Flux cannot read the repository and nothing you merge is deployed (see [In-Cluster Flux Pull-Polling](#core-controllers-installed-out-of-the-box) below).
 
 ### Existing Cluster (`kubeconfig`)
 
@@ -40,6 +52,8 @@ keel bootstrap init \
 ```
 
 #### Local `k3d` (`k3s`) Example
+
+This example is not covered by automated tests.
 
 Disable `k3d`'s bundled Traefik ingress so Envoy Gateway (`keel-ingress`) can bind ports cleanly, and expose `:8888` for Rauthy OIDC:
 
@@ -61,10 +75,12 @@ keel bootstrap init \
 
 ### Public Cloud Management Clusters (AWS, Azure, GCP)
 
-Stage 0 can bootstrap directly onto public cloud providers executing provider Pulumi programs (`deploy/bootstrap/<provider>/Pulumi.yaml`). All templates are pre-configured with free-tier-eligible instance types and volume sizes:
+Stage 0 can bootstrap onto public cloud providers by running provider Pulumi programs (`deploy/bootstrap/<provider>/Pulumi.yaml`).
+
+> **Experimental and untested.** No automated test runs these programs; CI only checks the files. They default to 4 GB instances, which are **not** free tier and are probably too small: a local management node alone peaks at about 7 GiB of memory. Override the size in the program config if you try them, and please [report the result](https://github.com/rdylanwalker/keel/issues/new/choose).
 
 #### 1. Amazon Web Services (`--target aws`)
-Uses `deploy/bootstrap/aws/Pulumi.yaml` (`pulumi/aws`) with free-tier `t3.micro` / `t2.micro` EC2 instance, 30 GB gp3 root disk, and versioned S3 Pulumi state bucket.
+Uses `deploy/bootstrap/aws/Pulumi.yaml` (`pulumi/aws`) with a `t3.medium` EC2 instance (4 GB), 30 GB gp3 root disk, and versioned S3 Pulumi state bucket.
 
 ```bash
 # Acquire credentials via aws iam (or AWS Console)
@@ -81,7 +97,7 @@ keel bootstrap init \
 ```
 
 #### 2. Microsoft Azure (`--target azure`)
-Uses `deploy/bootstrap/azure/Pulumi.yaml` (`pulumi/azure-native`) with free-tier `Standard_B1s` VM, 30 GB OS disk, protected Resource Group, and Blob Storage state container.
+Uses `deploy/bootstrap/azure/Pulumi.yaml` (`pulumi/azure-native`) with a `Standard_B2s` VM (4 GB), 30 GB OS disk, protected Resource Group, and Blob Storage state container.
 
 ```bash
 # Acquire credentials via az ad sp create-for-rbac (or Azure Portal)
@@ -100,7 +116,7 @@ keel bootstrap init \
 ```
 
 #### 3. Google Cloud Platform (`--target gcp`)
-Uses `deploy/bootstrap/gcp/Pulumi.yaml` (`pulumi/gcp`) with Always-Free `e2-micro` VM in `us-central1-a`, 10 GB `pd-standard` boot disk, and versioned GCS state bucket.
+Uses `deploy/bootstrap/gcp/Pulumi.yaml` (`pulumi/gcp`) with an `e2-medium` VM (4 GB) in `us-central1-a`, 20 GB `pd-standard` boot disk, and versioned GCS state bucket.
 
 ```bash
 # Acquire credentials via gcloud iam service-accounts (or GCP Console)
@@ -132,7 +148,7 @@ The AWS, Azure, and GCP programs install single-node `k3s` on first boot with `I
 
 These k3s-owned components are reconciled by k3s from `/var/lib/rancher/k3s/server/manifests`, not by Flux, and are not Keel catalog add-ons. Do not delete them, and do not install a second ingress controller on the management cluster.
 
-`--target hetzner` and `--target proxmox` only provision the protected VM; they do not install `k3s`. Install your distribution of choice on the node yourself (for `k3s`, pass `--disable=traefik`, or `--k3s-arg "--disable=traefik@server:*"` for `k3d`). Then attach it with `--target kubeconfig`.
+`--target hetzner` and `--target proxmox` only provision the protected VM; they do not install `k3s` and export no kubeconfig, so `keel bootstrap init` stops with an error after the VM is created. Install your distribution of choice on the node yourself (for `k3s`, pass `--disable=traefik`, or `--k3s-arg "--disable=traefik@server:*"` for `k3d`). Then attach it with `--target kubeconfig`.
 
 > **Existing clusters:** the install script runs only on first boot, and the node resources ignore later changes to it (`ignoreChanges`), so `keel bootstrap recover` never restarts or replaces a protected node because of a script edit. Nodes created before Traefik was disabled keep it until you migrate them by hand. Add `disable: [traefik]` to `/etc/rancher/k3s/config.yaml` and run `systemctl restart k3s`. If `kubectl -n kube-system get helmchart traefik traefik-crd` still returns either chart, delete it.
 
@@ -185,17 +201,19 @@ Stage 0 is a set of Pulumi stacks named `stage0-<program>-<cluster>`, for exampl
 
 The root directory is `$KEEL_CONFIG_DIR`, or `$XDG_CONFIG_HOME/keel`, or `~/.config/keel`. Set `PULUMI_CONFIG_PASSPHRASE` to supply your own passphrase. If the state directory holds stacks but no passphrase file, bootstrap stops instead of generating a new passphrase that could not decrypt them: set `PULUMI_CONFIG_PASSPHRASE`, or remove `~/.config/keel/stage0/<cluster>/` to start over.
 
-When the in-cluster SeaweedFS is used, Stage 0 also escrows every stack to `s3://pulumi-state/stage0/<cluster>/`. It turns on bucket versioning, or falls back to timestamped snapshots if the backend rejects versioning. The first run prints a one-time notice: **copy the passphrase into your vault.** Without it, the S3 escrow can't be decrypted if both this workstation and the cluster are lost. See [Break-Glass Recovery](../operations/break-glass-recovery.md).
+When the in-cluster SeaweedFS is used, Stage 0 also escrows every stack to `s3://pulumi-state/stage0/<cluster>/`. It turns on bucket versioning, or falls back to timestamped snapshots if the backend rejects versioning. This escrow lives **inside the management cluster**: it lets you repair broken add-ons, but it is lost with the cluster. Copy `~/.config/keel/stage0/<cluster>/` somewhere else if you need a backup. The first run prints a one-time notice: **copy the passphrase into your vault.** See [Break-Glass Recovery](../operations/break-glass-recovery.md).
 
 Stage 0 core resources carry `protect: true`. To tear the stack down deliberately with Pulumi, you first need `pulumi state unprotect --all`. Deleting the cluster skips this.
 
 ## 2. Configure Local DNS
 
-The Stage 0 ingress (Envoy Gateway `keel-ingress`, port `8888`) serves Rauthy and, with `--with-forge`, Forgejo over HTTPS. Add both hosts to `/etc/hosts`, or `C:\Windows\System32\drivers\etc\hosts` on Windows:
+The Stage 0 ingress (Envoy Gateway `keel-ingress`, port `8888`) serves Rauthy and, with `--with-forge`, Forgejo over HTTPS. Add both hosts, plus any app host you plan to use (such as `podinfo.keel.local`), to `/etc/hosts`, or `C:\Windows\System32\drivers\etc\hosts` for a Windows browser:
 
 ```text
-127.0.0.1 idp.keel.local forgejo.keel.local
+127.0.0.1 idp.keel.local forgejo.keel.local podinfo.keel.local
 ```
+
+The `keel serve` process needs these entries as well as your browser: it calls the IdP at `https://idp.keel.local:8888`. Without them, OIDC discovery fails without an error message and the login page is blank.
 
 The `forgejo.keel.local` entry is needed so PR links printed by the CLI and shown in the GUI resolve. On every target, Stage 0 also adds CoreDNS rewrites so pods reach the same hostnames through the Envoy Gateway `keel-ingress` service. It rewrites the Forgejo host whenever `--with-forge` is set, because tenant and preview PKO Stacks clone it over HTTPS (see [How PKO clones the in-cluster Forgejo](git-repositories.md#how-pko-clones-the-in-cluster-forgejo)), and the IdP host only for the built-in Rauthy. An external `--oidc-issuer` host is never rewritten.
 
@@ -204,6 +222,8 @@ The `forgejo.keel.local` entry is needed so PR links printed by the CLI and show
 ```bash
 keel serve --repo-dir ./keel-gitops    # binds 127.0.0.1:8080 by default
 ```
+
+Stop it with **Ctrl+C**. Other signals can leave its `kubectl port-forward` processes running, and the next start then cannot use port `8888`.
 
 When a Kubernetes cluster is reachable (through `KUBECONFIG` or in-cluster config), `keel serve`:
 
@@ -252,13 +272,27 @@ When `kind` and `keel serve` run inside **WSL2** and you open the GUI in a **Win
 
 ## 6. Break-Glass Recovery
 
-If the management cluster's add-ons or the Git forge are broken, re-apply the escrowed Stage 0 state directly from S3:
+If the management cluster's add-ons or the Git forge are broken while the cluster itself is still reachable, re-apply the escrowed Stage 0 state from the in-cluster S3:
 
 ```bash
 kubectl -n keel-system port-forward svc/s3-state-backend-seaweedfs-s3 8333:8333 &
-export AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=...   # from keel-system/s3-state-backend-seaweedfs-s3-secret
+secret=s3-state-backend-seaweedfs-s3-secret
+export AWS_ACCESS_KEY_ID="$(kubectl -n keel-system get secret $secret -o jsonpath='{.data.admin_access_key_id}' | base64 -d)"
+export AWS_SECRET_ACCESS_KEY="$(kubectl -n keel-system get secret $secret -o jsonpath='{.data.admin_secret_access_key}' | base64 -d)"
 keel bootstrap recover --s3-endpoint http://127.0.0.1:8333 --cluster-name keel-mgmt --dry-run
 keel bootstrap recover --s3-endpoint http://127.0.0.1:8333 --cluster-name keel-mgmt
 ```
 
-The full runbook is in [Break-Glass Recovery](../operations/break-glass-recovery.md).
+The dry run currently lists only `stage0-control-plane-<cluster>`; the real run also recovers the other `control-plane*` stacks in the escrow (for example Forgejo and Rauthy). The full runbook is in [Break-Glass Recovery](../operations/break-glass-recovery.md).
+
+## 7. Teardown
+
+Stop `keel serve` with Ctrl+C, then delete the clusters and the local state:
+
+```bash
+kind delete cluster --name workload-dev     # any workload kind clusters you created
+kind delete cluster --name keel-mgmt
+rm -rf ./keel-gitops ./keel-gitops.git ./keel-gitops-tenant-repos ~/.config/keel/stage0/keel-mgmt
+```
+
+If you keep the Stage 0 state directory or the bare repository, a later bootstrap with the same names reuses them, including the old Git history. To remove a single stack or app instead, click **Delete** on it in the web UI and merge the removal PR (see [Provisioning Workflow](provisioning.md#6-edit-reconcile-or-delete-deployed-resources)).

@@ -8,7 +8,7 @@ Thank you for your interest in contributing to **Keel**! Whether you are fixing 
 
 ## Reporting Issues & Target Feedback
 
-Keel is in active early alpha. The local `kind` + in-cluster Forgejo/Rauthy workflow is continuously tested end-to-end in CI, while cloud and hypervisor targets (`proxmox`, `aws`, `gcp`, `azure`, `hetzner`, `Talos`/managed `kubeconfig`) are ready for real-world validation.
+Keel is in active early alpha. The local `kind` + in-cluster Forgejo/Rauthy workflow runs as a live E2E gate on every push to `main` (not on pull requests). Cloud and hypervisor targets (`aws`, `gcp`, `azure`, `Talos`/managed `kubeconfig`) are untested and need real-world validation; `proxmox` and `hetzner` Stage 0 create a VM only. See [Known Limitations](./docs/reference/known-limitations.md).
 
 When opening an issue, please choose the appropriate [GitHub Issue Template](https://github.com/rdylanwalker/keel/issues/new/choose):
 
@@ -174,7 +174,7 @@ just test-e2e-cloud
 
 ## Multi-Cloud Free-Tier Live E2E Testing (AWS, Azure, GCP)
 
-Keel includes a live end-to-end test suite (`e2e/tests/08-cloud-free-tier-live-e2e.spec.ts`) that validates Stage 0 cloud bootstrapping and Stage 1 PKO v2 provider provisioning against real cloud APIs using zero-cost free-tier resources:
+Keel includes an opt-in live end-to-end test suite (`e2e/tests/08-cloud-free-tier-live-e2e.spec.ts`) that provisions Stage 1 VMs through PKO v2 against real cloud APIs using free-tier-sized resources. It does not run in CI. For the Stage 0 cloud programs it only checks the program files; it does not run `keel bootstrap init --target aws|gcp|azure`:
 * **AWS:** `t3.micro` / `t2.micro` EC2 instances (`aws-vm` blueprint) + S3
 * **Azure:** `Standard_B1s` VMs (`azure-vm` blueprint) in `eastus`
 * **GCP:** `e2-micro` VMs (`gcp-vm` blueprint) in `us-central1-a` (Always Free tier)

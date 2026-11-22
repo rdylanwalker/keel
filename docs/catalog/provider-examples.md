@@ -8,7 +8,7 @@ Remember to enable the corresponding provider on **Control Plane & Providers** (
 
 ---
 
-## Multi-Cloud Free-Tier Credential Acquisition & Setup
+## Multi-Cloud Credential Acquisition & Setup
 
 Before deploying cloud blueprints or running live cloud tests, configure credentials for your cloud provider:
 
@@ -1025,9 +1025,9 @@ outputs:
 
 ---
 
-## Proxmox VE k3s VM (`proxmox`)
+## Proxmox VE VM for k3s (`proxmox`)
 
-Place in `catalog/infra/proxmox-k3s/`.
+Place in `catalog/infra/proxmox-k3s/`. This blueprint creates a VM only; it does not install k3s. It is not covered by automated tests.
 
 ### `catalog.yaml`
 
@@ -1287,7 +1287,7 @@ outputs:
 
 ## Custom OpenTofu / Terraform Provider (`hashicorp/random` Example)
 
-Any OpenTofu/Terraform provider can be added dynamically after Keel MGMT is running via PKO v2's `terraform-provider` bridge—without recompiling Keel. The zero-credential `hashicorp/random` example below is useful for smoke-testing the bridge end-to-end.
+Any OpenTofu/Terraform provider can be added dynamically after Keel MGMT is running via PKO v2's `terraform-provider` bridge—without recompiling Keel. The bridge itself is exercised by the live E2E suite through the bundled `kind-cluster` blueprint (`tehcyx/kind`); this `hashicorp/random` example is not part of the automated tests. The zero-credential `hashicorp/random` example below is useful for smoke-testing the bridge end-to-end.
 
 > **Resource Type Naming Tip:** Pulumi's dynamic `terraform-provider` bridge strips the `<provider>_` prefix from Terraform resource names (for example, `random_pet` becomes `random:index/pet:Pet`). Inspect exact resource type tokens anytime with:
 > ```bash

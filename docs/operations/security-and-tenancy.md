@@ -32,6 +32,8 @@ Per-tenant repositories give each tenant real read isolation in Git. These gaps 
 
 - **Forgejo repository metadata (ADDON-18).** A repository-scoped Forgejo token can read the name and description of other repositories in `keel-tenants` (`GET /api/v1/repos/keel-tenants/<repo>`). It gets `403` on their content and refs. Repository names contain tenant ids, so a tenant can learn which other tenant ids exist. Keel gives every tenant repository the same generic description, with no tenant data.
 - **Local Git provider.** The development-only Local provider (`--git-url` set to a local path, or no forge) keeps every tenant in the platform repository. It has no repository isolation and creates no read credentials. Do not use it for real tenants.
+- **External forges are not tested live.** Tenant isolation is verified by the live E2E suite on the in-cluster Forgejo only. GitHub, GitLab and external Forgejo are tested against a mock forge.
+- **GitHub SSH host keys.** GitHub tenant credentials pin GitHub's published SSH host keys when they are issued. After a GitHub host-key rotation, run `keel tenant repair-credentials` to issue new credentials with fresh host keys.
 - **No forge access for tenant users.** Keel does not add tenant users to their repository on the forge. If you add them yourself, give read access only: write access would let them push changes that skip Keel's previews and path checks.
 - **GitHub Free.** Private repositories cannot be branch-protected on GitHub Free. Keel reports this, and the forge then does not block direct pushes to tenant repositories by accounts with write access.
 - **Platform decryption key.** Tenant secrets are encrypted to the tenant's `age` key and to the cluster recipient in the platform `.sops.yaml`, so platform administrators holding the cluster key can decrypt them.
@@ -181,6 +183,8 @@ If you put a proxy in front of `keel-server` that rewrites CSP, keep `'wasm-unsa
 6. **Audit.** Every connection attempt is logged with the user, client IP, tenant, stack, and resolved target.
 
 ## Progressive Delivery (Flagger + Envoy Gateway)
+
+> **v0.12.0 bug:** tenant ServiceAccounts cannot manage Flagger `Canary` objects, so canary apps in tenant namespaces on the management cluster fail to apply. See the [workaround](../reference/known-limitations.md#canary-apps-on-the-management-cluster). Canary analysis, promotion and rollback are not covered by automated tests.
 
 Applications whose `CatalogApplication` sets `spec.progressiveDelivery.flaggerSupported: true` can opt into canary rollouts (`--canary` in the CLI, or **Enable Flagger Canary** in the GUI). Keel then generates:
 

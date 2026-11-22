@@ -2,6 +2,8 @@
 
 Keel is built so that you cannot lock yourself out of the control plane (`NFR-REL-01`). If the management cluster's add-ons are damaged, or the Git forge or `keel-server` is unreachable, you can re-apply the Stage 0 control plane straight from escrowed Pulumi state. Git, PRs, and the API are not involved.
 
+> **This is not a backup.** The default escrow is the SeaweedFS S3 service **inside the management cluster**, so recovery needs a reachable cluster. If the cluster is lost, the in-cluster escrow is lost with it, and only your local `~/.config/keel/stage0/<cluster>/` copy remains. Copy that directory and the passphrase off the workstation if you need to survive losing both. Live E2E covers only `recover --dry-run`; a real run was tested manually on v0.12.0.
+
 ## What Stage 0 Escrows
 
 `keel bootstrap init` keeps durable Stage 0 state for each cluster:
@@ -20,7 +22,7 @@ Stage 0 stacks are named `stage0-<program>-<cluster>`. Examples are `stage0-cont
 
 During escrow, Keel turns on **bucket versioning** for `pulumi-state`, so every `pulumi up` keeps an older object version you can return to. If the S3 backend rejects versioning, Keel instead writes timestamped snapshots to `stage0/<cluster>/snapshots/<stack>/<timestamp>.json`. The bootstrap summary says which mode is active.
 
-> **Escrow the passphrase.** On the first run, `keel bootstrap init` prints a one-time notice with the passphrase location. Copy the passphrase into your password manager or vault. The S3 escrow cannot be decrypted without it if you lose both this workstation and the cluster.
+> **Escrow the passphrase.** On the first run, `keel bootstrap init` prints a one-time notice with the passphrase location. Copy the passphrase into your password manager or vault. Without it, no copy of the state can be decrypted once the workstation and the in-cluster Secret are gone.
 
 ## Runbook
 
@@ -51,7 +53,7 @@ kubectl -n keel-system get secret keel-stage0-pulumi-passphrase \
 
 Without `--stack`, recovery covers the `control-plane*` stacks listed in the escrow manifest. To also re-run the cluster-provisioning stack, name it explicitly, for example `--stack stage0-kind-keel-mgmt`.
 
-If the cluster itself is gone, use your escrowed copies of the S3 keys and passphrase, and point `--s3-endpoint` at wherever the bucket now lives.
+If the cluster itself is gone, the in-cluster bucket is gone too. Recovery then works only if you copied the state to another S3 endpoint yourself: point `--s3-endpoint` at it and use your saved keys and passphrase.
 
 ### 3. Inspect what is available
 
@@ -72,6 +74,8 @@ keel bootstrap recover \
 ```
 
 The dry run prints the backend URL (`s3://pulumi-state/stage0/keel-mgmt?endpoint=...`), the stacks it will recover, the prerequisites, and the exact `pulumi` argv it would run. Secrets are passed only through environment variables and stdin, and never appear in argv.
+
+Without `--stack`, the dry run currently lists only `stage0-control-plane-<cluster>`, while a real run recovers every `control-plane*` stack in the escrow manifest (for example also `stage0-control-plane-forgejo-<cluster>` and `stage0-control-plane-rauthy-<cluster>`).
 
 ### 5. Execute
 

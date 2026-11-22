@@ -68,18 +68,28 @@ kind get clusters
 
 With a tenant namespace ready (such as `default` or `dev-team`), deploy **Podinfo** (`podinfo`) using an upstream Helm chart with Flagger + Envoy Gateway progressive delivery enabled.
 
+> **v0.12.0 bug:** a canary app in a tenant namespace on the management cluster fails because the tenant ServiceAccount cannot manage Flagger `Canary` objects. Apply the [RBAC workaround](../reference/known-limitations.md#canary-apps-on-the-management-cluster) before this walkthrough. Add `127.0.0.1 podinfo.keel.local` to your `hosts` file as well.
+
 ### Step 1: Initial Canary Deployment
 
 1. In **Catalog & Form Wizard**, select your target tenant (e.g., `default`) and choose **Podinfo Microservice** (`podinfo`).
 2. Check **Enable Flagger Canary**.
 3. Fill in the form (`Replica Count`: `2`, `Ingress Hostname`: `podinfo.keel.local`, `API Secret Token`: any 8+ character secret, and keep the pre-filled `restricted` PSS `Container Security Context` defaults).
-4. Click **Submit & Open Git PR Proposal** (or via CLI):
+4. Click **Submit & Open Git PR Proposal** (or via CLI). The CLI does not fill in the form's defaults, so the values file must include the `restricted` `securityContext`; without it, Kyverno rejects the Deployment:
 
 ```bash
 cat <<'EOF' > podinfo-values.yaml
 replicaCount: 2
 ingressHost: podinfo.keel.local
 apiToken: demo-podinfo-token
+securityContext:
+  allowPrivilegeEscalation: false
+  runAsNonRoot: true
+  runAsUser: 100
+  capabilities:
+    drop: [ALL]
+  seccompProfile:
+    type: RuntimeDefault
 EOF
 
 keel app install \
@@ -88,24 +98,24 @@ keel app install \
   --values-file ./podinfo-values.yaml \
   --canary \
   --server http://127.0.0.1:8080
+
+# Merge with the PR number printed above:
+keel proposal merge <PR_NUMBER> --tenant default --server http://127.0.0.1:8080
 ```
 
 5. Inspect the PR diff in **PR & Preview Inspector**—which synthesizes `helmrelease-canary.yaml`, `canary.yaml`, `networkpolicy-canary.yaml`, and, when the form's `apiToken` secret is set, the SOPS-encrypted `secrets.enc.yaml` Secret (listed in the tenant repository's `tenants/<id>/kustomization.yaml` and merged into the release through `HelmRelease.spec.valuesFrom`)—and click **Merge PR**.
-6. In **Topology Map**, wait for `podinfo` to reach `Ready` / `Initialized` in the **Flagger Canary Traffic Rollouts (Envoy Gateway)** panel.
+6. In **Topology Map**, wait for `podinfo` to reach `Ready` / `Initialized` in the **Flagger Canary Traffic Rollouts (Envoy Gateway)** panel (about a minute and a half after the merge). If it stays `Pending`, see [Known Limitations](../reference/known-limitations.md#other-app-limitations) for how to read the Flux error.
+7. Open `https://podinfo.keel.local:8888` (accept the certificate warning) or run `curl -k https://podinfo.keel.local:8888/version`. The app is served over HTTPS only.
 
 ### Step 2: Demonstrate a Live Canary Traffic Rollout
 
-1. Ensure `127.0.0.1 podinfo.keel.local` is in your `hosts` file and Envoy Gateway (`keel-ingress`) is port-forwarded on `127.0.0.1:8888`:
-
-```bash
-kubectl --context kind-keel-mgmt -n keel-system port-forward svc/envoy-keel-system-keel-ingress-34e23306 8888:8888
-```
+1. Ensure `127.0.0.1 podinfo.keel.local` is in your `hosts` file and `keel serve` is running: it port-forwards Envoy Gateway (`keel-ingress`) to `127.0.0.1:8888`.
 
 2. Start a traffic loop in a terminal so Prometheus records live Envoy Gateway success-rate and latency metrics:
 
 ```bash
 while true; do
-  curl -s -H "Host: podinfo.keel.local" http://127.0.0.1:8888/version
+  curl -sk https://podinfo.keel.local:8888/version
   echo ""
   sleep 1
 done
@@ -113,18 +123,18 @@ done
 
 3. In **Topology Map**, click **Edit** on the `podinfo` release, change **Chart Version** (for example, `6.7.1` → `6.7.0`) or **Replica Count** (`2` → `3`), re-enter **API Secret Token**, and verify **Enable Flagger Canary** remains checked.
 4. Submit and merge the PR.
-5. Watch the **Flagger Canary Traffic Rollouts (Envoy Gateway)** panel and your `curl` loop:
+5. Watch the **Flagger Canary Traffic Rollouts (Envoy Gateway)** panel and your `curl` loop. This analysis is not covered by automated tests yet, so please report what you see:
    - Flagger scales up the new canary pods alongside `podinfo-primary`.
    - Every `30s`, Flagger shifts weight (`10% → 20% → 30% → 40% → 50%`) while querying Prometheus (`envoy-gateway-request-success-rate` and `envoy-gateway-request-duration`).
    - Your `curl` output will alternate between the old and new versions in proportion to the canary weight until Flagger promotes the new version to `podinfo-primary` (`Succeeded`).
 
 ---
 
-## 3. Provision a Minimal AWS EKS Cluster (Free-Tier-Eligible Nodes)
+## 3. Provision a Small AWS EKS Cluster
 
-You can use the same management cluster to provision cloud infrastructure. This walkthrough provisions a minimal **AWS EKS** cluster using AWS Free-Tier-eligible `t3.micro` / `t2.micro` EC2 nodes.
+You can use the same management cluster to provision cloud infrastructure. This walkthrough provisions a small **AWS EKS** cluster. It is not covered by automated tests.
 
-> **Cost Note:** While `t3.micro` / `t2.micro` EC2 instances are eligible for the AWS Free Tier, the EKS control plane itself incurs standard AWS hourly charges (~$0.10/hour). Remember to delete the stack via PR when you finish testing.
+> **Cost Note:** This is **not** free tier. The EKS control plane costs about $0.10/hour, plus the `t3.medium` nodes (the blueprint default). Smaller instances such as `t3.micro` can run only a handful of pods per node on EKS. Delete the stack when you finish testing.
 
 ### Step 1: Enable the `aws` Provider
 
@@ -144,7 +154,7 @@ You can use the same management cluster to provision cloud infrastructure. This 
 2. Configure minimal sizing to keep costs low and provide your IAM credentials (`AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`, which are encrypted with SOPS + `age` into `secret.enc.yaml`):
    - **Cluster Name:** `eks-sandbox`
    - **AWS Region:** `us-east-1`
-   - **Node Instance Type:** `t3.micro`
+   - **Node Instance Type:** `t3.medium`
    - **Desired Node Count:** `1`
    - **AWS Access Key ID / Secret Access Key:** Your IAM credentials
 3. Submit the PR and inspect the **Resource Diff Tree** in **PR & Preview Inspector** to verify the exact VPC, subnets, and EKS resources before any cloud resources are created.
@@ -153,7 +163,7 @@ You can use the same management cluster to provision cloud infrastructure. This 
 
 ### Step 4: Clean Up Cloud Resources
 
-When you are done testing, open a PR that removes `tenants/default/infra/eks-sandbox.yaml`. Merging that PR triggers PKO v2 to destroy the EKS cluster and VPC cleanly.
+When you are done testing, click **Delete** on the `eks-sandbox` stack in **Topology Map** and merge the removal PR. PKO v2 then destroys the EKS cluster and VPC.
 
 ---
 
@@ -281,13 +291,15 @@ keel infra provision \
 keel preview status --pr <PR_NUMBER> --tenant <TENANT> --watch --server http://127.0.0.1:8080
 ```
 
-`GOOGLE_CREDENTIALS` (marked `"writeOnly": true` and `"format": "password"`) is encrypted with SOPS + `age` into `secret.enc.yaml` and bound to `Stack.spec.envRefs`, while `vmName`, `project`, and `zone` populate `Stack.spec.config`. Merge the PR to create the VM, and remove `tenants/default/infra/<instance>/` via PR when done so PKO v2 runs `pulumi destroy`.
+`GOOGLE_CREDENTIALS` (marked `"writeOnly": true` and `"format": "password"`) is encrypted with SOPS + `age` into `secret.enc.yaml` and bound to `Stack.spec.envRefs`, while `vmName`, `project`, and `zone` populate `Stack.spec.config`. Merge the PR to create the VM. When you are done, click **Delete** on the stack in **Topology Map** and merge the removal PR so PKO v2 runs `pulumi destroy`.
 
 ---
 
 ## 5. Add Your Own Blueprint (`cloudflare` or `hetzner`)
 
 Try extending the self-service catalog with another provider from [Provider Blueprint Examples](../catalog/provider-examples.md):
+
+These providers have doc examples only and are not tested.
 
 1. Enable **Cloudflare (`cloudflare`)** or **Hetzner Cloud (`hetzner`)** on **Control Plane & Providers** and merge the PR.
 2. Add the corresponding `catalog.yaml` + `Pulumi.yaml` under `catalog/infra/<blueprint-id>/` via **+ Add Catalog Item** and merge.
