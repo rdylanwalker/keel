@@ -34,5 +34,7 @@ spec:
       apiToken:
         type: string
         title: Optional Secret API Token
+        description: "Stored SOPS-encrypted in Git and substituted by Flux into the http-echo-api-token Secret (ECHO_API_TOKEN). Up to 128 characters [A-Za-z0-9+/=_.-]."
+        pattern: "^[A-Za-z0-9+/=_.-]{0,128}$"
         format: password
         writeOnly: true

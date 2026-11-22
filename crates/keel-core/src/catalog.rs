@@ -1841,6 +1841,36 @@ metadata:
         }
     }
 
+    /// The shipped `http-echo-manifest` keeps its secret `apiToken` as a Flux placeholder: Keel
+    /// renders only the non-secret values into Git.
+    #[test]
+    fn http_echo_manifest_leaves_the_secret_token_to_flux() {
+        let raw = include_str!("../../../deploy/catalog/apps/http-echo-manifest/manifests.yaml");
+        let rendered = render_manifest_template(
+            raw,
+            &serde_json::json!({ "echoText": "hello", "replicas": 2 }),
+        )
+        .unwrap();
+        assert!(rendered.contains("- -text=hello"), "{rendered}");
+        assert!(rendered.contains("token: \"${apiToken}\""), "{rendered}");
+        let docs = verify_rendered_manifest_structure(raw, &rendered).unwrap();
+        let kinds: Vec<_> = docs
+            .iter()
+            .filter_map(|d| d.get("kind").and_then(Value::as_str))
+            .collect();
+        assert_eq!(kinds, ["Deployment", "Service", "Secret"]);
+        let app = parse_catalog_application(include_str!(
+            "../../../deploy/catalog/apps/http-echo-manifest/catalog.yaml"
+        ))
+        .unwrap();
+        let token = &app.spec.schema["properties"]["apiToken"];
+        assert_eq!(token["format"], "password");
+        assert!(
+            token.get("default").is_none(),
+            "secret fields are never defaulted"
+        );
+    }
+
     #[test]
     fn test_catalog_application_placement_namespace() {
         let with_placement = |placement: &str| {

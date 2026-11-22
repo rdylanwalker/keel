@@ -306,6 +306,7 @@ Deploy raw Kubernetes YAML templates without packaging a Helm chart, choosing be
    - **Application Name:** `echo-demo`
    - **Service Port:** `8080`
    - **Echo Message:** `"Hello from Keel Manifest Template!"`
+   - **Optional Secret API Token:** any value (`[A-Za-z0-9+/=_.-]`, up to 128 characters). It is committed only SOPS-encrypted (`config/secrets.enc.yaml`); on the Flux engine the `<instance>-config` Kustomization decrypts it with the tenant's `sops-age` key and Flux substitutes it into the `http-echo-api-token` Secret (`ECHO_API_TOKEN` in the pod).
 4. Notice the **Action Engine** selector:
    - **Flux CD Kustomization (`flux`):** Generates `manifests.yaml`, non-secret substitutions in `config/values-configmap.yaml` (applied first by an `<instance>-config` Kustomization), and a Flux `Kustomization` that depends on it and uses `postBuild.substituteFrom`.
    - **Pulumi PKO Stack (`pulumi`):** Generates `Pulumi.yaml` wrapping the rendered manifests in `kubernetes:yaml/v2:ConfigGroup` with a PKO v2 `Stack` and ephemeral PR preview diffing.

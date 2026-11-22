@@ -25,6 +25,14 @@ spec:
           image: hashicorp/http-echo:1.0.0
           args:
             - -text=${echoText}
+          env:
+            # Secret value: never rendered into Git; Flux substitutes it from the SOPS-decrypted
+            # `<instance>-secrets` Secret (`postBuild.substituteFrom`).
+            - name: ECHO_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: http-echo-api-token
+                  key: token
           ports:
             - containerPort: 5678
               name: http
@@ -59,3 +67,13 @@ spec:
       name: http
   selector:
     app: http-echo
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: http-echo-api-token
+  labels:
+    app.kubernetes.io/name: http-echo
+type: Opaque
+stringData:
+  token: "${apiToken}"
