@@ -1,3 +1,32 @@
+## [0.9.0](https://github.com/rdylanwalker/keel/compare/v0.8.0...v0.9.0) (2026-11-22)
+
+### Features
+
+* **catalog:** add self-service Forgejo and SeaweedFS catalog apps ([d63c753](https://github.com/rdylanwalker/keel/commit/d63c753038e5968a33572c81a1d52c27b9e0341c))
+* **catalog:** add self-service keel-server catalog app ([142d21e](https://github.com/rdylanwalker/keel/commit/142d21eda820fd3872b86b028f2c0600d7f35b40))
+* **catalog:** add self-service Kyverno, Pulumi Kubernetes Operator and Flux catalog apps ([20cee98](https://github.com/rdylanwalker/keel/commit/20cee980df012321b9a98d026b9fd0b23251feca))
+* **catalog:** add self-service Rauthy OIDC provider catalog app ([16de4eb](https://github.com/rdylanwalker/keel/commit/16de4eb93cb473b136fc4381febd0ca708417791))
+* **catalog:** declare workload-cluster placement for cluster-scoped apps ([c0b8efb](https://github.com/rdylanwalker/keel/commit/c0b8efb0f27bdecc7f5148115d9b12d5fd635150))
+* **cli:** add opt-in --with-keel-server Flux add-on with catalog entry ([c95237d](https://github.com/rdylanwalker/keel/commit/c95237dd8d1d1089729fe35a7fa228959a3d4dff))
+* **deploy:** let Flux upgrade and roll back itself via a protected flux2 HelmRelease ([2b2a5c5](https://github.com/rdylanwalker/keel/commit/2b2a5c5d734d5cf418048b8c202e9f48b51f2c2a))
+* **deploy:** manage optional Forgejo as a Flux add-on with a catalog entry ([ff6f907](https://github.com/rdylanwalker/keel/commit/ff6f90766b260b0042b2cb28e6d7610e93422274))
+* **server:** list management add-ons as protected releases for cluster admins ([341d3bc](https://github.com/rdylanwalker/keel/commit/341d3bc5a8103fefa7d23f7aef398ed70bb58eef))
+* **ui:** render management add-ons as rows in the topology releases table ([fcaef14](https://github.com/rdylanwalker/keel/commit/fcaef14ce43af5af2101745d6dcc444cf8d56dc0))
+* **ui:** show management add-ons in the topology applications section ([9ece8d8](https://github.com/rdylanwalker/keel/commit/9ece8d88e5de7415b0a31063469ea11af84a3fee))
+* **ui:** use Edit for management add-on rows to match tenant release actions ([4553027](https://github.com/rdylanwalker/keel/commit/4553027c48ef751a8e4cd02a0182f4760f7773b5))
+
+### Bug Fixes
+
+* **catalog:** align self-service envoy-gateway, flagger and prometheus with management versions ([abcfc7e](https://github.com/rdylanwalker/keel/commit/abcfc7e04c4a6e52f18b9ec38f5ec703d9296da0))
+* **cli:** reconcile management add-ons with Flux and manage Rauthy as a Flux add-on ([c22c29c](https://github.com/rdylanwalker/keel/commit/c22c29c2003b31ec2ef3a3ec41c4c5af8e57d02a))
+* **deploy:** disable bundled k3s Traefik in favour of Envoy Gateway ([bddb4d8](https://github.com/rdylanwalker/keel/commit/bddb4d88da911ce573dae460ded9b4d7b003ea21))
+* **security:** resolve CodeQL command-injection, path-injection and cleartext-logging alerts ([206c5a0](https://github.com/rdylanwalker/keel/commit/206c5a0ec5b76fa63564213769e34036a64a9944))
+* **server:** apply manifest app secrets before substitution and fix remote canary placement ([64702c1](https://github.com/rdylanwalker/keel/commit/64702c102ca9ca8407537db20d3714e21679808c))
+* **server:** create the target namespace in remote canary Kustomizations ([67904fe](https://github.com/rdylanwalker/keel/commit/67904fe5a55e5c89ec2a7fa12ddb8ea7fe390747))
+* **server:** keep Helm app secrets in the root tenant kustomization ([f30f0ab](https://github.com/rdylanwalker/keel/commit/f30f0ab94213c61fcd4fcd4aecb776939ff24389))
+* **server:** keep SOPS secret metadata readable so Flux can decrypt under kustomize transforms ([79cf735](https://github.com/rdylanwalker/keel/commit/79cf735bfe196e4c64f43f8cc567fa4b009d8bce))
+* **server:** make core add-on upgrades multi-document safe and kind-aware ([8435e49](https://github.com/rdylanwalker/keel/commit/8435e49c96534d370335960a2775168748338ec9))
+
 # [0.8.0](https://github.com/rdylanwalker/keel/compare/v0.7.0...v0.8.0) (2026-11-21)
 
 
