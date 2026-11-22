@@ -20,6 +20,7 @@ Every tenant maps to a dedicated Kubernetes namespace (`tenant-<id>`) and a Git 
   - cluster DNS;
   - the `keel-ingress` Envoy proxy pods, which serve the in-cluster Forgejo over HTTPS;
   - the in-cluster S3 state backend on port 8333;
+  - the local-dev `flux-system/keel-docker-proxy` on port 2375 (kind-in-kind blueprints; deployed only with `--local-dev-docker-socket-exception`);
   - private addresses (`10.0.0.0/8`, `100.64.0.0/10`, `172.16.0.0/12`, `192.168.0.0/16`) on TCP 22, 443, 6443 and 8006: the Kubernetes API server, private forges and the Proxmox VE API;
   - public IPv4 addresses on any port, for cloud APIs and external forges.
 

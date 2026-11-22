@@ -377,6 +377,12 @@ pub const TENANT_PKO_WORKSPACE_NETWORK_POLICY: &str = "allow-pko-workspace";
 /// (`keel-system/s3-state-backend-seaweedfs-s3`, `keel_pko::IN_CLUSTER_S3_BACKEND_URL`).
 pub const IN_CLUSTER_S3_STATE_BACKEND_PORT: u16 = 8333;
 
+/// `app` label of the local-dev `flux-system/keel-docker-proxy` (`local-docker-proxy.yaml`).
+pub const LOCAL_DOCKER_PROXY_APP_LABEL: &str = "keel-docker-proxy";
+
+/// Port of the local-dev Docker socket proxy (`DOCKER_HOST=tcp://keel-docker-proxy.flux-system:2375`).
+pub const LOCAL_DOCKER_PROXY_PORT: u16 = 2375;
+
 /// Private IPv4 ranges (RFC 1918 and CGNAT) PKO workspaces reach only on
 /// [`PKO_WORKSPACE_PRIVATE_EGRESS_PORTS`]. Link-local `169.254.0.0/16` (cloud instance metadata
 /// `169.254.169.254` on aws/gcp/azure/hetzner) is never allowed.
@@ -401,6 +407,8 @@ pub const PKO_WORKSPACE_PRIVATE_EGRESS_PORTS: [u16; 4] = [22, 443, 6443, 8006];
 ///   container clones `projectRepo` from the in-cluster Forgejo HTTPS ingress), never other
 ///   `keel-system` workloads (Forgejo's HTTP Service, the IdP, keel-server, SeaweedFS admin/filer);
 /// * `keel-system` on [`IN_CLUSTER_S3_STATE_BACKEND_PORT`] (the default Pulumi state backend);
+/// * the local-dev `flux-system/keel-docker-proxy` pods on [`LOCAL_DOCKER_PROXY_PORT`] (kind-in-kind
+///   blueprints; present only with `--local-dev-docker-socket-exception`);
 /// * [`PKO_WORKSPACE_PRIVATE_EGRESS_CIDRS`] on [`PKO_WORKSPACE_PRIVATE_EGRESS_PORTS`] (the
 ///   Kubernetes API server, private forges over HTTPS/SSH, the Proxmox VE API);
 /// * public IPv4 on any port ([`PUBLIC_EGRESS_EXCEPT_CIDRS`] excluded: private, link-local,
@@ -444,6 +452,18 @@ pub fn build_tenant_pko_workspace_network_policy(
         {
             "to": [{ "namespaceSelector": keel_system_selector }],
             "ports": tcp_ports(&[IN_CLUSTER_S3_STATE_BACKEND_PORT])?,
+        },
+        {
+            // Local-dev only: `--local-dev-docker-socket-exception` runs the `keel-docker-proxy`
+            // in flux-system for kind-in-kind blueprints (`DOCKER_HOST`). Matches nothing when
+            // the proxy is not deployed.
+            "to": [{
+                "namespaceSelector": {
+                    "matchLabels": { "kubernetes.io/metadata.name": "flux-system" }
+                },
+                "podSelector": { "matchLabels": { "app": LOCAL_DOCKER_PROXY_APP_LABEL } }
+            }],
+            "ports": tcp_ports(&[LOCAL_DOCKER_PROXY_PORT])?,
         },
         {
             "to": PKO_WORKSPACE_PRIVATE_EGRESS_CIDRS
@@ -2511,7 +2531,7 @@ mod tests {
             json!({"matchLabels": {"auto.pulumi.com/component": "workspace"}})
         );
         let egress = json_docs[5]["spec"]["egress"].as_array().unwrap();
-        assert_eq!(egress.len(), 5);
+        assert_eq!(egress.len(), 6);
         // Every rule names destinations; no allow-all `{}`.
         assert!(
             egress
@@ -2526,7 +2546,11 @@ mod tests {
             egress[2]["ports"],
             json!([{"protocol": "TCP", "port": 8333}])
         );
-        assert!(egress[3]["ports"].as_array().is_some_and(|p| !p.is_empty()));
+        assert_eq!(
+            egress[3]["ports"],
+            json!([{"protocol": "TCP", "port": LOCAL_DOCKER_PROXY_PORT}])
+        );
+        assert!(egress[4]["ports"].as_array().is_some_and(|p| !p.is_empty()));
         assert_eq!(
             json_docs[5]["spec"]["ingress"],
             json!([{
@@ -3088,6 +3112,35 @@ mod tests {
             .unwrap();
         assert_eq!(sub_from.len(), 1, "no Secret source without secret values");
         assert_eq!(sub_from[0]["optional"], false);
+    }
+
+    #[test]
+    fn pko_workspace_policy_reaches_only_the_local_docker_proxy_in_flux_system() {
+        let np = serde_json::to_value(build_tenant_pko_workspace_network_policy("acme").unwrap())
+            .unwrap();
+        let rules = np["spec"]["egress"].as_array().unwrap();
+        let docker: Vec<_> = rules
+            .iter()
+            .filter(|r| {
+                r["ports"]
+                    .as_array()
+                    .is_some_and(|ps| ps.iter().any(|p| p["port"] == LOCAL_DOCKER_PROXY_PORT))
+            })
+            .collect();
+        assert_eq!(docker.len(), 1, "exactly one docker proxy rule");
+        let to = &docker[0]["to"][0];
+        assert_eq!(
+            to["namespaceSelector"]["matchLabels"]["kubernetes.io/metadata.name"],
+            "flux-system"
+        );
+        assert_eq!(
+            to["podSelector"]["matchLabels"]["app"],
+            LOCAL_DOCKER_PROXY_APP_LABEL
+        );
+        // The label must match the shipped proxy manifest.
+        let manifest = include_str!("../../../deploy/bootstrap/manifests/local-docker-proxy.yaml");
+        assert!(manifest.contains(&format!("app: {LOCAL_DOCKER_PROXY_APP_LABEL}")));
+        assert!(manifest.contains(&format!("port: {LOCAL_DOCKER_PROXY_PORT}")));
     }
 
     #[test]
