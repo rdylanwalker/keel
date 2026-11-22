@@ -2,7 +2,7 @@
   "name": "keel-release-tooling",
   "private": true,
   "description": "Pinned semantic-release toolchain for .github/workflows/release.yml (SDD §9.3). Renovate keeps these versions and package-lock.json current.",
-  "license": "Apache-2.0",
+  "license": "MIT",
   "engines": {
     "node": ">=26.13"
   },
