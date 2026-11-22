@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# Test doubles (`InMemoryPreviewCluster`, `InMemorySecretStore` inspection helpers) for other
+# crates' tests. Enable only from `[dev-dependencies]`, never in shipped binaries.
+test-support = []
+
 [dependencies]
 keel-core.workspace = true
 keel-pko.workspace = true

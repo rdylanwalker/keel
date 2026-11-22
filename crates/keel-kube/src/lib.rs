@@ -29,7 +29,7 @@ pub use kyverno::{
     build_restrict_pulumi_providers_policy, build_restrict_pulumi_providers_policy_for_registry,
     build_restrict_tenant_flux_source_status_policy, build_restrict_tenant_flux_sources_policy,
     build_restrict_tenant_pulumi_objects_policy, build_sync_keel_ca_bundle_manifests,
-    is_tenant_subject, platform_owned_writers, pulumi_provider_allowlist,
+    platform_owned_writers, pulumi_provider_allowlist,
 };
 pub use live::{
     CanaryStatusInfo, ClusterEventSummary, KubeClusterStatusReader, LiveResourceInfo,
@@ -38,11 +38,13 @@ pub use live::{
     is_stack_manifest_protected, is_stack_object_protected,
 };
 pub use preview_runner::{
-    DEFAULT_TENANT_GIT_BRANCH, InMemoryPreviewCluster, InMemoryPreviewSecret, KubePreviewCluster,
-    PREVIEW_PROVIDER_SECRET_KIND, PreviewCluster, PreviewPrerequisites, TenantGitSource,
-    preview_report_configmap_name, preview_s3_secret_name, tenant_git_repository_manifest_path,
-    tenant_git_source_from_manifest, tenant_git_source_from_repository,
+    DEFAULT_TENANT_GIT_BRANCH, KubePreviewCluster, PREVIEW_PROVIDER_SECRET_KIND, PreviewCluster,
+    PreviewPrerequisites, TenantGitSource, preview_report_configmap_name, preview_s3_secret_name,
+    tenant_git_repository_manifest_path, tenant_git_source_from_manifest,
+    tenant_git_source_from_repository,
 };
+#[cfg(any(test, feature = "test-support"))]
+pub use preview_runner::{InMemoryPreviewCluster, InMemoryPreviewSecret};
 pub use s3_identity::{
     SeaweedFsIdentityOps, SeaweedFsTenantS3Provisioner, TenantS3IdentityProvisioner,
     TenantS3ProvisionOutcome, generate_tenant_s3_keys, provision_tenant_s3_identity_with,
@@ -63,15 +65,13 @@ pub use tenant::{
     ENVOY_OWNING_GATEWAY_LABEL, FlaggerCanarySpecInput, FluxDependencyRef, FluxHealthCheckRef,
     FluxKustomizationSpecInput, FluxManifestAppInput, FluxSubstituteReference, HelmChartSourceKind,
     HelmChartSourceRef, HelmReleaseSpecInput, HelmValuesSecretRef, KEEL_SERVER_TENANT_CLUSTER_ROLE,
-    MANIFEST_APP_CONFIG_DIR, PLATFORM_OWNED_KINDS, PLATFORM_OWNED_LABEL,
-    PLATFORM_OWNED_TENANT_FILES, ROUTE_HOSTNAMES_ANNOTATION, RemoteKubeConfigRef,
+    MANIFEST_APP_CONFIG_DIR, PLATFORM_OWNED_LABEL, ROUTE_HOSTNAMES_ANNOTATION, RemoteKubeConfigRef,
     TENANT_NAMESPACE_PREFIX, TENANT_PKO_WORKSPACE_NETWORK_POLICY, TenantIsolationConfig,
     TenantManifestBundle, TenantQuotaSpec, build_keel_server_tenant_role_binding,
     build_tenant_default_deny_network_policy, build_tenant_namespace,
     build_tenant_pko_workspace_network_policy, build_tenant_resource_quota,
-    build_tenant_service_account, generate_flux_kustomization_manifest,
-    manifest_app_config_kustomization_name, manifest_app_secrets_name,
-    manifest_app_values_configmap_name, platform_owned_labels_missing,
+    build_tenant_service_account, manifest_app_config_kustomization_name,
+    manifest_app_secrets_name, manifest_app_values_configmap_name,
     synthesize_canary_gateway_network_policy, synthesize_canary_gateway_network_policy_yaml,
     synthesize_flagger_canary, synthesize_flagger_canary_yaml, synthesize_flux_kustomization,
     synthesize_flux_kustomization_yaml, synthesize_flux_manifest_app_kustomizations,
@@ -91,9 +91,8 @@ pub use tenant_repo::{
     pko_operator_needs_ssh_known_hosts, synthesize_tenant_repo_stub,
     tenant_gitops_credentials_secret, tenant_gitops_credentials_status, tenant_repo_git_auth,
     tenant_repo_preview_git_source, tenant_repo_preview_secret_keys,
-    tenant_repo_preview_secret_payload, tenant_repo_resources_from_monorepo,
-    tenant_repo_stack_git_source, tenant_repo_stub_kustomization_entries,
-    tenant_repo_workspace_template, validate_known_hosts,
+    tenant_repo_preview_secret_payload, tenant_repo_stack_git_source,
+    tenant_repo_stub_kustomization_entries, tenant_repo_workspace_template, validate_known_hosts,
 };
 
 #[derive(Debug, thiserror::Error)]

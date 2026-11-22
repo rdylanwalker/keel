@@ -464,6 +464,7 @@ impl InMemorySecretStore {
 
     /// Inspects a raw Kubernetes `Secret` stored in memory (useful in tests to verify
     /// that sensitive values are stored strictly as `AES-256-GCM` ciphertext).
+    #[cfg(any(test, feature = "test-support"))]
     pub async fn inspect_raw_secret(&self, namespace: &str, name: &str) -> Option<Secret> {
         let guard = self.state.read().await;
         guard
@@ -475,6 +476,7 @@ impl InMemorySecretStore {
     /// Marks `namespace` as missing (`present = false`) or existing for
     /// [`SecretStateStore::namespace_exists`] (every namespace exists by default). Writes into a
     /// missing namespace fail like on a real API server.
+    #[cfg(any(test, feature = "test-support"))]
     pub async fn set_namespace_present(&self, namespace: &str, present: bool) {
         let mut guard = self.state.write().await;
         if present {
@@ -485,6 +487,7 @@ impl InMemorySecretStore {
     }
 
     /// Removes `namespace/name` (tests: simulate a lost Secret).
+    #[cfg(any(test, feature = "test-support"))]
     pub async fn remove_secret(&self, namespace: &str, name: &str) {
         let mut guard = self.state.write().await;
         guard
@@ -1019,60 +1022,22 @@ async fn get_tenant_age_key_impl<B: SecretBackend>(
             reason: "Secret data map is empty".to_string(),
         })?;
 
-    if let (Some(pub_bytes), Some(sec_bytes)) = (
-        data.get(AGE_PUBLIC_KEY_FIELD),
-        data.get(AGE_SECRET_KEY_FIELD),
-    ) {
-        let public_key =
-            String::from_utf8(pub_bytes.0.clone()).map_err(|_| KubeError::CorruptedSecret {
-                namespace: namespace.clone(),
-                name: TENANT_SOPS_AGE_SECRET_NAME.to_string(),
-                reason: "invalid UTF-8 in `public-key`".to_string(),
-            })?;
-        let secret_key =
-            String::from_utf8(sec_bytes.0.clone()).map_err(|_| KubeError::CorruptedSecret {
-                namespace: namespace.clone(),
-                name: TENANT_SOPS_AGE_SECRET_NAME.to_string(),
-                reason: "invalid UTF-8 in `secret-key`".to_string(),
-            })?;
-        return Ok(Some(TenantAgeKey::new(public_key, secret_key)));
-    }
-
-    // Fallback: parse standard Flux `age.agekey` format (`# public key: age1...\nAGE-SECRET-KEY-1...`)
-    let agekey_raw = data
-        .get(AGE_SECRET_FILE_FIELD)
-        .ok_or_else(|| KubeError::CorruptedSecret {
+    let field = |key: &str| -> Result<String, KubeError> {
+        let corrupted = |reason: String| KubeError::CorruptedSecret {
             namespace: namespace.clone(),
             name: TENANT_SOPS_AGE_SECRET_NAME.to_string(),
-            reason: format!("missing `{AGE_SECRET_FILE_FIELD}` field"),
-        })?;
-    let content =
-        String::from_utf8(agekey_raw.0.clone()).map_err(|_| KubeError::CorruptedSecret {
-            namespace: namespace.clone(),
-            name: TENANT_SOPS_AGE_SECRET_NAME.to_string(),
-            reason: format!("invalid UTF-8 in `{AGE_SECRET_FILE_FIELD}`"),
-        })?;
-
-    let mut public_key = String::new();
-    let mut secret_key = String::new();
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix("# public key:") {
-            public_key = rest.trim().to_string();
-        } else if trimmed.starts_with("AGE-SECRET-KEY-1") {
-            secret_key = trimmed.to_string();
-        }
-    }
-
-    if secret_key.is_empty() {
-        return Err(KubeError::CorruptedSecret {
-            namespace,
-            name: TENANT_SOPS_AGE_SECRET_NAME.to_string(),
-            reason: "missing `AGE-SECRET-KEY-1` line in `age.agekey`".to_string(),
-        });
-    }
-
-    Ok(Some(TenantAgeKey::new(public_key, secret_key)))
+            reason,
+        };
+        let bytes = data
+            .get(key)
+            .ok_or_else(|| corrupted(format!("missing `{key}` field")))?;
+        String::from_utf8(bytes.0.clone())
+            .map_err(|_| corrupted(format!("invalid UTF-8 in `{key}`")))
+    };
+    Ok(Some(TenantAgeKey::new(
+        field(AGE_PUBLIC_KEY_FIELD)?,
+        field(AGE_SECRET_KEY_FIELD)?,
+    )))
 }
 
 async fn has_s3_credentials_impl(backend: &impl SecretBackend) -> Result<bool, KubeError> {
@@ -1499,30 +1464,6 @@ mod tests {
             .unwrap()
             .expect("tenant age key must be found");
         assert_eq!(fetched, age_key);
-
-        // Fallback parsing when only `age.agekey` is populated (Flux-created secret)
-        let flux_only_secret = Secret {
-            metadata: ObjectMeta {
-                name: Some(TENANT_SOPS_AGE_SECRET_NAME.to_string()),
-                namespace: Some("tenant-legacy".to_string()),
-                ..ObjectMeta::default()
-            },
-            data: Some(BTreeMap::from([(
-                AGE_SECRET_FILE_FIELD.to_string(),
-                ByteString(age_key.to_sops_agekey_file().into_bytes()),
-            )])),
-            ..Secret::default()
-        };
-        store
-            .upsert_secret("tenant-legacy", flux_only_secret)
-            .await
-            .unwrap();
-        let parsed_legacy = store
-            .get_tenant_age_key("legacy")
-            .await
-            .unwrap()
-            .expect("fallback parser must extract age keypair");
-        assert_eq!(parsed_legacy, age_key);
 
         // Unknown tenant returns Ok(None)
         assert!(store.get_tenant_age_key("unknown").await.unwrap().is_none());

@@ -55,7 +55,7 @@ const TENANT_SUBJECT_GROUPS: [&str; 1] = ["system:serviceaccounts:keel-previews"
 /// CEL: `true` when the request comes from a tenant subject (see the `TENANT_SUBJECT_*` lists),
 /// given CEL expressions for the requesting `username` (string) and `groups` (list). Matches the
 /// requesting user, never the target namespace, so Flux controllers writing tenant objects are
-/// not affected. Mirrored by [`is_tenant_subject`].
+/// not affected. Mirrored by the test-only `is_tenant_subject`.
 fn cel_tenant_subject(username: &str, groups: &str) -> String {
     let users = TENANT_SUBJECT_USER_PREFIXES
         .iter()
@@ -74,9 +74,10 @@ fn cel_tenant_subject(username: &str, groups: &str) -> String {
         .join(" || ")
 }
 
-/// Rust mirror of [`cel_tenant_subject`] (same lists), for callers and tests that need to know
-/// whether a requester is a tenant subject without a CEL evaluator.
-pub fn is_tenant_subject(username: &str, groups: &[&str]) -> bool {
+/// Rust mirror of [`cel_tenant_subject`] (same lists), so tests can check whether a requester is
+/// a tenant subject without a CEL evaluator.
+#[cfg(test)]
+pub(crate) fn is_tenant_subject(username: &str, groups: &[&str]) -> bool {
     TENANT_SUBJECT_USER_PREFIXES
         .iter()
         .any(|p| username.starts_with(p))
@@ -693,7 +694,7 @@ pub fn build_restrict_tenant_flux_sources_policy() -> Value {
 /// Generates `ValidatingPolicy/restrict-tenant-flux-source-status` (`policies.kyverno.io/v1`).
 ///
 /// Denies tenant subjects (`tenant-*` ServiceAccounts and groups, the `keel-previews` identity;
-/// see [`is_tenant_subject`]) every write to `*/status` of `source.toolkit.fluxcd.io` /
+/// see `cel_tenant_subject`) every write to `*/status` of `source.toolkit.fluxcd.io` /
 /// `source.extensions.fluxcd.io` objects, in any namespace: a forged `status.artifact` would make
 /// kustomize-controller apply another source's artifact (`NFR-SEC-02`). Fails closed.
 ///
@@ -758,7 +759,7 @@ const CEL_STACK_PROTECT_CONFIG_KEYS: &str = "['protect', 'keel:protect']";
 /// The PKO chart's aggregated `edit`/`admin` roles (`rbac.createClusterAggregationRoles`, pinned
 /// in the seed and Stage 0 PKO releases) grant every `pulumi.com` / `auto.pulumi.com` resource to
 /// tenant `admin`s, which tenant Stacks and Programs need. They also cover the operator's own
-/// objects, so this policy denies **tenant subjects** ([`is_tenant_subject`]), in any namespace:
+/// objects, so this policy denies **tenant subjects** (`cel_tenant_subject`), in any namespace:
 ///
 /// * every `CREATE`/`UPDATE`/`DELETE` of `auto.pulumi.com` objects (`Workspace`, `Update` and
 ///   their `status`): they are operator-owned and tenants go through Stacks. This removes a
@@ -1322,6 +1323,22 @@ impl KyvernoManifestBundle {
         Ok(docs.join("---\n"))
     }
 }
+
+/// Kinds the platform writes in a tenant's baseline files (`rbac.yaml`, `git-repository.yaml`,
+/// `sync.yaml`) and labels [`PLATFORM_OWNED_LABEL`]; every one must be matched by
+/// `protect-platform-owned-tenant-objects`.
+#[cfg(test)]
+pub(crate) const PLATFORM_OWNED_KINDS: [&str; 9] = [
+    "Namespace",
+    "ServiceAccount",
+    "ResourceQuota",
+    "LimitRange",
+    "NetworkPolicy",
+    "RoleBinding",
+    "ClusterRoleBinding",
+    "GitRepository",
+    "Kustomization",
+];
 
 #[cfg(test)]
 mod tests {
@@ -2085,7 +2102,7 @@ mod tests {
                 .any(|r| { r["apiGroups"] == json!([""]) && r["resources"] == json!(["secrets"]) })
         );
         // Every platform-owned kind is matched by some rule.
-        for kind in crate::PLATFORM_OWNED_KINDS {
+        for kind in PLATFORM_OWNED_KINDS {
             let resource = match kind {
                 "GitRepository" => "gitrepositories",
                 "Kustomization" => "kustomizations",

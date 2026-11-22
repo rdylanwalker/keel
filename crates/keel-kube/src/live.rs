@@ -200,40 +200,18 @@ pub trait LiveStatusSource: Send + Sync {
     /// Returns `(namespace, name) -> LiveResourceStatus` for PKO v2 `Stack` resources.
     async fn stack_statuses(&self) -> HashMap<(String, String), LiveResourceStatus>;
 
-    /// Returns `(namespace, name) -> LiveResourceStatus` for Flux `HelmRelease` and `Kustomization` resources.
-    async fn release_statuses(&self) -> HashMap<(String, String), LiveResourceStatus>;
-
     /// Returns `(namespace, name) -> LiveResourceInfo` for PKO v2 `Stack` resources.
-    async fn stack_status_details(&self) -> HashMap<(String, String), LiveResourceInfo> {
-        self.stack_statuses()
-            .await
-            .into_iter()
-            .map(|(k, status)| (k, LiveResourceInfo::from_status(status)))
-            .collect()
-    }
+    async fn stack_status_details(&self) -> HashMap<(String, String), LiveResourceInfo>;
 
     /// Returns `(namespace, name) -> LiveResourceInfo` for Flux `HelmRelease` and `Kustomization` resources.
-    async fn release_status_details(&self) -> HashMap<(String, String), LiveResourceInfo> {
-        self.release_statuses()
-            .await
-            .into_iter()
-            .map(|(k, status)| (k, LiveResourceInfo::from_status(status)))
-            .collect()
-    }
+    async fn release_status_details(&self) -> HashMap<(String, String), LiveResourceInfo>;
 
     /// Returns `(namespace, name) -> LiveResourceInfo` for Flux `HelmRelease` resources only.
-    ///
-    /// Defaults to [`LiveStatusSource::release_status_details`] for sources that do not
-    /// distinguish Flux kinds.
-    async fn helm_release_status_details(&self) -> HashMap<(String, String), LiveResourceInfo> {
-        self.release_status_details().await
-    }
+    async fn helm_release_status_details(&self) -> HashMap<(String, String), LiveResourceInfo>;
 
     /// Returns `(namespace, name) -> LiveResourceInfo` for Flux `Kustomization` resources only
-    /// (e.g. plain-manifest management add-ons in `flux-system`). Empty by default.
-    async fn kustomization_status_details(&self) -> HashMap<(String, String), LiveResourceInfo> {
-        HashMap::new()
-    }
+    /// (e.g. plain-manifest management add-ons in `flux-system`).
+    async fn kustomization_status_details(&self) -> HashMap<(String, String), LiveResourceInfo>;
 
     /// Returns `(namespace, name) -> CanaryStatusInfo` for Flagger `Canary` resources.
     async fn canary_statuses(&self) -> HashMap<(String, String), CanaryStatusInfo> {
@@ -350,7 +328,8 @@ impl KubeClusterStatusReader {
     }
 
     /// Overrides the CRD status LIST cache TTL (`Duration::ZERO` disables caching).
-    pub fn with_status_cache_ttl(mut self, ttl: Duration) -> Self {
+    #[cfg(test)]
+    fn with_status_cache_ttl(mut self, ttl: Duration) -> Self {
         self.cache_ttl = ttl;
         self
     }
@@ -981,32 +960,6 @@ impl LiveStatusSource for KubeClusterStatusReader {
             }
         }
 
-        out
-    }
-
-    async fn release_statuses(&self) -> HashMap<(String, String), LiveResourceStatus> {
-        let mut out = self
-            .list_dynamic_statuses(
-                "helm.toolkit.fluxcd.io",
-                "v2",
-                "HelmRelease",
-                "helmreleases",
-                false,
-            )
-            .await;
-
-        let kustomizations = self
-            .list_dynamic_statuses(
-                "kustomize.toolkit.fluxcd.io",
-                "v1",
-                "Kustomization",
-                "kustomizations",
-                false,
-            )
-            .await;
-        for (key, st) in kustomizations {
-            out.entry(key).or_insert(st);
-        }
         out
     }
 
@@ -2566,41 +2519,27 @@ current-context: workload
     #[async_trait]
     impl LiveStatusSource for StubLiveStatus {
         async fn stack_statuses(&self) -> HashMap<(String, String), LiveResourceStatus> {
-            HashMap::from([(
-                ("tenant-a".to_string(), "s1".to_string()),
-                LiveResourceStatus::Ready,
-            )])
+            HashMap::new()
         }
-
-        async fn release_statuses(&self) -> HashMap<(String, String), LiveResourceStatus> {
-            HashMap::from([(
-                ("tenant-a".to_string(), "r1".to_string()),
-                LiveResourceStatus::Synced,
-            )])
+        async fn stack_status_details(&self) -> HashMap<(String, String), LiveResourceInfo> {
+            HashMap::new()
+        }
+        async fn release_status_details(&self) -> HashMap<(String, String), LiveResourceInfo> {
+            HashMap::new()
+        }
+        async fn helm_release_status_details(&self) -> HashMap<(String, String), LiveResourceInfo> {
+            HashMap::new()
+        }
+        async fn kustomization_status_details(
+            &self,
+        ) -> HashMap<(String, String), LiveResourceInfo> {
+            HashMap::new()
         }
     }
 
     #[tokio::test]
     async fn live_status_source_default_methods_cover_fallbacks() {
         let stub = StubLiveStatus;
-        let s_details = stub.stack_status_details().await;
-        assert_eq!(
-            s_details
-                .get(&("tenant-a".to_string(), "s1".to_string()))
-                .unwrap()
-                .status,
-            LiveResourceStatus::Ready
-        );
-        let r_details = stub.release_status_details().await;
-        assert_eq!(
-            r_details
-                .get(&("tenant-a".to_string(), "r1".to_string()))
-                .unwrap()
-                .status,
-            LiveResourceStatus::Synced
-        );
-        assert_eq!(stub.helm_release_status_details().await, r_details);
-        assert!(stub.kustomization_status_details().await.is_empty());
         assert!(stub.canary_statuses().await.is_empty());
         assert!(stub.stack_diagnostics("tenant-a", "s1").await.is_none());
         assert!(stub.release_diagnostics("tenant-a", "r1").await.is_none());
@@ -3065,13 +3004,13 @@ current-context: workload
         let stack_details = reader.stack_status_details().await;
         assert!(stack_details.contains_key(&("tenant-a".to_string(), "my-stack".to_string())));
 
-        let releases = reader.release_statuses().await;
-        assert_eq!(
-            releases.get(&("tenant-a".to_string(), "podinfo".to_string())),
-            Some(&LiveResourceStatus::Ready)
-        );
         let release_details = reader.release_status_details().await;
-        assert!(release_details.contains_key(&("tenant-a".to_string(), "podinfo".to_string())));
+        assert_eq!(
+            release_details
+                .get(&("tenant-a".to_string(), "podinfo".to_string()))
+                .map(|i| i.status.clone()),
+            Some(LiveResourceStatus::Ready)
+        );
         let core_key = (
             "flux-system".to_string(),
             "management-cluster-core".to_string(),

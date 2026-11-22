@@ -171,12 +171,15 @@ fn stub_contains_the_baseline_source_and_sync_and_no_secret() {
     for (path, yaml) in &stub.files {
         ensure_git_safe_manifests(path, yaml).unwrap();
         // Every stub object is platform-owned (Kyverno-protected) and in the tenant namespace.
-        assert!(!crate::platform_owned_labels_missing(yaml), "{path}");
         for doc in keel_core::split_yaml_documents(yaml) {
             let v: Value = serde_yml::from_str(&doc).unwrap();
             let kind = v["kind"].as_str().unwrap().to_string();
+            assert_eq!(
+                v["metadata"]["labels"][PLATFORM_OWNED_LABEL], "true",
+                "{path} {kind}"
+            );
             assert!(
-                crate::PLATFORM_OWNED_KINDS.contains(&kind.as_str()),
+                crate::kyverno::PLATFORM_OWNED_KINDS.contains(&kind.as_str()),
                 "{kind}"
             );
             if kind != "Namespace" && kind != "ClusterRoleBinding" {
@@ -184,9 +187,6 @@ fn stub_contains_the_baseline_source_and_sync_and_no_secret() {
             }
             kinds.push(kind);
         }
-        // Every stub file is a platform-owned tenant file.
-        let file = path.rsplit('/').next().unwrap();
-        assert!(crate::PLATFORM_OWNED_TENANT_FILES.contains(&file), "{file}");
     }
     // Quota, LimitRange and NetworkPolicies stay in the platform stub (the tenant SA cannot
     // write them; one in the tenant repository would fail the tenant's whole apply).
@@ -625,28 +625,13 @@ fn pko_operator_known_hosts_configmap_merges_public_host_keys() {
 
 #[test]
 fn tenant_repo_kustomization_lists_only_tenant_resources() {
-    let monorepo: Vec<String> = [
-        "default/rbac.yaml",
-        "acme/rbac.yaml",
-        "acme/git-repository.yaml",
-        "acme/sync.yaml",
-        "acme/apps/web/release.yaml",
-        "acme/apps/web/secrets.enc.yaml",
-        "acme/apps/web/release.yaml",
-        "acme-two/apps/x/release.yaml",
-        "acme/infra/vm/stack.yaml",
+    let resources: Vec<String> = [
+        "apps/web/release.yaml",
+        "apps/web/secrets.enc.yaml",
+        "infra/vm/stack.yaml",
     ]
     .map(str::to_string)
     .to_vec();
-    let resources = tenant_repo_resources_from_monorepo("acme", &monorepo).unwrap();
-    assert_eq!(
-        resources,
-        [
-            "apps/web/release.yaml",
-            "apps/web/secrets.enc.yaml",
-            "infra/vm/stack.yaml"
-        ]
-    );
     let yaml = build_tenant_repo_kustomization_yaml("acme", &resources).unwrap();
     let v: Value = serde_yml::from_str(&yaml).unwrap();
     assert_eq!(v["kind"], "Kustomization");
@@ -655,19 +640,7 @@ fn tenant_repo_kustomization_lists_only_tenant_resources() {
         serde_yml::from_str(&build_tenant_repo_kustomization_yaml("acme", &[]).unwrap()).unwrap();
     assert_eq!(empty["resources"], json!([]));
     assert!(build_tenant_repo_kustomization_yaml("acme", &["sync.yaml".to_string()]).is_err());
-    for bad in [
-        "acme/../default/rbac.yaml",
-        "acme//x.yaml",
-        "acme/./x.yaml",
-        "acme/a\\b",
-        "acme/github.com/o/r?ref=main",
-    ] {
-        assert!(
-            tenant_repo_resources_from_monorepo("acme", &[bad.to_string()]).is_err(),
-            "{bad}"
-        );
-    }
-    // The builder refuses remote bases and paths outside `tenants/<id>/` itself.
+    // The builder refuses remote bases and paths outside `tenants/<id>/`.
     for bad in [
         "https://example.com/base.yaml",
         "github.com/o/r/deploy?ref=v1",

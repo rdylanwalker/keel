@@ -1600,9 +1600,32 @@ mod tests {
             self.stacks.clone()
         }
 
-        async fn release_statuses(&self) -> HashMap<(String, String), LiveResourceStatus> {
-            self.releases.clone()
+        async fn stack_status_details(&self) -> HashMap<(String, String), LiveResourceInfo> {
+            infos(&self.stacks)
         }
+
+        async fn release_status_details(&self) -> HashMap<(String, String), LiveResourceInfo> {
+            infos(&self.releases)
+        }
+
+        async fn helm_release_status_details(&self) -> HashMap<(String, String), LiveResourceInfo> {
+            infos(&self.releases)
+        }
+
+        async fn kustomization_status_details(
+            &self,
+        ) -> HashMap<(String, String), LiveResourceInfo> {
+            HashMap::new()
+        }
+    }
+
+    fn infos(
+        statuses: &HashMap<(String, String), LiveResourceStatus>,
+    ) -> HashMap<(String, String), LiveResourceInfo> {
+        statuses
+            .iter()
+            .map(|(k, status)| (k.clone(), LiveResourceInfo::from_status(status.clone())))
+            .collect()
     }
 
     struct KindSplitLiveStatus;
@@ -1613,7 +1636,11 @@ mod tests {
             HashMap::new()
         }
 
-        async fn release_statuses(&self) -> HashMap<(String, String), LiveResourceStatus> {
+        async fn stack_status_details(&self) -> HashMap<(String, String), LiveResourceInfo> {
+            HashMap::new()
+        }
+
+        async fn release_status_details(&self) -> HashMap<(String, String), LiveResourceInfo> {
             HashMap::new()
         }
 
@@ -1789,7 +1816,7 @@ mod tests {
             ("tenant-acme".to_string(), "podinfo".to_string()),
             LiveResourceStatus::Ready,
         );
-        // Simulate a Flux Kustomization wrapper for the `dev-kind` Stack appearing in release_statuses()
+        // Simulate a Flux Kustomization wrapper for the `dev-kind` Stack appearing in the release statuses
         releases.insert(
             ("tenant-acme".to_string(), "dev-kind".to_string()),
             LiveResourceStatus::Ready,
@@ -1947,13 +1974,25 @@ mod tests {
                 .map(|(k, v)| (k.clone(), v.status.clone()))
                 .collect()
         }
-        async fn release_statuses(&self) -> HashMap<(String, String), LiveResourceStatus> {
-            HashMap::new()
-        }
         async fn stack_status_details(
             &self,
         ) -> HashMap<(String, String), keel_kube::LiveResourceInfo> {
             self.stacks.clone()
+        }
+        async fn release_status_details(
+            &self,
+        ) -> HashMap<(String, String), keel_kube::LiveResourceInfo> {
+            HashMap::new()
+        }
+        async fn helm_release_status_details(
+            &self,
+        ) -> HashMap<(String, String), keel_kube::LiveResourceInfo> {
+            HashMap::new()
+        }
+        async fn kustomization_status_details(
+            &self,
+        ) -> HashMap<(String, String), keel_kube::LiveResourceInfo> {
+            HashMap::new()
         }
     }
 

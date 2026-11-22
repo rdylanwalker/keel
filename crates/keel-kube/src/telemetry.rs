@@ -454,7 +454,8 @@ impl TelemetryMux {
     }
 
     /// Returns the current number of active SSE/CLI subscribers.
-    pub fn subscriber_count(&self) -> usize {
+    #[cfg(test)]
+    fn subscriber_count(&self) -> usize {
         self.sender.receiver_count()
     }
 

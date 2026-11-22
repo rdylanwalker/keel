@@ -124,70 +124,6 @@ pub(crate) fn platform_owned_labels(tenant_id: &str) -> BTreeMap<String, String>
     labels
 }
 
-/// Kinds the platform writes in a tenant's baseline files and labels [`PLATFORM_OWNED_LABEL`]
-/// (all matched by Kyverno `protect-platform-owned-tenant-objects`). `Kustomization` is the
-/// per-tenant repository stub's `keel-tenant-root` (`tenants/<id>/sync.yaml`).
-pub const PLATFORM_OWNED_KINDS: [&str; 9] = [
-    "Namespace",
-    "ServiceAccount",
-    "ResourceQuota",
-    "LimitRange",
-    "NetworkPolicy",
-    "RoleBinding",
-    "ClusterRoleBinding",
-    "GitRepository",
-    "Kustomization",
-];
-
-/// Platform-written files under `tenants/<id>/` whose objects carry [`PLATFORM_OWNED_LABEL`]:
-/// the tenant baseline, the `keel-gitops` source stub and (per-tenant repositories) the
-/// `keel-tenant-root` sync stub ([`crate::tenant_repo::TENANT_REPO_STUB_FILES`]).
-pub const PLATFORM_OWNED_TENANT_FILES: [&str; 3] =
-    ["rbac.yaml", "git-repository.yaml", "sync.yaml"];
-
-/// `true` when `doc` is an object the platform owns in a platform-written tenant file: a
-/// [`PLATFORM_OWNED_KINDS`] kind, matched by API group where the kind name is ambiguous. A
-/// `GitRepository` must be Flux `source.toolkit.fluxcd.io`; a `Kustomization` must be the Flux
-/// `kustomize.toolkit.fluxcd.io` root `keel-tenant-root` (never a `kustomize.config.k8s.io`
-/// config file or a tenant-authored Flux Kustomization, which Kyverno would then lock).
-fn is_platform_owned_object(doc: &Value) -> bool {
-    let Some(kind) = doc.get("kind").and_then(Value::as_str) else {
-        return false;
-    };
-    let api_version = doc
-        .get("apiVersion")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    match kind {
-        "GitRepository" => api_version.starts_with("source.toolkit.fluxcd.io/"),
-        "Kustomization" => {
-            api_version.starts_with("kustomize.toolkit.fluxcd.io/")
-                && doc.pointer("/metadata/name").and_then(Value::as_str)
-                    == Some(crate::tenant_repo::TENANT_ROOT_KUSTOMIZATION_NAME)
-        }
-        other => PLATFORM_OWNED_KINDS.contains(&other),
-    }
-}
-
-fn needs_platform_owned_label(doc: &Value) -> bool {
-    is_platform_owned_object(doc)
-        && doc.pointer(&format!(
-            "/metadata/labels/{}",
-            PLATFORM_OWNED_LABEL.replace('~', "~0").replace('/', "~1")
-        )) != Some(&json!("true"))
-}
-
-/// `true` when some object of a platform-written tenant file ([`PLATFORM_OWNED_TENANT_FILES`])
-/// lacks `keel.io/platform-owned: "true"`. Unparsable documents count as unlabelled.
-pub fn platform_owned_labels_missing(yaml: &str) -> bool {
-    keel_core::split_yaml_documents(yaml).iter().any(|doc| {
-        match serde_yml::from_str::<Value>(doc) {
-            Ok(value) => needs_platform_owned_label(&value),
-            Err(_) => true,
-        }
-    })
-}
-
 fn tenant_common_labels(tenant_id: &str) -> BTreeMap<String, String> {
     BTreeMap::from([
         (
@@ -679,19 +615,6 @@ impl HelmValuesSecretRef {
             name: name.into(),
             values_key: None,
             target_path: None,
-            optional: None,
-        }
-    }
-
-    pub fn with_key_and_target(
-        name: impl Into<String>,
-        values_key: impl Into<String>,
-        target_path: impl Into<String>,
-    ) -> Self {
-        Self {
-            name: name.into(),
-            values_key: Some(values_key.into()),
-            target_path: Some(target_path.into()),
             optional: None,
         }
     }
@@ -1430,13 +1353,6 @@ pub fn synthesize_flux_kustomization_yaml(
     Ok(serde_yml::to_string(&manifest)?)
 }
 
-/// Alias for [`synthesize_flux_kustomization_yaml`] generating a `kustomize.toolkit.fluxcd.io/v1` `Kustomization` YAML.
-pub fn generate_flux_kustomization_manifest(
-    input: &FluxKustomizationSpecInput,
-) -> Result<String, KubeError> {
-    synthesize_flux_kustomization_yaml(input)
-}
-
 /// Sub-directory (relative to a manifest app's directory) holding the app's substitution
 /// sources: the values `ConfigMap` and the SOPS-encrypted `<app>-secrets` `Secret`.
 pub const MANIFEST_APP_CONFIG_DIR: &str = "config";
@@ -2040,37 +1956,12 @@ mod tests {
             .unwrap()
             .to_multi_doc_yaml()
             .unwrap();
-        assert!(!platform_owned_labels_missing(&current));
-        let unlabelled = current.replace("    keel.io/platform-owned: \"true\"\n", "");
-        assert_ne!(unlabelled, current, "label line format changed");
-        assert!(platform_owned_labels_missing(&unlabelled));
-        // A label set to anything but "true" does not count; unparsable YAML counts as unlabelled.
-        let wrong = "apiVersion: v1\nkind: ServiceAccount\nmetadata:\n  name: s\n  labels:\n    keel.io/platform-owned: 'false'\n";
-        assert!(platform_owned_labels_missing(wrong));
-        assert!(platform_owned_labels_missing("kind: ["));
-    }
-
-    /// Only the Flux `keel-tenant-root` Kustomization and Flux GitRepositories are platform-owned
-    /// by kind name; kustomize config files and tenant-authored Flux Kustomizations in an
-    /// existing `sync.yaml` / `rbac.yaml` never need the label (Kyverno would lock them).
-    #[test]
-    fn only_the_flux_tenant_root_kustomization_is_platform_owned() {
-        let root = serde_yml::to_string(
-            &crate::tenant_repo::build_tenant_root_kustomization("acme").unwrap(),
-        )
-        .unwrap();
-        assert!(!platform_owned_labels_missing(&root));
-        let unlabelled_root = root.replace("    keel.io/platform-owned: 'true'\n", "");
-        let unlabelled_root = unlabelled_root.replace("    keel.io/platform-owned: \"true\"\n", "");
-        assert_ne!(unlabelled_root, root, "label line format changed");
-        assert!(platform_owned_labels_missing(&unlabelled_root));
-
-        let kustomize_config = "apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\nresources:\n- apps/web/release.yaml\n";
-        let tenant_flux = "apiVersion: kustomize.toolkit.fluxcd.io/v1\nkind: Kustomization\nmetadata:\n  name: web\n  namespace: tenant-acme\nspec:\n  path: ./tenants/acme/apps/web\n";
-        let foreign_git_repository =
-            "apiVersion: example.com/v1\nkind: GitRepository\nmetadata:\n  name: x\n";
-        for doc in [kustomize_config, tenant_flux, foreign_git_repository] {
-            assert!(!platform_owned_labels_missing(doc), "{doc}");
+        for doc in keel_core::split_yaml_documents(&current) {
+            let v: Value = serde_yml::from_str(&doc).unwrap();
+            assert_eq!(
+                v["metadata"]["labels"][PLATFORM_OWNED_LABEL], "true",
+                "{doc}"
+            );
         }
     }
 
@@ -2728,11 +2619,12 @@ mod tests {
             "postgresql": { "enabled": false }
         }));
         input.values_from_secrets = vec![
-            HelmValuesSecretRef::with_key_and_target(
-                "postgres-managed-outputs",
-                "db_host",
-                "authentik.postgresql.host",
-            ),
+            HelmValuesSecretRef {
+                name: "postgres-managed-outputs".to_string(),
+                values_key: Some("db_host".to_string()),
+                target_path: Some("authentik.postgresql.host".to_string()),
+                optional: None,
+            },
             HelmValuesSecretRef {
                 name: "authentik-sops-secrets".to_string(),
                 values_key: Some("db_password".to_string()),
@@ -2919,7 +2811,7 @@ mod tests {
             },
         ];
 
-        let yaml = generate_flux_kustomization_manifest(&input).unwrap();
+        let yaml = synthesize_flux_kustomization_yaml(&input).unwrap();
         let doc: Value = serde_yml::from_str(&yaml).unwrap();
         assert_eq!(doc["apiVersion"], "kustomize.toolkit.fluxcd.io/v1");
         assert_eq!(doc["kind"], "Kustomization");

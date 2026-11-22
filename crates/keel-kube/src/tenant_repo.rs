@@ -355,37 +355,6 @@ pub fn synthesize_tenant_repo_stub(
     })
 }
 
-/// Paths (relative to `tenants/<id>/` of the tenant repository) of the tenant's resources in the
-/// monorepo `tenants/kustomization.yaml` (`resources` entries `<id>/...`), without the platform
-/// stub files, for the tenant repository's own `tenants/<id>/kustomization.yaml` (the root
-/// Kustomization must apply exactly the listed files, never every YAML below `tenants/<id>`:
-/// manifest apps keep `${var}` templates that only their own Kustomization substitutes).
-pub fn tenant_repo_resources_from_monorepo(
-    tenant_id: &str,
-    monorepo_resources: &[String],
-) -> Result<Vec<String>, KubeError> {
-    tenant_namespace(tenant_id)?;
-    let prefix = format!("{tenant_id}/");
-    let mut out = Vec::new();
-    for entry in monorepo_resources {
-        let Some(rel) = entry.trim().strip_prefix(&prefix) else {
-            continue;
-        };
-        if TENANT_REPO_STUB_FILES.contains(&rel) {
-            continue;
-        }
-        if !is_contained_tenant_resource(rel) {
-            return Err(KubeError::InvalidInput(format!(
-                "tenants/kustomization.yaml entry `{entry}` is not a contained tenant path"
-            )));
-        }
-        if !out.contains(&rel.to_string()) {
-            out.push(rel.to_string());
-        }
-    }
-    Ok(out)
-}
-
 /// `true` when `rel` (a kustomize `resources` entry relative to `tenants/<id>/`) is a plain
 /// relative path inside the tenant directory. kustomize-controller (in `flux-system`, outside the
 /// tenant NetworkPolicies, without `--no-remote-bases`) would otherwise fetch remote bases
@@ -404,9 +373,11 @@ fn is_contained_tenant_resource(rel: &str) -> bool {
 }
 
 /// Renders the tenant repository's `tenants/<id>/kustomization.yaml` listing `resources`
-/// (relative to `tenants/<id>/`, see [`tenant_repo_resources_from_monorepo`]). Refuses the
-/// platform stub files, which the tenant ServiceAccount cannot apply, and anything that is not a
-/// contained relative path (remote bases, `..`, absolute paths).
+/// (relative to `tenants/<id>/`). The root Kustomization must apply exactly the listed files,
+/// never every YAML below `tenants/<id>`: manifest apps keep `${var}` templates that only their
+/// own Kustomization substitutes. Refuses the platform stub files, which the tenant
+/// ServiceAccount cannot apply, and anything that is not a contained relative path (remote
+/// bases, `..`, absolute paths).
 pub fn build_tenant_repo_kustomization_yaml(
     tenant_id: &str,
     resources: &[String],
@@ -439,10 +410,6 @@ pub fn build_tenant_repo_kustomization_yaml(
 /// (`keel-gitops-credentials`, the monorepo-layout `git-credentials`, or one labelled with their
 /// `keel.io/secret-kind`), even encrypted. Objects nested in `kind: List` (or any `*List`)
 /// `items` are checked too. Unparsable documents are refused.
-///
-/// Today only [`synthesize_tenant_repo_stub`] runs it. TODO(per-tenant repos, workflow 2): call it
-/// from the shared commit/staging helper of keel-server and the CLI (tenant creation bundle,
-/// proposals, bootstrap `files_to_write`) so every Git write path goes through it.
 pub fn ensure_git_safe_manifests(path: &str, yaml: &str) -> Result<(), KubeError> {
     let refuse = |why: &str| {
         KubeError::InvalidInput(format!(
