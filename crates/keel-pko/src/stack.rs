@@ -2752,7 +2752,7 @@ mod tests {
         ] {
             assert!(validate_git_source_url(ok).is_ok(), "{ok}");
         }
-        for bad in [
+        for (i, bad) in [
             "",
             " https://forge.example/x.git",
             "/tmp/keel-gitops.git",
@@ -2765,13 +2765,20 @@ mod tests {
             "https://forge.example/x.git\nevil",
             "forge.example:keel/gitops.git",
             "https://keel:token@forge.example/keel/gitops.git",
-        ] {
-            assert!(validate_git_source_url(bad).is_err(), "{bad}");
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            // Index only: some cases embed sample credentials.
+            assert!(validate_git_source_url(bad).is_err(), "bad URL case #{i}");
         }
         let err = validate_git_source_url("https://keel:s3cr3t-token@forge.example/x.git")
             .unwrap_err()
             .to_string();
-        assert!(!err.contains("s3cr3t-token"), "{err}");
+        assert!(
+            !err.contains("s3cr3t-token"),
+            "git source URL error echoed the token"
+        );
         assert!(is_ssh_git_url("git@github.com:acme/gitops.git"));
         assert!(!is_ssh_git_url("https://github.com/acme/gitops.git"));
 

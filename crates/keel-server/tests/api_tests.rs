@@ -5957,7 +5957,10 @@ spec:
     assert_eq!(res.status(), StatusCode::OK);
     let body = res.into_body().collect().await.unwrap().to_bytes();
     let body_str = String::from_utf8_lossy(&body);
-    assert!(!body_str.contains("outside-secret-marker"), "{body_str}");
+    assert!(
+        !body_str.contains("outside-secret-marker"),
+        "catalog response leaked the outside-repo secret marker"
+    );
     let catalog: Value = serde_json::from_slice(&body).unwrap();
     assert!(catalog["manifestsYaml"].get("leaky").is_none());
     assert!(catalog["pulumiYaml"].get("leaky-bp").is_none());
@@ -6036,11 +6039,18 @@ async fn test_rauthy_catalog_app_proposal_keeps_secrets_out_of_git() {
     let git = &fixture.state.git_runner;
     let workdir = &fixture.state.repo_workdir;
 
-    let secrets = [
-        ("encKey", "q2Vz7mU0ZcV1x7pYb7Yk2r9mD0aH3sW5tL8nQ4eR6fA="),
-        ("hiqliteSecretRaft", "raftSecretSampleValue-0123456789"),
-        ("hiqliteSecretApi", "apiSecretSampleValue-9876543210"),
-        ("adminPassword", "Sample-Admin#Passw0rd!"),
+    // Field names and sample values are kept apart so assertion messages name only the field.
+    let fields = [
+        "encKey",
+        "hiqliteSecretRaft",
+        "hiqliteSecretApi",
+        "adminPassword",
+    ];
+    let samples = [
+        "q2Vz7mU0ZcV1x7pYb7Yk2r9mD0aH3sW5tL8nQ4eR6fA=",
+        "raftSecretSampleValue-0123456789",
+        "apiSecretSampleValue-9876543210",
+        "Sample-Admin#Passw0rd!",
     ];
     let mut values = json!({
         "hostname": "auth.acme.example",
@@ -6050,8 +6060,8 @@ async fn test_rauthy_catalog_app_proposal_keeps_secrets_out_of_git() {
         "storageSize": "1Gi",
         "encKeyId": "acme1",
     });
-    for (k, v) in secrets {
-        values[k] = json!(v);
+    for (i, field) in fields.into_iter().enumerate() {
+        values[field] = json!(samples[i]);
     }
     let res = app
         .oneshot(
@@ -6088,8 +6098,11 @@ async fn test_rauthy_catalog_app_proposal_keeps_secrets_out_of_git() {
     let dir = workdir.join("tenants/acme/apps/rauthy");
     let read = |name: &str| std::fs::read_to_string(dir.join(name)).unwrap();
     let committed = read_tree(&dir);
-    for (field, value) in secrets {
-        assert!(!committed.contains(value), "{field} committed in plaintext");
+    for (i, field) in fields.into_iter().enumerate() {
+        assert!(
+            !committed.contains(samples[i]),
+            "{field} committed in plaintext"
+        );
     }
 
     let manifests = read("manifests.yaml");
@@ -9691,14 +9704,16 @@ async fn test_keel_server_catalog_app_rejects_management_cluster_and_bad_request
     ];
     for (req, needle) in cases {
         let (status, body) = post_proposal(&fixture, &cookie, req.clone()).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{req}: {body}");
-        assert!(body.contains(needle), "{needle}: {body}");
+        // Checked first (and never interpolated) so later messages only print a secret-free body;
+        // the request itself carries sample secrets, so messages name the case by its needle.
         for secret in [
             "oidc-Client-Secret-0123456789",
             "glpat-SampleGitToken0123456789",
         ] {
-            assert!(!body.contains(secret), "secret echoed: {body}");
+            assert!(!body.contains(secret), "{needle}: secret echoed");
         }
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{needle}: {body}");
+        assert!(body.contains(needle), "{needle}: {body}");
     }
     assert_eq!(git.rev_parse(workdir, "HEAD").await.unwrap(), head_before);
 }
@@ -9802,15 +9817,19 @@ async fn test_keel_server_catalog_app_installs_once_per_cluster() {
                 "values": keel_server_values("keel2.team-a.example.com") }),
     )
     .await;
-    assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert!(body.contains("once per cluster"), "{body}");
-    assert!(body.contains("tenants/acme/apps/keel-server"), "{body}");
+    // Checked first (and never interpolated) so later messages only print a secret-free body.
     for secret in [
         "oidc-Client-Secret-0123456789",
         "glpat-SampleGitToken0123456789",
     ] {
-        assert!(!body.contains(secret), "secret echoed: {body}");
+        assert!(
+            !body.contains(secret),
+            "secret echoed in the conflict response"
+        );
     }
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body.contains("once per cluster"), "{body}");
+    assert!(body.contains("tenants/acme/apps/keel-server"), "{body}");
     assert_eq!(git.rev_parse(&workdir, "HEAD").await.unwrap(), head_before);
 
     // Editing the installed instance is not a second install.

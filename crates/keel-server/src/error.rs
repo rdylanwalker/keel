@@ -468,7 +468,10 @@ mod tests {
             let body = body_json(err.into_response()).await;
             let msg = body["error"].as_str().unwrap();
             let cid = body["correlationId"].as_str().unwrap();
-            assert!(!msg.contains("secret-path"), "{msg}");
+            assert!(
+                !msg.contains("secret-path"),
+                "error response leaked the internal path"
+            );
             assert!(msg.contains(cid));
             assert!(uuid::Uuid::parse_str(cid).is_ok());
         }

@@ -2844,14 +2844,18 @@ mod security_hardening_tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("--with-forge and --git-url"), "{err}");
-        for bad in [
+        // Messages carry the case index only: some cases embed sample credentials.
+        for (i, bad) in [
             "git@github.com:acme/infra-gitops.git",
             "ssh://git@github.com/acme/infra-gitops.git",
             "file:///srv/git/infra-gitops.git",
             "https://user:token@github.com/acme/infra-gitops.git",
             "https://x-access-token@github.com/acme/infra-gitops.git",
             "/srv/git/infra-gitops.git",
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             assert!(
                 validate_keel_server_args(&parse(&[
                     "--with-keel-server",
@@ -2861,9 +2865,12 @@ mod security_hardening_tests {
                     bad
                 ]))
                 .is_err(),
-                "{bad} accepted"
+                "git URL case #{i} accepted"
             );
-            assert!(validate_keel_server_git_url(bad).is_err(), "{bad} accepted");
+            assert!(
+                validate_keel_server_git_url(bad).is_err(),
+                "git URL case #{i} accepted"
+            );
         }
     }
 
@@ -2922,13 +2929,17 @@ mod security_hardening_tests {
                 KeelServerTokenSource::Missing,
             ),
         ];
-        for (argv, expected) in cases {
+        // Messages carry the case index only: some argv vectors include a sample token.
+        for (i, (argv, expected)) in cases.iter().enumerate() {
             let mut args = parse(argv);
             if !argv.contains(&"--git-token") {
                 // Ignore an ambient `KEEL_GIT_TOKEN`.
                 args.git_token = None;
             }
-            assert_eq!(keel_server_token_source(&args), *expected, "{argv:?}");
+            assert!(
+                keel_server_token_source(&args) == *expected,
+                "token source case #{i}"
+            );
         }
     }
 
@@ -4122,27 +4133,32 @@ mod tenant_rauthy_app_tests {
     #[test]
     fn schema_rejects_values_that_would_break_flux_substitution() {
         let schema = app().spec.schema;
-        let reject = |field: &str, value: &str| {
-            let mut v = sample_values();
-            v[field] = json!(value);
-            assert!(
-                keel_core::validate_schema_values(&schema, &v).is_err(),
-                "{field}={value:?} accepted"
-            );
-        };
-        reject("adminPassword", "has\"quote-1234567");
-        reject("adminPassword", "has\\backslash-1234567");
-        reject("adminPassword", "has space-1234567890");
-        reject("adminPassword", "short");
+        // A macro (not a closure) so a failure points at the offending `reject!` line: the
+        // message names only the field, never the (possibly secret) sample value.
+        macro_rules! reject {
+            ($field:expr, $value:expr) => {{
+                let field: &str = $field;
+                let mut v = sample_values();
+                v[field] = json!($value);
+                assert!(
+                    keel_core::validate_schema_values(&schema, &v).is_err(),
+                    "{field}: invalid value accepted"
+                );
+            }};
+        }
+        reject!("adminPassword", "has\"quote-1234567");
+        reject!("adminPassword", "has\\backslash-1234567");
+        reject!("adminPassword", "has space-1234567890");
+        reject!("adminPassword", "short");
         // Flux postBuild also substitutes the decrypted `<instance>-secrets` Secret.
-        reject("adminPassword", "has${dollar}-1234567");
-        reject("adminPassword", "has$dollar-12345678");
-        reject("encKey", "not-base64");
-        reject("hiqliteSecretRaft", "tooshort");
-        reject("hiqliteSecretApi", "contains\"quote-123456");
-        reject("encKeyId", "bad/id");
-        reject("storageSize", "1Ti");
-        reject("publicPortSuffix", "8888");
+        reject!("adminPassword", "has${dollar}-1234567");
+        reject!("adminPassword", "has$dollar-12345678");
+        reject!("encKey", "not-base64");
+        reject!("hiqliteSecretRaft", "tooshort");
+        reject!("hiqliteSecretApi", "contains\"quote-123456");
+        reject!("encKeyId", "bad/id");
+        reject!("storageSize", "1Ti");
+        reject!("publicPortSuffix", "8888");
         let mut missing = sample_values();
         missing.as_object_mut().unwrap().remove("encKey");
         assert!(keel_core::validate_schema_values(&schema, &missing).is_err());
@@ -4151,13 +4167,16 @@ mod tenant_rauthy_app_tests {
     #[test]
     fn rendered_manifests_never_contain_plaintext_secrets() {
         let (rendered, secrets, docs) = render(&sample_values());
-        for (field, value) in [
-            ("encKey", SAMPLE_ENC_KEY),
-            ("hiqliteSecretRaft", SAMPLE_RAFT),
-            ("hiqliteSecretApi", SAMPLE_API),
-            ("adminPassword", SAMPLE_ADMIN_PASSWORD),
-        ] {
-            assert_eq!(secrets[field], value);
+        // Messages name only the field: secret sample values never reach test output.
+        let samples = [
+            SAMPLE_ENC_KEY,
+            SAMPLE_RAFT,
+            SAMPLE_API,
+            SAMPLE_ADMIN_PASSWORD,
+        ];
+        for (i, field) in SECRET_FIELDS.into_iter().enumerate() {
+            let value = samples[i];
+            assert!(secrets[field] == value, "{field} sample mismatch");
             assert!(!rendered.contains(value), "{field} leaked into manifests");
             // Left for Flux `postBuild.substituteFrom` (`<instance>-secrets`).
             assert!(rendered.contains(&format!("${{{field}}}")), "{field}");
@@ -4218,28 +4237,35 @@ mod tenant_rauthy_app_tests {
     #[test]
     fn rendered_manifests_are_tenant_namespaced_and_restricted_pss() {
         let (_, _, docs) = render(&sample_values());
+        let expected = [
+            "ConfigMap",
+            "Secret",
+            "Service",
+            "Service",
+            "StatefulSet",
+            "NetworkPolicy",
+            "HTTPRoute",
+        ];
         let kinds: Vec<&str> = docs.iter().filter_map(|d| d["kind"].as_str()).collect();
-        assert_eq!(
-            kinds,
-            [
-                "ConfigMap",
-                "Secret",
-                "Service",
-                "Service",
-                "StatefulSet",
-                "NetworkPolicy",
-                "HTTPRoute"
-            ]
+        assert!(
+            docs.len() == expected.len(),
+            "unexpected rendered document count"
         );
-        for d in &docs {
+        assert!(kinds == expected, "rendered kinds differ from {expected:?}");
+        // Messages name only the expected kind: rendered docs derive from secret samples.
+        for (i, kind) in expected.into_iter().enumerate() {
+            let d = &docs[i];
             // Flux `targetNamespace` pins every (namespaced) object into `tenant-<id>`.
-            assert!(d["metadata"].get("namespace").is_none(), "{}", d["kind"]);
+            assert!(
+                d["metadata"].get("namespace").is_none(),
+                "{kind} namespaced"
+            );
             // Must not collide with the Keel-generated `<instance>-values` ConfigMap and
             // `<instance>-secrets` Secret of the default instance name.
             let name = d["metadata"]["name"].as_str().unwrap();
             assert!(
                 name != "rauthy-values" && name != "rauthy-secrets",
-                "{name}"
+                "{kind} name collides with a Keel-generated object"
             );
         }
 
@@ -5495,11 +5521,11 @@ mod tenant_keel_server_app_tests {
         }
 
         let (rendered, secrets, docs) = render(&sample_values());
-        for (field, value) in [
-            ("oidcClientSecret", SAMPLE_CLIENT_SECRET),
-            ("gitToken", SAMPLE_GIT_TOKEN),
-        ] {
-            assert_eq!(secrets[field], value);
+        // Messages name only the field: secret sample values never reach test output.
+        let samples = [SAMPLE_CLIENT_SECRET, SAMPLE_GIT_TOKEN];
+        for (i, field) in SECRET_FIELDS.into_iter().enumerate() {
+            let value = samples[i];
+            assert!(secrets[field] == value, "{field} sample mismatch");
             assert!(!rendered.contains(value), "{field} leaked into manifests");
             // `${field}` stays for Flux `postBuild.substituteFrom` and never has a default
             // (Keel would otherwise render the default at proposal time).
@@ -5535,36 +5561,41 @@ mod tenant_keel_server_app_tests {
     #[test]
     fn schema_rejects_values_that_would_break_substitution_or_leak_credentials() {
         let schema = app().spec.schema;
-        let reject = |field: &str, value: &str| {
-            let mut v = sample_values();
-            v[field] = json!(value);
-            assert!(
-                keel_core::validate_schema_values(&schema, &v).is_err(),
-                "{field}={value:?} accepted"
-            );
-        };
-        // No credentials in URLs (the token is injected by keel, never via the remote URL).
-        reject("gitUrl", "https://user:pw@git.example.com/a/b.git");
-        reject("gitUrl", "ssh://git@git.example.com/a/b.git");
-        reject("gitUrl", "https://git.example.com/a/${b}.git");
-        // The Git token is sent on every clone/fetch/push: never over cleartext HTTP.
-        reject("gitUrl", "http://git.example.com/team-a/infra-gitops.git");
-        reject("oidcIssuerUrl", "http://auth.team-a.example.com");
-        reject("oidcIssuerUrl", "https://auth.example.com/\"x");
-        for secret in SECRET_FIELDS {
-            reject(secret, "short");
-            reject(secret, "has space-1234567890");
-            reject(secret, "has\"quote-1234567");
-            reject(secret, "has\\backslash-1234567");
-            reject(secret, "has${dollar}-1234567");
+        // A macro (not a closure) so a failure points at the offending `reject!` line: the
+        // message names only the field, never the (possibly secret) sample value.
+        macro_rules! reject {
+            ($field:expr, $value:expr) => {{
+                let field: &str = $field;
+                let mut v = sample_values();
+                v[field] = json!($value);
+                assert!(
+                    keel_core::validate_schema_values(&schema, &v).is_err(),
+                    "{field}: invalid value accepted"
+                );
+            }};
         }
-        reject("adminGroup", "a,b");
-        reject("adminGroup", "with space");
-        reject("gatewayName", "Edge_GW");
-        reject("gatewayNamespace", "-bad");
-        reject("publicPortSuffix", "8443");
-        reject("oidcClientId", "has space");
-        reject("gitUsername", "a/b");
+        // No credentials in URLs (the token is injected by keel, never via the remote URL).
+        reject!("gitUrl", "https://user:pw@git.example.com/a/b.git");
+        reject!("gitUrl", "ssh://git@git.example.com/a/b.git");
+        reject!("gitUrl", "https://git.example.com/a/${b}.git");
+        // The Git token is sent on every clone/fetch/push: never over cleartext HTTP.
+        reject!("gitUrl", "http://git.example.com/team-a/infra-gitops.git");
+        reject!("oidcIssuerUrl", "http://auth.team-a.example.com");
+        reject!("oidcIssuerUrl", "https://auth.example.com/\"x");
+        for field in SECRET_FIELDS {
+            reject!(field, "short");
+            reject!(field, "has space-1234567890");
+            reject!(field, "has\"quote-1234567");
+            reject!(field, "has\\backslash-1234567");
+            reject!(field, "has${dollar}-1234567");
+        }
+        reject!("adminGroup", "a,b");
+        reject!("adminGroup", "with space");
+        reject!("gatewayName", "Edge_GW");
+        reject!("gatewayNamespace", "-bad");
+        reject!("publicPortSuffix", "8443");
+        reject!("oidcClientId", "has space");
+        reject!("gitUsername", "a/b");
         for field in [
             "hostname",
             "oidcIssuerUrl",

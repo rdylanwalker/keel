@@ -2662,7 +2662,10 @@ spec:
             panic!("expected schema errors");
         };
         let rendered = format!("{errors:?}");
-        assert!(!rendered.contains("TOP-SECRET"), "{rendered}");
+        assert!(
+            !rendered.contains("TOP-SECRET"),
+            "schema errors echoed a writeOnly secret value"
+        );
         assert!(
             rendered.contains("Bad-Name"),
             "non-secret values keep the detail"
