@@ -36,7 +36,7 @@ describe("preview run + camelCase PullRequestInfo normalization", () => {
     })
   })
 
-  it("normalizes camelCase resource diffs and keeps a snake_case fallback", async () => {
+  it("normalizes camelCase resource diffs", async () => {
     stubJson({
       report: {
         source: "pko",
@@ -51,10 +51,9 @@ describe("preview run + camelCase PullRequestInfo normalization", () => {
           },
           {
             urn: "urn:b",
-            name: "legacy",
+            name: "cm",
             op: "update",
-            resource_type: "kubernetes:core/v1:ConfigMap",
-            changed_fields: ["data"],
+            resourceType: "kubernetes:core/v1:ConfigMap",
           },
         ],
       },
@@ -70,10 +69,10 @@ describe("preview run + camelCase PullRequestInfo normalization", () => {
       },
       {
         urn: "urn:b",
-        name: "legacy",
+        name: "cm",
         op: "update",
         resource_type: "kubernetes:core/v1:ConfigMap",
-        changed_fields: ["data"],
+        changed_fields: [],
       },
     ])
   })

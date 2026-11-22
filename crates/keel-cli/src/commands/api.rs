@@ -1,5 +1,6 @@
 //! Read/act commands over existing keel-server APIs: `keel proposal list|show|close|merge`,
-//! `keel catalog list|show`, and `keel app list` (`SDD.md` §7.2, §7.3).
+//! `keel catalog list|show`, `keel app list` and `keel tenant repair-credentials` (`SDD.md` §7.2,
+//! §7.3).
 //!
 //! Responses are handled as loose JSON so the CLI tolerates additive server changes.
 
@@ -7,7 +8,7 @@ use serde_json::Value;
 
 use crate::cli::{
     AppListArgs, CatalogListArgs, CatalogShowArgs, OutputFormat, ProposalListArgs, ProposalRefArgs,
-    TenantMigrateBaselineArgs, TenantMigrateStackSourcesArgs,
+    TenantRepairCredentialsArgs,
 };
 
 use super::{
@@ -132,8 +133,8 @@ pub(crate) fn format_proposals_table(proposals: &[Value]) -> String {
                     .unwrap_or("-")
                     .to_string(),
                 s(p, &["title"]).to_string(),
-                s(p, &["sourceBranch", "source_branch"]).to_string(),
-                s(p, &["updatedAt", "updated_at"]).to_string(),
+                s(p, &["sourceBranch"]).to_string(),
+                s(p, &["updatedAt"]).to_string(),
             ]
         })
         .collect();
@@ -156,20 +157,16 @@ fn format_proposal_detail(p: &Value) -> String {
     for (label, keys) in [
         ("State", &["state"][..]),
         ("Tenant", &["scope", "tenant"][..]),
-        ("Branch", &["sourceBranch", "source_branch"][..]),
-        ("Target", &["targetBranch", "target_branch"][..]),
-        ("Head SHA", &["headSha", "head_sha"][..]),
+        ("Branch", &["sourceBranch"][..]),
+        ("Target", &["targetBranch"][..]),
+        ("Head SHA", &["headSha"][..]),
         ("URL", &["url"][..]),
-        ("Created", &["createdAt", "created_at"][..]),
-        ("Updated", &["updatedAt", "updated_at"][..]),
+        ("Created", &["createdAt"][..]),
+        ("Updated", &["updatedAt"][..]),
     ] {
         out.push_str(&format!("{label:<10} {}\n", s(p, keys)));
     }
-    if let Some(stat) = p
-        .get("diffStat")
-        .or_else(|| p.get("diff_stat"))
-        .and_then(Value::as_str)
-    {
+    if let Some(stat) = p.get("diffStat").and_then(Value::as_str) {
         out.push_str(&format!("Diff       {stat}\n"));
     }
     let body = s(p, &["body"]);
@@ -286,10 +283,9 @@ async fn act_on_proposal(
         s(proposal, &["title"]),
         s(proposal, &["state"])
     );
-    if let Some(gc) = payload.get("gcPlan").or_else(|| payload.get("gc_plan")) {
+    if let Some(gc) = payload.get("gcPlan") {
         let n = gc
-            .get("deletions")
-            .or_else(|| gc.get("stacks"))
+            .get("targets")
             .and_then(Value::as_array)
             .map_or(0, Vec::len);
         if n > 0 {
@@ -444,159 +440,136 @@ pub async fn execute_app_list(args: &AppListArgs, ctx: &CliContext) -> Result<St
     }
 }
 
-/// Renders the `POST /api/v1/tenants/{id}/stack-sources/migrate` response.
-pub(crate) fn format_stack_source_migration(payload: &Value) -> String {
-    let tenant = s(payload, &["tenant"]);
-    let strings = |field: &str| -> Vec<String> {
-        payload
-            .get(field)
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(|v| v.as_str().map(str::to_string))
-            .collect()
-    };
-    let migrated = strings("migrated");
-    let dry_run = payload
-        .get("dryRun")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let mut out = if migrated.is_empty() {
-        format!("Tenant `{tenant}`: no Stacks use fluxSource; nothing to migrate.\n")
-    } else if dry_run {
-        format!(
-            "Tenant `{tenant}`: {} Stack(s) would move to PKO gitSource (dry run):\n",
-            migrated.len()
-        )
-    } else {
-        format!(
-            "Tenant `{tenant}`: opened a PR moving {} Stack(s) to PKO gitSource:\n",
-            migrated.len()
-        )
-    };
-    for path in &migrated {
-        out.push_str(&format!("  {path}\n"));
-    }
-    if let Some(pr) = payload.get("proposal").filter(|p| !p.is_null()) {
-        out.push_str(&format!(
-            "Proposal #{}: {} ({})\nReview and merge it (`keel proposal merge {}`).\n",
-            s(pr, &["id"]),
-            s(pr, &["title"]),
-            s(pr, &["url"]),
-            s(pr, &["id"])
-        ));
-    }
-    if let Some(skipped) = payload
-        .get("skipped")
-        .and_then(Value::as_array)
-        .filter(|a| !a.is_empty())
-    {
-        out.push_str("Not migrated (review manually):\n");
-        for item in skipped {
-            out.push_str(&format!(
-                "  {}: {}\n",
-                s(item, &["path"]),
-                s(item, &["reason"])
-            ));
-        }
-    }
-    out
+/// Outcome of one `POST /api/v1/tenants/{id}/credentials/repair` call.
+#[derive(Debug)]
+pub(crate) enum RepairResult {
+    /// The server's step outcomes (never a secret value).
+    Repaired(Value),
+    /// `409`: the tenant is not provisioned on the cluster yet (stub proposal not merged,
+    /// `tenant-<id>` not created) or is being deleted. Not a failure in bulk mode.
+    Skipped(String),
+    Failed(String),
 }
 
-/// Human-readable summary of `POST /api/v1/tenants/{id}/baseline/migrate`.
-pub(crate) fn format_baseline_migration(payload: &Value) -> String {
-    let tenant = s(payload, &["tenant"]);
-    let labelled: Vec<String> = payload
-        .get("labelled")
+/// Classifies one repair call; `None` stops a bulk run (`400`: tenants have no dedicated
+/// repository credential, Local Git provider).
+pub(crate) fn classify_repair(result: Result<Value, CliError>) -> Result<RepairResult, CliError> {
+    match result {
+        Ok(v) => Ok(RepairResult::Repaired(v)),
+        Err(CliError::Api {
+            status: 409,
+            message,
+        }) => Ok(RepairResult::Skipped(message)),
+        Err(e @ CliError::Api { status: 400, .. }) => Err(e),
+        Err(e) => Ok(RepairResult::Failed(e.to_string())),
+    }
+}
+
+/// One table row of a repair result.
+fn repair_row(tenant: &str, result: &RepairResult) -> Vec<String> {
+    match result {
+        RepairResult::Repaired(v) => vec![
+            tenant.to_string(),
+            s(v, &["repository"]).to_string(),
+            s(v, &["credential"]).to_string(),
+            s(v, &["sopsAge"]).to_string(),
+            "ok".to_string(),
+        ],
+        RepairResult::Skipped(why) | RepairResult::Failed(why) => vec![
+            tenant.to_string(),
+            "-".to_string(),
+            "-".to_string(),
+            "-".to_string(),
+            if matches!(result, RepairResult::Skipped(_)) {
+                format!("skipped: {why}")
+            } else {
+                why.clone()
+            },
+        ],
+    }
+}
+
+/// Renders `keel tenant repair-credentials` results as a table.
+pub(crate) fn format_credential_repairs(results: &[(String, RepairResult)]) -> String {
+    if results.is_empty() {
+        return "No tenants found.\n".to_string();
+    }
+    let rows: Vec<Vec<String>> = results.iter().map(|(t, r)| repair_row(t, r)).collect();
+    render_table(
+        &["TENANT", "REPOSITORY", "CREDENTIAL", "SOPS-AGE", "RESULT"],
+        &rows,
+    )
+}
+
+/// JSON document of a repair run: `{"results": [...], "failed": n}`.
+pub(crate) fn credential_repairs_json(results: &[(String, RepairResult)]) -> Value {
+    let failed = results
+        .iter()
+        .filter(|(_, r)| matches!(r, RepairResult::Failed(_)))
+        .count();
+    let rows: Vec<Value> = results
+        .iter()
+        .map(|(t, r)| match r {
+            RepairResult::Repaired(v) => v.clone(),
+            RepairResult::Skipped(why) => serde_json::json!({ "id": t, "skipped": why }),
+            RepairResult::Failed(e) => serde_json::json!({ "id": t, "error": e }),
+        })
+        .collect();
+    serde_json::json!({ "results": rows, "failed": failed })
+}
+
+/// `keel tenant repair-credentials [<id>]`: re-mints one tenant's (or every tenant's) repository
+/// read credential through `POST /api/v1/tenants/{id}/credentials/repair`. With one id any error
+/// fails the command. With every tenant, tenants that are not provisioned yet or are being
+/// deleted (`409`) are reported as skipped, other failures are reported per tenant and fail the
+/// command once all were attempted (the full report still goes to stdout), and the Local Git
+/// provider (`400`, no tenant repository credentials) stops the run.
+pub async fn execute_tenant_repair_credentials(
+    args: &TenantRepairCredentialsArgs,
+    ctx: &CliContext,
+) -> Result<String, CliError> {
+    let base_url = normalize_server_url(&args.server)?;
+    if let Some(t) = args.tenant.as_deref() {
+        let tenant = normalize_tenant_arg(t);
+        keel_core::validate_dns_label(&tenant, "tenant")?;
+        let path = format!("/api/v1/tenants/{tenant}/credentials/repair");
+        let v = post_json(ctx, &base_url, &path).await?;
+        let results = vec![(tenant, RepairResult::Repaired(v.clone()))];
+        return match args.output {
+            OutputFormat::Json => pretty(&v),
+            OutputFormat::Table => Ok(format_credential_repairs(&results)),
+        };
+    }
+    let tenants: Vec<String> = get_json(ctx, &base_url, "/api/v1/tenants", &[])
+        .await?
+        .get("tenants")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .filter_map(|v| v.as_str().map(str::to_string))
+        .filter_map(|t| t.get("id").and_then(Value::as_str).map(str::to_string))
+        .filter(|id| keel_core::validate_dns_label(id, "tenant").is_ok())
         .collect();
-    let dry_run = payload
-        .get("dryRun")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let mut out = if labelled.is_empty() {
-        format!(
-            "Tenant `{tenant}`: baseline already labelled keel.io/platform-owned; nothing to do.\n"
-        )
-    } else if dry_run {
-        format!(
-            "Tenant `{tenant}`: {} file(s) would be labelled keel.io/platform-owned (dry run):\n",
-            labelled.len()
-        )
-    } else {
-        format!(
-            "Tenant `{tenant}`: opened a PR labelling {} file(s) keel.io/platform-owned:\n",
-            labelled.len()
-        )
+    let mut results = Vec::new();
+    for tenant in tenants {
+        let path = format!("/api/v1/tenants/{tenant}/credentials/repair");
+        let result = classify_repair(post_json(ctx, &base_url, &path).await)?;
+        results.push((tenant, result));
+    }
+    let failed = results
+        .iter()
+        .filter(|(_, r)| matches!(r, RepairResult::Failed(_)))
+        .count();
+    let out = match args.output {
+        OutputFormat::Json => pretty(&credential_repairs_json(&results))?,
+        OutputFormat::Table => format_credential_repairs(&results),
     };
-    for path in &labelled {
-        out.push_str(&format!("  {path}\n"));
+    if failed > 0 {
+        return Err(CliError::Incomplete {
+            output: out,
+            message: format!("{failed} tenant(s) could not be repaired"),
+        });
     }
-    if let Some(pr) = payload.get("proposal").filter(|p| !p.is_null()) {
-        out.push_str(&format!(
-            "Proposal #{}: {} ({})\nReview and merge it (`keel proposal merge {}`).\n",
-            s(pr, &["id"]),
-            s(pr, &["title"]),
-            s(pr, &["url"]),
-            s(pr, &["id"])
-        ));
-    }
-    out
-}
-
-/// `keel tenant migrate-baseline --tenant <id> [--dry-run]`.
-pub async fn execute_tenant_migrate_baseline(
-    args: &TenantMigrateBaselineArgs,
-    ctx: &CliContext,
-) -> Result<String, CliError> {
-    let tenant = normalize_tenant_arg(&args.tenant);
-    keel_core::validate_dns_label(&tenant, "tenant")?;
-    let base_url = normalize_server_url(&args.server)?;
-    let query: &[(&str, &str)] = if args.dry_run {
-        &[("dryRun", "true")]
-    } else {
-        &[]
-    };
-    let payload = post_json_query(
-        ctx,
-        &base_url,
-        &format!("/api/v1/tenants/{tenant}/baseline/migrate"),
-        query,
-    )
-    .await?;
-    match args.output {
-        OutputFormat::Json => pretty(&payload),
-        OutputFormat::Table => Ok(format_baseline_migration(&payload)),
-    }
-}
-
-/// `keel tenant migrate-stack-sources --tenant <id> [--dry-run]`.
-pub async fn execute_tenant_migrate_stack_sources(
-    args: &TenantMigrateStackSourcesArgs,
-    ctx: &CliContext,
-) -> Result<String, CliError> {
-    let tenant = normalize_tenant_arg(&args.tenant);
-    keel_core::validate_dns_label(&tenant, "tenant")?;
-    let base_url = normalize_server_url(&args.server)?;
-    let query: &[(&str, &str)] = if args.dry_run {
-        &[("dryRun", "true")]
-    } else {
-        &[]
-    };
-    let payload = post_json_query(
-        ctx,
-        &base_url,
-        &format!("/api/v1/tenants/{tenant}/stack-sources/migrate"),
-        query,
-    )
-    .await?;
-    match args.output {
-        OutputFormat::Json => pretty(&payload),
-        OutputFormat::Table => Ok(format_stack_source_migration(&payload)),
-    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -625,50 +598,62 @@ mod tests {
     }
 
     #[test]
-    fn baseline_migration_output() {
-        let opened = format_baseline_migration(&json!({
-            "tenant": "acme", "dryRun": false,
-            "labelled": ["tenants/acme/rbac.yaml"],
-            "proposal": {"id": "9", "title": "fix(acme): protect the platform-owned tenant baseline", "url": "http://forge/pr/9"}
-        }));
-        assert!(
-            opened.contains("opened a PR labelling 1 file(s)"),
-            "{opened}"
-        );
-        assert!(opened.contains("tenants/acme/rbac.yaml"));
-        assert!(opened.contains("keel proposal merge 9"));
-        let dry = format_baseline_migration(&json!({
-            "tenant": "acme", "dryRun": true, "labelled": ["tenants/acme/rbac.yaml"]
-        }));
-        assert!(dry.contains("(dry run)"), "{dry}");
-        assert!(!dry.contains("Proposal"));
-        let none =
-            format_baseline_migration(&json!({"tenant": "acme", "dryRun": false, "labelled": []}));
-        assert!(none.contains("nothing to do"), "{none}");
+    fn credential_repair_output_has_no_secrets_and_reports_failures() {
+        let results = vec![
+            (
+                "acme".to_string(),
+                RepairResult::Repaired(
+                    json!({"id": "acme", "repository": "keel-tenants/tenant-acme",
+                          "namespaceReady": true, "credential": "rotated", "sopsAge": "existed"}),
+                ),
+            ),
+            (
+                "beta".to_string(),
+                RepairResult::Skipped("`tenant-beta` does not exist yet".to_string()),
+            ),
+            (
+                "gamma".to_string(),
+                RepairResult::Failed("Server API error (HTTP 502): forge down".to_string()),
+            ),
+        ];
+        let out = format_credential_repairs(&results);
+        assert!(out.starts_with("TENANT"), "{out}");
+        assert!(out.contains("keel-tenants/tenant-acme"));
+        assert!(out.contains("rotated"));
+        assert!(out.contains("skipped: `tenant-beta` does not exist yet"));
+        assert!(out.contains("HTTP 502"));
+        assert_eq!(format_credential_repairs(&[]), "No tenants found.\n");
+
+        let doc = credential_repairs_json(&results);
+        assert_eq!(doc["failed"], 1);
+        assert_eq!(doc["results"][0]["credential"], "rotated");
+        assert_eq!(doc["results"][1]["id"], "beta");
+        assert!(doc["results"][1]["skipped"].is_string());
+        assert!(doc["results"][2]["error"].is_string());
     }
 
     #[test]
-    fn stack_source_migration_output() {
-        let opened = format_stack_source_migration(&json!({
-            "tenant": "default", "dryRun": false,
-            "migrated": ["tenants/default/infra/kind/stack.yaml"],
-            "skipped": [{"path": "tenants/default/x/stack.yaml", "reason": "fluxSource is not the tenant's own GitRepository"}],
-            "proposal": {"id": "12", "title": "fix(default): clone tenant PKO Stacks with gitSource", "url": "http://forge/pr/12"}
-        }));
-        assert!(opened.contains("opened a PR moving 1 Stack(s)"), "{opened}");
-        assert!(opened.contains("tenants/default/infra/kind/stack.yaml"));
-        assert!(opened.contains("keel proposal merge 12"));
-        assert!(opened.contains("Not migrated"));
-        let dry = format_stack_source_migration(&json!({
-            "tenant": "acme", "dryRun": true, "migrated": ["tenants/acme/infra/vm/stack.yaml"], "skipped": []
-        }));
-        assert!(
-            dry.contains("would move to PKO gitSource (dry run)"),
-            "{dry}"
-        );
-        let none = format_stack_source_migration(
-            &json!({"tenant": "acme", "migrated": [], "skipped": []}),
-        );
-        assert!(none.contains("nothing to migrate"), "{none}");
+    fn credential_repair_classifies_pending_and_local_provider_responses() {
+        let api = |status, message: &str| CliError::Api {
+            status,
+            message: message.to_string(),
+        };
+        assert!(matches!(
+            classify_repair(Ok(json!({"id": "a"}))).unwrap(),
+            RepairResult::Repaired(_)
+        ));
+        // Not provisioned yet / being deleted: skipped, not a failure.
+        assert!(matches!(
+            classify_repair(Err(api(409, "`tenant-a` does not exist yet"))).unwrap(),
+            RepairResult::Skipped(m) if m.contains("does not exist yet")
+        ));
+        // Local Git provider: stops the bulk run with the server's message.
+        let err = classify_repair(Err(api(400, "Local Git provider"))).unwrap_err();
+        assert!(err.to_string().contains("Local Git provider"), "{err}");
+        // Anything else is a per-tenant failure.
+        assert!(matches!(
+            classify_repair(Err(api(502, "forge down"))).unwrap(),
+            RepairResult::Failed(m) if m.contains("forge down")
+        ));
     }
 }

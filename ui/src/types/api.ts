@@ -121,18 +121,13 @@ export interface ResourceDiff {
   changed_fields: string[]
 }
 
-/**
- * Resource diff as sent by the server: camelCase (`resourceType`, `changedFields`). The
- * snake_case keys are accepted as a fallback for reports persisted by older servers.
- */
+/** Resource diff as sent by the server: camelCase (`resourceType`, `changedFields`). */
 export interface RawResourceDiff {
   urn?: string
   name?: string
   op: ChangeOp
   resourceType?: string
   changedFields?: string[]
-  resource_type?: string
-  changed_fields?: string[]
 }
 
 export interface PreviewSummary {
@@ -153,7 +148,7 @@ export interface PreviewReport {
   policyStatus?: PolicyStatus
   /** `synthesized` = control-plane simulation (no PKO `pulumi preview` executed). */
   source?: PreviewSource
-  /** Ephemeral PKO preview run state (absent for legacy/synthesized reports). */
+  /** Ephemeral PKO preview run state (absent for synthesized reports). */
   run?: PreviewRun
   gitDiff?: string
 }

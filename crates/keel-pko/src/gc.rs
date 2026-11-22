@@ -1,4 +1,4 @@
-//! Pure garbage-collection planner for ephemeral PR preview CRs (`GitRepository` and `Stack`)
+//! Pure garbage-collection planner for ephemeral PR preview `Stack` CRs
 //! in the `keel-previews` namespace (`SDD.md` §4.2, `NFR-REL-01`, `NFR-REL-02`).
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -7,19 +7,16 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::stack::{
-    FLUX_GIT_REPO_API_VERSION, FLUX_GIT_REPO_KIND, FluxGitRepository, KEEL_PREVIEWS_NAMESPACE,
-    LABEL_EPHEMERAL_PREVIEW, LABEL_PR_ID, LABEL_PROTECT, MANAGEMENT_CORE_STACK_NAME,
-    PKO_STACK_API_VERSION, PKO_STACK_KIND, PkoStack, PreviewStack, sanitize_pr_id,
+    KEEL_PREVIEWS_NAMESPACE, LABEL_EPHEMERAL_PREVIEW, LABEL_PR_ID, LABEL_PROTECT,
+    MANAGEMENT_CORE_STACK_NAME, PKO_STACK_API_VERSION, PKO_STACK_KIND, PkoStack, PreviewStack,
+    sanitize_pr_id,
 };
 
-/// Kind of ephemeral Kubernetes Custom Resource managed in `keel-previews`.
-///
-/// Ordered so `Stack` precedes `GitRepository` during deletion, ensuring PKO stops reconciling
-/// against the Flux source before the `GitRepository` is removed.
+/// Kind of ephemeral Kubernetes Custom Resource managed in `keel-previews` (previews clone the PR
+/// branch through PKO `gitSource`, so a preview is exactly one `Stack`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum PreviewResourceKind {
     Stack,
-    GitRepository,
 }
 
 impl PreviewResourceKind {
@@ -27,7 +24,6 @@ impl PreviewResourceKind {
     pub fn api_version(self) -> &'static str {
         match self {
             Self::Stack => PKO_STACK_API_VERSION,
-            Self::GitRepository => FLUX_GIT_REPO_API_VERSION,
         }
     }
 
@@ -35,7 +31,6 @@ impl PreviewResourceKind {
     pub fn kind_str(self) -> &'static str {
         match self {
             Self::Stack => PKO_STACK_KIND,
-            Self::GitRepository => FLUX_GIT_REPO_KIND,
         }
     }
 }
@@ -64,19 +59,7 @@ impl PreviewResourceCandidate {
         }
     }
 
-    /// Builds a candidate from a typed `FluxGitRepository`.
-    pub fn from_git_repository(repo: &FluxGitRepository) -> Self {
-        Self {
-            kind: PreviewResourceKind::GitRepository,
-            name: repo.metadata.name.clone(),
-            namespace: repo.metadata.namespace.clone(),
-            labels: repo.metadata.labels.clone(),
-        }
-    }
-
-    /// Builds the `Stack` candidate of a synthesized `PreviewStack`. Previews clone through PKO
-    /// `gitSource`; `GitRepository` candidates only remain for previews created by older releases
-    /// (`preview-source-pr-<id>`), which are still garbage-collected.
+    /// Builds the `Stack` candidate of a synthesized `PreviewStack`.
     pub fn from_preview_bundle(bundle: &PreviewStack) -> [Self; 1] {
         [Self::from_stack(&bundle.stack)]
     }
@@ -86,7 +69,6 @@ impl PreviewResourceCandidate {
         let kind_str = value.get("kind")?.as_str()?;
         let kind = match kind_str {
             PKO_STACK_KIND => PreviewResourceKind::Stack,
-            FLUX_GIT_REPO_KIND => PreviewResourceKind::GitRepository,
             _ => return None,
         };
 
@@ -136,10 +118,9 @@ impl PreviewResourceCandidate {
             return Some(normalized);
         }
 
-        // Fallback to deterministic naming convention (`preview-stack-pr-<id>` / `preview-source-pr-<id>`)
+        // Fallback to the deterministic naming convention (`preview-stack-pr-<id>`).
         let suffix = match self.kind {
             PreviewResourceKind::Stack => self.name.strip_prefix("preview-stack-pr-"),
-            PreviewResourceKind::GitRepository => self.name.strip_prefix("preview-source-pr-"),
         }?;
         sanitize_pr_id(suffix).ok()
     }
@@ -151,7 +132,6 @@ impl PreviewResourceCandidate {
         self.labels.get(LABEL_EPHEMERAL_PREVIEW).map(String::as_str) == Some("true")
             || self.labels.contains_key(LABEL_PR_ID)
             || self.name.starts_with("preview-stack-pr-")
-            || self.name.starts_with("preview-source-pr-")
     }
 }
 
@@ -186,17 +166,9 @@ impl GcPlan {
             .filter(|t| t.kind == PreviewResourceKind::Stack)
             .collect()
     }
-
-    /// Returns all Flux `GitRepository` deletion targets in execution order.
-    pub fn git_repositories_to_delete(&self) -> Vec<&ResourceDeletionTarget> {
-        self.targets
-            .iter()
-            .filter(|t| t.kind == PreviewResourceKind::GitRepository)
-            .collect()
-    }
 }
 
-/// Determines which ephemeral `Stack` and `GitRepository` resources in `keel-previews` must be
+/// Determines which ephemeral preview `Stack` resources in `keel-previews` must be
 /// deleted given a list of closed or merged PR IDs.
 pub fn plan_preview_gc<S: AsRef<str>>(
     candidates: &[PreviewResourceCandidate],
@@ -210,7 +182,7 @@ pub fn plan_preview_gc<S: AsRef<str>>(
     evaluate_candidates(candidates, |pr_id| closed_set.contains(pr_id))
 }
 
-/// Determines which orphaned ephemeral `Stack` and `GitRepository` resources in `keel-previews`
+/// Determines which orphaned ephemeral preview `Stack` resources in `keel-previews`
 /// should be deleted by comparing live cluster candidates against the authoritative set of open PR IDs.
 pub fn plan_orphan_preview_gc<S: AsRef<str>>(
     candidates: &[PreviewResourceCandidate],
@@ -265,7 +237,7 @@ where
         }
     }
 
-    // Order Stack deletions before GitRepository deletions for clean PKO teardown.
+    // Deterministic deletion order.
     plan.targets.sort_by(|a, b| {
         a.kind
             .cmp(&b.kind)
@@ -298,23 +270,6 @@ mod tests {
         synthesize_ephemeral_preview(&params).expect("valid preview bundle")
     }
 
-    /// `GitRepository` written by releases before previews moved to PKO `gitSource`.
-    fn legacy_preview_git_repository(pr_id: &str) -> PreviewResourceCandidate {
-        PreviewResourceCandidate::from_json_value(&serde_json::json!({
-            "apiVersion": "source.toolkit.fluxcd.io/v1",
-            "kind": "GitRepository",
-            "metadata": {
-                "name": format!("preview-source-pr-{pr_id}"),
-                "namespace": "keel-previews",
-                "labels": {
-                    "keel.io/pr-id": pr_id,
-                    "keel.io/ephemeral-preview": "true"
-                }
-            }
-        }))
-        .expect("candidate")
-    }
-
     #[test]
     fn preview_bundles_no_longer_carry_a_flux_git_repository() {
         let bundle = make_preview("21", "acme", 1_700_000_021);
@@ -325,7 +280,7 @@ mod tests {
     }
 
     #[test]
-    fn plans_deletions_for_closed_prs_stacks_before_git_repositories() {
+    fn plans_deletions_for_closed_prs_in_order() {
         let pr_10 = make_preview("10", "acme", 1_700_000_010);
         let pr_11 = make_preview("11", "acme", 1_700_000_011);
         let pr_12 = make_preview("12", "beta", 1_700_000_012);
@@ -350,11 +305,8 @@ mod tests {
         ))
         .unwrap();
 
-        // Deliberately insert (legacy) GitRepositories before Stacks and include duplicates to test
-        // ordering & dedup.
+        // Deliberately insert PR #12 first and twice to test ordering & dedup.
         let mut candidates = vec![
-            legacy_preview_git_repository("12"),
-            legacy_preview_git_repository("10"),
             PreviewResourceCandidate::from_stack(&pr_12.stack),
             PreviewResourceCandidate::from_stack(&pr_12.stack),
         ];
@@ -368,19 +320,12 @@ mod tests {
         assert!(!plan.is_empty());
         assert_eq!(plan.skipped_non_preview_namespace, 2);
         assert_eq!(plan.skipped_protected, 0);
-        assert_eq!(plan.targets.len(), 4);
-
-        // Stacks must all precede GitRepositories
+        assert_eq!(plan.targets.len(), 2);
         assert_eq!(plan.stacks_to_delete().len(), 2);
-        assert_eq!(plan.git_repositories_to_delete().len(), 2);
         assert_eq!(plan.targets[0].kind, PreviewResourceKind::Stack);
         assert_eq!(plan.targets[0].name, "preview-stack-pr-10");
         assert_eq!(plan.targets[1].kind, PreviewResourceKind::Stack);
         assert_eq!(plan.targets[1].name, "preview-stack-pr-12");
-        assert_eq!(plan.targets[2].kind, PreviewResourceKind::GitRepository);
-        assert_eq!(plan.targets[2].name, "preview-source-pr-10");
-        assert_eq!(plan.targets[3].kind, PreviewResourceKind::GitRepository);
-        assert_eq!(plan.targets[3].name, "preview-source-pr-12");
     }
 
     #[test]
@@ -402,15 +347,7 @@ mod tests {
             }
         });
 
-        // Unlabeled resources following naming convention in keel-previews
-        let convention_named_repo = serde_json::json!({
-            "apiVersion": "source.toolkit.fluxcd.io/v1",
-            "kind": "GitRepository",
-            "metadata": {
-                "name": "preview-source-pr-88",
-                "namespace": "keel-previews"
-            }
-        });
+        // Unlabeled resource following the naming convention in keel-previews
         let convention_named_stack = serde_json::json!({
             "apiVersion": "pulumi.com/v1",
             "kind": "Stack",
@@ -422,8 +359,8 @@ mod tests {
 
         // Explicitly non-ephemeral resource in keel-previews
         let permanent_helper = serde_json::json!({
-            "apiVersion": "source.toolkit.fluxcd.io/v1",
-            "kind": "GitRepository",
+            "apiVersion": "pulumi.com/v1",
+            "kind": "Stack",
             "metadata": {
                 "name": "shared-catalog",
                 "namespace": "keel-previews",
@@ -433,7 +370,13 @@ mod tests {
             }
         });
 
-        // Unrelated Kubernetes Kind should return None on from_json_value
+        // Unrelated Kubernetes kinds (including Flux `GitRepository`) return None
+        let flux_source = serde_json::json!({
+            "apiVersion": "source.toolkit.fluxcd.io/v1",
+            "kind": "GitRepository",
+            "metadata": { "name": "preview-source-pr-88", "namespace": "keel-previews" }
+        });
+        assert!(PreviewResourceCandidate::from_json_value(&flux_source).is_none());
         let unrelated_secret = serde_json::json!({
             "apiVersion": "v1",
             "kind": "Secret",
@@ -445,7 +388,6 @@ mod tests {
 
         let mut candidates = vec![
             PreviewResourceCandidate::from_json_value(&protected_in_previews).unwrap(),
-            PreviewResourceCandidate::from_json_value(&convention_named_repo).unwrap(),
             PreviewResourceCandidate::from_json_value(&convention_named_stack).unwrap(),
             PreviewResourceCandidate::from_json_value(&permanent_helper).unwrap(),
         ];
@@ -454,11 +396,9 @@ mod tests {
         // Reconcile against open PRs = ["50"]; PR #88 is orphaned and should be deleted, PR #77 is protected!
         let orphan_plan = plan_orphan_preview_gc(&candidates, &["#50"]);
         assert_eq!(orphan_plan.skipped_protected, 1);
-        assert_eq!(orphan_plan.targets.len(), 2);
+        assert_eq!(orphan_plan.targets.len(), 1);
         assert_eq!(orphan_plan.targets[0].kind.kind_str(), "Stack");
         assert_eq!(orphan_plan.targets[0].name, "preview-stack-pr-88");
-        assert_eq!(orphan_plan.targets[1].pr_id, "88");
-        assert_eq!(orphan_plan.targets[1].name, "preview-source-pr-88");
-        assert_eq!(orphan_plan.targets[1].kind.kind_str(), "GitRepository");
+        assert_eq!(orphan_plan.targets[0].pr_id, "88");
     }
 }

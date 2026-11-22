@@ -874,11 +874,36 @@ pub async fn reconcile_tenant_credential(
     tenant: &str,
     secrets: &dyn TenantCredentialSecrets,
 ) -> Result<StepOutcome, ServerError> {
+    store_tenant_credential(forge, tenant, secrets, false).await
+}
+
+/// Re-mints the tenant's repository read credential even when the stored one is valid
+/// (`keel tenant repair-credentials`): a fresh credential replaces the Secret (or creates it),
+/// then the previous one and every other read credential of the repository are revoked. Returns
+/// [`StepOutcome::Rotated`] (or [`StepOutcome::Created`] when there was no Secret). Never logs or
+/// returns secret values.
+pub async fn rotate_tenant_credential(
+    forge: &TenantRepoForge,
+    tenant: &str,
+    secrets: &dyn TenantCredentialSecrets,
+) -> Result<StepOutcome, ServerError> {
+    store_tenant_credential(forge, tenant, secrets, true).await
+}
+
+async fn store_tenant_credential(
+    forge: &TenantRepoForge,
+    tenant: &str,
+    secrets: &dyn TenantCredentialSecrets,
+    force: bool,
+) -> Result<StepOutcome, ServerError> {
     let source = forge.source(tenant)?;
     let existing = secrets.read(tenant).await?;
     let ssh = forge.credential_kind() == RepoCredentialKind::SshDeployKey;
     let (previous_id, outcome) = match tenant_gitops_credentials_status(&source, existing.as_ref())
     {
+        TenantGitopsCredentialStatus::Valid { credential_id } if force => {
+            (credential_id, StepOutcome::Rotated)
+        }
         TenantGitopsCredentialStatus::Valid { credential_id } => {
             let fingerprint = stored_deploy_key_fingerprint(existing.as_ref());
             match (credential_id, ssh, fingerprint) {
@@ -1045,6 +1070,72 @@ pub async fn complete_cluster_provisioning(
         }
         None => StepOutcome::NotApplicable,
     };
+    Ok(ClusterProvisioning {
+        namespace_ready: true,
+        sops_age,
+        credential,
+    })
+}
+
+/// Repairs a provisioned tenant's runtime credentials (`POST /api/v1/tenants/{id}/credentials/repair`,
+/// `keel tenant repair-credentials`): re-mints the repository read credential and its
+/// `tenant-<id>/keel-gitops-credentials` Secret ([`rotate_tenant_credential`]) and creates a missing
+/// `sops-age` Secret (an existing key is never replaced: it decrypts the tenant's committed
+/// secrets). Fails with `400` when tenants have no dedicated repository (Local Git provider), with
+/// `409` while `tenant-<id>` does not exist, and with `409` when `platform_stub` (the committed
+/// platform `main`, read under the lock) no longer holds this tenant's dedicated-repository stub: a
+/// merged tenant removal leaves `tenant-<id>` behind until `keel-tenants` prunes it, and no
+/// credential may be minted for a deleted tenant. Serialized (`<id>#cluster`) with
+/// [`complete_cluster_provisioning`] and the post-merge [`revoke_all_credentials`] of a removal.
+pub async fn repair_tenant_credentials<F, Fut>(
+    store: &dyn SecretStateStore,
+    repos: &TenantRepos,
+    tenant: &str,
+    platform_stub: F,
+) -> Result<ClusterProvisioning, ServerError>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<TenantStubState, ServerError>>,
+{
+    let namespace = keel_kube::tenant_namespace(tenant)?;
+    let Some(forge) = repos.require_forge()? else {
+        return Err(ServerError::BadRequest(
+            "tenants have no dedicated repository or read credential with the Local Git provider"
+                .to_string(),
+        ));
+    };
+    let _cluster_guard = repos.lock(&format!("{tenant}#cluster")).await;
+    match platform_stub().await? {
+        TenantStubState::Dedicated => {}
+        TenantStubState::Absent => {
+            return Err(ServerError::Conflict(format!(
+                "tenant `{tenant}` does not exist or is being deleted (no tenant stub on the platform repository `main`)"
+            )));
+        }
+        TenantStubState::Foreign(why) => {
+            return Err(ServerError::Conflict(format!(
+                "tenant `{tenant}` is not a dedicated-repository tenant ({why})"
+            )));
+        }
+    }
+    if !store.namespace_exists(&namespace).await? {
+        return Err(ServerError::Conflict(format!(
+            "`{namespace}` does not exist yet; merge the tenant's stub proposal first"
+        )));
+    }
+    let sops_age = match store.get_tenant_age_key(tenant).await? {
+        Some(_) => StepOutcome::Existed,
+        None => {
+            let key = generate_tenant_age_key(tenant).await?;
+            if store.create_tenant_age_key_if_absent(tenant, &key).await? {
+                StepOutcome::Created
+            } else {
+                StepOutcome::Existed
+            }
+        }
+    };
+    let credential =
+        rotate_tenant_credential(forge, tenant, &StoreCredentialSecrets(store)).await?;
     Ok(ClusterProvisioning {
         namespace_ready: true,
         sops_age,
@@ -1526,9 +1617,10 @@ mod tests {
             classify_tenant_stub(None, true, &source),
             TenantStubState::Foreign(_)
         ));
-        let legacy = stub.replace("keel-tenants/infra-gitops-tenant-acme", "keel/infra-gitops");
+        let platform_repo =
+            stub.replace("keel-tenants/infra-gitops-tenant-acme", "keel/infra-gitops");
         assert!(matches!(
-            classify_tenant_stub(Some(&legacy), true, &source),
+            classify_tenant_stub(Some(&platform_repo), true, &source),
             TenantStubState::Foreign(_)
         ));
     }

@@ -904,9 +904,8 @@ struct FluxManifestAppLayoutInput<'a> {
 struct FluxManifestAppFiles {
     /// `(relative path, contents)`, parents before children.
     files: Vec<(String, String)>,
-    /// Relative paths (files or directories) to remove when present: the pre-split layout
-    /// (`values-configmap.yaml` / `secrets.enc.yaml` applied by the app `Kustomization` itself)
-    /// and artifacts of a previous local/remote or secret/no-secret variant.
+    /// Relative paths (files or directories) to remove when present: artifacts of a previous
+    /// local/remote or secret/no-secret variant.
     stale: Vec<&'static str>,
     /// The app `Kustomization` (`flux-kustomization.yaml`) YAML.
     app_kustomization_yaml: String,
@@ -1026,7 +1025,7 @@ fn build_flux_manifest_app_files(
         app_k_yaml.clone(),
     ));
 
-    let mut stale = vec!["values-configmap.yaml", "secrets.enc.yaml"];
+    let mut stale = Vec::new();
     if !remote {
         stale.push("namespace.yaml");
     }
@@ -1380,9 +1379,8 @@ struct StoredManifestAppSecret {
 }
 
 /// Reads the committed `<name>-secrets` `Secret` of the Flux manifest app or Helm app in
-/// `rel_dir`: `config/secrets.enc.yaml` (a manifest app's substitution sources, or a Helm app
-/// written with the former `<name>-config` layout) or the root `secrets.enc.yaml` (a Helm app, or
-/// a pre-split manifest app; the same `Secret`).
+/// `rel_dir`: `config/secrets.enc.yaml` (a manifest app's substitution sources) or the root
+/// `secrets.enc.yaml` (a Helm app).
 async fn read_stored_manifest_app_secret(
     repo_workdir: &Path,
     rel_dir: &str,
@@ -1391,38 +1389,23 @@ async fn read_stored_manifest_app_secret(
     let is_manifest_app = tokio::fs::try_exists(dir.join("manifests.yaml"))
         .await
         .unwrap_or(false);
-    let candidates = [
-        (
-            dir.join(keel_kube::MANIFEST_APP_CONFIG_DIR)
-                .join("secrets.enc.yaml"),
-            false,
-        ),
-        // A legacy Helm app's root `secrets.enc.yaml` holds encrypted values (no `Secret`); a
-        // current one is a `Secret` whose `kind` stays plaintext (`encrypt_k8s_secret_yaml`).
-        (dir.join("secrets.enc.yaml"), !is_manifest_app),
-    ];
-    for (path, require_secret_kind) in candidates {
-        let Ok(ciphertext) = read_contained_to_string(repo_workdir, &path).await else {
-            continue;
-        };
-        let Ok(doc) = serde_yml::from_str::<Value>(&ciphertext) else {
-            continue;
-        };
-        if doc.get("sops").is_none()
-            || (require_secret_kind && doc.get("kind").and_then(Value::as_str) != Some("Secret"))
-        {
-            continue;
-        }
-        let keys: std::collections::BTreeSet<String> = ["stringData", "data"]
-            .iter()
-            .filter_map(|field| doc.get(*field).and_then(Value::as_object))
-            .flat_map(|m| m.keys().cloned())
-            .collect();
-        if !keys.is_empty() {
-            return Some(StoredManifestAppSecret { ciphertext, keys });
-        }
+    let path = if is_manifest_app {
+        dir.join(keel_kube::MANIFEST_APP_CONFIG_DIR)
+            .join("secrets.enc.yaml")
+    } else {
+        dir.join(HELM_APP_SECRETS_FILE)
+    };
+    let ciphertext = read_contained_to_string(repo_workdir, &path).await.ok()?;
+    let doc = serde_yml::from_str::<Value>(&ciphertext).ok()?;
+    if doc.get("sops").is_none() || doc.get("kind").and_then(Value::as_str) != Some("Secret") {
+        return None;
     }
-    None
+    let keys: std::collections::BTreeSet<String> = ["stringData", "data"]
+        .iter()
+        .filter_map(|field| doc.get(*field).and_then(Value::as_object))
+        .flat_map(|m| m.keys().cloned())
+        .collect();
+    (!keys.is_empty()).then_some(StoredManifestAppSecret { ciphertext, keys })
 }
 
 /// Returns `schema` with every secret property whose value is already stored (`stored_keys`)
@@ -1510,17 +1493,10 @@ async fn resolve_tenant_app_secret(
     }
     let mut merged = match stored {
         None if submitted.is_empty() => return Ok(None),
-        Some(stored)
-            if submitted.is_empty() && secret_metadata_is_plaintext(&stored.ciphertext) =>
-        {
+        Some(stored) if submitted.is_empty() => {
             return Ok(Some((stored.ciphertext.clone(), stored.keys.clone())));
         }
-        // Legacy ciphertext (metadata encrypted, written before `encrypt_k8s_secret_yaml`) is
-        // re-encrypted on any edit: kustomize transforms metadata before Flux decrypts, which
-        // breaks fully encrypted `Secret`s in the split `<name>-config` Kustomization.
-        Some(stored)
-            if submitted.is_empty() || !stored.keys.iter().all(|k| submitted.contains_key(k)) =>
-        {
+        Some(stored) if !stored.keys.iter().all(|k| submitted.contains_key(k)) => {
             decrypt_stored_secret_string_data(state, tenant, &stored.ciphertext).await?
         }
         _ => std::collections::BTreeMap::new(),
@@ -1547,26 +1523,6 @@ async fn resolve_tenant_app_secret(
             .await?,
         keys,
     )))
-}
-
-/// `true` when a stored SOPS `Secret` keeps `kind`/`metadata.name` in plaintext and has a MAC over
-/// encrypted values only (written by `SopsManager::encrypt_k8s_secret_yaml`), i.e. it is safe to
-/// reuse verbatim under kustomize transformers. Legacy or partially hardened files return `false`.
-fn secret_metadata_is_plaintext(ciphertext: &str) -> bool {
-    serde_yml::from_str::<Value>(ciphertext).is_ok_and(|doc| {
-        // `--encrypted-regex` without `--mac-only-encrypted` still fails under kustomize
-        // metadata transforms (MAC mismatch), so both must be present.
-        doc.get("sops")
-            .and_then(|m| m.get("mac_only_encrypted"))
-            .and_then(Value::as_bool)
-            == Some(true)
-            && doc.get("kind").and_then(Value::as_str) == Some("Secret")
-            && doc
-                .get("metadata")
-                .and_then(|m| m.get("name"))
-                .and_then(Value::as_str)
-                .is_some_and(|n| !n.starts_with("ENC["))
-    })
 }
 
 /// Decrypts a stored manifest-app `Secret` (encrypted to the tenant `age` key) into its
@@ -1824,9 +1780,6 @@ fn conflicting_hostname<'a>(wanted: &'a [String], claimed: &[String]) -> Option<
 const HELM_APP_NETWORK_POLICY_FILE: &str = "networkpolicy.yaml";
 /// File (relative to the app directory) of a Helm app's SOPS-encrypted `<name>-secrets` `Secret`.
 const HELM_APP_SECRETS_FILE: &str = "secrets.enc.yaml";
-/// Former (`<name>-config` Kustomization) layout of a Helm app's secrets, removed on Edit: the
-/// tenant-namespace Kustomization needs a tenant `GitRepository`, which only `tenant-default` has.
-const LEGACY_HELM_APP_CONFIG_LAYOUT: [&str; 2] = ["config-kustomization.yaml", "config"];
 
 /// Inputs for [`prepare_helm_app_extras`].
 struct HelmAppExtrasInput<'a> {
@@ -1864,8 +1817,8 @@ struct HelmAppExtras {
     resources: Vec<&'static str>,
     /// Files registered directly in `tenants/kustomization.yaml` (applied by `keel-tenants`).
     tenant_resources: Vec<&'static str>,
-    /// Relative paths of other variants (the former `config/` layout, and a root
-    /// `secrets.enc.yaml` once no secret is stored) removed when present.
+    /// Relative paths of other variants (`secrets.enc.yaml` once no secret is stored, the
+    /// `NetworkPolicy` of a remote release) removed when present.
     stale: Vec<&'static str>,
     /// `spec.valuesFrom` entries (one per stored secret fragment).
     values_from: Vec<HelmValuesSecretRef>,
@@ -2015,7 +1968,7 @@ async fn prepare_helm_app_extras(
         files: Vec::new(),
         resources: Vec::new(),
         tenant_resources: Vec::new(),
-        stale: LEGACY_HELM_APP_CONFIG_LAYOUT.to_vec(),
+        stale: Vec::new(),
         values_from: Vec::new(),
         route_hostnames,
         release_values,
@@ -5439,6 +5392,9 @@ async fn apply_platform_merge_side_effects(state: &AppState, merged: &PullReques
         && keel_core::validate_dns_label(tenant, "tenant").is_ok()
         && let Some(forge) = state.tenant_repos.forge()
     {
+        // Serialized with `repair_tenant_credentials`: a repair waiting on this lock then sees
+        // the stub gone from `main` and refuses to mint a credential for the deleted tenant.
+        let _cluster_guard = state.tenant_repos.lock(&format!("{tenant}#cluster")).await;
         match crate::tenant_repos::revoke_all_credentials(forge, tenant).await {
             Ok(revoked) => tracing::info!(
                 target: "keel::audit",
@@ -6021,18 +5977,6 @@ mod tests {
 
     fn files(paths: &[&str]) -> Vec<String> {
         paths.iter().map(|p| (*p).to_string()).collect()
-    }
-
-    #[test]
-    fn legacy_fully_encrypted_secrets_are_not_reused_verbatim() {
-        let partial = "apiVersion: v1\nkind: Secret\nmetadata:\n  name: app-secrets\n  namespace: tenant-acme\nstringData:\n  apiToken: ENC[AES256_GCM,data:abc,type:str]\nsops:\n  mac_only_encrypted: true\n";
-        // encrypted_regex alone (MAC over all values) still breaks under metadata transforms.
-        let regex_only = partial.replace("  mac_only_encrypted: true\n", "  encrypted_regex: x\n");
-        assert!(!secret_metadata_is_plaintext(&regex_only));
-        let legacy = "apiVersion: ENC[AES256_GCM,data:Vgk=,type:str]\nkind: ENC[AES256_GCM,data:l5N0,type:str]\nmetadata:\n  name: ENC[AES256_GCM,data:0Dx,type:str]\nstringData:\n  apiToken: ENC[AES256_GCM,data:abc,type:str]\n";
-        assert!(secret_metadata_is_plaintext(partial));
-        assert!(!secret_metadata_is_plaintext(legacy));
-        assert!(!secret_metadata_is_plaintext("not: [valid"));
     }
 
     #[test]

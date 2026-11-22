@@ -40,7 +40,6 @@ pub use live::{
 pub use preview_runner::{
     DEFAULT_TENANT_GIT_BRANCH, InMemoryPreviewCluster, InMemoryPreviewSecret, KubePreviewCluster,
     PREVIEW_PROVIDER_SECRET_KIND, PreviewCluster, PreviewPrerequisites, TenantGitSource,
-    legacy_flux_source_stacks, legacy_flux_source_tenant_stacks, preview_git_secret_name,
     preview_report_configmap_name, preview_s3_secret_name, tenant_git_repository_manifest_path,
     tenant_git_source_from_manifest, tenant_git_source_from_repository,
 };
@@ -70,8 +69,7 @@ pub use tenant::{
     TenantManifestBundle, TenantQuotaSpec, build_keel_server_tenant_role_binding,
     build_tenant_default_deny_network_policy, build_tenant_namespace,
     build_tenant_pko_workspace_network_policy, build_tenant_resource_quota,
-    build_tenant_service_account, ensure_tenant_pko_workspace_network_policy,
-    generate_flux_kustomization_manifest, label_platform_owned_manifests,
+    build_tenant_service_account, generate_flux_kustomization_manifest,
     manifest_app_config_kustomization_name, manifest_app_secrets_name,
     manifest_app_values_configmap_name, platform_owned_labels_missing,
     synthesize_canary_gateway_network_policy, synthesize_canary_gateway_network_policy_yaml,

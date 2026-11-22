@@ -1724,7 +1724,7 @@ spec:
 
     #[test]
     fn test_catalog_application_placement_scope() {
-        // Absent placement defaults to namespaced and is not re-serialized (backward compatible).
+        // Absent placement defaults to namespaced and is not re-serialized.
         let app = parse_catalog_application(AUTHENTIK_CATALOG_YAML).unwrap();
         assert_eq!(app.spec.placement.scope, PlacementScope::Namespaced);
         assert!(!app.spec.placement.requires_remote_cluster());

@@ -485,6 +485,22 @@ async fn create(state: &AppState, id: &str) -> (StatusCode, Value, String) {
     .await
 }
 
+/// Creates a tenant and merges its platform stub proposal (the tenant then exists on `main`).
+async fn create_and_merge(state: &AppState, id: &str) -> Value {
+    let (status, body, _) = create(state, id).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let pr = body["proposal"]["id"].as_str().unwrap();
+    let (status, merged, _) = send(
+        state,
+        Method::POST,
+        &format!("/api/v1/tenants/management/proposals/{pr}/merge"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{merged}");
+    body
+}
+
 fn git_show(repo: &std::path::Path, rev_path: &str) -> Option<String> {
     let out = std::process::Command::new("git")
         .arg("--git-dir")
@@ -951,6 +967,23 @@ async fn deleted_tenant_credentials_are_revoked_and_its_repository_is_not_silent
         fx.log.live_tokens.lock().unwrap()
     );
 
+    // `tenant-acme` still exists until `keel-tenants` prunes it: a credential repair in that
+    // window must not mint a credential for the deleted tenant.
+    let (status, refused, _) = send(
+        &fx.state,
+        Method::POST,
+        "/api/v1/tenants/acme/credentials/repair",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+    assert!(refused.to_string().contains("being deleted"), "{refused}");
+    assert!(
+        fx.log.live_tokens.lock().unwrap().is_empty(),
+        "{:?}",
+        fx.log.live_tokens.lock().unwrap()
+    );
+
     // `keel-tenants` prunes the namespace. Re-creating the id refuses the old content...
     fx.store.set_namespace_present("tenant-acme", false).await;
     // Proposal branches carry a seconds timestamp.
@@ -1055,4 +1088,173 @@ async fn ssh_credentials_without_a_public_key_are_rotated_not_kept() {
     assert_eq!(keys.len(), 1, "{keys:?}");
     assert_ne!(keys[0].id, old_id);
     assert_eq!(annotation(&secret, "keel.io/credential-id"), keys[0].id);
+}
+
+#[tokio::test]
+async fn repair_credentials_rotates_a_valid_credential_and_revokes_the_old_one() {
+    for kind in [
+        TenantRepoForgeKind::Forgejo,
+        TenantRepoForgeKind::GitLab,
+        TenantRepoForgeKind::GitHub,
+    ] {
+        let fx = fixture(kind).await;
+        create_and_merge(&fx.state, "web").await;
+        let before = credentials(&fx.store, "web").await.unwrap();
+        let old_id = annotation(&before, "keel.io/credential-id");
+
+        let (status, repaired, raw) = send(
+            &fx.state,
+            Method::POST,
+            "/api/v1/tenants/web/credentials/repair",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{kind:?}: {repaired}");
+        assert_eq!(repaired["id"], "web");
+        assert_eq!(repaired["credential"], "rotated", "{kind:?}");
+        assert_eq!(repaired["sopsAge"], "existed", "{kind:?}");
+        assert_eq!(repaired["namespaceReady"], true);
+        assert_eq!(
+            repaired["repository"], "keel-tenants/infra-gitops-tenant-web",
+            "{kind:?}"
+        );
+        // Never a secret value in the response.
+        for key in ["password", "identity", "sshPrivateKey"] {
+            if let Some(v) = before.data.as_ref().unwrap().get(key) {
+                assert!(!raw.contains(&*String::from_utf8_lossy(&v.0)), "{kind:?}");
+            }
+        }
+        assert!(!raw.contains("PRIVATE KEY"), "{kind:?}");
+
+        let after = credentials(&fx.store, "web").await.unwrap();
+        let new_id = annotation(&after, "keel.io/credential-id");
+        assert_ne!(new_id, old_id, "{kind:?}");
+        // Exactly the new credential is live on the repository.
+        match kind {
+            TenantRepoForgeKind::GitHub => {
+                let keys = fx.log.deploy_keys.lock().unwrap().clone();
+                assert_eq!(keys.len(), 1, "{keys:?}");
+                assert_eq!(keys[0].id, new_id);
+            }
+            _ => {
+                let live = fx.log.live_tokens.lock().unwrap().clone();
+                assert_eq!(live.len(), 1, "{kind:?}: {live:?}");
+                assert_eq!(live[0].0, new_id);
+                assert!(
+                    fx.log.revoked_tokens.lock().unwrap().contains(&old_id),
+                    "{kind:?}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn repair_credentials_recreates_lost_secrets_and_refuses_pending_tenants() {
+    let fx = fixture(TenantRepoForgeKind::Forgejo).await;
+    create_and_merge(&fx.state, "web").await;
+    fx.store
+        .remove_secret("tenant-web", "keel-gitops-credentials")
+        .await;
+    fx.store.remove_secret("tenant-web", "sops-age").await;
+    let (status, repaired, _) = send(
+        &fx.state,
+        Method::POST,
+        "/api/v1/tenants/web/credentials/repair",
+        None,
+    )
+    .await;
+    if status == StatusCode::SERVICE_UNAVAILABLE
+        && repaired.to_string().contains("age-keygen")
+        && std::env::var_os("KEEL_REQUIRE_SOPS").is_none()
+    {
+        eprintln!("SKIPPED: age-keygen unavailable");
+        return;
+    }
+    assert_eq!(status, StatusCode::OK, "{repaired}");
+    assert_eq!(repaired["credential"], "created");
+    assert_eq!(repaired["sopsAge"], "created");
+    assert!(credentials(&fx.store, "web").await.is_some());
+    assert_eq!(fx.log.live_tokens.lock().unwrap().len(), 1);
+
+    // A tenant whose namespace does not exist yet (stub PR not merged) is a conflict.
+    fx.store.set_namespace_present("tenant-new", false).await;
+    let (status, body, _) = send(
+        &fx.state,
+        Method::POST,
+        "/api/v1/tenants/new/credentials/repair",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(credentials(&fx.store, "new").await.is_none());
+
+    // Invalid ids are rejected before any forge call.
+    let calls = fx.log.calls().len();
+    let (status, _, _) = send(
+        &fx.state,
+        Method::POST,
+        "/api/v1/tenants/Bad_Id/credentials/repair",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(fx.log.calls().len(), calls);
+}
+
+#[tokio::test]
+async fn repair_credentials_is_admin_only_and_not_applicable_to_the_local_provider() {
+    let fx = fixture(TenantRepoForgeKind::Forgejo).await;
+    let key = fx
+        .state
+        .secret_store
+        .get_or_create_session_key()
+        .await
+        .unwrap();
+    let member = SessionClaims {
+        sub: "dev@keel.local".to_string(),
+        email: Some("dev@keel.local".to_string()),
+        name: None,
+        groups: vec!["tenant-web".to_string()],
+        auth_phase: AuthPhase::OidcActive,
+        exp: chrono::Utc::now().timestamp() + 3600,
+    };
+    let cookie = format!(
+        "{SESSION_COOKIE_NAME}={}",
+        encrypt_session_token(&key, &member).unwrap()
+    );
+    let res = build_router(fx.state.clone())
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/tenants/web/credentials/repair")
+                .header(COOKIE, cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    assert!(fx.log.calls().is_empty(), "{:?}", fx.log.calls());
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (bare, workdir) = seed_platform_repo(&tmp).await;
+    let local = AppState::new(
+        Arc::new(LocalGitProvider::new(&bare)),
+        Arc::new(InMemorySecretStore::new()),
+        TelemetryMux::default(),
+        GitRunner::new(),
+        &workdir,
+        bare.to_string_lossy().to_string(),
+        AuthPhase::OidcActive,
+    );
+    let (status, body, _) = send(
+        &local,
+        Method::POST,
+        "/api/v1/tenants/default/credentials/repair",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.to_string().contains("Local Git provider"), "{body}");
 }

@@ -17,9 +17,8 @@ pub use bootstrap::{
     STAGE0_BACKEND_DIR, STAGE0_PASSPHRASE_FILE, Stage0Passphrase, Stage0PassphraseSource,
     ValidatedKubeconfig, clear_stale_kind_stage0_state_in, ensure_private_dir,
     factory as bootstrap_target_factory, generate_stage0_passphrase, keel_config_dir,
-    legacy_stage0_tmp_root, migrate_legacy_stage0_state_in, resolve_stage0_passphrase,
-    resolve_stage0_passphrase_in, stage0_cluster_dir_in, stage0_program_dir_in, stage0_state_root,
-    validate_kubeconfig_yaml, write_private_file,
+    resolve_stage0_passphrase, resolve_stage0_passphrase_in, stage0_cluster_dir_in,
+    stage0_program_dir_in, stage0_state_root, validate_kubeconfig_yaml, write_private_file,
 };
 pub use catalog::{
     CLUSTER_SCOPED_KINDS, DEFAULT_PLATFORM_BASE_DOMAIN, GATEWAY_ROUTE_KINDS, PLATFORM_HOST_LABELS,

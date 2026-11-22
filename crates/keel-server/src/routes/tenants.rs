@@ -1143,3 +1143,77 @@ pub async fn delete_tenant(
         notes,
     }))
 }
+
+/// Response body for `POST /api/v1/tenants/{id}/credentials/repair`.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RepairTenantCredentialsResponse {
+    pub id: String,
+    /// Tenant repository (`<owner>/<name>`); the credential works on it only.
+    pub repository: String,
+    #[serde(flatten)]
+    pub cluster: ClusterProvisioning,
+}
+
+/// The tenant's platform stub on the platform repository's freshly fetched `main`.
+async fn committed_platform_stub_state(
+    state: &AppState,
+    tenant: &str,
+) -> Result<TenantStubState, ServerError> {
+    let Some(forge) = state.tenant_repos.forge() else {
+        return Ok(TenantStubState::Absent);
+    };
+    let source = forge.source(tenant)?;
+    let _guard = state.git_lock.lock().await;
+    state
+        .git_runner
+        .sync_branch_from_remote(&state.repo_workdir, "origin", "main")
+        .await?;
+    let (manifest, dir_exists) = read_platform_tenant_stub(state, tenant).await?;
+    Ok(tenant_repos::classify_tenant_stub(
+        manifest.as_deref(),
+        dir_exists,
+        &source,
+    ))
+}
+
+/// `POST /api/v1/tenants/{id}/credentials/repair` (platform admin only).
+///
+/// Re-mints the tenant's repository read credential and rewrites the cluster-only
+/// `tenant-<id>/keel-gitops-credentials` Secret, revoking the previous credential and every other
+/// read credential of the repository; a missing `sops-age` Secret is created (never replaced).
+/// Flux and PKO pick the new credential up on their next pull. Normal operations (lost, leaked or
+/// expired credentials), not a migration. Secret values are never logged or returned.
+pub async fn repair_tenant_credentials(
+    auth: AuthSession,
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<RepairTenantCredentialsResponse>, ServerError> {
+    auth.require_admin()?;
+    validate_dns_label(&id, "id")?;
+    let repository = match state.tenant_repos.require_forge()? {
+        Some(forge) => tenant_repos::target_label(forge, &id),
+        None => String::new(),
+    };
+    let cluster = tenant_repos::repair_tenant_credentials(
+        state.secret_store.as_ref(),
+        &state.tenant_repos,
+        &id,
+        || committed_platform_stub_state(&state, &id),
+    )
+    .await?;
+    tracing::info!(
+        target: "keel::audit",
+        action = "tenant.credential.repair",
+        user = %auth.claims.sub,
+        tenant = %id,
+        credential = ?cluster.credential,
+        sops_age = ?cluster.sops_age,
+        "Repaired tenant runtime credentials"
+    );
+    Ok(Json(RepairTenantCredentialsResponse {
+        id,
+        repository,
+        cluster,
+    }))
+}

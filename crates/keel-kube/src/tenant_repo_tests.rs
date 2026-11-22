@@ -184,7 +184,7 @@ fn stub_contains_the_baseline_source_and_sync_and_no_secret() {
             }
             kinds.push(kind);
         }
-        // Platform-owned stub files are the ones the baseline migration relabels.
+        // Every stub file is a platform-owned tenant file.
         let file = path.rsplit('/').next().unwrap();
         assert!(crate::PLATFORM_OWNED_TENANT_FILES.contains(&file), "{file}");
     }
@@ -233,9 +233,11 @@ fn credentials_secret_is_never_written_to_git() {
         let renamed = yaml.replace("name: keel-gitops-credentials", "name: renamed");
         assert!(ensure_git_safe_manifests("x.yaml", &renamed).is_err());
     }
-    // The legacy read-only `git-credentials` Secret too, and any plaintext Secret.
-    let legacy = crate::tenant::build_tenant_git_credentials_secret("acme", "u", "t").unwrap();
-    assert!(ensure_git_safe_manifests("x.yaml", &serde_yml::to_string(&legacy).unwrap()).is_err());
+    // The monorepo-layout read-only `git-credentials` Secret too, and any plaintext Secret.
+    let monorepo = crate::tenant::build_tenant_git_credentials_secret("acme", "u", "t").unwrap();
+    assert!(
+        ensure_git_safe_manifests("x.yaml", &serde_yml::to_string(&monorepo).unwrap()).is_err()
+    );
     let plain = "apiVersion: v1\nkind: Secret\nmetadata:\n  name: app\nstringData:\n  k: v\n";
     assert!(ensure_git_safe_manifests("x.yaml", plain).is_err());
     // SOPS-encrypted app Secrets (`secrets.enc.yaml`) and non-Secret objects are fine.

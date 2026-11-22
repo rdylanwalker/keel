@@ -46,12 +46,8 @@ pub const PREVIEW_LABEL_SELECTOR: &str = "keel.io/ephemeral-preview=true";
 pub const TENANT_GIT_REPOSITORY_NAME: &str = "keel-gitops";
 /// `keel.io/secret-kind` for tenant-scoped S3 state credentials mirrored into `keel-previews`.
 pub const PREVIEW_S3_SECRET_KIND: &str = "preview-tenant-s3-credentials";
-/// `keel.io/secret-kind` of the per-tenant `keel-preview-git-<tenant>` Git credential mirror, kept
-/// only while preview `GitRepository` objects from earlier releases reference it (current previews
-/// use a per-preview copy owned by their `Stack`).
-pub const PREVIEW_GIT_SECRET_KIND: &str = "preview-tenant-git-credentials";
-/// Flux `GitRepository` auth keys copied into the `keel-previews` Git credential mirror; any other
-/// key in the tenant Secret is never staged in the shared preview namespace.
+/// Flux `GitRepository` auth keys a preview copies from the tenant's read-only Git credentials;
+/// any other key in the tenant Secret is never staged in the shared preview namespace.
 pub const FLUX_GIT_AUTH_KEYS: &[&str] = &[
     "username",
     "password",
@@ -68,13 +64,6 @@ pub const PREVIEW_PROVIDER_SECRET_KIND: &str = "preview-provider-credentials";
 pub fn preview_s3_secret_name(tenant: &str) -> Result<String, KubeError> {
     tenant_namespace(tenant)?;
     Ok(format!("keel-preview-s3-{tenant}"))
-}
-
-/// Name of the legacy per-tenant `keel-previews` mirror of a tenant's read-only Git credentials
-/// (see [`PREVIEW_GIT_SECRET_KIND`]).
-pub fn preview_git_secret_name(tenant: &str) -> Result<String, KubeError> {
-    tenant_namespace(tenant)?;
-    Ok(format!("keel-preview-git-{tenant}"))
 }
 
 /// Name of the `ConfigMap` persisting the rendered report for a preview `Stack`.
@@ -235,37 +224,6 @@ pub fn tenant_git_source_from_manifest(
     Ok(source)
 }
 
-/// Returns `(namespace, name)` of tenant `Stack`s (in `tenant-*` namespaces) still using
-/// `spec.fluxSource`, i.e. committed by releases before tenant Stacks moved to PKO `gitSource`.
-/// Their workspaces download `source-controller` artifacts (`flux-system` port 9090) and stop
-/// working once that port is closed to tenant namespaces; migrate them first with
-/// `keel tenant migrate-stack-sources`. The `flux-system` management Stack is never listed.
-pub fn legacy_flux_source_tenant_stacks(stacks: &[Value]) -> Vec<(String, String)> {
-    legacy_flux_source_stacks(stacks, |ns| ns.starts_with("tenant-"))
-}
-
-/// Returns `(namespace, name)` (sorted, deduplicated) of `Stack`s whose namespace satisfies
-/// `in_scope` and that set a non-null `spec.fluxSource`. Shared by the tenant audit
-/// ([`legacy_flux_source_tenant_stacks`]) and the Stage 0 `source-controller` artifact gate, which
-/// treats every `fluxSource` Stack outside `flux-system` as blocking.
-pub fn legacy_flux_source_stacks(
-    stacks: &[Value],
-    in_scope: impl Fn(&str) -> bool,
-) -> Vec<(String, String)> {
-    let mut out: Vec<(String, String)> = stacks
-        .iter()
-        .filter(|s| s.pointer("/spec/fluxSource").is_some_and(|f| !f.is_null()))
-        .filter_map(|s| {
-            let ns = s.pointer("/metadata/namespace").and_then(Value::as_str)?;
-            let name = s.pointer("/metadata/name").and_then(Value::as_str)?;
-            in_scope(ns).then(|| (ns.to_string(), name.to_string()))
-        })
-        .collect();
-    out.sort();
-    out.dedup();
-    out
-}
-
 /// Validates the tenant's `keel-gitops` `GitRepository` (as fetched from `tenant-<id>`) and
 /// extracts the preview Git source.
 ///
@@ -325,7 +283,7 @@ pub fn tenant_git_source_from_repository(
 }
 
 /// Validates the tenant credentials Secret referenced by `tenant-<id>/keel-gitops` and returns the
-/// exact (allow-listed) payload mirrored into `keel-previews/keel-preview-git-<tenant>`.
+/// exact (allow-listed) payload each preview copies into its own `keel-previews` Secret.
 ///
 /// Fails closed with [`KubeError::PreviewSourceUnavailable`] unless the reference is the
 /// platform-written read-only `git-credentials` Secret (labelled
@@ -405,31 +363,11 @@ pub trait PreviewCluster: Send + Sync {
         )))
     }
 
-    /// One-off sweep (run at `keel-server` start-up): deletes `keel-previews` Git credential
-    /// mirrors (`keel.io/secret-kind=preview-tenant-git-credentials`) that no longer match the
-    /// tenant's own read-only `tenant-<id>/git-credentials` Secret, e.g. platform credentials
-    /// copied by the former `flux-system/flux-system` fallback. Returns the number of Secrets deleted.
-    async fn purge_stale_preview_git_credentials(&self) -> Result<usize, KubeError> {
-        Ok(0)
-    }
-
-    /// Lists tenant `Stack`s still on `spec.fluxSource` (see
-    /// [`legacy_flux_source_tenant_stacks`]); empty when unknown.
-    async fn list_legacy_flux_source_tenant_stacks(
-        &self,
-    ) -> Result<Vec<(String, String)>, KubeError> {
-        Ok(Vec::new())
-    }
-
     /// Server-side applies the preview `Stack` document (PKO `gitSource`, no Flux `GitRepository`).
     async fn apply_preview(&self, stack: &Value) -> Result<(), KubeError>;
 
     /// Lists preview `Stack` objects in `keel-previews`.
     async fn list_preview_stacks(&self) -> Result<Vec<Value>, KubeError>;
-
-    /// Lists preview `GitRepository` objects in `keel-previews` (only left by releases before
-    /// previews moved to PKO `gitSource`; still garbage-collected).
-    async fn list_preview_git_repositories(&self) -> Result<Vec<Value>, KubeError>;
 
     /// Fetches a preview `Stack` by name.
     async fn get_preview_stack(&self, name: &str) -> Result<Option<Value>, KubeError>;
@@ -457,7 +395,7 @@ pub trait PreviewCluster: Send + Sync {
     /// Loads the persisted report for a preview `Stack`.
     async fn load_report(&self, stack_name: &str) -> Result<Option<String>, KubeError>;
 
-    /// Deletes a preview object (`Stack`, `GitRepository`, `ConfigMap`). `Ok(false)` if absent.
+    /// Deletes a preview object (`Stack`, `ConfigMap`). `Ok(false)` if absent.
     async fn delete_preview_object(&self, kind: &str, name: &str) -> Result<bool, KubeError>;
 
     /// Copies exactly the planned per-preview Secrets (only the referenced keys) from
@@ -853,54 +791,6 @@ impl KubePreviewCluster {
             tenant_git_credentials_payload(tenant, &source, &secret_name, secret.as_ref())?;
         Ok((source, Some(payload)))
     }
-
-    /// The per-tenant `keel-preview-git-<tenant>` mirror is only still needed by preview
-    /// `GitRepository` objects created by earlier releases (`spec.secretRef`); refresh it with the
-    /// validated read-only payload while one references it, otherwise delete it.
-    async fn reconcile_legacy_git_mirror(
-        &self,
-        tenant: &str,
-        mirror: &str,
-        payload: BTreeMap<String, k8s_openapi::ByteString>,
-    ) -> Result<(), KubeError> {
-        let legacy_in_use = match self.list_preview_git_repositories().await {
-            Ok(repos) => repos.iter().any(|repo| {
-                repo.pointer("/spec/secretRef/name").and_then(Value::as_str) == Some(mirror)
-            }),
-            Err(e) => {
-                // Not fatal for the preview (it uses its own per-preview copy); the start-up sweep
-                // and the next preview retry the clean-up.
-                tracing::warn!(tenant, error = %e, "could not list legacy preview GitRepositories; leaving the Git credential mirror as is");
-                return Ok(());
-            }
-        };
-        if legacy_in_use {
-            let filtered = Secret {
-                data: Some(payload),
-                ..Secret::default()
-            };
-            self.mirror_secret(
-                &filtered,
-                mirror,
-                tenant,
-                PREVIEW_GIT_SECRET_KIND,
-                Some(FLUX_GIT_AUTH_KEYS),
-            )
-            .await
-        } else {
-            self.delete_preview_git_mirror(mirror).await.map(|_| ())
-        }
-    }
-
-    /// Idempotently deletes `keel-previews/keel-preview-git-<tenant>` (404 is success).
-    async fn delete_preview_git_mirror(&self, name: &str) -> Result<bool, KubeError> {
-        let api: Api<Secret> = Api::namespaced(self.client.clone(), KEEL_PREVIEWS_NAMESPACE);
-        match api.delete(name, &DeleteParams::default()).await {
-            Ok(_) => Ok(true),
-            Err(e) if not_found(&e) => Ok(false),
-            Err(e) => Err(e.into()),
-        }
-    }
 }
 
 #[async_trait]
@@ -910,18 +800,12 @@ impl PreviewCluster for KubePreviewCluster {
         tenant: &str,
     ) -> Result<PreviewPrerequisites, KubeError> {
         tenant_namespace(tenant)?;
-        let git_mirror = preview_git_secret_name(tenant)?;
 
         // Tenant-owned Git source only (fail closed: never the platform `flux-system` source).
         // Resolved before anything is written to `keel-previews`, so a refusal stages nothing.
         let (source, git_payload) = match self.resolve_tenant_git(tenant).await {
             Ok(resolved) => resolved,
             Err(err @ KubeError::PreviewSourceUnavailable(_)) => {
-                // Drop any mirror left behind (e.g. platform credentials copied by the former
-                // `flux-system` fallback). The audit record is emitted once by keel-server.
-                if let Err(e) = self.delete_preview_git_mirror(&git_mirror).await {
-                    tracing::warn!(tenant, error = %e, "could not delete stale preview Git credentials");
-                }
                 tracing::debug!(tenant, error = %err, "tenant has no usable preview Git source");
                 return Err(err);
             }
@@ -934,21 +818,12 @@ impl PreviewCluster for KubePreviewCluster {
             s3_secret: self.mirror_tenant_s3_identity(tenant).await?,
             ..PreviewPrerequisites::default()
         };
-
-        match git_payload {
-            Some(data) => {
-                // Each preview copies exactly these keys into its own Secret owned by the preview
-                // Stack (`keel-preview-<pr>-git-credentials`, GC'd with it); no long-lived
-                // per-tenant Git credential is kept in the shared `keel-previews` namespace.
-                out.git_secret_keys = data.keys().cloned().collect();
-                out.git_secret = source.secret_name.clone();
-                self.reconcile_legacy_git_mirror(tenant, &git_mirror, data)
-                    .await?;
-            }
-            // Public tenant source: no credentials, and no stale mirror may linger.
-            None => {
-                self.delete_preview_git_mirror(&git_mirror).await?;
-            }
+        // Each preview copies exactly these keys into its own Secret owned by the preview Stack
+        // (`keel-preview-<pr>-git-credentials`, GC'd with it); no long-lived per-tenant Git
+        // credential is kept in the shared `keel-previews` namespace.
+        if let Some(data) = git_payload {
+            out.git_secret_keys = data.keys().cloned().collect();
+            out.git_secret = source.secret_name.clone();
         }
         out.git_url = Some(source.url);
         Ok(out)
@@ -972,72 +847,12 @@ impl PreviewCluster for KubePreviewCluster {
         let payload = crate::tenant_repo_preview_secret_payload(source, &secret)?;
         self.ensure_service_account().await;
         self.ensure_preview_ca_bundle().await;
-        // The per-tenant mirror of the former shared credential is never used by a tenant
-        // repository preview (each preview copies its own keys).
-        if let Err(e) = self
-            .delete_preview_git_mirror(&preview_git_secret_name(tenant)?)
-            .await
-        {
-            tracing::warn!(tenant, error = %e, "could not delete a stale preview Git credential mirror");
-        }
         Ok(PreviewPrerequisites {
             s3_secret: self.mirror_tenant_s3_identity(tenant).await?,
             git_url: Some(source.url().to_string()),
             git_secret: Some(TENANT_GITOPS_CREDENTIALS_SECRET_NAME.to_string()),
             git_secret_keys: payload.into_keys().collect(),
         })
-    }
-
-    async fn purge_stale_preview_git_credentials(&self) -> Result<usize, KubeError> {
-        let api: Api<Secret> = Api::namespaced(self.client.clone(), KEEL_PREVIEWS_NAMESPACE);
-        let mirrors = api
-            .list(
-                &ListParams::default()
-                    .labels(&format!("keel.io/secret-kind={PREVIEW_GIT_SECRET_KIND}")),
-            )
-            .await?;
-        let mut deleted = 0;
-        for mirror in mirrors.items {
-            let name = mirror.name_any();
-            let tenant = mirror.labels().get("keel.io/tenant").cloned();
-            let stale = match tenant.as_deref() {
-                Some(t) if preview_git_secret_name(t).ok().as_deref() == Some(name.as_str()) => {
-                    match self.resolve_tenant_git(t).await {
-                        Ok((_, Some(expected))) => {
-                            mirror.data.clone().unwrap_or_default() != expected
-                        }
-                        Ok((_, None)) | Err(KubeError::PreviewSourceUnavailable(_)) => true,
-                        Err(e) => {
-                            tracing::warn!(secret = %name, error = %e, "could not verify preview Git credential mirror; keeping it");
-                            false
-                        }
-                    }
-                }
-                _ => true,
-            };
-            if stale && self.delete_preview_git_mirror(&name).await? {
-                tracing::info!(
-                    secret = %name,
-                    tenant = tenant.as_deref().unwrap_or(""),
-                    "removed stale keel-previews Git credential mirror (not the tenant's own read-only credential)"
-                );
-                deleted += 1;
-            }
-        }
-        Ok(deleted)
-    }
-
-    async fn list_legacy_flux_source_tenant_stacks(
-        &self,
-    ) -> Result<Vec<(String, String)>, KubeError> {
-        let api: Api<DynamicObject> = Api::all_with(self.client.clone(), &stack_ar());
-        let list = api.list(&ListParams::default()).await?;
-        let docs = list
-            .items
-            .iter()
-            .map(to_value)
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(legacy_flux_source_tenant_stacks(&docs))
     }
 
     async fn apply_preview(&self, stack: &Value) -> Result<(), KubeError> {
@@ -1052,14 +867,6 @@ impl PreviewCluster for KubePreviewCluster {
     async fn list_preview_stacks(&self) -> Result<Vec<Value>, KubeError> {
         let list = self
             .dyn_api(&stack_ar())
-            .list(&ListParams::default().labels(PREVIEW_LABEL_SELECTOR))
-            .await?;
-        list.items.iter().map(to_value).collect()
-    }
-
-    async fn list_preview_git_repositories(&self) -> Result<Vec<Value>, KubeError> {
-        let list = self
-            .dyn_api(&git_repo_ar())
             .list(&ListParams::default().labels(PREVIEW_LABEL_SELECTOR))
             .await?;
         list.items.iter().map(to_value).collect()
@@ -1167,11 +974,6 @@ impl PreviewCluster for KubePreviewCluster {
         let res = match kind {
             "Stack" => self
                 .dyn_api(&stack_ar())
-                .delete(name, &dp)
-                .await
-                .map(|_| ()),
-            "GitRepository" => self
-                .dyn_api(&git_repo_ar())
                 .delete(name, &dp)
                 .await
                 .map(|_| ()),
@@ -1312,7 +1114,6 @@ impl PreviewCluster for KubePreviewCluster {
 #[derive(Default)]
 struct InMemoryState {
     stacks: BTreeMap<String, Value>,
-    repos: BTreeMap<String, Value>,
     updates: HashMap<String, Value>,
     logs: HashMap<String, String>,
     reports: HashMap<String, String>,
@@ -1408,17 +1209,6 @@ impl InMemoryPreviewCluster {
         self.lock().stacks.get(name).cloned()
     }
 
-    /// Returns stored preview `GitRepository` names.
-    pub fn git_repository_names(&self) -> Vec<String> {
-        self.lock().repos.keys().cloned().collect()
-    }
-
-    /// Seeds a preview `GitRepository` as written by releases before previews used PKO
-    /// `gitSource` (exercises legacy garbage collection).
-    pub fn put_legacy_git_repository(&self, name: &str, doc: Value) {
-        self.lock().repos.insert(name.to_string(), doc);
-    }
-
     /// Seeds a Secret in `tenant-<tenant>` (source for preview credential copies).
     pub fn put_tenant_secret(&self, tenant: &str, name: &str, data: &[(&str, &str)]) {
         self.lock().tenant_secrets.insert(
@@ -1504,10 +1294,6 @@ impl PreviewCluster for InMemoryPreviewCluster {
         Ok(self.lock().stacks.values().cloned().collect())
     }
 
-    async fn list_preview_git_repositories(&self) -> Result<Vec<Value>, KubeError> {
-        Ok(self.lock().repos.values().cloned().collect())
-    }
-
     async fn get_preview_stack(&self, name: &str) -> Result<Option<Value>, KubeError> {
         Ok(self.lock().stacks.get(name).cloned())
     }
@@ -1570,7 +1356,6 @@ impl PreviewCluster for InMemoryPreviewCluster {
                     .retain(|_, s| s.owner_stack.as_deref() != Some(name));
                 st.stacks.remove(name).is_some()
             }
-            "GitRepository" => st.repos.remove(name).is_some(),
             "ConfigMap" => false,
             other => {
                 return Err(KubeError::InvalidInput(format!(
@@ -1866,28 +1651,6 @@ spec:
     }
 
     #[test]
-    fn legacy_flux_source_tenant_stacks_are_listed_for_migration() {
-        let stack = |ns: &str, name: &str, spec: Value| json!({ "metadata": { "namespace": ns, "name": name }, "spec": spec });
-        let flux = json!({ "fluxSource": { "sourceRef": { "name": "keel-gitops" }, "dir": "x" } });
-        let git = json!({ "projectRepo": "https://forge/x.git", "branch": "main" });
-        let found = legacy_flux_source_tenant_stacks(&[
-            stack("tenant-default", "wl-cluster", flux.clone()),
-            stack("tenant-acme", "vm", git),
-            // The protected management Stack keeps its same-namespace Flux source.
-            stack("flux-system", "management-cluster-core", flux.clone()),
-            stack("keel-previews", "preview-stack-pr-1", flux.clone()),
-            stack("tenant-default", "canary-config", flux),
-        ]);
-        assert_eq!(
-            found,
-            vec![
-                ("tenant-default".to_string(), "canary-config".to_string()),
-                ("tenant-default".to_string(), "wl-cluster".to_string()),
-            ]
-        );
-    }
-
-    #[test]
     fn tenant_stack_source_fails_closed_without_a_usable_stub() {
         let refused = |tenant: &str, manifest: Option<&str>| match tenant_git_source_from_manifest(
             tenant, manifest,
@@ -2170,8 +1933,6 @@ spec:
         )
     }
 
-    const ACME_GIT_MIRROR: &str = "/api/v1/namespaces/keel-previews/secrets/keel-preview-git-acme";
-
     fn assert_never_flux_system(seen: &[String]) {
         assert!(
             seen.iter().all(|p| !p.contains("flux-system")),
@@ -2202,30 +1963,6 @@ spec:
         assert_never_flux_system(&seen);
     }
 
-    const PREVIEW_GIT_REPOS: &str =
-        "/apis/source.toolkit.fluxcd.io/v1/namespaces/keel-previews/gitrepositories";
-
-    fn legacy_repo_list(secret: Option<&str>) -> Route {
-        let items: Vec<Value> = secret
-            .map(|s| {
-                let mut repo = repo_doc("preview-source-pr-7");
-                repo["spec"] = json!({ "url": REPO_URL, "secretRef": { "name": s } });
-                repo
-            })
-            .into_iter()
-            .collect();
-        (
-            format!("GET {PREVIEW_GIT_REPOS}"),
-            200,
-            json!({
-                "apiVersion": "source.toolkit.fluxcd.io/v1",
-                "kind": "GitRepositoryList",
-                "metadata": {},
-                "items": items,
-            }),
-        )
-    }
-
     #[tokio::test]
     async fn prerequisites_validate_but_never_mirror_the_tenant_credentials() {
         let creds = git_secret(
@@ -2238,8 +1975,6 @@ spec:
             vec![
                 repo_route("acme", Some("git-credentials")),
                 secret_route("tenant-acme", &creds),
-                legacy_repo_list(None),
-                deleted_route(ACME_GIT_MIRROR),
             ],
             recorded.clone(),
         ));
@@ -2255,11 +1990,7 @@ spec:
         );
         assert_eq!(out.s3_secret, None);
         let seen = recorded.lock().unwrap().clone();
-        // No long-lived per-tenant mirror: the old one is deleted, nothing is written.
-        assert!(
-            seen.contains(&format!("DELETE {ACME_GIT_MIRROR}")),
-            "{seen:?}"
-        );
+        // No long-lived per-tenant mirror: nothing is written.
         assert!(
             !seen
                 .iter()
@@ -2270,36 +2001,7 @@ spec:
     }
 
     #[tokio::test]
-    async fn legacy_preview_git_repositories_keep_their_mirror_refreshed() {
-        let creds = git_secret(
-            "git-credentials",
-            Some(TENANT_GIT_CREDENTIALS_SECRET_KIND),
-            &[("username", "git"), ("password", "ro")],
-        );
-        let recorded = Recorded::default();
-        let cluster = KubePreviewCluster::new(mock_client(
-            vec![
-                repo_route("acme", Some("git-credentials")),
-                secret_route("tenant-acme", &creds),
-                legacy_repo_list(Some("keel-preview-git-acme")),
-            ],
-            recorded.clone(),
-        ));
-        let out = cluster.ensure_preview_prerequisites("acme").await.unwrap();
-        assert_eq!(out.git_secret.as_deref(), Some("git-credentials"));
-        let seen = recorded.lock().unwrap().clone();
-        assert!(
-            seen.contains(&format!("PATCH {ACME_GIT_MIRROR}")),
-            "{seen:?}"
-        );
-        assert!(
-            !seen.contains(&format!("DELETE {ACME_GIT_MIRROR}")),
-            "{seen:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn prerequisites_refusals_write_nothing_and_delete_the_stale_mirror() {
+    async fn prerequisites_refusals_write_nothing() {
         let wrong_name = git_secret(
             "web-kubeconfig",
             Some(TENANT_GIT_CREDENTIALS_SECRET_KIND),
@@ -2319,8 +2021,7 @@ spec:
                 ],
             ),
         ];
-        for (case, mut routes) in cases {
-            routes.push(deleted_route(ACME_GIT_MIRROR));
+        for (case, routes) in cases {
             let recorded = Recorded::default();
             let cluster = KubePreviewCluster::new(mock_client(routes, recorded.clone()));
             let err = cluster
@@ -2332,10 +2033,6 @@ spec:
                 "{case}: {err:?}"
             );
             let seen = recorded.lock().unwrap().clone();
-            assert!(
-                seen.contains(&format!("DELETE {ACME_GIT_MIRROR}")),
-                "{case}: {seen:?}"
-            );
             let writes: Vec<_> = seen
                 .iter()
                 .filter(|r| {
@@ -2356,7 +2053,7 @@ spec:
     }
 
     #[tokio::test]
-    async fn public_tenant_source_drops_a_stale_git_mirror() {
+    async fn public_tenant_source_has_no_git_credentials() {
         let recorded = Recorded::default();
         let cluster = KubePreviewCluster::new(mock_client(
             vec![repo_route("acme", None)],
@@ -2365,83 +2062,14 @@ spec:
         let out = cluster.ensure_preview_prerequisites("acme").await.unwrap();
         assert_eq!(out.git_url.as_deref(), Some(REPO_URL));
         assert_eq!(out.git_secret, None);
+        assert!(out.git_secret_keys.is_empty());
         let seen = recorded.lock().unwrap().clone();
-        assert!(
-            seen.contains(&format!("DELETE {ACME_GIT_MIRROR}")),
-            "{seen:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn sweep_purges_mirrors_that_are_not_the_tenant_readonly_credential() {
-        let mirror = |tenant: Option<&str>, name: &str, password: &str| {
-            let mut s = git_secret(
-                name,
-                Some(PREVIEW_GIT_SECRET_KIND),
-                &[("username", "git"), ("password", password)],
-            );
-            s.metadata.namespace = Some(KEEL_PREVIEWS_NAMESPACE.to_string());
-            if let Some(t) = tenant {
-                s.labels_mut()
-                    .insert("keel.io/tenant".to_string(), t.to_string());
-            }
-            s
-        };
-        let list = json!({
-            "apiVersion": "v1",
-            "kind": "SecretList",
-            "metadata": {},
-            "items": [
-                // acme has no tenant source: platform credential left by the old fallback.
-                mirror(Some("acme"), "keel-preview-git-acme", "platform-token"),
-                // default matches its read-only credential: kept.
-                mirror(Some("default"), "keel-preview-git-default", "ro"),
-                // beta has a source but the mirror holds a different (platform) token.
-                mirror(Some("beta"), "keel-preview-git-beta", "platform-token"),
-                // unlabelled mirror: always stale.
-                mirror(None, "keel-preview-git-ghost", "x"),
-            ],
-        });
-        let ro = |ns: &str| {
-            let mut s = git_secret(
-                "git-credentials",
-                Some(TENANT_GIT_CREDENTIALS_SECRET_KIND),
-                &[("username", "git"), ("password", "ro")],
-            );
-            s.metadata.namespace = Some(ns.to_string());
-            s
-        };
-        let recorded = Recorded::default();
-        let cluster = KubePreviewCluster::new(mock_client(
-            vec![
-                (
-                    "GET /api/v1/namespaces/keel-previews/secrets".to_string(),
-                    200,
-                    list,
-                ),
-                repo_route("default", Some("git-credentials")),
-                secret_route("tenant-default", &ro("tenant-default")),
-                repo_route("beta", Some("git-credentials")),
-                secret_route("tenant-beta", &ro("tenant-beta")),
-                deleted_route(ACME_GIT_MIRROR),
-                deleted_route("/api/v1/namespaces/keel-previews/secrets/keel-preview-git-beta"),
-                deleted_route("/api/v1/namespaces/keel-previews/secrets/keel-preview-git-ghost"),
-            ],
-            recorded.clone(),
-        ));
-        assert_eq!(
-            cluster.purge_stale_preview_git_credentials().await.unwrap(),
-            3
-        );
-        let seen = recorded.lock().unwrap().clone();
-        let deletes: Vec<_> = seen.iter().filter(|r| r.starts_with("DELETE ")).collect();
-        assert_eq!(deletes.len(), 3, "{seen:?}");
         assert!(
             !seen
                 .iter()
-                .any(|r| r.starts_with("DELETE ") && r.ends_with("keel-preview-git-default"))
+                .any(|r| !r.starts_with("GET ") && r.contains("/namespaces/keel-previews/secrets")),
+            "{seen:?}"
         );
-        assert_never_flux_system(&seen);
     }
 
     #[tokio::test]
@@ -2489,23 +2117,11 @@ spec:
         ));
     }
 
-    fn repo_doc(name: &str) -> Value {
-        json!({
-            "apiVersion": "source.toolkit.fluxcd.io/v1",
-            "kind": "GitRepository",
-            "metadata": { "name": name, "namespace": KEEL_PREVIEWS_NAMESPACE }
-        })
-    }
-
     #[test]
     fn naming_helpers_are_tenant_scoped_and_validated() {
         assert_eq!(
             preview_s3_secret_name("acme").unwrap(),
             "keel-preview-s3-acme"
-        );
-        assert_eq!(
-            preview_git_secret_name("acme").unwrap(),
-            "keel-preview-git-acme"
         );
         assert!(preview_s3_secret_name("Bad_Tenant").is_err());
         assert_eq!(
@@ -2525,7 +2141,12 @@ spec:
         let mut wrong_ns = stack_doc("s", true);
         wrong_ns["metadata"]["namespace"] = json!("tenant-acme");
         assert!(validate_preview_doc(&wrong_ns, "Stack").is_err());
-        assert!(validate_preview_doc(&repo_doc("r"), "Stack").is_err());
+        let flux_source = json!({
+            "apiVersion": "source.toolkit.fluxcd.io/v1",
+            "kind": "GitRepository",
+            "metadata": { "name": "r", "namespace": KEEL_PREVIEWS_NAMESPACE }
+        });
+        assert!(validate_preview_doc(&flux_source, "Stack").is_err());
     }
 
     #[tokio::test]

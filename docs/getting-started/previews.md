@@ -49,7 +49,6 @@ Previews never receive control-plane credentials:
 
 - The PR comment table and GUI show only what PKO prints in its workspace log, up to the last 4000 lines.
 - A tenant needs its own Git source (`tenants/<id>/git-repository.yaml`, Flux `GitRepository` `tenant-<id>/keel-gitops`, plus the read-only `git-credentials` Secret). Without one, Pulumi-backed proposals for that tenant are refused with `409 Conflict` and an actionable message; Keel never falls back to the platform repository. Tenants created through `POST /api/v1/tenants` don't get a source yet. Until per-tenant repositories land they can install Helm apps, but Pulumi Stacks and Pulumi-engine apps are refused with `409`, and Flux-engine manifest apps (whose `Kustomization`s reference `tenant-<id>/keel-gitops`) never reconcile. A tenant source with an SSH URL is also refused with `409`: tenant Stacks clone over HTTP(S) with the read-only token, and SSH deploy keys aren't supported yet. Each refusal is logged with `audit="stack-source-denied"`.
-- Tenant Stacks created by earlier releases still use `fluxSource`, and `keel-server` logs a `legacy-stack-source` warning for each of them at start-up. Move them to `gitSource` with `keel tenant migrate-stack-sources --tenant <id>` (one PR per tenant), then merge the PR. See [Upgrading from Keel 0.9](../operations/upgrading.md).
 
 ## Deep Links
 

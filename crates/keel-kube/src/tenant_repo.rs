@@ -436,7 +436,7 @@ pub fn build_tenant_repo_kustomization_yaml(
 /// Kubernetes `Secret` that is not fully SOPS-encrypted (every `data`/`stringData` value an
 /// `ENC[...]` string, not merely a `sops` key next to plaintext values left by
 /// `encrypted_regex`/`unencrypted_suffix`), or any cluster-only Git credential Secret
-/// (`keel-gitops-credentials`, the legacy `git-credentials`, or one labelled with their
+/// (`keel-gitops-credentials`, the monorepo-layout `git-credentials`, or one labelled with their
 /// `keel.io/secret-kind`), even encrypted. Objects nested in `kind: List` (or any `*List`)
 /// `items` are checked too. Unparsable documents are refused.
 ///
@@ -986,8 +986,8 @@ pub fn tenant_repo_preview_secret_keys(transport: TenantRepoTransport) -> BTreeS
 /// `ca.crt`, `identity`, `bearerToken` or tenant-added keys). Fails closed unless the Secret is
 /// the platform-written one (name, namespace, `keel.io/secret-kind`, `keel.io/platform-owned`)
 /// and every needed key is present; an SSH `known_hosts` is re-validated for exactly the
-/// repository host. The legacy `git-credentials` layout keeps using the preview mirror's
-/// `FLUX_GIT_AUTH_KEYS`.
+/// repository host. The monorepo-layout `git-credentials` Secret uses `FLUX_GIT_AUTH_KEYS`
+/// instead.
 pub fn tenant_repo_preview_secret_payload(
     source: &TenantRepoSource,
     secret: &k8s_openapi::api::core::v1::Secret,

@@ -79,7 +79,8 @@ pub enum Commands {
     Proposal(ProposalArgs),
     /// Browse the application / infrastructure catalog
     Catalog(CatalogArgs),
-    /// Tenant maintenance (state migration)
+    /// Tenant operations (credential repair)
+    #[command(visible_alias = "tenants")]
     Tenant(TenantArgs),
 }
 
@@ -728,24 +729,16 @@ pub struct TenantArgs {
 /// Subcommands under `keel tenant`.
 #[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
 pub enum TenantCommands {
-    /// Move a tenant's Pulumi stack state from the bucket root to `tenants/<id>/` (idempotent)
-    MigrateState(TenantMigrateStateArgs),
-    /// Open one PR moving a tenant's legacy `fluxSource` PKO Stacks to PKO `gitSource` (idempotent)
-    MigrateStackSources(TenantMigrateStackSourcesArgs),
-    /// Open one PR labelling a tenant's platform-written baseline `keel.io/platform-owned` (idempotent)
-    MigrateBaseline(TenantMigrateBaselineArgs),
+    /// Re-mint a tenant's repository read credential and its cluster Secret (all tenants when no
+    /// id is given; platform admin only)
+    RepairCredentials(TenantRepairCredentialsArgs),
 }
 
-/// Arguments for `keel tenant migrate-baseline` (calls keel-server; platform admin only).
+/// Arguments for `keel tenant repair-credentials` (calls keel-server; platform admin only).
 #[derive(Args, Debug, Clone, PartialEq, Eq)]
-pub struct TenantMigrateBaselineArgs {
-    /// Tenant (bare id, e.g. `default`; a `tenant-` prefix is stripped)
-    #[arg(long, help = TENANT_HELP)]
-    pub tenant: String,
-
-    /// List the files that would be labelled without opening a PR
-    #[arg(long, default_value_t = false)]
-    pub dry_run: bool,
+pub struct TenantRepairCredentialsArgs {
+    /// Tenant (bare id, e.g. `acme`; a `tenant-` prefix is stripped). Omit to repair every tenant
+    pub tenant: Option<String>,
 
     /// Output format (`table|json`)
     #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
@@ -754,46 +747,6 @@ pub struct TenantMigrateBaselineArgs {
     /// Keel server base URL (set via global `--server` / `KEEL_SERVER`)
     #[arg(skip = DEFAULT_SERVER_URL.to_string())]
     pub server: String,
-}
-
-/// Arguments for `keel tenant migrate-stack-sources` (calls keel-server; platform admin only).
-#[derive(Args, Debug, Clone, PartialEq, Eq)]
-pub struct TenantMigrateStackSourcesArgs {
-    /// Tenant (bare id, e.g. `default`; a `tenant-` prefix is stripped)
-    #[arg(long, help = TENANT_HELP)]
-    pub tenant: String,
-
-    /// List the Stacks that would be rewritten without opening a PR
-    #[arg(long, default_value_t = false)]
-    pub dry_run: bool,
-
-    /// Output format (`table|json`)
-    #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
-    pub output: OutputFormat,
-
-    /// Keel server base URL (set via global `--server` / `KEEL_SERVER`)
-    #[arg(skip = DEFAULT_SERVER_URL.to_string())]
-    pub server: String,
-}
-
-/// Arguments for `keel tenant migrate-state` (talks to the cluster via kubectl, not keel-server).
-#[derive(Args, Debug, Clone, PartialEq, Eq)]
-pub struct TenantMigrateStateArgs {
-    /// Tenant (bare id, e.g. `default`; a `tenant-` prefix is stripped)
-    #[arg(long, help = TENANT_HELP)]
-    pub tenant: String,
-
-    /// Show what would be migrated without changing anything
-    #[arg(long, default_value_t = false)]
-    pub dry_run: bool,
-
-    /// Kubeconfig file for the management cluster
-    #[arg(long)]
-    pub kubeconfig: Option<PathBuf>,
-
-    /// Kubeconfig context for the management cluster
-    #[arg(long)]
-    pub context: Option<String>,
 }
 
 /// Arguments for `keel app install` (`SDD.md` §7.2).

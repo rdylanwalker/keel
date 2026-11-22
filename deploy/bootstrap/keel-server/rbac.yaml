@@ -155,16 +155,13 @@ metadata:
     app.kubernetes.io/managed-by: keel
 rules:
   # Ephemeral preview Stacks + their copied tenant-scoped creds (keel-preview-s3-<tenant>,
-  # keel-preview-git-<tenant>) and result ConfigMaps; garbage-collected on PR merge/close.
+  # keel-preview-<pr>-*) and result ConfigMaps; garbage-collected on PR merge/close.
   - apiGroups: ["pulumi.com"]
     resources: ["stacks"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   - apiGroups: ["auto.pulumi.com"]
     resources: ["workspaces", "updates"]
     verbs: ["get", "list", "watch", "delete"]
-  - apiGroups: ["source.toolkit.fluxcd.io"]
-    resources: ["gitrepositories"]
-    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   - apiGroups: [""]
     resources: ["secrets", "configmaps"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]

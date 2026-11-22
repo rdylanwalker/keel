@@ -79,22 +79,18 @@ impl CreatePrRequest {
 
 /// Comment attached to a Pull Request (such as a PKO v2 ephemeral preview diff report).
 ///
-/// Serialized in `camelCase` (consistent with the rest of the REST API); `snake_case` keys are
-/// still accepted on deserialization for previously persisted local proposal metadata.
+/// Serialized in `camelCase` (consistent with the rest of the REST API).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PullRequestComment {
     pub id: String,
     pub body: String,
-    #[serde(alias = "created_at")]
     pub created_at: DateTime<Utc>,
 }
 
 /// Canonical Pull Request / proposal representation returned by [`ForgeProvider`] implementations.
 ///
-/// Serialized in `camelCase` (consistent with the rest of the REST API); `snake_case` keys are
-/// still accepted on deserialization for previously persisted local proposal metadata and older
-/// servers.
+/// Serialized in `camelCase` (consistent with the rest of the REST API).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PullRequestInfo {
@@ -102,32 +98,23 @@ pub struct PullRequestInfo {
     pub title: String,
     pub body: String,
     pub state: PullRequestState,
-    #[serde(alias = "source_branch")]
     pub source_branch: String,
-    #[serde(alias = "target_branch")]
     pub target_branch: String,
-    #[serde(alias = "head_sha")]
     pub head_sha: String,
     pub tenant: Option<String>,
     pub url: String,
-    #[serde(alias = "created_at")]
     pub created_at: DateTime<Utc>,
-    #[serde(alias = "updated_at")]
     pub updated_at: DateTime<Utc>,
     #[serde(default)]
     pub comments: Vec<PullRequestComment>,
-    #[serde(default, alias = "diff_stat")]
+    #[serde(default)]
     pub diff_stat: Option<String>,
     /// Merge (or squash) commit created on the target branch once the PR is merged.
-    #[serde(
-        default,
-        alias = "merge_commit_sha",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub merge_commit_sha: Option<String>,
     /// Merge-base / target-branch commit the PR diff is computed against (recorded at merge time
     /// by the local forge, `diff_refs.base_sha` on GitLab).
-    #[serde(default, alias = "base_sha", skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_sha: Option<String>,
 }
 
@@ -747,15 +734,11 @@ mod tests {
         };
         assert!(matches_tenant(&pr, "team-sec"));
 
-        // camelCase on the wire, snake_case still accepted for persisted metadata.
+        // camelCase on the wire.
         let json = serde_json::to_value(&pr).unwrap();
         assert_eq!(json["sourceBranch"], "feature/custom-branch");
         assert!(json.get("source_branch").is_none());
-        let mut legacy = json.clone();
-        let obj = legacy.as_object_mut().unwrap();
-        let v = obj.remove("sourceBranch").unwrap();
-        obj.insert("source_branch".to_string(), v);
-        let back: PullRequestInfo = serde_json::from_value(legacy).unwrap();
+        let back: PullRequestInfo = serde_json::from_value(json).unwrap();
         assert_eq!(back, pr);
         assert!(matches_tenant(&pr, "Team Sec"));
         assert!(!matches_tenant(&pr, "other"));

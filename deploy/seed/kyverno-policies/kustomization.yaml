@@ -1,9 +1,9 @@
 # Default production Kyverno policy bundle (`Enforce` mode).
 # NOTE: `local-kind-docker-socket-exception.yaml` is intentionally omitted here and is only
 # applied when `--target kind --local-dev-docker-socket-exception` is explicitly requested.
-# The former `sync-tenant-secrets` GeneratingPolicy (which cloned control-plane admin S3/Git
-# credentials into every tenant) is retired; tenants receive dedicated least-privilege
-# credentials (`tenant-<id>/keel-tenant-s3-credentials`, read-only `tenant-<id>/git-credentials`).
+# No policy copies control-plane credentials into tenants: each tenant receives dedicated
+# least-privilege credentials (`tenant-<id>/keel-tenant-s3-credentials`, and a read credential for
+# its own repository only in `tenant-<id>/keel-gitops-credentials`).
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:

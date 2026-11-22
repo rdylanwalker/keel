@@ -399,13 +399,7 @@ async fn execute_gc(state: &AppState, cluster: &dyn PreviewCluster, plan: &GcPla
 pub async fn gc_preview_for_pr(state: &AppState, pr_id: &str, reason: &str) -> GcPlan {
     let cached = state.preview_cache.write().await.remove(pr_id);
     if let Some(cluster) = state.preview_cluster.clone() {
-        let mut values = cluster.list_preview_stacks().await.unwrap_or_default();
-        values.extend(
-            cluster
-                .list_preview_git_repositories()
-                .await
-                .unwrap_or_default(),
-        );
+        let values = cluster.list_preview_stacks().await.unwrap_or_default();
         let plan = plan_preview_gc(&candidates_from(&values), &[pr_id]);
         execute_gc(state, cluster.as_ref(), &plan, reason).await;
         // Adopted copies go with their Stack; this also removes copies never adopted.
@@ -442,12 +436,7 @@ pub async fn reconcile_previews_once(state: &AppState) -> PreviewReconcileOutcom
     let Ok(stacks) = cluster.list_preview_stacks().await else {
         return outcome;
     };
-    let Ok(repos) = cluster.list_preview_git_repositories().await else {
-        return outcome;
-    };
-    let mut all = stacks.clone();
-    all.extend(repos);
-    let candidates = candidates_from(&all);
+    let candidates = candidates_from(&stacks);
     let records: Vec<PreviewRecord> = stacks
         .iter()
         .filter_map(|s| {
@@ -562,16 +551,8 @@ pub fn spawn_preview_reconciler(
     state: AppState,
     interval: Duration,
 ) -> Option<tokio::task::JoinHandle<()>> {
-    let cluster = state.preview_cluster.clone()?;
+    state.preview_cluster.as_ref()?;
     Some(tokio::spawn(async move {
-        // One-off migration sweep: drop `keel-previews` Git credential mirrors that are not the
-        // tenant's own read-only credential (e.g. left by the former `flux-system` fallback).
-        match cluster.purge_stale_preview_git_credentials().await {
-            Ok(0) => {}
-            Ok(n) => tracing::info!(deleted = n, "purged stale preview Git credential mirrors"),
-            Err(e) => tracing::warn!(error = %e, "stale preview Git credential sweep failed"),
-        }
-        report_legacy_stack_sources(cluster.as_ref()).await;
         loop {
             tokio::time::sleep(jitter(interval)).await;
             let outcome = reconcile_previews_once(&state).await;
@@ -580,31 +561,6 @@ pub fn spawn_preview_reconciler(
             }
         }
     }))
-}
-
-/// Start-up audit: logs every tenant `Stack` still on `spec.fluxSource` (committed by earlier
-/// releases), which keeps depending on `source-controller` artifacts until it is migrated to PKO
-/// `gitSource` (`POST /api/v1/tenants/{id}/stack-sources/migrate`,
-/// `keel tenant migrate-stack-sources`). Secret-free: only namespaces and names are logged.
-pub async fn report_legacy_stack_sources(cluster: &dyn PreviewCluster) -> Vec<(String, String)> {
-    match cluster.list_legacy_flux_source_tenant_stacks().await {
-        Ok(stacks) => {
-            for (namespace, name) in &stacks {
-                tracing::warn!(
-                    namespace = %namespace,
-                    stack = %name,
-                    audit = "legacy-stack-source",
-                    "tenant Stack still uses fluxSource (source-controller artifacts); run `keel tenant migrate-stack-sources --tenant {}` and merge the PR",
-                    namespace.strip_prefix("tenant-").unwrap_or(namespace)
-                );
-            }
-            stacks
-        }
-        Err(e) => {
-            tracing::debug!(error = %e, "could not list tenant Stacks for the legacy source audit");
-            Vec::new()
-        }
-    }
 }
 
 /// Convenience: wraps a concrete runner for [`AppState::with_preview_cluster`].

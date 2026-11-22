@@ -322,14 +322,12 @@ interface RawProposal {
   id: string
   title: string
   branch?: string
-  source_branch?: string
   sourceBranch?: string
   author?: string | null
   tenant?: string | null
   status?: "open" | "merged" | "closed"
   state?: "open" | "merged" | "closed"
   createdAt?: string
-  created_at?: string
   prUrl?: string
   url?: string
   previewStatus?: "pending" | "ready" | "failed"
@@ -339,11 +337,11 @@ function normalizeProposal(raw: RawProposal): Proposal {
   return {
     id: raw.id,
     title: raw.title,
-    branch: raw.branch ?? raw.source_branch ?? raw.sourceBranch ?? "",
+    branch: raw.branch ?? raw.sourceBranch ?? "",
     author: raw.author || "keel",
     tenant: raw.tenant || "default",
     status: raw.status ?? raw.state ?? "open",
-    createdAt: raw.createdAt ?? raw.created_at ?? "just now",
+    createdAt: raw.createdAt ?? "just now",
     prUrl: raw.prUrl ?? raw.url,
     previewStatus: raw.previewStatus ?? "ready",
   }
@@ -394,14 +392,14 @@ export async function createProposal(
   return unwrapProposalResponse(raw)
 }
 
-/** Maps a wire (camelCase, legacy snake_case fallback) resource diff to the UI shape. */
+/** Maps a wire (camelCase) resource diff to the UI shape. */
 export function normalizeResourceDiff(raw: RawResourceDiff): ResourceDiff {
   return {
     urn: raw.urn ?? "",
     name: raw.name ?? "",
     op: raw.op,
-    resource_type: raw.resourceType ?? raw.resource_type ?? "",
-    changed_fields: raw.changedFields ?? raw.changed_fields ?? [],
+    resource_type: raw.resourceType ?? "",
+    changed_fields: raw.changedFields ?? [],
   }
 }
 

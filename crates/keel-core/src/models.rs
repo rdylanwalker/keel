@@ -1413,7 +1413,7 @@ pub struct CatalogAppSpec {
         skip_serializing_if = "Option::is_none"
     )]
     pub default_engine: Option<ManifestEngine>,
-    /// Placement rule; absent means `scope: namespaced` (backward compatible).
+    /// Placement rule; absent means `scope: namespaced`.
     #[serde(default, skip_serializing_if = "PlacementSpec::is_default")]
     pub placement: PlacementSpec,
     /// Gateway API routes the Helm chart renders from its values (`runtime: helm` only).

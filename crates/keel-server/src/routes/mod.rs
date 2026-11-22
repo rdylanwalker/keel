@@ -3,16 +3,12 @@
 pub mod catalog;
 pub mod management;
 pub mod proposals;
-pub mod stack_sources;
-pub mod tenant_baseline;
 pub mod tenants;
 pub mod workloads;
 
 pub use catalog::*;
 pub use management::*;
 pub use proposals::*;
-pub use stack_sources::*;
-pub use tenant_baseline::*;
 pub use tenants::*;
 pub use workloads::*;
 
@@ -1152,7 +1148,7 @@ spec:
             .expect_err("delete refused");
         assert!(matches!(err, ServerError::Forbidden(_)));
 
-        // Legacy add-ons in `keel-system` are guarded identically.
+        // Add-ons in `keel-system` are guarded identically.
         let kyverno = || AxumPath(("keel-system".to_string(), "kyverno".to_string()));
         let err = get_release_config(test_auth(), State(state.clone()), kyverno())
             .await

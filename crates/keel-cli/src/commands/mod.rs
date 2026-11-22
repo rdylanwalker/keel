@@ -29,7 +29,7 @@ use crate::cli::{
 pub use api::{
     execute_app_list, execute_catalog_list, execute_catalog_show, execute_proposal_close,
     execute_proposal_list, execute_proposal_merge, execute_proposal_show,
-    execute_tenant_migrate_baseline, execute_tenant_migrate_stack_sources,
+    execute_tenant_repair_credentials,
 };
 pub use auth::{
     AuthLoginOutcome, PkceChallenge, execute_auth_login, execute_auth_logout, execute_auth_status,
@@ -40,7 +40,6 @@ pub use bootstrap::{
     SeedRepoInitResult, default_bare_repo_for_workdir, execute_bootstrap_init,
     execute_bootstrap_init_with_target, initialize_seed_git_repo, synthesize_seed_control_plane,
 };
-pub use bootstrap::{TenantMigrationReport, TenantStackMigration};
 pub use recover::{BootstrapRecoverOutcome, build_pulumi_recover_argv, execute_bootstrap_recover};
 pub use serve::{build_serve_state, execute_serve, execute_serve_until};
 pub use workloads::{
@@ -546,24 +545,8 @@ pub async fn dispatch(cli: &Cli, ctx: &CliContext) -> Result<String, CliError> {
             CatalogCommands::Show(args) => execute_catalog_show(&with_server!(args), ctx).await,
         },
         Commands::Tenant(t) => match &t.command {
-            TenantCommands::MigrateState(args) => {
-                let tenant = normalize_tenant_arg(&args.tenant);
-                keel_core::validate_dns_label(&tenant, "tenant")?;
-                let target = bootstrap::kube::KubeTarget::new(
-                    args.context.as_deref(),
-                    args.kubeconfig.as_deref(),
-                );
-                Ok(
-                    bootstrap::state::migrate_tenant_state(target, &tenant, args.dry_run)
-                        .await?
-                        .render(),
-                )
-            }
-            TenantCommands::MigrateStackSources(args) => {
-                execute_tenant_migrate_stack_sources(&with_server!(args), ctx).await
-            }
-            TenantCommands::MigrateBaseline(args) => {
-                execute_tenant_migrate_baseline(&with_server!(args), ctx).await
+            TenantCommands::RepairCredentials(args) => {
+                execute_tenant_repair_credentials(&with_server!(args), ctx).await
             }
         },
     }

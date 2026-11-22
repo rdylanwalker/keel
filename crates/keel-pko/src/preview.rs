@@ -40,18 +40,15 @@ impl ChangeOp {
 
 /// Parsed diff for an individual Pulumi resource.
 ///
-/// Serialized camelCase on the wire (`resourceType`, `changedFields`) like the rest of the API;
-/// snake_case is still accepted on input for reports persisted by older servers (report
-/// `ConfigMap`s).
+/// Serialized camelCase on the wire (`resourceType`, `changedFields`) like the rest of the API.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ResourceDiff {
     pub urn: String,
-    #[serde(alias = "resource_type")]
     pub resource_type: String,
     pub name: String,
     pub op: ChangeOp,
-    #[serde(default, alias = "changed_fields")]
+    #[serde(default)]
     pub changed_fields: Vec<String>,
 }
 
@@ -114,7 +111,7 @@ pub struct PreviewReport {
     pub summary: PreviewSummary,
     #[serde(default)]
     pub source: PreviewSource,
-    /// Status of the ephemeral PKO preview run (absent for legacy/offline reports).
+    /// Status of the ephemeral PKO preview run (absent for offline reports).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run: Option<crate::run::PreviewRunStatus>,
 }
@@ -982,7 +979,7 @@ mod tests {
     }
 
     #[test]
-    fn report_wire_format_is_camel_case_and_accepts_legacy_snake_case() {
+    fn report_wire_format_is_camel_case() {
         let report = PreviewReport {
             resources: vec![ResourceDiff {
                 urn: "urn:pulumi:s::p::aws:ec2/instance:Instance::vm".to_string(),
@@ -1003,22 +1000,6 @@ mod tests {
         assert!(wire["resources"][0].get("changed_fields").is_none());
         assert_eq!(
             serde_json::from_value::<PreviewReport>(wire).unwrap(),
-            report
-        );
-
-        let legacy = serde_json::json!({
-            "resources": [{
-                "urn": "urn:pulumi:s::p::aws:ec2/instance:Instance::vm",
-                "resource_type": "aws:ec2/instance:Instance",
-                "name": "vm",
-                "op": "update",
-                "changed_fields": ["tags"]
-            }],
-            "summary": { "create": 0, "update": 0, "delete": 0, "replace": 0, "same": 0, "drift": 0 },
-            "source": "synthesized"
-        });
-        assert_eq!(
-            serde_json::from_value::<PreviewReport>(legacy).unwrap(),
             report
         );
     }

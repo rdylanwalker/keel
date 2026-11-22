@@ -179,7 +179,7 @@ where
                     "true".to_string(),
                 );
             let stored = if existing.is_some() {
-                // Present but unusable (corrupted/legacy): replace it.
+                // Present but unusable (corrupted): replace it.
                 secrets.upsert_secret(&tenant_ns, desired).await?
             } else {
                 // Create-if-absent so concurrent provisioners converge on one key pair.

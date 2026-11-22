@@ -270,6 +270,8 @@ Several great open-source tools solve individual slices of this problem—develo
 ## Alpha Status & Support Matrix
 
 > **Early Alpha Notice:** Keel is in active early alpha. The local `kind` + in-cluster Forgejo/Rauthy workflow is continuously tested end-to-end in CI, while cloud/hypervisor targets and external forges are implemented and ready for early-adopter testing. Feedback and real-world test reports on any ⚠️ target are especially welcome!
+>
+> Breaking alpha releases ship **no upgrade or migration path**: after a release marked breaking in the changelog, start over with a fresh cluster and GitOps repository (`keel bootstrap init`).
 
 **Legend:** ✅ Tested in Live E2E &nbsp;|&nbsp; ⚠️ Implemented / Experimental (Unit-Tested, Needs Real-World Testing)
 

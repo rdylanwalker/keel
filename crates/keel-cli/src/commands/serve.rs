@@ -717,9 +717,6 @@ where
     F: Future<Output = ()> + Send + 'static,
 {
     let (state, _unused, _forge_pf) = build_serve_state_with_forward(args, true).await?;
-    // Start-up audit: tenants whose baseline predates `keel.io/platform-owned` (not yet protected
-    // by Kyverno `protect-platform-owned-tenant-objects`; `keel tenant migrate-baseline`).
-    keel_server::routes::report_unlabelled_tenant_baselines(&state.repo_workdir).await;
     // Restart-/replica-safe preview GC + result publication driven by cluster state and forge
     // PR states (OPEN-10). No-op without a live cluster.
     let preview_reconciler = keel_server::preview_lifecycle::spawn_preview_reconciler(

@@ -455,8 +455,6 @@ impl BootstrapTarget for PulumiBootstrapTarget {
 pub const STAGE0_BACKEND_DIR: &str = "state";
 /// File (0600) inside a cluster's Stage 0 dir holding the generated Pulumi passphrase.
 pub const STAGE0_PASSPHRASE_FILE: &str = "pulumi-passphrase";
-/// Marker file recording that legacy (empty-passphrase) state is in use.
-pub const STAGE0_LEGACY_MARKER_FILE: &str = "legacy-empty-passphrase";
 
 /// Returns the Keel CLI config directory: `$KEEL_CONFIG_DIR`, `$XDG_CONFIG_HOME/keel`,
 /// `$HOME/.config/keel` (or `%APPDATA%\keel`), falling back to `<tmp>/keel` only if no home exists.
@@ -489,11 +487,6 @@ pub fn stage0_cluster_dir_in(root: &Path, cluster_name: &str) -> PathBuf {
 /// Per-program materialized Pulumi project directory for a cluster.
 pub fn stage0_program_dir_in(cluster_dir: &Path, program: &str) -> PathBuf {
     cluster_dir.join("programs").join(program)
-}
-
-/// Legacy (pre-0.7) `$TMP` location of Stage 0 Pulumi state.
-pub fn legacy_stage0_tmp_root() -> PathBuf {
-    std::env::temp_dir().join("keel-stage0-pulumi")
 }
 
 /// Creates `path` (and parents) and restricts it to the current user (`0700` on Unix).
@@ -540,8 +533,6 @@ pub enum Stage0PassphraseSource {
     LocalFile(PathBuf),
     /// Freshly generated and written to this `0600` file (must be escrowed by the operator).
     Generated(PathBuf),
-    /// Pre-existing state created by older Keel versions with an empty passphrase.
-    LegacyEmpty,
 }
 
 /// Stage 0 Pulumi passphrase (zeroized on drop, never printed by `Debug`).
@@ -596,8 +587,11 @@ fn dir_has_pulumi_stacks(backend_dir: &Path) -> bool {
 /// Resolves the Stage 0 Pulumi passphrase for `cluster_name` under `root`:
 /// 1. `PULUMI_CONFIG_PASSPHRASE` (operator-provided),
 /// 2. the existing local `0600` passphrase file,
-/// 3. legacy empty passphrase if state already exists without a passphrase file,
-/// 4. otherwise a freshly generated strong passphrase persisted to a `0600` file.
+/// 3. otherwise a freshly generated strong passphrase persisted to a `0600` file.
+///
+/// Fails when Stage 0 state already exists without a passphrase file: a new passphrase could not
+/// decrypt it. Set `PULUMI_CONFIG_PASSPHRASE` or remove the cluster's Stage 0 directory to start
+/// over.
 pub fn resolve_stage0_passphrase_in(
     root: &Path,
     cluster_name: &str,
@@ -620,15 +614,13 @@ pub fn resolve_stage0_passphrase_in(
             ));
         }
     }
-    let marker = cluster_dir.join(STAGE0_LEGACY_MARKER_FILE);
-    if marker.is_file() || dir_has_pulumi_stacks(&cluster_dir.join(STAGE0_BACKEND_DIR)) {
-        if !marker.is_file() {
-            write_private_file(&marker, b"state predates passphrase generation\n")?;
-        }
-        return Ok(Stage0Passphrase::new(
-            String::new(),
-            Stage0PassphraseSource::LegacyEmpty,
-        ));
+    if dir_has_pulumi_stacks(&cluster_dir.join(STAGE0_BACKEND_DIR)) {
+        return Err(CoreError::Validation(format!(
+            "Stage 0 state exists in {} without a passphrase file; set PULUMI_CONFIG_PASSPHRASE \
+             or remove {} to start over",
+            cluster_dir.join(STAGE0_BACKEND_DIR).display(),
+            cluster_dir.display()
+        )));
     }
     let generated = generate_stage0_passphrase();
     write_private_file(&file, format!("{generated}\n").as_bytes())?;
@@ -641,62 +633,6 @@ pub fn resolve_stage0_passphrase_in(
 /// [`resolve_stage0_passphrase_in`] using the default [`stage0_state_root`].
 pub fn resolve_stage0_passphrase(cluster_name: &str) -> Result<Stage0Passphrase, CoreError> {
     resolve_stage0_passphrase_in(&stage0_state_root(), cluster_name)
-}
-
-fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(dst)?;
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let ty = entry.file_type()?;
-        let target = dst.join(entry.file_name());
-        if ty.is_dir() {
-            copy_dir_recursive(&entry.path(), &target)?;
-        } else if ty.is_file() && !target.exists() {
-            std::fs::copy(entry.path(), &target)?;
-        }
-    }
-    Ok(())
-}
-
-/// One-time migration of legacy `$TMP/keel-stage0-pulumi/*-<cluster>` DIY backends into the
-/// durable per-cluster backend under `root`. Returns `true` if anything was migrated.
-pub fn migrate_legacy_stage0_state_in(
-    root: &Path,
-    legacy_root: &Path,
-    cluster_name: &str,
-) -> Result<bool, CoreError> {
-    crate::validate_dns_label(cluster_name, "cluster_name")?;
-    let backend = stage0_cluster_dir_in(root, cluster_name).join(STAGE0_BACKEND_DIR);
-    if dir_has_pulumi_stacks(&backend) {
-        return Ok(false);
-    }
-    let mut candidates: Vec<PathBuf> = Vec::new();
-    for target in BootstrapTargetKind::all() {
-        candidates.push(legacy_root.join(format!("{target}-{cluster_name}")));
-    }
-    let cp_root = legacy_root.join(format!("control-plane-{cluster_name}"));
-    if let Ok(entries) = std::fs::read_dir(&cp_root) {
-        for entry in entries.flatten() {
-            candidates.push(entry.path());
-        }
-    }
-    let mut migrated = false;
-    for dir in candidates {
-        let src = dir.join(".pulumi");
-        if src.join("stacks").is_dir() {
-            ensure_private_dir(&backend)?;
-            copy_dir_recursive(&src, &backend.join(".pulumi"))?;
-            migrated = true;
-        }
-    }
-    if migrated {
-        tracing::warn!(
-            cluster = cluster_name,
-            backend = %backend.display(),
-            "Migrated legacy Stage 0 Pulumi state out of $TMP; it was encrypted with an EMPTY passphrase. Re-bootstrap on a fresh cluster to rotate to a generated passphrase."
-        );
-    }
-    Ok(migrated)
 }
 
 /// Clears stale Stage 0 state when the `kind` cluster it describes no longer exists.
@@ -729,7 +665,6 @@ pub async fn clear_stale_kind_stage0_state_in(root: &Path, cluster_name: &str) {
     );
     let _ = tokio::fs::remove_dir_all(&backend).await;
     let _ = tokio::fs::remove_dir_all(cluster_dir.join("programs")).await;
-    let _ = tokio::fs::remove_file(cluster_dir.join(STAGE0_LEGACY_MARKER_FILE)).await;
 }
 
 /// Pre-existing Kubernetes cluster Stage 0 driver (`k3s`, `Talos`, managed K8s) via `kubeconfig`.
@@ -1502,7 +1437,7 @@ contexts:
     }
 
     #[test]
-    fn test_stage0_passphrase_resolution_and_legacy_migration() {
+    fn test_stage0_passphrase_resolution() {
         if std::env::var_os("PULUMI_CONFIG_PASSPHRASE").is_some() {
             eprintln!("SKIPPED: PULUMI_CONFIG_PASSPHRASE set in test environment");
             return;
@@ -1520,19 +1455,21 @@ contexts:
         ));
         assert!(resolve_stage0_passphrase_in(&root, "../evil").is_err());
 
-        // Legacy: state exists without a passphrase file -> empty passphrase, sticky marker.
-        let legacy_root = root.join("legacy-tmp");
-        let legacy_stack = legacy_root
-            .join("control-plane-old")
-            .join("control-plane")
+        // State without a passphrase file cannot be decrypted by a new passphrase: refuse.
+        let orphan_stacks = stage0_cluster_dir_in(&root, "old")
+            .join(STAGE0_BACKEND_DIR)
             .join(".pulumi/stacks/keel-stage0-control-plane");
-        std::fs::create_dir_all(&legacy_stack).unwrap();
-        std::fs::write(legacy_stack.join("stage0-control-plane-old.json"), "{}").unwrap();
-        assert!(migrate_legacy_stage0_state_in(&root, &legacy_root, "old").unwrap());
-        assert!(!migrate_legacy_stage0_state_in(&root, &legacy_root, "old").unwrap());
-        let legacy = resolve_stage0_passphrase_in(&root, "old").unwrap();
-        assert_eq!(legacy.source, Stage0PassphraseSource::LegacyEmpty);
-        assert_eq!(legacy.expose(), "");
+        std::fs::create_dir_all(&orphan_stacks).unwrap();
+        std::fs::write(orphan_stacks.join("stage0-control-plane-old.json"), "{}").unwrap();
+        let err = resolve_stage0_passphrase_in(&root, "old")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("start over"), "{err}");
+        assert!(
+            !stage0_cluster_dir_in(&root, "old")
+                .join(STAGE0_PASSPHRASE_FILE)
+                .exists()
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

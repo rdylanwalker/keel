@@ -25,11 +25,6 @@ use crate::tenant::{
 pub const POLICY_DISALLOW_PRIVILEGED: &str = "disallow-privileged-containers";
 pub const POLICY_PROTECT_CONTROL_PLANE: &str = "protect-control-plane";
 pub const POLICY_RESTRICT_PULUMI_PROVIDERS: &str = "restrict-pulumi-providers";
-/// Retired `GeneratingPolicy` that cloned control-plane admin credentials into every tenant.
-/// Kept only so bootstrap can delete it (and its RBAC) from existing clusters.
-pub const POLICY_SYNC_TENANT_SECRETS: &str = "sync-tenant-secrets";
-/// Retired RBAC (`ClusterRole` + `ClusterRoleBinding`) used by [`POLICY_SYNC_TENANT_SECRETS`].
-pub const RETIRED_SYNC_TENANT_SECRETS_RBAC: &str = "keel-kyverno-tenant-secret-sync";
 pub const POLICY_RESTRICT_TENANT_RECONCILER: &str = "restrict-tenant-reconciler";
 pub const POLICY_RESTRICT_TENANT_ROUTE_HOSTNAMES: &str = "restrict-tenant-route-hostnames";
 pub const POLICY_RESTRICT_TENANT_FLUX_SOURCES: &str = "restrict-tenant-flux-sources";
@@ -1356,7 +1351,7 @@ mod tests {
             !bundle
                 .to_multi_doc_yaml()
                 .unwrap()
-                .contains(POLICY_SYNC_TENANT_SECRETS)
+                .contains("sync-tenant-secrets")
         );
 
         let names: Vec<&str> = bundle
@@ -1468,8 +1463,8 @@ mod tests {
         let yaml = bundle.to_multi_doc_yaml().unwrap();
         assert!(!yaml.contains("keel-s3-credentials"));
         assert!(!yaml.contains("git-credentials"));
-        assert!(!yaml.contains(POLICY_SYNC_TENANT_SECRETS));
-        assert!(!yaml.contains(RETIRED_SYNC_TENANT_SECRETS_RBAC));
+        // Control-plane credentials are never cloned into tenant namespaces.
+        assert!(!yaml.contains("sync-tenant-secrets"));
     }
 
     #[test]

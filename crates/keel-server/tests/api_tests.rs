@@ -5248,13 +5248,6 @@ async fn test_pko_preview_lifecycle_is_applied_published_and_gced_from_cluster_s
     // PKO `gitSource`: the preview clones the PR branch of the platform-written tenant source
     // (the tenant Stack's `projectRepo`, not the live `keel-gitops` URL) with the mirrored
     // read-only credentials; no Flux GitRepository / source-controller artifact is involved.
-    assert!(
-        cluster
-            .list_preview_git_repositories()
-            .await
-            .unwrap()
-            .is_empty()
-    );
     assert!(applied["spec"].get("fluxSource").is_none());
     assert_eq!(applied["spec"]["projectRepo"], TENANT_PKO_GIT_URL);
     assert!(
@@ -5365,22 +5358,6 @@ async fn test_pko_preview_lifecycle_is_applied_published_and_gced_from_cluster_s
         "{comments:?}"
     );
 
-    // A preview `GitRepository` left by a release before previews used PKO `gitSource` is still
-    // garbage-collected with its PR.
-    let legacy_repo = format!("preview-source-pr-{pr_id}");
-    cluster.put_legacy_git_repository(
-        &legacy_repo,
-        json!({
-            "apiVersion": "source.toolkit.fluxcd.io/v1",
-            "kind": "GitRepository",
-            "metadata": {
-                "name": legacy_repo,
-                "namespace": "keel-previews",
-                "labels": { "keel.io/pr-id": pr_id, "keel.io/ephemeral-preview": "true" }
-            }
-        }),
-    );
-
     // A copy never adopted by a Stack (e.g. keel-server stopped between copying and applying)
     // is found by its labels; an open PR's copies are never swept (a launch may be in progress).
     cluster.put_tenant_secret("acme", "orphan-source", &[("k", "v")]);
@@ -5403,12 +5380,11 @@ async fn test_pko_preview_lifecycle_is_applied_published_and_gced_from_cluster_s
     assert!(cluster.preview_secret(&orphan).is_some());
 
     // Closing the PR out-of-band (not via the API) is still GC'd by the reconciler: the Stack,
-    // the legacy GitRepository, the adopted copies (with their owner) and the orphan copy.
+    // the adopted copies (with their owner) and the orphan copy.
     restarted.forge.close_pull_request(&pr_id).await.unwrap();
     let outcome = keel_server::preview_lifecycle::reconcile_previews_once(&restarted).await;
-    assert_eq!(outcome.deleted, 3, "{outcome:?}");
+    assert_eq!(outcome.deleted, 2, "{outcome:?}");
     assert!(cluster.stack_names().is_empty());
-    assert!(cluster.git_repository_names().is_empty());
     assert!(cluster.preview_secret_names().is_empty());
 }
 
@@ -5583,7 +5559,7 @@ async fn post_infra_proposal_with_cluster(
 /// source), and the report/PR comment carry an actionable `notExecuted` reason.
 #[tokio::test]
 async fn test_pko_preview_fails_closed_without_tenant_git_source() {
-    use keel_kube::{InMemoryPreviewCluster, PreviewCluster};
+    use keel_kube::InMemoryPreviewCluster;
 
     let fixture = setup_fixture().await;
     let cluster = InMemoryPreviewCluster::new().without_tenant_source();
@@ -5594,13 +5570,6 @@ async fn test_pko_preview_fails_closed_without_tenant_git_source() {
     assert!(message.contains("PKO preview not executed"), "{message}");
     assert!(body["report"]["run"]["stack"].is_null());
     assert!(cluster.stack_names().is_empty());
-    assert!(
-        cluster
-            .list_preview_git_repositories()
-            .await
-            .unwrap()
-            .is_empty()
-    );
 
     // A cluster that reports no Git URL (defense in depth) is refused too, never falling back to
     // the control-plane remote.
@@ -5654,7 +5623,7 @@ spec:
     )
     .await
     .unwrap();
-    // A pre-existing instance whose Stack still points at the legacy (un-prefixed) backend.
+    // An instance whose committed Stack points at the unscoped (bucket-root) backend.
     let legacy_dir = fixture
         .state
         .repo_workdir
@@ -5771,7 +5740,7 @@ async fn test_preview_uses_tenant_backend_and_copies_only_referenced_provider_se
     let cookie = login_and_get_cookie(&fixture).await;
     let app = build_router(state.clone());
 
-    // 1. Existing (legacy-backend) stack, no credentials in this change.
+    // 1. Existing (unscoped-backend) stack, no credentials in this change.
     let (status, body) =
         propose_infra(&app, &cookie, json!({ "vmName": "legacy" }), "legacy-vm").await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
@@ -6761,202 +6730,6 @@ async fn test_proposals_work_when_the_local_repo_path_has_spaces() {
     }
 }
 
-/// Commits `content` at `rel` on `main` (simulating manifests written by earlier releases).
-async fn commit_on_main(fixture: &TestFixture, rel: &str, content: &str) {
-    let git = &fixture.state.git_runner;
-    let workdir = &fixture.state.repo_workdir;
-    let path = workdir.join(rel);
-    tokio::fs::create_dir_all(path.parent().unwrap())
-        .await
-        .unwrap();
-    tokio::fs::write(&path, content).await.unwrap();
-    git.add(workdir, [rel]).await.unwrap();
-    git.commit(
-        workdir,
-        &format!("chore: seed {rel}"),
-        &CommitAuthor::new("Keel Seed", "seed@keel.local"),
-    )
-    .await
-    .unwrap();
-    git.push(workdir, "origin", "HEAD:refs/heads/main")
-        .await
-        .unwrap();
-}
-
-async fn post_stack_source_migration(
-    fixture: &TestFixture,
-    cookie: &str,
-    tenant: &str,
-    dry_run: bool,
-) -> (StatusCode, Value) {
-    let uri = if dry_run {
-        format!("/api/v1/tenants/{tenant}/stack-sources/migrate?dryRun=true")
-    } else {
-        format!("/api/v1/tenants/{tenant}/stack-sources/migrate")
-    };
-    let res = build_router(fixture.state.clone())
-        .oneshot(
-            Request::builder()
-                .method(Method::POST)
-                .uri(uri)
-                .header(COOKIE, cookie)
-                .header(CONTENT_TYPE, "application/json")
-                .body(Body::from("{}"))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let status = res.status();
-    let bytes = res.into_body().collect().await.unwrap().to_bytes();
-    (
-        status,
-        serde_json::from_slice(&bytes)
-            .unwrap_or_else(|_| json!({ "raw": String::from_utf8_lossy(&bytes) })),
-    )
-}
-
-const LEGACY_ACME_STACK: &str = "apiVersion: pulumi.com/v1
-kind: Stack
-metadata:
-  name: legacy-vm
-  namespace: tenant-acme
-  labels:
-    keel.io/provider: proxmox
-spec:
-  stack: organization/proxmox-vm/acme-legacy-vm
-  backend: s3://pulumi-state/tenants/acme
-  fluxSource:
-    sourceRef:
-      apiVersion: source.toolkit.fluxcd.io/v1
-      kind: GitRepository
-      name: keel-gitops
-    dir: tenants/acme/infra/legacy-vm
-  config:
-    cores: '2'
-  resyncFrequencySeconds: 300
-";
-
-/// Stacks committed by earlier releases (`fluxSource` → `tenant-<id>/keel-gitops`, which needs
-/// `source-controller` artifacts on port 9090) are moved to PKO `gitSource` through one reviewed
-/// PR (never a direct commit to `main`), before that port is closed to tenant namespaces.
-#[tokio::test]
-async fn test_legacy_flux_source_stacks_migrate_to_git_source_through_one_pr() {
-    let fixture = setup_fixture().await;
-    let admin = login_and_get_cookie(&fixture).await;
-    commit_on_main(
-        &fixture,
-        "tenants/acme/infra/legacy-vm/stack.yaml",
-        LEGACY_ACME_STACK,
-    )
-    .await;
-    // A Stack in another namespace is reported, never rewritten.
-    commit_on_main(
-        &fixture,
-        "tenants/acme/infra/odd/stack.yaml",
-        &LEGACY_ACME_STACK.replace("namespace: tenant-acme", "namespace: flux-system"),
-    )
-    .await;
-    let prs_before = fixture
-        .state
-        .forge
-        .list_pull_requests(None, None)
-        .await
-        .unwrap()
-        .len();
-
-    // Non-admins cannot run it.
-    let tenant_admin =
-        login_with_groups(&fixture, "admin@acme.local", vec!["tenant-acme-admin"]).await;
-    let (status, _) = post_stack_source_migration(&fixture, &tenant_admin, "acme", false).await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
-
-    // Dry run: lists, opens nothing.
-    let (status, body) = post_stack_source_migration(&fixture, &admin, "acme", true).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(
-        body["migrated"],
-        json!(["tenants/acme/infra/legacy-vm/stack.yaml"])
-    );
-    assert_eq!(
-        body["skipped"][0]["path"],
-        "tenants/acme/infra/odd/stack.yaml"
-    );
-    assert!(body.get("proposal").is_none(), "{body}");
-
-    let (status, body) = post_stack_source_migration(&fixture, &admin, "acme", false).await;
-    assert_eq!(status, StatusCode::CREATED, "{body}");
-    assert!(
-        body["branch"]
-            .as_str()
-            .unwrap()
-            .starts_with("keel/acme/migrate-stack-sources-")
-    );
-    assert_eq!(
-        fixture
-            .state
-            .forge
-            .list_pull_requests(None, None)
-            .await
-            .unwrap()
-            .len(),
-        prs_before + 1
-    );
-    // `main` is untouched until the PR is merged.
-    let on_main = std::fs::read_to_string(
-        fixture
-            .state
-            .repo_workdir
-            .join("tenants/acme/infra/legacy-vm/stack.yaml"),
-    )
-    .unwrap();
-    assert!(on_main.contains("fluxSource"));
-
-    checkout_proposal_branch(&fixture, &body.to_string()).await;
-    let raw = std::fs::read_to_string(
-        fixture
-            .state
-            .repo_workdir
-            .join("tenants/acme/infra/legacy-vm/stack.yaml"),
-    )
-    .unwrap();
-    let stack: Value = serde_yml::from_str(&raw).unwrap();
-    assert!(stack["spec"].get("fluxSource").is_none(), "{raw}");
-    assert_eq!(stack["spec"]["projectRepo"], TENANT_PKO_GIT_URL);
-    assert_eq!(stack["spec"]["branch"], "main");
-    assert_eq!(stack["spec"]["repoDir"], "tenants/acme/infra/legacy-vm");
-    assert_eq!(stack["spec"]["shallow"], true);
-    assert_eq!(
-        stack["spec"]["gitAuth"]["basicAuth"]["password"]["secret"]["name"],
-        "git-credentials"
-    );
-    // Programs, config and identity are unchanged.
-    assert_eq!(
-        stack["spec"]["stack"],
-        "organization/proxmox-vm/acme-legacy-vm"
-    );
-    assert_eq!(stack["spec"]["config"]["cores"], "2");
-    assert_eq!(stack["metadata"]["labels"]["keel.io/provider"], "proxmox");
-    let odd = std::fs::read_to_string(
-        fixture
-            .state
-            .repo_workdir
-            .join("tenants/acme/infra/odd/stack.yaml"),
-    )
-    .unwrap();
-    assert!(odd.contains("fluxSource"), "{odd}");
-    fixture
-        .state
-        .git_runner
-        .checkout_branch(&fixture.state.repo_workdir, "main")
-        .await
-        .unwrap();
-
-    // Without a platform-written source the migration fails closed (409), like new Stacks.
-    remove_tenant_git_source_stub(&fixture, "acme").await;
-    let (status, body) = post_stack_source_migration(&fixture, &admin, "acme", false).await;
-    assert_eq!(status, StatusCode::CONFLICT, "{body}");
-}
-
 /// Deletes the platform-written `tenants/<tenant>/git-repository.yaml` stub on `main`
 /// (tenants created through `POST /api/v1/tenants` have none yet).
 async fn remove_tenant_git_source_stub(fixture: &TestFixture, tenant: &str) {
@@ -7062,129 +6835,6 @@ async fn test_manifest_app_with_secrets_targets_remote_cluster() {
             .await
             .unwrap();
     }
-}
-
-/// An app deployed with the pre-split layout (the app Kustomization applied `secrets.enc.yaml` and
-/// `values-configmap.yaml` itself, `optional: true`) is rewritten to the split layout on edit.
-#[tokio::test]
-async fn test_manifest_app_edit_migrates_pre_split_layout() {
-    let fixture = setup_fixture().await;
-    let cookie = login_and_get_cookie(&fixture).await;
-    seed_rauthy_catalog(&fixture).await;
-    let workdir = fixture.state.repo_workdir.clone();
-
-    let mut resources: Vec<String> = if workdir.join("tenants/kustomization.yaml").is_file() {
-        tenants_kustomization_resources(&fixture)
-    } else {
-        Vec::new()
-    };
-    resources.push("acme/apps/rauthy/flux-kustomization.yaml".to_string());
-    let tenants_k = serde_yml::to_string(&json!({
-        "apiVersion": "kustomize.config.k8s.io/v1beta1",
-        "kind": "Kustomization",
-        "resources": resources,
-    }))
-    .unwrap();
-    let old_fk = r#"apiVersion: kustomize.toolkit.fluxcd.io/v1
-kind: Kustomization
-metadata:
-  name: rauthy
-  namespace: tenant-acme
-spec:
-  interval: 2m
-  path: ./tenants/acme/apps/rauthy
-  prune: true
-  sourceRef:
-    kind: GitRepository
-    name: keel-gitops
-    namespace: tenant-acme
-  decryption:
-    provider: sops
-    secretRef:
-      name: sops-age
-  postBuild:
-    substituteFrom:
-      - kind: ConfigMap
-        name: rauthy-values
-        optional: true
-      - kind: Secret
-        name: rauthy-secrets
-        optional: true
-"#;
-    commit_to_main(
-        &fixture,
-        &[
-            ("tenants/kustomization.yaml", tenants_k.as_str()),
-            ("tenants/acme/apps/rauthy/flux-kustomization.yaml", old_fk),
-            (
-                "tenants/acme/apps/rauthy/kustomization.yaml",
-                "apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\nresources:\n  - manifests.yaml\n  - values-configmap.yaml\n  - secrets.enc.yaml\n",
-            ),
-            (
-                "tenants/acme/apps/rauthy/manifests.yaml",
-                "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: rauthy-config\n",
-            ),
-            (
-                "tenants/acme/apps/rauthy/values-configmap.yaml",
-                "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: rauthy-values\n",
-            ),
-            (
-                "tenants/acme/apps/rauthy/secrets.enc.yaml",
-                "apiVersion: v1\nkind: Secret\nmetadata:\n  name: rauthy-secrets\nsops: {}\n",
-            ),
-            ("tenants/acme/apps/rauthy/values.yaml", "hostname: auth.acme.example\n"),
-        ],
-        "feat(acme): rauthy (pre-split layout)",
-    )
-    .await;
-
-    let (status, body) = post_proposal(
-        &fixture,
-        &cookie,
-        json!({ "tenant": "acme", "catalogId": "rauthy",
-                "values": rauthy_values("auth.acme.example") }),
-    )
-    .await;
-    if sops_unavailable(status, &body) {
-        return;
-    }
-    assert_eq!(status, StatusCode::CREATED, "{body}");
-    let parsed: Value = serde_json::from_str(&body).unwrap();
-    assert!(
-        parsed["proposal"]["title"]
-            .as_str()
-            .unwrap()
-            .contains("update"),
-        "{body}"
-    );
-    checkout_proposal_branch(&fixture, &body).await;
-
-    let dir = workdir.join("tenants/acme/apps/rauthy");
-    assert_rauthy_split_layout(&dir, "rauthy", None);
-    let resources = tenants_kustomization_resources(&fixture);
-    for file in ["config-kustomization.yaml", "flux-kustomization.yaml"] {
-        let entry = format!("acme/apps/rauthy/{file}");
-        assert_eq!(
-            resources.iter().filter(|r| **r == entry).count(),
-            1,
-            "{resources:?}"
-        );
-    }
-    // The removals are part of the proposal commit.
-    let status_out = std::process::Command::new("git")
-        .args(["show", "--name-status", "--format=", "HEAD"])
-        .current_dir(&workdir)
-        .output()
-        .unwrap();
-    let changes = String::from_utf8_lossy(&status_out.stdout);
-    assert!(
-        changes.contains("D\ttenants/acme/apps/rauthy/secrets.enc.yaml"),
-        "{changes}"
-    );
-    assert!(
-        changes.contains("D\ttenants/acme/apps/rauthy/values-configmap.yaml"),
-        "{changes}"
-    );
 }
 
 /// Deleting a manifest app removes its directory and both Kustomizations from the tenant tree.
@@ -7766,7 +7416,7 @@ async fn test_derived_flux_kustomization_name_collisions_are_refused() {
     };
     let web = flux_kustomization("web");
     let web_config_of_web = flux_kustomization("web-config");
-    let legacy = flux_kustomization("api-config");
+    let api_config = flux_kustomization("api-config");
     let edge_web = flux_kustomization("edge-web");
     let stack_db = flux_kustomization("stack-db");
     let stack_db_config = flux_kustomization("stack-db-config");
@@ -7785,7 +7435,7 @@ async fn test_derived_flux_kustomization_name_collisions_are_refused() {
             // A manifest app named `api-config`.
             (
                 "tenants/acme/apps/api-config/flux-kustomization.yaml",
-                legacy.as_str(),
+                api_config.as_str(),
             ),
             // A manifest app named like a bundle item resource.
             (
@@ -9218,142 +8868,6 @@ async fn test_helm_app_secrets_in_non_default_tenant_use_root_tenants_kustomizat
     );
 }
 
-/// A Helm app committed with the former `<name>-config` layout (`config-kustomization.yaml` +
-/// `config/secrets.enc.yaml`) moves back to the root layout on its next Edit: the stored Secret
-/// is read from `config/` and kept, written to the root `secrets.enc.yaml`, and the config
-/// directory, `config-kustomization.yaml` and its tenants entry are removed.
-#[tokio::test]
-async fn test_helm_app_edit_migrates_config_layout_to_root_secret() {
-    let fixture = setup_fixture().await;
-    let cookie = login_and_get_cookie(&fixture).await;
-    seed_builtin_helm_catalog(&fixture, "forgejo", FORGEJO_APP_CATALOG).await;
-    let workdir = fixture.state.repo_workdir.clone();
-    let dir = workdir.join("tenants/acme/apps/git");
-
-    let (status, body) = post_proposal(
-        &fixture,
-        &cookie,
-        json!({ "tenant": "acme", "catalogId": "forgejo", "name": "git",
-                "values": forgejo_values("git.acme.example") }),
-    )
-    .await;
-    if sops_unavailable(status, &body) {
-        return;
-    }
-    assert_eq!(status, StatusCode::CREATED, "{body}");
-    merge_proposal_and_sync(&fixture, &cookie, &body).await;
-    let stored = std::fs::read_to_string(dir.join("secrets.enc.yaml")).unwrap();
-
-    // Rewrite main into the former layout.
-    std::fs::create_dir_all(dir.join("config")).unwrap();
-    let mv = std::process::Command::new("git")
-        .args([
-            "mv",
-            "tenants/acme/apps/git/secrets.enc.yaml",
-            "tenants/acme/apps/git/config/secrets.enc.yaml",
-        ])
-        .current_dir(&workdir)
-        .status()
-        .unwrap();
-    assert!(mv.success());
-    let mut resources: Vec<String> = tenants_kustomization_resources(&fixture)
-        .into_iter()
-        .filter(|r| r != "acme/apps/git/secrets.enc.yaml")
-        .collect();
-    resources.push("acme/apps/git/config-kustomization.yaml".to_string());
-    let tenants_k = serde_yml::to_string(&json!({
-        "apiVersion": "kustomize.config.k8s.io/v1beta1",
-        "kind": "Kustomization",
-        "resources": resources,
-    }))
-    .unwrap();
-    let config_fk = r#"apiVersion: kustomize.toolkit.fluxcd.io/v1
-kind: Kustomization
-metadata:
-  name: git-config
-  namespace: tenant-acme
-  labels:
-    keel.io/tenant: acme
-    keel.io/config-for: git
-spec:
-  interval: 2m
-  path: ./tenants/acme/apps/git/config
-  prune: true
-  sourceRef:
-    kind: GitRepository
-    name: keel-gitops
-    namespace: tenant-acme
-  decryption:
-    provider: sops
-    secretRef:
-      name: sops-age
-"#;
-    commit_to_main(
-        &fixture,
-        &[
-            ("tenants/kustomization.yaml", tenants_k.as_str()),
-            ("tenants/acme/apps/git/config-kustomization.yaml", config_fk),
-            (
-                "tenants/acme/apps/git/config/kustomization.yaml",
-                "apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\nresources:\n  - secrets.enc.yaml\n",
-            ),
-        ],
-        "feat(acme): git (config layout)",
-    )
-    .await;
-    assert!(!dir.join("secrets.enc.yaml").exists());
-
-    // Edit without re-entering the secrets: the stored Secret is kept verbatim.
-    let mut edit = forgejo_values("git.acme.example");
-    edit["gitea"]["admin"]
-        .as_object_mut()
-        .unwrap()
-        .remove("password");
-    edit["gitea"]["oauth"] = json!([]);
-    let (status, body) = post_proposal(
-        &fixture,
-        &cookie,
-        json!({ "tenant": "acme", "catalogId": "forgejo", "name": "git", "values": edit }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::CREATED, "{body}");
-    checkout_proposal_branch(&fixture, &body).await;
-    assert_eq!(
-        std::fs::read_to_string(dir.join("secrets.enc.yaml")).unwrap(),
-        stored
-    );
-    assert!(!dir.join("config").exists());
-    assert!(!dir.join("config-kustomization.yaml").exists());
-    assert_eq!(
-        read_yaml(&dir.join("helmrelease.yaml"))["spec"]["valuesFrom"]
-            .as_array()
-            .unwrap()
-            .len(),
-        2
-    );
-    let resources = tenants_kustomization_resources(&fixture);
-    assert!(resources.contains(&"acme/apps/git/secrets.enc.yaml".to_string()));
-    assert!(
-        !resources
-            .iter()
-            .any(|r| r.starts_with("acme/apps/git/config")),
-        "{resources:?}"
-    );
-    // The removals are part of the proposal commit.
-    let out = std::process::Command::new("git")
-        .args(["show", "--name-status", "--format=", "HEAD"])
-        .current_dir(&workdir)
-        .output()
-        .unwrap();
-    let changes = String::from_utf8_lossy(&out.stdout);
-    for removed in [
-        "tenants/acme/apps/git/config-kustomization.yaml",
-        "tenants/acme/apps/git/config/kustomization.yaml",
-    ] {
-        assert!(changes.contains(&format!("D\t{removed}")), "{changes}");
-    }
-}
-
 const KYVERNO_APP_CATALOG: &str = include_str!("../../../deploy/catalog/apps/kyverno/catalog.yaml");
 const PKO_APP_CATALOG: &str =
     include_str!("../../../deploy/catalog/apps/pulumi-kubernetes-operator/catalog.yaml");
@@ -10078,120 +9592,4 @@ async fn test_keel_server_catalog_app_installs_once_per_cluster() {
     .await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
     git.checkout_branch(&workdir, "main").await.unwrap();
-}
-
-async fn post_baseline_migration(
-    fixture: &TestFixture,
-    cookie: &str,
-    tenant: &str,
-    dry_run: bool,
-) -> (StatusCode, Value) {
-    let uri = if dry_run {
-        format!("/api/v1/tenants/{tenant}/baseline/migrate?dryRun=true")
-    } else {
-        format!("/api/v1/tenants/{tenant}/baseline/migrate")
-    };
-    let res = build_router(fixture.state.clone())
-        .oneshot(
-            Request::builder()
-                .method(Method::POST)
-                .uri(uri)
-                .header(COOKIE, cookie)
-                .header(CONTENT_TYPE, "application/json")
-                .body(Body::from("{}"))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let status = res.status();
-    let bytes = res.into_body().collect().await.unwrap().to_bytes();
-    (
-        status,
-        serde_json::from_slice(&bytes)
-            .unwrap_or_else(|_| json!({ "raw": String::from_utf8_lossy(&bytes) })),
-    )
-}
-
-/// Tenants created before `keel.io/platform-owned` existed get the label through one reviewed PR
-/// (never a direct commit to `main`) that only touches the platform-written baseline files, and
-/// the start-up audit names them until it is merged.
-#[tokio::test]
-async fn test_legacy_tenant_baseline_is_labelled_platform_owned_through_one_pr() {
-    let fixture = setup_fixture().await;
-    let admin = login_and_get_cookie(&fixture).await;
-    let current =
-        keel_kube::TenantManifestBundle::synthesize(&keel_kube::TenantIsolationConfig::new("acme"))
-            .unwrap()
-            .to_multi_doc_yaml()
-            .unwrap();
-    // Earlier releases wrote neither the label nor the `allow-pko-workspace` NetworkPolicy.
-    let legacy = keel_core::split_yaml_documents(&current)
-        .into_iter()
-        .filter(|d| !d.contains("name: allow-pko-workspace"))
-        .collect::<Vec<_>>()
-        .join("---\n")
-        .replace("    keel.io/platform-owned: \"true\"\n", "");
-    assert_ne!(legacy, current);
-    assert!(!legacy.contains("allow-pko-workspace"));
-    commit_on_main(&fixture, "tenants/acme/rbac.yaml", &legacy).await;
-    let root = fixture.state.repo_workdir.clone();
-    assert!(
-        keel_server::routes::report_unlabelled_tenant_baselines(&root)
-            .await
-            .contains(&"acme".to_string())
-    );
-
-    // Non-admins cannot run it; unknown tenants are 404.
-    let tenant_admin =
-        login_with_groups(&fixture, "admin@acme.local", vec!["tenant-acme-admin"]).await;
-    let (status, _) = post_baseline_migration(&fixture, &tenant_admin, "acme", false).await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
-    let (status, _) = post_baseline_migration(&fixture, &admin, "ghost", false).await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
-
-    let (status, body) = post_baseline_migration(&fixture, &admin, "acme", true).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert!(
-        body["labelled"]
-            .as_array()
-            .unwrap()
-            .contains(&json!("tenants/acme/rbac.yaml")),
-        "{body}"
-    );
-    assert!(body.get("proposal").is_none(), "{body}");
-
-    let (status, body) = post_baseline_migration(&fixture, &admin, "acme", false).await;
-    assert_eq!(status, StatusCode::CREATED, "{body}");
-    assert!(
-        body["branch"]
-            .as_str()
-            .unwrap()
-            .starts_with("keel/acme/migrate-baseline-")
-    );
-    // `main` is untouched until the PR is merged.
-    let on_main = std::fs::read_to_string(root.join("tenants/acme/rbac.yaml")).unwrap();
-    assert_eq!(on_main, legacy);
-
-    checkout_proposal_branch(&fixture, &body.to_string()).await;
-    let labelled = std::fs::read_to_string(root.join("tenants/acme/rbac.yaml")).unwrap();
-    assert!(!keel_kube::platform_owned_labels_missing(&labelled));
-    // The same PR adds the missing PKO workspace NetworkPolicy (once, platform-owned).
-    assert_eq!(
-        labelled.matches("name: allow-pko-workspace").count(),
-        1,
-        "{labelled}"
-    );
-    assert!(
-        keel_kube::ensure_tenant_pko_workspace_network_policy("acme", &labelled, &[])
-            .unwrap()
-            .is_none()
-    );
-    let repo = std::fs::read_to_string(root.join("tenants/acme/git-repository.yaml")).unwrap();
-    assert!(!keel_kube::platform_owned_labels_missing(&repo), "{repo}");
-    fixture
-        .state
-        .git_runner
-        .checkout_branch(&root, "main")
-        .await
-        .unwrap();
 }

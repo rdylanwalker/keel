@@ -1102,8 +1102,8 @@ async fn ensure_s3_credentials_in_namespace_impl(
 ///
 /// Instead, the tenant-local scoped identity `keel-tenant-s3-credentials` (provisioned per tenant,
 /// see `keel_kube::tenant::seaweedfs_configure_tenant_identity_script`) is mirrored under the
-/// `keel-s3-credentials` name PKO `Stack.spec.envRefs` reference. Any legacy admin copy (e.g.
-/// previously cloned by Kyverno) is overwritten. Returns `Ok(false)` when the tenant has no
+/// `keel-s3-credentials` name PKO `Stack.spec.envRefs` reference. Any other Secret under that
+/// name (e.g. an admin copy) is overwritten. Returns `Ok(false)` when the tenant has no
 /// scoped identity yet (fail closed).
 pub(crate) async fn ensure_tenant_scoped_s3_credentials_impl(
     backend: &impl SecretBackend,
@@ -1712,7 +1712,7 @@ mod tests {
                 .is_none()
         );
 
-        // A legacy admin copy (e.g. from the removed Kyverno clone) is replaced by the scoped one.
+        // An admin copy under the same name is replaced by the scoped one.
         store
             .upsert_secret(
                 "tenant-acme",

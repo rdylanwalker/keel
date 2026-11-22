@@ -178,8 +178,7 @@ fn needs_platform_owned_label(doc: &Value) -> bool {
 }
 
 /// `true` when some object of a platform-written tenant file ([`PLATFORM_OWNED_TENANT_FILES`])
-/// lacks `keel.io/platform-owned: "true"` (written by a release before the label existed).
-/// Unparsable documents count as unlabelled.
+/// lacks `keel.io/platform-owned: "true"`. Unparsable documents count as unlabelled.
 pub fn platform_owned_labels_missing(yaml: &str) -> bool {
     keel_core::split_yaml_documents(yaml).iter().any(|doc| {
         match serde_yml::from_str::<Value>(doc) {
@@ -187,80 +186,6 @@ pub fn platform_owned_labels_missing(yaml: &str) -> bool {
             Err(_) => true,
         }
     })
-}
-
-/// Adds `keel.io/platform-owned: "true"` to every [`PLATFORM_OWNED_KINDS`] object of a
-/// platform-written tenant file, leaving every other document (and already labelled ones)
-/// byte-for-byte unchanged. Returns `None` when nothing changes. Used by the tenant baseline
-/// migration (`keel tenant migrate-baseline`) for tenants created before the label existed.
-pub fn label_platform_owned_manifests(yaml: &str) -> Result<Option<String>, KubeError> {
-    let docs = keel_core::split_yaml_documents(yaml);
-    let mut out = yaml.to_string();
-    let mut changed = false;
-    for (index, doc) in docs.iter().enumerate() {
-        let mut value: Value = serde_yml::from_str(doc)?;
-        if !needs_platform_owned_label(&value) {
-            continue;
-        }
-        let meta = value
-            .get_mut("metadata")
-            .and_then(Value::as_object_mut)
-            .ok_or_else(|| {
-                KubeError::InvalidInput("platform-owned object without metadata".to_string())
-            })?;
-        let labels = meta
-            .entry("labels")
-            .or_insert_with(|| json!({}))
-            .as_object_mut()
-            .ok_or_else(|| KubeError::InvalidInput("metadata.labels is not a map".to_string()))?;
-        labels.insert(PLATFORM_OWNED_LABEL.to_string(), json!("true"));
-        // Keep the document's header comments; the object itself is re-serialized.
-        let rendered = format!(
-            "{}{}",
-            keel_core::yaml_leading_comments(doc),
-            serde_yml::to_string(&value)?
-        );
-        out = keel_core::replace_yaml_document(&out, index, &rendered).ok_or_else(|| {
-            KubeError::InvalidInput("YAML document index out of range".to_string())
-        })?;
-        changed = true;
-    }
-    Ok(changed.then_some(out))
-}
-
-/// Appends the tenant's `allow-pko-workspace` `NetworkPolicy`
-/// ([`build_tenant_pko_workspace_network_policy`]) to its baseline `rbac.yaml` when none of the
-/// platform-written tenant files (`rbac_yaml` and `other_files`, e.g. `git-repository.yaml`, where
-/// earlier releases wrote it for `tenant-default`) defines it yet. Tenants created through the API
-/// by earlier releases lack it, so `default-deny-all` blocks their PKO workspace pods (no clone,
-/// no operator gRPC). Returns `None` when nothing changes; existing documents stay byte-for-byte.
-pub fn ensure_tenant_pko_workspace_network_policy(
-    tenant_id: &str,
-    rbac_yaml: &str,
-    other_files: &[&str],
-) -> Result<Option<String>, KubeError> {
-    let defines_policy = |yaml: &str| {
-        keel_core::split_yaml_documents(yaml).iter().any(|doc| {
-            serde_yml::from_str::<Value>(doc).is_ok_and(|v| {
-                v.get("kind").and_then(Value::as_str) == Some("NetworkPolicy")
-                    && v.pointer("/metadata/name").and_then(Value::as_str)
-                        == Some(TENANT_PKO_WORKSPACE_NETWORK_POLICY)
-            })
-        })
-    };
-    if defines_policy(rbac_yaml) || other_files.iter().any(|f| defines_policy(f)) {
-        return Ok(None);
-    }
-    let policy = serde_yml::to_string(&build_tenant_pko_workspace_network_policy(tenant_id)?)?;
-    let mut out = rbac_yaml.to_string();
-    if !out.is_empty() && !out.ends_with('\n') {
-        out.push('\n');
-    }
-    if !out.trim().is_empty() {
-        out.push_str("---\n");
-    }
-    out.push_str(&policy);
-    Ok(Some(out))
 }
 
 fn tenant_common_labels(tenant_id: &str) -> BTreeMap<String, String> {
@@ -2109,56 +2034,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn legacy_tenant_baselines_get_the_platform_owned_label() {
-        // A baseline written before the label existed (labels stripped from the current one).
+    fn synthesized_tenant_baselines_are_labelled_platform_owned() {
         let current = TenantManifestBundle::synthesize(&TenantIsolationConfig::new("acme"))
             .unwrap()
             .to_multi_doc_yaml()
             .unwrap();
         assert!(!platform_owned_labels_missing(&current));
-        assert_eq!(label_platform_owned_manifests(&current).unwrap(), None);
-        let legacy = current.replace("    keel.io/platform-owned: \"true\"\n", "");
-        assert_ne!(legacy, current, "label line format changed");
-        assert!(platform_owned_labels_missing(&legacy));
-        let labelled = label_platform_owned_manifests(&legacy).unwrap().unwrap();
-        assert!(!platform_owned_labels_missing(&labelled));
-        let docs = keel_core::split_yaml_documents(&labelled);
-        assert_eq!(docs.len(), keel_core::split_yaml_documents(&current).len());
-        for doc in docs {
-            let v: Value = serde_yml::from_str(&doc).unwrap();
-            assert_eq!(
-                v["metadata"]["labels"][PLATFORM_OWNED_LABEL], "true",
-                "{doc}"
-            );
-            // Everything else is preserved.
-            assert_eq!(v["metadata"]["labels"]["keel.io/tenant"], "acme", "{doc}");
-        }
-        // Idempotent.
-        assert_eq!(label_platform_owned_manifests(&labelled).unwrap(), None);
-
-        // Comments, other kinds and already-labelled documents stay byte-for-byte.
-        let stub = "# platform-written source\napiVersion: source.toolkit.fluxcd.io/v1\nkind: GitRepository\nmetadata:\n  name: keel-gitops\n  namespace: tenant-acme\nspec:\n  url: https://forge.example/keel.git\n---\n# kept\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: x\n";
-        let out = label_platform_owned_manifests(stub).unwrap().unwrap();
-        assert!(out.starts_with("# platform-written source\n"), "{out}");
-        assert!(
-            out.ends_with("---\n# kept\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: x\n"),
-            "{out}"
-        );
-        let repo: Value = serde_yml::from_str(&keel_core::split_yaml_documents(&out)[0]).unwrap();
-        assert_eq!(repo["metadata"]["labels"][PLATFORM_OWNED_LABEL], "true");
-        assert_eq!(repo["spec"]["url"], "https://forge.example/keel.git");
-
-        // A label set to anything but "true" is corrected; unparsable YAML is an error.
+        let unlabelled = current.replace("    keel.io/platform-owned: \"true\"\n", "");
+        assert_ne!(unlabelled, current, "label line format changed");
+        assert!(platform_owned_labels_missing(&unlabelled));
+        // A label set to anything but "true" does not count; unparsable YAML counts as unlabelled.
         let wrong = "apiVersion: v1\nkind: ServiceAccount\nmetadata:\n  name: s\n  labels:\n    keel.io/platform-owned: 'false'\n";
         assert!(platform_owned_labels_missing(wrong));
-        assert!(label_platform_owned_manifests(wrong).unwrap().is_some());
-        assert!(label_platform_owned_manifests("kind: [").is_err());
         assert!(platform_owned_labels_missing("kind: ["));
     }
 
     /// Only the Flux `keel-tenant-root` Kustomization and Flux GitRepositories are platform-owned
     /// by kind name; kustomize config files and tenant-authored Flux Kustomizations in an
-    /// existing `sync.yaml` / `rbac.yaml` are never labelled (Kyverno would lock them).
+    /// existing `sync.yaml` / `rbac.yaml` never need the label (Kyverno would lock them).
     #[test]
     fn only_the_flux_tenant_root_kustomization_is_platform_owned() {
         let root = serde_yml::to_string(
@@ -2170,11 +2063,6 @@ mod tests {
         let unlabelled_root = unlabelled_root.replace("    keel.io/platform-owned: \"true\"\n", "");
         assert_ne!(unlabelled_root, root, "label line format changed");
         assert!(platform_owned_labels_missing(&unlabelled_root));
-        assert!(
-            label_platform_owned_manifests(&unlabelled_root)
-                .unwrap()
-                .is_some()
-        );
 
         let kustomize_config = "apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\nresources:\n- apps/web/release.yaml\n";
         let tenant_flux = "apiVersion: kustomize.toolkit.fluxcd.io/v1\nkind: Kustomization\nmetadata:\n  name: web\n  namespace: tenant-acme\nspec:\n  path: ./tenants/acme/apps/web\n";
@@ -2182,15 +2070,7 @@ mod tests {
             "apiVersion: example.com/v1\nkind: GitRepository\nmetadata:\n  name: x\n";
         for doc in [kustomize_config, tenant_flux, foreign_git_repository] {
             assert!(!platform_owned_labels_missing(doc), "{doc}");
-            assert_eq!(label_platform_owned_manifests(doc).unwrap(), None, "{doc}");
         }
-        let mixed = format!("{tenant_flux}---\n{unlabelled_root}");
-        let out = label_platform_owned_manifests(&mixed).unwrap().unwrap();
-        let docs = keel_core::split_yaml_documents(&out);
-        let first: Value = serde_yml::from_str(&docs[0]).unwrap();
-        let second: Value = serde_yml::from_str(&docs[1]).unwrap();
-        assert!(first["metadata"].get("labels").is_none());
-        assert_eq!(second["metadata"]["labels"][PLATFORM_OWNED_LABEL], "true");
     }
 
     #[test]
@@ -3243,49 +3123,5 @@ mod tests {
             }
         }
         assert_eq!(public_rules, 1);
-    }
-
-    #[test]
-    fn baseline_migration_adds_a_missing_pko_workspace_policy_once() {
-        let legacy = "apiVersion: v1\nkind: Namespace\nmetadata:\n  name: tenant-acme\n";
-        let updated = ensure_tenant_pko_workspace_network_policy("acme", legacy, &[])
-            .unwrap()
-            .expect("added");
-        assert!(
-            updated.starts_with(legacy),
-            "existing documents stay byte-for-byte"
-        );
-        let docs = keel_core::split_yaml_documents(&updated);
-        assert_eq!(docs.len(), 2);
-        let policy: Value = serde_yml::from_str(&docs[1]).unwrap();
-        assert_eq!(
-            policy,
-            serde_json::to_value(build_tenant_pko_workspace_network_policy("acme").unwrap())
-                .unwrap()
-        );
-        // Idempotent, and never duplicated when another baseline file already defines it
-        // (`tenants/default/git-repository.yaml` of earlier releases).
-        assert!(
-            ensure_tenant_pko_workspace_network_policy("acme", &updated, &[])
-                .unwrap()
-                .is_none()
-        );
-        let stub = "kind: NetworkPolicy\nmetadata:\n  name: allow-pko-workspace\n";
-        assert!(
-            ensure_tenant_pko_workspace_network_policy("acme", legacy, &[stub])
-                .unwrap()
-                .is_none()
-        );
-        // A full current baseline already carries it.
-        let current = TenantManifestBundle::synthesize(&TenantIsolationConfig::new("acme"))
-            .unwrap()
-            .to_multi_doc_yaml()
-            .unwrap();
-        assert!(
-            ensure_tenant_pko_workspace_network_policy("acme", &current, &[])
-                .unwrap()
-                .is_none()
-        );
-        assert!(ensure_tenant_pko_workspace_network_policy("../x", legacy, &[]).is_err());
     }
 }

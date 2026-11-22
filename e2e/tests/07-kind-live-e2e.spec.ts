@@ -542,13 +542,12 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
         logStep('Deleting stale workload kind cluster "workload-dev"...');
         runCmd('kind', ['delete', 'cluster', '--name', 'workload-dev'], undefined, true);
       }
-      // Stage 0 Pulumi state now lives in <config>/stage0/<cluster>/ (escrowed to S3); stale local
+      // Stage 0 Pulumi state lives in <config>/stage0/<cluster>/ (escrowed to S3); stale local
       // state for a deleted cluster would make a fresh bootstrap believe resources still exist.
       fs.rmSync(path.join(keelConfigDir(), 'stage0', MGMT_CLUSTER), {
         recursive: true,
         force: true,
       });
-      fs.rmSync(path.join(os.tmpdir(), 'keel-stage0-pulumi'), { recursive: true, force: true });
       if (fs.existsSync(DETERMINISTIC_REPO_DIR)) {
         fs.rmSync(DETERMINISTIC_REPO_DIR, { recursive: true, force: true });
       }
@@ -796,18 +795,6 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
       expect(recover.out).toContain(`stage0/${MGMT_CLUSTER}/`);
       expect(recover.out).toMatch(/Plan \(dry run/);
       expect(recover.out).toContain('pulumi');
-    });
-
-    await test.step('4. `keel tenant migrate-state --tenant default --dry-run` is a safe no-op', async () => {
-      const migrate = runCmdAll(KEEL_BIN, [
-        'tenant',
-        'migrate-state',
-        '--tenant',
-        'default',
-        '--dry-run',
-      ]);
-      expect(migrate.ok, migrate.out).toBe(true);
-      logStep(`tenant migrate-state --dry-run:\n${migrate.out.trim()}`);
     });
   });
 
@@ -1173,33 +1160,6 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
             const [name, projectRepo = '', fluxSource = ''] = line.split('\t');
             return { name, projectRepo, fluxSource };
           });
-      const legacy = () => stackSources().filter((s) => s.fluxSource !== '');
-
-      if (legacy().length > 0) {
-        // Reused cluster whose Stacks were committed by an earlier release: migrate them through
-        // one reviewed PR (never a direct commit to main), exactly as an upgraded install would.
-        logStep(
-          `Legacy fluxSource Stacks found (${legacy()
-            .map((s) => s.name)
-            .join(', ')}); running \`keel tenant migrate-stack-sources\`...`,
-        );
-        const migrate = runCmdAll(
-          KEEL_BIN,
-          ['tenant', 'migrate-stack-sources', '--tenant', 'default', '--output', 'json'],
-          cliEnv,
-        );
-        expect(migrate.ok, migrate.out).toBe(true);
-        const prId = String(JSON.parse(migrate.out).proposal?.id ?? '');
-        expect(prId, migrate.out).not.toBe('');
-        const merge = runCmdAll(KEEL_BIN, ['proposal', 'merge', prId], cliEnv);
-        expect(merge.ok, merge.out).toBe(true);
-        await expect
-          .poll(() => legacy().map((s) => s.name), { timeout: 300_000, intervals: [10_000] })
-          .toEqual([]);
-        await waitForK8sReady('stack', `${WORKLOAD_CLUSTER}-cluster`, 'tenant-default', 480_000);
-        logStep(`Migrated tenant-default Stacks to PKO gitSource (PR #${prId})`);
-      }
-
       const cluster = stackSources().find((s) => s.name === `${WORKLOAD_CLUSTER}-cluster`);
       expect(cluster, JSON.stringify(stackSources())).toBeTruthy();
       expect(cluster!.projectRepo).not.toBe('');
@@ -1207,7 +1167,7 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
       // ingress origin (`forge.publicUrl`), Flux keeps the http Service URL.
       expect(cluster!.projectRepo).toMatch(/^https:\/\//);
       expect(cluster!.fluxSource).toBe('');
-      expect(legacy()).toEqual([]);
+      expect(stackSources().filter((st) => st.fluxSource !== '')).toEqual([]);
 
       // Workspaces trust the Keel CA through the PUBLIC `keel-ca-bundle` ConfigMap only.
       for (const ns of ['keel-system', 'tenant-default', 'keel-previews']) {
@@ -1541,8 +1501,7 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
       expect(source[2], source.join('|')).toBe(`keel-preview-${prId}-git-credentials`);
 
       // Tenant previews never reference the platform source or anything else in flux-system
-      // (no whole-repository fallback). Hard assertions are scoped to this PR's Stacks: on a
-      // reused cluster, previews of older PRs may predate PKO gitSource until their PR closes.
+      // (no whole-repository fallback).
       const allPreviewStacks = JSON.parse(
         runCmd('kubectl', ['get', 'stacks.pulumi.com', '-n', 'keel-previews', '-o', 'json']),
       ) as {
@@ -1571,21 +1530,11 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
         }
         expect(String(stack.spec.repoDir ?? ''), stack.metadata.name).toMatch(/^tenants\//);
       }
-      const legacyPreviews = allPreviewStacks.items
-        .filter((s) => s.metadata.labels?.['keel.io/pr-id'] !== prId && s.spec.fluxSource)
+      const fluxSourcePreviews = allPreviewStacks.items
+        .filter((s) => s.spec.fluxSource)
         .map((s) => s.metadata.name);
-      if (legacyPreviews.length > 0) {
-        expect(
-          bootstrapOutput,
-          `fresh cluster has legacy fluxSource previews: ${legacyPreviews.join(', ')}`,
-        ).toBe('');
-        logStep(
-          `Legacy fluxSource previews of earlier PRs (reused cluster): ${legacyPreviews.join(', ')}`,
-        );
-      }
-      // Previews create no Flux GitRepository at all; legacy ones (reused cluster) must still
-      // never point at flux-system. Only `spec` is checked: every reconciled GitRepository has a
-      // `status.artifact.url` on source-controller.flux-system.
+      expect(fluxSourcePreviews, 'no preview Stack uses fluxSource').toEqual([]);
+      // Previews create no Flux GitRepository at all.
       const previewSources = tryCmd('kubectl', [
         'get',
         'gitrepositories.source.toolkit.fluxcd.io',
@@ -1600,15 +1549,10 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
             items: { metadata: { name: string }; spec: Record<string, unknown> }[];
           }
         ).items;
-        for (const repo of repos) {
-          expect(JSON.stringify(repo.spec), repo.metadata.name).not.toContain('flux-system');
-        }
-        if (bootstrapOutput) {
-          expect(
-            repos.map((r) => r.metadata.name),
-            'no preview GitRepository',
-          ).toEqual([]);
-        }
+        expect(
+          repos.map((r) => r.metadata.name),
+          'no preview GitRepository',
+        ).toEqual([]);
       }
     });
 
@@ -1658,7 +1602,6 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
 
   test('07.4 - Tenant isolation: no source-controller artifacts, no ExternalArtifact, platform-owned objects', async () => {
     const tenantNs = 'tenant-acme';
-    const freshCluster = bootstrapOutput !== '';
     const policyExists = (name: string) =>
       tryCmd('kubectl', ['get', 'validatingpolicies.policies.kyverno.io', name]).ok;
 
@@ -1686,40 +1629,7 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
               (peer) => JSON.stringify(peer) === '{"namespaceSelector":{}}' || 'ipBlock' in peer,
             )),
       );
-      if (openToAll) {
-        // Only possible on a reused cluster bootstrapped by an earlier release: apply exactly
-        // what `keel bootstrap init` applies once no Stack outside flux-system uses fluxSource.
-        expect(freshCluster, 'fresh bootstrap must not open port 9090 to every namespace').toBe(
-          false,
-        );
-        const legacy = runCmd('kubectl', [
-          'get',
-          'stacks.pulumi.com',
-          '-A',
-          '-o',
-          'jsonpath={range .items[?(@.spec.fluxSource)]}{.metadata.namespace}/{.metadata.name}{"\\n"}{end}',
-        ])
-          .split('\n')
-          .filter((l) => l.trim() !== '' && !l.startsWith('flux-system/'));
-        if (legacy.length > 0) {
-          // Exactly the `keel bootstrap init` gate: port 9090 stays open until these migrate.
-          logStep(
-            `Reused cluster: port 9090 left open by the gate (fluxSource Stacks: ${legacy.join(', ')}); skipping the artifact probe`,
-          );
-          return;
-        }
-        logStep(
-          `Reused cluster: restricting flux-system/${policyName} as \`keel bootstrap init\` does`,
-        );
-        runCmd('kubectl', [
-          'apply',
-          '-f',
-          path.resolve(
-            process.cwd(),
-            '../deploy/bootstrap/manifests/source-controller-artifacts-network-policy.yaml',
-          ),
-        ]);
-      }
+      expect(openToAll, 'port 9090 is reachable from flux-system only').toBe(false);
 
       // Same image as the tenant's own podinfo workload (already pulled; ships curl).
       const images = tryCmd('kubectl', [
@@ -1876,14 +1786,10 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
     });
 
     await test.step('2. ExternalArtifact and tenant Kustomizations without the tenant SA are denied', async () => {
-      if (!policyExists('restrict-tenant-flux-sources')) {
-        expect(
-          freshCluster,
-          'restrict-tenant-flux-sources must exist after a fresh bootstrap',
-        ).toBe(false);
-        logStep('Reused cluster predates restrict-tenant-flux-sources; skipping admission checks');
-        return;
-      }
+      expect(
+        policyExists('restrict-tenant-flux-sources'),
+        'restrict-tenant-flux-sources must exist',
+      ).toBe(true);
       if (!tryCmd('kubectl', ['get', 'crd', 'externalartifacts.source.toolkit.fluxcd.io']).ok) {
         logStep('ExternalArtifact CRD not installed; skipping ExternalArtifact admission check');
       } else {
@@ -1933,14 +1839,10 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
     });
 
     await test.step('3. Tenant identities cannot write Flux source status (Kyverno, not RBAC)', async () => {
-      if (!policyExists('restrict-tenant-flux-source-status')) {
-        expect(
-          freshCluster,
-          'restrict-tenant-flux-source-status must exist after a fresh bootstrap',
-        ).toBe(false);
-        logStep('Reused cluster predates restrict-tenant-flux-source-status; skipping');
-        return;
-      }
+      expect(
+        policyExists('restrict-tenant-flux-source-status'),
+        'restrict-tenant-flux-source-status must exist',
+      ).toBe(true);
       // Schema-valid status patch, so the request reaches validating admission.
       const patchStatus = (identity: string[]) =>
         runCmdAll('kubectl', [
@@ -1995,11 +1897,10 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
     });
 
     await test.step('4. Tenant identities cannot change platform-owned objects', async () => {
-      if (!policyExists('protect-platform-owned-tenant-objects')) {
-        expect(freshCluster).toBe(false);
-        logStep('Reused cluster predates protect-platform-owned-tenant-objects; skipping');
-        return;
-      }
+      expect(
+        policyExists('protect-platform-owned-tenant-objects'),
+        'protect-platform-owned-tenant-objects must exist',
+      ).toBe(true);
       const owned = tryCmd('kubectl', [
         'get',
         'networkpolicy',
@@ -2009,11 +1910,7 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
         '-o',
         'jsonpath={.metadata.labels.keel\\.io/platform-owned}',
       ]).stdout;
-      if (owned !== 'true') {
-        expect(freshCluster, 'tenant baseline objects are labelled on fresh clusters').toBe(false);
-        logStep(`${tenantNs}/default-deny-all predates the platform-owned label; skipping`);
-        return;
-      }
+      expect(owned, `${tenantNs}/default-deny-all is platform-owned`).toBe('true');
       const edit = runCmdAll('kubectl', [
         `--as=system:serviceaccount:${tenantNs}:${tenantNs}-sa`,
         'label',
@@ -2046,11 +1943,10 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
         '-o',
         'jsonpath={.metadata.labels.keel\\.io/platform-owned}',
       ]).stdout;
-      if (!exemption.includes('reconcile.fluxcd.io/requestedAt') || sourceOwned !== 'true') {
-        expect(freshCluster, 'fresh clusters carry the reconcile-request exemption').toBe(false);
-        logStep('Reused cluster predates the keel-gitops reconcile-request exemption; skipping');
-        return;
-      }
+      expect(exemption, 'keel-gitops reconcile-request exemption').toContain(
+        'reconcile.fluxcd.io/requestedAt',
+      );
+      expect(sourceOwned, 'tenant-default/keel-gitops is platform-owned').toBe('true');
       const sourceSa = 'system:serviceaccount:tenant-default:tenant-default-sa';
       const canPatch = tryCmd('kubectl', [
         'auth',
@@ -2098,7 +1994,6 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
 
   test('07.5 - Tenant PKO hardening: no Workspace/Update/Stack status writes, no keel.io/protect, HelmRelease SA', async () => {
     const tenantNs = 'tenant-acme';
-    const freshCluster = bootstrapOutput !== '';
     const policyExists = (name: string) =>
       tryCmd('kubectl', ['get', 'validatingpolicies.policies.kyverno.io', name]).ok;
     // A tenant group member that RBAC fully allows (`system:masters`): only Kyverno's
@@ -2145,14 +2040,10 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
       expect(canI, `${tenantSa} creates Stacks through the aggregated roles`).toBe('yes');
     });
 
-    if (!policyExists('restrict-tenant-pulumi-objects')) {
-      expect(
-        freshCluster,
-        'restrict-tenant-pulumi-objects must exist after a fresh bootstrap',
-      ).toBe(false);
-      logStep('Reused cluster predates restrict-tenant-pulumi-objects; skipping admission checks');
-      return;
-    }
+    expect(
+      policyExists('restrict-tenant-pulumi-objects'),
+      'restrict-tenant-pulumi-objects must exist',
+    ).toBe(true);
 
     await test.step('2. Tenant identities cannot write auto.pulumi.com Workspaces or Updates', async () => {
       for (const kind of ['Workspace', 'Update']) {
@@ -2265,11 +2156,9 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
         '-o',
         'jsonpath={.spec.validations[*].expression}',
       ]).stdout;
-      if (!exprs.includes('HelmRelease')) {
-        expect(freshCluster, 'fresh clusters carry the HelmRelease SA rule').toBe(false);
-        logStep('Reused cluster predates the HelmRelease SA rule; skipping');
-        return;
-      }
+      expect(exprs, 'restrict-tenant-flux-sources carries the HelmRelease SA rule').toContain(
+        'HelmRelease',
+      );
       // Every HelmRelease Keel committed for a tenant already satisfies the rule.
       const releases = runCmd('kubectl', [
         'get',

@@ -818,23 +818,17 @@ mod tests {
     fn candidates(prs: &[&str]) -> Vec<PreviewResourceCandidate> {
         prs.iter()
             .flat_map(|pr| {
-                [
-                    (PreviewResourceKind::Stack, format!("preview-stack-pr-{pr}")),
-                    (
-                        PreviewResourceKind::GitRepository,
-                        format!("preview-source-pr-{pr}"),
-                    ),
-                ]
-                .into_iter()
-                .map(|(kind, name)| PreviewResourceCandidate {
-                    kind,
-                    name,
-                    namespace: "keel-previews".into(),
-                    labels: BTreeMap::from([
-                        ("keel.io/pr-id".to_string(), pr.to_string()),
-                        ("keel.io/ephemeral-preview".to_string(), "true".to_string()),
-                    ]),
-                })
+                [(PreviewResourceKind::Stack, format!("preview-stack-pr-{pr}"))]
+                    .into_iter()
+                    .map(|(kind, name)| PreviewResourceCandidate {
+                        kind,
+                        name,
+                        namespace: "keel-previews".into(),
+                        labels: BTreeMap::from([
+                            ("keel.io/pr-id".to_string(), pr.to_string()),
+                            ("keel.io/ephemeral-preview".to_string(), "true".to_string()),
+                        ]),
+                    })
             })
             .collect()
     }
@@ -868,21 +862,13 @@ mod tests {
         ]);
         let plan = plan_preview_reconcile(&cands, &records, &states);
         let deleted: Vec<&str> = plan.gc.targets.iter().map(|t| t.name.as_str()).collect();
-        assert_eq!(
-            deleted,
-            vec![
-                "preview-stack-pr-3",
-                "preview-stack-pr-4",
-                "preview-source-pr-3",
-                "preview-source-pr-4"
-            ]
-        );
+        assert_eq!(deleted, vec!["preview-stack-pr-3", "preview-stack-pr-4"]);
         assert_eq!(plan.publish, vec!["1".to_string()]);
         assert_eq!(plan.head_moved, vec![("2".to_string(), "b2".to_string())]);
 
         let gone = BTreeMap::from([("1".to_string(), PrLifecycle::NotFound)]);
         let plan = plan_preview_reconcile(&cands, &records, &gone);
-        assert_eq!(plan.gc.targets.len(), 2);
+        assert_eq!(plan.gc.targets.len(), 1);
         assert!(plan.publish.is_empty());
     }
 

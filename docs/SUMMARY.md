@@ -22,7 +22,6 @@
 - [Security, Tenancy & Canary](operations/security-and-tenancy.md)
 - [Break-Glass Recovery](operations/break-glass-recovery.md)
 - [Running keel-server In-Cluster](operations/in-cluster-server.md)
-- [Upgrading from Keel 0.9](operations/upgrading.md)
 
 # Reference
 

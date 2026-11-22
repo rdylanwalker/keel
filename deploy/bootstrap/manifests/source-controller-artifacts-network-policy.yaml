@@ -6,13 +6,7 @@
 # Tenant and preview PKO Stacks clone their own Git source through PKO `gitSource` and never need
 # port 9090; keel-server and the PKO controller (`keel-system`) never download artifacts.
 #
-# Earlier releases allowed port 9090 from every namespace (`namespaceSelector: {}`). Re-running
-# `keel bootstrap init` replaces that rule in place with this one, but only once no PKO Stack
-# outside `flux-system` still uses `fluxSource` (live, or committed under `tenants/` on
-# `origin/main`; `keel tenant migrate-stack-sources`). Until then bootstrap applies this object
-# with the 9090 peer widened to `flux-system` plus exactly the blocking Stacks' namespaces
-# (`kubernetes.io/metadata.name In [...]`), also on fresh clusters where the flux2 chart's
-# `allow-egress` would otherwise close 9090 to them, and the bootstrap summary lists them.
+# `keel bootstrap init` always applies this object as is.
 #
 # The flux2 chart's own policies (`allow-egress`: ingress from `flux-system` pods,
 # `allow-scraping`: port 8080 from any namespace) still apply; the metrics rule below only keeps

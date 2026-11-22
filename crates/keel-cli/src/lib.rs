@@ -16,8 +16,7 @@ pub use cli::{
     DEFAULT_BIND_ADDR, DEFAULT_S3_BUCKET, DEFAULT_SERVER_URL, InfraArgs, InfraCommands,
     InfraListArgs, InfraProvisionArgs, InfraSshArgs, OutputFormat, PreviewArgs, PreviewCommands,
     PreviewStatusArgs, ProposalArgs, ProposalCommands, ProposalListArgs, ProposalRefArgs,
-    ProposalStatusArg, ServeArgs, TenantArgs, TenantCommands, TenantMigrateBaselineArgs,
-    TenantMigrateStackSourcesArgs, TenantMigrateStateArgs,
+    ProposalStatusArg, ServeArgs, TenantArgs, TenantCommands, TenantRepairCredentialsArgs,
 };
 pub use commands::{
     AuthLoginOutcome, BootstrapInitOutcome, BootstrapRecoverOutcome, CliContext, CliError,
@@ -71,5 +70,26 @@ mod tests {
         ])
         .unwrap();
         run(&cli).await.unwrap();
+    }
+
+    #[test]
+    fn tenant_repair_credentials_parses_with_and_without_an_id() {
+        for group in ["tenant", "tenants"] {
+            let cli = Cli::try_parse_from(["keel", group, "repair-credentials", "acme"]).unwrap();
+            let Commands::Tenant(t) = cli.command else {
+                panic!("expected tenant command");
+            };
+            let TenantCommands::RepairCredentials(args) = t.command;
+            assert_eq!(args.tenant.as_deref(), Some("acme"));
+        }
+        let cli = Cli::try_parse_from(["keel", "tenant", "repair-credentials"]).unwrap();
+        let Commands::Tenant(t) = cli.command else {
+            panic!("expected tenant command");
+        };
+        let TenantCommands::RepairCredentials(args) = t.command;
+        assert!(args.tenant.is_none());
+        for removed in ["migrate-state", "migrate-stack-sources", "migrate-baseline"] {
+            assert!(Cli::try_parse_from(["keel", "tenant", removed, "--tenant", "x"]).is_err());
+        }
     }
 }

@@ -1,6 +1,6 @@
 //! Durable Stage 0 Pulumi state: per-cluster local backend under the user config dir, generated
 //! passphrase (local `0600` file + `keel-system` Secret), escrow to the in-cluster S3 bucket
-//! (`s3://pulumi-state/stage0/<cluster>`, versioned), and tenant state migration (`NFR-REL-01`).
+//! (`s3://pulumi-state/stage0/<cluster>`, versioned) (`NFR-REL-01`).
 //!
 //! Every `pulumi` invocation uses explicit argv; backend URLs, S3 credentials and passphrases are
 //! passed through environment variables and secret config values through stdin — never argv
@@ -11,9 +11,8 @@ use std::process::Stdio;
 
 use keel_core::{
     KEEL_SYSTEM_NAMESPACE, STAGE0_BACKEND_DIR, STAGE0_PASSPHRASE_FILE, Stage0Passphrase,
-    Stage0PassphraseSource, ensure_private_dir, legacy_stage0_tmp_root,
-    migrate_legacy_stage0_state_in, resolve_stage0_passphrase_in, stage0_cluster_dir_in,
-    stage0_program_dir_in, stage0_state_root, write_private_file,
+    Stage0PassphraseSource, ensure_private_dir, resolve_stage0_passphrase_in,
+    stage0_cluster_dir_in, stage0_program_dir_in, stage0_state_root, write_private_file,
 };
 use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt;
@@ -24,11 +23,6 @@ use super::s3::{
     read_seaweedfs_admin_credentials, s3_backend_url, start_seaweedfs_s3_port_forward,
 };
 use crate::commands::CliError;
-
-/// Passphrase of tenant checkpoints stored at the bucket root (the layout `keel tenant
-/// migrate-state` moves under `tenants/<id>/`); those stacks were written without a per-tenant
-/// passphrase. Only ever used to *read* that layout.
-const BUCKET_ROOT_STATE_PASSPHRASE: &str = "";
 
 /// Secret (in `keel-system`) holding the Stage 0 Pulumi passphrase.
 pub const STAGE0_PASSPHRASE_SECRET_NAME: &str = "keel-stage0-pulumi-passphrase";
@@ -88,30 +82,22 @@ pub(crate) struct Stage0Context {
 }
 
 impl Stage0Context {
-    /// Migrates legacy `$TMP` state and resolves the passphrase.
+    /// Creates the per-cluster Stage 0 directory and resolves the passphrase.
     /// `passphrase_preexisted` must be sampled before any Stage 0 Pulumi run in this invocation.
     pub(crate) fn prepare(
         cluster_name: &str,
         passphrase_preexisted: bool,
     ) -> Result<Self, CliError> {
-        let root = stage0_state_root();
-        Self::prepare_in(
-            &root,
-            &legacy_stage0_tmp_root(),
-            cluster_name,
-            passphrase_preexisted,
-        )
+        Self::prepare_in(&stage0_state_root(), cluster_name, passphrase_preexisted)
     }
 
     pub(crate) fn prepare_in(
         root: &Path,
-        legacy_root: &Path,
         cluster_name: &str,
         passphrase_preexisted: bool,
     ) -> Result<Self, CliError> {
         let cluster_dir = stage0_cluster_dir_in(root, cluster_name);
         ensure_private_dir(&cluster_dir)?;
-        migrate_legacy_stage0_state_in(root, legacy_root, cluster_name)?;
         let passphrase = resolve_stage0_passphrase_in(root, cluster_name)?;
         let passphrase_newly_created = passphrase.was_generated()
             || (!passphrase_preexisted
@@ -329,27 +315,6 @@ impl PulumiRunner {
             .map(|_| ())
     }
 
-    /// Like [`PulumiRunner::export`] but with decrypted secrets (`--show-secrets`); `file` is
-    /// pre-created `0600` and must live in a private directory removed after use.
-    pub(crate) async fn export_decrypted(&self, stack: &str, file: &Path) -> Result<(), CliError> {
-        if let Some(parent) = file.parent() {
-            ensure_private_dir(parent)?;
-        }
-        write_private_file(file, b"")?;
-        let file_str = file.to_string_lossy().to_string();
-        self.run(&[
-            "stack",
-            "export",
-            "--show-secrets",
-            "--stack",
-            stack,
-            "--file",
-            &file_str,
-        ])
-        .await
-        .map(|_| ())
-    }
-
     /// Ensures `stack` exists (init with passphrase provider if missing) and imports `file`.
     pub(crate) async fn init_and_import(&self, stack: &str, file: &Path) -> Result<(), CliError> {
         if let Err(err) = self
@@ -378,21 +343,6 @@ impl PulumiRunner {
         ])
         .await
         .map(|_| ())
-    }
-
-    /// Lists stack names visible in the backend (`pulumi stack ls --all --json`).
-    pub(crate) async fn list_stacks(&self) -> Result<Vec<String>, CliError> {
-        let out = self.run(&["stack", "ls", "--all", "--json"]).await?;
-        let parsed: Value = serde_json::from_str(out.trim()).unwrap_or(Value::Array(Vec::new()));
-        Ok(parsed
-            .as_array()
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(|i| i.get("name").and_then(Value::as_str).map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default())
     }
 }
 
@@ -424,9 +374,6 @@ pub(crate) async fn store_passphrase_secret(
     target: KubeTarget<'_>,
     ctx: &Stage0Context,
 ) -> Result<(), CliError> {
-    if ctx.passphrase.source == Stage0PassphraseSource::LegacyEmpty {
-        return Ok(());
-    }
     let doc = json!({
         "apiVersion": "v1",
         "kind": "Secret",
@@ -618,236 +565,6 @@ pub(crate) async fn sync_stage0_state_to_s3(
     Ok(report)
 }
 
-// ============================================================================
-// Tenant state migration (bucket root -> tenants/<id>/), OPEN-25
-// ============================================================================
-
-/// Planned/executed migration for one tenant stack.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TenantStackMigration {
-    pub stack: String,
-    pub action: String,
-}
-
-/// Outcome of `keel tenant migrate-state`.
-#[derive(Debug, Clone, Default)]
-pub struct TenantMigrationReport {
-    pub tenant: String,
-    pub dry_run: bool,
-    pub source_backend: String,
-    pub target_backend: String,
-    pub stacks: Vec<TenantStackMigration>,
-}
-
-impl TenantMigrationReport {
-    pub fn render(&self) -> String {
-        let mut out = format!(
-            "Tenant state migration for tenant-{}{}\n  from: {}\n  to:   {}\n",
-            self.tenant,
-            if self.dry_run { " (dry run)" } else { "" },
-            self.source_backend,
-            self.target_backend
-        );
-        if self.stacks.is_empty() {
-            out.push_str("  No tenant stacks found at the bucket root; nothing to migrate.\n");
-        }
-        for s in &self.stacks {
-            out.push_str(&format!("  - {}: {}\n", s.stack, s.action));
-        }
-        out
-    }
-}
-
-/// Lists `spec.stack` names of PKO Stacks in `tenant-<id>`.
-pub(crate) async fn tenant_stack_names(
-    target: KubeTarget<'_>,
-    tenant_id: &str,
-) -> Result<Vec<String>, CliError> {
-    let ns = format!("tenant-{tenant_id}");
-    let raw = target
-        .output(&["-n", &ns, "get", "stacks.pulumi.com", "-o", "json"])
-        .await?;
-    let parsed: Value = serde_json::from_str(&raw)?;
-    Ok(parsed
-        .get("items")
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|i| {
-                    i.pointer("/spec/stack")
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
-                })
-                .collect()
-        })
-        .unwrap_or_default())
-}
-
-/// Matches tenant stack names against fully-qualified root backend names.
-pub(crate) fn match_tenant_stacks(
-    tenant_stacks: &[String],
-    root_stacks: &[String],
-) -> Vec<(String, Option<String>)> {
-    tenant_stacks
-        .iter()
-        .map(|wanted| {
-            let exact = root_stacks.iter().find(|r| *r == wanted);
-            let found = exact.cloned().or_else(|| {
-                let candidates: Vec<&String> = root_stacks
-                    .iter()
-                    .filter(|r| r.rsplit('/').next() == wanted.rsplit('/').next())
-                    .collect();
-                (candidates.len() == 1).then(|| candidates[0].clone())
-            });
-            (wanted.clone(), found)
-        })
-        .collect()
-}
-
-/// Moves tenant stack state from the bucket root to `tenants/<id>/` (export/import per stack,
-/// idempotent: stacks already present in the tenant prefix are skipped; legacy copies are left
-/// in place for manual removal after verification).
-pub(crate) async fn migrate_tenant_state(
-    target: KubeTarget<'_>,
-    tenant_id: &str,
-    dry_run: bool,
-) -> Result<TenantMigrationReport, CliError> {
-    keel_core::validate_dns_label(tenant_id, "tenant")?;
-    let bucket = crate::cli::DEFAULT_S3_BUCKET;
-    let mut report = TenantMigrationReport {
-        tenant: tenant_id.to_string(),
-        dry_run,
-        ..Default::default()
-    };
-    let tenant_prefix = keel_kube::tenant::tenant_s3_state_prefix(tenant_id)?;
-    report.source_backend = format!("s3://{bucket}/");
-    report.target_backend = format!("s3://{bucket}/{tenant_prefix}/");
-    let tenant_stacks = tenant_stack_names(target, tenant_id).await?;
-    if tenant_stacks.is_empty() {
-        return Ok(report);
-    }
-    let creds = read_seaweedfs_admin_credentials(target).await?;
-    let pf = start_seaweedfs_s3_port_forward(target).await?;
-    let endpoint = S3Endpoint::parse(
-        &format!("http://127.0.0.1:{}", pf.local_port),
-        "S3 endpoint",
-    )?;
-    let root_url = s3_backend_url(bucket, None, &endpoint, DEFAULT_S3_REGION)?;
-    let tenant_url = s3_backend_url(bucket, Some(&tenant_prefix), &endpoint, DEFAULT_S3_REGION)?;
-
-    let tenant_ns = keel_kube::tenant::tenant_namespace(tenant_id)?;
-    let tenant_passphrase = read_pulumi_passphrase(target, &tenant_ns)
-        .await
-        .ok_or_else(|| {
-            CliError::Execution(format!(
-                "tenant `{tenant_id}` has no Pulumi state passphrase (`{tenant_ns}/{}`, key `{}`); \
-                 provision the tenant before migrating its state",
-                keel_kube::PULUMI_PASSPHRASE_SECRET_NAME,
-                keel_kube::PULUMI_PASSPHRASE_SECRET_KEY
-            ))
-        })?;
-
-    let work = std::env::temp_dir().join(format!("keel-tenant-migrate-{}", uuid::Uuid::new_v4()));
-    ensure_private_dir(&work)?;
-    // Bucket-root checkpoints are read with the passphrase they were written with and exported
-    // with decrypted secrets into the private (0700/0600) work dir, which is removed afterwards;
-    // the import under the tenant prefix re-encrypts them with the tenant passphrase.
-    let root = PulumiRunner::new(&work, root_url, BUCKET_ROOT_STATE_PASSPHRASE)
-        .with_s3_credentials(&creds);
-    let tenant = PulumiRunner::new(&work, tenant_url, tenant_passphrase.as_str())
-        .with_s3_credentials(&creds);
-    let root_stacks = root.list_stacks().await?;
-    let existing = tenant.list_stacks().await.unwrap_or_default();
-
-    let result = async {
-        for (wanted, found) in match_tenant_stacks(&tenant_stacks, &root_stacks) {
-            let Some(full) = found else {
-                report.stacks.push(TenantStackMigration {
-                    stack: wanted,
-                    action: "no legacy state at bucket root (skipped)".to_string(),
-                });
-                continue;
-            };
-            if existing.contains(&full) {
-                report.stacks.push(TenantStackMigration {
-                    stack: full,
-                    action: "already present under tenant prefix (skipped)".to_string(),
-                });
-                continue;
-            }
-            if dry_run {
-                report.stacks.push(TenantStackMigration {
-                    stack: full,
-                    action: "would export from bucket root and import under tenant prefix"
-                        .to_string(),
-                });
-                continue;
-            }
-            let project = full.split('/').nth(1).unwrap_or("project").to_string();
-            let proj_dir = work.join(&project);
-            ensure_private_dir(&proj_dir)?;
-            tokio::fs::write(
-                proj_dir.join("Pulumi.yaml"),
-                format!("name: {project}\nruntime: yaml\n"),
-            )
-            .await?;
-            let file = work.join(format!("{}.json", full.replace('/', "_")));
-            let root_p = PulumiRunner {
-                program_dir: proj_dir.clone(),
-                ..root.clone_env()
-            };
-            let tenant_p = PulumiRunner {
-                program_dir: proj_dir.clone(),
-                ..tenant.clone_env()
-            };
-            root_p.export_decrypted(&full, &file).await?;
-            strip_secrets_providers(&file).await?;
-            tenant_p.init_and_import(&full, &file).await?;
-            report.stacks.push(TenantStackMigration {
-                stack: full,
-                action: "migrated (legacy copy kept at bucket root; remove after verification)"
-                    .to_string(),
-            });
-        }
-        Ok::<(), CliError>(())
-    }
-    .await;
-    let _ = tokio::fs::remove_dir_all(&work).await;
-    drop(pf);
-    result?;
-    Ok(report)
-}
-
-impl PulumiRunner {
-    fn clone_env(&self) -> Self {
-        Self {
-            program_dir: self.program_dir.clone(),
-            backend_url: self.backend_url.clone(),
-            passphrase: self.passphrase.clone(),
-            extra_env: self.extra_env.clone(),
-        }
-    }
-}
-
-/// Drops `deployment.secrets_providers` from a `--show-secrets` export so `pulumi stack import`
-/// encrypts the (plaintext) secrets with the target stack's passphrase instead of trying to
-/// unlock the source provider with it.
-async fn strip_secrets_providers(file: &Path) -> Result<(), CliError> {
-    let raw = zeroize::Zeroizing::new(tokio::fs::read(file).await?);
-    let stripped = zeroize::Zeroizing::new(strip_secrets_providers_json(&raw)?);
-    write_private_file(file, &stripped)?;
-    Ok(())
-}
-
-fn strip_secrets_providers_json(raw: &[u8]) -> Result<Vec<u8>, CliError> {
-    let mut doc: Value = serde_json::from_slice(raw)?;
-    if let Some(dep) = doc.get_mut("deployment").and_then(Value::as_object_mut) {
-        dep.remove("secrets_providers");
-    }
-    Ok(serde_json::to_vec(&doc)?)
-}
-
 /// Converts a DIY checkpoint file (`.pulumi/stacks/<project>/<stack>.json`) into the
 /// `pulumi stack import` format.
 pub(crate) fn checkpoint_to_export(raw: &[u8]) -> Result<Vec<u8>, CliError> {
@@ -902,26 +619,6 @@ mod tests {
     }
 
     #[test]
-    fn tenant_stack_matching_is_exact_then_unique_suffix() {
-        let root = vec![
-            "organization/web/prod".to_string(),
-            "organization/db/prod".to_string(),
-            "organization/cache/cache-a".to_string(),
-        ];
-        let tenant = vec![
-            "organization/web/prod".to_string(),
-            "cache-a".to_string(),
-            "prod".to_string(),
-            "missing".to_string(),
-        ];
-        let m = match_tenant_stacks(&tenant, &root);
-        assert_eq!(m[0].1.as_deref(), Some("organization/web/prod"));
-        assert_eq!(m[1].1.as_deref(), Some("organization/cache/cache-a"));
-        assert_eq!(m[2].1, None, "ambiguous short name must not match");
-        assert_eq!(m[3].1, None);
-    }
-
-    #[test]
     fn pulumi_passphrase_secret_manifest_is_a_complete_kubectl_document() {
         let secret = keel_kube::build_pulumi_passphrase_secret("flux-system", "p4ss");
         let v: Value = serde_json::to_value(&secret).unwrap();
@@ -937,16 +634,6 @@ mod tests {
             v["data"][keel_kube::PULUMI_PASSPHRASE_SECRET_KEY],
             "cDRzcw=="
         );
-    }
-
-    #[test]
-    fn secrets_providers_are_stripped_from_decrypted_exports() {
-        let raw = br#"{"version":3,"deployment":{"manifest":{},"secrets_providers":{"type":"passphrase","state":{"salt":"v1:x"}},"resources":[]}}"#;
-        let v: Value = serde_json::from_slice(&strip_secrets_providers_json(raw).unwrap()).unwrap();
-        assert!(v["deployment"].get("secrets_providers").is_none());
-        assert_eq!(v["deployment"]["resources"], json!([]));
-        assert_eq!(v["version"], json!(3));
-        assert!(strip_secrets_providers_json(b"not json").is_err());
     }
 
     #[test]
@@ -966,14 +653,13 @@ mod tests {
             return;
         }
         let root = std::env::temp_dir().join(format!("keel-cli-stage0-{}", uuid::Uuid::new_v4()));
-        let legacy = root.join("legacy");
-        let ctx = Stage0Context::prepare_in(&root, &legacy, "ctx-test", false).unwrap();
+        let ctx = Stage0Context::prepare_in(&root, "ctx-test", false).unwrap();
         assert!(ctx.passphrase_newly_created);
         let notice = ctx.escrow_notice().unwrap();
         assert!(notice.contains(STAGE0_PASSPHRASE_SECRET_NAME));
         assert!(!notice.contains(ctx.passphrase.expose()));
         assert!(ctx.local_backend_url().starts_with("file://"));
-        let again = Stage0Context::prepare_in(&root, &legacy, "ctx-test", true).unwrap();
+        let again = Stage0Context::prepare_in(&root, "ctx-test", true).unwrap();
         assert!(!again.passphrase_newly_created);
         assert!(again.escrow_notice().is_none());
         let _ = std::fs::remove_dir_all(&root);
