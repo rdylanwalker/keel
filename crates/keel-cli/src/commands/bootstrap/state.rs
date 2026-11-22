@@ -120,8 +120,9 @@ impl Stage0Context {
         format!("file://{}", self.backend_dir.display())
     }
 
-    /// Materializes `<cluster_dir>/programs/<program>/Pulumi.yaml` from the repository checkout
-    /// (when run from it) or the embedded copy.
+    /// Materializes `<cluster_dir>/programs/<program>/Pulumi.yaml` from the copy embedded in the
+    /// `keel` binary. The current directory is never consulted, so a stray
+    /// `deploy/bootstrap/<program>/Pulumi.yaml` cannot silently replace the program.
     pub(crate) async fn materialize_program(
         &self,
         program: &str,
@@ -129,19 +130,7 @@ impl Stage0Context {
     ) -> Result<PathBuf, CliError> {
         let program_dir = stage0_program_dir_in(&self.cluster_dir, program);
         ensure_private_dir(&program_dir)?;
-        let rel = PathBuf::from("deploy").join("bootstrap").join(program);
-        let candidates = [
-            rel.join("Pulumi.yaml"),
-            PathBuf::from("..").join(&rel).join("Pulumi.yaml"),
-        ];
-        let mut yaml = embedded_yaml.to_string();
-        for candidate in candidates {
-            if candidate.is_file() {
-                yaml = tokio::fs::read_to_string(&candidate).await?;
-                break;
-            }
-        }
-        tokio::fs::write(program_dir.join("Pulumi.yaml"), yaml).await?;
+        tokio::fs::write(program_dir.join("Pulumi.yaml"), embedded_yaml).await?;
         Ok(program_dir)
     }
 

@@ -195,7 +195,7 @@ pub struct BootstrapInitArgs {
     #[arg(long, env = "KEEL_GIT_TOKEN")]
     pub git_token: Option<String>,
 
-    /// Optional override directory containing the Stage 0 Pulumi.yaml program
+    /// Override directory with the Stage 0 Pulumi.yaml program (default: the embedded program)
     #[arg(long)]
     pub pulumi_program_dir: Option<PathBuf>,
 }

@@ -461,17 +461,12 @@ pub async fn synthesize_seed_control_plane_with_ingress(
     let kyverno_bundle = kyverno_gen.generate()?;
 
     // Protected anti-lockout `management-cluster-core` PKO v2 Stack (`protect: true`)
-    let use_in_cluster_s3 = keel_config.s3.is_none();
-    let mgmt_backend = if let Some(s3) = keel_config.s3.as_ref() {
-        format!("s3://{}", s3.bucket)
-    } else {
-        IN_CLUSTER_S3_BACKEND_URL.to_string()
-    };
-    let mut mgmt_params =
-        ManagementCoreStackParams::new(mgmt_backend, FLUX_SYSTEM_NAMESPACE, "clusters/management");
-    if use_in_cluster_s3 {
-        attach_s3_credentials_env_refs(&mut mgmt_params.env_refs, S3_CREDENTIALS_SECRET_NAME);
-    }
+    let mut mgmt_params = ManagementCoreStackParams::new(
+        IN_CLUSTER_S3_BACKEND_URL,
+        FLUX_SYSTEM_NAMESPACE,
+        "clusters/management",
+    );
+    attach_s3_credentials_env_refs(&mut mgmt_params.env_refs, S3_CREDENTIALS_SECRET_NAME);
     let management_stack = synthesize_management_core_stack(&mgmt_params)?;
 
     // Stage 0 Rauthy OIDC admin credentials & bootstrap config (`SDD.md` §2.1, §6.1, `NFR-SEC-01`)

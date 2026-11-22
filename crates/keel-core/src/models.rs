@@ -551,27 +551,6 @@ fn default_oidc_scopes() -> Vec<String> {
     ]
 }
 
-/// S3-compatible Pulumi state backend configuration inside `.keel/config.yaml`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct S3BackendConfig {
-    pub endpoint: String,
-    #[serde(default = "default_s3_bucket")]
-    pub bucket: String,
-    #[serde(default = "default_s3_region")]
-    pub region: String,
-    #[serde(default)]
-    pub force_path_style: bool,
-}
-
-fn default_s3_bucket() -> String {
-    "pulumi-state".to_string()
-}
-
-fn default_s3_region() -> String {
-    "us-east-1".to_string()
-}
-
 /// Repository-level control plane configuration stored at `.keel/config.yaml` (`SDD.md` §3.1).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -592,8 +571,6 @@ pub struct KeelConfig {
     pub forge: ForgeConfig,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oidc: Option<OidcConfig>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub s3: Option<S3BackendConfig>,
 }
 
 fn default_api_version() -> String {
@@ -664,13 +641,6 @@ impl KeelConfig {
         }
         Ok(())
     }
-
-    /// Checks whether a given provider ID is enabled in `.keel/config.yaml`.
-    pub fn is_provider_enabled(&self, provider_id: &str) -> bool {
-        self.enabled_providers
-            .iter()
-            .any(|p| p.eq_ignore_ascii_case(provider_id))
-    }
 }
 
 impl Default for KeelConfig {
@@ -684,7 +654,6 @@ impl Default for KeelConfig {
             enabled_providers: Vec::new(),
             forge: ForgeConfig::default(),
             oidc: None,
-            s3: None,
         }
     }
 }
@@ -875,126 +844,6 @@ impl ProviderRegistry {
 impl Default for ProviderRegistry {
     fn default() -> Self {
         Self::default_day1()
-    }
-}
-
-/// Namespace resource quota specification for a tenant (`SDD.md` §6.2).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ResourceQuotaSpec {
-    pub cpu_requests: String,
-    pub cpu_limits: String,
-    pub memory_requests: String,
-    pub memory_limits: String,
-    pub max_pods: u32,
-}
-
-impl Default for ResourceQuotaSpec {
-    fn default() -> Self {
-        Self {
-            cpu_requests: "4".to_string(),
-            cpu_limits: "8".to_string(),
-            memory_requests: "8Gi".to_string(),
-            memory_limits: "16Gi".to_string(),
-            max_pods: 50,
-        }
-    }
-}
-
-/// Multi-tenant isolation and policy configuration (`SDD.md` §6.2, §6.3).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TenantConfig {
-    pub id: String,
-    pub display_name: String,
-    /// Dedicated Kubernetes namespace (`tenant-<id>`).
-    pub namespace: String,
-    /// Per-tenant SOPS `age` public key (`age1...`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub age_public_key: Option<String>,
-    /// Cloud / hypervisor providers permitted by Kyverno `restrict-pulumi-providers`.
-    #[serde(default)]
-    pub allowed_providers: Vec<String>,
-    /// OIDC groups mapped to this tenant's RBAC bindings.
-    #[serde(default)]
-    pub oidc_groups: Vec<String>,
-    /// Optional workload cluster `kubeconfig` Secret name in `tenant-<id>` (`spec.kubeConfig.secretRef`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub target_cluster_kubeconfig_secret: Option<String>,
-    #[serde(default)]
-    pub quotas: ResourceQuotaSpec,
-}
-
-impl TenantConfig {
-    /// Constructs and validates a new `TenantConfig` mapping `id` to `tenant-<id>`.
-    pub fn new(id: impl Into<String>, display_name: impl Into<String>) -> Result<Self, CoreError> {
-        let id = id.into();
-        let namespace = crate::tenant_namespace(&id)?;
-        let cfg = Self {
-            id,
-            display_name: display_name.into(),
-            namespace,
-            age_public_key: None,
-            allowed_providers: Vec::new(),
-            oidc_groups: Vec::new(),
-            target_cluster_kubeconfig_secret: None,
-            quotas: ResourceQuotaSpec::default(),
-        };
-        cfg.validate()?;
-        Ok(cfg)
-    }
-
-    /// Validates strict namespace naming (`tenant-<id>`) and key hygiene (`NFR-SEC-02`, `NFR-SEC-05`).
-    pub fn validate(&self) -> Result<(), CoreError> {
-        let expected_ns = crate::tenant_namespace(&self.id)?;
-        if self.namespace != expected_ns {
-            return Err(CoreError::Validation(format!(
-                "Tenant namespace '{}' does not match required isolation boundary '{}'",
-                self.namespace, expected_ns
-            )));
-        }
-        if self.display_name.trim().is_empty() {
-            return Err(CoreError::Validation(
-                "Tenant display_name must not be empty".to_string(),
-            ));
-        }
-        if let Some(pub_key) = &self.age_public_key
-            && (!pub_key.starts_with("age1") || pub_key.chars().any(char::is_whitespace))
-        {
-            return Err(CoreError::Validation(
-                "Tenant age_public_key must be a valid 'age1...' recipient without whitespace"
-                    .to_string(),
-            ));
-        }
-        for provider in &self.allowed_providers {
-            validate_dns_label(provider, "allowed_provider")?;
-        }
-        Ok(())
-    }
-
-    /// Returns the `.sops.yaml` `path_regex` scoping encrypted secrets for this tenant.
-    pub fn sops_path_regex(&self) -> String {
-        format!(r"^tenants/{}/.*\.enc\.yaml$", self.id)
-    }
-
-    /// Checks whether this tenant is permitted to instantiate the specified Pulumi provider.
-    pub fn is_provider_allowed(&self, provider_id: &str) -> bool {
-        self.allowed_providers
-            .iter()
-            .any(|p| p.eq_ignore_ascii_case(provider_id))
-    }
-
-    /// Parses and validates a `TenantConfig` from YAML.
-    pub fn from_yaml(yaml: &str) -> Result<Self, CoreError> {
-        let cfg: Self = serde_yml::from_str(yaml)?;
-        cfg.validate()?;
-        Ok(cfg)
-    }
-
-    /// Serializes this `TenantConfig` to YAML.
-    pub fn to_yaml(&self) -> Result<String, CoreError> {
-        self.validate()?;
-        Ok(serde_yml::to_string(self)?)
     }
 }
 
@@ -1333,15 +1182,6 @@ pub struct ProgressiveDeliverySpec {
     pub default_canary: bool,
 }
 
-/// Companion PKO infrastructure stack hook bound atomically in the same PR (`SDD.md` §5.1).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CompanionInfraHook {
-    pub blueprint: String,
-    #[serde(default)]
-    pub bind_values: BTreeMap<String, serde_json::Value>,
-}
-
 /// A Gateway API route an upstream Helm chart renders from its own values
 /// (`spec.gatewayRoutes[]`, `runtime: helm` only). Keel never patches the chart: it reads the
 /// hostnames from the submitted values, applies the tenant route guards (no platform host, no
@@ -1398,8 +1238,6 @@ pub struct CatalogAppSpec {
     pub upstream: UpstreamSource,
     #[serde(default)]
     pub progressive_delivery: ProgressiveDeliverySpec,
-    #[serde(default)]
-    pub companion_infrastructure: Vec<CompanionInfraHook>,
     pub schema: serde_json::Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ui_schema: Option<serde_json::Value>,
@@ -1542,9 +1380,6 @@ impl CatalogApplication {
             return Err(CoreError::Validation(
                 "spec.schema must be a JSON Schema object".to_string(),
             ));
-        }
-        for hook in &self.spec.companion_infrastructure {
-            validate_dns_label(&hook.blueprint, "companionInfrastructure.blueprint")?;
         }
         if let Some(ns) = &self.spec.placement.namespace {
             validate_dns_label(ns, "spec.placement.namespace")?;
@@ -2848,17 +2683,8 @@ mod tests {
                 redirect_url: "https://keel.example.com/api/v1/auth/callback".to_string(),
                 scopes: default_oidc_scopes(),
             }),
-            s3: Some(S3BackendConfig {
-                endpoint: "https://s3.example.com".to_string(),
-                bucket: "pulumi-state".to_string(),
-                region: "us-east-1".to_string(),
-                force_path_style: true,
-            }),
             ..KeelConfig::default()
         };
-
-        assert!(cfg.is_provider_enabled("PROXMOX"));
-        assert!(!cfg.is_provider_enabled("aws"));
 
         let yaml = cfg.to_yaml().unwrap();
         let parsed = KeelConfig::from_yaml(&yaml).unwrap();
@@ -2956,46 +2782,6 @@ mod tests {
     }
 
     #[test]
-    fn test_tenant_config_isolation_and_sops_regex() {
-        let mut tenant = TenantConfig::new("acme-corp", "Acme Corp").unwrap();
-        assert_eq!(tenant.namespace, "tenant-acme-corp");
-        assert_eq!(
-            tenant.sops_path_regex(),
-            r"^tenants/acme-corp/.*\.enc\.yaml$"
-        );
-
-        tenant.age_public_key =
-            Some("age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p".to_string());
-        tenant.allowed_providers = vec!["proxmox".to_string(), "aws".to_string()];
-        assert!(tenant.is_provider_allowed("Proxmox"));
-        assert!(!tenant.is_provider_allowed("gcp"));
-
-        let yaml = tenant.to_yaml().unwrap();
-        let roundtrip = TenantConfig::from_yaml(&yaml).unwrap();
-        assert_eq!(tenant, roundtrip);
-
-        // Reject path traversal / uppercase in tenant id
-        assert!(TenantConfig::new("../evil", "Evil").is_err());
-        assert!(TenantConfig::new("UpperCase", "Upper").is_err());
-
-        // Reject mismatched namespace
-        let mut tampered = tenant.clone();
-        tampered.namespace = "flux-system".to_string();
-        assert!(tampered.validate().is_err());
-
-        // Reject malformed age key, empty display name, and invalid allowed provider
-        let mut bad_key = tenant.clone();
-        bad_key.age_public_key = Some("not-an-age-key".to_string());
-        assert!(bad_key.validate().is_err());
-
-        assert!(TenantConfig::new("acme-empty", "   ").is_err());
-
-        let mut bad_prov = tenant;
-        bad_prov.allowed_providers = vec!["INVALID_PROVIDER".to_string()];
-        assert!(bad_prov.validate().is_err());
-    }
-
-    #[test]
     fn test_app_runtime_variants() {
         assert_eq!(AppRuntime::from_str("helm").unwrap(), AppRuntime::Helm);
         assert_eq!(
@@ -3053,7 +2839,6 @@ mod tests {
             spec: CatalogAppSpec {
                 upstream: UpstreamSource::default(),
                 progressive_delivery: ProgressiveDeliverySpec::default(),
-                companion_infrastructure: Vec::new(),
                 schema: serde_json::json!({ "type": "object", "properties": {} }),
                 ui_schema: None,
                 service_url: None,

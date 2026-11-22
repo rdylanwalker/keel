@@ -2,7 +2,7 @@
 //!
 //! Synthesizes tenant `Namespace` (enforcing `restricted` Pod Security Standards),
 //! `ServiceAccount`, `ResourceQuota`, default-deny `NetworkPolicy`, and Flux CD
-//! `HelmRelease` manifests with `spec.valuesFrom` (`kind: Secret`) companion infra bindings
+//! `HelmRelease` manifests with `spec.valuesFrom` (`kind: Secret`) bindings
 //! and optional `spec.kubeConfig.secretRef` for remote workload clusters.
 
 use std::collections::BTreeMap;
@@ -659,10 +659,11 @@ pub struct HelmChartSourceRef {
     pub namespace: Option<String>,
 }
 
-/// Companion infrastructure secret binding rendered into `HelmRelease.spec.valuesFrom` (`kind: Secret`).
+/// Secret binding rendered into `HelmRelease.spec.valuesFrom` (`kind: Secret`): SOPS app secrets
+/// or bundle item outputs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HelmValuesSecretRef {
-    /// Name of the tenant-scoped Kubernetes `Secret` holding companion PKO outputs or SOPS secrets.
+    /// Name of the tenant-scoped Kubernetes `Secret` holding bundle item outputs or SOPS secrets.
     pub name: String,
     /// Optional key inside the `Secret` (defaults to `values.yaml` in Flux when omitted).
     pub values_key: Option<String>,
@@ -795,7 +796,7 @@ impl HelmReleaseSpecInput {
 /// Synthesizes a Flux CD `HelmRelease` (`helm.toolkit.fluxcd.io/v2`) JSON manifest enforcing:
 /// - `tenant-<id>` namespace confinement (`--no-cross-namespace-refs=true`),
 /// - mandatory `spec.serviceAccountName` impersonation,
-/// - `spec.valuesFrom` (`kind: Secret`) bindings for companion PKO infrastructure outputs, and
+/// - `spec.valuesFrom` (`kind: Secret`) bindings (SOPS app secrets, bundle item outputs), and
 /// - optional `spec.kubeConfig.secretRef` for remote workload clusters.
 pub fn synthesize_helm_release(input: &HelmReleaseSpecInput) -> Result<Value, KubeError> {
     let namespace = tenant_namespace(&input.tenant_id)?;

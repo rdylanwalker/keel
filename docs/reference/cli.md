@@ -92,7 +92,7 @@ The CLI does not create or delete tenants: use **+ New Tenant** in the portal (s
 | `--local-dev-docker-socket-exception` | Adds a Kyverno `PolicyException` that gives local `kind` PKO workspaces Docker access. |
 | `--repo-dir <DIR>` | Local directory for the seed GitOps repository. |
 | `--skip-core-install` | Skips the Stage 0 control-plane install: the `control-plane*` Pulumi programs (Flux, PKO, Kyverno, SeaweedFS, Envoy Gateway, Prometheus, Flagger, cert-manager, Rauthy, and Forgejo with `--with-forge`), Forgejo repository/token provisioning, and the Stage 0 S3 state escrow. The cluster is still provisioned and the seed GitOps repository is still initialized. With `--with-keel-server`, you must create the `keel-system/forge-token` Secret yourself. |
-| `--pulumi-program-dir <DIR>` | Overrides the directory of the Stage 0 `Pulumi.yaml`. |
+| `--pulumi-program-dir <DIR>` | Overrides the directory of the Stage 0 `Pulumi.yaml`. Without it, the program embedded in the `keel` binary is used (a `deploy/bootstrap/<target>/` copy in the current directory is ignored). |
 
 Environment variables read by `bootstrap init`:
 

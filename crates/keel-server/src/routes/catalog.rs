@@ -527,7 +527,6 @@ pub async fn register_catalog_app(
                         flagger_supported: req.flagger_supported,
                         default_canary: false,
                     },
-                    companion_infrastructure: Vec::new(),
                     schema,
                     ui_schema: None,
                     service_url: None,

@@ -95,6 +95,7 @@ impl PulumiBootstrapTarget {
     }
 
     /// Creates a `PulumiBootstrapTarget` using an explicit path to the `pulumi` binary.
+    #[cfg(test)]
     pub fn with_binary(target: BootstrapTargetKind, pulumi_bin: impl Into<PathBuf>) -> Self {
         Self {
             target,
@@ -103,7 +104,8 @@ impl PulumiBootstrapTarget {
         }
     }
 
-    /// Overrides the Stage 0 state root directory (tests / custom layouts).
+    /// Overrides the Stage 0 state root directory.
+    #[cfg(test)]
     pub fn with_state_root(mut self, root: impl Into<PathBuf>) -> Self {
         self.state_root = Some(root.into());
         self
@@ -111,14 +113,6 @@ impl PulumiBootstrapTarget {
 
     fn root(&self) -> PathBuf {
         self.state_root.clone().unwrap_or_else(stage0_state_root)
-    }
-
-    /// Resolves the Stage 0 Pulumi program directory from `cfg.pulumi_program_dir` or the
-    /// default `deploy/bootstrap/<target>` path.
-    pub fn resolve_program_dir(&self, cfg: &BootstrapConfig) -> PathBuf {
-        cfg.pulumi_program_dir
-            .clone()
-            .unwrap_or_else(|| PathBuf::from("deploy/bootstrap").join(self.target.to_string()))
     }
 
     /// Returns the embedded Stage 0 `Pulumi.yaml` template for this target, if available.
@@ -161,19 +155,12 @@ impl PulumiBootstrapTarget {
             return Ok(explicit.clone());
         }
 
-        // Always materialize into the private per-cluster program dir so the stack config file
-        // (`Pulumi.<stack>.yaml`, holding the passphrase salt and encrypted config) lives next to
-        // the durable state rather than in the repository checkout or `$TMP`.
-        let rel = PathBuf::from("deploy/bootstrap").join(self.target.to_string());
-        let parent_rel = PathBuf::from("..").join(&rel);
-        let source_yaml = if rel.join("Pulumi.yaml").is_file() {
-            Some(tokio::fs::read_to_string(rel.join("Pulumi.yaml")).await?)
-        } else if parent_rel.join("Pulumi.yaml").is_file() {
-            Some(tokio::fs::read_to_string(parent_rel.join("Pulumi.yaml")).await?)
-        } else {
-            self.embedded_pulumi_yaml().map(str::to_string)
-        };
-        if let Some(yaml) = source_yaml {
+        // Without an explicit `--pulumi-program-dir`, only the program embedded in the binary is
+        // used (never a cwd-relative `deploy/bootstrap/<target>` copy). It is materialized into
+        // the private per-cluster program dir so the stack config file (`Pulumi.<stack>.yaml`,
+        // holding the passphrase salt and encrypted config) lives next to the durable state
+        // rather than in the repository checkout or `$TMP`.
+        if let Some(yaml) = self.embedded_pulumi_yaml() {
             let program_dir = stage0_program_dir_in(cluster_dir, self.target.as_str());
             ensure_private_dir(&program_dir)?;
             tokio::fs::write(program_dir.join("Pulumi.yaml"), yaml).await?;
@@ -199,16 +186,6 @@ impl PulumiBootstrapTarget {
     /// Returns the Pulumi stack name for this Stage 0 target and cluster.
     pub fn stack_name(&self, cfg: &BootstrapConfig) -> String {
         format!("stage0-{}-{}", self.target, cfg.cluster_name)
-    }
-
-    /// Builds explicit CLI arguments for `pulumi login file://<state_dir>` (informational; the
-    /// driver selects the backend through `PULUMI_BACKEND_URL` so the user's global
-    /// `pulumi login` is never modified).
-    pub fn build_login_args(state_dir: &Path) -> Vec<String> {
-        vec![
-            "login".to_string(),
-            format!("file://{}", state_dir.display()),
-        ]
     }
 
     /// Builds explicit CLI arguments for `pulumi stack select <stack> [--create]`.
@@ -630,11 +607,6 @@ pub fn resolve_stage0_passphrase_in(
     ))
 }
 
-/// [`resolve_stage0_passphrase_in`] using the default [`stage0_state_root`].
-pub fn resolve_stage0_passphrase(cluster_name: &str) -> Result<Stage0Passphrase, CoreError> {
-    resolve_stage0_passphrase_in(&stage0_state_root(), cluster_name)
-}
-
 /// Clears stale Stage 0 state when the `kind` cluster it describes no longer exists.
 /// The passphrase file is preserved.
 pub async fn clear_stale_kind_stage0_state_in(root: &Path, cluster_name: &str) {
@@ -802,12 +774,12 @@ struct NamedUser {
     name: String,
 }
 
-/// Parses and validates a Kubernetes `kubeconfig` YAML payload and optional context override.
 /// Returns `true` if `cluster_name` appears as an exact line in `kind get clusters` output.
 pub(crate) fn parse_kind_clusters_output(stdout: &str, cluster_name: &str) -> bool {
     stdout.lines().any(|line| line.trim() == cluster_name)
 }
 
+/// Parses and validates a Kubernetes `kubeconfig` YAML payload and optional context override.
 pub fn validate_kubeconfig_yaml(
     yaml: &str,
     requested_context: Option<&str>,
@@ -1062,23 +1034,9 @@ users:
         let mut cfg = BootstrapConfig::new(BootstrapTargetKind::Kind);
         cfg.cluster_name = "keel-dev".to_string();
 
-        assert_eq!(
-            driver.resolve_program_dir(&cfg),
-            PathBuf::from("deploy/bootstrap/kind")
-        );
-        cfg.pulumi_program_dir = Some(PathBuf::from("/custom/pulumi/kind"));
-        assert_eq!(
-            driver.resolve_program_dir(&cfg),
-            PathBuf::from("/custom/pulumi/kind")
-        );
-
         let state_dir = driver.state_dir(&cfg);
         assert!(state_dir.ends_with("stage0/keel-dev/state"));
         assert!(!state_dir.starts_with(std::env::temp_dir()) || std::env::var_os("HOME").is_none());
-        assert_eq!(
-            PulumiBootstrapTarget::build_login_args(&state_dir),
-            vec!["login", &format!("file://{}", state_dir.display())]
-        );
 
         assert_eq!(
             driver.build_stack_select_args(&cfg, true).unwrap(),

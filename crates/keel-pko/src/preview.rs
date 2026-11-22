@@ -69,11 +69,6 @@ impl PreviewSummary {
         self.create + self.update + self.delete + self.replace + self.same + self.drift
     }
 
-    /// Returns `true` if any resource will be created, updated, deleted, replaced, or has drifted.
-    pub fn has_changes(&self) -> bool {
-        (self.create + self.update + self.delete + self.replace + self.drift) > 0
-    }
-
     /// Returns `true` if any resource will be deleted or replaced.
     pub fn has_destructive_changes(&self) -> bool {
         (self.delete + self.replace) > 0
@@ -114,62 +109,6 @@ pub struct PreviewReport {
     /// Status of the ephemeral PKO preview run (absent for offline reports).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run: Option<crate::run::PreviewRunStatus>,
-}
-
-/// Parses raw `pulumi preview --json` output (standard JSON object, PKO `Stack` status JSON,
-/// step array, or streaming NDJSON engine events) into a structured `PreviewReport`.
-pub fn parse_preview_json(raw_json: &str) -> Result<PreviewReport, PkoError> {
-    let trimmed = raw_json.trim();
-    if trimmed.is_empty() {
-        return Err(PkoError::PreviewParse(
-            "preview JSON payload is empty".to_string(),
-        ));
-    }
-
-    if let Ok(single_val) = serde_json::from_str::<Value>(trimmed) {
-        return parse_preview_value(&single_val);
-    }
-
-    // Fallback to streaming NDJSON (`pulumi preview --json` event stream).
-    let mut step_values = Vec::new();
-    for (idx, line) in trimmed.lines().enumerate() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let event: Value = serde_json::from_str(line).map_err(|err| {
-            PkoError::PreviewParse(format!("invalid JSON on line {}: {err}", idx + 1))
-        })?;
-        if let Some(meta) = event
-            .get("resourcePreEvent")
-            .and_then(|ev| ev.get("metadata"))
-        {
-            step_values.push(meta.clone());
-        } else if event.get("op").is_some() && event.get("urn").is_some() {
-            step_values.push(event);
-        }
-    }
-
-    if step_values.is_empty() {
-        // Verify whether NDJSON contained valid Pulumi events with zero resource steps (e.g., only summaryEvent/preludeEvent).
-        let has_engine_event = trimmed.lines().any(|line| {
-            serde_json::from_str::<Value>(line.trim())
-                .ok()
-                .is_some_and(|v| {
-                    v.get("summaryEvent").is_some()
-                        || v.get("preludeEvent").is_some()
-                        || v.get("diagnosticEvent").is_some()
-                })
-        });
-        if has_engine_event {
-            return Ok(PreviewReport::default());
-        }
-        return Err(PkoError::PreviewParse(
-            "unrecognized Pulumi preview JSON stream".to_string(),
-        ));
-    }
-
-    build_report_from_steps(&step_values, &[])
 }
 
 /// Parses an already-deserialized `serde_json::Value` representing `pulumi preview --json`
@@ -626,6 +565,11 @@ fn sanitize_md_inline(input: &str) -> String {
 mod tests {
     use super::*;
 
+    fn parse_preview_json(raw: &str) -> Result<PreviewReport, PkoError> {
+        let value: Value = serde_json::from_str(raw.trim())?;
+        parse_preview_value(&value)
+    }
+
     #[test]
     fn parses_all_change_ops_and_coalesces_replacements() {
         let raw = r#"
@@ -702,7 +646,6 @@ mod tests {
         assert_eq!(report.summary.same, 1);
         assert_eq!(report.summary.drift, 1);
         assert_eq!(report.summary.total(), 6);
-        assert!(report.summary.has_changes());
         assert!(report.summary.has_destructive_changes());
 
         // Check replacement coalescing and component-parented URN parsing
@@ -738,23 +681,10 @@ mod tests {
     }
 
     #[test]
-    fn parses_streaming_ndjson_and_pko_status_wrappers() {
-        let ndjson = r#"
-{"sequence":1,"preludeEvent":{"config":{}}}
-{"sequence":2,"resourcePreEvent":{"metadata":{"op":"create","urn":"urn:pulumi:dev::app::kubernetes:core/v1:Namespace::tenant-acme","type":"kubernetes:core/v1:Namespace","diffs":["metadata"]}}}
-{"sequence":3,"resourcePreEvent":{"metadata":{"op":"drift","urn":"urn:pulumi:dev::app::kubernetes:core/v1:ConfigMap::cfg","diffs":["data"]}}}
-{"sequence":4,"summaryEvent":{"resourceChanges":{"create":1}}}
-"#;
-
-        let report = parse_preview_json(ndjson).expect("ndjson parse");
-        assert_eq!(report.summary.create, 1);
-        assert_eq!(report.summary.drift, 1);
-        assert_eq!(report.resources.len(), 2);
-
-        // Empty NDJSON stream with only summaryEvent
-        let empty_ndjson = r#"{"sequence":1,"summaryEvent":{"resourceChanges":{"same":0}}}"#;
-        let empty_report = parse_preview_json(empty_ndjson).expect("empty ndjson");
-        assert!(!empty_report.summary.has_changes());
+    fn parses_engine_events_and_pko_status_wrappers() {
+        // A summary-only engine event yields an empty report
+        let summary_event = r#"{"sequence":1,"summaryEvent":{"resourceChanges":{"same":0}}}"#;
+        let empty_report = parse_preview_json(summary_event).expect("summary event");
         assert_eq!(empty_report.summary.total(), 0);
 
         // PKO Stack status wrapper
@@ -887,12 +817,6 @@ mod tests {
             )
             .is_err()
         );
-        // Multi-line NDJSON with invalid second line
-        let bad_ndjson = "{\"sequence\":1,\"preludeEvent\":{}}\n{bad_json}";
-        assert!(parse_preview_json(bad_ndjson).is_err());
-        // Multi-line NDJSON with unrecognized objects
-        let unknown_ndjson = "{\"foo\":1}\n{\"bar\":2}";
-        assert!(parse_preview_json(unknown_ndjson).is_err());
     }
 
     #[test]

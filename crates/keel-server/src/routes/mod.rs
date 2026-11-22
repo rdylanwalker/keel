@@ -2355,14 +2355,11 @@ spec:
     async fn sops_recipients_and_cloud_secret_refs_and_tenant_read_rbac() {
         let (_tmp, state, workdir) = setup_test_state().await;
 
-        // 1. resolve_sops_recipients skips leading tenant rules and picks cluster_age_recipient
+        // 1. resolve_sops_recipients appends the cluster rule's recipient (cluster_age_recipient)
         tokio::fs::write(
             workdir.join(".sops.yaml"),
             r#"creation_rules:
-  - path_regex: ^tenants/alpha/.*\.enc\.yaml$
-    encrypted_regex: ^(data|stringData)$
-    age: age1alphatenantkey000000000000000000000000000000000000000000
-  - path_regex: ^clusters/.*\.enc\.yaml$
+  - path_regex: ^clusters/management/.*\.enc\.yaml$
     encrypted_regex: ^(data|stringData)$
     age: age1clusterkey0000000000000000000000000000000000000000000000
 "#,

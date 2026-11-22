@@ -1,6 +1,6 @@
 //! PKO v2 `Stack` (`pulumi.com/v1`) and Flux CD `GitRepository` (`source.toolkit.fluxcd.io/v1`)
 //! Custom Resource synthesis for management anti-lockout stacks, ephemeral PR previews,
-//! and multi-tenant infrastructure stacks with companion output `Secret` bindings.
+//! and multi-tenant infrastructure stacks.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -946,6 +946,7 @@ impl PkoWorkspaceTemplate {
     }
 
     /// Returns the `Secret` reference `PULUMI_CONFIG_PASSPHRASE` is sourced from, if any.
+    #[cfg(test)]
     pub fn passphrase_secret_ref(&self) -> Option<&SecretKeySelector> {
         self.spec
             .pod_template
@@ -1142,8 +1143,6 @@ pub struct PkoStackSpec {
     pub continue_resync_on_commit_match: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resync_frequency_seconds: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub output_secret_name: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub config: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -1152,20 +1151,6 @@ pub struct PkoStackSpec {
     pub secrets_ref: BTreeMap<String, PkoEnvRef>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workspace_template: Option<PkoWorkspaceTemplate>,
-}
-
-/// Flux `HelmRelease` `spec.valuesFrom` Secret reference for consuming companion `PkoStack` outputs (`SDD.md` §5.1).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct HelmValuesFromRef {
-    pub kind: String,
-    pub name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub values_key: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub target_path: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub optional: Option<bool>,
 }
 
 /// Typed PKO v2 `pulumi.com/v1` `Stack` Custom Resource.
@@ -1219,22 +1204,9 @@ impl PkoStack {
     }
 
     /// Returns `true` if this stack runs strictly in ephemeral preview mode (`spec.preview: true`).
+    #[cfg(test)]
     pub fn is_preview(&self) -> bool {
         self.spec.preview == Some(true)
-    }
-
-    /// Produces a Flux `HelmRelease` `spec.valuesFrom` Secret reference if `output_secret_name` is bound.
-    pub fn helm_values_from_ref(&self) -> Option<HelmValuesFromRef> {
-        self.spec
-            .output_secret_name
-            .as_ref()
-            .map(|secret_name| HelmValuesFromRef {
-                kind: "Secret".to_string(),
-                name: secret_name.clone(),
-                values_key: None,
-                target_path: None,
-                optional: Some(false),
-            })
     }
 }
 
@@ -1637,7 +1609,6 @@ pub struct TenantStackParams {
     /// directly by the workspace pod with the tenant's read-only credentials (`gitAuth`).
     pub git_source: PkoGitSource,
     pub service_account_name: Option<String>,
-    pub output_secret_name: Option<String>,
     pub config: BTreeMap<String, String>,
     pub env_refs: BTreeMap<String, PkoEnvRef>,
     pub secrets_ref: BTreeMap<String, PkoEnvRef>,
@@ -1664,7 +1635,6 @@ impl TenantStackParams {
             backend_url: backend_url.into(),
             git_source,
             service_account_name: None,
-            output_secret_name: None,
             config: BTreeMap::new(),
             env_refs: BTreeMap::new(),
             secrets_ref: BTreeMap::new(),
@@ -1767,7 +1737,6 @@ pub fn synthesize_management_core_stack(
             destroy_on_finalize: Some(false),
             continue_resync_on_commit_match: Some(true),
             resync_frequency_seconds: Some(300),
-            output_secret_name: None,
             config,
             env_refs: params.env_refs.clone(),
             secrets_ref: BTreeMap::new(),
@@ -1886,7 +1855,6 @@ pub fn synthesize_ephemeral_preview(
             destroy_on_finalize: Some(false),
             continue_resync_on_commit_match: Some(false),
             resync_frequency_seconds: None,
-            output_secret_name: None,
             config: params.config.clone(),
             env_refs: params.env_refs.clone(),
             secrets_ref: params.secrets_ref.clone(),
@@ -1908,8 +1876,7 @@ pub fn synthesize_ephemeral_preview(
     })
 }
 
-/// Synthesizes a tenant PKO v2 `Stack` CR strictly isolated to `tenant-<tenant>` with optional
-/// `output_secret_name` binding for Flux `HelmRelease` `spec.valuesFrom` consumption (`SDD.md` §5.1, §6.2).
+/// Synthesizes a tenant PKO v2 `Stack` CR strictly isolated to `tenant-<tenant>` (`SDD.md` §6.2).
 pub fn synthesize_tenant_stack(params: &TenantStackParams) -> Result<PkoStack, PkoError> {
     validate_k8s_dns_label("tenant", &params.tenant)?;
     validate_k8s_name("name", &params.name)?;
@@ -1940,14 +1907,6 @@ pub fn synthesize_tenant_stack(params: &TenantStackParams) -> Result<PkoStack, P
         None => format!("tenant-{}-sa", params.tenant),
     };
 
-    let output_secret_name = match &params.output_secret_name {
-        Some(secret_name) => {
-            validate_k8s_name("output_secret_name", secret_name)?;
-            Some(secret_name.clone())
-        }
-        None => None,
-    };
-
     let mut labels = BTreeMap::new();
     labels.insert(LABEL_MANAGED_BY.to_string(), "keel".to_string());
     labels.insert(LABEL_STACK_ROLE.to_string(), "tenant".to_string());
@@ -1975,7 +1934,6 @@ pub fn synthesize_tenant_stack(params: &TenantStackParams) -> Result<PkoStack, P
             destroy_on_finalize: Some(true),
             continue_resync_on_commit_match: Some(true),
             resync_frequency_seconds: Some(300),
-            output_secret_name,
             config: params.config.clone(),
             env_refs: params.env_refs.clone(),
             secrets_ref: params.secrets_ref.clone(),
@@ -2498,7 +2456,7 @@ mod tests {
     }
 
     #[test]
-    fn tenant_stack_synthesizes_namespace_isolation_and_output_secret_binding() {
+    fn tenant_stack_synthesizes_namespace_isolation() {
         let mut params = TenantStackParams::new(
             "analytics",
             "postgres-managed",
@@ -2506,7 +2464,6 @@ mod tests {
             "s3://pulumi-state",
             test_git_source("tenants/analytics/infra/postgres-managed"),
         );
-        params.output_secret_name = Some("postgres-companion-outputs".to_string());
 
         let stack = synthesize_tenant_stack(&params).expect("valid tenant stack");
         assert_eq!(stack.metadata.name, "postgres-managed");
@@ -2515,33 +2472,13 @@ mod tests {
             stack.spec.service_account_name.as_deref(),
             Some("tenant-analytics-sa")
         );
-        assert_eq!(
-            stack.spec.output_secret_name.as_deref(),
-            Some("postgres-companion-outputs")
-        );
         assert!(!stack.is_protected());
         assert!(!stack.is_preview());
 
-        let values_from = stack
-            .helm_values_from_ref()
-            .expect("helm valuesFrom secret binding");
-        assert_eq!(values_from.kind, "Secret");
-        assert_eq!(values_from.name, "postgres-companion-outputs");
-        assert_eq!(values_from.optional, Some(false));
-
-        let json = stack.to_json_value().expect("json value");
-        assert_eq!(
-            json["spec"]["outputSecretName"],
-            "postgres-companion-outputs"
-        );
-
-        // Also test tenant stack without companion output_secret_name
-        params.output_secret_name = None;
         params.service_account_name = Some("custom-analytics-sa".to_string());
-        let stack_no_secret = synthesize_tenant_stack(&params).expect("valid tenant stack");
-        assert!(stack_no_secret.helm_values_from_ref().is_none());
+        let stack_custom_sa = synthesize_tenant_stack(&params).expect("valid tenant stack");
         assert_eq!(
-            stack_no_secret.spec.service_account_name.as_deref(),
+            stack_custom_sa.spec.service_account_name.as_deref(),
             Some("custom-analytics-sa")
         );
 
@@ -2616,7 +2553,7 @@ mod tests {
         bad_preview.repo_dir = "../secrets".to_string();
         assert!(synthesize_ephemeral_preview(&bad_preview).is_err());
 
-        // Cross-namespace slash in output_secret_name
+        // Cross-namespace slash in service_account_name
         let mut bad_tenant = TenantStackParams::new(
             "alpha",
             "db",
@@ -2624,11 +2561,11 @@ mod tests {
             "s3://pulumi-state",
             test_git_source("tenants/alpha/infra/db"),
         );
-        bad_tenant.output_secret_name = Some("other-ns/secret".to_string());
+        bad_tenant.service_account_name = Some("other-ns/sa".to_string());
         assert!(synthesize_tenant_stack(&bad_tenant).is_err());
 
         // Reserved management stack name in tenant namespace
-        bad_tenant.output_secret_name = None;
+        bad_tenant.service_account_name = None;
         bad_tenant.name = MANAGEMENT_CORE_STACK_NAME.to_string();
         assert!(synthesize_tenant_stack(&bad_tenant).is_err());
 

@@ -17,8 +17,8 @@ pub use bootstrap::{
     STAGE0_BACKEND_DIR, STAGE0_PASSPHRASE_FILE, Stage0Passphrase, Stage0PassphraseSource,
     ValidatedKubeconfig, clear_stale_kind_stage0_state_in, ensure_private_dir,
     factory as bootstrap_target_factory, generate_stage0_passphrase, keel_config_dir,
-    resolve_stage0_passphrase, resolve_stage0_passphrase_in, stage0_cluster_dir_in,
-    stage0_program_dir_in, stage0_state_root, validate_kubeconfig_yaml, write_private_file,
+    resolve_stage0_passphrase_in, stage0_cluster_dir_in, stage0_program_dir_in, stage0_state_root,
+    validate_kubeconfig_yaml, write_private_file,
 };
 pub use catalog::{
     CLUSTER_SCOPED_KINDS, DEFAULT_PLATFORM_BASE_DOMAIN, GATEWAY_ROUTE_KINDS, PLATFORM_HOST_LABELS,
@@ -52,14 +52,13 @@ pub use models::{
     CATALOG_INFRA_BLUEPRINT_KIND, CatalogAppMetadata, CatalogAppSpec, CatalogApplication,
     CatalogBlueprintMetadata, CatalogBlueprintSpec, CatalogBundle, CatalogBundleItem,
     CatalogBundleMetadata, CatalogBundleSpec, CatalogInfraBlueprint, CatalogManifest,
-    CompanionInfraHook, DEFAULT_CLUSTER_NAME, DEFAULT_POLL_INTERVAL, ForgeConfig, ForgeKind,
-    HelmCrdPolicy, HelmGatewayRouteSpec, HelmNetworkPolicySpec, InfraResourceKind, KeelConfig,
+    DEFAULT_CLUSTER_NAME, DEFAULT_POLL_INTERVAL, ForgeConfig, ForgeKind, HelmCrdPolicy,
+    HelmGatewayRouteSpec, HelmNetworkPolicySpec, InfraResourceKind, KeelConfig,
     MANAGEMENT_CORE_CATEGORY, ManifestEngine, OIDC_CLIENT_ID_ENV, OIDC_CLIENT_SECRET_ENV,
     OIDC_ISSUER_URL_ENV, OIDC_REDIRECT_URL_ENV, OidcConfig, PlacementScope, PlacementSpec,
-    ProgressiveDeliverySpec, ProviderEntry, ProviderRegistry, ResourceQuotaSpec, S3BackendConfig,
-    StackSshInfoResponse, TenantConfig, UpstreamSource, clean_candidate_ssh_host,
-    clean_candidate_ssh_user, default_ssh_user_for_provider, is_private_or_internal_ssh_host,
-    resolve_ssh_target_from_sources, validate_https_origin,
+    ProgressiveDeliverySpec, ProviderEntry, ProviderRegistry, StackSshInfoResponse, UpstreamSource,
+    clean_candidate_ssh_host, clean_candidate_ssh_user, default_ssh_user_for_provider,
+    is_private_or_internal_ssh_host, resolve_ssh_target_from_sources, validate_https_origin,
 };
 
 /// Flux CD controllers namespace (`SDD.md` §1).
@@ -123,9 +122,6 @@ pub enum CoreError {
 
     #[error("Command '{program}' failed: {message}")]
     CommandFailed { program: String, message: String },
-
-    #[error("Not implemented: {0}")]
-    NotImplemented(String),
 }
 
 fn format_schema_validation_errors(errors: &[SchemaFieldError]) -> String {

@@ -756,7 +756,7 @@ mod tests {
         let log = "Previewing update (s):\n  pulumi:pulumi:Stack: (same)\n    [urn=urn:pulumi:s::p::pulumi:pulumi:Stack::p-s]\nResources:\n    7 unchanged\n\nDuration: 1s\n";
         let report = parse_pulumi_console_preview(log).unwrap();
         assert_eq!(report.summary.same, 7);
-        assert!(!report.summary.has_changes());
+        assert_eq!(report.summary.total(), 7);
 
         assert!(parse_pulumi_console_preview("2026\tINFO\tserver\tup completed\n").is_none());
         assert!(parse_pulumi_console_preview("").is_none());

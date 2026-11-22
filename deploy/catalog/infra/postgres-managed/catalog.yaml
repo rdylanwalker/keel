@@ -1,4 +1,4 @@
-# Managed PostgreSQL Companion Blueprint (`SDD.md` §5.1)
+# Managed PostgreSQL Blueprint (`SDD.md` §5.1)
 apiVersion: keel.io/v1alpha1
 kind: CatalogInfraBlueprint
 metadata:

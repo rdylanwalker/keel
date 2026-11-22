@@ -1278,12 +1278,6 @@ spec:
   progressiveDelivery:
     flaggerSupported: true
     defaultCanary: false
-  companionInfrastructure:
-    - blueprint: postgres-managed
-      bindValues:
-        postgresql.enabled: false
-        authentik.postgresql.host: "${outputs.db_host}"
-        authentik.postgresql.password: "${secrets.db_password}"
   schema:
     type: object
     required: [domain, adminEmail, secretKey]
@@ -1357,17 +1351,6 @@ spec:
         assert_eq!(app.spec.upstream.chart.as_deref(), Some("authentik"));
         assert!(app.spec.progressive_delivery.flagger_supported);
         assert!(!app.spec.progressive_delivery.default_canary);
-        assert_eq!(app.spec.companion_infrastructure.len(), 1);
-        assert_eq!(
-            app.spec.companion_infrastructure[0].blueprint,
-            "postgres-managed"
-        );
-        assert_eq!(
-            app.spec.companion_infrastructure[0]
-                .bind_values
-                .get("postgresql.enabled"),
-            Some(&json!(false))
-        );
         assert!(app.spec.ui_schema.is_some());
 
         let bp_manifest = parse_catalog(POSTGRES_BLUEPRINT_YAML).unwrap();

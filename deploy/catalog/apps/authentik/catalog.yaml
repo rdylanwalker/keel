@@ -4,7 +4,7 @@ kind: CatalogApplication
 metadata:
   id: authentik
   name: Authentik Identity Provider
-  description: Open-source OIDC & SAML Identity Provider deployed from upstream Helm chart with companion PostgreSQL binding.
+  description: Open-source OIDC & SAML Identity Provider deployed from the upstream Helm chart.
   category: security-identity
   runtime: helm
 spec:
@@ -19,12 +19,6 @@ spec:
   progressiveDelivery:
     flaggerSupported: true
     defaultCanary: false
-  companionInfrastructure:
-    - blueprint: postgres-managed
-      bindValues:
-        postgresql.enabled: false
-        authentik.postgresql.host: "${outputs.db_host}"
-        authentik.postgresql.password: "${secrets.db_password}"
   schema:
     type: object
     required:

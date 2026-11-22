@@ -158,14 +158,6 @@ impl GcPlan {
     pub fn is_empty(&self) -> bool {
         self.targets.is_empty()
     }
-
-    /// Returns all PKO `Stack` deletion targets in execution order.
-    pub fn stacks_to_delete(&self) -> Vec<&ResourceDeletionTarget> {
-        self.targets
-            .iter()
-            .filter(|t| t.kind == PreviewResourceKind::Stack)
-            .collect()
-    }
 }
 
 /// Determines which ephemeral preview `Stack` resources in `keel-previews` must be
@@ -180,20 +172,6 @@ pub fn plan_preview_gc<S: AsRef<str>>(
         .collect();
 
     evaluate_candidates(candidates, |pr_id| closed_set.contains(pr_id))
-}
-
-/// Determines which orphaned ephemeral preview `Stack` resources in `keel-previews`
-/// should be deleted by comparing live cluster candidates against the authoritative set of open PR IDs.
-pub fn plan_orphan_preview_gc<S: AsRef<str>>(
-    candidates: &[PreviewResourceCandidate],
-    open_pr_ids: &[S],
-) -> GcPlan {
-    let open_set: BTreeSet<String> = open_pr_ids
-        .iter()
-        .filter_map(|id| sanitize_pr_id(id.as_ref()).ok())
-        .collect();
-
-    evaluate_candidates(candidates, |pr_id| !open_set.contains(pr_id))
 }
 
 fn evaluate_candidates<F>(candidates: &[PreviewResourceCandidate], should_delete_pr: F) -> GcPlan
@@ -321,7 +299,6 @@ mod tests {
         assert_eq!(plan.skipped_non_preview_namespace, 2);
         assert_eq!(plan.skipped_protected, 0);
         assert_eq!(plan.targets.len(), 2);
-        assert_eq!(plan.stacks_to_delete().len(), 2);
         assert_eq!(plan.targets[0].kind, PreviewResourceKind::Stack);
         assert_eq!(plan.targets[0].name, "preview-stack-pr-10");
         assert_eq!(plan.targets[1].kind, PreviewResourceKind::Stack);
@@ -393,8 +370,8 @@ mod tests {
         ];
         candidates.extend(PreviewResourceCandidate::from_preview_bundle(&pr_50));
 
-        // Reconcile against open PRs = ["50"]; PR #88 is orphaned and should be deleted, PR #77 is protected!
-        let orphan_plan = plan_orphan_preview_gc(&candidates, &["#50"]);
+        // PRs #77 and #88 are closed (PR #50 stays open): #88 is deleted, #77 is protected!
+        let orphan_plan = plan_preview_gc(&candidates, &["#77", "88"]);
         assert_eq!(orphan_plan.skipped_protected, 1);
         assert_eq!(orphan_plan.targets.len(), 1);
         assert_eq!(orphan_plan.targets[0].kind.kind_str(), "Stack");

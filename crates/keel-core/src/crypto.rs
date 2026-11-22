@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 use tokio::process::Command;
 use zeroize::Zeroizing;
 
-use crate::{CoreError, validate_dns_label};
+use crate::CoreError;
 
 /// AES-256 key length in bytes (256 bits).
 pub const AES_256_KEY_LEN: usize = 32;
@@ -73,29 +73,6 @@ impl EnvelopeCrypto {
         Self {
             key: Zeroizing::new(key),
         }
-    }
-
-    /// Creates an `EnvelopeCrypto` instance from a raw byte slice, validating 256-bit key length.
-    pub fn from_slice(key_bytes: &[u8]) -> Result<Self, CoreError> {
-        let key: Zeroizing<[u8; AES_256_KEY_LEN]> =
-            Zeroizing::new(key_bytes.try_into().map_err(|_| {
-                CoreError::Crypto(format!(
-                    "Invalid AES-256-GCM key length: expected {} bytes, got {}",
-                    AES_256_KEY_LEN,
-                    key_bytes.len()
-                ))
-            })?);
-        Ok(Self { key })
-    }
-
-    /// Creates an `EnvelopeCrypto` instance from a Base64-encoded 32-byte key.
-    pub fn from_base64_key(b64_key: &str) -> Result<Self, CoreError> {
-        let decoded = Zeroizing::new(
-            BASE64
-                .decode(b64_key.trim())
-                .map_err(|e| CoreError::Crypto(format!("Invalid Base64 envelope key: {e}")))?,
-        );
-        Self::from_slice(&decoded)
     }
 
     /// Generates a fresh cryptographically random 256-bit key.
@@ -266,43 +243,12 @@ impl SopsConfig {
         Ok(serde_yml::to_string(self)?)
     }
 
-    /// Inserts or updates a per-tenant rule (`^tenants/<tenant>/.*\.enc\.yaml$`) at the top of `creation_rules`
-    /// so tenant-specific rules always match before any global fallback rule.
-    pub fn upsert_tenant_rule(
-        &mut self,
-        tenant_id: &str,
-        age_public_key: &str,
-    ) -> Result<(), CoreError> {
-        let rule = SopsManager::tenant_creation_rule(tenant_id, age_public_key)?;
-        if let Some(existing) = self
-            .creation_rules
-            .iter_mut()
-            .find(|r| r.path_regex == rule.path_regex)
-        {
-            existing.age = rule.age;
-        } else {
-            // Keep tenant rules ahead of catch-all cluster rules
-            let insert_idx = self
-                .creation_rules
-                .iter()
-                .position(|r| !r.path_regex.starts_with("^tenants/"))
-                .unwrap_or(self.creation_rules.len());
-            self.creation_rules.insert(insert_idx, rule);
-        }
-        Ok(())
-    }
-
-    /// Finds the creation rule whose `path_regex` starts with `^clusters/` (or does not start with `^tenants/`)
-    /// and returns its `.age` public key recipient slice.
+    /// Returns the `.age` recipient of the first cluster rule (`path_regex` starting with
+    /// `^clusters/`, e.g. the Stage 0 `^clusters/management/` rule).
     pub fn cluster_age_recipient(&self) -> Option<&str> {
         self.creation_rules
             .iter()
             .find(|r| r.path_regex.starts_with("^clusters/"))
-            .or_else(|| {
-                self.creation_rules
-                    .iter()
-                    .find(|r| !r.path_regex.starts_with("^tenants/"))
-            })
             .map(|r| r.age.trim())
             .filter(|age| !age.is_empty())
     }
@@ -358,46 +304,12 @@ impl SopsManager {
     }
 
     /// Creates a `SopsManager` with explicit paths to `sops` and `age-keygen`.
+    #[cfg(test)]
     pub fn with_binaries(sops_bin: impl Into<PathBuf>, age_keygen_bin: impl Into<PathBuf>) -> Self {
         Self {
             sops_bin: sops_bin.into(),
             age_keygen_bin: age_keygen_bin.into(),
         }
-    }
-
-    /// Builds a validated `.sops.yaml` creation rule scoped to `^tenants/<tenant>/.*\.enc\.yaml$`.
-    pub fn tenant_creation_rule(
-        tenant_id: &str,
-        age_public_key: &str,
-    ) -> Result<SopsCreationRule, CoreError> {
-        validate_dns_label(tenant_id, "tenant_id")?;
-        validate_age_public_key(age_public_key)?;
-        Ok(SopsCreationRule {
-            path_regex: format!(r"^tenants/{tenant_id}/.*\.enc\.yaml$"),
-            age: age_public_key.trim().to_string(),
-            encrypted_regex: None,
-        })
-    }
-
-    /// Generates a complete `.sops.yaml` document for the given `(tenant_id, age_public_key)` pairs
-    /// and optional cluster-level root `age` public key.
-    pub fn generate_sops_yaml(
-        tenants: &[(String, String)],
-        root_age_public_key: Option<&str>,
-    ) -> Result<String, CoreError> {
-        let mut cfg = SopsConfig::default();
-        for (tenant_id, pub_key) in tenants {
-            cfg.upsert_tenant_rule(tenant_id, pub_key)?;
-        }
-        if let Some(root_pub) = root_age_public_key {
-            validate_age_public_key(root_pub)?;
-            cfg.creation_rules.push(SopsCreationRule {
-                path_regex: r"^clusters/.*\.enc\.yaml$".to_string(),
-                age: root_pub.trim().to_string(),
-                encrypted_regex: None,
-            });
-        }
-        cfg.to_yaml()
     }
 
     /// Builds explicit CLI argument vector for `sops --encrypt`.
@@ -706,7 +618,7 @@ mod tests {
     fn test_envelope_crypto_roundtrip_and_tamper_detection() {
         let key = EnvelopeCrypto::generate_key();
         let b64_key = BASE64.encode(key);
-        let crypto = EnvelopeCrypto::from_base64_key(&b64_key).unwrap();
+        let crypto = EnvelopeCrypto::new(key);
 
         // Debug redaction check (NFR-SEC-05)
         let dbg = format!("{crypto:?}");
@@ -750,8 +662,6 @@ mod tests {
         // Too-short payload and invalid base64 rejected
         assert!(crypto.decrypt(&BASE64.encode([1u8; 10])).is_err());
         assert!(crypto.decrypt("!!!not-base64!!!").is_err());
-        assert!(EnvelopeCrypto::from_slice(&[0u8; 16]).is_err());
-        assert!(EnvelopeCrypto::from_base64_key("!!!").is_err());
     }
 
     #[test]
@@ -765,48 +675,32 @@ mod tests {
     }
 
     #[test]
-    fn test_sops_yaml_per_tenant_rules_and_upsert() {
+    fn test_sops_config_roundtrip_and_cluster_age_recipient() {
         let sample_pub = sample_age_pub();
-        let tenants = vec![
-            ("alpha".to_string(), sample_pub.clone()),
-            ("beta".to_string(), sample_pub.clone()),
-        ];
-        let yaml = SopsManager::generate_sops_yaml(&tenants, Some(&sample_pub)).unwrap();
-        let mut parsed = SopsConfig::from_yaml(&yaml).unwrap();
-
-        assert_eq!(parsed.creation_rules.len(), 3);
-        assert_eq!(
-            parsed.creation_rules[0].path_regex,
-            r"^tenants/alpha/.*\.enc\.yaml$"
-        );
-        assert_eq!(
-            parsed.creation_rules[1].path_regex,
-            r"^tenants/beta/.*\.enc\.yaml$"
-        );
-        assert_eq!(
-            parsed.creation_rules[2].path_regex,
-            r"^clusters/.*\.enc\.yaml$"
-        );
+        let cfg = SopsConfig {
+            creation_rules: vec![
+                SopsCreationRule {
+                    path_regex: r"^apps/.*\.enc\.yaml$".to_string(),
+                    age: "age1other".to_string(),
+                    encrypted_regex: None,
+                },
+                SopsCreationRule {
+                    path_regex: r"^clusters/management/.*\.enc\.yaml$".to_string(),
+                    age: format!("  {sample_pub} "),
+                    encrypted_regex: Some("^(data|stringData)$".to_string()),
+                },
+            ],
+        };
+        let parsed = SopsConfig::from_yaml(&cfg.to_yaml().unwrap()).unwrap();
+        assert_eq!(parsed, cfg);
         assert_eq!(parsed.cluster_age_recipient(), Some(sample_pub.as_str()));
 
-        // Upserting a new tenant places it BEFORE the cluster rule, and updating existing works in-place
-        parsed.upsert_tenant_rule("gamma", &sample_pub).unwrap();
-        parsed.upsert_tenant_rule("alpha", &sample_pub).unwrap();
-        let reserialized = parsed.to_yaml().unwrap();
-        assert!(reserialized.contains("tenants/gamma"));
-        assert_eq!(parsed.creation_rules.len(), 4);
-        assert_eq!(
-            parsed.creation_rules[2].path_regex,
-            r"^tenants/gamma/.*\.enc\.yaml$"
-        );
-        assert_eq!(
-            parsed.creation_rules[3].path_regex,
-            r"^clusters/.*\.enc\.yaml$"
-        );
-
-        // Reject unsafe tenant id or invalid age key
-        assert!(SopsManager::tenant_creation_rule("../escape", &sample_pub).is_err());
-        assert!(SopsManager::tenant_creation_rule("alpha", "bad-key").is_err());
+        // Only `^clusters/` rules count as the cluster recipient.
+        let no_cluster = SopsConfig {
+            creation_rules: vec![cfg.creation_rules[0].clone()],
+        };
+        assert_eq!(no_cluster.cluster_age_recipient(), None);
+        assert_eq!(SopsConfig::default().cluster_age_recipient(), None);
     }
 
     #[test]

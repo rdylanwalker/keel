@@ -9,12 +9,11 @@ pub mod run;
 pub mod stack;
 
 pub use gc::{
-    GcPlan, PreviewResourceCandidate, PreviewResourceKind, ResourceDeletionTarget,
-    plan_orphan_preview_gc, plan_preview_gc,
+    GcPlan, PreviewResourceCandidate, PreviewResourceKind, ResourceDeletionTarget, plan_preview_gc,
 };
 pub use preview::{
     ChangeOp, PreviewReport, PreviewSource, PreviewSummary, ResourceDiff, format_markdown_report,
-    parse_preview_json, parse_preview_value,
+    parse_preview_value,
 };
 pub use run::{
     ANNOTATION_HEAD_SHA, ANNOTATION_REPORTED_COMMIT, PREVIEW_LOG_TAIL_LINES,
@@ -26,10 +25,10 @@ pub use stack::{
     CrObjectMeta, DEFAULT_FLUX_POLL_INTERVAL, DEFAULT_MANAGEMENT_SERVICE_ACCOUNT,
     DEFAULT_PREVIEW_SERVICE_ACCOUNT, EphemeralPreviewParams, FLUX_GIT_REPO_API_VERSION,
     FLUX_GIT_REPO_KIND, FluxGitRepository, FluxGitRepositoryRef, FluxGitRepositorySpec,
-    HelmValuesFromRef, IN_CLUSTER_FORGEJO_HTTP_HOST, IN_CLUSTER_S3_BACKEND_URL,
-    KEEL_CA_BUNDLE_CONFIGMAP, KEEL_CA_MOUNT_PATH, KEEL_CA_VOLUME_NAME, KEEL_PREVIEWS_NAMESPACE,
-    KEEL_SSH_KNOWN_HOSTS_FILE, KEEL_SSH_KNOWN_HOSTS_MOUNT_PATH, KEEL_SSH_KNOWN_HOSTS_VOLUME_NAME,
-    KEEL_SSL_CERT_DIR, LABEL_PR_ID, LABEL_PROVIDER, LABEL_REPO, LABEL_TENANT, LocalObjectReference,
+    IN_CLUSTER_FORGEJO_HTTP_HOST, IN_CLUSTER_S3_BACKEND_URL, KEEL_CA_BUNDLE_CONFIGMAP,
+    KEEL_CA_MOUNT_PATH, KEEL_CA_VOLUME_NAME, KEEL_PREVIEWS_NAMESPACE, KEEL_SSH_KNOWN_HOSTS_FILE,
+    KEEL_SSH_KNOWN_HOSTS_MOUNT_PATH, KEEL_SSH_KNOWN_HOSTS_VOLUME_NAME, KEEL_SSL_CERT_DIR,
+    LABEL_PR_ID, LABEL_PROVIDER, LABEL_REPO, LABEL_TENANT, LocalObjectReference,
     MANAGEMENT_CORE_STACK_NAME, MAX_PREVIEW_STACK_NAME_LEN, ManagementCoreStackParams,
     PKO_FETCH_CONTAINER_NAME, PKO_STACK_API_VERSION, PKO_STACK_KIND, PLATFORM_REPO_LABEL,
     PULUMI_CONFIG_PASSPHRASE_ENV, PULUMI_PASSPHRASE_SECRET_KEY, PULUMI_PASSPHRASE_SECRET_NAME,
@@ -49,8 +48,6 @@ pub use stack::{
 /// Errors produced by `keel-pko` synthesis and preview diff parsing.
 #[derive(Debug, thiserror::Error)]
 pub enum PkoError {
-    #[error("Synthesis error: {0}")]
-    Synthesis(String),
     #[error("Validation error: {0}")]
     Validation(String),
     #[error("Preview diff parse error: {0}")]
