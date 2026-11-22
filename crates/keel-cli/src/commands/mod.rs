@@ -1,11 +1,11 @@
 //! Command execution handlers for `keel` (`SDD.md` §2.1, §2.2, §4.2, §6.1, §7.2).
 
-pub mod api;
-pub mod auth;
-pub mod bootstrap;
-pub mod recover;
-pub mod serve;
-pub mod workloads;
+mod api;
+mod auth;
+mod bootstrap;
+mod recover;
+mod serve;
+mod workloads;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -26,27 +26,18 @@ use crate::cli::{
     PreviewCommands, ProposalCommands, TenantCommands,
 };
 
-pub use api::{
+use api::{
     execute_app_list, execute_catalog_list, execute_catalog_show, execute_proposal_close,
     execute_proposal_list, execute_proposal_merge, execute_proposal_show,
     execute_tenant_repair_credentials,
 };
-pub use auth::{
-    AuthLoginOutcome, PkceChallenge, execute_auth_login, execute_auth_logout, execute_auth_status,
-    generate_pkce_pair,
-};
-pub use bootstrap::{
-    BootstrapInitOutcome, KyvernoPolicyGenerator, RauthySeedConfig, SeedControlPlaneArtifacts,
-    SeedRepoInitResult, default_bare_repo_for_workdir, execute_bootstrap_init,
-    execute_bootstrap_init_with_target, synthesize_seed_control_plane,
-};
-pub use recover::{BootstrapRecoverOutcome, build_pulumi_recover_argv, execute_bootstrap_recover};
-pub use serve::{execute_serve, execute_serve_until};
-pub use workloads::{
-    PreviewStatusOutcome, ProposalCommandOutcome, build_ssh_argv, execute_app_install,
-    execute_infra_force_delete, execute_infra_list, execute_infra_provision, execute_infra_ssh,
-    execute_infra_unlock, execute_preview_status, format_preview_table, format_ssh_info_output,
-    format_stacks_output, load_values_file, validate_application_values, validate_blueprint_values,
+use auth::{execute_auth_login, execute_auth_logout, execute_auth_status};
+use bootstrap::execute_bootstrap_init;
+use recover::execute_bootstrap_recover;
+use serve::execute_serve;
+use workloads::{
+    execute_app_install, execute_infra_force_delete, execute_infra_list, execute_infra_provision,
+    execute_infra_ssh, execute_infra_unlock, execute_preview_status,
 };
 
 /// Unified error type returned by `keel` CLI command handlers.
@@ -486,7 +477,7 @@ pub async fn dispatch(cli: &Cli, ctx: &CliContext) -> Result<String, CliError> {
     match &cli.command {
         Commands::Bootstrap(b) => match &b.command {
             BootstrapCommands::Init(args) => Ok(execute_bootstrap_init(args).await?.output),
-            BootstrapCommands::Recover(args) => Ok(execute_bootstrap_recover(args).await?.output),
+            BootstrapCommands::Recover(args) => execute_bootstrap_recover(args).await,
         },
         Commands::Auth(a) => match &a.command {
             AuthCommands::Login(args) => Ok(execute_auth_login(&with_server!(args), ctx)
@@ -499,9 +490,9 @@ pub async fn dispatch(cli: &Cli, ctx: &CliContext) -> Result<String, CliError> {
         Commands::Serve(args) => execute_serve(args).await,
         Commands::Infra(i) => match &i.command {
             InfraCommands::List(args) => execute_infra_list(&with_server!(args), ctx).await,
-            InfraCommands::Provision(args) => Ok(execute_infra_provision(&with_server!(args), ctx)
-                .await?
-                .output),
+            InfraCommands::Provision(args) => {
+                execute_infra_provision(&with_server!(args), ctx).await
+            }
             InfraCommands::Ssh(args) => execute_infra_ssh(&with_server!(args), ctx).await,
             InfraCommands::ForceDelete(args) => {
                 execute_infra_force_delete(&with_server!(args), ctx).await
@@ -509,15 +500,11 @@ pub async fn dispatch(cli: &Cli, ctx: &CliContext) -> Result<String, CliError> {
             InfraCommands::Unlock(args) => execute_infra_unlock(&with_server!(args), ctx).await,
         },
         Commands::App(a) => match &a.command {
-            AppCommands::Install(args) => {
-                Ok(execute_app_install(&with_server!(args), ctx).await?.output)
-            }
+            AppCommands::Install(args) => execute_app_install(&with_server!(args), ctx).await,
             AppCommands::List(args) => execute_app_list(&with_server!(args), ctx).await,
         },
         Commands::Preview(p) => match &p.command {
-            PreviewCommands::Status(args) => Ok(execute_preview_status(&with_server!(args), ctx)
-                .await?
-                .output),
+            PreviewCommands::Status(args) => execute_preview_status(&with_server!(args), ctx).await,
         },
         Commands::Proposal(p) => match &p.command {
             ProposalCommands::List(args) => execute_proposal_list(&with_server!(args), ctx).await,
@@ -539,8 +526,18 @@ pub async fn dispatch(cli: &Cli, ctx: &CliContext) -> Result<String, CliError> {
 
 #[cfg(test)]
 mod tests {
+    use super::auth::generate_pkce_pair;
+    use super::bootstrap::{
+        KyvernoPolicyGenerator, default_bare_repo_for_workdir, execute_bootstrap_init_with_target,
+        synthesize_seed_control_plane,
+    };
     use super::bootstrap::{infer_forge_config, render_default_tenant_git_repository_yaml};
+    use super::serve::execute_serve_until;
     use super::workloads::resolve_local_fallback_ssh_info;
+    use super::workloads::{
+        build_ssh_argv, format_preview_table, format_ssh_info_output, format_stacks_output,
+        load_values_file, validate_application_values, validate_blueprint_values,
+    };
     use super::*;
     use crate::cli::{
         BootstrapInitArgs, BootstrapRecoverArgs, InfraSshArgs, OutputFormat, PreviewStatusArgs,
@@ -741,9 +738,7 @@ spec:
     #[test]
     fn kyverno_policy_generator_respects_docker_socket_exception_flag() {
         let prod_gen = KyvernoPolicyGenerator::new(
-            keel_kube::pulumi_provider_allowlist(
-                &keel_kube::kyverno::default_allowed_pulumi_providers(),
-            ),
+            keel_kube::pulumi_provider_allowlist(&keel_kube::default_allowed_pulumi_providers()),
             false,
         );
         let prod_bundle = prod_gen.generate().unwrap();
@@ -751,9 +746,7 @@ spec:
         assert!(prod_bundle.policy_exception.is_none());
 
         let kind_dev_gen = KyvernoPolicyGenerator::new(
-            keel_kube::pulumi_provider_allowlist(
-                &keel_kube::kyverno::default_allowed_pulumi_providers(),
-            ),
+            keel_kube::pulumi_provider_allowlist(&keel_kube::default_allowed_pulumi_providers()),
             true,
         );
         let kind_dev_bundle = kind_dev_gen.generate().unwrap();
@@ -1175,7 +1168,7 @@ spec:
             last_synced: Some("2026-11-15T10:00:00Z".to_string()),
             status: "Ready".to_string(),
             catalog_id: Some("postgres-managed".to_string()),
-            resource_kind: Some(keel_core::models::InfraResourceKind::Service),
+            resource_kind: Some(keel_core::InfraResourceKind::Service),
         }];
 
         let stack_table = format_stacks_output(&stacks, OutputFormat::Table).unwrap();

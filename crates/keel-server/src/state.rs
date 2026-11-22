@@ -295,7 +295,7 @@ pub trait TenantManifestSource: Send + Sync {
 
 /// Default stateless [`ClusterStateProvider`] that scans `tenants/` and `clusters/` YAML
 /// manifests inside `repo_workdir` and, when tenants have their own repositories, each tenant
-/// repository's committed `tenants/<id>/` ([`TenantManifestSource`]).
+/// repository's committed `tenants/<id>/` (`TenantManifestSource`).
 ///
 /// Content read from tenant `<id>`'s own repository is confined to it: documents outside the
 /// `tenant-<id>` namespace are ignored and the tenant is always `<id>` (never a `keel.io/tenant`

@@ -1048,7 +1048,7 @@ pub async fn force_delete_stack(
     {
         let err = ServerError::Conflict(format!(
             "Cannot force-delete protected Stack {namespace}/{name}; remove `{}` / `spec.config.protect` via a GitOps PR first",
-            keel_pko::stack::LABEL_PROTECT
+            keel_pko::LABEL_PROTECT
         ));
         audit_stack_operation(&auth, "force-delete", tenant, &namespace, &name, Err(&err));
         return Err(err);
@@ -1287,7 +1287,7 @@ async fn resolve_stack_ssh_info(
             }
         )));
     }
-    let expected_host_key = keel_core::models::resolve_ssh_host_key_from_sources(
+    let expected_host_key = keel_core::resolve_ssh_host_key_from_sources(
         &live_outputs,
         values_doc.as_ref(),
         stack_doc.as_ref(),

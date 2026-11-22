@@ -11,7 +11,7 @@ use keel_core::{
 };
 use keel_git::{PullRequestInfo, PullRequestState};
 use keel_kube::{CrdReconcileStatus, CrdWatchEvent};
-use keel_pko::{PkoStack, PreviewPhase, PreviewReport, PreviewSource};
+use keel_pko::{PreviewPhase, PreviewReport, PreviewSource};
 use keel_server::StackSummary;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -176,18 +176,7 @@ struct CatalogApiResponse {
 struct CreateProposalApiResponse {
     proposal: PullRequestInfo,
     branch: String,
-    preview_stack: PkoStack,
     report: PreviewReport,
-}
-
-/// Outcome of opening an infrastructure provisioning or application installation PR (`AGENTS.md` §3.6).
-#[derive(Debug, Clone)]
-pub struct ProposalCommandOutcome {
-    pub proposal: PullRequestInfo,
-    pub branch: String,
-    pub preview_stack: PkoStack,
-    pub report: PreviewReport,
-    pub output: String,
 }
 
 /// Reads and parses a YAML or JSON values file into a JSON object (`serde_json::Value`).
@@ -246,7 +235,7 @@ pub fn validate_application_values(
 pub async fn execute_infra_provision(
     args: &InfraProvisionArgs,
     ctx: &CliContext,
-) -> Result<ProposalCommandOutcome, CliError> {
+) -> Result<String, CliError> {
     validate_dns_label(&args.blueprint, "blueprint")?;
     let tenant = normalize_tenant_arg(&args.tenant);
     validate_dns_label(&tenant, "tenant")?;
@@ -284,7 +273,7 @@ pub async fn execute_infra_provision(
 pub async fn execute_app_install(
     args: &AppInstallArgs,
     ctx: &CliContext,
-) -> Result<ProposalCommandOutcome, CliError> {
+) -> Result<String, CliError> {
     validate_dns_label(&args.app, "app")?;
     let tenant = normalize_tenant_arg(&args.tenant);
     validate_dns_label(&tenant, "tenant")?;
@@ -342,7 +331,7 @@ async fn submit_proposal_request(
     values: &Value,
     canary: bool,
     action_engine: Option<&str>,
-) -> Result<ProposalCommandOutcome, CliError> {
+) -> Result<String, CliError> {
     keel_core::validate_dns_label(tenant, "tenant")?;
     let endpoint = format!("{base_url}/api/v1/tenants/{tenant}/proposals");
     let mut req_body = json!({
@@ -386,13 +375,7 @@ async fn submit_proposal_request(
     output.push('\n');
     output.push_str(&format_preview_table(&created.report));
 
-    Ok(ProposalCommandOutcome {
-        proposal: created.proposal,
-        branch: created.branch,
-        preview_stack: created.preview_stack,
-        report: created.report,
-        output,
-    })
+    Ok(output)
 }
 
 /// Builds a validated `ssh` argument vector (never invoking `sh -c`, preventing flag injection per `NFR-SEC-06`).
@@ -683,17 +666,6 @@ struct ProposalPreviewApiResponse {
     report: PreviewReport,
 }
 
-/// Outcome of `keel preview status`.
-#[derive(Debug, Clone)]
-pub struct PreviewStatusOutcome {
-    pub pr_id: String,
-    pub state: PullRequestState,
-    pub url: String,
-    pub report: PreviewReport,
-    pub watched_events: Vec<CrdWatchEvent>,
-    pub output: String,
-}
-
 /// Renders a PKO v2 [`PreviewReport`] as an aligned terminal diff table (`+ Create`, `~ Update`, `- Delete`, `! Replace`, `! Drift`).
 /// Describes where a preview report came from and the state of its PKO run (CLI-4): a real
 /// PKO `pulumi preview` vs. a control-plane simulation, and the preview `Stack` only when it was
@@ -805,7 +777,7 @@ pub fn format_preview_table(report: &PreviewReport) -> String {
 pub async fn execute_preview_status(
     args: &PreviewStatusArgs,
     ctx: &CliContext,
-) -> Result<PreviewStatusOutcome, CliError> {
+) -> Result<String, CliError> {
     validate_non_flag_input(&args.pr, "pr")?;
     if args.pr.contains('/') || args.pr.contains("..") {
         return Err(CliError::Validation(format!(
@@ -879,14 +851,7 @@ pub async fn execute_preview_status(
     output.push('\n');
     output.push_str(&format_preview_table(&preview.report));
 
-    Ok(PreviewStatusOutcome {
-        pr_id: preview.pr_id,
-        state: preview.state,
-        url: preview.url,
-        report: preview.report,
-        watched_events,
-        output,
-    })
+    Ok(output)
 }
 
 async fn watch_preview_sse(

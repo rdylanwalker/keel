@@ -234,11 +234,8 @@ fn credentials_secret_is_never_written_to_git() {
         assert!(ensure_git_safe_manifests("x.yaml", &renamed).is_err());
     }
     // The monorepo-layout read-only `git-credentials` Secret too, and any plaintext Secret.
-    let monorepo = crate::tenant::build_tenant_git_credentials_secret("acme", "u", "t").unwrap();
-    assert!(
-        ensure_git_safe_manifests("x.yaml", &keel_core::yaml::to_string(&monorepo).unwrap())
-            .is_err()
-    );
+    let monorepo = "apiVersion: v1\nkind: Secret\nmetadata:\n  name: git-credentials\n  namespace: tenant-acme\n  labels:\n    keel.io/secret-kind: tenant-git-credentials-readonly\nstringData:\n  username: u\n  password: t\n";
+    assert!(ensure_git_safe_manifests("x.yaml", monorepo).is_err());
     let plain = "apiVersion: v1\nkind: Secret\nmetadata:\n  name: app\nstringData:\n  k: v\n";
     assert!(ensure_git_safe_manifests("x.yaml", plain).is_err());
     // SOPS-encrypted app Secrets (`secrets.enc.yaml`) and non-Secret objects are fine.

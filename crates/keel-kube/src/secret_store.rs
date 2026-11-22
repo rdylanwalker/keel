@@ -1066,7 +1066,7 @@ async fn ensure_s3_credentials_in_namespace_impl(
 /// Tenant namespaces NEVER receive the control-plane (SeaweedFS admin) `keel-s3-credentials`.
 ///
 /// Instead, the tenant-local scoped identity `keel-tenant-s3-credentials` (provisioned per tenant,
-/// see `keel_kube::tenant::seaweedfs_configure_tenant_identity_script`) is mirrored under the
+/// see `tenant::seaweedfs_configure_tenant_identity_script`) is mirrored under the
 /// `keel-s3-credentials` name PKO `Stack.spec.envRefs` reference. Any other Secret under that
 /// name (e.g. an admin copy) is overwritten. Returns `Ok(false)` when the tenant has no
 /// scoped identity yet (fail closed).

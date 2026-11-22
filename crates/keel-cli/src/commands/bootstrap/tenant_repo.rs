@@ -22,8 +22,8 @@ use keel_git::{
     CommitAuthor, ForgeProvider, ForgejoGiteaProvider, GitCredentials, GitRunner, RepositoryOptions,
 };
 use keel_kube::TenantIsolationConfig;
-use keel_server::tenant_repos::{
-    self, TENANT_REPO_DESCRIPTION, TenantRepoForge, TenantRepoForgeKind, TenantRepoNaming,
+use keel_server::{
+    TENANT_REPO_DESCRIPTION, TenantRepoForge, TenantRepoForgeKind, TenantRepoNaming,
 };
 
 use super::DEFAULT_TENANT_ID;
@@ -170,7 +170,7 @@ pub(crate) async fn external_forge(
     };
     let target_repo = naming.target(DEFAULT_TENANT_ID).map_err(server_err)?;
     let push_url =
-        tenant_repos::tenant_push_url(&forge_cfg.repo_url, &target_repo).map_err(server_err)?;
+        keel_server::tenant_push_url(&forge_cfg.repo_url, &target_repo).map_err(server_err)?;
     Ok(Some(DefaultTenantForge {
         forge: TenantRepoForge {
             naming,
@@ -231,7 +231,7 @@ async fn platform_owned_writer(target: KubeTarget<'_>) -> Result<Option<String>,
         .output(&[
             "get",
             "validatingpolicies.policies.kyverno.io",
-            keel_kube::kyverno::POLICY_PROTECT_PLATFORM_OWNED_TENANT_OBJECTS,
+            keel_kube::POLICY_PROTECT_PLATFORM_OWNED_TENANT_OBJECTS,
             "--ignore-not-found",
             "-o",
             "name",
@@ -244,7 +244,7 @@ async fn platform_owned_writer(target: KubeTarget<'_>) -> Result<Option<String>,
         format!(
             "system:serviceaccount:{}:{}",
             keel_core::FLUX_SYSTEM_NAMESPACE,
-            keel_kube::tenant::TENANT_RECONCILER_SERVICE_ACCOUNT
+            keel_kube::TENANT_RECONCILER_SERVICE_ACCOUNT
         )
     }))
 }
@@ -284,7 +284,7 @@ pub(crate) async fn ensure_default_tenant_age_key(
     {
         return Ok(false);
     }
-    let key = tenant_repos::generate_tenant_age_key(DEFAULT_TENANT_ID)
+    let key = keel_server::generate_tenant_age_key(DEFAULT_TENANT_ID)
         .await
         .map_err(server_err)?;
     let secret = keel_kube::build_tenant_age_key_secret(DEFAULT_TENANT_ID, &key)?;
@@ -308,7 +308,7 @@ fn cli_to_server(err: CliError) -> keel_server::ServerError {
 }
 
 #[async_trait::async_trait]
-impl tenant_repos::TenantCredentialSecrets for KubectlCredentialSecrets<'_> {
+impl keel_server::TenantCredentialSecrets for KubectlCredentialSecrets<'_> {
     async fn read(&self, tenant: &str) -> Result<Option<Secret>, keel_server::ServerError> {
         let namespace = keel_kube::tenant_namespace(tenant)?;
         read_secret(
@@ -368,7 +368,7 @@ pub(crate) async fn provision_default_tenant_repo(
         )
         .await
         .map_err(|e| {
-            server_err(tenant_repos::provisioning_error(
+            server_err(keel_server::provisioning_error(
                 tenant,
                 &repo.full_name(),
                 "repository creation",
@@ -376,7 +376,7 @@ pub(crate) async fn provision_default_tenant_repo(
             ))
         })?;
     let seeded = seed_default_tenant_repo(access).await?;
-    let state = tenant_repos::provision_forge(forge, tenant)
+    let state = keel_server::provision_forge(forge, tenant)
         .await
         .map_err(server_err)?;
     let age_created = ensure_default_tenant_age_key(target).await?;
@@ -387,12 +387,12 @@ pub(crate) async fn provision_default_tenant_repo(
         target,
         writer: platform_owned_writer(target).await?,
     };
-    let credential = match tenant_repos::reconcile_tenant_credential(forge, tenant, &secrets)
+    let credential = match keel_server::reconcile_tenant_credential(forge, tenant, &secrets)
         .await
         .map_err(server_err)?
     {
-        tenant_repos::StepOutcome::Created => "issued",
-        tenant_repos::StepOutcome::Rotated => "rotated",
+        keel_server::StepOutcome::Created => "issued",
+        keel_server::StepOutcome::Rotated => "rotated",
         _ => "kept",
     };
     Ok(format!(

@@ -42,7 +42,7 @@ pub struct Cli {
 }
 
 impl Cli {
-    /// Server URL from `--server` / `KEEL_SERVER`, or [`DEFAULT_SERVER_URL`].
+    /// Server URL from `--server` / `KEEL_SERVER`, or `DEFAULT_SERVER_URL`.
     pub fn server_url(&self) -> String {
         self.server
             .clone()

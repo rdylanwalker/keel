@@ -10,7 +10,6 @@
 //!   re-publication driven only by cluster state and forge PR states (no in-memory state).
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
 use std::time::Duration;
 
 use keel_core::KEEL_PREVIEWS_NAMESPACE;
@@ -561,11 +560,6 @@ pub fn spawn_preview_reconciler(
             }
         }
     }))
-}
-
-/// Convenience: wraps a concrete runner for [`AppState::with_preview_cluster`].
-pub fn preview_cluster<C: PreviewCluster + 'static>(c: C) -> Option<Arc<dyn PreviewCluster>> {
-    Some(Arc::new(c))
 }
 
 #[cfg(test)]

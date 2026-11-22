@@ -6,11 +6,11 @@ use std::time::Duration;
 
 use axum::extract::ws::{Message, WebSocket};
 use futures::StreamExt;
-use keel_core::models::{is_private_or_internal_ip, is_unresolved_ssh_target};
 use keel_core::{
     StackSshInfoResponse, clean_candidate_ssh_host, clean_candidate_ssh_user,
     is_private_or_internal_ssh_host,
 };
+use keel_core::{is_private_or_internal_ip, is_unresolved_ssh_target};
 use russh::keys::{HashAlg, PrivateKeyWithHashAlg, PublicKey, decode_secret_key};
 use russh::{ChannelMsg, client};
 use serde::{Deserialize, Serialize};

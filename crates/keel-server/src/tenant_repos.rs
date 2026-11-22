@@ -333,14 +333,14 @@ impl TenantRepos {
     }
 
     /// `true` when tenants have (or must have) their own repositories: every remote forge,
-    /// including a misconfigured one ([`TenantRepoLayout::Unavailable`]). Only the Local Git
+    /// including a misconfigured one (`TenantRepoLayout::Unavailable`). Only the Local Git
     /// provider keeps tenants in the platform repository.
     pub fn is_dedicated(&self) -> bool {
         !matches!(self.layout, TenantRepoLayout::Monorepo)
     }
 
     /// The forge for tenant repository work, or `503` with the configuration problem when the
-    /// layout is [`TenantRepoLayout::Unavailable`]. `None` only for the monorepo layout.
+    /// layout is `TenantRepoLayout::Unavailable`. `None` only for the monorepo layout.
     pub fn require_forge(&self) -> Result<Option<&Arc<TenantRepoForge>>, ServerError> {
         match &self.layout {
             TenantRepoLayout::Dedicated(forge) => Ok(Some(forge)),
@@ -850,7 +850,7 @@ impl TenantCredentialSecrets for StoreCredentialSecrets<'_> {
 fn stored_deploy_key_fingerprint(secret: Option<&Secret>) -> Option<String> {
     secret
         .and_then(|s| s.data.as_ref())
-        .and_then(|d| d.get(keel_kube::tenant_repo::SSH_IDENTITY_PUB_KEY))
+        .and_then(|d| d.get(keel_kube::SSH_IDENTITY_PUB_KEY))
         .and_then(|v| std::str::from_utf8(&v.0).ok())
         .and_then(|k| ssh_public_key_fingerprint(k).ok())
 }
@@ -864,7 +864,7 @@ fn stored_deploy_key_fingerprint(secret: Option<&Secret>) -> Option<String> {
 ///   the Secret was unusable ([`StepOutcome::Rotated`]); a credential whose Secret write fails is
 ///   revoked again;
 /// * finally every other read credential of the repository is revoked
-///   ([`retire_stray_credentials`]), including ones whose Secret was lost.
+///   (`retire_stray_credentials`), including ones whose Secret was lost.
 ///
 /// Never logs or returns secret values.
 pub async fn reconcile_tenant_credential(
@@ -1207,9 +1207,9 @@ pub const MANIFEST_MIRROR_FETCH_TIMEOUT: std::time::Duration = std::time::Durati
 /// workload listings (`GET /api/v1/stacks`, `GET /api/v1/releases`), which clients poll.
 pub const MANIFEST_MIRROR_TTL: std::time::Duration = std::time::Duration::from_secs(15);
 
-/// [`crate::state::TenantManifestSource`] over the read-only tenant repository mirrors
+/// `crate::state::TenantManifestSource` over the read-only tenant repository mirrors
 /// ([`TenantRepos::sync_mirror`]): each tenant repository's committed `main` is fetched at most
-/// once per [`MANIFEST_MIRROR_TTL`] (bounded concurrency; a failed fetch is retried only after
+/// once per `MANIFEST_MIRROR_TTL` (bounded concurrency; a failed fetch is retried only after
 /// an exponential backoff, the last snapshot being served meanwhile) and its `tenants/<id>/` YAML is read
 /// through object reads only, cached per commit. Only files under `tenants/<id>/` of tenant
 /// `<id>`'s own repository are returned. A disposable in-memory cache: keel-server stays
@@ -1281,7 +1281,7 @@ impl TenantRepoManifests {
         }
     }
 
-    /// Overrides [`MANIFEST_MIRROR_TTL`] (tests).
+    /// Overrides `MANIFEST_MIRROR_TTL` (tests).
     pub fn with_ttl(mut self, ttl: std::time::Duration) -> Self {
         self.ttl = ttl;
         self

@@ -4414,7 +4414,7 @@ data:
 async fn test_tenant_stack_uses_scoped_state_backend_and_fails_closed_without_identity() {
     use k8s_openapi::ByteString;
     use k8s_openapi::api::core::v1::Secret;
-    use keel_kube::secret_store::SecretBackend;
+    use keel_kube::SecretBackend;
     use std::collections::BTreeMap;
 
     let fixture = setup_fixture().await;
@@ -5320,10 +5320,10 @@ async fn test_pko_preview_lifecycle_is_applied_published_and_gced_from_cluster_s
         .clone()
         .with_preview_cluster(Some(Arc::new(cluster.clone())));
     restarted.preview_cache.write().await.clear();
-    let outcome = keel_server::preview_lifecycle::reconcile_previews_once(&restarted).await;
+    let outcome = keel_server::reconcile_previews_once(&restarted).await;
     assert_eq!(outcome.published, 1, "{outcome:?}");
     // Second pass is idempotent (reported commit recorded on the Stack).
-    let again = keel_server::preview_lifecycle::reconcile_previews_once(&restarted).await;
+    let again = keel_server::reconcile_previews_once(&restarted).await;
     assert_eq!(again.published, 0);
     assert_eq!(
         cluster.stack(&stack_name).unwrap()["metadata"]["annotations"]["keel.io/preview-reported-commit"],
@@ -5375,14 +5375,14 @@ async fn test_pko_preview_lifecycle_is_applied_published_and_gced_from_cluster_s
         )
         .await
         .unwrap();
-    let outcome = keel_server::preview_lifecycle::reconcile_previews_once(&restarted).await;
+    let outcome = keel_server::reconcile_previews_once(&restarted).await;
     assert_eq!(outcome.deleted, 0, "{outcome:?}");
     assert!(cluster.preview_secret(&orphan).is_some());
 
     // Closing the PR out-of-band (not via the API) is still GC'd by the reconciler: the Stack,
     // the adopted copies (with their owner) and the orphan copy.
     restarted.forge.close_pull_request(&pr_id).await.unwrap();
-    let outcome = keel_server::preview_lifecycle::reconcile_previews_once(&restarted).await;
+    let outcome = keel_server::reconcile_previews_once(&restarted).await;
     assert_eq!(outcome.deleted, 2, "{outcome:?}");
     assert!(cluster.stack_names().is_empty());
     assert!(cluster.preview_secret_names().is_empty());
@@ -5809,7 +5809,7 @@ async fn test_preview_uses_tenant_backend_and_copies_only_referenced_provider_se
     assert!(!body.to_string().contains("service_account"));
 
     // GC of the preview Stack removes its credential copies (ownerReference).
-    keel_server::preview_lifecycle::gc_preview_for_pr(&state, &pr, "test").await;
+    keel_server::gc_preview_for_pr(&state, &pr, "test").await;
     assert!(
         !cluster
             .preview_secret_names()

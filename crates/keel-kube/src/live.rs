@@ -37,7 +37,7 @@ pub struct LiveResourceInfo {
     pub resource_count: Option<u32>,
     /// `true` only when `metadata.deletionTimestamp` is set on the live object.
     pub terminating: bool,
-    /// Anti-lockout protection (`keel.io/protect` label or `spec.config.protect`), see [`is_stack_object_protected`].
+    /// Anti-lockout protection (`keel.io/protect` label or `spec.config.protect`), see `is_stack_object_protected`.
     pub protected: bool,
     /// Tenant from the `keel.io/tenant` label, if present.
     pub tenant: Option<String>,
@@ -46,7 +46,8 @@ pub struct LiveResourceInfo {
 }
 
 impl LiveResourceInfo {
-    /// Creates a minimal [`LiveResourceInfo`] carrying only a reconciliation status.
+    /// Creates a minimal [`LiveResourceInfo`] carrying only a reconciliation status (test fixtures).
+    #[cfg(any(test, feature = "test-support"))]
     pub fn from_status(status: LiveResourceStatus) -> Self {
         Self {
             terminating: status == LiveResourceStatus::Deleting,
@@ -77,19 +78,19 @@ pub fn is_stack_object_protected(
     data: &Value,
 ) -> bool {
     let label = labels
-        .and_then(|l| l.get(keel_pko::stack::LABEL_PROTECT))
+        .and_then(|l| l.get(keel_pko::LABEL_PROTECT))
         .is_some_and(|v| v.trim().eq_ignore_ascii_case("true"));
     label
         || truthy(data.pointer("/spec/config/protect"))
         || truthy(data.pointer("/spec/config/keel:protect"))
 }
 
-/// Same as [`is_stack_object_protected`] for a full manifest document (`metadata` + `spec`).
+/// Same as `is_stack_object_protected` for a full manifest document (`metadata` + `spec`).
 pub fn is_stack_manifest_protected(doc: &Value) -> bool {
     let label = doc
         .pointer("/metadata/labels")
         .and_then(Value::as_object)
-        .and_then(|l| l.get(keel_pko::stack::LABEL_PROTECT));
+        .and_then(|l| l.get(keel_pko::LABEL_PROTECT));
     truthy(label) || is_stack_object_protected(None, doc)
 }
 
@@ -295,7 +296,7 @@ pub trait LiveStatusSource: Send + Sync {
 
 /// Live `kube-rs` implementation querying PKO v2 `Stack`, Flux `HelmRelease`, and Flux `Kustomization` CRDs.
 ///
-/// CRD list results are memoized for [`DEFAULT_STATUS_CACHE_TTL`] so concurrent UI/CLI polling of
+/// CRD list results are memoized for `DEFAULT_STATUS_CACHE_TTL` so concurrent UI/CLI polling of
 /// `GET /api/v1/stacks` / `GET /api/v1/releases` does not fan out into repeated cluster-wide LISTs
 /// (`NFR-PERF`). Mutating operations invalidate the cache immediately.
 #[derive(Clone)]
@@ -1295,7 +1296,7 @@ impl LiveStatusSource for KubeClusterStatusReader {
         if is_stack_object_protected(existing.metadata.labels.as_ref(), &existing.data) {
             return Err(KubeError::Conflict(format!(
                 "Cannot force-delete protected Stack {namespace}/{name} (labeled `{}: \"true\"` or `spec.config.protect: true`); remove protection via a GitOps PR first",
-                keel_pko::stack::LABEL_PROTECT
+                keel_pko::LABEL_PROTECT
             )));
         }
 
@@ -3099,10 +3100,7 @@ current-context: workload
     #[test]
     fn stack_protection_matches_pko_is_protected_semantics() {
         let mut labels = std::collections::BTreeMap::new();
-        labels.insert(
-            keel_pko::stack::LABEL_PROTECT.to_string(),
-            "true".to_string(),
-        );
+        labels.insert(keel_pko::LABEL_PROTECT.to_string(), "true".to_string());
         assert!(is_stack_object_protected(Some(&labels), &json!({})));
 
         // The legacy/incorrect `keel.io/protected` label must NOT count.

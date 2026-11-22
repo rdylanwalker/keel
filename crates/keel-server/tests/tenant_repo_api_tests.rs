@@ -18,7 +18,7 @@ use keel_git::{
     PullRequestInfo, PullRequestState, RepoReadToken, RepoReadTokenInfo, RepositoryEnsureOutcome,
     RepositoryInfo, RepositoryOptions, RepositoryTarget, ssh_public_key_fingerprint,
 };
-use keel_kube::secret_store::SecretBackend;
+use keel_kube::SecretBackend;
 use keel_kube::{InMemorySecretStore, KubeError, SecretStateStore, TelemetryMux};
 use keel_server::{
     AppState, SESSION_COOKIE_NAME, SessionClaims, TenantRepoCloneBase, TenantRepoForge,
@@ -881,7 +881,7 @@ async fn concurrent_cluster_provisioning_keeps_exactly_one_live_credential() {
             .await;
         // The post-merge task and a re-run of POST race on a lost Secret.
         let run = || {
-            keel_server::tenant_repos::complete_cluster_provisioning(
+            keel_server::complete_cluster_provisioning(
                 fx.state.secret_store.as_ref(),
                 &fx.state.tenant_repos,
                 "web",

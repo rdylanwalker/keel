@@ -3,38 +3,35 @@
 //! Direct `git` CLI runner (HTTPS credential injection) and `ForgeProvider` trait abstraction for Git forge integrations
 //! (Forgejo/Gitea, GitHub, GitLab, and Local Git).
 
-pub mod forge;
-pub mod forgejo_admin;
-pub mod git;
+mod forge;
+mod forgejo_admin;
+mod git;
 mod http;
-pub mod local;
-pub mod remote;
+mod local;
+mod remote;
 mod remote_repo;
-pub mod ssh_keys;
+mod ssh_keys;
 #[cfg(test)]
 mod test_http;
 
 pub use forge::{
     BranchProtectionOutcome, CreatePrRequest, DeployKeyInfo, DeployKeyOutcome, EnsuredDeployKey,
-    ForgeError, ForgeProvider, ForkPolicyOutcome, PROTECTED_MAIN_BRANCH, PullRequestComment,
-    PullRequestInfo, PullRequestState, REPO_READ_TOKEN_NAME_PREFIX, RepoCredentialKind,
-    RepoReadToken, RepoReadTokenInfo, RepositoryEnsureOutcome, RepositoryInfo, RepositoryOptions,
+    ForgeError, ForgeProvider, ForkPolicyOutcome, PullRequestComment, PullRequestInfo,
+    PullRequestState, REPO_READ_TOKEN_NAME_PREFIX, RepoCredentialKind, RepoReadToken,
+    RepoReadTokenInfo, RepositoryEnsureOutcome, RepositoryInfo, RepositoryOptions,
     RepositoryTarget, validate_commit_sha,
 };
 pub use forgejo_admin::{
-    AccessTokenInfo, MintedAccessToken, ORG_OWNERS_TEAM, ProvisionOutcome, ServiceUser,
-    ServiceUserSpec, StrayCredentialReport, TeamInfo, TeamSpec,
+    AccessTokenInfo, ProvisionOutcome, ServiceUserSpec, StrayCredentialReport, TeamSpec,
 };
 pub use git::{
-    CommitAuthor, GitCredentials, GitError, GitRunner, WorkdirSync, ensure_workdir_from_remote,
-    parse_proposal_branch_tenant, sanitize_branch_segment, validate_git_ref,
-    validate_remote_url_without_credentials,
+    CommitAuthor, GitCredentials, GitError, GitRunner, ensure_workdir_from_remote,
+    parse_proposal_branch_tenant, validate_git_ref,
 };
 pub use local::LocalGitProvider;
 pub use remote::{
     ForgejoGiteaProvider, GitHubProvider, GitLabProvider, RemoteRepoSlug, parse_remote_repo_url,
 };
 pub use ssh_keys::{
-    GeneratedSshKeyPair, generate_ed25519_key_pair, known_hosts_file, known_hosts_line,
-    normalize_ssh_public_key, ssh_clone_url, ssh_public_key_fingerprint,
+    generate_ed25519_key_pair, known_hosts_file, ssh_clone_url, ssh_public_key_fingerprint,
 };

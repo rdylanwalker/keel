@@ -10,7 +10,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{CoreError, FLUX_SYSTEM_NAMESPACE, KEEL_SYSTEM_NAMESPACE, yaml_leading_comments};
+use crate::{CoreError, FLUX_SYSTEM_NAMESPACE, KEEL_SYSTEM_NAMESPACE, yaml::yaml_leading_comments};
 
 /// Repository-relative directory holding the management-plane core add-on manifests.
 pub const MANAGEMENT_CORE_ADDONS_DIR: &str = "clusters/management/core-addons";
@@ -334,7 +334,7 @@ fn not_addon_document(id: &str) -> CoreError {
 
 /// Validates a requested add-on chart version or image tag: semver-ish (`1`, `1.2`, `1.2.3`,
 /// optional `v` prefix, optional `-prerelease` / `+build` suffix), no whitespace, at most
-/// [`MANAGEMENT_ADDON_VERSION_MAX_LEN`] characters.
+/// `MANAGEMENT_ADDON_VERSION_MAX_LEN` characters.
 pub fn validate_management_addon_version(version: &str) -> Result<(), CoreError> {
     let invalid = || {
         CoreError::Validation(format!(

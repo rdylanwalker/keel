@@ -290,15 +290,15 @@ pub const PKO_WORKSPACE_PRIVATE_EGRESS_PORTS: [u16; 4] = [22, 443, 6443, 8006];
 /// PKO operator (`keel-system`) on the agent gRPC port `50051`. Egress is an allowlist:
 ///
 /// * cluster DNS (`kube-system`, 53);
-/// * the `keel-ingress` Envoy proxy pods on [`KEEL_INGRESS_PROXY_PORTS`] (the `fetch` init
+/// * the `keel-ingress` Envoy proxy pods on `KEEL_INGRESS_PROXY_PORTS` (the `fetch` init
 ///   container clones `projectRepo` from the in-cluster Forgejo HTTPS ingress), never other
 ///   `keel-system` workloads (Forgejo's HTTP Service, the IdP, keel-server, SeaweedFS admin/filer);
-/// * `keel-system` on [`IN_CLUSTER_S3_STATE_BACKEND_PORT`] (the default Pulumi state backend);
-/// * the local-dev `flux-system/keel-docker-proxy` pods on [`LOCAL_DOCKER_PROXY_PORT`] (kind-in-kind
+/// * `keel-system` on `IN_CLUSTER_S3_STATE_BACKEND_PORT` (the default Pulumi state backend);
+/// * the local-dev `flux-system/keel-docker-proxy` pods on `LOCAL_DOCKER_PROXY_PORT` (kind-in-kind
 ///   blueprints; present only with `--local-dev-docker-socket-exception`);
-/// * [`PKO_WORKSPACE_PRIVATE_EGRESS_CIDRS`] on [`PKO_WORKSPACE_PRIVATE_EGRESS_PORTS`] (the
+/// * `PKO_WORKSPACE_PRIVATE_EGRESS_CIDRS` on `PKO_WORKSPACE_PRIVATE_EGRESS_PORTS` (the
 ///   Kubernetes API server, private forges over HTTPS/SSH, the Proxmox VE API);
-/// * public IPv4 on any port ([`PUBLIC_EGRESS_EXCEPT_CIDRS`] excluded: private, link-local,
+/// * public IPv4 on any port (`PUBLIC_EGRESS_EXCEPT_CIDRS` excluded: private, link-local,
 ///   loopback, multicast and reserved ranges), for cloud provider APIs and external forges.
 ///
 /// Cloud instance metadata (`169.254.0.0/16`) is never reachable. Whether an `ipBlock` also
@@ -1067,7 +1067,7 @@ pub fn synthesize_canary_gateway_network_policy_yaml(
 /// kustomize-controller applies `Namespace` objects before namespaced ones, so including this
 /// manifest removes the race. It is annotated `prune: disabled` (never delete a namespace Helm
 /// may also own) and `ssa: IfNotPresent` (never fight an existing namespace). Like
-/// [`build_tenant_namespace`] it enforces the `restricted` Pod Security Standard (`NFR-SEC-03`):
+/// `build_tenant_namespace` it enforces the `restricted` Pod Security Standard (`NFR-SEC-03`):
 /// workload clusters carry no guaranteed Kyverno baseline. Must not be used on
 /// management-cluster tenant paths, where the tenant reconciler cannot create namespaces.
 pub fn synthesize_remote_target_namespace(
@@ -1739,39 +1739,6 @@ pub fn build_tenant_s3_credentials_secret(
     }))
 }
 
-/// Synthesizes the tenant's read-only Git credential `Secret` (`tenant-<id>/git-credentials`).
-pub fn build_tenant_git_credentials_secret(
-    tenant_id: &str,
-    username: &str,
-    read_only_token: &str,
-) -> Result<Value, KubeError> {
-    let ns = tenant_namespace(tenant_id)?;
-    if username.trim().is_empty() || read_only_token.trim().is_empty() {
-        return Err(KubeError::InvalidInput(
-            "tenant git credentials require a non-empty username and token".to_string(),
-        ));
-    }
-    let mut labels = tenant_common_labels(tenant_id);
-    labels.insert(
-        "keel.io/secret-kind".to_string(),
-        TENANT_GIT_CREDENTIALS_SECRET_KIND.to_string(),
-    );
-    Ok(json!({
-        "apiVersion": "v1",
-        "kind": "Secret",
-        "metadata": {
-            "name": TENANT_GIT_CREDENTIALS_SECRET_NAME,
-            "namespace": ns,
-            "labels": labels,
-        },
-        "type": "Opaque",
-        "stringData": {
-            "username": username,
-            "password": read_only_token,
-        },
-    }))
-}
-
 fn validate_s3_bucket_name(bucket: &str) -> Result<(), KubeError> {
     let valid = (3..=63).contains(&bucket.len())
         && bucket
@@ -1919,8 +1886,8 @@ pub fn build_tenant_gateway_routes_cluster_role() -> Value {
     })
 }
 
-/// Serializes [`build_tenant_reconciler_rbac`] plus
-/// [`build_tenant_gateway_routes_cluster_role`] into multi-document YAML.
+/// Serializes `build_tenant_reconciler_rbac` plus
+/// `build_tenant_gateway_routes_cluster_role` into multi-document YAML.
 pub fn build_tenant_reconciler_rbac_yaml() -> Result<String, KubeError> {
     let docs = build_tenant_reconciler_rbac()
         .into_iter()
@@ -2089,15 +2056,6 @@ mod tests {
             s3["metadata"]["annotations"]["keel.io/s3-identity"],
             "keel-tenant-acme"
         );
-
-        let git = build_tenant_git_credentials_secret("default", "keel", "ro-token").unwrap();
-        assert_eq!(git["metadata"]["namespace"], "tenant-default");
-        assert_eq!(git["metadata"]["name"], "git-credentials");
-        assert_eq!(
-            git["metadata"]["labels"]["keel.io/secret-kind"],
-            TENANT_GIT_CREDENTIALS_SECRET_KIND
-        );
-        assert!(build_tenant_git_credentials_secret("default", "keel", " ").is_err());
     }
 
     #[test]

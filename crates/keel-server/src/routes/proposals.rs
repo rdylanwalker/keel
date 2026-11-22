@@ -416,7 +416,7 @@ fn sanitize_pulumi_project_name(raw: &str) -> String {
 /// Returns the tenant-scoped Pulumi DIY backend (`s3://<bucket>/tenants/<id>?...`) so tenant
 /// Stack state lands under the prefix the tenant's scoped SeaweedFS identity can access.
 fn tenant_stack_backend_url(state: &AppState, tenant: &str) -> Result<String, ServerError> {
-    keel_kube::tenant::tenant_s3_backend_url(&state.backend_url, tenant).map_err(|e| {
+    keel_kube::tenant_s3_backend_url(&state.backend_url, tenant).map_err(|e| {
         ServerError::Internal(format!(
             "cannot derive tenant state backend for `{tenant}`: {e}"
         ))
@@ -674,7 +674,7 @@ async fn attach_tenant_s3_credentials(
             Err(ServerError::Conflict(format!(
                 "tenant `{tenant}` has no scoped state credentials \
                  (`{tenant_ns}/{}`); run tenant provisioning before creating Pulumi stacks",
-                keel_kube::tenant::TENANT_S3_CREDENTIALS_SECRET_NAME
+                keel_kube::TENANT_S3_CREDENTIALS_SECRET_NAME
             )))
         }
         Err(e) => {
@@ -758,7 +758,7 @@ fn preview_runner_managed_secrets(state: &AppState) -> std::collections::BTreeSe
     let mut out = std::collections::BTreeSet::from([
         keel_kube::S3_CREDENTIALS_SECRET_NAME.to_string(),
         keel_kube::GITHUB_TOKEN_SECRET_NAME.to_string(),
-        keel_kube::tenant::TENANT_S3_CREDENTIALS_SECRET_NAME.to_string(),
+        keel_kube::TENANT_S3_CREDENTIALS_SECRET_NAME.to_string(),
     ]);
     if let Some(name) = &state.s3_credentials_secret {
         out.insert(name.clone());
@@ -1887,7 +1887,7 @@ async fn ensure_helm_values_within_catalog(
         }
     }
 
-    let reconciler_sa = keel_kube::tenant::default_tenant_service_account_name(input.tenant)?;
+    let reconciler_sa = keel_kube::default_tenant_service_account_name(input.tenant)?;
     fn names_string(value: &Value, needle: &str) -> bool {
         match value {
             Value::String(s) => s.trim() == needle,
@@ -5367,10 +5367,7 @@ async fn apply_platform_merge_side_effects(state: &AppState, merged: &PullReques
         {
             let _ = state
                 .state_provider
-                .apply_cluster_policy(
-                    keel_kube::kyverno::POLICY_RESTRICT_PULUMI_PROVIDERS,
-                    &policy_val,
-                )
+                .apply_cluster_policy(keel_kube::POLICY_RESTRICT_PULUMI_PROVIDERS, &policy_val)
                 .await;
         }
     }

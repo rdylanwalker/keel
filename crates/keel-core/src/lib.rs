@@ -4,29 +4,26 @@
 //! `keel.io/v1alpha1` catalog parser, JSONSchema validator, Helm `values.yaml` renderer,
 //! `AES-256-GCM` envelope encryption, and SOPS + `age` secrets management.
 
-pub mod bootstrap;
-pub mod catalog;
-pub mod crypto;
-pub mod management_addon;
-pub mod models;
+mod bootstrap;
+mod catalog;
+mod crypto;
+mod management_addon;
+mod models;
 pub mod yaml;
 
 use thiserror::Error;
 
 pub use bootstrap::{
-    BootstrapTarget, ClusterConnection, KubeconfigBootstrapTarget, PulumiBootstrapTarget,
-    STAGE0_BACKEND_DIR, STAGE0_PASSPHRASE_FILE, Stage0Passphrase, Stage0PassphraseSource,
-    ValidatedKubeconfig, clear_stale_kind_stage0_state_in, ensure_private_dir,
-    factory as bootstrap_target_factory, generate_stage0_passphrase, keel_config_dir,
-    resolve_stage0_passphrase_in, stage0_cluster_dir_in, stage0_program_dir_in, stage0_state_root,
-    validate_kubeconfig_yaml, write_private_file,
+    BootstrapTarget, ClusterConnection, PulumiBootstrapTarget, STAGE0_BACKEND_DIR,
+    STAGE0_PASSPHRASE_FILE, Stage0Passphrase, Stage0PassphraseSource,
+    clear_stale_kind_stage0_state_in, ensure_private_dir, factory as bootstrap_target_factory,
+    keel_config_dir, resolve_stage0_passphrase_in, stage0_cluster_dir_in, stage0_program_dir_in,
+    stage0_state_root, validate_kubeconfig_yaml, write_private_file,
 };
 pub use catalog::{
-    CLUSTER_SCOPED_KINDS, DEFAULT_PLATFORM_BASE_DOMAIN, GATEWAY_ROUTE_KINDS, PLATFORM_HOST_LABELS,
     PartitionedValues, PreparedHelmValues, SchemaFieldError, changed_immutable_values,
-    extract_manifest_variables, extract_secret_field_paths, gateway_route_hostnames,
-    helm_secret_value_fragments, is_secret_schema_node, keel_ingress_parent_refs,
-    manifest_cluster_scoped_kinds, manifest_objects_outside_namespaces, parse_catalog,
+    extract_manifest_variables, gateway_route_hostnames, helm_secret_value_fragments,
+    is_secret_schema_node, keel_ingress_parent_refs, manifest_cluster_scoped_kinds, parse_catalog,
     parse_catalog_application, parse_catalog_blueprint, parse_catalog_bundle,
     partition_values_by_schema, platform_reserved_hostnames, prepare_helm_values,
     render_helm_values_yaml, render_manifest_template, resolve_helm_gateway_routes,
@@ -34,13 +31,11 @@ pub use catalog::{
     validate_route_hostnames, validate_schema_values, verify_rendered_manifest_structure,
 };
 pub use crypto::{
-    AES_256_KEY_LEN, AES_GCM_NONCE_LEN, AES_GCM_TAG_LEN, AgeKeyPair, EnvelopeCrypto, SopsConfig,
-    SopsCreationRule, SopsManager, generate_admin_password, sha256_hex,
+    EnvelopeCrypto, SopsConfig, SopsCreationRule, SopsManager, generate_admin_password, sha256_hex,
 };
 pub use management_addon::{
-    MANAGEMENT_ADDON_VERSION_MAX_LEN, MANAGEMENT_CORE_ADDONS_DIR, ManagementAddonKind,
-    ManagementAddonRef, apply_management_addon_upgrade, changed_value_paths,
-    disallowed_value_changes, ensure_management_addon_protected,
+    MANAGEMENT_CORE_ADDONS_DIR, ManagementAddonKind, ManagementAddonRef,
+    apply_management_addon_upgrade, disallowed_value_changes, ensure_management_addon_protected,
     ensure_management_addon_upgradable, management_addon_chart, management_addon_desired_version,
     management_addon_mutable_values, management_addon_ref, merge_json_values,
     render_management_addon_document, validate_management_addon_document,
@@ -53,16 +48,15 @@ pub use models::{
     CatalogBlueprintMetadata, CatalogBlueprintSpec, CatalogBundle, CatalogBundleItem,
     CatalogBundleMetadata, CatalogBundleSpec, CatalogInfraBlueprint, CatalogManifest,
     DEFAULT_CLUSTER_NAME, DEFAULT_POLL_INTERVAL, ForgeConfig, ForgeKind, HelmCrdPolicy,
-    HelmGatewayRouteSpec, HelmNetworkPolicySpec, InfraResourceKind, KeelConfig,
-    MANAGEMENT_CORE_CATEGORY, ManifestEngine, OIDC_CLIENT_ID_ENV, OIDC_CLIENT_SECRET_ENV,
-    OIDC_ISSUER_URL_ENV, OIDC_REDIRECT_URL_ENV, OidcConfig, PlacementScope, PlacementSpec,
-    ProgressiveDeliverySpec, ProviderEntry, ProviderRegistry, StackSshInfoResponse, UpstreamSource,
-    clean_candidate_ssh_host, clean_candidate_ssh_user, default_ssh_user_for_provider,
-    is_private_or_internal_ssh_host, resolve_ssh_target_from_sources, validate_https_origin,
+    HelmNetworkPolicySpec, InfraResourceKind, KeelConfig, MANAGEMENT_CORE_CATEGORY, ManifestEngine,
+    OIDC_CLIENT_ID_ENV, OIDC_CLIENT_SECRET_ENV, OIDC_ISSUER_URL_ENV, OIDC_REDIRECT_URL_ENV,
+    OidcConfig, PlacementScope, PlacementSpec, ProgressiveDeliverySpec, ProviderRegistry,
+    StackSshInfoResponse, UpstreamSource, clean_candidate_ssh_host, clean_candidate_ssh_user,
+    is_private_or_internal_ip, is_private_or_internal_ssh_host, is_unresolved_ssh_target,
+    resolve_ssh_host_key_from_sources, resolve_ssh_target_from_sources, validate_https_origin,
 };
-pub use yaml::{
-    replace_yaml_document, split_yaml_documents, to_yaml_documents, yaml_leading_comments,
-};
+
+pub use yaml::{replace_yaml_document, split_yaml_documents, to_yaml_documents};
 
 /// Flux CD controllers namespace (`SDD.md` §1).
 pub const FLUX_SYSTEM_NAMESPACE: &str = "flux-system";

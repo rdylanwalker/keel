@@ -695,10 +695,7 @@ pub(crate) async fn build_serve_state(
             {
                 let _ = state
                     .state_provider
-                    .apply_cluster_policy(
-                        keel_kube::kyverno::POLICY_RESTRICT_PULUMI_PROVIDERS,
-                        &policy_val,
-                    )
+                    .apply_cluster_policy(keel_kube::POLICY_RESTRICT_PULUMI_PROVIDERS, &policy_val)
                     .await;
             }
         }
@@ -715,9 +712,9 @@ where
     let (state, _forge_pf) = build_serve_state(args, true).await?;
     // Restart-/replica-safe preview GC + result publication driven by cluster state and forge
     // PR states (OPEN-10). No-op without a live cluster.
-    let preview_reconciler = keel_server::preview_lifecycle::spawn_preview_reconciler(
+    let preview_reconciler = keel_server::spawn_preview_reconciler(
         state.clone(),
-        keel_server::preview_lifecycle::PREVIEW_RECONCILE_INTERVAL,
+        keel_server::PREVIEW_RECONCILE_INTERVAL,
     );
     let router = build_router(state);
     let listener = tokio::net::TcpListener::bind(&args.bind).await?;

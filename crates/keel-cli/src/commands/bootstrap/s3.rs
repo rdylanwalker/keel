@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use hmac::{Hmac, KeyInit, Mac};
 use k8s_openapi::api::core::v1::Secret;
 use keel_core::{FLUX_SYSTEM_NAMESPACE, KEEL_PREVIEWS_NAMESPACE, KEEL_SYSTEM_NAMESPACE};
-use keel_kube::secret_store::SecretBackend;
+use keel_kube::SecretBackend;
 use keel_kube::{
     KubeError, S3_CREDENTIALS_SECRET_NAME, SeaweedFsIdentityOps, TenantS3ProvisionOutcome,
 };

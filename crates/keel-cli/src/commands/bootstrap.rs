@@ -193,7 +193,7 @@ impl KyvernoPolicyGenerator {
         Self {
             allowed_providers,
             local_dev_docker_socket_exception,
-            reserved_route_hostnames: keel_kube::kyverno::default_reserved_route_hostnames(),
+            reserved_route_hostnames: keel_kube::default_reserved_route_hostnames(),
         }
     }
 
@@ -297,11 +297,9 @@ pub struct SeedRepoInitResult {
 /// Outcome of `keel bootstrap init`.
 #[derive(Debug, Clone)]
 pub struct BootstrapInitOutcome {
-    pub connection: ClusterConnection,
+    /// The synthesized seed control plane; only inspected by tests.
+    #[cfg(test)]
     pub artifacts: SeedControlPlaneArtifacts,
-    pub seed_repo: Option<SeedRepoInitResult>,
-    /// S3 escrow report for Stage 0 state (when core add-ons were installed).
-    pub stage0_backend_url: Option<String>,
     pub output: String,
 }
 
@@ -857,7 +855,7 @@ pub(crate) fn tenant_baseline_action(
         (false, false) => TenantBaselineAction::ApplyAsOperator,
         (false, true) => TenantBaselineAction::ApplyAs(format!(
             "system:serviceaccount:{FLUX_SYSTEM_NAMESPACE}:{}",
-            keel_kube::tenant::TENANT_RECONCILER_SERVICE_ACCOUNT
+            keel_kube::TENANT_RECONCILER_SERVICE_ACCOUNT
         )),
     }
 }
@@ -899,7 +897,7 @@ pub(crate) async fn ensure_tenant_baseline(
         && kube_object_exists(
             target,
             "validatingpolicies.policies.kyverno.io",
-            keel_kube::kyverno::POLICY_PROTECT_PLATFORM_OWNED_TENANT_OBJECTS,
+            keel_kube::POLICY_PROTECT_PLATFORM_OWNED_TENANT_OBJECTS,
         )
         .await?;
     let action = tenant_baseline_action(namespace_exists, policy_installed);
@@ -918,7 +916,7 @@ pub(crate) async fn ensure_tenant_baseline(
                          Kyverno `{}` only admits keel-tenant-reconciler, keel-server and cluster \
                          admins in `system:masters`/`kubeadm:cluster-admins`, and the current \
                          kubeconfig identity needs `impersonate` on that ServiceAccount",
-                        keel_kube::kyverno::POLICY_PROTECT_PLATFORM_OWNED_TENANT_OBJECTS
+                        keel_kube::POLICY_PROTECT_PLATFORM_OWNED_TENANT_OBJECTS
                     ))
                 })?;
         }
@@ -1264,7 +1262,7 @@ fn seed_management_files(
         ),
         (
             format!("{flux}/tenant-reconciler-rbac.yaml"),
-            keel_kube::tenant::build_tenant_reconciler_rbac_yaml()?,
+            keel_kube::build_tenant_reconciler_rbac_yaml()?,
         ),
         (
             format!("{flux}/gotk-sync.yaml"),
@@ -2021,7 +2019,6 @@ pub async fn execute_bootstrap_init_with_target(
     }
 
     // Escrow Stage 0 state to the in-cluster versioned S3 bucket (break-glass, NFR-REL-01).
-    let mut stage0_backend_url = None;
     if !args.skip_core_install
         && let Some(stage0) = stage0.as_ref()
     {
@@ -2042,7 +2039,6 @@ pub async fn execute_bootstrap_init_with_target(
                         format!("; snapshots: {}", report.snapshots.len())
                     }
                 ));
-                stage0_backend_url = Some(report.backend_url);
             }
             Err(err) => {
                 let msg = format!(
@@ -2089,10 +2085,8 @@ pub async fn execute_bootstrap_init_with_target(
     }
 
     Ok(BootstrapInitOutcome {
-        connection,
+        #[cfg(test)]
         artifacts,
-        seed_repo,
-        stage0_backend_url,
         output,
     })
 }
@@ -2311,9 +2305,7 @@ mod security_hardening_tests {
     #[test]
     fn seed_policies_no_longer_clone_admin_credentials_into_tenants() {
         let bundle = KyvernoPolicyGenerator::new(
-            keel_kube::pulumi_provider_allowlist(
-                &keel_kube::kyverno::default_allowed_pulumi_providers(),
-            ),
+            keel_kube::pulumi_provider_allowlist(&keel_kube::default_allowed_pulumi_providers()),
             false,
         )
         .generate()
@@ -2594,7 +2586,7 @@ mod security_hardening_tests {
         let exec = has(&keel_system, "", "pods/exec").expect("pods/exec rule");
         assert_eq!(
             exec["resourceNames"],
-            serde_json::json!([keel_kube::s3_identity::SEAWEEDFS_FILER_POD])
+            serde_json::json!([keel_kube::SEAWEEDFS_FILER_POD])
         );
         // Core HelmReleases live in flux-system; no write access to keel-system HelmReleases.
         assert!(has(&keel_system, "helm.toolkit.fluxcd.io", "helmreleases").is_none());
@@ -4064,7 +4056,7 @@ mod security_hardening_tests {
         assert_eq!(tenants["spec"]["path"], "./tenants");
         assert_eq!(
             tenants["spec"]["serviceAccountName"],
-            keel_kube::tenant::TENANT_RECONCILER_SERVICE_ACCOUNT
+            keel_kube::TENANT_RECONCILER_SERVICE_ACCOUNT
         );
         assert_eq!(tenants["spec"]["dependsOn"][0]["name"], "core-addons");
         assert_eq!(tenants["spec"]["interval"], "1m");
@@ -5507,7 +5499,7 @@ mod tenant_keel_server_app_tests {
         json!({
             "apiGroups": ["policies.kyverno.io"],
             "resources": ["validatingpolicies"],
-            "resourceNames": [keel_kube::kyverno::POLICY_RESTRICT_PULUMI_PROVIDERS],
+            "resourceNames": [keel_kube::POLICY_RESTRICT_PULUMI_PROVIDERS],
             "verbs": ["create", "update", "patch"],
         })
     }

@@ -142,7 +142,7 @@ impl PreviewCluster for InMemoryPreviewCluster {
         source: &crate::TenantRepoSource,
     ) -> Result<PreviewPrerequisites, KubeError> {
         let tenant = source.tenant_id();
-        let keys = crate::tenant_repo_preview_secret_keys(source.transport());
+        let keys = crate::tenant_repo::tenant_repo_preview_secret_keys(source.transport());
         let present = self
             .lock()
             .tenant_secrets

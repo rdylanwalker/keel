@@ -390,7 +390,7 @@ pub fn build_restrict_pulumi_providers_policy(
 pub const BUILTIN_PULUMI_PROVIDERS: &[&str] = &["kubernetes"];
 
 /// Returns the deduplicated `restrict-pulumi-providers` allowlist: registry-enabled providers
-/// followed by [`BUILTIN_PULUMI_PROVIDERS`]. Blank ids are dropped.
+/// followed by `BUILTIN_PULUMI_PROVIDERS`. Blank ids are dropped.
 pub fn pulumi_provider_allowlist<S: AsRef<str>>(enabled_provider_ids: &[S]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let ids = enabled_provider_ids
@@ -780,8 +780,8 @@ const CEL_STACK_PROTECT_CONFIG_KEYS: &str = "['protect', 'keel:protect']";
 /// never reach the webhook, so an unavailable Kyverno cannot stall PKO reconciliation
 /// (anti-lockout, `NFR-REL-01`). Fails closed for tenant requests.
 pub fn build_restrict_tenant_pulumi_objects_policy() -> Value {
-    let protect = keel_pko::stack::LABEL_PROTECT;
-    let core = keel_pko::stack::MANAGEMENT_CORE_STACK_NAME;
+    let protect = keel_pko::LABEL_PROTECT;
+    let core = keel_pko::MANAGEMENT_CORE_STACK_NAME;
     json!({
         "apiVersion": "policies.kyverno.io/v1",
         "kind": "ValidatingPolicy",
@@ -1789,12 +1789,12 @@ mod tests {
     #[test]
     fn synthesized_tenant_kustomizations_use_the_tenant_service_account() {
         let input = crate::FluxKustomizationSpecInput::new("acme", "app", "keel-gitops", "./x");
-        let ks = crate::synthesize_flux_kustomization(&input).unwrap();
+        let ks = crate::tenant::synthesize_flux_kustomization(&input).unwrap();
         let ns = ks["metadata"]["namespace"].as_str().unwrap();
         assert_eq!(ks["spec"]["serviceAccountName"], format!("{ns}-sa"));
         // The per-tenant repository root (`tenants/<id>/sync.yaml`, applied by
         // keel-tenant-reconciler) satisfies the same rule and only references its own namespace.
-        let root = crate::build_tenant_root_kustomization("acme").unwrap();
+        let root = crate::tenant_repo::build_tenant_root_kustomization("acme").unwrap();
         let ns = root["metadata"]["namespace"].as_str().unwrap();
         assert_eq!(root["spec"]["serviceAccountName"], format!("{ns}-sa"));
         assert_eq!(root["spec"]["sourceRef"]["namespace"], ns);
@@ -1815,7 +1815,7 @@ mod tests {
             "workload-kubeconfig",
         ));
         for input in [local, remote] {
-            let hr = crate::synthesize_helm_release(&input).unwrap();
+            let hr = crate::tenant::synthesize_helm_release(&input).unwrap();
             let ns = hr["metadata"]["namespace"].as_str().unwrap();
             assert_eq!(ns, "tenant-acme");
             assert_eq!(hr["spec"]["serviceAccountName"], format!("{ns}-sa"));
@@ -1930,7 +1930,7 @@ mod tests {
         ] {
             assert!(exprs[3].contains(needle), "{needle}");
         }
-        for key in keel_pko::stack::CONFIG_PROTECT_KEYS {
+        for key in keel_pko::CONFIG_PROTECT_KEYS {
             let protected = json!({ "spec": { "config": { key: "true" } } });
             assert!(
                 crate::live::is_stack_object_protected(None, &protected),
@@ -1950,8 +1950,8 @@ mod tests {
         assert!(exprs[4].contains("request.name != 'management-cluster-core'"));
         // The name and label match what `protect-control-plane` treats as undeletable.
         let guard = expressions(&build_protect_control_plane_policy())[0].clone();
-        assert!(guard.contains(keel_pko::stack::MANAGEMENT_CORE_STACK_NAME));
-        assert!(guard.contains(&format!("'{}'", keel_pko::stack::LABEL_PROTECT)));
+        assert!(guard.contains(keel_pko::MANAGEMENT_CORE_STACK_NAME));
+        assert!(guard.contains(&format!("'{}'", keel_pko::LABEL_PROTECT)));
     }
 
     #[test]
@@ -2015,8 +2015,8 @@ mod tests {
             crate::TenantRepoSource::new("acme", "https://forgejo.example/keel-tenants/r.git")
                 .unwrap();
         let stub_docs = [
-            crate::build_tenant_repo_git_repository(&source).unwrap(),
-            crate::build_tenant_root_kustomization("acme").unwrap(),
+            crate::tenant_repo::build_tenant_repo_git_repository(&source).unwrap(),
+            crate::tenant_repo::build_tenant_root_kustomization("acme").unwrap(),
         ];
         for doc in &stub_docs {
             assert_eq!(doc["metadata"]["labels"][PLATFORM_OWNED_LABEL], "true");
@@ -2032,7 +2032,9 @@ mod tests {
             token: "t".to_string(),
             ca_crt: None,
         };
-        let secret = crate::build_tenant_gitops_credentials_secret(&source, &credential).unwrap();
+        let secret =
+            crate::tenant_repo::build_tenant_gitops_credentials_secret(&source, &credential)
+                .unwrap();
         assert_eq!(secret["metadata"]["labels"][PLATFORM_OWNED_LABEL], "true");
         assert!(
             rules

@@ -3,46 +3,35 @@
 //! Pulumi Kubernetes Operator (PKO v2) `Stack` & Flux CD `GitRepository` synthesis engine,
 //! `pulumi preview --json` diff parser & Markdown reporter, and ephemeral PR preview garbage-collection planner.
 
-pub mod gc;
-pub mod preview;
-pub mod run;
-pub mod stack;
+mod gc;
+mod preview;
+mod run;
+mod stack;
 
-pub use gc::{
-    GcPlan, PreviewResourceCandidate, PreviewResourceKind, ResourceDeletionTarget, plan_preview_gc,
-};
+pub use gc::{GcPlan, PreviewResourceCandidate, plan_preview_gc};
 pub use preview::{
     ChangeOp, PreviewReport, PreviewSource, PreviewSummary, ResourceDiff, format_markdown_report,
-    parse_preview_value,
 };
 pub use run::{
     ANNOTATION_HEAD_SHA, ANNOTATION_REPORTED_COMMIT, PREVIEW_LOG_TAIL_LINES,
-    PREVIEW_REPORT_CONFIGMAP_KEY, PrLifecycle, PreviewPhase, PreviewReconcilePlan, PreviewRecord,
-    PreviewRunStatus, build_pko_preview_report, map_pko_preview_status, normalize_pko_commit,
-    parse_pulumi_console_preview, plan_preview_reconcile, select_update_name,
+    PREVIEW_REPORT_CONFIGMAP_KEY, PrLifecycle, PreviewPhase, PreviewRecord, PreviewRunStatus,
+    build_pko_preview_report, map_pko_preview_status, plan_preview_reconcile, select_update_name,
 };
 pub use stack::{
-    CrObjectMeta, DEFAULT_FLUX_POLL_INTERVAL, DEFAULT_MANAGEMENT_SERVICE_ACCOUNT,
-    DEFAULT_PREVIEW_SERVICE_ACCOUNT, EphemeralPreviewParams, FLUX_GIT_REPO_API_VERSION,
-    FLUX_GIT_REPO_KIND, FluxGitRepository, FluxGitRepositoryRef, FluxGitRepositorySpec,
-    IN_CLUSTER_FORGEJO_HTTP_HOST, IN_CLUSTER_S3_BACKEND_URL, KEEL_CA_BUNDLE_CONFIGMAP,
-    KEEL_CA_MOUNT_PATH, KEEL_CA_VOLUME_NAME, KEEL_PREVIEWS_NAMESPACE, KEEL_SSH_KNOWN_HOSTS_FILE,
-    KEEL_SSH_KNOWN_HOSTS_MOUNT_PATH, KEEL_SSH_KNOWN_HOSTS_VOLUME_NAME, KEEL_SSL_CERT_DIR,
-    LABEL_PR_ID, LABEL_PROVIDER, LABEL_REPO, LABEL_TENANT, LocalObjectReference,
-    MANAGEMENT_CORE_STACK_NAME, MAX_PREVIEW_STACK_NAME_LEN, ManagementCoreStackParams,
-    PKO_FETCH_CONTAINER_NAME, PKO_STACK_API_VERSION, PKO_STACK_KIND, PLATFORM_REPO_LABEL,
-    PULUMI_CONFIG_PASSPHRASE_ENV, PULUMI_PASSPHRASE_SECRET_KEY, PULUMI_PASSPHRASE_SECRET_NAME,
-    PkoEnvRef, PkoFluxSource, PkoFluxSourceRef, PkoGitAuth, PkoGitBasicAuth, PkoGitSource,
-    PkoGitSshAuth, PkoStack, PkoStackSpec, PkoWorkspaceTemplate, PreviewSecretCopy, PreviewStack,
-    SSH_KNOWN_HOSTS_ENV, TenantStackParams, WorkspaceConfigMapVolumeSource, WorkspaceEnvVar,
-    WorkspaceEnvVarSource, WorkspaceInitContainerPatch, WorkspaceKeyToPath,
-    WorkspaceSecretVolumeSource, WorkspaceVolume, WorkspaceVolumeMount,
+    CONFIG_PROTECT_KEYS, CrObjectMeta, DEFAULT_FLUX_POLL_INTERVAL,
+    DEFAULT_MANAGEMENT_SERVICE_ACCOUNT, DEFAULT_PREVIEW_SERVICE_ACCOUNT, EphemeralPreviewParams,
+    FLUX_GIT_REPO_API_VERSION, FLUX_GIT_REPO_KIND, FluxGitRepository, FluxGitRepositoryRef,
+    FluxGitRepositorySpec, IN_CLUSTER_S3_BACKEND_URL, KEEL_SSH_KNOWN_HOSTS_FILE,
+    KEEL_SSH_KNOWN_HOSTS_MOUNT_PATH, KEEL_SSH_KNOWN_HOSTS_VOLUME_NAME, LABEL_PROTECT, LABEL_REPO,
+    LocalObjectReference, MANAGEMENT_CORE_STACK_NAME, ManagementCoreStackParams,
+    PLATFORM_REPO_LABEL, PULUMI_PASSPHRASE_SECRET_KEY, PULUMI_PASSPHRASE_SECRET_NAME, PkoEnvRef,
+    PkoGitAuth, PkoGitBasicAuth, PkoGitSource, PkoGitSshAuth, PkoStack, PkoWorkspaceTemplate,
+    PreviewSecretCopy, PreviewStack, SSH_KNOWN_HOSTS_ENV, TenantStackParams,
     attach_github_token_env_ref, attach_s3_credentials_env_refs, build_preview_branch,
-    is_in_cluster_forgejo_http_url, is_ssh_git_url, is_tenant_scoped_backend, parse_preview_key,
-    pko_project_repo_url, preview_key, preview_secret_copy_name, preview_stack_name,
-    synthesize_ephemeral_preview, synthesize_k8s_manifest_pulumi_yaml,
-    synthesize_management_core_stack, synthesize_tenant_stack, tenant_scoped_preview_backend,
-    validate_flux_git_source_url, validate_git_source_url, validate_preview_branch,
+    is_ssh_git_url, is_tenant_scoped_backend, parse_preview_key, pko_project_repo_url, preview_key,
+    preview_secret_copy_name, preview_stack_name, synthesize_ephemeral_preview,
+    synthesize_k8s_manifest_pulumi_yaml, synthesize_management_core_stack, synthesize_tenant_stack,
+    validate_flux_git_source_url, validate_git_source_url,
 };
 
 /// Errors produced by `keel-pko` synthesis and preview diff parsing.

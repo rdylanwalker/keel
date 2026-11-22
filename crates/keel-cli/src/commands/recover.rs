@@ -25,20 +25,6 @@ use super::bootstrap::state::{
     stage0_s3_prefix, stage0_stack_name,
 };
 
-/// Outcome of `keel bootstrap recover`.
-#[derive(Debug, Clone)]
-pub struct BootstrapRecoverOutcome {
-    /// Pulumi DIY backend URL of the escrowed Stage 0 state.
-    pub backend_url: String,
-    /// Stage 0 stacks covered by the plan.
-    pub stacks: Vec<String>,
-    /// Planned `pulumi` argv per step (env-only secrets are not shown).
-    pub pulumi_commands: Vec<Vec<String>>,
-    /// `true` when the plan was executed (not `--dry-run` / `--list-versions`).
-    pub executed: bool,
-    pub output: String,
-}
-
 fn validate_recover_args(args: &BootstrapRecoverArgs) -> Result<(S3Endpoint, String), CliError> {
     let endpoint = S3Endpoint::parse(&args.s3_endpoint, "--s3-endpoint")?;
     validate_dns_label(&args.bucket, "bucket")?;
@@ -194,9 +180,7 @@ fn prerequisites_text(cluster: &str) -> String {
 }
 
 /// Executes `keel bootstrap recover`.
-pub async fn execute_bootstrap_recover(
-    args: &BootstrapRecoverArgs,
-) -> Result<BootstrapRecoverOutcome, CliError> {
+pub async fn execute_bootstrap_recover(args: &BootstrapRecoverArgs) -> Result<String, CliError> {
     let (endpoint, backend_url) = validate_recover_args(args)?;
     let prefix = stage0_s3_prefix(&args.cluster_name);
 
@@ -222,13 +206,7 @@ pub async fn execute_bootstrap_recover(
         for (idx, argv) in cmds.iter().enumerate() {
             output.push_str(&format!("  {}. {}\n", idx + 1, argv.join(" ")));
         }
-        return Ok(BootstrapRecoverOutcome {
-            backend_url,
-            stacks,
-            pulumi_commands: cmds,
-            executed: false,
-            output,
-        });
+        return Ok(output);
     }
 
     let creds = S3Credentials::from_env().ok_or_else(|| {
@@ -287,13 +265,7 @@ pub async fn execute_bootstrap_recover(
         {
             output.push_str(&format!("  {}\n", v.key));
         }
-        return Ok(BootstrapRecoverOutcome {
-            backend_url,
-            pulumi_commands: plan_commands(args, &stacks),
-            stacks,
-            executed: false,
-            output,
-        });
+        return Ok(output);
     }
 
     let passphrase = resolve_passphrase(args)?;
@@ -455,13 +427,7 @@ pub async fn execute_bootstrap_recover(
         "\nRecovery complete. Verify with `kubectl get pods -A` and `flux get all -A`.\n",
     );
 
-    Ok(BootstrapRecoverOutcome {
-        backend_url,
-        pulumi_commands: plan_commands(args, &stacks),
-        stacks,
-        executed: true,
-        output,
-    })
+    Ok(output)
 }
 
 #[cfg(test)]
@@ -498,16 +464,15 @@ mod tests {
             "v1",
         ]);
         let out = execute_bootstrap_recover(&args).await.unwrap();
-        assert!(!out.executed);
-        assert_eq!(out.stacks, vec!["stage0-control-plane-keel-mgmt"]);
-        assert!(out.backend_url.starts_with("s3://pulumi-state/stage0/keel-mgmt?endpoint=127.0.0.1:8333&region=us-east-1&s3ForcePathStyle=true&disableSSL=true"));
-        assert!(out.output.contains(
+        assert!(out.contains("Stacks:        stage0-control-plane-keel-mgmt\n"));
+        assert!(out.contains("Backend URL:   s3://pulumi-state/stage0/keel-mgmt?endpoint=127.0.0.1:8333&region=us-east-1&s3ForcePathStyle=true&disableSSL=true"));
+        assert!(out.contains(
             "pulumi refresh --yes --non-interactive --stack stage0-control-plane-keel-mgmt"
         ));
-        assert!(out.output.contains("pulumi stack import"));
-        assert!(out.output.contains("kubeconfig <stdin>"));
-        assert!(out.output.contains("AWS_ACCESS_KEY_ID"));
-        assert!(!out.output.contains("pulumi login"));
+        assert!(out.contains("pulumi stack import"));
+        assert!(out.contains("kubeconfig <stdin>"));
+        assert!(out.contains("AWS_ACCESS_KEY_ID"));
+        assert!(!out.contains("pulumi login"));
     }
 
     #[tokio::test]

@@ -536,7 +536,7 @@ pub const CLUSTER_SCOPED_KINDS: &[&str] = &[
     "VolumeSnapshotClass",
 ];
 
-/// Returns the distinct well-known cluster-scoped kinds ([`CLUSTER_SCOPED_KINDS`]) declared by a
+/// Returns the distinct well-known cluster-scoped kinds (`CLUSTER_SCOPED_KINDS`) declared by a
 /// (raw or rendered) multi-document manifest, in first-seen order. Documents that do not parse
 /// as YAML mappings are skipped (structure is validated separately).
 pub fn manifest_cluster_scoped_kinds(raw_yaml: &str) -> Vec<String> {
@@ -823,7 +823,7 @@ pub const DEFAULT_PLATFORM_BASE_DOMAIN: &str = "keel.local";
 pub const PLATFORM_HOST_LABELS: &[&str] = &["idp", "keel", "forgejo"];
 
 /// Extracts the lower-cased `spec.hostnames` of every Gateway API route document
-/// ([`GATEWAY_ROUTE_KINDS`], `gateway.networking.k8s.io/*`) in `docs`.
+/// (`GATEWAY_ROUTE_KINDS`, `gateway.networking.k8s.io/*`) in `docs`.
 pub fn gateway_route_hostnames(docs: &[Value]) -> Vec<String> {
     let mut hosts = Vec::new();
     for doc in docs {
@@ -863,8 +863,8 @@ fn url_host(url: &str) -> Option<String> {
 }
 
 /// Hostnames tenant routes must never claim on the shared Gateway: the platform hosts derived
-/// from [`DEFAULT_PLATFORM_BASE_DOMAIN`] plus, for every platform URL given (OIDC issuer, Keel
-/// redirect URL, ...), its host and `<label>.<base-domain>` for each [`PLATFORM_HOST_LABELS`]
+/// from `DEFAULT_PLATFORM_BASE_DOMAIN` plus, for every platform URL given (OIDC issuer, Keel
+/// redirect URL, ...), its host and `<label>.<base-domain>` for each `PLATFORM_HOST_LABELS`
 /// entry (base domain = the host minus its first label, as Stage 0 derives it).
 pub fn platform_reserved_hostnames<'a>(
     platform_urls: impl IntoIterator<Item = &'a str>,

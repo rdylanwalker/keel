@@ -3,36 +3,36 @@
 //! Stateless Axum HTTP and SSE REST API server, OIDC PKCE
 //! authentication handler, and embedded React SPA static asset host (`SDD.md` §6.1, §6.3, §7.3).
 
-pub mod auth;
-pub mod error;
-pub mod preview_lifecycle;
-pub mod proposal_repo;
-pub mod routes;
-pub mod security;
-pub mod spa;
-pub mod ssh;
-pub mod state;
-pub mod tenant_repos;
+mod auth;
+mod error;
+mod preview_lifecycle;
+mod proposal_repo;
+mod routes;
+mod security;
+mod spa;
+mod ssh;
+mod state;
+mod tenant_repos;
 
 use axum::Router;
 use axum::routing::{delete, get, post, put};
 use tower_http::trace::TraceLayer;
 
-pub use auth::{
-    AuthLoginResponse, AuthLogoutResponse, AuthSession, AuthStatusResponse, CliExchangeRequest,
-    CliExchangeResponse, PKCE_COOKIE_NAME, SESSION_COOKIE_NAME, SessionClaims,
-    decrypt_session_token, encrypt_session_token,
+pub use auth::{SESSION_COOKIE_NAME, SessionClaims, encrypt_session_token};
+pub use error::ServerError;
+pub use preview_lifecycle::{
+    PREVIEW_RECONCILE_INTERVAL, gc_preview_for_pr, reconcile_previews_once,
+    spawn_preview_reconciler,
 };
-pub use error::{ErrorResponse, ServerError};
-pub use keel_core::StackSshInfoResponse;
-pub use routes::CatalogItemDto;
 pub use state::{
-    AppState, CachedPreview, ClusterStateProvider, KubeClusterStateProvider, ManifestTree,
-    ReleaseSummary, RepoClusterStateProvider, StackSummary, TenantManifestSource,
+    AppState, ClusterStateProvider, KubeClusterStateProvider, ReleaseSummary,
+    RepoClusterStateProvider, StackSummary,
 };
 pub use tenant_repos::{
-    TenantRepoCloneBase, TenantRepoForge, TenantRepoForgeKind, TenantRepoLayout,
-    TenantRepoManifests, TenantRepoNaming, TenantRepos,
+    StepOutcome, TENANT_REPO_DESCRIPTION, TenantCredentialSecrets, TenantRepoCloneBase,
+    TenantRepoForge, TenantRepoForgeKind, TenantRepoManifests, TenantRepoNaming, TenantRepos,
+    complete_cluster_provisioning, generate_tenant_age_key, provision_forge, provisioning_error,
+    reconcile_tenant_credential, tenant_push_url,
 };
 
 /// Builds the complete stateless Axum [`Router`] with all REST, SSE, auth, and embedded SPA routes.

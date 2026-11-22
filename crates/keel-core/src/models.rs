@@ -1541,7 +1541,7 @@ impl CatalogApplication {
 
     /// For a multi-namespace manifest app ([`Self::multi_namespace_placement`]), rejects rendered
     /// manifests with a namespaced object (any kind outside
-    /// [`crate::catalog::CLUSTER_SCOPED_KINDS`]) that does not name one of the placement
+    /// `crate::catalog::CLUSTER_SCOPED_KINDS`) that does not name one of the placement
     /// namespaces in `metadata.namespace`: without a Flux `targetNamespace` such an object would
     /// land in an arbitrary namespace of the workload cluster. A no-op for other apps.
     pub fn ensure_manifest_namespaces(&self, rendered_yaml: &str) -> Result<(), CoreError> {

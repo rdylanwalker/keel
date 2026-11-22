@@ -342,7 +342,7 @@ pub trait PreviewCluster: Send + Sync {
     /// Preview prerequisites of a tenant with its own repository (`source`, derived by keel-server
     /// from the platform forge configuration, never from the tenant-editable `keel-gitops`
     /// object): validates the platform-written `tenant-<id>/keel-gitops-credentials` Secret
-    /// ([`crate::tenant_repo_preview_secret_payload`]) and mirrors the tenant-scoped state
+    /// (`tenant_repo_preview_secret_payload`) and mirrors the tenant-scoped state
     /// identity. `git_secret` is that Secret, `git_secret_keys` exactly the keys a preview copies
     /// (HTTPS `username`/`password`, SSH `sshPrivateKey`/`known_hosts`) and `git_url` the tenant
     /// repository URL. Fails closed with [`KubeError::PreviewSourceUnavailable`].
@@ -840,7 +840,7 @@ impl PreviewCluster for KubePreviewCluster {
                     "tenant `{tenant}` has no repository read credential `{tenant_ns}/{TENANT_GITOPS_CREDENTIALS_SECRET_NAME}`; re-run tenant provisioning (POST /api/v1/tenants)"
                 ))
             })?;
-        let payload = crate::tenant_repo_preview_secret_payload(source, &secret)?;
+        let payload = crate::tenant_repo::tenant_repo_preview_secret_payload(source, &secret)?;
         self.ensure_service_account().await;
         self.ensure_preview_ca_bundle().await;
         Ok(PreviewPrerequisites {
@@ -1110,7 +1110,7 @@ impl PreviewCluster for KubePreviewCluster {
 #[cfg(any(test, feature = "test-support"))]
 mod in_memory;
 #[cfg(any(test, feature = "test-support"))]
-pub use in_memory::{InMemoryPreviewCluster, InMemoryPreviewSecret};
+pub use in_memory::InMemoryPreviewCluster;
 
 #[cfg(test)]
 mod tests {

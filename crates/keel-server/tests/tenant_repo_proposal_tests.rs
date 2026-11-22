@@ -987,7 +987,7 @@ async fn merge_close_and_reconcile_collect_previews_per_repository() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    let outcome = keel_server::preview_lifecycle::reconcile_previews_once(&fx.state).await;
+    let outcome = keel_server::reconcile_previews_once(&fx.state).await;
     assert_eq!(outcome.unknown_prs, 0, "{outcome:?}");
     assert!(fx.cluster.stack_names().is_empty());
     assert!(fx.cluster.preview_secret_names().is_empty());

@@ -452,7 +452,7 @@ impl ForgejoGiteaProvider {
 
     /// Fails closed unless `org` is controlled only by Keel:
     ///
-    /// - the [`ORG_OWNERS_TEAM`] team's members are exactly `owners` (case-insensitive);
+    /// - the `ORG_OWNERS_TEAM` team's members are exactly `owners` (case-insensitive);
     /// - every other team not named in `managed_teams` has neither
     ///   `includes_all_repositories` nor access to any repository.
     ///

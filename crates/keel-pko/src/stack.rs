@@ -331,7 +331,7 @@ impl PkoGitAuth {
 }
 
 /// PKO v2 Git source fields of a `Stack` spec (`projectRepo`, `branch` | `commit`, `repoDir`,
-/// `gitAuth`), flattened into [`PkoStackSpec`]. The workspace pod clones `projectRepo` directly,
+/// `gitAuth`), flattened into `PkoStackSpec`. The workspace pod clones `projectRepo` directly,
 /// so tenant and preview Stacks never download a Flux artifact from `source-controller`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -455,7 +455,7 @@ pub fn validate_git_source_url(url: &str) -> Result<(), PkoError> {
 
 /// Like [`validate_git_source_url`] but also accepts `http://`: the URL schemes a Flux
 /// `GitRepository` may use (e.g. the in-cluster Forgejo Service
-/// [`IN_CLUSTER_FORGEJO_HTTP_HOST`]). Never put such a URL in a PKO Stack as is; map it with
+/// `IN_CLUSTER_FORGEJO_HTTP_HOST`). Never put such a URL in a PKO Stack as is; map it with
 /// [`pko_project_repo_url`].
 pub fn validate_flux_git_source_url(url: &str) -> Result<(), PkoError> {
     validate_network_git_url(url, true)
@@ -1004,10 +1004,10 @@ impl PkoWorkspaceTemplate {
     /// in-cluster Forgejo through its HTTPS ingress (`https://forgejo.<domain>`, signed by the
     /// self-signed Keel CA):
     ///
-    /// * volume [`KEEL_CA_VOLUME_NAME`] from the namespace-local **public** CA ConfigMap
+    /// * volume `KEEL_CA_VOLUME_NAME` from the namespace-local **public** CA ConfigMap
     ///   [`KEEL_CA_BUNDLE_CONFIGMAP`] (key `ca.crt`), `optional: true` so a namespace without it
     ///   (external forge with a public CA) still starts and simply uses the system roots;
-    /// * mounted read-only at [`KEEL_CA_MOUNT_PATH`] into `fetch` (a strategic-merge patch of PKO's
+    /// * mounted read-only at `KEEL_CA_MOUNT_PATH` into `fetch` (a strategic-merge patch of PKO's
     ///   own init container, matched by name) and `pulumi`;
     /// * `SSL_CERT_DIR=/etc/ssl/certs:/etc/keel-ca` on both (Go reads every PEM in those dirs).
     ///
@@ -1520,7 +1520,7 @@ pub fn parse_preview_key(key: &str) -> (Option<&str>, &str) {
 }
 
 /// Preview `Stack` name of a [`preview_key`]: `preview-stack-pr-<key>`, shortened with a stable
-/// hash suffix to at most [`MAX_PREVIEW_STACK_NAME_LEN`] characters.
+/// hash suffix to at most `MAX_PREVIEW_STACK_NAME_LEN` characters.
 pub fn preview_stack_name(key: &str) -> Result<String, PkoError> {
     let key = sanitize_pr_id(key)?;
     let full = format!("preview-stack-pr-{key}");
@@ -1575,7 +1575,7 @@ pub fn is_tenant_scoped_backend(backend_url: &str, tenant: &str) -> bool {
 }
 
 /// Pins an S3 DIY backend to the tenant prefix (`s3://<bucket>/tenants/<tenant>[?query]`),
-/// matching `keel_kube::tenant::tenant_s3_backend_url`. Already-scoped and non-S3 backends are
+/// matching `keel_kube::tenant_s3_backend_url`. Already-scoped and non-S3 backends are
 /// returned unchanged.
 pub fn tenant_scoped_preview_backend(backend_url: &str, tenant: &str) -> String {
     if is_tenant_scoped_backend(backend_url, tenant) {

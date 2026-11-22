@@ -537,7 +537,7 @@ pub trait ForgeProvider: Send + Sync {
         Err(ForgeError::unsupported("revoke_deploy_key"))
     }
 
-    /// Protects [`PROTECTED_MAIN_BRANCH`] of `repo`: no direct or force pushes and no deletion
+    /// Protects `PROTECTED_MAIN_BRANCH` of `repo`: no direct or force pushes and no deletion
     /// (also for repository admins), changes only through merged PRs/MRs, no required approvals
     /// (Keel merges after its own checks).
     ///

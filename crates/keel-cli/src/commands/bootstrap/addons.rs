@@ -6,7 +6,7 @@ use std::time::Duration;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use keel_core::{ClusterConnection, FLUX_SYSTEM_NAMESPACE, KEEL_SYSTEM_NAMESPACE};
-use keel_kube::tenant::build_tenant_reconciler_rbac_yaml;
+use keel_kube::build_tenant_reconciler_rbac_yaml;
 
 use super::forge::{render_forgejo_admin_secret_yaml, resolve_forgejo_admin_password};
 use super::kube::{KubeTarget, find_gateway_service};

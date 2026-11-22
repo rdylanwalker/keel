@@ -88,7 +88,7 @@ pub enum TenantRepoTransport {
 }
 
 impl TenantRepoTransport {
-    /// `https` | `ssh` (value of [`GIT_TRANSPORT_ANNOTATION`]).
+    /// `https` | `ssh` (value of `GIT_TRANSPORT_ANNOTATION`).
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Https => "https",
@@ -785,9 +785,9 @@ pub const CREDENTIAL_ID_ANNOTATION: &str = "keel.io/credential-id";
 /// issued for (a credential for another URL is rotated).
 pub const CREDENTIAL_REPO_URL_ANNOTATION: &str = "keel.io/repo-url";
 
-/// [`build_tenant_gitops_credentials_secret`] as a typed `Secret` ready for the Kubernetes API:
-/// `stringData` folded into `data`, plus the non-secret [`CREDENTIAL_ID_ANNOTATION`] and
-/// [`CREDENTIAL_REPO_URL_ANNOTATION`].
+/// `build_tenant_gitops_credentials_secret` as a typed `Secret` ready for the Kubernetes API:
+/// `stringData` folded into `data`, plus the non-secret `CREDENTIAL_ID_ANNOTATION` and
+/// `CREDENTIAL_REPO_URL_ANNOTATION`.
 pub fn tenant_gitops_credentials_secret(
     source: &TenantRepoSource,
     credential: &TenantRepoCredential,
@@ -1029,7 +1029,7 @@ pub fn is_full_commit_sha(commit: &str) -> bool {
 /// `gitSource` of an ephemeral preview `Stack` for a tenant repository PR: pinned to the PR head
 /// `commit` (a full SHA, [`is_full_commit_sha`]; never a moving branch), authenticated with the
 /// per-preview credential copy `preview_secret_name` in `keel-previews` (keys
-/// [`tenant_repo_preview_secret_keys`]). The checkout is not shallow
+/// `tenant_repo_preview_secret_keys`). The checkout is not shallow
 /// ([`PkoGitSource::commit`]), so the pinned commit still resolves after a later push moves the
 /// PR branch tip.
 pub fn tenant_repo_preview_git_source(
