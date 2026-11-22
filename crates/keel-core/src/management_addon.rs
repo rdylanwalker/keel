@@ -1215,6 +1215,11 @@ mod tests {
                 json!({"securityContext": {"allowPrivilegeEscalation": true}}),
                 "/securityContext",
             ),
+            // Tenant Stack/Program access depends on the chart's aggregated roles.
+            (
+                json!({"rbac": {"createClusterAggregationRoles": false}}),
+                "/rbac",
+            ),
         ] {
             assert_rejected("pulumi-kubernetes-operator", &doc, values, needle);
         }

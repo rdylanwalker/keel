@@ -14,5 +14,6 @@ resources:
   - restrict-tenant-route-hostnames.yaml
   - restrict-tenant-flux-sources.yaml
   - restrict-tenant-flux-source-status.yaml
+  - restrict-tenant-pulumi-objects.yaml
   - protect-platform-owned-tenant-objects.yaml
   - sync-keel-ca-bundle.yaml

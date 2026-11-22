@@ -26,8 +26,8 @@ pub use kyverno::{
     build_protect_control_plane_policy, build_protect_platform_owned_tenant_objects_policy,
     build_restrict_pulumi_providers_policy, build_restrict_pulumi_providers_policy_for_registry,
     build_restrict_tenant_flux_source_status_policy, build_restrict_tenant_flux_sources_policy,
-    build_sync_keel_ca_bundle_manifests, is_tenant_subject, platform_owned_writers,
-    pulumi_provider_allowlist,
+    build_restrict_tenant_pulumi_objects_policy, build_sync_keel_ca_bundle_manifests,
+    is_tenant_subject, platform_owned_writers, pulumi_provider_allowlist,
 };
 pub use live::{
     CanaryStatusInfo, ClusterEventSummary, KubeClusterStatusReader, LiveResourceInfo,

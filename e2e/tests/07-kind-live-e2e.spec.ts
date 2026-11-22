@@ -2095,4 +2095,219 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
       logStep('keel-gitops: reconcile request admitted, other annotation changes denied');
     });
   });
+
+  test('07.5 - Tenant PKO hardening: no Workspace/Update/Stack status writes, no keel.io/protect, HelmRelease SA', async () => {
+    const tenantNs = 'tenant-acme';
+    const freshCluster = bootstrapOutput !== '';
+    const policyExists = (name: string) =>
+      tryCmd('kubectl', ['get', 'validatingpolicies.policies.kyverno.io', name]).ok;
+    // A tenant group member that RBAC fully allows (`system:masters`): only Kyverno's
+    // `restrict-tenant-pulumi-objects` (tenant subject in matchConditions) can deny it. The same
+    // request without the tenant group is not a tenant subject and must be admitted (dry run).
+    const forgedTenant = [
+      '--as=keel-e2e-tenant-user',
+      '--as-group=tenant-acme-admins',
+      '--as-group=system:masters',
+    ];
+    const admin = ['--as=keel-e2e-admin', '--as-group=system:masters'];
+    const tenantSa = `system:serviceaccount:${tenantNs}:${tenantNs}-sa`;
+    const dryRunApply = (identity: string[], manifest: string[]) =>
+      runCmdStdin(
+        'kubectl',
+        [...identity, 'apply', '--dry-run=server', '-f', '-'],
+        [...manifest, ''].join('\n'),
+      );
+    const pulumiDenied =
+      /restrict-tenant-pulumi-objects|Tenant identities may not|Tenant Stacks may not/;
+
+    await test.step('1. PKO aggregated roles are installed and give the tenant SA Stacks', async () => {
+      const aggregated = runCmd('kubectl', [
+        'get',
+        'clusterroles',
+        '-l',
+        'rbac.authorization.k8s.io/aggregate-to-edit=true',
+        '-o',
+        'jsonpath={.items[*].metadata.name}',
+      ]).split(/\s+/);
+      expect(
+        aggregated.some((n) => n.includes('pulumi-kubernetes-operator') && n.endsWith('-edit')),
+        `PKO edit aggregation ClusterRole: ${aggregated.join(',')}`,
+      ).toBe(true);
+      const canI = tryCmd('kubectl', [
+        'auth',
+        'can-i',
+        'create',
+        'stacks.pulumi.com',
+        '-n',
+        tenantNs,
+        `--as=${tenantSa}`,
+      ]).stdout.trim();
+      expect(canI, `${tenantSa} creates Stacks through the aggregated roles`).toBe('yes');
+    });
+
+    if (!policyExists('restrict-tenant-pulumi-objects')) {
+      expect(
+        freshCluster,
+        'restrict-tenant-pulumi-objects must exist after a fresh bootstrap',
+      ).toBe(false);
+      logStep('Reused cluster predates restrict-tenant-pulumi-objects; skipping admission checks');
+      return;
+    }
+
+    await test.step('2. Tenant identities cannot write auto.pulumi.com Workspaces or Updates', async () => {
+      for (const kind of ['Workspace', 'Update']) {
+        const manifest = [
+          'apiVersion: auto.pulumi.com/v1alpha1',
+          `kind: ${kind}`,
+          'metadata:',
+          `  name: keel-e2e-probe-${kind.toLowerCase()}`,
+          `  namespace: ${tenantNs}`,
+          'spec: {}',
+        ];
+        const forged = dryRunApply(forgedTenant, manifest);
+        expect(forged.ok, forged.out).toBe(false);
+        expect(forged.out).toMatch(pulumiDenied);
+        const sa = dryRunApply([`--as=${tenantSa}`], manifest);
+        expect(sa.ok, sa.out).toBe(false);
+        expect(sa.out).toMatch(pulumiDenied);
+        const control = dryRunApply(admin, manifest);
+        expect(control.ok, `non-tenant ${kind} (dry run) must pass: ${control.out}`).toBe(true);
+        logStep(`${kind} in ${tenantNs}: tenant identities denied, admin admitted`);
+      }
+    });
+
+    await test.step('3. Tenant identities cannot write Stack status', async () => {
+      const stacks = runCmd('kubectl', [
+        'get',
+        'stacks.pulumi.com',
+        '-A',
+        '-o',
+        'jsonpath={range .items[*]}{.metadata.namespace}/{.metadata.name}{"\\n"}{end}',
+      ])
+        .split('\n')
+        .filter((l) => l.startsWith('tenant-'));
+      if (stacks.length === 0) {
+        logStep('No tenant Stack exists; Stack status probe skipped');
+        return;
+      }
+      const [ns, name] = stacks[0].split('/');
+      const patchStatus = (identity: string[]) =>
+        runCmdAll('kubectl', [
+          ...identity,
+          'patch',
+          'stacks.pulumi.com',
+          name,
+          '-n',
+          ns,
+          '--subresource=status',
+          '--type=merge',
+          '-p',
+          '{"status":{"observedGeneration":1}}',
+          '--dry-run=server',
+        ]);
+      const forged = patchStatus(forgedTenant);
+      expect(forged.ok, forged.out).toBe(false);
+      expect(forged.out).toMatch(pulumiDenied);
+      const control = patchStatus(admin);
+      expect(control.ok, `non-tenant Stack status write (dry run) must pass: ${control.out}`).toBe(
+        true,
+      );
+      logStep(`${ns}/${name}: tenant Stack status writes denied`);
+    });
+
+    await test.step('4. Tenant Stacks cannot carry keel.io/protect, protect config or the management Stack name', async () => {
+      const stack = (name: string, labels: string[], spec: string[] = []) => [
+        'apiVersion: pulumi.com/v1',
+        'kind: Stack',
+        'metadata:',
+        `  name: ${name}`,
+        `  namespace: ${tenantNs}`,
+        '  labels:',
+        '    keel.io/provider: kind',
+        ...labels,
+        'spec:',
+        '  stack: keel-e2e-probe',
+        ...spec,
+      ];
+      const protectedStack = stack('keel-e2e-probe-protect', ['    keel.io/protect: "true"']);
+      const forged = dryRunApply(forgedTenant, protectedStack);
+      expect(forged.ok, forged.out).toBe(false);
+      expect(forged.out).toMatch(pulumiDenied);
+      const sa = dryRunApply([`--as=${tenantSa}`], protectedStack);
+      expect(sa.ok, sa.out).toBe(false);
+      expect(sa.out).toMatch(pulumiDenied);
+      const reserved = dryRunApply(forgedTenant, stack('management-cluster-core', []));
+      expect(reserved.ok, reserved.out).toBe(false);
+      expect(reserved.out).toMatch(/restrict-tenant-pulumi-objects|reserved/);
+      // `spec.config.protect` / `spec.config["keel:protect"]` count as protection for Keel's
+      // force-delete and preview GC, so tenants may not set them either.
+      for (const key of ['protect', '"keel:protect"']) {
+        const res = dryRunApply(
+          [`--as=${tenantSa}`],
+          stack('keel-e2e-probe-protect-config', [], ['  config:', `    ${key}: "true"`]),
+        );
+        expect(res.ok, `tenant Stack with spec.config.${key} (dry run): ${res.out}`).toBe(false);
+        expect(res.out).toMatch(pulumiDenied);
+      }
+      // Positive control: the same tenant Stack without the label is admitted.
+      const plain = dryRunApply([`--as=${tenantSa}`], stack('keel-e2e-probe-plain', []));
+      expect(plain.ok, `unlabelled tenant Stack (dry run) must pass: ${plain.out}`).toBe(true);
+      logStep(
+        'Tenant Stacks: keel.io/protect, protect config and management-cluster-core denied, plain Stack admitted',
+      );
+    });
+
+    await test.step('5. Tenant HelmReleases must impersonate tenant-<id>-sa', async () => {
+      const exprs = tryCmd('kubectl', [
+        'get',
+        'validatingpolicies.policies.kyverno.io',
+        'restrict-tenant-flux-sources',
+        '-o',
+        'jsonpath={.spec.validations[*].expression}',
+      ]).stdout;
+      if (!exprs.includes('HelmRelease')) {
+        expect(freshCluster, 'fresh clusters carry the HelmRelease SA rule').toBe(false);
+        logStep('Reused cluster predates the HelmRelease SA rule; skipping');
+        return;
+      }
+      // Every HelmRelease Keel committed for a tenant already satisfies the rule.
+      const releases = runCmd('kubectl', [
+        'get',
+        'helmreleases.helm.toolkit.fluxcd.io',
+        '-A',
+        '-o',
+        'jsonpath={range .items[*]}{.metadata.namespace} {.spec.serviceAccountName}{"\\n"}{end}',
+      ])
+        .split('\n')
+        .filter((l) => l.startsWith('tenant-'));
+      for (const line of releases) {
+        const [ns, sa] = line.split(' ');
+        expect(sa, `HelmRelease in ${ns} impersonates ${ns}-sa`).toBe(`${ns}-sa`);
+      }
+      const hr = (serviceAccount: string | null) => [
+        'apiVersion: helm.toolkit.fluxcd.io/v2',
+        'kind: HelmRelease',
+        'metadata:',
+        '  name: keel-e2e-probe',
+        `  namespace: ${tenantNs}`,
+        'spec:',
+        '  interval: 10m',
+        ...(serviceAccount ? [`  serviceAccountName: ${serviceAccount}`] : []),
+        '  chart:',
+        '    spec:',
+        '      chart: podinfo',
+        '      sourceRef:',
+        '        kind: HelmRepository',
+        '        name: keel-e2e-probe',
+      ];
+      for (const sa of [null, 'default']) {
+        const res = dryRunApply(admin, hr(sa));
+        expect(res.ok, res.out).toBe(false);
+        expect(res.out).toMatch(/restrict-tenant-flux-sources|tenant-<id>-sa/);
+      }
+      const ok = dryRunApply(admin, hr(`${tenantNs}-sa`));
+      expect(ok.ok, `HelmRelease with the tenant SA (dry run) must pass: ${ok.out}`).toBe(true);
+      logStep(`${tenantNs} HelmReleases: missing/foreign SA denied, ${tenantNs}-sa admitted`);
+    });
+  });
 });

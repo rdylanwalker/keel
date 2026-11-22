@@ -34,6 +34,10 @@ pub const POLICY_RESTRICT_TENANT_RECONCILER: &str = "restrict-tenant-reconciler"
 pub const POLICY_RESTRICT_TENANT_ROUTE_HOSTNAMES: &str = "restrict-tenant-route-hostnames";
 pub const POLICY_RESTRICT_TENANT_FLUX_SOURCES: &str = "restrict-tenant-flux-sources";
 pub const POLICY_RESTRICT_TENANT_FLUX_SOURCE_STATUS: &str = "restrict-tenant-flux-source-status";
+/// `ValidatingPolicy` denying tenant subjects writes to PKO-internal objects (`auto.pulumi.com`
+/// Workspaces / Updates, `stacks/status`) and the anti-lockout markers on Stacks
+/// ([`build_restrict_tenant_pulumi_objects_policy`]).
+pub const POLICY_RESTRICT_TENANT_PULUMI_OBJECTS: &str = "restrict-tenant-pulumi-objects";
 /// `GeneratingPolicy` cloning the public `keel-system/keel-ca-bundle` into `keel-previews` and
 /// every `tenant-*` namespace ([`build_sync_keel_ca_bundle_manifests`]).
 pub const POLICY_SYNC_KEEL_CA_BUNDLE: &str = "sync-keel-ca-bundle";
@@ -608,9 +612,12 @@ pub fn build_restrict_tenant_reconciler_policy() -> Value {
 ///   republish another source's artifact (the whole GitOps repository) into the tenant namespace.
 ///   Updates that leave `spec` unchanged and objects being deleted pass (finalizer removal), and
 ///   deletions are never matched.
-/// * Flux `Kustomization`s in `tenant-<id>` must impersonate `tenant-<id>-sa`
-///   (`spec.serviceAccountName`). Updates that leave `spec` unchanged (finalizer removal, reconcile
-///   annotations) and objects being deleted are always allowed.
+/// * Flux `Kustomization`s and `HelmRelease`s in `tenant-<id>` must impersonate `tenant-<id>-sa`
+///   (`spec.serviceAccountName`; without it the controllers impersonate the namespace's `default`
+///   ServiceAccount under the `--default-service-account=default` lockdown). Keel pins the single
+///   tenant identity so RBAC and quota do not depend on that controller flag. Updates that leave
+///   `spec` unchanged (finalizer removal, reconcile annotations) and objects being deleted are
+///   always allowed, so releases written before the rule can still be finalized and deleted.
 pub fn build_restrict_tenant_flux_sources_policy() -> Value {
     json!({
         "apiVersion": "policies.kyverno.io/v1",
@@ -649,6 +656,12 @@ pub fn build_restrict_tenant_flux_sources_policy() -> Value {
                         "apiVersions": ["*"],
                         "operations": ["CREATE", "UPDATE"],
                         "resources": ["kustomizations"]
+                    },
+                    {
+                        "apiGroups": ["helm.toolkit.fluxcd.io"],
+                        "apiVersions": ["*"],
+                        "operations": ["CREATE", "UPDATE"],
+                        "resources": ["helmreleases"]
                     }
                 ]
             },
@@ -672,6 +685,10 @@ pub fn build_restrict_tenant_flux_sources_policy() -> Value {
                 {
                     "expression": format!("!(request.kind.group == 'kustomize.toolkit.fluxcd.io' && request.kind.kind == 'Kustomization') || (has(object.spec) && has(object.spec.serviceAccountName) && object.spec.serviceAccountName == variables.ns + '-sa') || {CEL_SPEC_PRESERVING_UPDATE}"),
                     "message": "Flux Kustomizations in a tenant namespace `tenant-<id>` must set `spec.serviceAccountName: tenant-<id>-sa` (multi-tenancy lockdown, NFR-SEC-02)."
+                },
+                {
+                    "expression": format!("!(request.kind.group == 'helm.toolkit.fluxcd.io' && request.kind.kind == 'HelmRelease') || (has(object.spec) && has(object.spec.serviceAccountName) && object.spec.serviceAccountName == variables.ns + '-sa') || {CEL_SPEC_PRESERVING_UPDATE}"),
+                    "message": "Flux HelmReleases in a tenant namespace `tenant-<id>` must set `spec.serviceAccountName: tenant-<id>-sa`; without it helm-controller impersonates the namespace `default` ServiceAccount (`--default-service-account=default` lockdown), and Keel pins the single tenant identity (NFR-SEC-02)."
                 }
             ]
         }
@@ -728,6 +745,113 @@ pub fn build_restrict_tenant_flux_source_status_policy() -> Value {
                 {
                     "expression": "(has(request.subResource) ? request.subResource : '') != 'status'",
                     "message": "Tenant identities may not write the status of Flux source objects (a forged `status.artifact` would make Flux apply another source's content); only source-controller writes source status."
+                }
+            ]
+        }
+    })
+}
+
+/// CEL: the request targets the main resource (no subresource such as `status`).
+const CEL_NO_SUBRESOURCE: &str = "(has(request.subResource) ? request.subResource : '') == ''";
+
+/// CEL list of the `Stack` `spec.config` keys Keel treats as protection
+/// ([`crate::live::is_stack_object_protected`], [`keel_pko::PkoStack::is_protected`]).
+const CEL_STACK_PROTECT_CONFIG_KEYS: &str = "['protect', 'keel:protect']";
+
+/// Generates `ValidatingPolicy/restrict-tenant-pulumi-objects` (`policies.kyverno.io/v1`).
+///
+/// The PKO chart's aggregated `edit`/`admin` roles (`rbac.createClusterAggregationRoles`, pinned
+/// in the seed and Stage 0 PKO releases) grant every `pulumi.com` / `auto.pulumi.com` resource to
+/// tenant `admin`s, which tenant Stacks and Programs need. They also cover the operator's own
+/// objects, so this policy denies **tenant subjects** ([`is_tenant_subject`]), in any namespace:
+///
+/// * every `CREATE`/`UPDATE`/`DELETE` of `auto.pulumi.com` objects (`Workspace`, `Update` and
+///   their `status`): they are operator-owned and tenants go through Stacks. This removes a
+///   duplicate path only; it does not by itself enforce provider governance, because
+///   `restrict-pulumi-providers` checks only the Stack's `keel.io/provider` label value and not
+///   `gitSource`/`programRef`/`workspaceTemplate`;
+/// * writes to `stacks/status` (a forged status misreports previews and outputs);
+/// * adding or changing the `keel.io/protect` label on a `Stack` (`protect-control-plane` denies
+///   deleting labelled Stacks, so a tenant could block pruning and preview GC); an `UPDATE` that
+///   keeps the existing value (Stacks labelled before this policy) or drops the label passes;
+/// * adding or changing `spec.config.protect` / `spec.config["keel:protect"]` on a `Stack` (Keel's
+///   force-delete and preview GC treat them as protection, and previews inherit tenant config);
+///   same keep-or-drop semantics as the label;
+/// * creating a `Stack` named `management-cluster-core` (also undeletable by name).
+///
+/// Like [`build_restrict_tenant_flux_source_status_policy`], the tenant-subject test sits inline
+/// in `matchConditions`: the PKO operator, keel-server, keel-tenant-reconciler and cluster admins
+/// never reach the webhook, so an unavailable Kyverno cannot stall PKO reconciliation
+/// (anti-lockout, `NFR-REL-01`). Fails closed for tenant requests.
+pub fn build_restrict_tenant_pulumi_objects_policy() -> Value {
+    let protect = keel_pko::stack::LABEL_PROTECT;
+    let core = keel_pko::stack::MANAGEMENT_CORE_STACK_NAME;
+    json!({
+        "apiVersion": "policies.kyverno.io/v1",
+        "kind": "ValidatingPolicy",
+        "metadata": {
+            "name": POLICY_RESTRICT_TENANT_PULUMI_OBJECTS,
+            "labels": {
+                "app.kubernetes.io/managed-by": "keel",
+                "keel.io/policy-tier": "tenant-isolation"
+            }
+        },
+        "spec": {
+            "validationActions": ["Deny"],
+            "failurePolicy": "Fail",
+            "evaluation": {
+                "background": {
+                    "enabled": false
+                }
+            },
+            "matchConstraints": {
+                "resourceRules": [
+                    {
+                        "apiGroups": ["auto.pulumi.com"],
+                        "apiVersions": ["*"],
+                        "operations": ["CREATE", "UPDATE", "DELETE"],
+                        "resources": ["*", "*/status"]
+                    },
+                    {
+                        "apiGroups": ["pulumi.com"],
+                        "apiVersions": ["*"],
+                        "operations": ["CREATE", "UPDATE"],
+                        "resources": ["stacks", "stacks/status"]
+                    }
+                ]
+            },
+            "matchConditions": [
+                {
+                    "name": "tenant-subject",
+                    "expression": cel_tenant_subject(CEL_REQUEST_USERNAME, CEL_REQUEST_GROUPS)
+                }
+            ],
+            "variables": [
+                {
+                    "name": "stack",
+                    "expression": format!("request.kind.group == 'pulumi.com' && request.kind.kind == 'Stack' && {CEL_NO_SUBRESOURCE}")
+                }
+            ],
+            "validations": [
+                {
+                    "expression": "request.kind.group != 'auto.pulumi.com'",
+                    "message": "Tenant identities may not create, change or delete PKO `auto.pulumi.com` objects (Workspace, Update): they are owned by the Pulumi Kubernetes Operator, which creates them for Stacks. Commit a `Stack` instead."
+                },
+                {
+                    "expression": format!("!(request.kind.group == 'pulumi.com' && request.kind.kind == 'Stack') || {CEL_NO_SUBRESOURCE}"),
+                    "message": "Tenant identities may not write the status of PKO Stacks; only the Pulumi Kubernetes Operator writes Stack status."
+                },
+                {
+                    "expression": format!("!variables.stack || !(object != null && has(object.metadata.labels) && '{protect}' in object.metadata.labels) || (request.operation == 'UPDATE' && oldObject != null && has(oldObject.metadata.labels) && '{protect}' in oldObject.metadata.labels && oldObject.metadata.labels['{protect}'] == object.metadata.labels['{protect}'])"),
+                    "message": format!("Tenant Stacks may not set the `{protect}` label: it makes a Stack undeletable (`protect-control-plane`) and would block pruning and preview garbage collection. Only platform identities may set it.")
+                },
+                {
+                    "expression": format!("!variables.stack || !(object != null && has(object.spec) && has(object.spec.config)) || {keys}.all(k, !(k in object.spec.config) || (request.operation == 'UPDATE' && oldObject != null && has(oldObject.spec) && has(oldObject.spec.config) && (k in oldObject.spec.config) && oldObject.spec.config[k] == object.spec.config[k]))", keys = CEL_STACK_PROTECT_CONFIG_KEYS),
+                    "message": "Tenant Stacks may not set `spec.config.protect` or `spec.config[\"keel:protect\"]`: Keel treats them as protection, so force-delete and preview garbage collection would skip the Stack and its previews. Only platform identities may set them."
+                },
+                {
+                    "expression": format!("!variables.stack || request.operation != 'CREATE' || request.name != '{core}'"),
+                    "message": format!("The Stack name `{core}` is reserved for the protected management control-plane Stack.")
                 }
             ]
         }
@@ -1113,6 +1237,7 @@ impl KyvernoManifestBundle {
             build_restrict_tenant_route_hostnames_policy(&config.reserved_route_hostnames)?,
             build_restrict_tenant_flux_sources_policy(),
             build_restrict_tenant_flux_source_status_policy(),
+            build_restrict_tenant_pulumi_objects_policy(),
             build_protect_platform_owned_tenant_objects_policy(),
         ];
         supporting_manifests.extend(build_sync_keel_ca_bundle_manifests());
@@ -1168,10 +1293,10 @@ mod tests {
 
         let bundle = KyvernoManifestBundle::generate(&cfg).unwrap();
         assert_eq!(bundle.cluster_policies.len(), 3);
-        // 5 ValidatingPolicies + sync-keel-ca-bundle (ClusterRole, binding, GeneratingPolicy).
-        assert_eq!(bundle.supporting_manifests.len(), 8);
+        // 6 ValidatingPolicies + sync-keel-ca-bundle (ClusterRole, binding, GeneratingPolicy).
+        assert_eq!(bundle.supporting_manifests.len(), 9);
         assert!(bundle.policy_exception.is_none());
-        assert_eq!(bundle.all_manifests().len(), 11);
+        assert_eq!(bundle.all_manifests().len(), 12);
         // The only GeneratingPolicy copies the public CA bundle; the retired
         // `sync-tenant-secrets` (control-plane credentials into tenants) never comes back.
         let generating: Vec<Value> = bundle
@@ -1223,7 +1348,7 @@ mod tests {
         };
 
         let bundle = KyvernoManifestBundle::generate(&cfg).unwrap();
-        assert_eq!(bundle.all_manifests().len(), 12);
+        assert_eq!(bundle.all_manifests().len(), 13);
 
         let exc = bundle
             .policy_exception
@@ -1351,12 +1476,16 @@ mod tests {
                 .unwrap(),
             build_restrict_tenant_flux_sources_policy(),
             build_restrict_tenant_flux_source_status_policy(),
+            build_restrict_tenant_pulumi_objects_policy(),
             build_protect_platform_owned_tenant_objects_policy(),
         ];
         for seed in [
             include_str!("../../../deploy/seed/kyverno-policies/restrict-tenant-flux-sources.yaml"),
             include_str!(
                 "../../../deploy/seed/kyverno-policies/restrict-tenant-flux-source-status.yaml"
+            ),
+            include_str!(
+                "../../../deploy/seed/kyverno-policies/restrict-tenant-pulumi-objects.yaml"
             ),
             include_str!(
                 "../../../deploy/seed/kyverno-policies/protect-platform-owned-tenant-objects.yaml"
@@ -1543,6 +1672,8 @@ mod tests {
             "kustomizations",
             "CREATE"
         ));
+        assert!(covers("helm.toolkit.fluxcd.io", "helmreleases", "CREATE"));
+        assert!(covers("helm.toolkit.fluxcd.io", "helmreleases", "UPDATE"));
         // Status writes live in their own policy (requester-filtered matchConditions).
         assert!(rules.iter().all(|r| {
             r["resources"]
@@ -1567,7 +1698,7 @@ mod tests {
         );
 
         let exprs = expressions(&policy);
-        assert_eq!(exprs.len(), 2);
+        assert_eq!(exprs.len(), 3);
         // 1: artifact republishing kinds denied for every requester in tenant namespaces.
         assert!(exprs[0].contains("request.kind.kind == 'ExternalArtifact'"));
         assert!(exprs[0].contains("request.kind.group == 'source.extensions.fluxcd.io'"));
@@ -1582,6 +1713,12 @@ mod tests {
         ));
         // 2: tenant Kustomizations impersonate `tenant-<id>-sa`.
         assert!(exprs[1].contains("object.spec.serviceAccountName == variables.ns + '-sa'"));
+        // 3: tenant HelmReleases too (without it helm-controller would impersonate the namespace
+        // `default` ServiceAccount under the `--default-service-account=default` lockdown).
+        assert!(exprs[2].starts_with(
+            "!(request.kind.group == 'helm.toolkit.fluxcd.io' && request.kind.kind == 'HelmRelease')"
+        ));
+        assert!(exprs[2].contains("object.spec.serviceAccountName == variables.ns + '-sa'"));
     }
 
     #[test]
@@ -1647,6 +1784,166 @@ mod tests {
         let ks = crate::synthesize_flux_kustomization(&input).unwrap();
         let ns = ks["metadata"]["namespace"].as_str().unwrap();
         assert_eq!(ks["spec"]["serviceAccountName"], format!("{ns}-sa"));
+    }
+
+    /// Every tenant HelmRelease Keel synthesizes (local and remote workload clusters) satisfies the
+    /// HelmRelease `serviceAccountName` rule of `restrict-tenant-flux-sources`.
+    #[test]
+    fn synthesized_tenant_helm_releases_use_the_tenant_service_account() {
+        let source = crate::HelmChartSourceRef {
+            kind: crate::HelmChartSourceKind::HelmRepository,
+            name: "podinfo".to_string(),
+            namespace: None,
+        };
+        let local = crate::HelmReleaseSpecInput::new("acme", "web", "podinfo", source.clone());
+        let mut remote = local.clone();
+        remote.kube_config = Some(crate::tenant::RemoteKubeConfigRef::new(
+            "workload-kubeconfig",
+        ));
+        for input in [local, remote] {
+            let hr = crate::synthesize_helm_release(&input).unwrap();
+            let ns = hr["metadata"]["namespace"].as_str().unwrap();
+            assert_eq!(ns, "tenant-acme");
+            assert_eq!(hr["spec"]["serviceAccountName"], format!("{ns}-sa"));
+        }
+    }
+
+    #[test]
+    fn restrict_tenant_pulumi_objects_policy_matches_seed_and_filters_on_tenant_subjects() {
+        let policy = build_restrict_tenant_pulumi_objects_policy();
+        let seed: Value = serde_yml::from_str(include_str!(
+            "../../../deploy/seed/kyverno-policies/restrict-tenant-pulumi-objects.yaml"
+        ))
+        .unwrap();
+        assert_eq!(seed["spec"], policy["spec"]);
+        assert_eq!(seed["metadata"], policy["metadata"]);
+        assert_eq!(
+            policy["metadata"]["name"],
+            POLICY_RESTRICT_TENANT_PULUMI_OBJECTS
+        );
+        assert_eq!(policy["spec"]["failurePolicy"], "Fail");
+        assert_eq!(policy["spec"]["validationActions"], json!(["Deny"]));
+        assert_eq!(policy["spec"]["evaluation"]["background"]["enabled"], false);
+
+        // Every auto.pulumi.com write (incl. status and deletion); Stack create/update + status.
+        assert_eq!(
+            policy["spec"]["matchConstraints"]["resourceRules"],
+            json!([
+                {
+                    "apiGroups": ["auto.pulumi.com"],
+                    "apiVersions": ["*"],
+                    "operations": ["CREATE", "UPDATE", "DELETE"],
+                    "resources": ["*", "*/status"]
+                },
+                {
+                    "apiGroups": ["pulumi.com"],
+                    "apiVersions": ["*"],
+                    "operations": ["CREATE", "UPDATE"],
+                    "resources": ["stacks", "stacks/status"]
+                }
+            ])
+        );
+        // Stack deletion (pruning, preview GC) is never matched; Programs stay tenant-writable.
+        let rules = policy["spec"]["matchConstraints"]["resourceRules"]
+            .as_array()
+            .unwrap();
+        assert!(
+            !rules[1]["operations"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("DELETE"))
+        );
+        assert!(
+            !rules[1]["resources"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("programs"))
+        );
+
+        // Only tenant requesters reach Kyverno: the PKO operator, keel-server, the tenant
+        // reconciler and admins never do (anti-lockout).
+        let conds = policy["spec"]["matchConditions"].as_array().unwrap();
+        assert_eq!(conds.len(), 1);
+        assert_eq!(
+            conds[0]["expression"].as_str().unwrap(),
+            cel_tenant_subject(CEL_REQUEST_USERNAME, CEL_REQUEST_GROUPS)
+        );
+        for platform in [
+            "system:serviceaccount:keel-system:pulumi-kubernetes-operator-controller-manager",
+            "system:serviceaccount:keel-system:keel-server",
+            "system:serviceaccount:flux-system:keel-tenant-reconciler",
+            "system:serviceaccount:flux-system:kustomize-controller",
+        ] {
+            assert!(
+                !is_tenant_subject(platform, &["system:serviceaccounts"]),
+                "{platform}"
+            );
+        }
+        assert!(is_tenant_subject(
+            "system:serviceaccount:tenant-acme:tenant-acme-sa",
+            &[]
+        ));
+
+        assert_eq!(
+            policy["spec"]["variables"],
+            json!([{
+                "name": "stack",
+                "expression": format!("request.kind.group == 'pulumi.com' && request.kind.kind == 'Stack' && {CEL_NO_SUBRESOURCE}")
+            }])
+        );
+        let exprs = expressions(&policy);
+        assert_eq!(exprs.len(), 5);
+        // 1: no auto.pulumi.com write at all.
+        assert_eq!(exprs[0], "request.kind.group != 'auto.pulumi.com'");
+        // 2: no Stack status write.
+        assert_eq!(
+            exprs[1],
+            format!(
+                "!(request.kind.group == 'pulumi.com' && request.kind.kind == 'Stack') || {CEL_NO_SUBRESOURCE}"
+            )
+        );
+        // 3: `keel.io/protect` may not be added or changed; kept or dropped on UPDATE passes.
+        for needle in [
+            "!variables.stack",
+            "'keel.io/protect' in object.metadata.labels",
+            "request.operation == 'UPDATE' && oldObject != null",
+            "oldObject.metadata.labels['keel.io/protect'] == object.metadata.labels['keel.io/protect']",
+        ] {
+            assert!(exprs[2].contains(needle), "{needle}");
+        }
+        // 4: `spec.config.protect` / `spec.config["keel:protect"]` may not be added or changed;
+        // kept or dropped on UPDATE passes. Every key Keel treats as protection is covered.
+        for needle in [
+            "!variables.stack",
+            "has(object.spec.config)",
+            "['protect', 'keel:protect'].all(k, !(k in object.spec.config)",
+            "request.operation == 'UPDATE' && oldObject != null",
+            "(k in oldObject.spec.config) && oldObject.spec.config[k] == object.spec.config[k]",
+        ] {
+            assert!(exprs[3].contains(needle), "{needle}");
+        }
+        for key in keel_pko::stack::CONFIG_PROTECT_KEYS {
+            let protected = json!({ "spec": { "config": { key: "true" } } });
+            assert!(
+                crate::live::is_stack_object_protected(None, &protected),
+                "protection key missing from is_stack_object_protected"
+            );
+            assert!(
+                CEL_STACK_PROTECT_CONFIG_KEYS.contains(&format!("'{key}'")),
+                "protection key missing from the policy"
+            );
+        }
+        let message = policy["spec"]["validations"][3]["message"]
+            .as_str()
+            .unwrap();
+        assert!(message.starts_with("Tenant Stacks may not set `spec.config.protect`"));
+        // 5: the anti-lockout Stack name is reserved.
+        assert!(exprs[4].contains("request.operation != 'CREATE'"));
+        assert!(exprs[4].contains("request.name != 'management-cluster-core'"));
+        // The name and label match what `protect-control-plane` treats as undeletable.
+        let guard = expressions(&build_protect_control_plane_policy())[0].clone();
+        assert!(guard.contains(keel_pko::stack::MANAGEMENT_CORE_STACK_NAME));
+        assert!(guard.contains(&format!("'{}'", keel_pko::stack::LABEL_PROTECT)));
     }
 
     #[test]
@@ -1913,7 +2210,7 @@ mod tests {
             }
         }
         let docs: Vec<&str> = yaml.split("\n---\n").collect();
-        assert_eq!(docs.len(), 12);
+        assert_eq!(docs.len(), 13);
         for doc in docs {
             let parsed: serde_json::Value =
                 serde_yml::from_str(doc).expect("each Kyverno multi-doc YAML part must parse");

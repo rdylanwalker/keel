@@ -1,0 +1,64 @@
+# Kyverno ValidatingPolicy: restrict-tenant-pulumi-objects (NFR-SEC-02, NFR-SEC-04)
+# Mirrors `keel_kube::kyverno::build_restrict_tenant_pulumi_objects_policy()`.
+# The PKO chart's aggregated edit/admin roles (`rbac.createClusterAggregationRoles: true`, pinned
+# in `core-addons/pko.yaml`) give tenant admins every `pulumi.com` / `auto.pulumi.com` resource,
+# which tenant Stacks and Programs need. Tenant identities (`tenant-*` ServiceAccounts and groups,
+# the `keel-previews` identity) are denied, in any namespace:
+# * every write to `auto.pulumi.com` objects (Workspace, Update, their status): they are
+#   operator-owned and tenants go through Stacks. This removes a duplicate path only; provider
+#   governance is not enforced by it (`restrict-pulumi-providers` checks only the Stack's
+#   `keel.io/provider` label value, not `gitSource`/`programRef`/`workspaceTemplate`);
+# * writes to `stacks/status`;
+# * adding or changing the `keel.io/protect` label on a Stack (`protect-control-plane` makes
+#   labelled Stacks undeletable, blocking pruning and preview GC); keeping or dropping it passes;
+# * adding or changing `spec.config.protect` / `spec.config["keel:protect"]` on a Stack (Keel's
+#   force-delete and preview GC treat them as protection, and previews inherit tenant config);
+#   keeping or dropping them passes;
+# * creating a Stack named `management-cluster-core` (undeletable by name).
+# The tenant-subject test is inline in `matchConditions`, so the PKO operator, keel-server,
+# keel-tenant-reconciler and cluster admins never reach Kyverno and an unavailable Kyverno cannot
+# stall PKO (anti-lockout, NFR-REL-01). Fails closed for tenant requests.
+apiVersion: policies.kyverno.io/v1
+kind: ValidatingPolicy
+metadata:
+  name: restrict-tenant-pulumi-objects
+  labels:
+    app.kubernetes.io/managed-by: keel
+    keel.io/policy-tier: tenant-isolation
+spec:
+  validationActions:
+    - Deny
+  failurePolicy: Fail
+  evaluation:
+    background:
+      enabled: false
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["auto.pulumi.com"]
+        apiVersions: ["*"]
+        operations: ["CREATE", "UPDATE", "DELETE"]
+        resources: ["*", "*/status"]
+      - apiGroups: ["pulumi.com"]
+        apiVersions: ["*"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["stacks", "stacks/status"]
+  matchConditions:
+    - name: tenant-subject
+      expression: >-
+        (has(request.userInfo.username) ? request.userInfo.username : '').startsWith('system:serviceaccount:tenant-') || (has(request.userInfo.username) ? request.userInfo.username : '').startsWith('system:serviceaccount:keel-previews:') || (has(request.userInfo.groups) ? request.userInfo.groups : []).exists(g, g.startsWith('tenant-') || g.startsWith('system:serviceaccounts:tenant-') || g == 'system:serviceaccounts:keel-previews')
+  variables:
+    - name: stack
+      expression: "request.kind.group == 'pulumi.com' && request.kind.kind == 'Stack' && (has(request.subResource) ? request.subResource : '') == ''"
+  validations:
+    - expression: "request.kind.group != 'auto.pulumi.com'"
+      message: "Tenant identities may not create, change or delete PKO `auto.pulumi.com` objects (Workspace, Update): they are owned by the Pulumi Kubernetes Operator, which creates them for Stacks. Commit a `Stack` instead."
+    - expression: "!(request.kind.group == 'pulumi.com' && request.kind.kind == 'Stack') || (has(request.subResource) ? request.subResource : '') == ''"
+      message: "Tenant identities may not write the status of PKO Stacks; only the Pulumi Kubernetes Operator writes Stack status."
+    - expression: >-
+        !variables.stack || !(object != null && has(object.metadata.labels) && 'keel.io/protect' in object.metadata.labels) || (request.operation == 'UPDATE' && oldObject != null && has(oldObject.metadata.labels) && 'keel.io/protect' in oldObject.metadata.labels && oldObject.metadata.labels['keel.io/protect'] == object.metadata.labels['keel.io/protect'])
+      message: "Tenant Stacks may not set the `keel.io/protect` label: it makes a Stack undeletable (`protect-control-plane`) and would block pruning and preview garbage collection. Only platform identities may set it."
+    - expression: >-
+        !variables.stack || !(object != null && has(object.spec) && has(object.spec.config)) || ['protect', 'keel:protect'].all(k, !(k in object.spec.config) || (request.operation == 'UPDATE' && oldObject != null && has(oldObject.spec) && has(oldObject.spec.config) && (k in oldObject.spec.config) && oldObject.spec.config[k] == object.spec.config[k]))
+      message: "Tenant Stacks may not set `spec.config.protect` or `spec.config[\"keel:protect\"]`: Keel treats them as protection, so force-delete and preview garbage collection would skip the Stack and its previews. Only platform identities may set them."
+    - expression: "!variables.stack || request.operation != 'CREATE' || request.name != 'management-cluster-core'"
+      message: "The Stack name `management-cluster-core` is reserved for the protected management control-plane Stack."

@@ -39,6 +39,10 @@ pub const DEFAULT_TERMINATION_GRACE_PERIOD_SECONDS: u64 = 600;
 pub const LABEL_MANAGED_BY: &str = "app.kubernetes.io/managed-by";
 pub const LABEL_STACK_ROLE: &str = "keel.io/stack-role";
 pub const LABEL_PROTECT: &str = "keel.io/protect";
+/// `Stack` `spec.config` keys Keel also treats as anti-lockout protection (force-delete and
+/// preview GC). Previews never inherit them, and tenants may not set them
+/// (Kyverno `restrict-tenant-pulumi-objects`).
+pub const CONFIG_PROTECT_KEYS: [&str; 2] = ["protect", "keel:protect"];
 pub const LABEL_EPHEMERAL_PREVIEW: &str = "keel.io/ephemeral-preview";
 pub const LABEL_PR_ID: &str = "keel.io/pr-id";
 pub const LABEL_TENANT: &str = "keel.io/tenant";
@@ -1266,6 +1270,9 @@ impl EphemeralPreviewParams {
     /// A backend outside the tenant prefix is never adopted (OPEN-9b): the preview holds only the
     /// tenant-scoped state identity, so [`synthesize_ephemeral_preview`] always pins the preview to
     /// `s3://<bucket>/tenants/<tenant>` regardless of the inherited value.
+    ///
+    /// The protection keys ([`CONFIG_PROTECT_KEYS`]) are never inherited: a preview must always
+    /// stay collectable by preview GC (`NFR-REL-02`).
     pub fn inherit_tenant_stack(&mut self, tenant_stack: &PkoStack) {
         self.pulumi_stack_name = tenant_stack.spec.stack.clone();
         if let Some(backend) = &tenant_stack.spec.backend
@@ -1274,7 +1281,9 @@ impl EphemeralPreviewParams {
             self.backend_url = backend.clone();
         }
         for (k, v) in &tenant_stack.spec.config {
-            self.config.insert(k.clone(), v.clone());
+            if !CONFIG_PROTECT_KEYS.contains(&k.as_str()) {
+                self.config.insert(k.clone(), v.clone());
+            }
         }
         if let Some(provider) = tenant_stack.metadata.labels.get(LABEL_PROVIDER) {
             self.provider = Some(provider.clone());
@@ -2652,6 +2661,51 @@ mod tests {
         assert!(bundle.stack.spec.env_refs.is_empty());
         assert!(bundle.stack.is_preview());
         assert_eq!(bundle.stack.spec.destroy_on_finalize, Some(false));
+    }
+
+    #[test]
+    fn preview_never_inherits_tenant_protect_config() {
+        for key in CONFIG_PROTECT_KEYS {
+            let mut tparams = TenantStackParams::new(
+                "acme",
+                "web",
+                "organization/web/acme-web",
+                "s3://pulumi-state/tenants/acme",
+                test_git_source("tenants/acme/apps/web"),
+            );
+            tparams.config.insert(key.to_string(), "true".to_string());
+            tparams
+                .config
+                .insert("aws:region".to_string(), "eu-west-1".to_string());
+            let tenant_stack = synthesize_tenant_stack(&tparams).unwrap();
+            assert_eq!(
+                tenant_stack.spec.config.get(key).map(String::as_str),
+                Some("true")
+            );
+
+            let mut params = EphemeralPreviewParams::for_action(
+                "9",
+                "acme",
+                "deploy",
+                1_700_000_000,
+                "tenants/acme/apps/web",
+                "organization/web-pr-9/acme",
+                "s3://pulumi-state",
+            )
+            .unwrap();
+            params.inherit_tenant_stack(&tenant_stack);
+            assert!(!params.config.contains_key(key), "protect key inherited");
+            assert_eq!(
+                params.config.get("aws:region").map(String::as_str),
+                Some("eu-west-1")
+            );
+            let bundle = synthesize_ephemeral_preview(&params).unwrap();
+            assert!(!bundle.stack.spec.config.contains_key(key));
+            assert!(
+                !bundle.stack.is_protected(),
+                "preview must stay collectable"
+            );
+        }
     }
 
     fn tenant_stack_with_creds(backend: &str) -> PkoStack {

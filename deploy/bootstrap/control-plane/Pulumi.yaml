@@ -245,6 +245,12 @@ resources:
           capabilities:
             drop:
               - ALL
+        # Pinned (chart default today): the aggregated `edit`/`admin` ClusterRoles grant tenant admins
+        # (`tenant-<id>-sa`, used by tenant Flux Kustomizations) their Stacks and Programs. Kyverno
+        # `restrict-tenant-pulumi-objects` denies tenants the operator-owned parts they also cover
+        # (`auto.pulumi.com` Workspaces/Updates, `stacks/status`, the `keel.io/protect` label).
+        rbac:
+          createClusterAggregationRoles: true
         # Trust the public Keel CA (`keel-system/keel-ca-bundle`, `ca.crt` only) in addition to the
         # system roots: the controller resolves tenant/preview Stack branches (go-git ls-remote)
         # against the in-cluster Forgejo HTTPS ingress (`forge.publicUrl`). `optional`, so the

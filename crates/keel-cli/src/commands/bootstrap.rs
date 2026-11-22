@@ -2336,6 +2336,22 @@ mod security_hardening_tests {
                 );
             }
         }
+        // Tenant admins reach Stacks/Programs only through the PKO chart's aggregated
+        // `edit`/`admin` roles; pinned in both releases so a chart default change cannot drop them.
+        let pko_hr = SEED_CORE_ADDON_PKO_YAML
+            .split("\n---\n")
+            .map(|d| serde_yml::from_str::<Value>(d).unwrap())
+            .find(|d| d["kind"] == "HelmRelease")
+            .unwrap();
+        for values in [
+            &pko_hr["spec"]["values"],
+            &program["resources"]["pulumiKubernetesOperator"]["properties"]["values"],
+        ] {
+            assert_eq!(
+                values["rbac"]["createClusterAggregationRoles"],
+                Value::Bool(true)
+            );
+        }
         // Kyverno's Stage 0 values are templated by `enableKyvernoPolicyExceptions`.
         let stage0_kyverno = |enabled: bool| -> Value {
             serde_json::from_str(
