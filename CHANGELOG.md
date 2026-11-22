@@ -1,3 +1,13 @@
+## [0.12.0](https://github.com/rdylanwalker/keel/compare/v0.11.0...v0.12.0) (2026-11-22)
+
+### Features
+
+* **cli:** seed every built-in catalog entry and remove orphan seed templates ([c0782ab](https://github.com/rdylanwalker/keel/commit/c0782abe9a3cfb1314e98e6da238807a04e66a2c))
+
+### Bug Fixes
+
+* **security:** refuse credentials over non-local http and resolve CodeQL alerts ([06ce1fa](https://github.com/rdylanwalker/keel/commit/06ce1fa6b94c2217c5f29f45dccb7cc72f09151e)), closes [48-#52](https://github.com/rdylanwalker/48-/issues/52) [#56](https://github.com/rdylanwalker/keel/issues/56) [#57](https://github.com/rdylanwalker/keel/issues/57) [#53](https://github.com/rdylanwalker/keel/issues/53) [#54](https://github.com/rdylanwalker/keel/issues/54) [#55](https://github.com/rdylanwalker/keel/issues/55) [#47](https://github.com/rdylanwalker/keel/issues/47)
+
 ## [0.11.0](https://github.com/rdylanwalker/keel/compare/v0.10.0...v0.11.0) (2026-11-22)
 
 ### ⚠ BREAKING CHANGES
