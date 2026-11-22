@@ -923,6 +923,44 @@ async fn listings_follow_full_pages() {
     assert!(request_line(&reqs[1]).contains("page=2"));
 }
 
+/// Forgejo 15 unregisters `GET .../forks` while `DISABLE_FORKS` is set (plain-text 404).
+#[tokio::test]
+async fn forgejo_forks_listing_with_forks_disabled_uses_forks_count() {
+    let route_gone = || r(404, "404 page not found");
+    let (url, handle) = spawn_mock_http_server(vec![
+        // No forks: empty listing.
+        route_gone(),
+        r(200, r#"{"name":"r","owner":{"login":"o"},"forks_count":0}"#),
+        // Forks created before DISABLE_FORKS was set cannot be listed: fail closed.
+        route_gone(),
+        r(200, r#"{"name":"r","owner":{"login":"o"},"forks_count":2}"#),
+        // No forks_count reported: fail closed.
+        route_gone(),
+        r(200, r#"{"name":"r","owner":{"login":"o"}}"#),
+        // Missing repository stays NotFound.
+        route_gone(),
+        r(404, r#"{"message":"The target couldn't be found."}"#),
+    ])
+    .await;
+    let p = ForgejoGiteaProvider::new(&url, "o", "r", "tok").unwrap();
+    let repo = target("o", "r");
+    assert!(p.list_forks(&repo).await.unwrap().is_empty());
+    let err = p.list_forks(&repo).await.unwrap_err().to_string();
+    assert!(
+        err.contains("2 fork(s)") && err.contains("DISABLE_FORKS"),
+        "{err}"
+    );
+    let err = p.list_forks(&repo).await.unwrap_err().to_string();
+    assert!(err.contains("an unknown number of fork(s)"), "{err}");
+    assert!(matches!(
+        p.list_forks(&repo).await,
+        Err(ForgeError::NotFound(_))
+    ));
+    let reqs = handle.await.unwrap();
+    assert!(request_line(&reqs[0]).starts_with("GET /api/v1/repos/o/r/forks?"));
+    assert_eq!(request_line(&reqs[1]), "GET /api/v1/repos/o/r HTTP/1.1");
+}
+
 // ----------------------------------------------------------------------------
 // GitHub
 // ----------------------------------------------------------------------------

@@ -909,14 +909,35 @@ impl ForgejoGiteaProvider {
         Ok(())
     }
 
+    /// Forgejo removes the `GET .../forks` route entirely while `[repository] DISABLE_FORKS` is
+    /// set (plain-text `404 page not found`, even for site admins). A 404 is therefore resolved
+    /// through the repository object: no repository stays [`ForgeError::NotFound`];
+    /// `forks_count: 0` means there are no forks; forks created before the setting was enabled
+    /// (or a missing `forks_count`) fail closed, because they cannot be listed.
     pub(crate) async fn list_repo_forks(
         &self,
         repo: &RepositoryTarget,
     ) -> Result<Vec<ForkInfo>, ForgeError> {
-        flat_list_forks(&self.client, &self.repo_api_for(repo)?, "limit", |b| {
-            self.authorized(b)
-        })
-        .await
+        let repo_api = self.repo_api_for(repo)?;
+        let authorize = |b| self.authorized(b);
+        let err = match flat_list_forks(&self.client, &repo_api, "limit", authorize).await {
+            Err(err @ ForgeError::NotFound(_)) => err,
+            other => return other,
+        };
+        let Some(info) = get_optional(&self.client, &repo_api, authorize, "repository").await?
+        else {
+            return Err(err);
+        };
+        match info.get("forks_count").and_then(Value::as_u64) {
+            Some(0) => Ok(Vec::new()),
+            count => Err(ForgeError::Api {
+                status: 404,
+                message: format!(
+                    "repository '{repo}' reports {} fork(s) but Forgejo/Gitea does not list forks while `[repository] DISABLE_FORKS` is set; review them in the Forgejo UI or temporarily re-enable forks",
+                    count.map_or_else(|| "an unknown number of".to_string(), |c| c.to_string())
+                ),
+            }),
+        }
     }
 }
 
