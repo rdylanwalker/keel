@@ -1557,7 +1557,19 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
       expect(ownStacks.length, `preview Stacks of PR #${prId}`).toBeGreaterThan(0);
       for (const stack of ownStacks) {
         expect(stack.spec.fluxSource, stack.metadata.name).toBeUndefined();
-        expect(JSON.stringify(stack.spec), stack.metadata.name).not.toContain('flux-system');
+        // Only the Git source fields must stay off flux-system: the workspace template may
+        // legitimately carry DOCKER_HOST=tcp://keel-docker-proxy.flux-system... (local dev).
+        const projectRepo = String(stack.spec.projectRepo ?? '');
+        expect(projectRepo, `${stack.metadata.name} projectRepo`).toMatch(/^https:\/\//);
+        expect(projectRepo, `${stack.metadata.name} projectRepo`).not.toContain('flux-system');
+        const gitAuth = JSON.stringify(stack.spec.gitAuth ?? {});
+        expect(gitAuth, `${stack.metadata.name} gitAuth`).not.toContain('flux-system');
+        for (const secretName of gitAuth.match(/"name":"([^"]+)"/g) ?? []) {
+          expect(secretName, `${stack.metadata.name} gitAuth secret`).toContain(
+            `keel-preview-${prId}-`,
+          );
+        }
+        expect(String(stack.spec.repoDir ?? ''), stack.metadata.name).toMatch(/^tenants\//);
       }
       const legacyPreviews = allPreviewStacks.items
         .filter((s) => s.metadata.labels?.['keel.io/pr-id'] !== prId && s.spec.fluxSource)
