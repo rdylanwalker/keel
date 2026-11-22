@@ -27,3 +27,4 @@
 
 - [CLI Reference](reference/cli.md)
 - [Known Limitations](reference/known-limitations.md)
+- [FAQ](reference/faq.md)

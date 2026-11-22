@@ -4,7 +4,7 @@
 
 > **Alpha.** Only the local `kind` path with the in-cluster Forgejo is tested end to end, and breaking releases have no upgrade path. Read [Known Limitations](reference/known-limitations.md) before you start.
 
-Keel uses **Git** as the single source of truth for desired state, **Flux CD** for Kubernetes GitOps reconciliation, **Pulumi Kubernetes Operator (PKO v2)** for infrastructure provisioning across clouds and hypervisors, and Kubernetes `Secret`s and watches of upstream CRDs for runtime state. `keel-server` has no database of its own; bundled components such as Forgejo, Rauthy and SeaweedFS keep their own storage.
+Keel uses **Git** as the single source of truth for desired state, **Flux CD** for Kubernetes GitOps reconciliation, **Pulumi Kubernetes Operator (PKO v2)** for infrastructure provisioning (only local `kind` clusters are tested), and Kubernetes `Secret`s and watches of upstream CRDs for runtime state. `keel-server` has no database of its own; bundled components such as Forgejo, Rauthy and SeaweedFS keep their own storage.
 
 ## Architecture Overview
 
@@ -37,6 +37,7 @@ flowchart TB
 10. **[Running keel-server In-Cluster](operations/in-cluster-server.md)**: the Kustomize bundle and its RBAC.
 11. **[CLI Reference](reference/cli.md)**: every `keel` command and flag.
 12. **[Known Limitations](reference/known-limitations.md)**: open bugs, untested paths and workarounds.
+13. **[FAQ](reference/faq.md)**: why Flux and Pulumi, footprint, security, AI-assisted development and license.
 
 ## Previewing Docs Locally
 

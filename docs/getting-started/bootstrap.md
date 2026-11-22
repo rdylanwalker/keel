@@ -12,8 +12,10 @@ For a local `kind` management cluster plus one workload `kind` cluster (measured
 
 - **Host:** 8 CPU cores (4 minimum), 16 GB RAM with about 12 GB free, 30 GB free disk. The management node peaks at about 7 GiB of memory, holds about 17 GB of container images, and the first PKO preview pulls the 3.5 GB `pulumi/pulumi` image.
 - **OS:** Linux x86_64 or WSL2 (tested).
-- **Tools on `PATH`:** `docker`, `pulumi`, `helm`, `kubectl`, `git`, `sops` and `age-keygen` (from `age`); `keel serve` calls `sops` and `age-keygen`. `kind` is only needed to list or delete clusters.
-- **Free host ports:** `8080` (`keel serve`), `8888` (HTTPS ingress) and `3000` (Forgejo port-forward with `--with-forge`).
+- **Tools on `PATH`:** `docker`, `kind`, `pulumi`, `helm`, `kubectl`, `git`, `sops` and `age-keygen` (from `age`); `keel serve` calls `sops` and `age-keygen`. Without `kind`, bootstrap silently skips clearing stale Stage 0 state and setting up the registry mirror.
+- **Free host ports:** `8080` (`keel serve`, change it with `--bind`) and `8888` (HTTPS ingress; must be free because the IdP URL contains it). The Forgejo port-forward (with `--with-forge`) prefers `3000` and falls back to a random free port.
+- **Memory limits:** WSL2 gets half of the host RAM by default, and Docker Desktop has its own limit. On a 16 GB host, raise it to about 12 GB (for WSL2, `memory=12GB` under `[wsl2]` in `%UserProfile%\.wslconfig`, then `wsl --shutdown`).
+- **inotify limits:** if pods fail with `too many open files`, raise `fs.inotify.max_user_watches` and `fs.inotify.max_user_instances` as described in the [kind known issues](https://kind.sigs.k8s.io/docs/user/known-issues/#pod-errors-due-to-too-many-open-files).
 
 ## Supported Targets
 
@@ -38,6 +40,8 @@ keel bootstrap init \
   --with-forge \
   --repo-dir ./keel-gitops
 ```
+
+> **Warning: `--local-dev-docker-socket-exception` gives up host and tenant isolation.** `keel-docker-proxy` exposes the host Docker socket on port 2375 without authentication. Its NetworkPolicy admits every PKO workspace pod, selected by a label that any tenant pod can also set, and Docker API access amounts to root on the host. Use the flag only on a throwaway machine, do not treat tenants as isolated while it is enabled, and leave it out if you do not need nested `kind` clusters.
 
 This takes about 3 minutes on a host that already has the `kindest/node` image. `--with-forge` installs an in-cluster Forgejo so Flux can pull the repository and PRs work; without it (or a network `--git-url`), Flux cannot read the repository and nothing you merge is deployed (see [In-Cluster Flux Pull-Polling](#core-controllers-installed-out-of-the-box) below).
 
