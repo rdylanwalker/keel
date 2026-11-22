@@ -130,7 +130,8 @@ resources:
       namespace: flux-system
       createNamespace: true
       waitForJobs: true
-      timeout: 300
+      # Fresh kind nodes pull images one at a time (kubelet serializeImagePulls); leave room.
+      timeout: 600
       values:
         # Multi-tenancy lockdown (NFR-SEC-02): adds `--no-cross-namespace-refs=true` and
         # `--default-service-account=default` to kustomize/helm controllers, so any Flux
@@ -185,7 +186,8 @@ resources:
       namespace: keel-system
       createNamespace: false
       waitForJobs: true
-      timeout: 300
+      # Fresh kind nodes pull images one at a time (kubelet serializeImagePulls); leave room.
+      timeout: 600
       values:
         # Keel only uses the CEL `policies.kyverno.io/v1` policy types. Kyverno 1.20 no longer
         # executes the deprecated `kyverno.io` policy kinds, and installing their CRDs only makes
@@ -232,7 +234,8 @@ resources:
       namespace: keel-system
       createNamespace: true
       waitForJobs: true
-      timeout: 300
+      # Fresh kind nodes pull images one at a time (kubelet serializeImagePulls); leave room.
+      timeout: 600
       values:
         replicaCount: 1
         securityContext:
@@ -287,7 +290,8 @@ resources:
       namespace: keel-system
       createNamespace: true
       waitForJobs: true
-      timeout: 300
+      # Fresh kind nodes pull images one at a time (kubelet serializeImagePulls); leave room.
+      timeout: 600
       values:
         s3:
           enabled: true
@@ -343,7 +347,8 @@ resources:
       namespace: keel-system
       createNamespace: true
       waitForJobs: true
-      timeout: 300
+      # Fresh kind nodes pull images one at a time (kubelet serializeImagePulls); leave room.
+      timeout: 600
 
   prometheus:
     type: kubernetes:helm.sh/v3:Release
@@ -372,7 +377,8 @@ resources:
       namespace: keel-system
       createNamespace: true
       waitForJobs: true
-      timeout: 300
+      # Fresh kind nodes pull images one at a time (kubelet serializeImagePulls); leave room.
+      timeout: 600
       values:
         alertmanager:
           enabled: false
@@ -416,7 +422,8 @@ resources:
       namespace: keel-system
       createNamespace: true
       waitForJobs: true
-      timeout: 300
+      # Fresh kind nodes pull images one at a time (kubelet serializeImagePulls); leave room.
+      timeout: 600
       values:
         meshProvider: gatewayapi:v1
         metricsServer: http://prometheus.keel-system.svc.cluster.local:80
@@ -450,7 +457,8 @@ resources:
       namespace: keel-system
       createNamespace: true
       waitForJobs: true
-      timeout: 300
+      # Fresh kind nodes pull images one at a time (kubelet serializeImagePulls); leave room.
+      timeout: 600
       values:
         crds:
           enabled: true

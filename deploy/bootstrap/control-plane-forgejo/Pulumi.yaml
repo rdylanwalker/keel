@@ -57,7 +57,8 @@ resources:
       namespace: keel-system
       createNamespace: true
       waitForJobs: true
-      timeout: 300
+      # Fresh kind nodes pull images one at a time (kubelet serializeImagePulls); leave room.
+      timeout: 600
       values:
         gitea:
           admin:

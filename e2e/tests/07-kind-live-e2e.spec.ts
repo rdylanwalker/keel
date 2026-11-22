@@ -1146,7 +1146,7 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
 
     await test.step('5. Wait for management podinfo, tenant-acme, and workload cluster bundle', async () => {
       await Promise.all([
-        waitForK8sReady('helmrelease', 'podinfo', 'tenant-default', 180_000),
+        waitForK8sReady('helmrelease', 'podinfo', 'tenant-default', 360_000),
         waitForNamespace('tenant-acme', 120_000),
         waitForK8sReady('stack', `${WORKLOAD_CLUSTER}-cluster`, 'tenant-default', 480_000),
       ]);
@@ -1446,7 +1446,7 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
           }
         }
 
-        await waitForK8sReady('helmrelease', acmeAppName, 'tenant-acme', 180_000);
+        await waitForK8sReady('helmrelease', acmeAppName, 'tenant-acme', 360_000);
         logStep('Non-admin acme-podinfo reconciled cleanly in tenant-acme');
       });
     } finally {
