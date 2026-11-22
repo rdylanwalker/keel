@@ -1,7 +1,9 @@
 import React from "react"
 import { GitPullRequest, Loader2 } from "lucide-react"
 
-import { Proposal } from "../../types/api"
+import { PLATFORM_SCOPE, Proposal } from "../../types/api"
+import { NativeSelect } from "../ui/native-select"
+import { ProposalRepoLabel, proposalRepositoryName } from "./ProposalRepoLabel"
 
 export type ProposalStatusFilter = "all" | "open" | "merged" | "closed"
 
@@ -15,10 +17,22 @@ const STATUS_FILTERS: readonly ProposalStatusFilter[] = [
 export function matchesProposalQuery(pr: Proposal, query: string): boolean {
   const q = query.trim().toLowerCase()
   if (!q) return true
-  return [pr.title, pr.id, pr.branch, pr.author, pr.tenant].some((v) =>
-    (v ?? "").toLowerCase().includes(q)
-  )
+  return [
+    pr.title,
+    pr.id,
+    pr.branch,
+    pr.author,
+    pr.tenant,
+    pr.scope,
+    proposalRepositoryName(pr),
+  ].some((v) => (v ?? "").toLowerCase().includes(q))
 }
+
+const proposalKeyOf = (pr: Proposal) => `${pr.scope}/${pr.id}`
+
+/** Scope label used by the repository filter and list rows. */
+export const scopeLabel = (scope: string) =>
+  scope === PLATFORM_SCOPE ? "platform" : scope
 
 const statusTone = (status: Proposal["status"]) =>
   status === "merged"
@@ -29,7 +43,8 @@ const statusTone = (status: Proposal["status"]) =>
 
 export interface ProposalListProps {
   proposals: Proposal[]
-  selectedId?: string
+  /** `<scope>/<id>` of the selected PR. */
+  selectedKey?: string
   loading: boolean
   statusFilter: ProposalStatusFilter
   onStatusFilterChange: (filter: ProposalStatusFilter) => void
@@ -40,7 +55,7 @@ export interface ProposalListProps {
 
 export const ProposalList: React.FC<ProposalListProps> = ({
   proposals,
-  selectedId,
+  selectedKey,
   loading,
   statusFilter,
   onStatusFilterChange,
@@ -48,8 +63,13 @@ export const ProposalList: React.FC<ProposalListProps> = ({
   onSearchQueryChange,
   onSelect,
 }) => {
-  const visible = proposals.filter((pr) =>
-    matchesProposalQuery(pr, searchQuery)
+  const [scopeFilter, setScopeFilter] = React.useState("all")
+  const scopes = Array.from(new Set(proposals.map((p) => p.scope))).sort()
+  const activeScope = scopes.includes(scopeFilter) ? scopeFilter : "all"
+  const visible = proposals.filter(
+    (pr) =>
+      (activeScope === "all" || pr.scope === activeScope) &&
+      matchesProposalQuery(pr, searchQuery)
   )
   return (
     <div className="lg:col-span-4 flex flex-col lg:h-full min-h-0 space-y-4">
@@ -84,6 +104,31 @@ export const ProposalList: React.FC<ProposalListProps> = ({
         ))}
       </div>
 
+      {scopes.length > 1 && (
+        <div className="flex items-center gap-2 shrink-0">
+          <label
+            htmlFor="pr-scope-filter"
+            className="shrink-0 text-[11px] text-slate-400"
+          >
+            Repository:
+          </label>
+          <NativeSelect
+            id="pr-scope-filter"
+            data-testid="pr-scope-filter"
+            value={activeScope}
+            onChange={(e) => setScopeFilter(e.target.value)}
+            className="h-8 py-1 text-xs"
+          >
+            <option value="all">All repositories</option>
+            {scopes.map((scope) => (
+              <option key={scope} value={scope}>
+                {scopeLabel(scope)}
+              </option>
+            ))}
+          </NativeSelect>
+        </div>
+      )}
+
       <div className="mb-4">
         <input
           type="text"
@@ -101,10 +146,12 @@ export const ProposalList: React.FC<ProposalListProps> = ({
         className="space-y-3 flex-1 min-h-0 max-h-160 lg:max-h-none overflow-y-auto p-0.5 pr-1.5"
       >
         {visible.map((pr) => {
-          const isSelected = selectedId === pr.id
+          const key = proposalKeyOf(pr)
+          const isSelected = selectedKey === key
           return (
             <div
-              key={pr.id}
+              key={key}
+              data-pr-scope={pr.scope}
               onClick={() => onSelect(pr)}
               role="button"
               tabIndex={0}
@@ -138,9 +185,16 @@ export const ProposalList: React.FC<ProposalListProps> = ({
               </p>
 
               <div className="flex items-center justify-between gap-2 text-[10px] font-mono text-slate-500">
-                <span className="truncate">{pr.tenant}</span>
+                <span
+                  className="truncate"
+                  data-testid="pr-scope"
+                  title="Tenant"
+                >
+                  {scopeLabel(pr.scope)}
+                </span>
                 <span className="shrink-0">{pr.createdAt}</span>
               </div>
+              <ProposalRepoLabel proposal={pr} className="mt-1 max-w-full" />
             </div>
           )
         })}

@@ -1,17 +1,18 @@
 import React from "react"
 
-import { ProviderRegistryEntry } from "../../types/api"
+import { ProposalRef, ProviderRegistryEntry } from "../../types/api"
+import { PendingProviderPr } from "./addonStatus"
 import { Badge } from "../ui/badge"
 import { Button } from "../ui/button"
 
 export interface ProviderCardProps {
   provider: ProviderRegistryEntry
   canManage: boolean
-  pendingPr?: { id: string; branch: string }
+  pendingPr?: PendingProviderPr
   toggling: boolean
   onToggle: (id: string, currentlyEnabled: boolean) => void
   onNavigateToCatalog?: () => void
-  onNavigateToPreview?: () => void
+  onNavigateToPreview?: (ref?: ProposalRef) => void
 }
 
 /** One provider registry entry; shows only fields reported by `GET /api/v1/providers`. */
@@ -62,7 +63,12 @@ export const ProviderCard: React.FC<ProviderCardProps> = ({
               <Button
                 variant="subtle"
                 size="sm"
-                onClick={onNavigateToPreview}
+                onClick={() =>
+                  onNavigateToPreview?.({
+                    scope: pendingPr.scope,
+                    id: pendingPr.id,
+                  })
+                }
                 className="bg-purple-500/10 text-purple-300 border-purple-500/30 hover:bg-purple-500/20"
               >
                 Go to PR #{pendingPr.id} →

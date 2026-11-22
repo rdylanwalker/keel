@@ -262,6 +262,7 @@ describe("TopologyView", () => {
       branch: "b",
       author: "a",
       tenant: "acme",
+      scope: "acme",
       status: "open" as const,
       createdAt: "now",
     }
@@ -793,6 +794,7 @@ describe("TopologyView", () => {
         branch: "keel/mgmt/upgrade-kyverno",
         author: "admin",
         tenant: "keel-system",
+        scope: "management",
         status: "open",
         createdAt: "now",
         prUrl: "https://forge.example/pr/500",
@@ -804,6 +806,7 @@ describe("TopologyView", () => {
           branch: "keel/mgmt/rollback-kyverno",
           author: "admin",
           tenant: "keel-system",
+          scope: "management",
           status: "open",
           createdAt: "now",
           prUrl: "https://forge.example/pr/501",
@@ -910,6 +913,7 @@ describe("TopologyView", () => {
         branch: "keel/mgmt/rollback-kyverno",
         author: "admin",
         tenant: "keel-system",
+        scope: "management",
         status: "open",
         createdAt: "now",
       })

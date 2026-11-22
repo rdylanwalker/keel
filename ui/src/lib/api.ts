@@ -5,7 +5,14 @@ import {
   CatalogItem,
   CreateCatalogItemPayload,
   CreateProposalPayload,
+  CreateTenantResult,
   CrdWatchEvent,
+  DeleteTenantResult,
+  ProposalListing,
+  ProposalRef,
+  ProposalRepository,
+  TenantRepositoryStatus,
+  UnavailableRepository,
   PreviewReport,
   RawResourceDiff,
   ResourceDiff,
@@ -23,6 +30,7 @@ import {
   UpgradeManagementAddonPayload,
 } from "../types/api"
 import { isDemoMode } from "./utils"
+import { repositoryWebUrl, safeHttpUrl } from "./forgeLinks"
 import { DemoModeError, parseApiError } from "./errors"
 
 let inMemoryToken: string | null = null
@@ -331,19 +339,80 @@ interface RawProposal {
   prUrl?: string
   url?: string
   previewStatus?: "pending" | "ready" | "failed"
+  scope: string
+  repository?: ProposalRepository
 }
 
-function normalizeProposal(raw: RawProposal): Proposal {
-  return {
+/**
+ * Route scope of a wire proposal. The server always sends `scope`; guessing it from `tenant`
+ * would address the wrong repository, so a missing scope is an error.
+ */
+function proposalScope(raw: RawProposal): string {
+  if (!raw.scope) {
+    throw new Error(`Proposal ${raw.id} has no scope in the server response`)
+  }
+  return raw.scope
+}
+
+export function normalizeProposal(raw: RawProposal): Proposal {
+  const scope = proposalScope(raw)
+  const prUrl = raw.prUrl ?? raw.url
+  const proposal: Proposal = {
     id: raw.id,
     title: raw.title,
     branch: raw.branch ?? raw.sourceBranch ?? "",
     author: raw.author || "keel",
-    tenant: raw.tenant || "default",
+    tenant: raw.tenant || scope,
     status: raw.status ?? raw.state ?? "open",
     createdAt: raw.createdAt ?? "just now",
-    prUrl: raw.prUrl ?? raw.url,
+    prUrl,
     previewStatus: raw.previewStatus ?? "ready",
+    scope,
+  }
+  if (raw.repository) proposal.repository = raw.repository
+  const repoUrl = repositoryWebUrl(prUrl)
+  if (repoUrl) proposal.repoUrl = repoUrl
+  return proposal
+}
+
+/** Stable key of a proposal (PR ids are per repository). */
+export function proposalKey(ref: ProposalRef): string {
+  return `${ref.scope}/${ref.id}`
+}
+
+/** `/api/v1/tenants/{scope}/proposals/{id}` (+ optional action suffix). */
+function proposalPath(ref: ProposalRef, suffix?: string): string {
+  const base = `/api/v1/tenants/${encodeURIComponent(ref.scope)}/proposals/${encodeURIComponent(ref.id)}`
+  return suffix ? `${base}/${suffix}` : base
+}
+
+/**
+ * Lists proposals: one scope (`/api/v1/tenants/{tenant}/proposals`; `management` = platform
+ * repository) or, without `tenant`, every repository the caller may read
+ * (`/api/v1/proposals`, admins see all tenants). `unavailable` names repositories whose PRs are
+ * missing or stale.
+ */
+export async function getProposalListing(
+  tenant?: string,
+  status?: "open" | "merged" | "closed" | "all"
+): Promise<ProposalListing> {
+  const params = new URLSearchParams()
+  if (status) params.set("status", status)
+  const qs = params.toString()
+  const base = tenant
+    ? `/api/v1/tenants/${encodeURIComponent(tenant)}/proposals`
+    : "/api/v1/proposals"
+  const res = await apiFetch(qs ? `${base}?${qs}` : base, {
+    headers: getHeaders(),
+  })
+  const raw = await handleResponse<
+    | RawProposal[]
+    | { proposals?: RawProposal[]; unavailable?: UnavailableRepository[] }
+  >(res)
+  const list = Array.isArray(raw) ? raw : (raw.proposals ?? [])
+  return {
+    proposals: list.map(normalizeProposal),
+    unavailable: Array.isArray(raw) ? [] : (raw.unavailable ?? []),
   }
 }
 
@@ -351,19 +420,8 @@ export async function getProposals(
   tenant?: string,
   status?: "open" | "merged" | "closed" | "all"
 ): Promise<Proposal[]> {
-  const params = new URLSearchParams()
-  if (tenant) params.set("tenant", tenant)
-  if (status) params.set("status", status)
-  const qs = params.toString()
-  const url = qs ? `/api/v1/proposals?${qs}` : "/api/v1/proposals"
-  const res = await apiFetch(url, {
-    headers: getHeaders(),
-  })
-  const raw = await handleResponse<
-    RawProposal[] | { proposals?: RawProposal[] }
-  >(res)
-  const list = Array.isArray(raw) ? raw : (raw.proposals ?? [])
-  return list.map(normalizeProposal)
+  const { proposals } = await getProposalListing(tenant, status)
+  return proposals
 }
 
 function unwrapProposalResponse(
@@ -378,14 +436,18 @@ function unwrapProposalResponse(
   return normalizeProposal(raw)
 }
 
+/** `POST /api/v1/tenants/{tenant}/proposals`: opens the PR in the tenant's repository. */
 export async function createProposal(
   payload: CreateProposalPayload
 ): Promise<Proposal> {
-  const res = await apiFetch("/api/v1/proposals", {
-    method: "POST",
-    headers: getHeaders(),
-    body: JSON.stringify(payload),
-  })
+  const res = await apiFetch(
+    `/api/v1/tenants/${encodeURIComponent(payload.tenant)}/proposals`,
+    {
+      method: "POST",
+      headers: getHeaders(),
+      body: JSON.stringify(payload),
+    }
+  )
   const raw = await handleResponse<
     RawProposal | { proposal: RawProposal; branch?: string }
   >(res)
@@ -408,14 +470,11 @@ type RawPreviewReport = Omit<PreviewReport, "resources"> & {
 }
 
 export async function getProposalPreview(
-  id: string | number
+  ref: ProposalRef
 ): Promise<PreviewReport> {
-  const res = await apiFetch(
-    `/api/v1/proposals/${encodeURIComponent(id)}/preview`,
-    {
-      headers: getHeaders(),
-    }
-  )
+  const res = await apiFetch(proposalPath(ref, "preview"), {
+    headers: getHeaders(),
+  })
   const raw = await handleResponse<
     | RawPreviewReport
     | {
@@ -445,15 +504,13 @@ export async function getProposalPreview(
 }
 
 export async function mergeProposal(
-  id: string | number
+  ref: ProposalRef
 ): Promise<{ success: boolean; message?: string }> {
-  const res = await apiFetch(
-    `/api/v1/proposals/${encodeURIComponent(id)}/merge`,
-    {
-      method: "POST",
-      headers: getHeaders(),
-    }
-  )
+  const { id } = ref
+  const res = await apiFetch(proposalPath(ref, "merge"), {
+    method: "POST",
+    headers: getHeaders(),
+  })
   const raw = await handleResponse<
     | { success: boolean; message?: string }
     | { proposal?: { id?: string; state?: string } }
@@ -471,15 +528,13 @@ export async function mergeProposal(
 }
 
 export async function rejectProposal(
-  id: string | number
+  ref: ProposalRef
 ): Promise<{ success: boolean; message?: string }> {
-  const res = await apiFetch(
-    `/api/v1/proposals/${encodeURIComponent(id)}/reject`,
-    {
-      method: "POST",
-      headers: getHeaders(),
-    }
-  )
+  const { id } = ref
+  const res = await apiFetch(proposalPath(ref, "reject"), {
+    method: "POST",
+    headers: getHeaders(),
+  })
   const raw = await handleResponse<
     | { success: boolean; message?: string }
     | { proposal?: { id?: string; state?: string } }
@@ -497,15 +552,13 @@ export async function rejectProposal(
 }
 
 export async function reopenProposal(
-  id: string | number
+  ref: ProposalRef
 ): Promise<{ success: boolean; message?: string }> {
-  const res = await apiFetch(
-    `/api/v1/proposals/${encodeURIComponent(id)}/reopen`,
-    {
-      method: "POST",
-      headers: getHeaders(),
-    }
-  )
+  const { id } = ref
+  const res = await apiFetch(proposalPath(ref, "reopen"), {
+    method: "POST",
+    headers: getHeaders(),
+  })
   const raw = await handleResponse<
     | { success: boolean; message?: string }
     | { proposal?: { id?: string; state?: string } }
@@ -846,31 +899,82 @@ export async function toggleProvider(
     headers: getHeaders(),
     body: JSON.stringify({ enabled }),
   })
-  const raw = await handleResponse<Proposal | { proposal: Proposal }>(res)
-  return "proposal" in raw ? raw.proposal : raw
+  const raw = await handleResponse<RawProposal | { proposal: RawProposal }>(res)
+  return normalizeProposal("proposal" in raw ? raw.proposal : raw)
 }
 
-export async function createTenant(id: string): Promise<Proposal> {
+interface RawCreateTenantResponse {
+  tenant: { id: string; namespace: string }
+  proposal?: RawProposal | null
+  branch?: string | null
+  repository: Omit<TenantRepositoryStatus, "skeletonProposal" | "notes"> & {
+    skeletonProposal?: RawProposal | null
+    notes?: string[]
+  }
+}
+
+/**
+ * `POST /api/v1/tenants`: provisions the tenant's repository + read credential (remote forges)
+ * and opens the platform stub PR. `adoptExisting` adopts a repository that already holds content.
+ */
+export async function createTenant(
+  id: string,
+  options: { adoptExisting?: boolean } = {}
+): Promise<CreateTenantResult> {
   const res = await apiFetch("/api/v1/tenants", {
     method: "POST",
     headers: getHeaders(),
-    body: JSON.stringify({ id }),
+    body: JSON.stringify(
+      options.adoptExisting ? { id, adoptExisting: true } : { id }
+    ),
   })
-  const raw = await handleResponse<
-    RawProposal | { proposal: RawProposal; branch?: string }
-  >(res)
-  return unwrapProposalResponse(raw)
+  const raw = await handleResponse<RawCreateTenantResponse>(res)
+  const { skeletonProposal, notes, ...repo } = raw.repository
+  const repository: TenantRepositoryStatus = {
+    ...repo,
+    notes: notes ?? [],
+  }
+  if (skeletonProposal) {
+    repository.skeletonProposal = normalizeProposal(skeletonProposal)
+  }
+  if (repository.webUrl !== undefined) {
+    repository.webUrl = safeHttpUrl(repository.webUrl)
+  }
+  return {
+    tenant: raw.tenant,
+    proposal: raw.proposal
+      ? normalizeProposal({
+          ...raw.proposal,
+          branch: raw.proposal.branch ?? raw.branch ?? undefined,
+        })
+      : undefined,
+    branch: raw.branch ?? undefined,
+    repository,
+  }
 }
 
-export async function deleteTenant(id: string): Promise<Proposal> {
+/** `DELETE /api/v1/tenants/{id}`: opens the PR removing the tenant's platform stub. */
+export async function deleteTenant(id: string): Promise<DeleteTenantResult> {
   const res = await apiFetch(`/api/v1/tenants/${encodeURIComponent(id)}`, {
     method: "DELETE",
     headers: getHeaders(),
   })
-  const raw = await handleResponse<
-    RawProposal | { proposal: RawProposal; branch?: string }
-  >(res)
-  return unwrapProposalResponse(raw)
+  const raw = await handleResponse<{
+    id?: string
+    proposal: RawProposal
+    branch?: string
+    notes?: string[]
+  }>(res)
+  return {
+    id: raw.id ?? id,
+    proposal: normalizeProposal({
+      ...raw.proposal,
+      branch: raw.proposal.branch ?? raw.branch,
+    }),
+    branch:
+      raw.branch ?? raw.proposal.branch ?? raw.proposal.sourceBranch ?? "",
+    notes: raw.notes ?? [],
+  }
 }
 
 export async function createCatalogApp(

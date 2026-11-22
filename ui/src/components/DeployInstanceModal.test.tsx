@@ -107,6 +107,7 @@ describe("DeployInstanceModal component", () => {
       status: "open",
       author: "admin@keel.local",
       tenant: "acme",
+      scope: "acme",
       createdAt: "2026-11-15T12:00:00Z",
     })
 
@@ -163,6 +164,7 @@ describe("DeployInstanceModal component", () => {
       branch: "keel/acme/app-podinfo-43",
       author: "tester",
       tenant: "acme",
+      scope: "acme",
       status: "open",
       createdAt: "just now",
     })
@@ -208,6 +210,7 @@ describe("DeployInstanceModal component", () => {
       branch: "keel/beta/bundle-44",
       author: "tester",
       tenant: "beta",
+      scope: "beta",
       status: "open",
       createdAt: "just now",
     })
@@ -314,6 +317,7 @@ describe("DeployInstanceModal component", () => {
       status: "open",
       author: "admin@keel.local",
       tenant: "keel-system",
+      scope: "management",
       createdAt: "2026-11-16T12:00:00Z",
     })
 
@@ -394,6 +398,7 @@ describe("DeployInstanceModal component", () => {
       branch: "keel/acme/custom-manifest-99",
       author: "user",
       tenant: "acme",
+      scope: "acme",
       status: "open",
       createdAt: "just now",
     })
@@ -458,6 +463,7 @@ describe("DeployInstanceModal component", () => {
       branch: "keel/acme/manifest-100",
       author: "user",
       tenant: "acme",
+      scope: "acme",
       status: "open",
       createdAt: "just now",
     })
@@ -692,6 +698,7 @@ describe("DeployInstanceModal validation, secrets and server errors", () => {
       branch: "b",
       author: "a",
       tenant: "default",
+      scope: "default",
       status: "open",
       createdAt: "now",
     })
@@ -878,6 +885,7 @@ describe("DeployInstanceModal cluster-scoped placement", () => {
       branch: "keel/acme/cert-manager",
       author: "tester",
       tenant: "acme",
+      scope: "acme",
       status: "open",
       createdAt: "just now",
     })

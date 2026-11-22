@@ -52,4 +52,4 @@ Previews never receive control-plane credentials:
 
 ## Deep Links
 
-The GUI preview inspector can be deep-linked with `#preview/<pr-id>`. The link survives the OIDC login round-trip.
+The GUI preview inspector can be deep-linked with `#preview/<tenant>/<pr-id>` (PR numbers are per repository; use `management` for platform-repository PRs). The link survives the OIDC login round-trip.

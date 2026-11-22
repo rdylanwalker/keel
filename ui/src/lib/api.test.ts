@@ -6,6 +6,8 @@ import {
   logout,
   getCatalog,
   getProposals,
+  getProposalListing,
+  proposalKey,
   createProposal,
   getProposalPreview,
   mergeProposal,
@@ -143,8 +145,8 @@ describe("api client module", () => {
     expect(fetch).toHaveBeenCalledWith("/api/v1/catalog", expect.any(Object))
   })
 
-  it("fetches proposals with and without tenant filter", async () => {
-    const mockProposals = [{ id: "10", title: "Prop 1" }]
+  it("fetches the aggregated listing or one tenant's proposals", async () => {
+    const mockProposals = [{ id: "10", title: "Prop 1", scope: "acme" }]
     vi.stubGlobal(
       "fetch",
       vi.fn().mockResolvedValue({
@@ -157,11 +159,101 @@ describe("api client module", () => {
     expect(res1).toMatchObject(mockProposals)
     expect(fetch).toHaveBeenCalledWith("/api/v1/proposals", expect.any(Object))
 
-    await getProposals("tenant-acme")
+    await getProposals("acme", "all")
     expect(fetch).toHaveBeenCalledWith(
-      "/api/v1/proposals?tenant=tenant-acme",
+      "/api/v1/tenants/acme/proposals?status=all",
       expect.any(Object)
     )
+
+    await getProposals(undefined, "merged")
+    expect(fetch).toHaveBeenCalledWith(
+      "/api/v1/proposals?status=merged",
+      expect.any(Object)
+    )
+  })
+
+  it("rejects proposals without a route scope instead of guessing one", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          proposals: [{ id: "3", title: "No scope", tenant: "acme" }],
+        }),
+      })
+    )
+    await expect(getProposals()).rejects.toThrow(/has no scope/)
+  })
+
+  it("maps scoped proposals with repository identity and unavailable repositories", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          proposals: [
+            {
+              id: "3",
+              title: "acme app",
+              sourceBranch: "keel/acme/podinfo-1",
+              tenant: "acme",
+              state: "open",
+              url: "https://forge.example/keel-tenants/infra-tenant-acme/pulls/3",
+              scope: "acme",
+              repository: {
+                label: "tenant-acme",
+                fullName: "keel-tenants/infra-tenant-acme",
+              },
+            },
+            {
+              id: "3",
+              title: "platform change",
+              sourceBranch: "keel/providers/toggle-aws-1",
+              tenant: null,
+              state: "merged",
+              url: "local:///tmp/remote.git/.keel/proposals/3.json",
+              scope: "management",
+              repository: { label: "platform" },
+            },
+          ],
+          unavailable: [
+            {
+              scope: "globex",
+              repository: { label: "tenant-globex" },
+              reason: "forge unavailable",
+            },
+          ],
+        }),
+      })
+    )
+    const listing = await getProposalListing()
+    expect(listing.proposals[0]).toMatchObject({
+      id: "3",
+      scope: "acme",
+      tenant: "acme",
+      branch: "keel/acme/podinfo-1",
+      repository: {
+        label: "tenant-acme",
+        fullName: "keel-tenants/infra-tenant-acme",
+      },
+      repoUrl: "https://forge.example/keel-tenants/infra-tenant-acme",
+    })
+    // Platform PRs without a tenant keep the platform scope; local:// URLs give no repo link.
+    expect(listing.proposals[1]).toMatchObject({
+      scope: "management",
+      tenant: "management",
+      status: "merged",
+    })
+    expect(listing.proposals[1].repoUrl).toBeUndefined()
+    expect(proposalKey(listing.proposals[0])).toBe("acme/3")
+    expect(proposalKey(listing.proposals[1])).toBe("management/3")
+    expect(listing.unavailable).toEqual([
+      {
+        scope: "globex",
+        repository: { label: "tenant-globex" },
+        reason: "forge unavailable",
+      },
+    ])
   })
 
   it("creates proposal", async () => {
@@ -170,7 +262,7 @@ describe("api client module", () => {
       tenant: "tenant-acme",
       values: { replicaCount: 3 },
     }
-    const mockRes = { id: "100", title: "Deploy app" }
+    const mockRes = { id: "100", title: "Deploy app", scope: "tenant-acme" }
     vi.stubGlobal(
       "fetch",
       vi.fn().mockResolvedValue({
@@ -181,11 +273,14 @@ describe("api client module", () => {
 
     const res = await createProposal(payload)
     expect(res).toMatchObject(mockRes)
-    expect(fetch).toHaveBeenCalledWith("/api/v1/proposals", {
-      method: "POST",
-      headers: expect.any(Object),
-      body: JSON.stringify(payload),
-    })
+    expect(fetch).toHaveBeenCalledWith(
+      "/api/v1/tenants/tenant-acme/proposals",
+      {
+        method: "POST",
+        headers: expect.any(Object),
+        body: JSON.stringify(payload),
+      }
+    )
   })
 
   it("fetches proposal preview and merges proposal", async () => {
@@ -198,10 +293,10 @@ describe("api client module", () => {
       })
     )
 
-    const preview = await getProposalPreview("42")
+    const preview = await getProposalPreview({ scope: "acme", id: "42" })
     expect(preview).toEqual(mockPreview)
     expect(fetch).toHaveBeenCalledWith(
-      "/api/v1/proposals/42/preview",
+      "/api/v1/tenants/acme/proposals/42/preview",
       expect.any(Object)
     )
 
@@ -214,10 +309,10 @@ describe("api client module", () => {
       })
     )
 
-    const mergeRes = await mergeProposal(42)
+    const mergeRes = await mergeProposal({ scope: "management", id: "42" })
     expect(mergeRes).toEqual(mockMerge)
     expect(fetch).toHaveBeenCalledWith(
-      "/api/v1/proposals/42/merge",
+      "/api/v1/tenants/management/proposals/42/merge",
       expect.objectContaining({ method: "POST" })
     )
 
@@ -243,14 +338,14 @@ describe("api client module", () => {
       })
     )
 
-    const wrappedPreview = await getProposalPreview(7)
+    const wrappedPreview = await getProposalPreview({ scope: "acme", id: "7" })
     expect(wrappedPreview.prUrl).toBe("https://git.local/pr/7")
     expect(wrappedPreview.resources).toEqual([])
     // Absent policy status must not be reported as "passed".
     expect(wrappedPreview.policyStatus).toBeUndefined()
     expect(wrappedPreview.source).toBe("synthesized")
 
-    const wrappedMerge = await mergeProposal(7)
+    const wrappedMerge = await mergeProposal({ scope: "acme", id: "7" })
     expect(wrappedMerge.success).toBe(true)
 
     vi.stubGlobal(
@@ -260,7 +355,7 @@ describe("api client module", () => {
         json: async () => ({ proposal: { id: "7", state: "closed" } }),
       })
     )
-    const wrappedReject = await rejectProposal(7)
+    const wrappedReject = await rejectProposal({ scope: "acme", id: "7" })
     expect(wrappedReject.success).toBe(true)
 
     vi.stubGlobal(
@@ -270,7 +365,7 @@ describe("api client module", () => {
         json: async () => ({ proposal: { id: "7", state: "open" } }),
       })
     )
-    const wrappedReopen = await reopenProposal(7)
+    const wrappedReopen = await reopenProposal({ scope: "acme", id: "7" })
     expect(wrappedReopen.success).toBe(true)
   })
 
@@ -306,14 +401,48 @@ describe("api client module", () => {
           return Promise.resolve({
             ok: true,
             json: async () => ({
-              proposal: { id: "101", title: "Create Tenant PR" },
+              tenant: { id: "acme", namespace: "tenant-acme" },
+              proposal: {
+                id: "101",
+                title: "Create Tenant PR",
+                scope: "management",
+                repository: { label: "platform" },
+              },
+              branch: "keel/acme/create-tenant-1",
+              repository: {
+                layout: "dedicated",
+                owner: "keel-tenants",
+                name: "infra-tenant-acme",
+                webUrl: "javascript:alert(1)",
+                transport: "https",
+                skeletonProposal: {
+                  id: "1",
+                  title: "skeleton",
+                  scope: "acme",
+                  url: "https://forge.example/keel-tenants/infra-tenant-acme/pulls/1",
+                },
+                cluster: {
+                  namespaceReady: false,
+                  sopsAge: "pendingNamespace",
+                  credential: "pendingNamespace",
+                },
+              },
             }),
           })
         }
         if (url.includes("/tenants/") && init?.method === "DELETE") {
           return Promise.resolve({
             ok: true,
-            json: async () => ({ id: "102", title: "Delete Tenant PR" }),
+            json: async () => ({
+              id: "acme",
+              proposal: {
+                id: "102",
+                title: "Delete Tenant PR",
+                scope: "management",
+              },
+              branch: "keel/acme/delete-tenant-2",
+              notes: ["revoke credentials"],
+            }),
           })
         }
         if (url.includes("/tenants")) {
@@ -328,7 +457,11 @@ describe("api client module", () => {
           return Promise.resolve({
             ok: true,
             json: async () => ({
-              proposal: { id: "103", title: "Add Catalog App PR" },
+              proposal: {
+                id: "103",
+                title: "Add Catalog App PR",
+                scope: "management",
+              },
             }),
           })
         }
@@ -340,15 +473,51 @@ describe("api client module", () => {
     expect(tenants).toEqual([{ id: "default", namespace: "tenant-default" }])
 
     const createdTenant = await createTenant("acme")
-    expect(createdTenant).toMatchObject({
+    expect(fetch).toHaveBeenCalledWith(
+      "/api/v1/tenants",
+      expect.objectContaining({ body: JSON.stringify({ id: "acme" }) })
+    )
+    expect(createdTenant.tenant).toEqual({
+      id: "acme",
+      namespace: "tenant-acme",
+    })
+    expect(createdTenant.proposal).toMatchObject({
       id: "101",
       title: "Create Tenant PR",
+      scope: "management",
+      branch: "keel/acme/create-tenant-1",
     })
+    expect(createdTenant.repository).toMatchObject({
+      layout: "dedicated",
+      transport: "https",
+      notes: [],
+      skeletonProposal: {
+        id: "1",
+        scope: "acme",
+        repoUrl: "https://forge.example/keel-tenants/infra-tenant-acme",
+      },
+    })
+    // Never render a non-http(s) repository link.
+    expect(createdTenant.repository.webUrl).toBeUndefined()
+
+    await createTenant("acme", { adoptExisting: true })
+    expect(fetch).toHaveBeenCalledWith(
+      "/api/v1/tenants",
+      expect.objectContaining({
+        body: JSON.stringify({ id: "acme", adoptExisting: true }),
+      })
+    )
 
     const deletedTenant = await deleteTenant("acme")
     expect(deletedTenant).toMatchObject({
-      id: "102",
-      title: "Delete Tenant PR",
+      id: "acme",
+      branch: "keel/acme/delete-tenant-2",
+      notes: ["revoke credentials"],
+      proposal: {
+        id: "102",
+        title: "Delete Tenant PR",
+        branch: "keel/acme/delete-tenant-2",
+      },
     })
 
     const createdApp = await createCatalogApp({
@@ -375,6 +544,7 @@ describe("api client module", () => {
               proposal: {
                 id: "201",
                 title: "Toggle AWS Provider",
+                scope: "management",
                 branch: "feature/toggle-aws",
               },
             }),
@@ -386,6 +556,7 @@ describe("api client module", () => {
             json: async () => ({
               id: "202",
               title: "Toggle GCP Provider",
+              scope: "management",
               branch: "feature/toggle-gcp",
             }),
           })
@@ -421,14 +592,15 @@ describe("api client module", () => {
     expect(fetch).toHaveBeenCalledWith("/api/v1/providers", expect.any(Object))
 
     const proposal1 = await toggleProvider("aws", false)
-    expect(proposal1).toEqual({
+    expect(proposal1).toMatchObject({
       id: "201",
       title: "Toggle AWS Provider",
       branch: "feature/toggle-aws",
+      scope: "management",
     })
 
     const proposal2 = await toggleProvider("gcp", true)
-    expect(proposal2).toEqual({
+    expect(proposal2).toMatchObject({
       id: "202",
       title: "Toggle GCP Provider",
       branch: "feature/toggle-gcp",
@@ -539,13 +711,17 @@ describe("api client module", () => {
         if (url.includes("/proposals") && init?.method === "POST") {
           return Promise.resolve({
             ok: true,
-            json: async () => ({ proposal: { id: "99", title: "Wrapped PR" } }),
+            json: async () => ({
+              proposal: { id: "99", title: "Wrapped PR", scope: "acme" },
+            }),
           })
         }
         if (url.includes("/proposals")) {
           return Promise.resolve({
             ok: true,
-            json: async () => ({ proposals: [{ id: "99", title: "Wrapped" }] }),
+            json: async () => ({
+              proposals: [{ id: "99", title: "Wrapped", scope: "acme" }],
+            }),
           })
         }
         if (url.includes("/stacks")) {
@@ -654,6 +830,7 @@ describe("api client module", () => {
         proposal: {
           id: "305",
           title: "feat(catalog): update infra kind-cluster",
+          scope: "management",
           sourceBranch: "keel/catalog/update-kind-cluster-305",
           state: "open",
         },
@@ -689,7 +866,7 @@ describe("api client module", () => {
       ok: true,
       json: async () => ({
         ok: true,
-        proposal: { id: "1", title: "delete" },
+        proposal: { id: "1", title: "delete", scope: "acme" },
       }),
     })
     vi.stubGlobal("fetch", fetchMock)
@@ -832,6 +1009,7 @@ describe("api client module", () => {
         proposal: {
           id: "401",
           title: "chore(mgmt): upgrade kyverno",
+          scope: "management",
           branch: "keel/mgmt/upgrade-kyverno",
           state: "open",
         },
@@ -920,19 +1098,19 @@ describe("api client module", () => {
         })
     )
 
-    await expect(rejectProposal("9")).resolves.toEqual({
+    await expect(rejectProposal({ scope: "acme", id: "9" })).resolves.toEqual({
       success: true,
       message: "Rejected directly",
     })
-    await expect(reopenProposal("9")).resolves.toEqual({
+    await expect(reopenProposal({ scope: "acme", id: "9" })).resolves.toEqual({
       success: true,
       message: "Reopened directly",
     })
-    await expect(reopenProposal("9")).resolves.toEqual({
+    await expect(reopenProposal({ scope: "acme", id: "9" })).resolves.toEqual({
       success: true,
       message: "PR #9 reopened.",
     })
-    await expect(rejectProposal("9")).resolves.toEqual({
+    await expect(rejectProposal({ scope: "acme", id: "9" })).resolves.toEqual({
       success: true,
       message: "PR #9 rejected and closed.",
     })

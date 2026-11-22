@@ -1,7 +1,12 @@
 import React, { useEffect, useState } from "react"
 import { Filter, Layers, Plus, Search, Trash2, X } from "lucide-react"
 
-import { CatalogItem, Proposal } from "../types/api"
+import {
+  CatalogItem,
+  CreateTenantResult,
+  Proposal,
+  ProposalRef,
+} from "../types/api"
 import {
   createTenant,
   deleteCatalogItem,
@@ -30,7 +35,7 @@ import { useCatalogData } from "./catalog/useCatalogData"
 import { useCatalogItemEditor } from "./catalog/useCatalogItemEditor"
 
 export interface CatalogWizardViewProps {
-  onNavigateToPreview?: () => void
+  onNavigateToPreview?: (ref?: ProposalRef) => void
   initialReleaseTarget?: {
     namespace: string
     name: string
@@ -91,6 +96,11 @@ export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
   const [newTenantId, setNewTenantId] = useState("")
   const [tenantLoading, setTenantLoading] = useState(false)
   const [tenantError, setTenantError] = useState<string | null>(null)
+  const [adoptExisting, setAdoptExisting] = useState(false)
+  const [tenantResult, setTenantResult] = useState<CreateTenantResult | null>(
+    null
+  )
+  const [tenantNotes, setTenantNotes] = useState<string[]>([])
 
   const {
     catalog,
@@ -188,17 +198,33 @@ export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
     setTenantLoading(true)
     setTenantError(null)
     setCreatedProposal(null)
+    setTenantNotes([])
     try {
-      const proposal = await createTenant(newId)
-      setCreatedProposal(proposal)
+      const result = await createTenant(
+        newId,
+        adoptExisting ? { adoptExisting: true } : {}
+      )
+      // The tenant repository skeleton PR must merge before the platform stub PR, so the
+      // notice that outlives the dialog points at it first.
+      setCreatedProposal(
+        result.repository.skeletonProposal ?? result.proposal ?? null
+      )
       setTenants((prev) =>
         prev.some((t) => t.id === newId)
           ? prev
-          : [...prev, { id: newId, namespace: `tenant-${newId}` }]
+          : [
+              ...prev,
+              {
+                id: newId,
+                namespace: result.tenant.namespace || `tenant-${newId}`,
+              },
+            ]
       )
       setTenant(newId)
       setNewTenantId("")
-      setIsNewTenantModalOpen(false)
+      setAdoptExisting(false)
+      // The dialog stays open on its provisioning summary until dismissed.
+      setTenantResult(result)
     } catch (err) {
       setTenantError(errorMessage(err, "Failed to create tenant proposal"))
     } finally {
@@ -206,14 +232,23 @@ export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
     }
   }
 
+  const closeTenantModal = () => {
+    setIsNewTenantModalOpen(false)
+    setTenantError(null)
+    setTenantResult(null)
+    setAdoptExisting(false)
+  }
+
   const handleDeleteTenant = async (tenantId: string) => {
     if (tenantId === "default") return
     setTenantLoading(true)
     setTenantError(null)
     setCreatedProposal(null)
+    setTenantNotes([])
     try {
-      const proposal = await deleteTenant(tenantId)
-      setCreatedProposal(proposal)
+      const result = await deleteTenant(tenantId)
+      setCreatedProposal(result.proposal)
+      setTenantNotes(result.notes)
       setTenants((prev) => prev.filter((t) => t.id !== tenantId))
       if (tenant === tenantId) setTenant("default")
     } catch (err) {
@@ -314,8 +349,28 @@ export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
         <ProposalCreatedNotice
           proposal={createdProposal}
           onDismiss={() => setCreatedProposal(null)}
-          onNavigateToPreview={onNavigateToPreview}
+          onNavigateToPreview={
+            onNavigateToPreview
+              ? () =>
+                  onNavigateToPreview({
+                    scope: createdProposal.scope,
+                    id: createdProposal.id,
+                  })
+              : undefined
+          }
         />
+      )}
+
+      {tenantNotes.length > 0 && (
+        <ul
+          data-testid="tenant-operator-notes"
+          aria-label="Tenant follow-ups"
+          className="list-disc space-y-1 rounded-xl border border-amber-500/30 bg-amber-950/30 p-3 pl-7 text-xs text-amber-200"
+        >
+          {tenantNotes.map((note) => (
+            <li key={note}>{note}</li>
+          ))}
+        </ul>
       )}
 
       <div className="flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3">
@@ -436,17 +491,15 @@ export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
           isOpen={isNewTenantModalOpen}
           newTenantId={newTenantId}
           onNewTenantIdChange={setNewTenantId}
+          adoptExisting={adoptExisting}
+          onAdoptExistingChange={setAdoptExisting}
           tenantLoading={tenantLoading}
           tenantError={tenantError}
+          result={tenantResult}
+          onNavigateToPreview={onNavigateToPreview}
           onSubmit={handleCreateTenant}
-          onClose={() => {
-            setIsNewTenantModalOpen(false)
-            setTenantError(null)
-          }}
-          onCancel={() => {
-            setIsNewTenantModalOpen(false)
-            setTenantError(null)
-          }}
+          onClose={closeTenantModal}
+          onCancel={closeTenantModal}
         />
       )}
 

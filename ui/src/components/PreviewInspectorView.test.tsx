@@ -17,14 +17,25 @@ import { buildAuthz } from "../lib/authz"
 import { renderWithAuthz } from "../test/render"
 import { CrdWatchEvent, PreviewReport, Proposal } from "../types/api"
 
-vi.mock("../lib/api", () => ({
-  getProposals: vi.fn(),
-  getProposalPreview: vi.fn(),
-  mergeProposal: vi.fn(),
-  rejectProposal: vi.fn(),
-  reopenProposal: vi.fn(),
-  createEventSourceStream: vi.fn(() => ({ close: vi.fn() })),
-}))
+vi.mock("../lib/api", () => {
+  // The view loads `getProposalListing`; most cases only care about the PR list, so the listing
+  // delegates to the `getProposals` mock (no unavailable repositories).
+  const getProposals = vi.fn()
+  return {
+    getProposals,
+    getProposalListing: vi.fn(async (...args: unknown[]) => ({
+      proposals: await getProposals(...args),
+      unavailable: [],
+    })),
+    proposalKey: (ref: { scope: string; id: string }) =>
+      `${ref.scope}/${ref.id}`,
+    getProposalPreview: vi.fn(),
+    mergeProposal: vi.fn(),
+    rejectProposal: vi.fn(),
+    reopenProposal: vi.fn(),
+    createEventSourceStream: vi.fn(() => ({ close: vi.fn() })),
+  }
+})
 
 const mockProposals: Proposal[] = [
   {
@@ -32,7 +43,13 @@ const mockProposals: Proposal[] = [
     title: "Deploy Redis Cache",
     branch: "keel/tenant-acme/redis-101",
     author: "dev@acme.com",
-    tenant: "tenant-acme",
+    tenant: "acme",
+    scope: "acme",
+    repository: {
+      label: "tenant-acme",
+      fullName: "keel-tenants/infra-tenant-acme",
+    },
+    repoUrl: "https://git.internal/keel-tenants/infra-tenant-acme",
     status: "open",
     createdAt: "5 mins ago",
     prUrl: "https://git.internal/pr/101",
@@ -144,7 +161,10 @@ describe("PreviewInspectorView component", () => {
     fireEvent.click(screen.getByRole("button", { name: /Merge PR/i }))
 
     await waitFor(() => {
-      expect(api.mergeProposal).toHaveBeenCalledWith("101")
+      expect(api.mergeProposal).toHaveBeenCalledWith({
+        scope: "acme",
+        id: "101",
+      })
       expect(screen.getByRole("status")).toHaveTextContent(
         "Merged cleanly into main"
       )
@@ -180,7 +200,10 @@ describe("PreviewInspectorView component", () => {
 
     await confirmReject()
     await waitFor(() => {
-      expect(api.rejectProposal).toHaveBeenCalledWith("101")
+      expect(api.rejectProposal).toHaveBeenCalledWith({
+        scope: "acme",
+        id: "101",
+      })
       expect(screen.getByRole("status")).toHaveTextContent(
         "PR #101 rejected and closed."
       )
@@ -269,7 +292,10 @@ describe("PreviewInspectorView component", () => {
     fireEvent.click(reopenBtn)
 
     await waitFor(() => {
-      expect(api.reopenProposal).toHaveBeenCalledWith("101")
+      expect(api.reopenProposal).toHaveBeenCalledWith({
+        scope: "acme",
+        id: "101",
+      })
       expect(screen.getByText("PR #101 reopened.")).toBeInTheDocument()
       expect(screen.getByRole("button", { name: /Merge PR/i })).toBeEnabled()
       expect(screen.getByRole("button", { name: /Reject PR/i })).toBeEnabled()
@@ -290,7 +316,7 @@ describe("PreviewInspectorView component", () => {
     expect(screen.getByRole("button", { name: /Merge PR/i })).toBeDisabled()
     expect(screen.getByRole("button", { name: /Reject PR/i })).toBeDisabled()
     expect(screen.getByTestId("pr-actions-permission-hint")).toHaveTextContent(
-      'Requires cluster admin or tenant admin for "tenant-acme"'
+      'Requires cluster admin or tenant admin for "acme"'
     )
     unmount()
 
@@ -325,50 +351,209 @@ describe("PreviewInspectorView component", () => {
 
     const { rerender } = renderWithAuthz(
       <PreviewInspectorView
-        selectedProposalId="102"
+        selectedProposal={{ scope: "acme", id: "102" }}
         onSelectProposal={onSelect}
       />
     )
     await screen.findByText("PR #102: Second PR")
-    expect(api.getProposalPreview).toHaveBeenCalledWith("102")
+    expect(api.getProposalPreview).toHaveBeenCalledWith({
+      scope: "acme",
+      id: "102",
+    })
     expect(onSelect).not.toHaveBeenCalled()
 
     fireEvent.click(screen.getByText("Deploy Redis Cache"))
     await screen.findByText("PR #101: Deploy Redis Cache")
-    expect(onSelect).toHaveBeenCalledWith("101")
+    expect(onSelect).toHaveBeenCalledWith({ scope: "acme", id: "101" })
 
     // A new deep link supersedes the manual click.
     rerender(
       <PreviewInspectorView
-        selectedProposalId="102"
+        selectedProposal={{ scope: "acme", id: "102" }}
         onSelectProposal={onSelect}
       />
     )
     rerender(
       <PreviewInspectorView
-        selectedProposalId="101"
+        selectedProposal={{ scope: "acme", id: "101" }}
         onSelectProposal={onSelect}
       />
     )
     rerender(
       <PreviewInspectorView
-        selectedProposalId="102"
+        selectedProposal={{ scope: "acme", id: "102" }}
         onSelectProposal={onSelect}
       />
     )
     await screen.findByText("PR #102: Second PR")
   })
 
+  it("lists every repository for a deep link outside the selected tenant", async () => {
+    const platformPr: Proposal = {
+      ...mockProposals[0],
+      id: "42",
+      title: "Add tenant globex",
+      tenant: "management",
+      scope: "management",
+      repository: { label: "platform" },
+    }
+    const listing = vi.mocked(api.getProposalListing)
+    const delegate = listing.getMockImplementation()
+    listing.mockImplementation(async (tenant) => ({
+      proposals: tenant
+        ? [{ ...mockProposals[0], scope: tenant }]
+        : [mockProposals[0], platformPr],
+      unavailable: [],
+    }))
+    vi.mocked(api.getProposalPreview).mockResolvedValue(mockPreview)
+
+    renderWithAuthz(
+      <PreviewInspectorView
+        selectedTenant="default"
+        selectedProposal={{ scope: "management", id: "42" }}
+      />
+    )
+
+    await screen.findByText("PR #42: Add tenant globex")
+    expect(api.getProposalListing).toHaveBeenLastCalledWith(undefined, "all")
+    expect(screen.queryByTestId("pr-deeplink-missing")).not.toBeInTheDocument()
+    expect(api.getProposalPreview).toHaveBeenCalledWith({
+      scope: "management",
+      id: "42",
+    })
+    if (delegate) listing.mockImplementation(delegate)
+  })
+
   it("shows a notice when the deep-linked PR is not visible", async () => {
     vi.mocked(api.getProposals).mockResolvedValue(mockProposals)
     vi.mocked(api.getProposalPreview).mockResolvedValue(mockPreview)
 
-    renderWithAuthz(<PreviewInspectorView selectedProposalId="999" />)
+    renderWithAuthz(
+      <PreviewInspectorView selectedProposal={{ scope: "acme", id: "999" }} />
+    )
 
     expect(await screen.findByTestId("pr-deeplink-missing")).toHaveTextContent(
-      "PR #999 not found or not visible"
+      "PR #999 (acme) not found or not visible"
     )
     await screen.findByText("PR #101: Deploy Redis Cache")
+  })
+
+  it("keys PRs by scope: equal ids in two repositories stay distinct", async () => {
+    const globex: Proposal = {
+      ...mockProposals[0],
+      title: "Globex Podinfo",
+      tenant: "globex",
+      scope: "globex",
+      repository: {
+        label: "tenant-globex",
+        fullName: "keel-tenants/infra-tenant-globex",
+      },
+    }
+    vi.mocked(api.getProposals).mockResolvedValue([mockProposals[0], globex])
+    vi.mocked(api.getProposalPreview).mockResolvedValue(mockPreview)
+    vi.mocked(api.mergeProposal).mockResolvedValue({ success: true })
+    const onSelect = vi.fn()
+
+    renderWithAuthz(
+      <PreviewInspectorView
+        selectedProposal={{ scope: "globex", id: "101" }}
+        onSelectProposal={onSelect}
+      />
+    )
+    await screen.findByText("PR #101: Globex Podinfo")
+    expect(api.getProposalPreview).toHaveBeenCalledWith({
+      scope: "globex",
+      id: "101",
+    })
+    expect(screen.getAllByText("PR #101")).toHaveLength(2)
+
+    fireEvent.click(screen.getByRole("button", { name: /Merge PR/i }))
+    await waitFor(() =>
+      expect(api.mergeProposal).toHaveBeenCalledWith({
+        scope: "globex",
+        id: "101",
+      })
+    )
+    // Only the globex PR changed status.
+    const list = screen.getByTestId("pr-list")
+    const cards = within(list).getAllByRole("button")
+    const statusOf = (title: string) =>
+      cards.find((c) => c.textContent?.includes(title))?.textContent
+    await waitFor(() => expect(statusOf("Globex Podinfo")).toMatch(/merged/))
+    expect(statusOf("Deploy Redis Cache")).toMatch(/open/)
+
+    fireEvent.click(within(list).getByText("Deploy Redis Cache"))
+    expect(onSelect).toHaveBeenCalledWith({ scope: "acme", id: "101" })
+    await screen.findByText("PR #101: Deploy Redis Cache")
+  })
+
+  it("shows the repository of each PR, forge links and unavailable repositories", async () => {
+    vi.mocked(api.getProposalListing).mockResolvedValueOnce({
+      proposals: mockProposals,
+      unavailable: [
+        {
+          scope: "globex",
+          repository: {
+            label: "tenant-globex",
+            fullName: "keel-tenants/infra-tenant-globex",
+          },
+          reason: "forge unavailable or rate limited",
+        },
+      ],
+    })
+    vi.mocked(api.getProposalPreview).mockResolvedValue(mockPreview)
+
+    renderWithAuthz(<PreviewInspectorView selectedTenant="acme" />)
+    await screen.findByText("PR #101: Deploy Redis Cache")
+    expect(api.getProposalListing).toHaveBeenCalledWith("acme", "all")
+    expect(
+      screen.getByText("keel-tenants/infra-tenant-acme", {
+        selector: "span[title]",
+      })
+    ).toBeInTheDocument()
+    expect(
+      screen.getByRole("link", { name: /Repository Link/i })
+    ).toHaveAttribute(
+      "href",
+      "https://git.internal/keel-tenants/infra-tenant-acme"
+    )
+    expect(
+      within(screen.getByTestId("pr-list")).getByTestId("pr-repository")
+    ).toHaveTextContent("keel-tenants/infra-tenant-acme")
+    expect(screen.getByTestId("pr-unavailable-repositories")).toHaveTextContent(
+      /keel-tenants\/infra-tenant-globex.*forge unavailable/
+    )
+  })
+
+  it("requires a cluster admin for platform-repository PRs", async () => {
+    vi.mocked(api.getProposals).mockResolvedValue([
+      {
+        ...mockProposals[0],
+        id: "9",
+        title: "Create tenant acme",
+        scope: "management",
+        repository: { label: "platform" },
+        repoUrl: undefined,
+        prUrl: "local:///tmp/remote.git/.keel/proposals/9.json",
+      },
+    ])
+    vi.mocked(api.getProposalPreview).mockResolvedValue(mockPreview)
+    const tenantAdmin = buildAuthz({
+      authenticated: true,
+      phase: "oidc-active",
+      groups: ["tenant-acme-admin"],
+    })
+    renderWithAuthz(<PreviewInspectorView />, tenantAdmin)
+    await screen.findByText("PR #9: Create tenant acme")
+    expect(screen.getByRole("button", { name: /Merge PR/i })).toBeDisabled()
+    expect(screen.getByTestId("pr-actions-permission-hint")).toHaveTextContent(
+      "Requires cluster admin (platform repository)"
+    )
+    // Non-http(s) forge URLs (Local Git provider) are never rendered as links.
+    expect(screen.queryByRole("link", { name: /Forge Link/i })).toBeNull()
+    expect(
+      screen.getByText("platform repository", { selector: "span[title]" })
+    ).toBeInTheDocument()
   })
 
   it("renders clean empty state when getProposals returns empty array in non-demo mode", async () => {
@@ -532,7 +717,10 @@ describe("PreviewInspectorView component", () => {
     fireEvent.keyDown(card, { key: " " })
 
     await waitFor(() => {
-      expect(api.getProposalPreview).toHaveBeenCalledWith("102")
+      expect(api.getProposalPreview).toHaveBeenCalledWith({
+        scope: "acme",
+        id: "102",
+      })
     })
 
     await confirmReject()
@@ -625,6 +813,8 @@ describe("PreviewInspectorView component", () => {
         title: "Deploy Redis Cache",
         branch: "branch-redis",
         tenant: "tenant-a",
+        scope: "a",
+        repository: { label: "tenant-a" },
         author: "alice",
       },
       {
@@ -633,6 +823,8 @@ describe("PreviewInspectorView component", () => {
         title: "Scale Kafka",
         branch: "branch-kafka",
         tenant: "tenant-b",
+        scope: "b",
+        repository: { label: "tenant-b" },
         author: "bob",
       },
       {
@@ -641,6 +833,8 @@ describe("PreviewInspectorView component", () => {
         title: "Update Postgres",
         branch: "branch-pg",
         tenant: "tenant-a",
+        scope: "a",
+        repository: { label: "tenant-a" },
         author: "charlie",
       },
     ]
@@ -679,6 +873,14 @@ describe("PreviewInspectorView component", () => {
       screen.getByText("No pull requests matching your search.")
     ).toBeInTheDocument()
     expect(screen.queryByText("Scale Kafka")).toBeNull()
+
+    // Repository (scope) filter narrows the aggregated listing.
+    fireEvent.change(searchInput, { target: { value: "" } })
+    fireEvent.change(screen.getByTestId("pr-scope-filter"), {
+      target: { value: "b" },
+    })
+    expect(screen.getByText("Scale Kafka")).toBeInTheDocument()
+    expect(screen.queryByText("Update Postgres")).toBeNull()
   })
 
   it("renders policy banner from status instead of hardcoded pass", () => {

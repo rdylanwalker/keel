@@ -8,7 +8,12 @@ import {
   RefreshCw,
 } from "lucide-react"
 
-import { Proposal, ReleaseSummary, StackSummary } from "../types/api"
+import {
+  Proposal,
+  ProposalRef,
+  ReleaseSummary,
+  StackSummary,
+} from "../types/api"
 import {
   deleteRelease,
   deleteStack,
@@ -52,7 +57,7 @@ const VmSshModal = React.lazy(() =>
 export interface TopologyViewProps {
   /** Navigates to the catalog, optionally pre-filtered by kind (`#catalog/<kind>`). */
   onNavigateToCatalog?: (kind?: CatalogKindFilter) => void
-  onNavigateToPreview?: () => void
+  onNavigateToPreview?: (ref?: ProposalRef) => void
   onNavigateToProviders?: () => void
   onEditRelease?: (namespace: string, name: string) => void
   onEditStack?: (namespace: string, name: string) => void
@@ -79,6 +84,7 @@ interface Banner {
   message: string
   prUrl?: string
   prId?: string
+  prScope?: string
 }
 
 export const TopologyView: React.FC<TopologyViewProps> = ({
@@ -152,6 +158,7 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
             message: `Opened Delete PR #${res.proposal.id} (${res.branch}) for stack ${stack.name}`,
             prUrl: res.proposal.prUrl,
             prId: res.proposal.id,
+            prScope: res.proposal.scope,
           })
           scheduleRefresh(1000)
         } catch (err) {
@@ -199,6 +206,7 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
         message: `Opened ${action === "upgrade" ? "Edit" : "Rollback"} PR #${proposal.id} (${proposal.branch || "main"}) for management add-on ${id}`,
         prUrl: proposal.prUrl,
         prId: proposal.id,
+        prScope: proposal.scope,
       })
     },
     []
@@ -246,6 +254,7 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
               message: `Opened Delete PR #${res.proposal.id} (${res.branch}) for release ${rel.name}`,
               prUrl: res.proposal.prUrl,
               prId: res.proposal.id,
+              prScope: res.proposal.scope,
             })
             scheduleRefresh(1000)
           } catch (err) {
@@ -385,6 +394,7 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
             <PrNotificationBanner
               message={stackBanner.message}
               prId={stackBanner.prId}
+              prScope={stackBanner.prScope}
               prUrl={stackBanner.prUrl}
               onNavigateToPreview={onNavigateToPreview}
               onDismiss={() => setStackBanner(null)}
@@ -452,6 +462,7 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
             <PrNotificationBanner
               message={releaseBanner.message}
               prId={releaseBanner.prId}
+              prScope={releaseBanner.prScope}
               prUrl={releaseBanner.prUrl}
               onNavigateToPreview={onNavigateToPreview}
               onDismiss={() => setReleaseBanner(null)}

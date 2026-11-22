@@ -62,7 +62,7 @@ export function deployPlacementError(
   return `${item.name} installs cluster-scoped resources (CRDs, ClusterRoles or webhooks) and can only be deployed to a remote workload cluster. Select a Target Cluster other than the management cluster.`
 }
 
-/** Builds the `POST /api/v1/proposals` payload for a catalog deployment / edit. */
+/** Builds the `POST /api/v1/tenants/{tenant}/proposals` payload for a catalog deployment / edit. */
 export function buildDeployProposalPayload(
   item: CatalogItem,
   target: DeployTargetState,

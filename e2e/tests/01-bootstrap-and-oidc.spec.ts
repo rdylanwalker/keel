@@ -165,18 +165,18 @@ test.describe('01 - OIDC PKCE Auth Flow (GUI + CLI loopback)', () => {
   test('01.9 - CSRF guard rejects cookie-authenticated cross-site mutations', async ({ page }) => {
     await uiLogin(page, USERS.admin);
     // page.request shares the browser cookie jar (keel_session) but sends no Origin by default.
-    const noProvenance = await page.request.post('/api/v1/proposals/999999/reject');
+    const noProvenance = await page.request.post('/api/v1/tenants/default/proposals/999999/reject');
     expect(noProvenance.status()).toBe(403);
-    const crossOrigin = await page.request.post('/api/v1/proposals/999999/reject', {
+    const crossOrigin = await page.request.post('/api/v1/tenants/default/proposals/999999/reject', {
       headers: { Origin: 'http://evil.example' },
     });
     expect(crossOrigin.status()).toBe(403);
-    const crossSite = await page.request.post('/api/v1/proposals/999999/reject', {
+    const crossSite = await page.request.post('/api/v1/tenants/default/proposals/999999/reject', {
       headers: { 'Sec-Fetch-Site': 'cross-site' },
     });
     expect(crossSite.status()).toBe(403);
     // Same-origin requests pass the guard and reach the handler (unknown PR -> 404).
-    const sameOrigin = await page.request.post('/api/v1/proposals/999999/reject', {
+    const sameOrigin = await page.request.post('/api/v1/tenants/default/proposals/999999/reject', {
       headers: { Origin: new URL(BASE_URL).origin },
     });
     expect(sameOrigin.status()).toBe(404);

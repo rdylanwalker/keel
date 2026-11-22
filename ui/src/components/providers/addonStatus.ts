@@ -86,15 +86,22 @@ export function deriveManagementHealth(
 }
 
 /** Maps open `keel/providers/toggle-<id>-<ts>` PR branches to provider ids. */
+export interface PendingProviderPr {
+  id: string
+  branch: string
+  /** Proposal scope (provider toggles live in the platform repository: `management`). */
+  scope: string
+}
+
 export function extractPendingProviderPrs(
-  proposals: { id: string; branch: string; status: string }[]
-): Record<string, { id: string; branch: string }> {
-  const map: Record<string, { id: string; branch: string }> = {}
+  proposals: { id: string; branch: string; status: string; scope: string }[]
+): Record<string, PendingProviderPr> {
+  const map: Record<string, PendingProviderPr> = {}
   for (const pr of proposals) {
     if (pr.status !== "open") continue
     const match = /^keel\/providers\/toggle-([a-z0-9-]+)-\d+$/.exec(pr.branch)
     if (match) {
-      map[match[1]] = { id: pr.id, branch: pr.branch }
+      map[match[1]] = { id: pr.id, branch: pr.branch, scope: pr.scope }
     }
   }
   return map

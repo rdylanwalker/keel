@@ -18,26 +18,39 @@ const KIND_FILTERS: readonly CatalogKindFilter[] = [
   "app",
 ]
 
+/** Proposal scope segment: a tenant id or `management` (DNS-1123 label). */
+const DNS_LABEL = /^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$/
+const PR_ID = /^[A-Za-z0-9._-]{1,64}$/
+
 export interface HashRoute {
   tab: ActiveTab
-  /** `#preview/<id>`: selected PR/proposal id. */
+  /** `#preview/<scope>/<id>`: selected PR id (unique within its repository only). */
   proposalId?: string
+  /** `#preview/<scope>/<id>`: proposal scope (tenant id or `management`). */
+  proposalScope?: string
   /** `#catalog/<kind>`: catalog kind pre-filter. */
   kind?: CatalogKindFilter
 }
 
 export function parseHashRoute(hash: string): HashRoute {
-  const [rawTab, rawParam] = hash
+  const [rawTab, rawParam, rawParam2] = hash
     .replace(/^#\/?/, "")
     .trim()
-    .split("/", 2)
+    .split("/", 3)
     .map((p) => decodeURIComponentSafe(p ?? ""))
   const tab = (VALID_TABS as readonly string[]).includes(rawTab)
     ? (rawTab as ActiveTab)
     : "topology"
   const param = rawParam?.trim()
-  if (tab === "preview" && param && /^[A-Za-z0-9._-]{1,64}$/.test(param)) {
-    return { tab, proposalId: param }
+  const param2 = rawParam2?.trim()
+  if (
+    tab === "preview" &&
+    param &&
+    param2 &&
+    DNS_LABEL.test(param) &&
+    PR_ID.test(param2)
+  ) {
+    return { tab, proposalScope: param, proposalId: param2 }
   }
   if (
     tab === "catalog" &&
@@ -50,8 +63,8 @@ export function parseHashRoute(hash: string): HashRoute {
 }
 
 export function formatHashRoute(route: HashRoute): string {
-  if (route.tab === "preview" && route.proposalId) {
-    return `#preview/${encodeURIComponent(route.proposalId)}`
+  if (route.tab === "preview" && route.proposalId && route.proposalScope) {
+    return `#preview/${encodeURIComponent(route.proposalScope)}/${encodeURIComponent(route.proposalId)}`
   }
   if (route.tab === "catalog" && route.kind) {
     return `#catalog/${route.kind}`

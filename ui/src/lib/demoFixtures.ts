@@ -1085,36 +1085,84 @@ export const DEFAULT_STACKS: StackSummary[] = [
   },
 ]
 
+/**
+ * Demo PRs across repositories: every tenant has its own repository in the `keel-tenants`
+ * organisation (PR numbers repeat between repositories), platform changes live in the platform
+ * repository (`management` scope).
+ */
 export const DEFAULT_PROPOSALS: Proposal[] = [
   {
-    id: "42",
+    id: "7",
     title:
       "Provision Managed PostgreSQL Instance (postgres-managed) for tenant-acme",
-    branch: "keel/tenant-acme/postgres-managed-42",
+    branch: "keel/acme/postgres-managed-7",
     author: "dylan@acme.internal",
-    tenant: "tenant-acme",
+    tenant: "acme",
     status: "open",
     createdAt: "10 minutes ago",
-    prUrl: "https://git.internal/keel-io/infra/pulls/42",
+    prUrl: "https://git.internal/keel-tenants/infra-tenant-acme/pulls/7",
     previewStatus: "ready",
+    scope: "acme",
+    repository: {
+      label: "tenant-acme",
+      fullName: "keel-tenants/infra-tenant-acme",
+    },
+    repoUrl: "https://git.internal/keel-tenants/infra-tenant-acme",
   },
   {
-    id: "43",
+    id: "8",
     title:
       "Resize pve-workload-cluster-prod (proxmox-k3s-cluster) to 8 vCPU cores",
-    branch: "keel/tenant-acme/proxmox-k3s-cluster-43",
+    branch: "keel/acme/proxmox-k3s-cluster-8",
     author: "infra-bot",
-    tenant: "tenant-acme",
+    tenant: "acme",
     status: "open",
     createdAt: "25 minutes ago",
-    prUrl: "https://git.internal/keel-io/infra/pulls/43",
+    prUrl: "https://git.internal/keel-tenants/infra-tenant-acme/pulls/8",
     previewStatus: "ready",
+    scope: "acme",
+    repository: {
+      label: "tenant-acme",
+      fullName: "keel-tenants/infra-tenant-acme",
+    },
+    repoUrl: "https://git.internal/keel-tenants/infra-tenant-acme",
+  },
+  {
+    id: "7",
+    title: "Install podinfo (podinfo) for tenant-globex",
+    branch: "keel/globex/podinfo-7",
+    author: "ops@globex.internal",
+    tenant: "globex",
+    status: "open",
+    createdAt: "40 minutes ago",
+    prUrl: "https://git.internal/keel-tenants/infra-tenant-globex/pulls/7",
+    previewStatus: "ready",
+    scope: "globex",
+    repository: {
+      label: "tenant-globex",
+      fullName: "keel-tenants/infra-tenant-globex",
+    },
+    repoUrl: "https://git.internal/keel-tenants/infra-tenant-globex",
+  },
+  {
+    id: "42",
+    title: "chore(tenants): create tenant stark",
+    branch: "keel/stark/create-tenant-42",
+    author: "platform-admin",
+    tenant: "stark",
+    status: "open",
+    createdAt: "1 hour ago",
+    prUrl: "https://git.internal/keel-io/infra/pulls/42",
+    previewStatus: "ready",
+    scope: "management",
+    repository: { label: "platform" },
+    repoUrl: "https://git.internal/keel-io/infra",
   },
 ]
 
-/** Preview of proposal #42: the `postgres-managed` blueprint's `Pulumi.yaml` for tenant-acme. */
+/** Preview of acme PR #7: the `postgres-managed` blueprint's `Pulumi.yaml` for tenant-acme. */
 export const DEFAULT_PREVIEW: PreviewReport = {
-  prUrl: "https://git.internal/keel-io/infra/pulls/42",
+  prUrl: "https://git.internal/keel-tenants/infra-tenant-acme/pulls/7",
   policyStatus: "passed",
   source: "pko",
   run: { phase: "succeeded" },

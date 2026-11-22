@@ -7,6 +7,8 @@ import {
   collectSse,
   createProposal,
   openTab,
+  proposalPath,
+  tenantProposalsPath,
   uiLogin,
   uniq,
 } from './support/harness.js';
@@ -36,7 +38,11 @@ test.describe('05 - Multi-Tenant Namespace & Secret Isolation Guards', () => {
     expect(created.status(), await created.text()).toBe(201);
     const body = await created.json();
     expect(body.proposal.title).toBe(`feat(${tenantB}): create tenant ${tenantB}`);
-    const merged = await admin.post(`/api/v1/proposals/${body.proposal.id}/merge`);
+    // The tenant stub PR lives in the platform repository (scope `management`). The mocked
+    // harness uses the Local Git provider: tenants share the platform repository (dev only).
+    expect(body.proposal.scope).toBe('management');
+    expect(body.repository.layout).toBe('monorepo');
+    const merged = await admin.post(proposalPath(body.proposal, 'merge'));
     expect(merged.status(), await merged.text()).toBe(200);
 
     const bApp = await createProposal(admin, {
@@ -94,31 +100,51 @@ test.describe('05 - Multi-Tenant Namespace & Secret Isolation Guards', () => {
     }>;
     for (const r of releases) expect(r.namespace).toBe('tenant-acme');
 
-    const proposals = (await (await acmeDev.get('/api/v1/proposals')).json()).proposals as Array<{
-      id: string;
-      tenant: string;
+    for (const listing of [
+      await acmeDev.get('/api/v1/proposals?status=all'),
+      await acmeDev.get(`${tenantProposalsPath('acme')}?status=all`),
+    ]) {
+      const proposals = (await listing.json()).proposals as Array<{
+        id: string;
+        tenant: string;
+        scope: string;
+      }>;
+      expect(proposals.some((p) => p.id === acmeProposalId)).toBe(true);
+      expect(proposals.some((p) => p.id === tenantBProposalId)).toBe(false);
+      for (const p of proposals) {
+        expect(p.tenant).toBe('acme');
+        expect(p.scope).toBe('acme');
+      }
+    }
+    // Admins see every repository, the platform scope included.
+    const all = (await (await admin.get('/api/v1/proposals?status=all')).json())
+      .proposals as Array<{
+      scope: string;
     }>;
-    expect(proposals.some((p) => p.id === acmeProposalId)).toBe(true);
-    expect(proposals.some((p) => p.id === tenantBProposalId)).toBe(false);
-    for (const p of proposals) expect(p.tenant).toBe('acme');
+    expect(all.some((p) => p.scope === 'management')).toBe(true);
+    expect(all.some((p) => p.scope === tenantB)).toBe(true);
   });
 
   test('05.3 - Cross-tenant reads and writes are rejected with 403', async () => {
     const forbidden: Array<[string, Promise<{ status(): number }>]> = [
       ['stacks', acmeDev.get(`/api/v1/stacks?tenant=${tenantB}`)],
       ['releases', acmeDev.get(`/api/v1/releases?tenant=${tenantB}`)],
-      ['proposals', acmeDev.get(`/api/v1/proposals?tenant=${tenantB}`)],
+      ['proposals', acmeDev.get(tenantProposalsPath(tenantB))],
+      ['platform proposals', acmeAdmin.get(tenantProposalsPath('management'))],
       [
         'create proposal',
-        acmeDev.post('/api/v1/proposals', {
+        acmeDev.post(tenantProposalsPath(tenantB), {
           data: { tenant: tenantB, catalogId: 'podinfo', name: uniq('x'), values: { replicas: 1 } },
         }),
       ],
       ['ssh-info', acmeDev.get(`/api/v1/stacks/tenant-${tenantB}/any/ssh-info`)],
-      ['merge B PR as acme admin', acmeAdmin.post(`/api/v1/proposals/${tenantBProposalId}/merge`)],
+      [
+        'merge B PR as acme admin',
+        acmeAdmin.post(proposalPath({ scope: tenantB, id: tenantBProposalId }, 'merge')),
+      ],
       [
         'reject B PR as acme admin',
-        acmeAdmin.post(`/api/v1/proposals/${tenantBProposalId}/reject`),
+        acmeAdmin.post(proposalPath({ scope: tenantB, id: tenantBProposalId }, 'reject')),
       ],
       [
         'create tenant as tenant admin',
@@ -128,8 +154,19 @@ test.describe('05 - Multi-Tenant Namespace & Secret Isolation Guards', () => {
     for (const [name, p] of forbidden) {
       expect((await p).status(), name).toBe(403);
     }
-    const preview = await acmeDev.get(`/api/v1/proposals/${tenantBProposalId}/preview`);
-    expect([403, 404]).toContain(preview.status());
+    const preview = await acmeDev.get(
+      proposalPath({ scope: tenantB, id: tenantBProposalId }, 'preview'),
+    );
+    expect(preview.status()).toBe(403);
+    // Addressing tenant B's PR through the caller's own scope never reaches it.
+    const viaOwnScope = await acmeDev.get(
+      proposalPath({ scope: 'acme', id: tenantBProposalId }, 'preview'),
+    );
+    expect([403, 404]).toContain(viaOwnScope.status());
+    const mergeViaOwnScope = await acmeAdmin.post(
+      proposalPath({ scope: 'acme', id: tenantBProposalId }, 'merge'),
+    );
+    expect([403, 404]).toContain(mergeViaOwnScope.status());
     const err = await (await acmeDev.get(`/api/v1/stacks?tenant=${tenantB}`)).json();
     expect(err.error).toBe(`Access denied for tenant '${tenantB}'`);
   });
@@ -160,8 +197,9 @@ test.describe('05 - Multi-Tenant Namespace & Secret Isolation Guards', () => {
     expect(schema.status()).toBe(403);
 
     // Members can propose but not merge; their tenant admin can merge.
-    expect((await acmeDev.post(`/api/v1/proposals/${acmeProposalId}/merge`)).status()).toBe(403);
-    const merged = await acmeAdmin.post(`/api/v1/proposals/${acmeProposalId}/merge`);
+    const acmePr = { scope: 'acme', id: acmeProposalId };
+    expect((await acmeDev.post(proposalPath(acmePr, 'merge'))).status()).toBe(403);
+    const merged = await acmeAdmin.post(proposalPath(acmePr, 'merge'));
     expect(merged.status(), await merged.text()).toBe(200);
   });
 
@@ -218,7 +256,7 @@ test.describe('05 - Multi-Tenant Namespace & Secret Isolation Guards', () => {
       name: uniq('own'),
       values: { replicas: 1 },
     });
-    await page.goto(`/#preview/${own.proposal.id}`);
+    await page.goto(`/#preview/acme/${own.proposal.id}`);
     await expect(
       page.getByRole('heading', { name: `PR #${own.proposal.id}: ${own.proposal.title}` }),
     ).toBeVisible();
@@ -227,7 +265,7 @@ test.describe('05 - Multi-Tenant Namespace & Secret Isolation Guards', () => {
     await expect(page.getByTestId('pr-actions-permission-hint')).toContainText('tenant admin');
     await expect(page.getByTestId('pr-list')).not.toContainText(tenantB);
 
-    await page.goto(`/#preview/${tenantBProposalId}`);
+    await page.goto(`/#preview/${tenantB}/${tenantBProposalId}`);
     await expect(page.getByTestId('pr-deeplink-missing')).toBeVisible();
 
     await openTab(page, 'Topology Map');
@@ -250,7 +288,7 @@ test.describe('05 - Multi-Tenant Namespace & Secret Isolation Guards', () => {
     await expect(page.getByRole('button', { name: /Add Catalog Item/i })).toBeVisible();
     await expect(page.getByRole('button', { name: /New Tenant/i })).toHaveCount(0);
 
-    await page.goto(`/#preview/${pr.proposal.id}`);
+    await page.goto(`/#preview/acme/${pr.proposal.id}`);
     await expect(page.getByRole('button', { name: 'Merge PR' })).toBeEnabled();
     await page.getByRole('button', { name: 'Merge PR' }).click();
     await expect(page.getByRole('button', { name: 'Merged', exact: true })).toBeVisible();

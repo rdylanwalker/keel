@@ -102,6 +102,7 @@ describe("ControlPlaneProvidersView component", () => {
       branch: "feature/enable-gcp",
       author: "user",
       tenant: "keel-system",
+      scope: "management",
       status: "open",
       createdAt: "now",
     })
@@ -198,6 +199,7 @@ describe("ControlPlaneProvidersView component", () => {
         branch: "keel/providers/toggle-aws-1234",
         author: "admin",
         tenant: "keel-system",
+        scope: "management",
         status: "open",
         createdAt: "now",
       },
@@ -207,6 +209,7 @@ describe("ControlPlaneProvidersView component", () => {
         branch: "keel/providers/toggle-aws-1",
         author: "admin",
         tenant: "keel-system",
+        scope: "management",
         status: "merged",
         createdAt: "now",
       },
@@ -220,7 +223,12 @@ describe("ControlPlaneProvidersView component", () => {
       name: "Go to PR #999 →",
     })
     fireEvent.click(goBtn)
-    expect(onNavigateToPreview).toHaveBeenCalled()
+    expect(onNavigateToPreview).toHaveBeenCalledWith({
+      scope: "management",
+      id: "999",
+    })
+    // Provider toggles live in the platform repository: only that scope is listed.
+    expect(api.getProposals).toHaveBeenCalledWith("management")
   })
 
   it("does not load data when unauthenticated", () => {

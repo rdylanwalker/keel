@@ -79,7 +79,7 @@ test.describe('04 - Flagger Canary Lifecycle & Live SSE Event Stream', () => {
     expect(files).toContain(`tenants/acme/apps/${name}/helmrelease.yaml`);
     expect(files.some((f) => f.includes('canary'))).toBe(false);
 
-    const rejected = await api.post('/api/v1/proposals', {
+    const rejected = await api.post('/api/v1/tenants/acme/proposals', {
       data: {
         tenant: 'acme',
         catalogId: 'static-site',
@@ -114,7 +114,8 @@ test.describe('04 - Flagger Canary Lifecycle & Live SSE Event Stream', () => {
     await expect(toggle).toHaveAttribute('data-state', 'checked');
 
     const createResponse = page.waitForResponse(
-      (r) => r.request().method() === 'POST' && r.url().endsWith('/api/v1/proposals'),
+      (r) =>
+        r.request().method() === 'POST' && /\/api\/v1\/tenants\/[^/]+\/proposals$/.test(r.url()),
     );
     await modal.getByRole('button', { name: /Submit & Open Git PR Proposal/i }).click();
     const res = await createResponse;

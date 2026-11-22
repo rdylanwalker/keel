@@ -1,11 +1,16 @@
 import React from "react"
 import { CheckCircle2, X } from "lucide-react"
 
+import { ProposalRef } from "../types/api"
+import { safeHttpUrl } from "../lib/forgeLinks"
+
 export interface PrNotificationBannerProps {
   message: string
   prId?: string
+  /** Proposal scope of `prId` (tenant id or `management`): PR ids are per repository. */
+  prScope?: string
   prUrl?: string
-  onNavigateToPreview?: () => void
+  onNavigateToPreview?: (ref?: ProposalRef) => void
   onDismiss: () => void
   className?: string
   variant?: "banner" | "snackbar"
@@ -14,12 +19,18 @@ export interface PrNotificationBannerProps {
 export const PrNotificationBanner: React.FC<PrNotificationBannerProps> = ({
   message,
   prId,
-  prUrl,
+  prScope,
+  prUrl: rawPrUrl,
   onNavigateToPreview,
   onDismiss,
   className = "",
   variant = "banner",
 }) => {
+  const prUrl = safeHttpUrl(rawPrUrl)
+  const goToPr = () =>
+    onNavigateToPreview?.(
+      prId && prScope ? { scope: prScope, id: prId } : undefined
+    )
   if (variant === "snackbar") {
     return (
       <div
@@ -37,7 +48,7 @@ export const PrNotificationBanner: React.FC<PrNotificationBannerProps> = ({
           {onNavigateToPreview && prId && (
             <button
               type="button"
-              onClick={onNavigateToPreview}
+              onClick={goToPr}
               className="px-2.5 py-1 rounded-lg bg-purple-600 hover:bg-purple-500 text-white font-semibold text-xs transition-colors cursor-pointer"
             >
               Go to PR →
@@ -76,7 +87,7 @@ export const PrNotificationBanner: React.FC<PrNotificationBannerProps> = ({
         {onNavigateToPreview && prId && (
           <button
             type="button"
-            onClick={onNavigateToPreview}
+            onClick={goToPr}
             className="px-2.5 py-1 rounded-lg bg-purple-600 hover:bg-purple-500 text-white font-semibold transition-colors cursor-pointer"
           >
             Go to PR →

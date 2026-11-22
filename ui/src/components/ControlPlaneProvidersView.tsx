@@ -1,7 +1,12 @@
 import React, { useCallback, useEffect, useState } from "react"
 import { AlertTriangle, Cloud, RefreshCw, Server } from "lucide-react"
 
-import { ManagementAddonStatus, ProviderRegistryEntry } from "../types/api"
+import {
+  ManagementAddonStatus,
+  PLATFORM_SCOPE,
+  ProposalRef,
+  ProviderRegistryEntry,
+} from "../types/api"
 import {
   getManagementAddons,
   getProposals,
@@ -25,6 +30,7 @@ import {
   deriveManagementHealth,
   extractPendingProviderPrs,
   ManagementHealth,
+  PendingProviderPr,
 } from "./providers/addonStatus"
 
 interface ClusterMeta {
@@ -39,7 +45,7 @@ interface LoadResult {
   providers?: ProviderRegistryEntry[]
   addonStatuses?: ManagementAddonStatus[] | null
   liveStatusAvailable?: boolean
-  pendingProviderPrs?: Record<string, { id: string; branch: string }>
+  pendingProviderPrs?: Record<string, PendingProviderPr>
 }
 
 const LOAD_ERROR = "Failed to load control plane & provider state"
@@ -70,7 +76,8 @@ async function loadProvidersState(isAdmin: boolean): Promise<LoadResult> {
     if (isAdmin) {
       const [statuses, proposals] = await Promise.all([
         getManagementAddons().catch(() => null),
-        getProposals().catch(() => []),
+        // Provider toggles are platform-repository PRs: no need to list every tenant repository.
+        getProposals(PLATFORM_SCOPE).catch(() => []),
       ])
       result.addonStatuses = statuses ? statuses.addons : null
       result.liveStatusAvailable = statuses?.liveStatusAvailable ?? false
@@ -94,7 +101,7 @@ const HEALTH_STYLES: Record<
 
 export interface ControlPlaneProvidersViewProps {
   onNavigateToCatalog?: () => void
-  onNavigateToPreview?: () => void
+  onNavigateToPreview?: (ref?: ProposalRef) => void
   /** Opens the Topology Map, where management add-ons are upgraded and rolled back. */
   onNavigateToTopology?: () => void
   authenticated?: boolean
@@ -119,13 +126,14 @@ export const ControlPlaneProvidersView: React.FC<
   >(() => (demo ? DEMO_MANAGEMENT_ADDON_STATUSES : null))
   const [liveStatusAvailable, setLiveStatusAvailable] = useState(demo)
   const [pendingProviderPrs, setPendingProviderPrs] = useState<
-    Record<string, { id: string; branch: string }>
+    Record<string, PendingProviderPr>
   >({})
   const [loading, setLoading] = useState(() => authenticated && !demo)
   const [togglingId, setTogglingId] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [prNotification, setPrNotification] = useState<{
     id: string
+    scope: string
     branch: string
     prUrl?: string
   } | null>(null)
@@ -173,12 +181,17 @@ export const ControlPlaneProvidersView: React.FC<
       const proposal = await toggleProvider(id, !currentlyEnabled)
       setPrNotification({
         id: proposal.id,
+        scope: proposal.scope,
         branch: proposal.branch || "main",
         prUrl: proposal.prUrl,
       })
       setPendingProviderPrs((prev) => ({
         ...prev,
-        [id]: { id: proposal.id, branch: proposal.branch || "main" },
+        [id]: {
+          id: proposal.id,
+          branch: proposal.branch || "main",
+          scope: proposal.scope,
+        },
       }))
     } catch (err) {
       setError(errorMessage(err, `Failed to toggle provider ${id}`))
@@ -232,6 +245,7 @@ export const ControlPlaneProvidersView: React.FC<
         <PrNotificationBanner
           message={`PR #${prNotification.id} opened on branch ${prNotification.branch}`}
           prId={prNotification.id}
+          prScope={prNotification.scope}
           prUrl={prNotification.prUrl}
           onNavigateToPreview={onNavigateToPreview}
           onDismiss={() => setPrNotification(null)}

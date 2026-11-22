@@ -1300,7 +1300,7 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
         const releasesDenied = await page.request.get('/api/v1/releases?tenant=default');
         expect(releasesDenied.status()).toBe(403);
 
-        const proposalDenied = await page.request.post('/api/v1/proposals', {
+        const proposalDenied = await page.request.post('/api/v1/tenants/default/proposals', {
           headers: SAME_ORIGIN,
           data: {
             catalogId: 'podinfo',
@@ -1365,15 +1365,16 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
           const prsRes = await page.request.get('/api/v1/proposals');
           expect(prsRes.status()).toBe(200);
           const prsJson = (await prsRes.json()) as {
-            proposals: Array<{ id: string; title: string }>;
+            proposals: Array<{ id: string; title: string; scope: string }>;
           };
           const acmePr = prsJson.proposals.find((p) =>
             p.title.toLowerCase().includes(acmeAppName.toLowerCase()),
           );
           expect(acmePr).toBeTruthy();
 
+          expect(acmePr!.scope).toBe('acme');
           const nonAdminMergeRes = await page.request.post(
-            `/api/v1/proposals/${acmePr!.id}/merge`,
+            `/api/v1/tenants/acme/proposals/${acmePr!.id}/merge`,
             { headers: SAME_ORIGIN },
           );
           expect(nonAdminMergeRes.status()).toBe(403);
@@ -1394,7 +1395,7 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
             expect(createTenantDenied2.status()).toBe(403);
 
             const tenantAdminMergeRes = await tenantAdminPage.request.post(
-              `/api/v1/proposals/${acmePr!.id}/merge`,
+              `/api/v1/tenants/acme/proposals/${acmePr!.id}/merge`,
               { headers: SAME_ORIGIN },
             );
             expect(tenantAdminMergeRes.status()).toBe(200);
@@ -1422,7 +1423,7 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
     let prId = '';
 
     await test.step('1. Create an infra (Pulumi-backed) proposal', async () => {
-      const res = await page.request.post('/api/v1/proposals', {
+      const res = await page.request.post('/api/v1/tenants/default/proposals', {
         headers: SAME_ORIGIN,
         data: {
           tenant: 'default',
@@ -1448,7 +1449,7 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
       await expect
         .poll(
           async () => {
-            const r = await page.request.get(`/api/v1/proposals/${prId}/preview`);
+            const r = await page.request.get(`/api/v1/tenants/default/proposals/${prId}/preview`);
             if (!r.ok()) return `http ${r.status()}`;
             const b = await r.json();
             const report = b.report ?? b;
@@ -1557,7 +1558,7 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
     });
 
     await test.step('3. GUI: PKO preview badge + SSE "PKO preview" event', async () => {
-      await page.goto(`/#preview/${prId}`);
+      await page.goto(`/#preview/default/${prId}`);
       await expect(page.getByTestId('preview-source-badge')).toHaveAttribute('data-source', 'pko', {
         timeout: 30_000,
       });
@@ -1578,17 +1579,21 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
     });
 
     await test.step('4. CLI: proposal list / show / close', async () => {
-      const list = runCmdAll(KEEL_BIN, ['proposal', 'list', '--output', 'json'], cliEnv);
+      const list = runCmdAll(
+        KEEL_BIN,
+        ['proposal', 'list', '--tenant', 'default', '--output', 'json'],
+        cliEnv,
+      );
       expect(list.ok, list.out).toBe(true);
       expect(list.out).toContain(`"${prId}"`);
-      const show = runCmdAll(KEEL_BIN, ['proposal', 'show', prId], cliEnv);
+      const show = runCmdAll(KEEL_BIN, ['proposal', 'show', '--tenant', 'default', prId], cliEnv);
       expect(show.ok, show.out).toBe(true);
       expect(show.out).toContain(instance);
-      const close = runCmdAll(KEEL_BIN, ['proposal', 'close', prId], cliEnv);
+      const close = runCmdAll(KEEL_BIN, ['proposal', 'close', '--tenant', 'default', prId], cliEnv);
       expect(close.ok, close.out).toBe(true);
       const closed = runCmdAll(
         KEEL_BIN,
-        ['proposal', 'list', '--status', 'closed', '--output', 'json'],
+        ['proposal', 'list', '--tenant', 'default', '--status', 'closed', '--output', 'json'],
         cliEnv,
       );
       expect(closed.out).toContain(`"${prId}"`);

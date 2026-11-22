@@ -30,11 +30,15 @@ Infrastructure blueprints in `catalog/infra/` are gated by `providers/registry.y
 Stage 0 creates the `default` tenant (`tenant-default`), which the examples below use. To add another tenant (cluster admin only):
 
 1. Open **Catalog & Form Wizard**.
-2. Click **+ New Tenant**, enter a DNS-compatible tenant ID such as `platform-team`, and submit. IDs ending in `-admin` are rejected.
-3. Merge the generated PR (`tenants/platform-team/rbac.yaml`). It contains the namespace, the quota and LimitRange, the tenant ServiceAccount and its RoleBindings, the `keel-server` RoleBinding, and the `default-deny-all` and `allow-pko-workspace` NetworkPolicies. All of these objects are labelled `keel.io/platform-owned`, and Kyverno stops tenant identities from changing them. `keel-server` provisions the tenant's scoped SeaweedFS identity.
-4. In your IdP, create the groups `tenant-platform-team` (members) and `tenant-platform-team-admin` (tenant admins) and assign users to them. Users must sign in again to pick up new groups.
+2. Click **+ New Tenant** and enter a DNS-compatible tenant ID such as `platform-team`. IDs ending in `-admin` are rejected. Tick **Adopt an existing tenant repository** only when you reuse the ID of a deleted tenant whose repository still holds content; otherwise Keel refuses such a repository.
+3. Click **Create Tenant PR**. Keel creates the tenant's own private repository (`<platform-repo>-tenant-platform-team`; in the `keel-tenants` organisation on Forgejo/Gitea, otherwise next to the platform repository) and a read-only credential limited to it (an HTTPS token, deploy key or deploy token, depending on the forge). The dialog then stays open on a provisioning summary: a link to the repository, the credential kind, the cluster-side steps still waiting for the namespace, and the pull requests to merge.
+4. Merge the two pull requests in the order the summary lists them (**Go to PR** opens each in **PR & Preview Inspector**):
+   1. The **tenant repository skeleton** PR in the new repository (`tenants/platform-team/kustomization.yaml`). Merge it first: until then the tenant's `keel-tenant-root` Kustomization reports a missing path.
+   2. The **platform stub** PR in the platform repository (`tenants/platform-team/`). It contains the namespace, the quota and LimitRange, the tenant ServiceAccount and its RoleBindings, the `keel-server` RoleBinding, the `default-deny-all` and `allow-pko-workspace` NetworkPolicies, and the tenant's Flux `GitRepository` and `Kustomization` pointing at its repository. The platform objects are labelled `keel.io/platform-owned`, and Kyverno stops tenant identities from changing them. Once the namespace exists, `keel-server` writes the repository credentials Secret and the tenant's SOPS `age` key, and provisions its scoped SeaweedFS identity.
+5. Click **Done**. The PR notice left on the page points at the skeleton PR.
+6. In your IdP, create the groups `tenant-platform-team` (members) and `tenant-platform-team-admin` (tenant admins) and assign users to them. Users must sign in again to pick up new groups.
 
-> **Current limit:** a tenant created this way doesn't have its own Git source (`tenants/<id>/git-repository.yaml`, Flux `GitRepository` `tenant-<id>/keel-gitops`) yet. It can install Helm apps, but Pulumi blueprints and Pulumi-engine apps are refused with `409 Conflict`, and Flux-engine manifest apps don't reconcile. The Stage 0 `default` tenant has a source. See [Pre-Merge PKO Previews](previews.md#limitations).
+> **Local Git provider:** with the development-only Local provider (`--git-url` set to a local path), tenants stay in the platform repository. No repository or credential is created, and only the platform stub PR is opened.
 
 ## 3. Provision Infrastructure
 

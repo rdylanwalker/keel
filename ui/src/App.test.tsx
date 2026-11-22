@@ -75,13 +75,19 @@ vi.mock("./components/CatalogWizardView", () => ({
 }))
 vi.mock("./components/PreviewInspectorView", () => ({
   PreviewInspectorView: (p: {
-    selectedProposalId?: string
-    onSelectProposal: (id: string | null) => void
+    selectedProposal?: { scope: string; id: string }
+    onSelectProposal: (ref: { scope: string; id: string } | null) => void
   }) => (
     <div>
       <h2>Preview View</h2>
-      <span data-testid="selected-pr">{p.selectedProposalId ?? "none"}</span>
-      <button onClick={() => p.onSelectProposal("77")}>select 77</button>
+      <span data-testid="selected-pr">
+        {p.selectedProposal
+          ? `${p.selectedProposal.scope}/${p.selectedProposal.id}`
+          : "none"}
+      </span>
+      <button onClick={() => p.onSelectProposal({ scope: "globex", id: "77" })}>
+        select 77
+      </button>
     </div>
   ),
 }))
@@ -110,6 +116,7 @@ vi.mock("./components/DeployInstanceModal", () => ({
               branch: "feat/x",
               author: "a",
               tenant: "acme",
+              scope: "acme",
               status: "open",
               createdAt: "now",
               prUrl: "https://forge/pr/55",
@@ -206,15 +213,17 @@ describe("App shell", () => {
     }
   })
 
-  it("routes #catalog/<kind> and #preview/<id> deep links", async () => {
+  it("routes #catalog/<kind> and #preview/<scope>/<id> deep links", async () => {
     vi.mocked(api.getAuthStatus).mockResolvedValue(adminStatus)
-    window.history.replaceState(null, "", "/#preview/42")
+    window.history.replaceState(null, "", "/#preview/acme/42")
     await renderApp()
-    expect(await screen.findByTestId("selected-pr")).toHaveTextContent("42")
+    expect(await screen.findByTestId("selected-pr")).toHaveTextContent(
+      "acme/42"
+    )
     fireEvent.click(screen.getByText("select 77"))
-    expect(window.location.hash).toBe("#preview/77")
+    expect(window.location.hash).toBe("#preview/globex/77")
     await waitFor(() =>
-      expect(screen.getByTestId("selected-pr")).toHaveTextContent("77")
+      expect(screen.getByTestId("selected-pr")).toHaveTextContent("globex/77")
     )
 
     act(() => {
@@ -237,10 +246,16 @@ describe("App shell", () => {
 
   it("restores the pre-login deep link after authentication", async () => {
     vi.mocked(api.getAuthStatus).mockResolvedValue(adminStatus)
-    vi.mocked(api.consumePostLoginLocation).mockReturnValue("#preview/9")
+    vi.mocked(api.consumePostLoginLocation).mockReturnValue(
+      "#preview/management/9"
+    )
     await renderApp()
-    await waitFor(() => expect(window.location.hash).toBe("#preview/9"))
-    expect(await screen.findByTestId("selected-pr")).toHaveTextContent("9")
+    await waitFor(() =>
+      expect(window.location.hash).toBe("#preview/management/9")
+    )
+    expect(await screen.findByTestId("selected-pr")).toHaveTextContent(
+      "management/9"
+    )
   })
 
   it("provides admin authz, tenant switcher and Admin badge for admins", async () => {
@@ -346,7 +361,7 @@ describe("App shell", () => {
     )
     fireEvent.click(screen.getByText("close edit"))
     fireEvent.click(screen.getByRole("button", { name: /Go to PR/ }))
-    expect(window.location.hash).toBe("#preview/55")
+    expect(window.location.hash).toBe("#preview/acme/55")
   })
 
   it("reports missing blueprints and load errors in the edit modal", async () => {

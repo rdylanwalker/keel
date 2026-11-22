@@ -16,11 +16,11 @@ Because the `kind` provider is enabled by default in `providers/registry.yaml`, 
 
 ### Step 1 (Optional): Create a Tenant
 
-The walkthroughs on this page use the Stage 0 `default` tenant. Pulumi (PKO) blueprints and Flux-engine manifest apps need the tenant's own Git source (`tenants/<id>/git-repository.yaml`, Flux `GitRepository` `tenant-<id>/keel-gitops`), which Stage 0 writes only for `default`. Tenants created with **+ New Tenant** have none yet: Keel refuses their Pulumi proposals with `409 Conflict`, and their Flux-engine apps never reconcile. They can still install Helm apps, such as Podinfo below.
+The walkthroughs on this page use the Stage 0 `default` tenant. Every tenant, `default` included, has its own Git repository and Flux source, so the walkthroughs work the same in a tenant you create.
 
 1. Open `http://127.0.0.1:8080` and go to **Catalog & Form Wizard**.
-2. Click **+ New Tenant**, enter `dev-team`, and submit.
-3. Open **PR & Preview Inspector** and merge the generated PR (`tenants/dev-team/rbac.yaml`).
+2. Click **+ New Tenant**, enter `dev-team`, and click **Create Tenant PR**. The dialog shows a provisioning summary with the new repository and two pull requests.
+3. Merge them in the listed order from **PR & Preview Inspector** (**Go to PR**): first the skeleton PR in the tenant repository, then the platform stub PR (`tenants/dev-team/`). Click **Done**.
 4. In the Rauthy Admin UI (`https://idp.keel.local:8888/auth/v1/admin`), create the groups `tenant-dev-team` and `tenant-dev-team-admin` and add your users to them. Keel honors only `tenant-<id>` and `tenant-<id>-admin` group names. The Stage 0 admin in `keel-admins` already has access to every tenant.
 
 ### Step 2: Submit the `kind-cluster` Blueprint
@@ -402,7 +402,7 @@ Choose a **Bootstrap Admin Password** of 14 to 128 characters without whitespace
 
 ### Step 2: Deploy via the Web Portal or CLI
 
-Rauthy is a Flux manifest app: its Kustomizations read the tenant's own Git source (`tenant-<id>/keel-gitops`, from `tenants/<id>/git-repository.yaml`), which only the Stage 0 `default` tenant has today. In tenants created through **+ New Tenant** its Kustomizations never become Ready.
+Rauthy is a Flux manifest app: its Kustomizations read the tenant's own Git source (`tenant-<id>/keel-gitops`, from `tenants/<id>/git-repository.yaml`).
 
 1. In **Catalog & Form Wizard**, select tenant `default` and choose **Rauthy OIDC Provider** (`rauthy`).
 2. Fill in a **Public Hostname** unique to your tenant (no default; for example `auth-default.keel.local`), **Public HTTPS Port Suffix** (`:8888` for the local `kind` Gateway, empty when served on port 443), **Bootstrap Admin Email**, and the four secrets from Step 1. Keel rejects platform hosts (`idp.`, `keel.`, `forgejo.` under the Keel domain, and the configured IdP host) and hostnames another app already routes; the Kyverno policy `restrict-tenant-route-hostnames` enforces the platform-host rule at admission too. Keep the **Flux CD** engine (the default): Keel rejects the Pulumi engine for this app, because only Flux can substitute its secret fields.

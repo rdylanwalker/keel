@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { Key, LogOut, Menu, ShieldAlert, ShieldCheck } from "lucide-react"
 
-import { AuthStatus, Proposal, TenantSummary } from "./types/api"
+import { AuthStatus, Proposal, ProposalRef, TenantSummary } from "./types/api"
 import {
   consumePostLoginLocation,
   getAuthStatus,
@@ -214,8 +214,8 @@ export const App: React.FC = () => {
     (authStatus.phase === "break-glass" ? "Break-Glass" : "OIDC Auth")
   const canViewApp = authStatus.authenticated || demo
 
-  const openPreview = (id?: string) =>
-    navigate({ tab: "preview", proposalId: id })
+  const openPreview = (ref?: ProposalRef) =>
+    navigate({ tab: "preview", proposalScope: ref?.scope, proposalId: ref?.id })
 
   // The sidebar sticks directly below the (sticky) header. The header height changes with
   // viewport width (subtitle wrapping) and the demo banner, so track its real bottom edge.
@@ -379,7 +379,7 @@ export const App: React.FC = () => {
                     onNavigateToCatalog={(kind?: CatalogKindFilter) =>
                       navigate({ tab: "catalog", kind })
                     }
-                    onNavigateToPreview={() => openPreview()}
+                    onNavigateToPreview={openPreview}
                     onNavigateToProviders={() => navigateToTab("providers")}
                     onEditRelease={(ns, name) =>
                       void edit.open(ns, name, "app")
@@ -392,7 +392,7 @@ export const App: React.FC = () => {
                 {route.tab === "catalog" && (
                   <CatalogWizardView
                     selectedTenant={activeSelectedTenant}
-                    onNavigateToPreview={() => openPreview()}
+                    onNavigateToPreview={openPreview}
                     kindFilter={route.kind}
                     onKindFilterChange={(kind) =>
                       navigate({ tab: "catalog", kind })
@@ -402,17 +402,19 @@ export const App: React.FC = () => {
                 {route.tab === "preview" && (
                   <PreviewInspectorView
                     selectedTenant={activeSelectedTenant || undefined}
-                    selectedProposalId={route.proposalId}
-                    onSelectProposal={(id) =>
-                      navigate({ tab: "preview", proposalId: id ?? undefined })
+                    selectedProposal={
+                      route.proposalScope && route.proposalId
+                        ? { scope: route.proposalScope, id: route.proposalId }
+                        : undefined
                     }
+                    onSelectProposal={(ref) => openPreview(ref ?? undefined)}
                   />
                 )}
                 {route.tab === "providers" && (
                   <ControlPlaneProvidersView
                     authenticated={authStatus.authenticated}
                     onNavigateToCatalog={() => navigateToTab("catalog")}
-                    onNavigateToPreview={() => openPreview()}
+                    onNavigateToPreview={openPreview}
                     onNavigateToTopology={() => navigateToTab("topology")}
                   />
                 )}
@@ -439,9 +441,9 @@ export const App: React.FC = () => {
           <ProposalToast
             proposal={toastProposal}
             onDismiss={() => setToastProposal(null)}
-            onOpen={(id) => {
+            onOpen={(ref) => {
               setToastProposal(null)
-              openPreview(id)
+              openPreview(ref)
             }}
           />
         )}

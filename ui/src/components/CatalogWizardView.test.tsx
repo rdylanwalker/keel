@@ -4,7 +4,7 @@ import { CatalogWizardView } from "./CatalogWizardView"
 import { renderWithAuthz as render } from "../test/render"
 import { buildAuthz } from "../lib/authz"
 import * as api from "../lib/api"
-import { CatalogItem } from "../types/api"
+import { CatalogItem, CreateTenantResult } from "../types/api"
 import { jsonToYaml } from "../lib/utils"
 
 vi.mock("../lib/api", () => ({
@@ -115,6 +115,7 @@ describe("CatalogWizardView component and jsonToYaml helper", () => {
       branch: "keel/default/test-99",
       author: "user",
       tenant: "default",
+      scope: "default",
       status: "open",
       createdAt: "just now",
       prUrl: "https://git.internal/pr/99",
@@ -255,27 +256,70 @@ describe("CatalogWizardView component and jsonToYaml helper", () => {
     })
   })
 
-  it("creates a new tenant via modal form", async () => {
+  const tenantResult = (
+    overrides: Partial<CreateTenantResult["repository"]> = {}
+  ): CreateTenantResult => ({
+    tenant: { id: "acme", namespace: "tenant-acme" },
+    branch: "keel/acme/create-tenant-105",
+    proposal: {
+      id: "105",
+      title: "chore(tenants): create tenant acme",
+      branch: "keel/acme/create-tenant-105",
+      author: "user",
+      tenant: "acme",
+      scope: "management",
+      status: "open",
+      createdAt: "just now",
+      prUrl: "https://git.example.com/keel/infra/pulls/105",
+    },
+    repository: {
+      layout: "dedicated",
+      owner: "keel-tenants",
+      name: "infra-tenant-acme",
+      url: "https://git.example.com/keel-tenants/infra-tenant-acme.git",
+      webUrl: "https://git.example.com/keel-tenants/infra-tenant-acme",
+      transport: "https",
+      created: true,
+      mainProtection: "created",
+      forks: { result: "disabled" },
+      skeletonProposal: {
+        id: "1",
+        title: "chore(acme): tenant repository skeleton",
+        branch: "keel/acme/skeleton-1",
+        author: "keel",
+        tenant: "acme",
+        scope: "acme",
+        status: "open",
+        createdAt: "just now",
+        prUrl: "https://git.example.com/keel-tenants/infra-tenant-acme/pulls/1",
+      },
+      cluster: {
+        namespaceReady: false,
+        sopsAge: "pendingNamespace",
+        credential: "pendingNamespace",
+      },
+      notes: ["Merge tenant repository pull request #1 first"],
+      ...overrides,
+    },
+  })
+
+  it("creates a new tenant and shows its provisioning summary", async () => {
     vi.mocked(api.getCatalog).mockResolvedValue(mockCatalog)
     vi.mocked(api.getTenants).mockResolvedValue([
       { id: "default", namespace: "tenant-default" },
     ])
-    vi.mocked(api.createTenant).mockResolvedValue({
-      id: "105",
-      title: "Create Tenant acme",
-      branch: "keel/tenant-acme/105",
-      author: "user",
-      tenant: "acme",
-      status: "open",
-      createdAt: "just now",
-    })
+    vi.mocked(api.createTenant).mockResolvedValue(tenantResult())
+    const onNavigateToPreview = vi.fn()
 
-    render(<CatalogWizardView />)
+    render(<CatalogWizardView onNavigateToPreview={onNavigateToPreview} />)
 
     const newTenantBtn = screen.getByRole("button", { name: /New Tenant/i })
     fireEvent.click(newTenantBtn)
 
     expect(screen.getByText("Create New Tenant")).toBeInTheDocument()
+    expect(
+      screen.getByRole("list", { name: /What creating a tenant does/i })
+    ).toHaveTextContent(/read-only credential limited to that repository/i)
 
     const tenantInput = screen.getByLabelText(/Tenant ID/i)
     fireEvent.change(tenantInput, { target: { value: "acme" } })
@@ -285,28 +329,113 @@ describe("CatalogWizardView component and jsonToYaml helper", () => {
     })
     fireEvent.click(submitTenantBtn)
 
-    await waitFor(() => {
-      expect(api.createTenant).toHaveBeenCalledWith("acme")
-      expect(
-        screen.getByText("Git PR Proposal Successfully Opened!")
-      ).toBeInTheDocument()
+    const summary = await screen.findByTestId("tenant-provisioning-summary")
+    expect(api.createTenant).toHaveBeenCalledWith("acme", {})
+    expect(screen.getByText("Tenant Provisioned")).toBeInTheDocument()
+    expect(
+      within(summary).getByRole("link", { name: /Open tenant repository/i })
+    ).toHaveAttribute(
+      "href",
+      "https://git.example.com/keel-tenants/infra-tenant-acme"
+    )
+    expect(
+      within(summary).getByTestId("tenant-step-credential")
+    ).toHaveTextContent(/Repository-scoped HTTPS read token/)
+    expect(
+      within(summary).getByTestId("tenant-step-credential")
+    ).toHaveAttribute("data-tone", "pending")
+    expect(within(summary).getByTestId("tenant-step-sops")).toHaveTextContent(
+      /once the platform PR is merged/
+    )
+    expect(
+      within(summary).getByText(/Tenant repository skeleton \(merge first\)/)
+    ).toBeInTheDocument()
+    expect(
+      within(summary).getByTestId("tenant-provisioning-notes")
+    ).toHaveTextContent(/Merge tenant repository pull request #1 first/)
+
+    // "Go to PR" deep-links with the PR's scope (ids repeat across repositories).
+    const goButtons = within(summary).getAllByRole("button", {
+      name: /Go to PR/i,
+    })
+    fireEvent.click(goButtons[0])
+    expect(onNavigateToPreview).toHaveBeenCalledWith({ scope: "acme", id: "1" })
+    fireEvent.click(goButtons[1])
+    expect(onNavigateToPreview).toHaveBeenCalledWith({
+      scope: "management",
+      id: "105",
+    })
+
+    fireEvent.click(screen.getByRole("button", { name: "Done" }))
+    await waitFor(() =>
+      expect(screen.queryByTestId("new-tenant-modal")).not.toBeInTheDocument()
+    )
+    expect(
+      screen.getByText("Git PR Proposal Successfully Opened!")
+    ).toBeInTheDocument()
+    // The remaining notice points at the skeleton PR, which must merge first.
+    expect(
+      screen.getByRole("status", { name: "Proposal Floating Toast" })
+    ).toHaveTextContent("PR #1 Opened")
+    fireEvent.click(
+      within(
+        screen.getByRole("status", { name: "Proposal Floating Toast" })
+      ).getByRole("button", { name: /Go to PR/i })
+    )
+    expect(onNavigateToPreview).toHaveBeenLastCalledWith({
+      scope: "acme",
+      id: "1",
     })
   })
 
-  it("removes non-default tenant", async () => {
+  it("passes adoptExisting when the operator adopts an existing repository", async () => {
+    vi.mocked(api.getCatalog).mockResolvedValue(mockCatalog)
+    vi.mocked(api.createTenant).mockResolvedValue(
+      tenantResult({ created: false, transport: "ssh" })
+    )
+    render(<CatalogWizardView />)
+    fireEvent.click(screen.getByRole("button", { name: /New Tenant/i }))
+    fireEvent.change(screen.getByLabelText(/Tenant ID/i), {
+      target: { value: "acme" },
+    })
+    fireEvent.click(
+      screen.getByRole("checkbox", {
+        name: /Adopt an existing tenant repository/i,
+      })
+    )
+    fireEvent.click(screen.getByRole("button", { name: /Create Tenant PR/i }))
+    const summary = await screen.findByTestId("tenant-provisioning-summary")
+    expect(api.createTenant).toHaveBeenCalledWith("acme", {
+      adoptExisting: true,
+    })
+    expect(
+      within(summary).getByTestId("tenant-step-repository")
+    ).toHaveTextContent(/already existed and was adopted/)
+    expect(
+      within(summary).getByTestId("tenant-step-credential")
+    ).toHaveTextContent(/Read-only SSH deploy key/)
+  })
+
+  it("removes non-default tenant and shows operator follow-ups", async () => {
     vi.mocked(api.getCatalog).mockResolvedValue(mockCatalog)
     vi.mocked(api.getTenants).mockResolvedValue([
       { id: "default", namespace: "tenant-default" },
       { id: "globex", namespace: "tenant-globex" },
     ])
     vi.mocked(api.deleteTenant).mockResolvedValue({
-      id: "106",
-      title: "Delete Tenant globex",
-      branch: "keel/tenant-globex/106",
-      author: "user",
-      tenant: "globex",
-      status: "open",
-      createdAt: "just now",
+      id: "globex",
+      branch: "keel/globex/delete-tenant-106",
+      notes: ["Archive keel-tenants/infra-tenant-globex on the forge"],
+      proposal: {
+        id: "106",
+        title: "Delete Tenant globex",
+        branch: "keel/globex/delete-tenant-106",
+        author: "user",
+        tenant: "globex",
+        scope: "management",
+        status: "open",
+        createdAt: "just now",
+      },
     })
 
     render(<CatalogWizardView />)
@@ -334,6 +463,9 @@ describe("CatalogWizardView component and jsonToYaml helper", () => {
         screen.getByText("Git PR Proposal Successfully Opened!")
       ).toBeInTheDocument()
     })
+    expect(screen.getByTestId("tenant-operator-notes")).toHaveTextContent(
+      /Archive keel-tenants\/infra-tenant-globex/
+    )
   })
 
   it("adds catalog app via modal form", async () => {
@@ -344,6 +476,7 @@ describe("CatalogWizardView component and jsonToYaml helper", () => {
       branch: "keel/catalog/107",
       author: "user",
       tenant: "default",
+      scope: "default",
       status: "open",
       createdAt: "just now",
     })
@@ -425,6 +558,7 @@ describe("CatalogWizardView component and jsonToYaml helper", () => {
       branch: "keel/catalog/120",
       author: "user",
       tenant: "catalog",
+      scope: "management",
       status: "open" as const,
       createdAt: "just now",
     }
@@ -458,6 +592,7 @@ describe("CatalogWizardView component and jsonToYaml helper", () => {
       branch: "keel/catalog/121",
       author: "user",
       tenant: "catalog",
+      scope: "catalog",
       status: "open",
       createdAt: "just now",
     })
@@ -498,6 +633,7 @@ describe("CatalogWizardView component and jsonToYaml helper", () => {
       branch: "keel/catalog/108",
       author: "user",
       tenant: "default",
+      scope: "default",
       status: "open",
       createdAt: "just now",
     })
@@ -593,6 +729,7 @@ describe("CatalogWizardView component and jsonToYaml helper", () => {
       branch: "keel/catalog/109",
       author: "user",
       tenant: "default",
+      scope: "default",
       status: "open",
       createdAt: "just now",
     })
@@ -825,6 +962,7 @@ describe("CatalogWizardView component and jsonToYaml helper", () => {
       branch: "keel/default/infra-108",
       author: "user",
       tenant: "default",
+      scope: "default",
       status: "open",
       createdAt: "just now",
     })
@@ -889,6 +1027,7 @@ describe("CatalogWizardView component and jsonToYaml helper", () => {
       branch: "keel/default/app-podinfo-109",
       author: "user",
       tenant: "default",
+      scope: "default",
       status: "open",
       createdAt: "just now",
     })
@@ -1049,6 +1188,7 @@ describe("CatalogWizardView component and jsonToYaml helper", () => {
       branch: "keel/catalog/update-podinfo-112",
       author: "user",
       tenant: "catalog",
+      scope: "catalog",
       status: "open",
       createdAt: "just now",
     })
@@ -1115,6 +1255,7 @@ describe("CatalogWizardView component and jsonToYaml helper", () => {
       branch: "keel/catalog/update-infra-pko-vm-115",
       author: "user",
       tenant: "catalog",
+      scope: "catalog",
       status: "open",
       createdAt: "just now",
     })
@@ -1274,6 +1415,7 @@ describe("CatalogWizardView component and jsonToYaml helper", () => {
       branch: "keel/catalog/add-canary-stack-201",
       author: "user",
       tenant: "catalog",
+      scope: "catalog",
       status: "open",
       createdAt: "just now",
     })
@@ -1545,6 +1687,7 @@ describe("CatalogWizardView component and jsonToYaml helper", () => {
       branch: "keel/catalog/update-web-bundle-301",
       author: "user",
       tenant: "catalog",
+      scope: "catalog",
       status: "open",
       createdAt: "just now",
       prUrl: "https://git.internal/pr/301",
@@ -1665,6 +1808,7 @@ describe("CatalogWizardView component and jsonToYaml helper", () => {
       branch: "keel/catalog/401",
       author: "user",
       tenant: "default",
+      scope: "default",
       status: "open",
       createdAt: "just now",
     })
@@ -1791,6 +1935,7 @@ spec:
       branch: "delete-branch",
       author: "user",
       tenant: "default",
+      scope: "default",
       status: "open",
       createdAt: "just now",
     })

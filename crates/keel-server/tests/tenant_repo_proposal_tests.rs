@@ -789,6 +789,29 @@ async fn admin_listing_aggregates_tenant_repositories() {
 }
 
 #[tokio::test]
+async fn unlistable_repositories_report_a_generic_reason_without_internal_details() {
+    let fx = fixture().await;
+    let admin = admin(&fx.state).await;
+    // The forge loses `beta`'s repository: listing it fails with an error naming server paths.
+    tokio::fs::remove_dir_all(fx.tenant_bare("beta"))
+        .await
+        .unwrap();
+    let (status, list) = send(&fx.state, &admin, Method::GET, "/api/v1/proposals", None).await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    let unavailable = list["unavailable"].as_array().expect("unavailable listed");
+    let beta = unavailable
+        .iter()
+        .find(|u| u["scope"] == "beta")
+        .unwrap_or_else(|| panic!("beta reported unavailable: {list}"));
+    let reason = beta["reason"].as_str().unwrap();
+    assert!(reason.contains("correlation id"), "{reason}");
+    let root = fx.root.to_string_lossy();
+    let body = list.to_string();
+    assert!(!body.contains(root.as_ref()), "server path leaked: {body}");
+    assert!(!body.contains(".git"), "repository path leaked: {body}");
+}
+
+#[tokio::test]
 async fn infra_previews_clone_the_tenant_repository_at_the_pr_head() {
     let fx = fixture().await;
     let admin = admin(&fx.state).await;

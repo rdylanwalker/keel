@@ -78,6 +78,14 @@ test.describe('06 - Full Localhost GUI GitOps Workflow', () => {
     await page.getByRole('button', { name: /New Tenant/i }).click();
     await page.getByLabel(/Tenant ID/i).fill('e2e-team');
     await page.getByRole('button', { name: /Create Tenant PR/i }).click();
+    // The dialog switches to its provisioning summary (Local Git provider harness: shared
+    // development repository, no repository credential) until dismissed.
+    const summary = page.getByTestId('tenant-provisioning-summary');
+    await expect(summary).toBeVisible({ timeout: 10000 });
+    await expect(summary.getByTestId('tenant-step-repository')).toContainText(/development only/i);
+    await expect(summary).toContainText(/Platform tenant stub: PR #\d+/);
+    await page.getByRole('button', { name: 'Done' }).click();
+    await expect(page.getByTestId('new-tenant-modal')).toHaveCount(0);
     await expectProposalOpened();
 
     await page.getByRole('button', { name: /PR & Preview Inspector/i }).click();

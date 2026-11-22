@@ -221,7 +221,7 @@ pub async fn list_proposals(
                         label: format!("tenant-{tenant}"),
                         full_name: None,
                     },
-                    reason: err.to_string(),
+                    reason: err.client_safe_reason(),
                 }),
             }
         }
@@ -280,7 +280,7 @@ pub async fn list_proposals(
             Err(err) => unavailable.push(UnavailableRepository {
                 scope: repo.scope.as_str().to_string(),
                 repository: repo.repository(),
-                reason: err.to_string(),
+                reason: err.client_safe_reason(),
             }),
         }
     }

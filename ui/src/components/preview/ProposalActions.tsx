@@ -1,13 +1,15 @@
 import React, { useState } from "react"
 import {
   ExternalLink,
+  FolderGit2,
   GitMerge,
   Loader2,
   RotateCcw,
   XCircle,
 } from "lucide-react"
 
-import { Proposal } from "../../types/api"
+import { PLATFORM_SCOPE, Proposal } from "../../types/api"
+import { safeHttpUrl } from "../../lib/forgeLinks"
 import { Button } from "../ui/button"
 import { ConfirmDialog } from "../ui/confirm-dialog"
 
@@ -15,7 +17,10 @@ export type ProposalAction = "merge" | "reject" | "reopen"
 
 export interface ProposalActionsProps {
   proposal: Proposal
-  /** Mirrors the server's `require_pr_tenant_admin_access` (cluster admin or tenant admin). */
+  /**
+   * Mirrors the server: cluster admin or tenant admin of the PR's scope; platform-repository
+   * (`management`) PRs need a cluster admin.
+   */
   canManage: boolean
   pending: ProposalAction | null
   onMerge: () => void
@@ -36,15 +41,32 @@ export const ProposalActions: React.FC<ProposalActionsProps> = ({
   const busy = pending !== null
   const permissionHint = canManage
     ? undefined
-    : `Requires cluster admin or tenant admin for "${proposal.tenant}"`
+    : proposal.scope === PLATFORM_SCOPE
+      ? "Requires cluster admin (platform repository)"
+      : `Requires cluster admin or tenant admin for "${proposal.scope}"`
+  const prUrl = safeHttpUrl(proposal.prUrl)
+  const repoUrl = safeHttpUrl(proposal.repoUrl)
 
   return (
     <div className="flex flex-col items-start gap-1.5 @3xl/header:items-end">
       <div className="flex flex-wrap items-center gap-2">
-        {proposal.prUrl && (
+        {repoUrl && (
           <Button asChild variant="secondary">
             <a
-              href={proposal.prUrl}
+              href={repoUrl}
+              target="_blank"
+              rel="noreferrer"
+              aria-label="Repository Link"
+            >
+              <FolderGit2 className="h-3.5 w-3.5" />
+              <span>Repository</span>
+            </a>
+          </Button>
+        )}
+        {prUrl && (
+          <Button asChild variant="secondary">
+            <a
+              href={prUrl}
               target="_blank"
               rel="noreferrer"
               aria-label="Forge Link"

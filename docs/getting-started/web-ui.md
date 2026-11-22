@@ -8,12 +8,12 @@
 | :--- | :--- |
 | **Topology Map** (`#topology`) | Live management, workload, and cloud stacks and app releases. Status overlays come from Flux and PKO through the SSE stream, with polling only while SSE is disconnected. Includes the reconciliation event timeline, Flagger canary gauges, and the Edit / Delete / Reconcile / SSH actions. For cluster admins, the **Deployed Application Releases** table lists the protected management add-ons (Flux `flux2`, SeaweedFS `s3-state-backend`, PKO `pulumi-kubernetes-operator`, Kyverno, Envoy Gateway, Prometheus, Flagger, cert-manager, plus the optional Rauthy, Forgejo, and in-cluster keel-server) as rows above the tenant releases. Each add-on row has a shield icon, a **Protected** badge, and the catalog display name under the release name, and shows live status, namespace, chart (HelmRelease) or add-on id (Kustomization), desired version, Flux kind (`HelmRelease` or `Kustomization`), and last sync. Its actions mirror tenant rows: Edit (PR: chart version + allowed values) / Inspect / Reconcile / Rollback (PR, in place of Delete). Type `management` or `protected` in the table filter to show only add-ons. The rows stay visible when a tenant is selected in the header. Upgrade (version plus a values form built from the add-on's `catalog/core` schema) and Rollback open PRs; an add-on defined by more than one Flux object shows one row per Flux object, each with a conflict warning and its Flux kind, and both actions stay disabled. Add-ons can't be edited or deleted like tenant releases. |
 | **Catalog & Form Wizard** (`#catalog`, `#catalog/<cluster\|vm\|service\|app>`) | Browse the catalog, deploy items through schema-driven forms, and author catalog entries. |
-| **PR & Preview Inspector** (`#preview`, `#preview/<pr-id>`) | Open, merged, closed, and all PRs, with the merge-base Git diff, the preview report (source badge and run status), and Merge / Reject / Reopen. |
+| **PR & Preview Inspector** (`#preview`, `#preview/<tenant>/<pr-id>`) | Open, merged, closed, and all PRs, with the merge-base Git diff, the preview report (source badge and run status), and Merge / Reject / Reopen. |
 | **Control Plane & Providers** (`#providers`) | Provider enablement (opened as a PR) and, for cluster admins, the management cluster health summary derived from add-on status, with a link to the add-ons in the Topology Map. |
 
 ![Topology Map Deployed Application Releases table with protected management add-on rows (admin view)](../assets/screenshots/topology-releases.png)
 
-Deep links, such as `#preview/42`, are kept across the OIDC login round-trip.
+Deep links, such as `#preview/acme/42` (`management` for platform-repository PRs), are kept across the OIDC login round-trip.
 
 ## Schema-Driven Forms for Unmodified Charts
 

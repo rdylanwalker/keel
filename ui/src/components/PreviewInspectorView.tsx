@@ -1,13 +1,20 @@
 import React, { useCallback, useEffect, useMemo, useState } from "react"
 import { AlertTriangle, GitPullRequest, Info } from "lucide-react"
 
-import { PreviewReport, Proposal } from "../types/api"
+import {
+  PLATFORM_SCOPE,
+  PreviewReport,
+  Proposal,
+  ProposalRef,
+  UnavailableRepository,
+} from "../types/api"
 import { GitDiffViewer } from "./GitDiffViewer"
 import { PrNotificationBanner } from "./PrNotificationBanner"
 import {
+  getProposalListing,
   getProposalPreview,
-  getProposals,
   mergeProposal,
+  proposalKey,
   rejectProposal,
   reopenProposal,
 } from "../lib/api"
@@ -25,6 +32,7 @@ import {
   ResourceDiffTree,
 } from "./preview/ResourceDiffSection"
 import { ProposalList, ProposalStatusFilter } from "./preview/ProposalList"
+import { proposalRepositoryName } from "./preview/ProposalRepoLabel"
 import { ProposalAction, ProposalActions } from "./preview/ProposalActions"
 import { PageHeader } from "./ui/page-header"
 import {
@@ -36,25 +44,38 @@ import { usePreviewRunRefresh } from "./preview/usePreviewRunRefresh"
 export { PolicyStatusBanner } from "./preview/PolicyStatusBanner"
 
 export interface PreviewInspectorViewProps {
+  /** Lists one tenant's repository (`/api/v1/tenants/{tenant}/proposals`); all when unset. */
   selectedTenant?: string
-  /** PR id from the `#preview/<id>` deep link. */
-  selectedProposalId?: string
-  /** Called when the user selects a PR so the parent can update `#preview/<id>`. */
-  onSelectProposal?: (id: string | null) => void
+  /** PR from the `#preview/<scope>/<id>` deep link. */
+  selectedProposal?: ProposalRef
+  /** Called when the user selects a PR so the parent can update `#preview/<scope>/<id>`. */
+  onSelectProposal?: (ref: ProposalRef | null) => void
 }
 
-function sortProposals(data: Proposal[]): Proposal[] {
+function createdAtMillis(p: Proposal): number {
+  const t = Date.parse(p.createdAt)
+  return Number.isNaN(t) ? 0 : t
+}
+
+/** Open first, then newest first (PR ids are only comparable within one repository). */
+export function sortProposals(data: Proposal[]): Proposal[] {
   return [...data].sort((a, b) => {
     if (a.status === "open" && b.status !== "open") return -1
     if (a.status !== "open" && b.status === "open") return 1
+    const byTime = createdAtMillis(b) - createdAtMillis(a)
+    if (byTime !== 0) return byTime
+    if (a.scope !== b.scope) return a.scope.localeCompare(b.scope)
     return Number(b.id) - Number(a.id)
   })
 }
 
+const sameRef = (p: Proposal, ref: ProposalRef | null | undefined) =>
+  Boolean(ref) && p.scope === ref?.scope && p.id === ref?.id
+
 const ACTION_COPY: Record<
   ProposalAction,
   {
-    call: (id: string) => Promise<{ success: boolean; message?: string }>
+    call: (ref: ProposalRef) => Promise<{ success: boolean; message?: string }>
     nextStatus: Proposal["status"]
     success: (id: string) => string
     failure: string
@@ -82,7 +103,7 @@ const ACTION_COPY: Record<
 
 export const PreviewInspectorView: React.FC<PreviewInspectorViewProps> = ({
   selectedTenant,
-  selectedProposalId,
+  selectedProposal,
   onSelectProposal,
 }) => {
   const demo = isDemoMode()
@@ -90,13 +111,14 @@ export const PreviewInspectorView: React.FC<PreviewInspectorViewProps> = ({
   const [proposals, setProposals] = useState<Proposal[]>(() =>
     demo ? DEFAULT_PROPOSALS : []
   )
-  const [manualSelectedId, setManualSelectedId] = useState<string | null>(null)
+  const [unavailable, setUnavailable] = useState<UnavailableRepository[]>([])
+  const [manualSelected, setManualSelected] = useState<ProposalRef | null>(null)
   const [previewState, setPreviewState] = useState<{
-    prId: string
+    key: string
     report: PreviewReport | null
   } | null>(() =>
     demo && DEFAULT_PROPOSALS[0]
-      ? { prId: DEFAULT_PROPOSALS[0].id, report: DEFAULT_PREVIEW }
+      ? { key: proposalKey(DEFAULT_PROPOSALS[0]), report: DEFAULT_PREVIEW }
       : null
   )
   const [loadingPRs, setLoadingPRs] = useState(!demo)
@@ -107,19 +129,36 @@ export const PreviewInspectorView: React.FC<PreviewInspectorViewProps> = ({
   const [statusFilter, setStatusFilter] = useState<ProposalStatusFilter>("all")
   const [previewRefreshTick, setPreviewRefreshTick] = useState(0)
 
+  // A deep link into another scope than the header tenant (e.g. a platform stub PR or a new
+  // tenant's skeleton PR) lists every repository the caller may read, so the link resolves.
+  const listingScope =
+    selectedProposal &&
+    selectedTenant &&
+    selectedProposal.scope !== selectedTenant
+      ? undefined
+      : selectedTenant
+  const listingKey = `${listingScope ?? "*"}|${statusFilter}`
+  const [lastListingKey, setLastListingKey] = useState(listingKey)
+  if (lastListingKey !== listingKey) {
+    setLastListingKey(listingKey)
+    if (!demo) setLoadingPRs(true)
+  }
+
   useEffect(() => {
     // Demo mode never calls the live API (UI-9); fixtures are already in state.
     if (demo) return
     let cancelled = false
-    getProposals(selectedTenant, statusFilter)
-      .then((data) => {
+    getProposalListing(listingScope, statusFilter)
+      .then((listing) => {
         if (cancelled) return
-        setProposals(sortProposals(data ?? []))
+        setProposals(sortProposals(listing.proposals ?? []))
+        setUnavailable(listing.unavailable ?? [])
       })
       .catch((err) => {
         if (cancelled) return
         setError(visibleLoadError(err, "Failed to load PR proposals"))
         setProposals([])
+        setUnavailable([])
       })
       .finally(() => {
         if (!cancelled) setLoadingPRs(false)
@@ -127,55 +166,58 @@ export const PreviewInspectorView: React.FC<PreviewInspectorViewProps> = ({
     return () => {
       cancelled = true
     }
-  }, [demo, selectedTenant, statusFilter])
+  }, [demo, listingScope, statusFilter])
 
   // A new deep link (e.g. "Go to PR" elsewhere) supersedes an earlier manual click.
-  const [lastDeepLink, setLastDeepLink] = useState(selectedProposalId)
-  if (lastDeepLink !== selectedProposalId) {
-    setLastDeepLink(selectedProposalId)
-    setManualSelectedId(null)
+  const deepLinkKey = selectedProposal ? proposalKey(selectedProposal) : null
+  const [lastDeepLink, setLastDeepLink] = useState(deepLinkKey)
+  if (lastDeepLink !== deepLinkKey) {
+    setLastDeepLink(deepLinkKey)
+    setManualSelected(null)
   }
 
   // Selection precedence: explicit user click > deep link > first listed PR.
-  const requestedId = manualSelectedId ?? selectedProposalId ?? null
+  const requested = manualSelected ?? selectedProposal ?? null
   const requestedMissing =
     !loadingPRs &&
-    Boolean(selectedProposalId) &&
-    manualSelectedId === null &&
-    !proposals.some((p) => p.id === selectedProposalId)
+    Boolean(selectedProposal) &&
+    manualSelected === null &&
+    !proposals.some((p) => sameRef(p, selectedProposal))
   const selectedPR = useMemo<Proposal | null>(
     () =>
-      proposals.find((p) => p.id === requestedId) ??
-      (requestedMissing || !requestedId ? (proposals[0] ?? null) : null),
-    [proposals, requestedId, requestedMissing]
+      proposals.find((p) => sameRef(p, requested)) ??
+      (requestedMissing || !requested ? (proposals[0] ?? null) : null),
+    [proposals, requested, requestedMissing]
   )
+  const selectedKey = selectedPR ? proposalKey(selectedPR) : undefined
+  const selectedScope = selectedPR?.scope
   const selectedId = selectedPR?.id
 
   useEffect(() => {
-    if (!selectedId || demo) return
+    if (!selectedKey || !selectedScope || !selectedId || demo) return
     let cancelled = false
-    getProposalPreview(selectedId)
+    getProposalPreview({ scope: selectedScope, id: selectedId })
       .then((report) => {
         if (cancelled) return
         setError(null)
-        setPreviewState({ prId: selectedId, report })
+        setPreviewState({ key: selectedKey, report })
       })
       .catch((err) => {
         if (cancelled) return
         setError(visibleLoadError(err, "Failed to load preview diff"))
-        setPreviewState({ prId: selectedId, report: null })
+        setPreviewState({ key: selectedKey, report: null })
       })
     return () => {
       cancelled = true
     }
-  }, [selectedId, demo, previewRefreshTick])
+  }, [selectedKey, selectedScope, selectedId, demo, previewRefreshTick])
 
   const preview =
-    previewState && previewState.prId === selectedId
+    previewState && previewState.key === selectedKey
       ? previewState.report
       : null
   const loadingPreview =
-    Boolean(selectedId) && !demo && previewState?.prId !== selectedId
+    Boolean(selectedKey) && !demo && previewState?.key !== selectedKey
 
   const refreshPreview = useCallback(
     () => setPreviewRefreshTick((t) => t + 1),
@@ -184,24 +226,28 @@ export const PreviewInspectorView: React.FC<PreviewInspectorViewProps> = ({
   usePreviewRunRefresh(isPreviewRunActive(preview?.run), refreshPreview)
 
   const handleSelectPR = (pr: Proposal) => {
-    setManualSelectedId(pr.id)
+    const ref = { scope: pr.scope, id: pr.id }
+    setManualSelected(ref)
     setActionSuccess(null)
-    onSelectProposal?.(pr.id)
+    onSelectProposal?.(ref)
   }
 
   const runAction = async (action: ProposalAction) => {
     if (!selectedPR) return
-    const id = selectedPR.id
+    const ref = { scope: selectedPR.scope, id: selectedPR.id }
+    const id = ref.id
     const copy = ACTION_COPY[action]
     setPending(action)
     setActionSuccess(null)
     setError(null)
     try {
-      const result = await copy.call(id)
+      const result = await copy.call(ref)
       if (result.success) {
         setActionSuccess(result.message || copy.success(id))
         setProposals((prev) =>
-          prev.map((p) => (p.id === id ? { ...p, status: copy.nextStatus } : p))
+          prev.map((p) =>
+            sameRef(p, ref) ? { ...p, status: copy.nextStatus } : p
+          )
         )
       } else {
         setError(result.message || copy.failure)
@@ -248,16 +294,40 @@ export const PreviewInspectorView: React.FC<PreviewInspectorViewProps> = ({
         >
           <Info className="h-4 w-4 shrink-0" />
           <span>
-            PR #{selectedProposalId} not found or not visible with the current
-            filters and permissions.
+            PR #{selectedProposal?.id} ({selectedProposal?.scope}) not found or
+            not visible with the current filters and permissions.
           </span>
+        </div>
+      )}
+
+      {unavailable.length > 0 && (
+        <div
+          data-testid="pr-unavailable-repositories"
+          role="status"
+          className="p-3 bg-slate-900 border border-amber-500/30 rounded-xl text-amber-300 text-xs space-y-1"
+        >
+          <p className="flex items-center gap-2 font-semibold">
+            <AlertTriangle className="h-4 w-4 shrink-0" />
+            Some repositories could not be listed; their pull requests may be
+            missing or out of date.
+          </p>
+          <ul className="list-disc pl-8 space-y-0.5">
+            {unavailable.map((u) => (
+              <li key={`${u.scope}:${u.repository.label}`}>
+                <code className="font-mono">
+                  {u.repository.fullName ?? u.repository.label}
+                </code>{" "}
+                ({u.scope}): {u.reason}
+              </li>
+            ))}
+          </ul>
         </div>
       )}
 
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 lg:h-[calc(100vh-14rem)] lg:min-h-140">
         <ProposalList
           proposals={proposals}
-          selectedId={selectedId}
+          selectedKey={selectedKey}
           loading={loadingPRs}
           statusFilter={statusFilter}
           onStatusFilterChange={(st) => {
@@ -279,6 +349,18 @@ export const PreviewInspectorView: React.FC<PreviewInspectorViewProps> = ({
                 title={`PR #${selectedPR.id}: ${selectedPR.title}`}
                 meta={[
                   {
+                    label: "Repository",
+                    value: proposalRepositoryName(selectedPR),
+                    valueClassName: "text-slate-200",
+                  },
+                  {
+                    label: "Tenant",
+                    value:
+                      selectedPR.scope === PLATFORM_SCOPE
+                        ? "platform"
+                        : selectedPR.scope,
+                  },
+                  {
                     label: "Branch",
                     value: selectedPR.branch,
                     valueClassName: "text-indigo-400",
@@ -288,7 +370,11 @@ export const PreviewInspectorView: React.FC<PreviewInspectorViewProps> = ({
                 actions={
                   <ProposalActions
                     proposal={selectedPR}
-                    canManage={authz.canAdminTenant(selectedPR.tenant)}
+                    canManage={
+                      selectedPR.scope === PLATFORM_SCOPE
+                        ? authz.isAdmin
+                        : authz.canAdminTenant(selectedPR.scope)
+                    }
                     pending={pending}
                     onMerge={() => void runAction("merge")}
                     onReject={() => void runAction("reject")}

@@ -37,7 +37,7 @@ async function openPodinfoDeployForm(page: Page) {
 test.describe('02 - Catalog Dynamic Forms & PR Proposal Generation', () => {
   test('02.1 - Unauthenticated catalog and proposal APIs are rejected', async ({ request }) => {
     expect((await request.get('/api/v1/catalog')).status()).toBe(401);
-    const res = await request.post('/api/v1/proposals', {
+    const res = await request.post('/api/v1/tenants/acme/proposals', {
       data: { catalogId: 'podinfo', tenant: 'acme', values: { replicas: 3 } },
     });
     expect(res.status()).toBe(401);
@@ -67,7 +67,7 @@ test.describe('02 - Catalog Dynamic Forms & PR Proposal Generation', () => {
 
   test('02.3 - Server-side JSON Schema validation rejects invalid values with field details', async () => {
     const api = await apiAs(USERS.admin);
-    const res = await api.post('/api/v1/proposals', {
+    const res = await api.post('/api/v1/tenants/acme/proposals', {
       data: { tenant: 'acme', catalogId: 'podinfo', name: uniq('bad'), values: { replicas: 0 } },
     });
     expect(res.status()).toBe(422);
@@ -160,7 +160,7 @@ test.describe('02 - Catalog Dynamic Forms & PR Proposal Generation', () => {
     // Client-side validation blocks submission (no POST is sent).
     let posted = 0;
     page.on('request', (r) => {
-      if (r.method() === 'POST' && r.url().endsWith('/api/v1/proposals')) posted++;
+      if (r.method() === 'POST' && /\/api\/v1\/tenants\/[^/]+\/proposals$/.test(r.url())) posted++;
     });
     await modal.getByLabel('Replica Count').fill('0');
     await modal.getByLabel('Ingress Hostname').fill('Bad Host!');
@@ -182,7 +182,8 @@ test.describe('02 - Catalog Dynamic Forms & PR Proposal Generation', () => {
     await expect(preview).not.toContainText(secret);
 
     const createResponse = page.waitForResponse(
-      (r) => r.request().method() === 'POST' && r.url().endsWith('/api/v1/proposals'),
+      (r) =>
+        r.request().method() === 'POST' && /\/api\/v1\/tenants\/[^/]+\/proposals$/.test(r.url()),
     );
     await modal.getByRole('button', { name: /Submit & Open Git PR Proposal/i }).click();
     const res = await createResponse;
@@ -217,7 +218,7 @@ test.describe('02 - Catalog Dynamic Forms & PR Proposal Generation', () => {
     expect(certManager?.spec.placement?.scope).toBe('cluster');
 
     for (const targetCluster of [undefined, 'local']) {
-      const res = await api.post('/api/v1/proposals', {
+      const res = await api.post('/api/v1/tenants/acme/proposals', {
         data: {
           tenant: 'acme',
           catalogId: 'cert-manager',
@@ -234,7 +235,8 @@ test.describe('02 - Catalog Dynamic Forms & PR Proposal Generation', () => {
     await uiLogin(page, USERS.admin);
     let posted = 0;
     page.on('request', (r) => {
-      if (r.method() === 'POST' && r.url().endsWith('/api/v1/proposals')) posted += 1;
+      if (r.method() === 'POST' && /\/api\/v1\/tenants\/[^/]+\/proposals$/.test(r.url()))
+        posted += 1;
     });
     await openTab(page, 'Catalog & Form Wizard');
     const card = page.getByTestId('catalog-list').locator('.p-5', { hasText: 'cert-manager' });
@@ -275,13 +277,13 @@ test.describe('02 - Catalog Dynamic Forms & PR Proposal Generation', () => {
     }
 
     // Required secret fields are validated before anything is encrypted or committed.
-    const missingKeys = await api.post('/api/v1/proposals', {
+    const missingKeys = await api.post('/api/v1/tenants/acme/proposals', {
       data: { tenant: 'acme', catalogId: 'seaweedfs', name: uniq('s3'), values: { s3: {} } },
     });
     expect(missingKeys.status()).toBe(422);
 
     // The chart's HTTPRoute may never claim a platform host on the shared keel-ingress Gateway.
-    const platformHost = await api.post('/api/v1/proposals', {
+    const platformHost = await api.post('/api/v1/tenants/acme/proposals', {
       data: {
         tenant: 'acme',
         catalogId: 'forgejo',
@@ -302,7 +304,7 @@ test.describe('02 - Catalog Dynamic Forms & PR Proposal Generation', () => {
     expect(JSON.stringify(await platformHost.json())).toContain('reserved platform host');
 
     // Chart values outside the catalog schema (here a second, unguarded route) are rejected.
-    const undeclared = await api.post('/api/v1/proposals', {
+    const undeclared = await api.post('/api/v1/tenants/acme/proposals', {
       data: {
         tenant: 'acme',
         catalogId: 'seaweedfs',
@@ -345,14 +347,14 @@ test.describe('02 - Catalog Dynamic Forms & PR Proposal Generation', () => {
       expect(app?.spec.upstream.version, id).toBe(version);
 
       // Cluster-wide CRDs, RBAC and webhooks never land on the management cluster.
-      const local = await api.post('/api/v1/proposals', {
+      const local = await api.post('/api/v1/tenants/acme/proposals', {
         data: { tenant: 'acme', catalogId: id, name: uniq(id.slice(0, 8)), values: {} },
       });
       expect(local.status(), id).toBe(400);
     }
 
     // The form is the whole interface: chart values outside the schema are rejected.
-    const undeclared = await api.post('/api/v1/proposals', {
+    const undeclared = await api.post('/api/v1/tenants/acme/proposals', {
       data: {
         tenant: 'acme',
         catalogId: 'flux2',
@@ -366,7 +368,7 @@ test.describe('02 - Catalog Dynamic Forms & PR Proposal Generation', () => {
     expect(JSON.stringify(await undeclared.json())).toContain('extraObjects');
 
     // Any namespace other than the dedicated one is rejected.
-    const sharedNs = await api.post('/api/v1/proposals', {
+    const sharedNs = await api.post('/api/v1/tenants/acme/proposals', {
       data: {
         tenant: 'acme',
         catalogId: 'kyverno',
@@ -380,7 +382,7 @@ test.describe('02 - Catalog Dynamic Forms & PR Proposal Generation', () => {
     expect(JSON.stringify(await sharedNs.json())).toContain('spec.placement.namespace');
 
     // The Flux multi-tenancy lockdown switch is required (no server-side schema defaults).
-    const noLockdown = await api.post('/api/v1/proposals', {
+    const noLockdown = await api.post('/api/v1/tenants/acme/proposals', {
       data: {
         tenant: 'acme',
         catalogId: 'flux2',

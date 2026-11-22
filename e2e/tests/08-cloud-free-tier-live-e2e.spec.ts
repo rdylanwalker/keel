@@ -365,14 +365,16 @@ async function deleteAndConfirmStage1StackRemoved(
 
     const delJson = (await delRes.json().catch(() => null)) as {
       id?: string | number;
-      proposal?: { id?: string | number };
+      proposal?: { id?: string | number; scope?: string };
     } | null;
     const delPrId = delJson?.proposal?.id ?? delJson?.id;
+    const delScope = delJson?.proposal?.scope ?? namespace.replace(/^tenant-/, '');
     if (delPrId !== undefined) {
       logStep(`Merging deletion PR #${delPrId} for ${namespace}/${stackName}...`, provider);
-      const mergeRes = await request.post(`${BASE_URL}/api/v1/proposals/${delPrId}/merge`, {
-        headers: SAME_ORIGIN,
-      });
+      const mergeRes = await request.post(
+        `${BASE_URL}/api/v1/tenants/${delScope}/proposals/${delPrId}/merge`,
+        { headers: SAME_ORIGIN },
+      );
       expect(mergeRes.ok()).toBe(true);
       triggerFluxReconcile();
     }
@@ -890,7 +892,7 @@ test.describe('08.1 - Multi-Cloud Free-Tier Stage 1 Live E2E (kind Management Cl
       const resolvedValues = Object.fromEntries(
         Object.entries(values).map(([k, v]) => [k, v === '${stackName}' ? stackName : v]),
       );
-      const createRes = await request.post(`${BASE_URL}/api/v1/proposals`, {
+      const createRes = await request.post(`${BASE_URL}/api/v1/tenants/${tenant}/proposals`, {
         headers: SAME_ORIGIN,
         data: {
           catalogId,
@@ -923,7 +925,9 @@ test.describe('08.1 - Multi-Cloud Free-Tier Stage 1 Live E2E (kind Management Cl
       let prevLastLog = 0;
       const done = await pollUntil(
         async () => {
-          const prevRes = await request.get(`${BASE_URL}/api/v1/proposals/${prId}/preview`);
+          const prevRes = await request.get(
+            `${BASE_URL}/api/v1/tenants/${tenant}/proposals/${prId}/preview`,
+          );
           if (prevRes.ok()) {
             const body = await prevRes.text();
             if (body.includes('+ Create') || body.includes('create') || body.includes('preview')) {
@@ -950,17 +954,23 @@ test.describe('08.1 - Multi-Cloud Free-Tier Stage 1 Live E2E (kind Management Cl
       ).toBe(true);
 
       logStep(`Merging proposal #${prId}...`, provider);
-      let mergeRes = await request.post(`${BASE_URL}/api/v1/proposals/${prId}/merge`, {
-        headers: SAME_ORIGIN,
-      });
+      let mergeRes = await request.post(
+        `${BASE_URL}/api/v1/tenants/${tenant}/proposals/${prId}/merge`,
+        {
+          headers: SAME_ORIGIN,
+        },
+      );
       if (mergeRes.status() === 409) {
         // Transient conflict (concurrent PR merges): retry with polling instead of fixed sleeps.
         await expect
           .poll(
             async () => {
-              mergeRes = await request.post(`${BASE_URL}/api/v1/proposals/${prId}/merge`, {
-                headers: SAME_ORIGIN,
-              });
+              mergeRes = await request.post(
+                `${BASE_URL}/api/v1/tenants/${tenant}/proposals/${prId}/merge`,
+                {
+                  headers: SAME_ORIGIN,
+                },
+              );
               return mergeRes.status();
             },
             { timeout: 10_000, intervals: [2_000] },
@@ -975,7 +985,9 @@ test.describe('08.1 - Multi-Cloud Free-Tier Stage 1 Live E2E (kind Management Cl
       if (!stackMerged && prId !== undefined) {
         logStep(`Closing unmerged proposal #${prId}; skipping stack delete.`, provider);
         await request
-          .post(`${BASE_URL}/api/v1/proposals/${prId}/reject`, { headers: SAME_ORIGIN })
+          .post(`${BASE_URL}/api/v1/tenants/${tenant}/proposals/${prId}/reject`, {
+            headers: SAME_ORIGIN,
+          })
           .catch(() => null);
       }
       await context.close();
@@ -1136,7 +1148,7 @@ test.describe('08.1 - Multi-Cloud Free-Tier Stage 1 Live E2E (kind Management Cl
             const togglePrId = toggleJson.proposal?.id;
             if (togglePrId !== undefined) {
               const mergeRes = await setupPage.request.post(
-                `${BASE_URL}/api/v1/proposals/${togglePrId}/merge`,
+                `${BASE_URL}/api/v1/tenants/management/proposals/${togglePrId}/merge`,
                 { headers: SAME_ORIGIN },
               );
               expect(mergeRes.ok()).toBe(true);

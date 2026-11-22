@@ -226,18 +226,35 @@ export interface ProposalInfo {
   url: string;
   mergeCommitSha?: string;
   baseSha?: string;
+  /** Route scope: a tenant id, or `management` for the platform repository. */
+  scope: string;
+  repository: { label: string; fullName?: string };
 }
 
-/** Creates a deploy proposal and returns the parsed response. */
+/** `POST`/`GET` collection of one tenant's proposals (`/api/v1/tenants/{tenant}/proposals`). */
+export function tenantProposalsPath(tenant: string): string {
+  return `/api/v1/tenants/${encodeURIComponent(tenant)}/proposals`;
+}
+
+/** Scoped proposal route; PR ids are only unique within their repository. */
+export function proposalPath(
+  proposal: { scope: string; id: string },
+  action?: 'preview' | 'merge' | 'reject' | 'reopen',
+): string {
+  const base = `${tenantProposalsPath(proposal.scope)}/${encodeURIComponent(proposal.id)}`;
+  return action ? `${base}/${action}` : base;
+}
+
+/** Creates a deploy proposal (in `data.tenant`'s scope) and returns the parsed response. */
 export async function createProposal(
   api: APIRequestContext,
-  data: Record<string, unknown>,
+  data: Record<string, unknown> & { tenant: string },
 ): Promise<{
   proposal: ProposalInfo;
   branch: string;
   report: { source: string; run?: { phase: string; message?: string } };
 }> {
-  const res = await api.post('/api/v1/proposals', { data });
+  const res = await api.post(tenantProposalsPath(data.tenant), { data });
   expect(res.status(), await res.text()).toBe(201);
   return res.json();
 }

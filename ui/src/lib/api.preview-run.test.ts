@@ -27,7 +27,7 @@ describe("preview run + camelCase PullRequestInfo normalization", () => {
         },
       },
     })
-    const preview = await getProposalPreview("9")
+    const preview = await getProposalPreview({ scope: "acme", id: "9" })
     expect(preview.source).toBe("pko")
     expect(preview.run).toEqual({
       phase: "running",
@@ -58,7 +58,7 @@ describe("preview run + camelCase PullRequestInfo normalization", () => {
         ],
       },
     })
-    const preview = await getProposalPreview("9")
+    const preview = await getProposalPreview({ scope: "acme", id: "9" })
     expect(preview.resources).toEqual([
       {
         urn: "urn:a",
@@ -85,7 +85,7 @@ describe("preview run + camelCase PullRequestInfo normalization", () => {
       },
       run: { phase: "notExecuted", message: "no infra changes" },
     })
-    const preview = await getProposalPreview("9")
+    const preview = await getProposalPreview({ scope: "acme", id: "9" })
     expect(preview.run).toEqual({
       phase: "notExecuted",
       message: "no infra changes",
@@ -98,6 +98,7 @@ describe("preview run + camelCase PullRequestInfo normalization", () => {
         {
           id: "12",
           title: "feat(acme): deploy podinfo",
+          scope: "acme",
           sourceBranch: "keel/acme/podinfo-12",
           author: "alice",
           state: "open",

@@ -37,12 +37,31 @@ describe("PrNotificationBanner component", () => {
     expect(goBtn).toBeInTheDocument()
     fireEvent.click(goBtn)
     expect(onNavigate).toHaveBeenCalledTimes(1)
+    // Without a scope the PR cannot be addressed (ids are per repository).
+    expect(onNavigate).toHaveBeenCalledWith(undefined)
 
     const forgeLink = screen.getByRole("link", { name: /View on Forge/i })
     expect(forgeLink).toHaveAttribute(
       "href",
       "https://forge.example.com/pr/100"
     )
+  })
+
+  it("navigates to the scoped PR and never links non-http(s) URLs", () => {
+    const onNavigate = vi.fn()
+    render(
+      <PrNotificationBanner
+        message="PR #3 created"
+        prId="3"
+        prScope="acme"
+        prUrl="javascript:alert(1)"
+        onNavigateToPreview={onNavigate}
+        onDismiss={vi.fn()}
+      />
+    )
+    fireEvent.click(screen.getByRole("button", { name: /Go to PR →/i }))
+    expect(onNavigate).toHaveBeenCalledWith({ scope: "acme", id: "3" })
+    expect(screen.queryByRole("link", { name: /View on Forge/i })).toBeNull()
   })
 
   it("renders snackbar variant with floating toast style and handles dismiss", () => {

@@ -97,7 +97,19 @@ export interface CatalogItem {
   resourceKind?: InfraResourceKind
 }
 
+/** Proposal scope of the platform (monorepo) repository; cluster administrators only. */
+export const PLATFORM_SCOPE = "management"
+
+/** Repository a proposal lives in (`repository` on every proposal response; never credentials). */
+export interface ProposalRepository {
+  /** `platform` or `tenant-<id>` (also the preview `keel.io/repo` label). */
+  label: string
+  /** `owner/name` of a tenant's own forge repository. */
+  fullName?: string
+}
+
 export interface Proposal {
+  /** PR number; unique per repository only (pair it with `scope`). */
   id: string
   title: string
   branch: string
@@ -107,6 +119,86 @@ export interface Proposal {
   createdAt: string
   prUrl?: string
   previewStatus?: "pending" | "ready" | "failed"
+  /** Route scope: a tenant id (`/api/v1/tenants/{scope}/proposals/{id}`) or {@link PLATFORM_SCOPE}. */
+  scope: string
+  repository?: ProposalRepository
+  /** Forge web page of the repository, derived from `prUrl` (http(s) forges only). */
+  repoUrl?: string
+}
+
+/** Identity of a proposal across repositories: PR ids repeat between tenant repositories. */
+export interface ProposalRef {
+  scope: string
+  id: string
+}
+
+/** A repository whose PRs could not be listed (forge failure or rate limit; never secrets). */
+export interface UnavailableRepository {
+  scope: string
+  repository: ProposalRepository
+  reason: string
+}
+
+/** `GET /api/v1/proposals` / `GET /api/v1/tenants/{tenant}/proposals`. */
+export interface ProposalListing {
+  proposals: Proposal[]
+  unavailable: UnavailableRepository[]
+}
+
+/** Runtime provisioning step outcome (`POST /api/v1/tenants`). */
+export type TenantStepOutcome =
+  "pendingNamespace" | "created" | "existed" | "rotated" | "notApplicable"
+
+export interface TenantClusterProvisioning {
+  namespaceReady: boolean
+  sopsAge: TenantStepOutcome
+  credential: TenantStepOutcome
+}
+
+export type BranchProtectionOutcome =
+  "created" | "updated" | "unchanged" | "unsupportedPlan"
+
+export interface ForkPolicyOutcome {
+  result: "disabled" | "alreadyDisabled" | "requiresAdminSetting"
+  detail?: string
+}
+
+/** Where and how a tenant's GitOps repository was provisioned. Never contains credentials. */
+export interface TenantRepositoryStatus {
+  /** `dedicated`: the tenant's own forge repository; `monorepo`: Local Git provider (dev only). */
+  layout: "dedicated" | "monorepo"
+  owner?: string
+  name?: string
+  /** Clone URL Flux and PKO use. */
+  url?: string
+  webUrl?: string
+  /** `https` (repository-scoped read token) or `ssh` (read-only deploy key). */
+  transport?: "https" | "ssh" | string
+  created?: boolean
+  mainProtection?: BranchProtectionOutcome
+  forks?: ForkPolicyOutcome
+  /** PR on the tenant repository adding its skeleton (absent once on `main`). */
+  skeletonProposal?: Proposal
+  cluster: TenantClusterProvisioning
+  notes: string[]
+}
+
+/** Result of `POST /api/v1/tenants`. */
+export interface CreateTenantResult {
+  tenant: TenantSummary
+  /** Platform-repository PR adding the tenant stub; absent when already on `main`. */
+  proposal?: Proposal
+  branch?: string
+  repository: TenantRepositoryStatus
+}
+
+/** Result of `DELETE /api/v1/tenants/{id}`. */
+export interface DeleteTenantResult {
+  id: string
+  proposal: Proposal
+  branch: string
+  /** Operator follow-ups (credential revocation, archiving the repository). */
+  notes: string[]
 }
 
 export type ChangeOp =

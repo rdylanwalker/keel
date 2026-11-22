@@ -102,6 +102,53 @@ pub enum ServerError {
     Internal(String),
 }
 
+impl ServerError {
+    /// One-line, client-safe reason for an error reported inside an otherwise successful
+    /// response (for example a repository the proposal listing could not reach). Messages the
+    /// server writes itself are kept; forge, git, I/O and other internal errors are logged in
+    /// full under a correlation id and replaced by a generic, category-level reason, so upstream
+    /// response bodies, internal URLs and server paths never reach clients (`NFR-SEC-05`).
+    pub fn client_safe_reason(&self) -> String {
+        match self {
+            Self::Unauthorized(msg)
+            | Self::Forbidden(msg)
+            | Self::NotFound(msg)
+            | Self::BadRequest(msg)
+            | Self::Conflict(msg)
+            | Self::ServiceUnavailable(msg)
+            | Self::Core(CoreError::Validation(msg))
+            | Self::Forge(ForgeError::InvalidInput(msg))
+            | Self::Pko(PkoError::Validation(msg))
+            | Self::Kube(
+                KubeError::InvalidInput(msg)
+                | KubeError::NotFound(msg)
+                | KubeError::Conflict(msg)
+                | KubeError::TenantSourceUnavailable(msg)
+                | KubeError::Unavailable(msg),
+            ) => msg.clone(),
+            Self::Forge(ForgeError::RateLimited { .. }) => {
+                "The Git forge is rate limiting Keel; retry later".to_string()
+            }
+            other => {
+                let category = match other {
+                    Self::Forge(_) => "forge",
+                    Self::Git(_) => "git",
+                    Self::Kube(_) => "kubernetes",
+                    _ => "internal",
+                };
+                let correlation_id = uuid::Uuid::new_v4().to_string();
+                tracing::warn!(
+                    correlation_id = %correlation_id,
+                    category,
+                    error = %other,
+                    "reporting an internal error to the client as a generic reason"
+                );
+                format!("{category} unavailable (correlation id: {correlation_id})")
+            }
+        }
+    }
+}
+
 impl IntoResponse for ServerError {
     fn into_response(self) -> Response {
         match self {
@@ -325,6 +372,35 @@ impl IntoResponse for ServerError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn client_safe_reason_keeps_server_messages_and_hides_internal_details() {
+        assert_eq!(
+            ServerError::ServiceUnavailable("retry later".into()).client_safe_reason(),
+            "retry later"
+        );
+        assert_eq!(
+            ServerError::Forge(ForgeError::RateLimited {
+                status: 429,
+                retry_after: None,
+            })
+            .client_safe_reason(),
+            "The Git forge is rate limiting Keel; retry later"
+        );
+        for err in [
+            ServerError::Forge(ForgeError::Api {
+                status: 500,
+                message: "<secret body> https://forge.internal/api".into(),
+            }),
+            ServerError::Internal("/var/lib/keel/secret-path".into()),
+            ServerError::Io(std::io::Error::other("/var/lib/keel/secret-path")),
+        ] {
+            let reason = err.client_safe_reason();
+            assert!(reason.contains("correlation id"), "{reason}");
+            assert!(!reason.contains("secret"), "{reason}");
+            assert!(!reason.contains("forge.internal"), "{reason}");
+        }
+    }
 
     #[test]
     fn server_error_variants_map_to_expected_status_codes() {
