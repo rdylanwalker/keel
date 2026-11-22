@@ -8,8 +8,9 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use crate::forge::{
-    CreatePrRequest, ForgeError, ForgeProvider, PullRequestComment, PullRequestInfo,
-    PullRequestState, RepositoryEnsureOutcome, matches_tenant, validate_commit_sha,
+    CreatePrRequest, ForgeError, ForgeProvider, PROTECTED_MAIN_BRANCH, PullRequestComment,
+    PullRequestInfo, PullRequestState, RepositoryEnsureOutcome, RepositoryInfo, RepositoryOptions,
+    matches_tenant, validate_commit_sha,
 };
 use crate::git::{
     CommitAuthor, GitError, GitRunner, parse_proposal_branch_tenant, sanitize_branch_segment,
@@ -122,6 +123,59 @@ impl LocalGitProvider {
         self.write_proposal_unlocked(&pr, &format!("chore(proposals): reopen proposal #{pr_id}"))
             .await?;
         Ok(pr)
+    }
+
+    /// Sibling bare repository `<parent of this repository>/<owner>/<name>.git` (development
+    /// only: no access control, `SDD.md` §3.2 D8).
+    fn sibling(&self, owner: &str, name: &str) -> Result<Self, ForgeError> {
+        let owner = local_path_segment(owner, "owner")?;
+        if owner.ends_with(".git") {
+            // `<parent>/<x>.git/...` would nest a repository inside a bare repository.
+            return Err(ForgeError::InvalidInput(format!(
+                "local repository owner '{owner}' must not end with '.git'"
+            )));
+        }
+        let name = local_path_segment(name, "repo")?;
+        let name = name.strip_suffix(".git").unwrap_or(name);
+        local_path_segment(name, "repo")?;
+        let parent = self.bare_repo_path.parent().ok_or_else(|| {
+            ForgeError::InvalidInput("local bare repository has no parent directory".to_string())
+        })?;
+        let bare_repo_path = parent.join(owner).join(format!("{name}.git"));
+        if bare_repo_path.starts_with(&self.bare_repo_path) {
+            return Err(ForgeError::InvalidInput(format!(
+                "local repository '{owner}/{name}' would be inside '{}'",
+                self.bare_repo_path.display()
+            )));
+        }
+        Ok(Self {
+            bare_repo_path,
+            git_runner: Clone::clone(&self.git_runner),
+            bot_author: self.bot_author.clone(),
+            mutex: Arc::new(Mutex::new(())),
+        })
+    }
+
+    /// Seeds an initial README commit on `main` (only for a repository without commits).
+    async fn seed_initial_commit(&self, name: &str) -> Result<(), ForgeError> {
+        let work = TempWorkDir::create(&format!("seed-{name}"))?;
+        let clone_dir = work.path().join("repo");
+        self.git_runner
+            .clone(self.remote_url_str()?, &clone_dir)
+            .await?;
+        tokio::fs::write(clone_dir.join("README.md"), format!("# {name}\n")).await?;
+        self.git_runner.add(&clone_dir, ["README.md"]).await?;
+        self.git_runner
+            .commit(&clone_dir, "chore: initial commit", &self.bot_author)
+            .await?;
+        self.git_runner
+            .push(
+                &clone_dir,
+                "origin",
+                &format!("HEAD:refs/heads/{PROTECTED_MAIN_BRANCH}"),
+            )
+            .await?;
+        Ok(())
     }
 
     fn remote_url_str(&self) -> Result<&str, ForgeError> {
@@ -584,6 +638,80 @@ impl ForgeProvider for LocalGitProvider {
         self.git_runner.init_bare(path).await?;
         Ok(RepositoryEnsureOutcome::Created)
     }
+
+    fn for_repository(
+        &self,
+        owner: &str,
+        name: &str,
+    ) -> Result<Arc<dyn ForgeProvider>, ForgeError> {
+        Ok(Arc::new(self.sibling(owner, name)?))
+    }
+
+    /// Creates the sibling bare repository (see [`LocalGitProvider::for_repository`]);
+    /// `private` is meaningless on a filesystem and only `main` is supported as default branch.
+    async fn ensure_named_repository(
+        &self,
+        owner: &str,
+        name: &str,
+        opts: &RepositoryOptions,
+    ) -> Result<RepositoryInfo, ForgeError> {
+        if let Some(branch) = opts.default_branch.as_deref()
+            && branch != PROTECTED_MAIN_BRANCH
+        {
+            return Err(ForgeError::InvalidInput(format!(
+                "the local Git provider only supports default branch '{PROTECTED_MAIN_BRANCH}', got '{branch}'"
+            )));
+        }
+        let repo = self.sibling(owner, name)?;
+        let outcome = ForgeProvider::ensure_repository(&repo, opts.private).await?;
+        // Seed whenever `main` is missing (not only on Created): an interrupted earlier seed must
+        // not leave the repository empty forever.
+        if opts.auto_init {
+            let _guard = repo.mutex.lock().await;
+            let main_ref = format!("refs/heads/{PROTECTED_MAIN_BRANCH}");
+            if !repo
+                .git_runner
+                .ref_exists(&repo.bare_repo_path, &main_ref)
+                .await?
+            {
+                repo.seed_initial_commit(name).await?;
+            }
+        }
+        let repo_name = repo
+            .bare_repo_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_suffix(".git"))
+            .unwrap_or(name)
+            .to_string();
+        Ok(RepositoryInfo {
+            owner: local_path_segment(owner, "owner")?.to_string(),
+            name: repo_name,
+            private: true,
+            default_branch: PROTECTED_MAIN_BRANCH.to_string(),
+            clone_url: Some(repo.remote_url_str()?.to_string()),
+            html_url: None,
+            outcome,
+        })
+    }
+}
+
+/// A single, non-hidden path segment (`[A-Za-z0-9._-]`, not starting with `.` or `-`).
+fn local_path_segment<'a>(value: &'a str, field: &str) -> Result<&'a str, ForgeError> {
+    let valid = !value.is_empty()
+        && value.len() <= 100
+        && !value.starts_with('.')
+        && !value.starts_with('-')
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+    if valid {
+        Ok(value)
+    } else {
+        Err(ForgeError::InvalidInput(format!(
+            "invalid local repository {field} '{value}'"
+        )))
+    }
 }
 
 fn validate_pr_id(pr_id: &str) -> Result<(), ForgeError> {
@@ -941,5 +1069,179 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, ForgeError::InvalidInput(_)), "{err}");
         assert!(junk.join("file.txt").is_file());
+    }
+
+    #[tokio::test]
+    async fn for_repository_and_ensure_named_repository_use_sibling_bare_repos() {
+        let tmp = TempDir::new().unwrap();
+        let platform = LocalGitProvider::new(tmp.path().join("infra-gitops.git"));
+        let info = platform
+            .ensure_named_repository("keel-tenants", "tenant-acme", &RepositoryOptions::default())
+            .await
+            .unwrap();
+        let expected = tmp.path().join("keel-tenants/tenant-acme.git");
+        assert_eq!(info.outcome, RepositoryEnsureOutcome::Created);
+        assert_eq!(info.owner, "keel-tenants");
+        assert_eq!(info.name, "tenant-acme");
+        assert_eq!(info.default_branch, "main");
+        assert_eq!(info.clone_url.as_deref(), expected.to_str());
+        assert!(expected.join("HEAD").is_file());
+        // auto_init seeded `main` with a README.
+        let runner = GitRunner::new();
+        let work = tmp.path().join("check");
+        runner
+            .clone(expected.to_str().unwrap(), &work)
+            .await
+            .unwrap();
+        assert!(work.join("README.md").is_file());
+
+        // Idempotent; `.git` suffix tolerated.
+        let again = platform
+            .ensure_named_repository(
+                "keel-tenants",
+                "tenant-acme.git",
+                &RepositoryOptions::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(again.outcome, RepositoryEnsureOutcome::Existed);
+        assert_eq!(again.name, "tenant-acme");
+
+        // Without auto_init the repository stays empty.
+        let bare_only = platform
+            .ensure_named_repository(
+                "keel-tenants",
+                "empty",
+                &RepositoryOptions {
+                    auto_init: false,
+                    ..RepositoryOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(bare_only.outcome, RepositoryEnsureOutcome::Created);
+
+        // The scoped provider targets the sibling repository.
+        let scoped = platform
+            .for_repository("keel-tenants", "tenant-acme")
+            .unwrap();
+        assert_eq!(
+            scoped.ensure_repository(true).await.unwrap(),
+            RepositoryEnsureOutcome::Existed
+        );
+        assert!(
+            scoped
+                .list_open_pull_requests(None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // An empty repository (e.g. an interrupted seed) is seeded once auto_init is requested.
+        let seeded = platform
+            .ensure_named_repository("keel-tenants", "empty", &RepositoryOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(seeded.outcome, RepositoryEnsureOutcome::Existed);
+        let work = tmp.path().join("check-empty");
+        runner
+            .clone(
+                tmp.path().join("keel-tenants/empty.git").to_str().unwrap(),
+                &work,
+            )
+            .await
+            .unwrap();
+        assert!(work.join("README.md").is_file());
+
+        // Path traversal, nesting inside the platform bare repository and unsupported options
+        // are refused.
+        for (owner, name) in [
+            ("..", "x"),
+            ("a/b", "x"),
+            ("o", ".hidden"),
+            ("o", "-x"),
+            ("", "x"),
+            ("infra-gitops.git", "objects"),
+            ("x.git", "r"),
+            ("o", ".git"),
+        ] {
+            assert!(
+                matches!(
+                    platform.for_repository(owner, name),
+                    Err(ForgeError::InvalidInput(_))
+                ),
+                "{owner}/{name}"
+            );
+        }
+        let err = platform
+            .ensure_named_repository(
+                "o",
+                "r",
+                &RepositoryOptions {
+                    default_branch: Some("trunk".to_string()),
+                    ..RepositoryOptions::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ForgeError::InvalidInput(_)), "{err}");
+        assert!(!tmp.path().join("o").exists());
+    }
+
+    #[tokio::test]
+    async fn per_repository_credentials_are_unsupported_on_the_local_provider() {
+        let tmp = TempDir::new().unwrap();
+        let p = LocalGitProvider::new(tmp.path().join("r.git"));
+        let repo = crate::forge::RepositoryTarget::new("o", "r").unwrap();
+        assert!(matches!(
+            p.read_credential_kind(),
+            Err(ForgeError::Unsupported(_))
+        ));
+        assert!(matches!(
+            p.create_repo_read_token(&repo, "t").await,
+            Err(ForgeError::Unsupported(_))
+        ));
+        assert!(matches!(
+            p.revoke_repo_read_token(&repo, "1").await,
+            Err(ForgeError::Unsupported(_))
+        ));
+        assert!(matches!(
+            p.ensure_deploy_key(&repo, "t", "k", true).await,
+            Err(ForgeError::Unsupported(_))
+        ));
+        assert!(matches!(
+            p.list_deploy_keys(&repo).await,
+            Err(ForgeError::Unsupported(_))
+        ));
+        assert!(matches!(
+            p.revoke_deploy_key(&repo, "1").await,
+            Err(ForgeError::Unsupported(_))
+        ));
+        assert!(matches!(
+            p.revoke_deploy_keys_by_fingerprint(&repo, "SHA256:x").await,
+            Err(ForgeError::Unsupported(_))
+        ));
+        assert!(matches!(
+            p.ensure_main_protection(&repo).await,
+            Err(ForgeError::Unsupported(_))
+        ));
+        assert!(matches!(
+            p.disable_forks(&repo).await,
+            Err(ForgeError::Unsupported(_))
+        ));
+        assert!(matches!(
+            p.ensure_read_collaborator(&repo, "u").await,
+            Err(ForgeError::Unsupported(_))
+        ));
+        assert!(matches!(
+            p.remove_collaborator(&repo, "u").await,
+            Err(ForgeError::Unsupported(_))
+        ));
+        assert!(matches!(
+            p.list_forks(&repo).await,
+            Err(ForgeError::Unsupported(_))
+        ));
+        let err = p.list_forks(&repo).await.unwrap_err().to_string();
+        assert!(err.contains("list_forks"), "{err}");
     }
 }

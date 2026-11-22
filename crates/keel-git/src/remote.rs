@@ -8,9 +8,15 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::time::Duration;
 
+use std::sync::Arc;
+
+use crate::remote_repo::ExistingRepo;
+
 use crate::forge::{
-    CreatePrRequest, ForgeError, ForgeProvider, PullRequestInfo, PullRequestState,
-    RepositoryEnsureOutcome, matches_tenant, validate_commit_sha,
+    BranchProtectionOutcome, CollaboratorOutcome, CreatePrRequest, DeployKeyInfo, EnsuredDeployKey,
+    ForgeError, ForgeProvider, ForkInfo, ForkPolicyOutcome, PullRequestInfo, PullRequestState,
+    RepoCredentialKind, RepoReadToken, RepositoryEnsureOutcome, RepositoryInfo, RepositoryOptions,
+    RepositoryTarget, matches_tenant, validate_commit_sha,
 };
 use crate::git::parse_proposal_branch_tenant;
 
@@ -57,7 +63,7 @@ fn validate_pr_number(pr_id: &str) -> Result<&str, ForgeError> {
     Ok(pr_id)
 }
 
-fn url_encode_project_path(path: &str) -> String {
+pub(crate) fn url_encode_project_path(path: &str) -> String {
     let mut encoded = String::with_capacity(path.len() + 8);
     for b in path.bytes() {
         match b {
@@ -207,8 +213,8 @@ pub(crate) enum ForgejoAuth {
 pub struct ForgejoGiteaProvider {
     pub(crate) client: Client,
     pub(crate) base_url: String,
-    owner: String,
-    repo: String,
+    pub(crate) owner: String,
+    pub(crate) repo: String,
     pub(crate) auth: ForgejoAuth,
 }
 
@@ -390,14 +396,14 @@ struct GiteaGitHubPrResponse {
 
 /// Page size requested from forge list endpoints (GitHub/GitLab cap at 100, Gitea at its
 /// configured `MAX_RESPONSE_ITEMS`, default 50).
-const LIST_PAGE_SIZE: usize = 50;
+pub(crate) const LIST_PAGE_SIZE: usize = 50;
 
 /// Hard cap on pages fetched per listing (`LIST_PAGE_SIZE * MAX_LIST_PAGES` PRs) so a huge or
 /// misbehaving forge cannot pin a request handler; truncation is logged.
-const MAX_LIST_PAGES: usize = 40;
+pub(crate) const MAX_LIST_PAGES: usize = 40;
 
 /// Returns `true` when an RFC 8288 `Link` header advertises a `rel="next"` page.
-fn link_header_has_next(headers: &reqwest::header::HeaderMap) -> bool {
+pub(crate) fn link_header_has_next(headers: &reqwest::header::HeaderMap) -> bool {
     headers
         .get_all(reqwest::header::LINK)
         .iter()
@@ -412,7 +418,7 @@ fn link_header_has_next(headers: &reqwest::header::HeaderMap) -> bool {
 
 /// Decides whether another page must be fetched: an explicit `next` link wins; otherwise a full
 /// page implies more results (Gitea does not always emit `Link` headers).
-fn page_has_more(batch_len: usize, has_next_link: bool) -> bool {
+pub(crate) fn page_has_more(batch_len: usize, has_next_link: bool) -> bool {
     batch_len > 0 && (has_next_link || batch_len >= LIST_PAGE_SIZE)
 }
 
@@ -627,58 +633,6 @@ where
     get_gitea_github_pr(client, base_url, repo_api_url, authorize, id).await
 }
 
-/// Looks up `repo_url`: `Ok(true)` when it exists, `Ok(false)` on HTTP 404.
-async fn repository_exists<F>(
-    client: &Client,
-    repo_url: &str,
-    authorize: F,
-) -> Result<bool, ForgeError>
-where
-    F: Fn(RequestBuilder) -> RequestBuilder,
-{
-    let resp = authorize(client.get(repo_url)).send().await?;
-    if resp.status().is_success() {
-        return Ok(true);
-    }
-    if resp.status() == StatusCode::NOT_FOUND {
-        return Ok(false);
-    }
-    Err(map_error_response(resp, Some("repository"), false).await)
-}
-
-/// Creates a repository via the Gitea/GitHub "organization" endpoint, falling back to the
-/// authenticated user's endpoint when the owner is not an organization (HTTP 404). A 409
-/// (concurrent creation) is reported as [`RepositoryEnsureOutcome::Existed`].
-async fn create_gitea_github_repo<F>(
-    client: &Client,
-    org_url: &str,
-    user_url: &str,
-    body: &serde_json::Value,
-    authorize: F,
-) -> Result<RepositoryEnsureOutcome, ForgeError>
-where
-    F: Fn(RequestBuilder) -> RequestBuilder,
-{
-    let org = authorize(client.post(org_url)).json(body).send().await?;
-    if org.status().is_success() {
-        return Ok(RepositoryEnsureOutcome::Created);
-    }
-    if org.status() == StatusCode::CONFLICT {
-        return Ok(RepositoryEnsureOutcome::Existed);
-    }
-    if org.status() != StatusCode::NOT_FOUND {
-        return Err(map_error_response(org, Some("repository"), false).await);
-    }
-    let user = authorize(client.post(user_url)).json(body).send().await?;
-    if user.status().is_success() {
-        return Ok(RepositoryEnsureOutcome::Created);
-    }
-    if user.status() == StatusCode::CONFLICT {
-        return Ok(RepositoryEnsureOutcome::Existed);
-    }
-    Err(map_error_response(user, Some("repository"), false).await)
-}
-
 #[async_trait]
 impl ForgeProvider for ForgejoGiteaProvider {
     async fn create_pull_request(
@@ -807,19 +761,117 @@ impl ForgeProvider for ForgejoGiteaProvider {
         &self,
         private: bool,
     ) -> Result<RepositoryEnsureOutcome, ForgeError> {
-        let authorize = |b| self.authorized(b);
-        if repository_exists(&self.client, &self.repo_api_url(), authorize).await? {
-            return Ok(RepositoryEnsureOutcome::Existed);
-        }
-        let body = serde_json::json!({ "name": self.repo, "private": private, "auto_init": false });
-        create_gitea_github_repo(
-            &self.client,
-            &format!("{}/api/v1/orgs/{}/repos", self.base_url, self.owner),
-            &format!("{}/api/v1/user/repos", self.base_url),
-            &body,
-            authorize,
-        )
-        .await
+        let opts = RepositoryOptions {
+            private,
+            auto_init: false,
+            default_branch: None,
+            description: None,
+        };
+        Ok(self
+            .ensure_named_repo(&self.owner, &self.repo, &opts, ExistingRepo::Accept)
+            .await?
+            .outcome)
+    }
+
+    fn for_repository(
+        &self,
+        owner: &str,
+        name: &str,
+    ) -> Result<Arc<dyn ForgeProvider>, ForgeError> {
+        self.scoped_to(owner, name)
+    }
+
+    async fn ensure_named_repository(
+        &self,
+        owner: &str,
+        name: &str,
+        opts: &RepositoryOptions,
+    ) -> Result<RepositoryInfo, ForgeError> {
+        self.ensure_named_repo(owner, name, opts, ExistingRepo::Verify)
+            .await
+    }
+
+    fn read_credential_kind(&self) -> Result<RepoCredentialKind, ForgeError> {
+        Ok(RepoCredentialKind::HttpsToken)
+    }
+
+    /// Requires a basic-auth provider for the token-owning bot (Forgejo mints tokens only as
+    /// the owner over basic auth) and Forgejo 15+ (repository-specific tokens; Gitea fails
+    /// closed).
+    async fn create_repo_read_token(
+        &self,
+        repo: &RepositoryTarget,
+        name: &str,
+    ) -> Result<RepoReadToken, ForgeError> {
+        self.create_repo_token(repo, name).await
+    }
+
+    async fn revoke_repo_read_token(
+        &self,
+        _repo: &RepositoryTarget,
+        token_id: &str,
+    ) -> Result<(), ForgeError> {
+        self.revoke_repo_token(token_id).await
+    }
+
+    async fn ensure_deploy_key(
+        &self,
+        repo: &RepositoryTarget,
+        title: &str,
+        public_key: &str,
+        read_only: bool,
+    ) -> Result<EnsuredDeployKey, ForgeError> {
+        self.ensure_repo_deploy_key(repo, title, public_key, read_only)
+            .await
+    }
+
+    async fn list_deploy_keys(
+        &self,
+        repo: &RepositoryTarget,
+    ) -> Result<Vec<DeployKeyInfo>, ForgeError> {
+        self.list_repo_deploy_keys(repo).await
+    }
+
+    async fn revoke_deploy_key(
+        &self,
+        repo: &RepositoryTarget,
+        key_id: &str,
+    ) -> Result<(), ForgeError> {
+        self.revoke_repo_deploy_key(repo, key_id).await
+    }
+
+    async fn ensure_main_protection(
+        &self,
+        repo: &RepositoryTarget,
+    ) -> Result<BranchProtectionOutcome, ForgeError> {
+        self.ensure_repo_main_protection(repo).await
+    }
+
+    async fn disable_forks(
+        &self,
+        _repo: &RepositoryTarget,
+    ) -> Result<ForkPolicyOutcome, ForgeError> {
+        self.repo_fork_policy().await
+    }
+
+    async fn ensure_read_collaborator(
+        &self,
+        repo: &RepositoryTarget,
+        username: &str,
+    ) -> Result<CollaboratorOutcome, ForgeError> {
+        self.ensure_repo_read_collaborator(repo, username).await
+    }
+
+    async fn remove_collaborator(
+        &self,
+        repo: &RepositoryTarget,
+        username: &str,
+    ) -> Result<(), ForgeError> {
+        self.remove_repo_collaborator(repo, username).await
+    }
+
+    async fn list_forks(&self, repo: &RepositoryTarget) -> Result<Vec<ForkInfo>, ForgeError> {
+        self.list_repo_forks(repo).await
     }
 }
 
@@ -830,11 +882,11 @@ impl ForgeProvider for ForgejoGiteaProvider {
 /// GitHub REST v3 [`ForgeProvider`] adapter (`/repos/{owner}/{repo}/...`).
 #[derive(Clone)]
 pub struct GitHubProvider {
-    client: Client,
-    base_url: String,
-    owner: String,
-    repo: String,
-    token: String,
+    pub(crate) client: Client,
+    pub(crate) base_url: String,
+    pub(crate) owner: String,
+    pub(crate) repo: String,
+    pub(crate) token: String,
 }
 
 impl fmt::Debug for GitHubProvider {
@@ -1009,19 +1061,110 @@ impl ForgeProvider for GitHubProvider {
         &self,
         private: bool,
     ) -> Result<RepositoryEnsureOutcome, ForgeError> {
-        let authorize = |b| self.authorized(b);
-        if repository_exists(&self.client, &self.repo_api_url(), authorize).await? {
-            return Ok(RepositoryEnsureOutcome::Existed);
-        }
-        let body = serde_json::json!({ "name": self.repo, "private": private, "auto_init": false });
-        create_gitea_github_repo(
-            &self.client,
-            &format!("{}/orgs/{}/repos", self.base_url, self.owner),
-            &format!("{}/user/repos", self.base_url),
-            &body,
-            authorize,
-        )
-        .await
+        let opts = RepositoryOptions {
+            private,
+            auto_init: false,
+            default_branch: None,
+            description: None,
+        };
+        Ok(self
+            .ensure_named_repo(&self.owner, &self.repo, &opts, ExistingRepo::Accept)
+            .await?
+            .outcome)
+    }
+
+    fn for_repository(
+        &self,
+        owner: &str,
+        name: &str,
+    ) -> Result<Arc<dyn ForgeProvider>, ForgeError> {
+        self.scoped_to(owner, name)
+    }
+
+    async fn ensure_named_repository(
+        &self,
+        owner: &str,
+        name: &str,
+        opts: &RepositoryOptions,
+    ) -> Result<RepositoryInfo, ForgeError> {
+        self.ensure_named_repo(owner, name, opts, ExistingRepo::Verify)
+            .await
+    }
+
+    fn read_credential_kind(&self) -> Result<RepoCredentialKind, ForgeError> {
+        Ok(RepoCredentialKind::SshDeployKey)
+    }
+
+    /// GitHub has no repository-scoped read token for a PAT owner; use a read-only deploy key
+    /// ([`ForgeProvider::ensure_deploy_key`]).
+    async fn create_repo_read_token(
+        &self,
+        _repo: &RepositoryTarget,
+        _name: &str,
+    ) -> Result<RepoReadToken, ForgeError> {
+        Err(ForgeError::Unsupported(
+            "create_repo_read_token (GitHub: use a read-only SSH deploy key)".to_string(),
+        ))
+    }
+
+    async fn ensure_deploy_key(
+        &self,
+        repo: &RepositoryTarget,
+        title: &str,
+        public_key: &str,
+        read_only: bool,
+    ) -> Result<EnsuredDeployKey, ForgeError> {
+        self.ensure_repo_deploy_key(repo, title, public_key, read_only)
+            .await
+    }
+
+    async fn list_deploy_keys(
+        &self,
+        repo: &RepositoryTarget,
+    ) -> Result<Vec<DeployKeyInfo>, ForgeError> {
+        self.list_repo_deploy_keys(repo).await
+    }
+
+    async fn revoke_deploy_key(
+        &self,
+        repo: &RepositoryTarget,
+        key_id: &str,
+    ) -> Result<(), ForgeError> {
+        self.revoke_repo_deploy_key(repo, key_id).await
+    }
+
+    async fn ensure_main_protection(
+        &self,
+        repo: &RepositoryTarget,
+    ) -> Result<BranchProtectionOutcome, ForgeError> {
+        self.ensure_repo_main_protection(repo).await
+    }
+
+    async fn disable_forks(
+        &self,
+        repo: &RepositoryTarget,
+    ) -> Result<ForkPolicyOutcome, ForgeError> {
+        self.disable_repo_forks(repo).await
+    }
+
+    async fn ensure_read_collaborator(
+        &self,
+        repo: &RepositoryTarget,
+        username: &str,
+    ) -> Result<CollaboratorOutcome, ForgeError> {
+        self.ensure_repo_read_collaborator(repo, username).await
+    }
+
+    async fn remove_collaborator(
+        &self,
+        repo: &RepositoryTarget,
+        username: &str,
+    ) -> Result<(), ForgeError> {
+        self.remove_repo_collaborator(repo, username).await
+    }
+
+    async fn list_forks(&self, repo: &RepositoryTarget) -> Result<Vec<ForkInfo>, ForgeError> {
+        self.list_repo_forks(repo).await
     }
 }
 
@@ -1032,11 +1175,11 @@ impl ForgeProvider for GitHubProvider {
 /// GitLab REST v4 [`ForgeProvider`] adapter (`/api/v4/projects/{encoded_project}/...`).
 #[derive(Clone)]
 pub struct GitLabProvider {
-    client: Client,
-    base_url: String,
-    project_path: String,
-    encoded_project: String,
-    token: String,
+    pub(crate) client: Client,
+    pub(crate) base_url: String,
+    pub(crate) project_path: String,
+    pub(crate) encoded_project: String,
+    pub(crate) token: String,
 }
 
 impl fmt::Debug for GitLabProvider {
@@ -1332,51 +1475,120 @@ impl ForgeProvider for GitLabProvider {
         &self,
         private: bool,
     ) -> Result<RepositoryEnsureOutcome, ForgeError> {
-        let authorize = |b| self.authorized(b);
-        if repository_exists(&self.client, &self.project_api_url(), authorize).await? {
-            return Ok(RepositoryEnsureOutcome::Existed);
-        }
         let (namespace, name) = self.project_path.rsplit_once('/').ok_or_else(|| {
             ForgeError::InvalidInput(format!(
                 "GitLab project path '{}' must include a namespace",
                 self.project_path
             ))
         })?;
-        let ns_resp = authorize(self.client.get(format!(
-            "{}/api/v4/namespaces/{}",
-            self.base_url,
-            url_encode_project_path(namespace)
-        )))
-        .send()
-        .await?;
-        if !ns_resp.status().is_success() {
-            return Err(map_error_response(ns_resp, Some(namespace), false).await);
-        }
-        let ns: serde_json::Value = ns_resp.json().await?;
-        let namespace_id = ns
-            .get("id")
-            .and_then(serde_json::Value::as_u64)
-            .ok_or_else(|| {
-                ForgeError::InvalidInput(format!(
-                    "GitLab namespace '{namespace}' response has no id"
-                ))
-            })?;
-        let created = authorize(
-            self.client
-                .post(format!("{}/api/v4/projects", self.base_url)),
-        )
-        .json(&serde_json::json!({
-            "name": name,
-            "path": name,
-            "namespace_id": namespace_id,
-            "visibility": if private { "private" } else { "internal" },
-        }))
-        .send()
-        .await?;
-        if created.status().is_success() {
-            return Ok(RepositoryEnsureOutcome::Created);
-        }
-        Err(map_error_response(created, Some("repository"), false).await)
+        let opts = RepositoryOptions {
+            private,
+            auto_init: false,
+            default_branch: None,
+            description: None,
+        };
+        Ok(self
+            .ensure_named_repo(namespace, name, &opts, ExistingRepo::Accept)
+            .await?
+            .outcome)
+    }
+
+    fn for_repository(
+        &self,
+        owner: &str,
+        name: &str,
+    ) -> Result<Arc<dyn ForgeProvider>, ForgeError> {
+        self.scoped_to(owner, name)
+    }
+
+    async fn ensure_named_repository(
+        &self,
+        owner: &str,
+        name: &str,
+        opts: &RepositoryOptions,
+    ) -> Result<RepositoryInfo, ForgeError> {
+        self.ensure_named_repo(owner, name, opts, ExistingRepo::Verify)
+            .await
+    }
+
+    fn read_credential_kind(&self) -> Result<RepoCredentialKind, ForgeError> {
+        Ok(RepoCredentialKind::HttpsToken)
+    }
+
+    async fn create_repo_read_token(
+        &self,
+        repo: &RepositoryTarget,
+        name: &str,
+    ) -> Result<RepoReadToken, ForgeError> {
+        self.create_repo_token(repo, name).await
+    }
+
+    async fn revoke_repo_read_token(
+        &self,
+        repo: &RepositoryTarget,
+        token_id: &str,
+    ) -> Result<(), ForgeError> {
+        self.revoke_repo_token(repo, token_id).await
+    }
+
+    async fn ensure_deploy_key(
+        &self,
+        repo: &RepositoryTarget,
+        title: &str,
+        public_key: &str,
+        read_only: bool,
+    ) -> Result<EnsuredDeployKey, ForgeError> {
+        self.ensure_repo_deploy_key(repo, title, public_key, read_only)
+            .await
+    }
+
+    async fn list_deploy_keys(
+        &self,
+        repo: &RepositoryTarget,
+    ) -> Result<Vec<DeployKeyInfo>, ForgeError> {
+        self.list_repo_deploy_keys(repo).await
+    }
+
+    async fn revoke_deploy_key(
+        &self,
+        repo: &RepositoryTarget,
+        key_id: &str,
+    ) -> Result<(), ForgeError> {
+        self.revoke_repo_deploy_key(repo, key_id).await
+    }
+
+    async fn ensure_main_protection(
+        &self,
+        repo: &RepositoryTarget,
+    ) -> Result<BranchProtectionOutcome, ForgeError> {
+        self.ensure_repo_main_protection(repo).await
+    }
+
+    async fn disable_forks(
+        &self,
+        repo: &RepositoryTarget,
+    ) -> Result<ForkPolicyOutcome, ForgeError> {
+        self.disable_repo_forks(repo).await
+    }
+
+    async fn ensure_read_collaborator(
+        &self,
+        repo: &RepositoryTarget,
+        username: &str,
+    ) -> Result<CollaboratorOutcome, ForgeError> {
+        self.ensure_repo_read_collaborator(repo, username).await
+    }
+
+    async fn remove_collaborator(
+        &self,
+        repo: &RepositoryTarget,
+        username: &str,
+    ) -> Result<(), ForgeError> {
+        self.remove_repo_collaborator(repo, username).await
+    }
+
+    async fn list_forks(&self, repo: &RepositoryTarget) -> Result<Vec<ForkInfo>, ForgeError> {
+        self.list_repo_forks(repo).await
     }
 }
 
@@ -1857,10 +2069,10 @@ mod tests {
             "GET /api/v1/repos/keel/infra-gitops HTTP/1.1"
         );
 
-        // 2. Missing; owner is a user (org endpoint 404) -> created via /user/repos with basic auth.
+        // 2. Missing; owner is the authenticated user (not an org) -> created via /user/repos.
         let (url, handle) = spawn_mock_http_server(vec![
             (404, "{}".to_string()),
-            (404, r#"{"message":"org not found"}"#.to_string()),
+            (200, r#"{"id":1,"login":"keel"}"#.to_string()),
             (201, r#"{"id":1}"#.to_string()),
         ])
         .await;
@@ -1874,13 +2086,11 @@ mod tests {
             RepositoryEnsureOutcome::Created
         );
         let reqs = handle.await.unwrap();
-        assert_eq!(
-            request_line(&reqs[1]),
-            "POST /api/v1/orgs/keel/repos HTTP/1.1"
-        );
+        assert_eq!(request_line(&reqs[1]), "GET /api/v1/user HTTP/1.1");
         assert_eq!(request_line(&reqs[2]), "POST /api/v1/user/repos HTTP/1.1");
         assert!(reqs[2].contains(r#""private":true"#), "{}", reqs[2]);
         assert!(reqs[2].contains(r#""name":"infra-gitops""#));
+        assert!(reqs[2].contains(r#""auto_init":false"#));
         let expected_auth = format!(
             "authorization: basic {}",
             base64::engine::general_purpose::STANDARD.encode(format!("keel:{password}"))
@@ -1891,10 +2101,16 @@ mod tests {
                 .contains(&expected_auth.to_ascii_lowercase())
         );
 
-        // 3. Org creation conflict (concurrent create) is reported as existing.
+        // 3. Org owner; creation conflict (concurrent create) is reported as existing.
         let (url, handle) = spawn_mock_http_server(vec![
             (404, "{}".to_string()),
+            (200, r#"{"login":"keel"}"#.to_string()),
+            (200, r#"{"id":7,"username":"acme"}"#.to_string()),
             (409, r#"{"message":"exists"}"#.to_string()),
+            (
+                200,
+                r#"{"name":"infra","owner":{"login":"acme"}}"#.to_string(),
+            ),
         ])
         .await;
         let p = ForgejoGiteaProvider::new(&url, "acme", "infra", "fg-tok").unwrap();
@@ -1903,9 +2119,15 @@ mod tests {
             RepositoryEnsureOutcome::Existed
         );
         let reqs = handle.await.unwrap();
-        assert!(reqs[1].contains(r#""private":false"#));
+        assert_eq!(request_line(&reqs[2]), "GET /api/v1/orgs/acme HTTP/1.1");
+        assert_eq!(
+            request_line(&reqs[3]),
+            "POST /api/v1/orgs/acme/repos HTTP/1.1"
+        );
+        assert!(reqs[3].contains(r#""private":false"#));
 
-        // 4. Lookup failures (non-404) surface as API errors; org 403 does not fall back.
+        // 4. Lookup failures (non-404) surface as API errors; a 403 create is not retried
+        //    against another owner.
         let (url, handle) = spawn_mock_http_server(vec![(500, "boom".to_string())]).await;
         let p = ForgejoGiteaProvider::new(&url, "acme", "infra", "fg-tok").unwrap();
         let err = p.ensure_repository(true).await.unwrap_err();
@@ -1914,13 +2136,30 @@ mod tests {
 
         let (url, handle) = spawn_mock_http_server(vec![
             (404, "{}".to_string()),
+            (
+                403,
+                r#"{"message":"token does not have required scope read:user"}"#.to_string(),
+            ),
+            (200, r#"{"id":7}"#.to_string()),
             (403, "forbidden".to_string()),
         ])
         .await;
         let p = ForgejoGiteaProvider::new(&url, "acme", "infra", "fg-tok").unwrap();
         let err = p.ensure_repository(true).await.unwrap_err();
         assert!(matches!(err, ForgeError::Api { status: 403, .. }), "{err}");
-        assert_eq!(handle.await.unwrap().len(), 2);
+        assert_eq!(handle.await.unwrap().len(), 4);
+
+        // 5. An owner that is neither an org nor the token owner is refused before any create.
+        let (url, handle) = spawn_mock_http_server(vec![
+            (404, "{}".to_string()),
+            (200, r#"{"login":"keel"}"#.to_string()),
+            (404, "{}".to_string()),
+        ])
+        .await;
+        let p = ForgejoGiteaProvider::new(&url, "mallory", "infra", "fg-tok").unwrap();
+        let err = p.ensure_repository(true).await.unwrap_err();
+        assert!(matches!(err, ForgeError::InvalidInput(_)), "{err}");
+        assert_eq!(handle.await.unwrap().len(), 3);
 
         let password = random_test_password();
         assert!(ForgejoGiteaProvider::with_basic_auth(&url, "o", "r", " ", &password).is_err());
@@ -1934,6 +2173,7 @@ mod tests {
     async fn github_ensure_repository_creates_in_org_or_user() {
         let (url, handle) = spawn_mock_http_server(vec![
             (404, "{}".to_string()),
+            (200, r#"{"login":"acme","type":"Organization"}"#.to_string()),
             (201, r#"{"id":1}"#.to_string()),
         ])
         .await;
@@ -1944,17 +2184,19 @@ mod tests {
         );
         let reqs = handle.await.unwrap();
         assert_eq!(request_line(&reqs[0]), "GET /repos/acme/infra HTTP/1.1");
-        assert_eq!(request_line(&reqs[1]), "POST /orgs/acme/repos HTTP/1.1");
+        assert_eq!(request_line(&reqs[1]), "GET /users/acme HTTP/1.1");
+        assert_eq!(request_line(&reqs[2]), "POST /orgs/acme/repos HTTP/1.1");
         assert!(
-            reqs[1]
+            reqs[2]
                 .to_ascii_lowercase()
                 .contains("authorization: bearer gh-tok")
         );
-        assert!(reqs[1].contains(r#""private":true"#));
+        assert!(reqs[2].contains(r#""private":true"#));
 
         let (url, handle) = spawn_mock_http_server(vec![
             (404, "{}".to_string()),
-            (404, "{}".to_string()),
+            (200, r#"{"login":"octocat","type":"User"}"#.to_string()),
+            (200, r#"{"login":"Octocat"}"#.to_string()),
             (201, r#"{"id":2}"#.to_string()),
         ])
         .await;
@@ -1964,11 +2206,14 @@ mod tests {
             RepositoryEnsureOutcome::Created
         );
         let reqs = handle.await.unwrap();
-        assert_eq!(request_line(&reqs[2]), "POST /user/repos HTTP/1.1");
+        assert_eq!(request_line(&reqs[2]), "GET /user HTTP/1.1");
+        assert_eq!(request_line(&reqs[3]), "POST /user/repos HTTP/1.1");
 
+        // A 422 that is not "already exists" is an error.
         let (url, handle) = spawn_mock_http_server(vec![
             (404, "{}".to_string()),
-            (404, "{}".to_string()),
+            (200, r#"{"login":"octocat","type":"User"}"#.to_string()),
+            (200, r#"{"login":"octocat"}"#.to_string()),
             (422, r#"{"message":"Validation Failed"}"#.to_string()),
         ])
         .await;
@@ -1976,6 +2221,18 @@ mod tests {
         let err = p.ensure_repository(true).await.unwrap_err();
         assert!(matches!(err, ForgeError::Api { status: 422, .. }), "{err}");
         handle.await.unwrap();
+
+        // Another user's account is never a create target.
+        let (url, handle) = spawn_mock_http_server(vec![
+            (404, "{}".to_string()),
+            (200, r#"{"login":"someone","type":"User"}"#.to_string()),
+            (200, r#"{"login":"octocat"}"#.to_string()),
+        ])
+        .await;
+        let p = GitHubProvider::new(&url, "someone", "infra", "gh-tok").unwrap();
+        let err = p.ensure_repository(true).await.unwrap_err();
+        assert!(matches!(err, ForgeError::InvalidInput(_)), "{err}");
+        assert_eq!(handle.await.unwrap().len(), 3);
     }
 
     #[tokio::test]

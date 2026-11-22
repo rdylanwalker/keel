@@ -15,6 +15,9 @@ serde_json.workspace = true
 chrono.workspace = true
 uuid.workspace = true
 base64.workspace = true
+russh.workspace = true
+rand.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

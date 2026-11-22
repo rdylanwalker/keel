@@ -2078,7 +2078,9 @@ dependencies = [
  "async-trait",
  "base64 0.23.1",
  "chrono",
+ "rand 0.10.4",
  "reqwest",
+ "russh",
  "serde",
  "serde_json",
  "tempfile",
@@ -2086,6 +2088,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]

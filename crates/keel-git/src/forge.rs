@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::sync::Arc;
 
 use crate::git::{GitError, parse_proposal_branch_tenant};
 
@@ -159,6 +160,29 @@ pub enum ForgeError {
 
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// The provider does not implement this operation (for example per-repository credentials
+    /// on the development-only [`crate::LocalGitProvider`], `SDD.md` §3.2).
+    #[error("Forge operation not supported by this provider: {0}")]
+    Unsupported(String),
+
+    /// A user's effective access to a repository is higher than Keel may leave in place
+    /// (organisation owner, team or base permission, or inherited GitLab group membership).
+    /// Keel cannot lower it per repository; an operator must change the membership.
+    #[error(
+        "Forge user '{user}' has '{permission}' access to '{repository}' through organisation, team or group membership; Keel cannot reduce it per repository"
+    )]
+    ElevatedAccess {
+        user: String,
+        repository: String,
+        permission: String,
+    },
+}
+
+impl ForgeError {
+    fn unsupported(operation: &str) -> Self {
+        Self::Unsupported(operation.to_string())
+    }
 }
 
 /// Result of [`ForgeProvider::ensure_repository`].
@@ -169,6 +193,234 @@ pub enum RepositoryEnsureOutcome {
     Existed,
     /// The repository was missing and has been created.
     Created,
+}
+
+/// A repository addressed by owner (user, organisation or GitLab group path) and name.
+///
+/// Also the target of a Forgejo repository-scoped access token (`RepoTargetOption`).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct RepositoryTarget {
+    /// Owning user or organisation (GitLab: namespace path, may contain `/`).
+    pub owner: String,
+    /// Repository name.
+    pub name: String,
+}
+
+impl RepositoryTarget {
+    /// Validates and builds a target: every `/`-separated owner segment and the name must match
+    /// `^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$` (no `..`, no `%`), because they are interpolated into
+    /// forge URL paths.
+    pub fn new(owner: &str, name: &str) -> Result<Self, ForgeError> {
+        Ok(Self {
+            owner: crate::remote_repo::namespace_path(owner, "owner")?,
+            name: crate::remote_repo::single_segment(name, "repo")?,
+        })
+    }
+
+    /// `owner/name`.
+    pub fn full_name(&self) -> String {
+        format!("{}/{}", self.owner, self.name)
+    }
+}
+
+impl fmt::Display for RepositoryTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}/{}", self.owner, self.name)
+    }
+}
+
+/// Branch protected by [`ForgeProvider::ensure_main_protection`].
+pub const PROTECTED_MAIN_BRANCH: &str = "main";
+
+/// Required name prefix of tokens minted by [`ForgeProvider::create_repo_read_token`]. Stage 0
+/// deletes every other token the Forgejo tenant-reader bot owns (`keel_core` keeps the same value
+/// as `TENANT_REPO_TOKEN_NAME_PREFIX`).
+pub const REPO_READ_TOKEN_NAME_PREFIX: &str = "keel-tenant-repo-";
+
+/// Creation options for [`ForgeProvider::ensure_named_repository`]. Only applied when the
+/// repository is created; an existing repository is never modified.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepositoryOptions {
+    /// Create the repository as private (GitLab: `private`, otherwise `internal`; never public).
+    pub private: bool,
+    /// Seed an initial commit (README) so the default branch exists and can be protected.
+    pub auto_init: bool,
+    /// Default branch name for the initial commit. GitHub ignores it (account/org setting).
+    pub default_branch: Option<String>,
+    /// Optional repository description.
+    pub description: Option<String>,
+}
+
+impl Default for RepositoryOptions {
+    /// Private, auto-initialised, default branch `main`.
+    fn default() -> Self {
+        Self {
+            private: true,
+            auto_init: true,
+            default_branch: Some(PROTECTED_MAIN_BRANCH.to_string()),
+            description: None,
+        }
+    }
+}
+
+/// Repository returned by [`ForgeProvider::ensure_named_repository`].
+///
+/// `clone_url` is what the forge reports (it follows the forge's configured root URL, which may
+/// differ from the address in-cluster clients use); callers build SSH transport URLs themselves
+/// ([`crate::ssh_clone_url`]) and never trust a forge-reported `ssh_url`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RepositoryInfo {
+    /// Owner (user, organisation or GitLab namespace path).
+    pub owner: String,
+    /// Repository name (GitLab: project path).
+    pub name: String,
+    /// Whether the repository is private (GitLab: visibility is not `public`/`internal`).
+    pub private: bool,
+    /// Default branch (empty when the forge reports none, e.g. an empty repository).
+    pub default_branch: String,
+    /// HTTPS clone URL as reported by the forge.
+    pub clone_url: Option<String>,
+    /// Web URL.
+    pub html_url: Option<String>,
+    /// Whether this call created the repository.
+    pub outcome: RepositoryEnsureOutcome,
+}
+
+impl RepositoryInfo {
+    /// The repository as a [`RepositoryTarget`].
+    pub fn target(&self) -> RepositoryTarget {
+        RepositoryTarget {
+            owner: self.owner.clone(),
+            name: self.name.clone(),
+        }
+    }
+}
+
+/// Transport of the per-repository read-only credential a provider issues
+/// ([`ForgeProvider::read_credential_kind`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RepoCredentialKind {
+    /// HTTPS basic auth with a repository-scoped read token
+    /// ([`ForgeProvider::create_repo_read_token`]): Forgejo (15+) bot token, GitLab deploy token.
+    HttpsToken,
+    /// SSH with a read-only deploy key ([`ForgeProvider::ensure_deploy_key`]): GitHub.
+    SshDeployKey,
+}
+
+/// A repository-scoped read-only token. `Debug` never prints the secret.
+#[derive(Clone, PartialEq, Eq)]
+pub struct RepoReadToken {
+    /// Forge id of the token (pass to [`ForgeProvider::revoke_repo_read_token`]).
+    pub id: String,
+    /// Token name.
+    pub name: String,
+    /// HTTPS basic-auth username to pair with the token (Forgejo: the bot login; GitLab: the
+    /// generated `gitlab+deploy-token-<n>` username).
+    pub username: String,
+    /// Token secret, returned by the forge only once.
+    pub token: String,
+}
+
+impl fmt::Debug for RepoReadToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RepoReadToken")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("username", &self.username)
+            .field("token", &"[REDACTED]")
+            .finish()
+    }
+}
+
+/// A repository deploy key (public half only).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeployKeyInfo {
+    /// Forge id of the key.
+    pub id: String,
+    /// Title.
+    pub title: String,
+    /// `SHA256:<base64>` fingerprint computed locally from the key (`None` when the forge
+    /// returned a key Keel cannot parse).
+    pub fingerprint: Option<String>,
+    /// Whether the key is read-only (cannot push).
+    pub read_only: bool,
+}
+
+/// Outcome of [`ForgeProvider::ensure_deploy_key`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DeployKeyOutcome {
+    /// The key was added.
+    Created,
+    /// A key with the same fingerprint and access mode already existed.
+    Existed,
+    /// A key with the same fingerprint but a different access mode existed; it was deleted and
+    /// re-added with the requested mode.
+    Replaced,
+}
+
+/// Result of [`ForgeProvider::ensure_deploy_key`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnsuredDeployKey {
+    /// The key as it now exists on the forge.
+    pub key: DeployKeyInfo,
+    /// What the call did.
+    pub outcome: DeployKeyOutcome,
+}
+
+/// Outcome of [`ForgeProvider::ensure_main_protection`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum BranchProtectionOutcome {
+    /// `main` was unprotected and is now protected.
+    Created,
+    /// `main` was protected with different settings; Keel's settings were applied.
+    Updated,
+    /// `main` already had Keel's settings.
+    Unchanged,
+    /// The forge plan does not offer branch protection for this repository (GitHub Free private
+    /// repositories). Nothing was changed; direct pushes to `main` are not blocked by the forge.
+    UnsupportedPlan,
+}
+
+/// Outcome of [`ForgeProvider::disable_forks`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", tag = "result", content = "detail")]
+pub enum ForkPolicyOutcome {
+    /// Forking was allowed and has been disabled for the repository.
+    Disabled,
+    /// Forking was already disabled (per repository, organisation or instance).
+    AlreadyDisabled,
+    /// Forking is governed by an instance or organisation setting Keel cannot (or may not)
+    /// change through this repository; the string tells the operator what to set.
+    RequiresAdminSetting(String),
+}
+
+/// Outcome of [`ForgeProvider::ensure_read_collaborator`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CollaboratorOutcome {
+    /// The user was added with read access.
+    Added,
+    /// GitHub: an invitation was created; access starts once the user accepts it.
+    Invited,
+    /// The user was a collaborator with another permission and now has read access.
+    Updated,
+    /// The user already had read access.
+    Unchanged,
+}
+
+/// A fork of a repository ([`ForgeProvider::list_forks`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ForkInfo {
+    /// `owner/name` of the fork.
+    pub full_name: String,
+    /// Web URL of the fork.
+    pub html_url: Option<String>,
 }
 
 /// Thin forge abstraction isolating PR/MR operations across Forgejo/Gitea, GitHub, GitLab,
@@ -222,6 +474,174 @@ pub trait ForgeProvider: Send + Sync {
     /// when missing. Existing repositories are left untouched (visibility is not changed).
     async fn ensure_repository(&self, private: bool)
     -> Result<RepositoryEnsureOutcome, ForgeError>;
+
+    // ------------------------------------------------------------------------------------
+    // Per-repository operations (per-tenant repositories, `SDD.md` §3.2). Every method has a
+    // default that returns [`ForgeError::Unsupported`]; REST wrappers only, no git transport.
+    // ------------------------------------------------------------------------------------
+
+    /// Returns a provider with the same forge, credentials and client, scoped to
+    /// `owner/name` (PR operations then target that repository).
+    fn for_repository(
+        &self,
+        _owner: &str,
+        _name: &str,
+    ) -> Result<Arc<dyn ForgeProvider>, ForgeError> {
+        Err(ForgeError::unsupported("for_repository"))
+    }
+
+    /// Ensures repository `owner/name` exists, creating it with `opts` when missing. The owner
+    /// type (organisation/group vs. the authenticated user) is resolved explicitly; creating a
+    /// repository for any other user (GitLab: another user's personal namespace) is refused.
+    ///
+    /// An existing repository is never modified. It is adopted only when the forge reports the
+    /// requested owner/name (a renamed or transferred repository answered through a redirect is
+    /// refused) and, when `opts.private` is set, reports it as private; otherwise
+    /// [`ForgeError::InvalidInput`]. An adopted repository may have been pre-created by someone
+    /// else: callers must reconcile its collaborators and deploy keys ([`Self::list_deploy_keys`],
+    /// [`Self::remove_collaborator`]) before trusting it.
+    async fn ensure_named_repository(
+        &self,
+        _owner: &str,
+        _name: &str,
+        _opts: &RepositoryOptions,
+    ) -> Result<RepositoryInfo, ForgeError> {
+        Err(ForgeError::unsupported("ensure_named_repository"))
+    }
+
+    /// Transport of the read-only per-repository credential this forge issues.
+    fn read_credential_kind(&self) -> Result<RepoCredentialKind, ForgeError> {
+        Err(ForgeError::unsupported("read_credential_kind"))
+    }
+
+    /// Mints a read-only token that works on `repo` only (Forgejo 15+: `read:repository` token
+    /// of the basic-auth bot restricted to `repo`; GitLab: project deploy token with
+    /// `read_repository`). Fails closed if the forge does not confirm the restriction (Forgejo:
+    /// exactly the requested scope and repository; GitLab: exactly `read_repository`).
+    ///
+    /// `name` must start with [`REPO_READ_TOKEN_NAME_PREFIX`] (Stage 0 deletes any other token
+    /// of the Forgejo bot). Forgejo token names are unique per user: minting a name that is
+    /// already taken by a token restricted to exactly `repo` revokes that token and mints a new
+    /// one (retry after a failed Secret write); a name taken by any other token is refused. To
+    /// rotate without a gap, mint under a new name, store it, then revoke the old token by id.
+    async fn create_repo_read_token(
+        &self,
+        _repo: &RepositoryTarget,
+        _name: &str,
+    ) -> Result<RepoReadToken, ForgeError> {
+        Err(ForgeError::unsupported("create_repo_read_token"))
+    }
+
+    /// Revokes a token minted by [`Self::create_repo_read_token`]. A missing token (404) is
+    /// success.
+    async fn revoke_repo_read_token(
+        &self,
+        _repo: &RepositoryTarget,
+        _token_id: &str,
+    ) -> Result<(), ForgeError> {
+        Err(ForgeError::unsupported("revoke_repo_read_token"))
+    }
+
+    /// Ensures the OpenSSH `public_key` is a deploy key of `repo` with the requested access.
+    /// Keys are matched by SHA-256 fingerprint (titles and comments are ignored); a key with the
+    /// same fingerprint but another access mode is replaced.
+    async fn ensure_deploy_key(
+        &self,
+        _repo: &RepositoryTarget,
+        _title: &str,
+        _public_key: &str,
+        _read_only: bool,
+    ) -> Result<EnsuredDeployKey, ForgeError> {
+        Err(ForgeError::unsupported("ensure_deploy_key"))
+    }
+
+    /// Lists the deploy keys of `repo` (fails closed instead of truncating).
+    async fn list_deploy_keys(
+        &self,
+        _repo: &RepositoryTarget,
+    ) -> Result<Vec<DeployKeyInfo>, ForgeError> {
+        Err(ForgeError::unsupported("list_deploy_keys"))
+    }
+
+    /// Removes deploy key `key_id` from `repo`. A missing key (404) is success.
+    async fn revoke_deploy_key(
+        &self,
+        _repo: &RepositoryTarget,
+        _key_id: &str,
+    ) -> Result<(), ForgeError> {
+        Err(ForgeError::unsupported("revoke_deploy_key"))
+    }
+
+    /// Removes every deploy key of `repo` whose fingerprint equals `fingerprint`
+    /// (`SHA256:<base64>`, as returned by [`crate::ssh_public_key_fingerprint`]). Returns the
+    /// number of keys removed.
+    async fn revoke_deploy_keys_by_fingerprint(
+        &self,
+        repo: &RepositoryTarget,
+        fingerprint: &str,
+    ) -> Result<usize, ForgeError> {
+        let mut removed = 0;
+        for key in self.list_deploy_keys(repo).await? {
+            if key.fingerprint.as_deref() == Some(fingerprint) {
+                self.revoke_deploy_key(repo, &key.id).await?;
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
+    /// Protects [`PROTECTED_MAIN_BRANCH`] of `repo`: no direct or force pushes and no deletion
+    /// (also for repository admins), changes only through merged PRs/MRs, no required approvals
+    /// (Keel merges after its own checks).
+    ///
+    /// Must run after `main` has its initial commit (push the seed first, or create the
+    /// repository with `auto_init`): a missing `main` fails with [`ForgeError::InvalidInput`]
+    /// instead of protecting a branch Keel's own seed push would then be refused on.
+    async fn ensure_main_protection(
+        &self,
+        _repo: &RepositoryTarget,
+    ) -> Result<BranchProtectionOutcome, ForgeError> {
+        Err(ForgeError::unsupported("ensure_main_protection"))
+    }
+
+    /// Disables forking of `repo` where the forge allows it per repository, otherwise reports
+    /// the instance/organisation setting that governs it.
+    async fn disable_forks(
+        &self,
+        _repo: &RepositoryTarget,
+    ) -> Result<ForkPolicyOutcome, ForgeError> {
+        Err(ForgeError::unsupported("disable_forks"))
+    }
+
+    /// Grants `username` read-only access to `repo` (D1: tenant users may read, never push), then
+    /// verifies the user's effective access: organisation owner, team, base-permission or
+    /// inherited group access above read fails with [`ForgeError::ElevatedAccess`] (the direct
+    /// grant may already have been set). `Added`/`Updated`/`Unchanged`/`Invited` therefore mean
+    /// the user has at most read access.
+    async fn ensure_read_collaborator(
+        &self,
+        _repo: &RepositoryTarget,
+        _username: &str,
+    ) -> Result<CollaboratorOutcome, ForgeError> {
+        Err(ForgeError::unsupported("ensure_read_collaborator"))
+    }
+
+    /// Removes `username`'s direct access to `repo` (GitHub: also cancels pending
+    /// invitations). Not being a collaborator is success. Access that remains through the
+    /// organisation, teams or group membership fails with [`ForgeError::ElevatedAccess`] (the
+    /// direct grant has been removed by then).
+    async fn remove_collaborator(
+        &self,
+        _repo: &RepositoryTarget,
+        _username: &str,
+    ) -> Result<(), ForgeError> {
+        Err(ForgeError::unsupported("remove_collaborator"))
+    }
+
+    /// Lists the forks of `repo` (fails closed instead of truncating).
+    async fn list_forks(&self, _repo: &RepositoryTarget) -> Result<Vec<ForkInfo>, ForgeError> {
+        Err(ForgeError::unsupported("list_forks"))
+    }
 }
 
 /// Validates an expected head commit SHA (hex, 7..=64 chars) before sending it to a forge.

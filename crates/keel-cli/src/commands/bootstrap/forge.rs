@@ -825,6 +825,11 @@ mod tests {
         ] {
             assert!(!is_keel_minted_tenant_token(&stray), "{stray:?}");
         }
+        // keel-git refuses to mint tokens without the prefix Stage 0 keeps.
+        assert_eq!(
+            TENANT_REPO_TOKEN_NAME_PREFIX,
+            keel_git::REPO_READ_TOKEN_NAME_PREFIX
+        );
     }
 
     #[test]
@@ -1422,6 +1427,8 @@ mod tests {
         let flag = created.clone();
         let app = axum::Router::new()
             .route("/api/v1/repos/{o}/{r}", get(|| async { S::NOT_FOUND }))
+            // The owner is resolved explicitly (organisation vs. token user) before creating.
+            .route("/api/v1/orgs/{o}", get(|| async { (S::OK, r#"{"id":1}"#) }))
             .route(
                 "/api/v1/orgs/{o}/repos",
                 post(move || {

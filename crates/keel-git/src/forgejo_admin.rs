@@ -20,6 +20,8 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
+pub use crate::forge::RepositoryTarget;
+
 use crate::forge::ForgeError;
 use crate::remote::{ForgejoAuth, ForgejoGiteaProvider, map_error_response, validate_slug};
 
@@ -134,25 +136,6 @@ pub struct TeamInfo {
     /// Whether the team covers every current and future organisation repository.
     #[serde(default)]
     pub includes_all_repositories: bool,
-}
-
-/// A repository a scoped access token is restricted to (Forgejo `RepoTargetOption`).
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct RepositoryTarget {
-    /// Owning user or organisation.
-    pub owner: String,
-    /// Repository name.
-    pub name: String,
-}
-
-impl RepositoryTarget {
-    /// Validates and builds a target.
-    pub fn new(owner: &str, name: &str) -> Result<Self, ForgeError> {
-        Ok(Self {
-            owner: validate_slug(owner, "owner")?,
-            name: validate_slug(name, "repo")?,
-        })
-    }
 }
 
 /// A freshly minted access token. `Debug` never prints the secret.
@@ -280,11 +263,11 @@ const PAGE_LIMIT: usize = 50;
 const MAX_PAGES: usize = 20;
 
 impl ForgejoGiteaProvider {
-    fn api(&self, path: &str) -> String {
+    pub(crate) fn api(&self, path: &str) -> String {
         format!("{}/api/v1{path}", self.base_url)
     }
 
-    fn basic_auth_username(&self, action: &str) -> Result<String, ForgeError> {
+    pub(crate) fn basic_auth_username(&self, action: &str) -> Result<String, ForgeError> {
         match &self.auth {
             ForgejoAuth::Basic { username, .. } => validate_slug(username, "username"),
             ForgejoAuth::Token(_) => Err(ForgeError::InvalidInput(format!(
@@ -294,7 +277,7 @@ impl ForgejoGiteaProvider {
     }
 
     /// `GET`s every page of a list endpoint (`page`/`limit` query parameters).
-    async fn get_all<T: DeserializeOwned>(
+    pub(crate) async fn get_all<T: DeserializeOwned>(
         &self,
         path: &str,
         what: &str,
@@ -329,7 +312,11 @@ impl ForgejoGiteaProvider {
     }
 
     /// `DELETE`, treating 404 as already deleted.
-    async fn delete_ignoring_missing(&self, path: &str, what: &str) -> Result<(), ForgeError> {
+    pub(crate) async fn delete_ignoring_missing(
+        &self,
+        path: &str,
+        what: &str,
+    ) -> Result<(), ForgeError> {
         let resp = self
             .authorized(self.client.delete(self.api(path)))
             .send()
@@ -746,7 +733,7 @@ impl ForgejoGiteaProvider {
     /// (`POST /api/v1/users/{user}/tokens` with `repositories: [{owner, name}]`; repository-specific
     /// access tokens need Forgejo 15 or later).
     ///
-    /// Fails closed: when the forge does not echo back exactly the requested repository set
+    /// Fails closed: when the forge does not echo back exactly the requested scopes and repository set
     /// (for example a Gitea or Forgejo before 15 that silently ignores `repositories` and would
     /// mint an account-wide token), the token is deleted and an error is returned.
     pub async fn create_repository_scoped_token(
@@ -785,8 +772,14 @@ impl ForgejoGiteaProvider {
             .map(|r| format!("{}/{}", r.owner, r.name).to_ascii_lowercase())
             .collect();
         let granted = TokenResponse::granted_repositories(body.repositories);
+        let wanted_scopes: BTreeSet<&str> = scopes.iter().copied().collect();
+        let granted_scopes: Option<BTreeSet<&str>> = body
+            .scopes
+            .as_ref()
+            .map(|s| s.iter().map(String::as_str).collect());
+        let scopes_ok = granted_scopes.as_ref() == Some(&wanted_scopes);
         match (token, granted) {
-            (Some(token), Some(granted)) if granted == wanted => {
+            (Some(token), Some(granted)) if granted == wanted && scopes_ok => {
                 Ok(MintedAccessToken { id: body.id, token })
             }
             (_, granted) => {
@@ -798,7 +791,10 @@ impl ForgejoGiteaProvider {
                 Err(ForgeError::Api {
                     status: 200,
                     message: format!(
-                        "Forgejo did not restrict the access token to the requested repositories (granted: {}); repository-specific access tokens require Forgejo 15 or later",
+                        "Forgejo did not restrict the access token to the requested scopes and repositories (scopes: {}; repositories: {}); repository-specific access tokens require Forgejo 15 or later",
+                        granted_scopes
+                            .map(|g| g.into_iter().collect::<Vec<_>>().join(","))
+                            .unwrap_or_else(|| "not reported".to_string()),
                         granted
                             .map(|g| g.into_iter().collect::<Vec<_>>().join(","))
                             .unwrap_or_else(|| "all repositories".to_string())
@@ -1608,6 +1604,39 @@ mod tests {
             request_line(&reqs[1]),
             "DELETE /api/v1/users/keel-tenant-reader/tokens/13 HTTP/1.1"
         );
+
+        // Right repository but broader (or unreported) scopes -> deleted, error.
+        for body in [
+            r#"{"id":15,"sha1":"broad-tok","scopes":["read:repository","write:repository"],"repositories":[{"owner":"keel-tenants","name":"tenant-acme"}]}"#,
+            r#"{"id":15,"sha1":"broad-tok","repositories":[{"owner":"keel-tenants","name":"tenant-acme"}]}"#,
+        ] {
+            let (url, h) =
+                spawn_mock_http_server(vec![(201, body.into()), (204, String::new())]).await;
+            let bot = ForgejoGiteaProvider::with_basic_auth(
+                &url,
+                "keel-tenants",
+                "x",
+                "keel-tenant-reader",
+                &pw,
+            )
+            .unwrap();
+            let err = bot
+                .create_repository_scoped_token(
+                    "t",
+                    &["read:repository"],
+                    std::slice::from_ref(&target),
+                )
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("scopes"), "{err}");
+            assert!(!err.contains("broad-tok"));
+            let reqs = h.await.unwrap();
+            assert_eq!(
+                request_line(&reqs[1]),
+                "DELETE /api/v1/users/keel-tenant-reader/tokens/15 HTTP/1.1"
+            );
+        }
 
         // Restricted to a different repository -> deleted, error.
         let (url, h) = spawn_mock_http_server(vec![
