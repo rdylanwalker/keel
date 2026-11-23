@@ -1,3 +1,13 @@
+## [0.12.1](https://github.com/rdylanwalker/keel/compare/v0.12.0...v0.12.1) (2026-11-23)
+
+### Bug Fixes
+
+* address fresh-user quick start snags ([4d6f956](https://github.com/rdylanwalker/keel/commit/4d6f956858d6a0d7af03b387ad662311dc98ff32))
+* **kube:** let tenant identities manage Flagger canaries in their namespace ([c308c5a](https://github.com/rdylanwalker/keel/commit/c308c5a90284e0d88f0018fb708e2c0a8b5fead0))
+* **server:** apply catalog schema defaults to API installs and surface release failure reasons ([e28f4cb](https://github.com/rdylanwalker/keel/commit/e28f4cbf61ae09125d3ca61cb8950f5844e7939b)), closes [#4](https://github.com/rdylanwalker/keel/issues/4)
+* **server:** bring stale proposal branches up to date instead of failing merges ([12f5c1b](https://github.com/rdylanwalker/keel/commit/12f5c1b54d6239469cbf95d1753a034e307b4cde)), closes [#9](https://github.com/rdylanwalker/keel/issues/9)
+* **server:** keep bundle kubeconfig wiring over item schema defaults ([356392f](https://github.com/rdylanwalker/keel/commit/356392fb25223b48011012c68e29e843a16f84c2))
+
 ## [0.12.0](https://github.com/rdylanwalker/keel/compare/v0.11.0...v0.12.0) (2026-11-22)
 
 ### Features
