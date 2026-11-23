@@ -51,10 +51,13 @@ Flux CD (GitOps), the Pulumi Kubernetes Operator (infrastructure), SeaweedFS (S3
 
 ## Quick Start (local `kind`)
 
-This follows the path the live E2E suite tests. It takes about 10 minutes plus downloads. **Use a throwaway machine or VM** (see the warning in step 3). If you tried Keel before, run the [clean-up](#clean-up) commands first, or old state is reused.
+This follows the path the live E2E suite tests: `e2e/tests/09-readme-quickstart.spec.ts` runs the commands of this section exactly as written, from a fresh home directory. It takes about 10 minutes plus downloads. **Use a throwaway machine or VM** (see the warning in step 3). If you tried Keel before, run the [clean-up](#clean-up) commands first, or old state is reused.
+
+<!-- quickstart:begin  (the marked blocks up to quickstart:end are executed by e2e/tests/09-readme-quickstart.spec.ts; keep the markers in place) -->
 
 **1. Install the binary (Linux x86_64).** This README describes v0.12.0, so the commands pin that release; for a newer release, read the docs at its tag. Other platforms: see the [release page](https://github.com/rdylanwalker/keel/releases/tag/v0.12.0).
 
+<!-- quickstart:step install install -->
 ```bash
 mkdir -p ~/.local/bin && cd "$(mktemp -d)"
 base=https://github.com/rdylanwalker/keel/releases/download/v0.12.0
@@ -66,6 +69,7 @@ keel --version        # ~/.local/bin must be on your PATH
 
 Optionally verify the Sigstore signature too (needs `cosign`), in the same directory:
 
+<!-- quickstart:step cosign optional -->
 ```bash
 curl -fsSL -O "$base/keel-linux-amd64.tar.gz.sigstore.json"
 cosign verify-blob --bundle keel-linux-amd64.tar.gz.sigstore.json \
@@ -78,12 +82,14 @@ To build from source instead, run `just build` (see [CONTRIBUTING.md](./CONTRIBU
 
 **2. Add the local host names.** Both your browser and the `keel serve` process must resolve them, so add them to `/etc/hosts` (with WSL2 and a Windows browser, also to `C:\Windows\System32\drivers\etc\hosts`):
 
+<!-- quickstart:step hosts hosts -->
 ```bash
 echo '127.0.0.1 idp.keel.local forgejo.keel.local podinfo.keel.local' | sudo tee -a /etc/hosts
 ```
 
 **3. Bootstrap the management cluster** (about 3 minutes) from a working directory of your choice:
 
+<!-- quickstart:step bootstrap run -->
 ```bash
 mkdir -p ~/keel-try && cd ~/keel-try
 keel bootstrap init \
@@ -102,14 +108,16 @@ keel bootstrap init \
 
 **4. Start the server** in a second terminal (in the same directory) and leave it running:
 
+<!-- quickstart:step serve serve -->
 ```bash
 keel serve --repo-dir ./keel-gitops     # http://127.0.0.1:8080
 ```
 
-Stop it with **Ctrl+C**. On v0.12.0 other signals can leave its `kubectl port-forward` processes running.
+Stop it with **Ctrl+C**; it also stops the `kubectl port-forward` processes it started.
 
 **5. Log in.** The CLI prints the login URL and tries to open your browser (on WSL2 through `wslview`; otherwise open the printed URL in your Windows browser, or pass `--no-browser`). Sign in with the admin credentials. The IdP uses a self-signed certificate, so expect a browser warning for `https://idp.keel.local:8888`.
 
+<!-- quickstart:step login login -->
 ```bash
 export KEEL_SERVER=http://127.0.0.1:8080
 keel auth login
@@ -117,6 +125,7 @@ keel auth login
 
 **6. Provision a workload cluster through a PR:**
 
+<!-- quickstart:step workload run -->
 ```bash
 printf 'clusterName: workload-dev\nkubernetesVersion: v1.35.8\nworkerCount: 1\n' > workload-values.yaml
 keel infra provision --blueprint kind-cluster --tenant default --values-file workload-values.yaml
@@ -128,10 +137,30 @@ kind get clusters                                      # workload-dev appears ab
 
 The first preview can sit silently for a few minutes while the cluster pulls the 3.5 GB `pulumi/pulumi` image.
 
-Next: deploy `podinfo` with a canary rollout, use the web UI and create tenants in [Things to Try](./docs/getting-started/things-to-try.md). In v0.12.0, a canary app in a tenant namespace of the management cluster needs a [small RBAC workaround](./docs/reference/known-limitations.md#canary-apps-on-the-management-cluster).
+**7. Deploy `podinfo` with a canary rollout** into the same tenant on the management cluster. The catalog fills in every value you leave out (two replicas, the host name `podinfo.keel.local` and a restricted security context), so the values file only needs the API token, which has no default.
+
+> **Needs a release newer than v0.12.0.** v0.12.0 neither fills in catalog defaults for CLI installs nor lets tenants manage Flagger canaries. On v0.12.0, apply the [RBAC workaround](./docs/reference/known-limitations.md#canary-apps-on-the-management-cluster) first and use the full values file from [Things to Try](./docs/getting-started/things-to-try.md#2-deploy-an-application-with-canary-rollouts-podinfo); otherwise Kyverno rejects the Deployment and the canary is forbidden.
+
+<!-- quickstart:step podinfo run -->
+```bash
+printf 'apiToken: demo-podinfo-token\n' > podinfo-values.yaml
+keel app install --app podinfo --tenant default --values-file podinfo-values.yaml --canary
+keel proposal merge 2 --tenant default                 # use the PR number printed above
+```
+
+Flux deploys it within a minute or two, then Flagger initializes the canary. Repeat these until `podinfo` shows `Ready` and `curl` prints its version (it is served over HTTPS only, through the port-forward of `keel serve`):
+
+<!-- quickstart:step podinfo-check poll -->
+```bash
+keel app list --tenant default
+curl -fsk https://podinfo.keel.local:8888/version
+```
+
+Next: use the web UI, drive a live canary traffic rollout and create tenants in [Things to Try](./docs/getting-started/things-to-try.md).
 
 ### Clean up
 
+<!-- quickstart:step cleanup teardown -->
 ```bash
 # Stop keel serve with Ctrl+C first.
 kind delete cluster --name workload-dev
@@ -139,11 +168,13 @@ kind delete cluster --name keel-mgmt
 rm -rf ~/keel-try ~/.config/keel/stage0/keel-mgmt   # repos and Stage 0 state
 ```
 
+<!-- quickstart:end -->
+
 Remove both: a later bootstrap with the same names otherwise reuses the old bare repository, its history and the Stage 0 state. To remove a single stack or app instead, click **Delete** on it in the web UI and merge the removal PR. Flux then prunes it, and PKO runs `pulumi destroy`.
 
 ## Maturity: what is tested
 
-The live E2E suite (`e2e/tests/07-kind-live-e2e.spec.ts`) runs on every push to `main`, not on pull requests. It covers: `kind` bootstrap with in-cluster Forgejo and Rauthy, CLI and GUI login, PR plus real PKO preview plus merge, a workload `kind` cluster through the OpenTofu/Terraform provider bridge, `podinfo` on the workload cluster, tenant isolation, per-tenant repositories and `recover --dry-run`.
+The live E2E suite (`e2e/tests/07-kind-live-e2e.spec.ts`) and a literal run of the Quick Start above (`e2e/tests/09-readme-quickstart.spec.ts`) run on every push to `main`, not on pull requests. Together they cover: `kind` bootstrap with in-cluster Forgejo and Rauthy, CLI and GUI login, PR plus real PKO preview plus merge, a workload `kind` cluster through the OpenTofu/Terraform provider bridge, `podinfo` canaries on the management and workload clusters, tenant isolation, per-tenant repositories and `recover --dry-run`.
 
 | Area | Status |
 | :--- | :--- |

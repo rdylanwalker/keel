@@ -306,6 +306,10 @@ test-ui:
 test-e2e: build
     pnpm --dir e2e test
 
+# Run the README Quick Start literally against fresh kind clusters (keel-mgmt, workload-dev; ports 8080/8888)
+test-e2e-quickstart: build
+    pnpm --dir e2e test:live:quickstart
+
 # Run multi-cloud free-tier live E2E suite (AWS/Azure/GCP; auto-loads .env.cloud-e2e if present)
 test-e2e-cloud: build
     #!/usr/bin/env bash

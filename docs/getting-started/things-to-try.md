@@ -72,6 +72,8 @@ With a tenant namespace ready (such as `default` or `dev-team`), deploy **Podinf
 
 ### Step 1: Initial Canary Deployment
 
+If you followed step 7 of the [README Quick Start](https://github.com/rdylanwalker/keel#quick-start-local-kind), `podinfo` already runs in `default` with a canary: skip to [Step 2](#step-2-demonstrate-a-live-canary-traffic-rollout). Installing it a second time opens a proposal for an app that already exists.
+
 1. In **Catalog & Form Wizard**, select your target tenant (e.g., `default`) and choose **Podinfo Microservice** (`podinfo`).
 2. Check **Enable Flagger Canary**.
 3. Fill in the form (`Replica Count`: `2`, `Ingress Hostname`: `podinfo.keel.local`, `API Secret Token`: any 8+ character secret, and keep the pre-filled `restricted` PSS `Container Security Context` defaults).

@@ -2465,16 +2465,11 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
     });
 
     await test.step('6. Tenant SA manages Flagger Canaries; Kyverno admits only the Keel-generated shape', async () => {
+      // `kubectl auth can-i` exits 1 when the answer is "no", so read its output either way.
       const canI = (verb: string, resource: string) =>
-        tryCmd('kubectl', [
-          'auth',
-          'can-i',
-          verb,
-          resource,
-          '-n',
-          tenantNs,
-          `--as=${tenantSa}`,
-        ]).stdout.trim();
+        runCmdAll('kubectl', ['auth', 'can-i', verb, resource, '-n', tenantNs, `--as=${tenantSa}`])
+          .out.trim()
+          .split('\n')[0];
       expect(canI('patch', 'canaries.flagger.app'), `${tenantSa} patches Canaries`).toBe('yes');
       expect(canI('create', 'metrictemplates.flagger.app'), 'no tenant MetricTemplates').toBe('no');
       expect(canI('create', 'alertproviders.flagger.app'), 'no tenant AlertProviders').toBe('no');

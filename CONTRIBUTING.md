@@ -115,7 +115,7 @@ All pull requests and `main` branch pushes are subject to automated verification
 * **Pull Requests (Fast Quality Gate via `ci.yml`):**
   PRs run formatting, linting, **at least 80% line coverage** (Rust via `cargo llvm-cov`, UI via `vitest --coverage`; currently about 84% and 96%), the SOPS round-trip test with pinned `sops`/`age`, `mdbook build`, the `semantic-release` config check (`release/verify-release-config.mjs`), and the **mocked Playwright end-to-end suite** (`pnpm --dir e2e test`). PR checks complete in under 3 minutes without spinning up full Kubernetes clusters or consuming cloud infrastructure resources.
 * **Pushes to `main` (Strict Pre-Release Gate via `release.yml`):**
-  Pushes to `main` execute `release.yml`, which orchestrates `ci.yml` and `e2e.yml` via reusable `workflow_call`. The `release` job declares `needs: [ci, e2e-live]`, ensuring `semantic-release` **only** runs if both the fast quality gates and the live `kind` E2E suite (`07-kind-live-e2e.spec.ts`) pass completely.
+  Pushes to `main` execute `release.yml`, which orchestrates `ci.yml` and `e2e.yml` via reusable `workflow_call`. The `release` job declares `needs: [ci, e2e-live]`, ensuring `semantic-release` **only** runs if the fast quality gates, the live `kind` E2E suite (`07-kind-live-e2e.spec.ts`) and the literal README Quick Start run (`09-readme-quickstart.spec.ts`) all pass. The release commit also bumps the release version the README Quick Start pins.
 
 ### Full Suite
 
@@ -163,6 +163,13 @@ pnpm --dir e2e test               # mocked Playwright suite
 pnpm --dir e2e test:live                           # reuses existing kind-keel-mgmt if present
 KEEL_E2E_REUSE_CLUSTER=0 pnpm --dir e2e test:live  # bootstraps a fresh kind cluster
 # Clean up afterwards: just down
+
+# Opt-in README Quick Start run: executes the marked README blocks literally from a fresh HOME
+# (the release download is replaced by the local binary). Uses the README's cluster names
+# keel-mgmt / workload-dev and ports 8080/8888, so never run it next to test:live. It runs the
+# README clean-up at the end; KEEL_E2E_QUICKSTART_KEEP=1 keeps the clusters after a failure.
+# Without passwordless sudo, idp.keel.local and forgejo.keel.local must already be in /etc/hosts.
+KEEL_E2E_REUSE_CLUSTER=0 pnpm --dir e2e test:live:quickstart   # or: just test-e2e-quickstart
 
 # Opt-in live cloud E2E (AWS, Azure, GCP Free-Tier tests)
 pnpm --dir e2e test:live:cloud

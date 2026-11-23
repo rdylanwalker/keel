@@ -134,6 +134,63 @@ jobs:
           path: e2e/playwright-report/
           retention-days: 14
 
+  e2e-live-quickstart:
+    name: Live README Quick Start
+    # In a called workflow `github.event_name` is the caller's event (e.g. `push`), so gate on an
+    # explicit input instead; release.yml passes `run_live: true`.
+    if: inputs.run_live == true
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: stable
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+        with:
+          version: 12
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 26
+          cache: 'pnpm'
+          cache-dependency-path: e2e/pnpm-lock.yaml
+      - uses: ./.github/actions/setup-sops-age
+      - name: Install kind, kubectl, helm, pulumi
+        run: |
+          curl -fsSL https://kind.sigs.k8s.io/dl/latest/kind-linux-amd64 -o /tmp/kind
+          sudo install -m 0755 /tmp/kind /usr/local/bin/kind
+          curl -fsSL "https://dl.k8s.io/release/$(curl -fsSL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl" -o /tmp/kubectl
+          sudo install -m 0755 /tmp/kubectl /usr/local/bin/kubectl
+          curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+          curl -fsSL https://get.pulumi.com | sh
+          echo "$HOME/.pulumi/bin" >> "$GITHUB_PATH"
+          rm -f /tmp/kind /tmp/kubectl
+      - name: Build UI & Keel Binary
+        run: |
+          pnpm --dir ui install --frozen-lockfile
+          pnpm --dir ui build
+          cargo build --bin keel
+      - name: Install E2E dependencies & Playwright Chromium
+        run: |
+          pnpm --dir e2e install --frozen-lockfile
+          pnpm --dir e2e exec playwright install --with-deps chromium
+      - name: Increase host inotify limits for multi-cluster kind
+        run: sudo sysctl -w fs.inotify.max_user_watches=524288 fs.inotify.max_user_instances=8192
+      # Runs the README Quick Start blocks as written (including its `sudo tee -a /etc/hosts`)
+      # from a fresh HOME; only the release download is replaced by the binary built above.
+      - name: Run README Quick Start
+        run: pnpm --dir e2e test:live:quickstart
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: playwright-quickstart-report
+          path: e2e/playwright-report/
+          retention-days: 14
+
   e2e-live-cloud:
     name: Live Multi-Cloud Free-Tier E2E (AWS/Azure/GCP)
     if: inputs.run_cloud_live == true || vars.KEEL_E2E_CLOUD_AWS == '1' || vars.KEEL_E2E_CLOUD_AZURE == '1' || vars.KEEL_E2E_CLOUD_GCP == '1' || vars.KEEL_E2E_CLOUD_ALL == '1'
