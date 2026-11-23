@@ -105,6 +105,44 @@ test.describe('03 - PKO Ephemeral Previews & PR Merge Reconciliation', () => {
     await api.dispose();
   });
 
+  test('03.3b - A proposal that fell behind main is rebuilt and re-previewed before it merges', async () => {
+    const api = await apiAs(USERS.admin);
+    const names = [uniq('stalea'), uniq('staleb')];
+    const created = [];
+    for (const name of names) {
+      created.push(
+        await createProposal(api, {
+          tenant: 'acme',
+          catalogId: 'podinfo',
+          name,
+          values: { replicas: 1 },
+        }),
+      );
+    }
+    const [first, second] = created;
+    const merged = await api.post(proposalPath(first.proposal, 'merge'));
+    expect(merged.status(), await merged.text()).toBe(200);
+
+    // Both proposals rewrote the tenant index from the same `main`: the second is rebuilt on the
+    // new `main` and must be reviewed again instead of merging.
+    const stale = await api.post(proposalPath(second.proposal, 'merge'));
+    expect(stale.status()).toBe(409);
+    expect((await stale.json()).error).toMatch(/Keel rebuilt branch/);
+    const rebuiltHead = git(['rev-parse', second.branch]).trim();
+    expect(git(['rev-parse', `${rebuiltHead}^`]).trim()).toBe(git(['rev-parse', 'main']).trim());
+
+    const preview = await (await api.get(proposalPath(second.proposal, 'preview'))).json();
+    expect(preview.gitDiff).toContain(`tenants/acme/apps/${names[1]}`);
+    // The first proposal's entries are unchanged context in the re-merged index.
+    expect(preview.gitDiff).not.toMatch(new RegExp(`^[-+].*${names[0]}`, 'm'));
+
+    const again = await api.post(proposalPath(second.proposal, 'merge'));
+    expect(again.status(), await again.text()).toBe(200);
+    const tree = git(['ls-tree', '-r', '--name-only', 'main']);
+    for (const name of names) expect(tree).toContain(`tenants/acme/apps/${name}/values.yaml`);
+    await api.dispose();
+  });
+
   test('03.4 - GUI inspector: synthesized preview badge, diff tree, confirmed reject, reopen, merge', async ({
     page,
   }) => {

@@ -346,6 +346,24 @@ pub(crate) async fn map_error_response(
 // Forgejo / Gitea Provider (REST API v1)
 // ============================================================================
 
+/// Waits between Forgejo/Gitea merge attempts answered with "Please try again later" (the
+/// forge's asynchronous mergeability check is pending): 10 s in total, well below the CLI's 30 s
+/// request timeout so a merge never times out client-side while the server goes on merging.
+#[cfg(not(test))]
+const GITEA_MERGEABILITY_RETRY_DELAYS: &[std::time::Duration] = &[
+    std::time::Duration::from_millis(500),
+    std::time::Duration::from_secs(1),
+    std::time::Duration::from_millis(1500),
+    std::time::Duration::from_secs(2),
+    std::time::Duration::from_secs(2),
+    std::time::Duration::from_secs(3),
+];
+#[cfg(test)]
+const GITEA_MERGEABILITY_RETRY_DELAYS: &[std::time::Duration] = &[
+    std::time::Duration::from_millis(1),
+    std::time::Duration::from_millis(1),
+];
+
 /// Credentials used by [`ForgejoGiteaProvider`].
 #[derive(Clone)]
 pub(crate) enum ForgejoAuth {
@@ -760,7 +778,8 @@ impl ForgeProvider for ForgejoGiteaProvider {
         let id = validate_pr_number(pr_id)?;
         let head_commit_id = expected_head_sha.map(validate_commit_sha).transpose()?;
         let url = format!("{}/pulls/{id}/merge", self.repo_api_url());
-        for attempt in 0..6 {
+        let mut delays = GITEA_MERGEABILITY_RETRY_DELAYS.iter();
+        loop {
             let resp = self
                 .authorized(self.client.post(&url))
                 .json(&GiteaMergeBody {
@@ -772,17 +791,40 @@ impl ForgeProvider for ForgejoGiteaProvider {
             if resp.status().is_success() {
                 return self.get_pull_request(id).await;
             }
-            if resp.status() == reqwest::StatusCode::CONFLICT {
+            if matches!(
+                resp.status(),
+                reqwest::StatusCode::CONFLICT | reqwest::StatusCode::METHOD_NOT_ALLOWED
+            ) {
                 let body = resp.text().await.unwrap_or_default();
-                if attempt < 5 && body.contains("Please try again later") {
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    continue;
+                // Forgejo/Gitea answer "Please try again later" while their asynchronous
+                // mergeability check of the PR (re-run whenever the base or head moves) is
+                // pending, and also for a PR that check found conflicting: wait a bounded time
+                // for the check, then report.
+                if body.contains("Please try again later") {
+                    if let Some(delay) = delays.next() {
+                        tokio::time::sleep(*delay).await;
+                        continue;
+                    }
+                    return Err(ForgeError::MergeConflict(
+                        id.to_string(),
+                        format!(
+                            "the forge still reports the PR as not mergeable after waiting {}s for its mergeability check (the branch conflicts with the target branch, or the check is still pending). Retry the merge in a minute; if it keeps failing, close the proposal and propose the change again. Forge answer: {}",
+                            GITEA_MERGEABILITY_RETRY_DELAYS
+                                .iter()
+                                .map(std::time::Duration::as_secs_f32)
+                                .sum::<f32>()
+                                .round(),
+                            body.chars().take(512).collect::<String>()
+                        ),
+                    ));
                 }
-                return Err(ForgeError::MergeConflict(id.to_string(), body));
+                return Err(ForgeError::MergeConflict(
+                    id.to_string(),
+                    body.chars().take(512).collect(),
+                ));
             }
             return Err(map_error_response(resp, Some(id), true).await);
         }
-        unreachable!("loop returns on final attempt")
     }
 
     async fn close_pull_request(&self, pr_id: &str) -> Result<PullRequestInfo, ForgeError> {
@@ -1871,6 +1913,70 @@ mod tests {
         let reqs = handle.await.unwrap();
         assert!(reqs[0].contains("limit=50&page=1"));
         assert!(reqs[1].contains("limit=50&page=2"));
+    }
+
+    #[tokio::test]
+    async fn forgejo_merge_waits_a_bounded_time_for_the_mergeability_check() {
+        let merged_json = r#"{
+            "number": 5, "title": "t", "body": "", "state": "closed", "merged": true,
+            "head": { "ref": "keel/acme/x-1", "sha": "abc123def456" },
+            "base": { "ref": "main", "sha": "abc123def456" },
+            "html_url": "http://forge.local/pulls/5",
+            "created_at": "2026-11-14T10:00:00Z", "updated_at": "2026-11-14T10:05:00Z"
+        }"#
+        .to_string();
+        let later = r#"{"message":"Please try again later"}"#.to_string();
+
+        // Pending check (409, then Gitea's 405 form), then the merge succeeds.
+        let (url, handle) = spawn_mock_http_server(vec![
+            (409, later.clone()),
+            (405, later.clone()),
+            (200, "{}".to_string()),
+            (200, merged_json),
+        ])
+        .await;
+        let provider = ForgejoGiteaProvider::new(&url, "keel", "gitops", "tok").unwrap();
+        let merged = provider.merge_pull_request("5", None).await.unwrap();
+        assert_eq!(merged.state, PullRequestState::Merged);
+        let reqs = handle.await.unwrap();
+        assert_eq!(
+            reqs.iter()
+                .filter(|r| request_line(r).starts_with("POST "))
+                .count(),
+            3
+        );
+
+        // A check that never completes (a conflicting PR) is reported once the wait is over.
+        let attempts = GITEA_MERGEABILITY_RETRY_DELAYS.len() + 1;
+        let (url, handle) = spawn_mock_http_server(vec![(409, later); attempts]).await;
+        let provider = ForgejoGiteaProvider::new(&url, "keel", "gitops", "tok").unwrap();
+        match provider.merge_pull_request("5", None).await {
+            Err(ForgeError::MergeConflict(id, reason)) => {
+                assert_eq!(id, "5");
+                assert!(
+                    reason.contains("still reports the PR as not mergeable"),
+                    "{reason}"
+                );
+                assert!(reason.contains("Retry the merge in a minute"), "{reason}");
+                assert!(
+                    ForgeError::MergeConflict(id.clone(), reason.clone())
+                        .is_behind_target_refusal(),
+                    "{reason}"
+                );
+            }
+            other => panic!("expected a merge conflict, got {other:?}"),
+        }
+        assert_eq!(handle.await.unwrap().len(), attempts);
+
+        // Any other refusal is reported at once.
+        let (url, _handle) =
+            spawn_mock_http_server(vec![(409, r#"{"message":"head out of date"}"#.to_string())])
+                .await;
+        let provider = ForgejoGiteaProvider::new(&url, "keel", "gitops", "tok").unwrap();
+        assert!(matches!(
+            provider.merge_pull_request("5", None).await,
+            Err(ForgeError::MergeConflict(_, reason)) if reason.contains("head out of date")
+        ));
     }
 
     #[tokio::test]

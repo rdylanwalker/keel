@@ -19,7 +19,7 @@ import {
   reopenProposal,
 } from "../lib/api"
 import { isDemoMode } from "../lib/utils"
-import { errorMessage, visibleLoadError } from "../lib/errors"
+import { ApiError, errorMessage, visibleLoadError } from "../lib/errors"
 import { useAuthz } from "../lib/authz-context"
 import { demoFixtures } from "../lib/demo"
 import {
@@ -128,6 +128,9 @@ export const PreviewInspectorView: React.FC<PreviewInspectorViewProps> = ({
   const [pending, setPending] = useState<ProposalAction | null>(null)
   const [actionSuccess, setActionSuccess] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
+  // Merge/reject/reopen failures; kept apart from load errors so a preview reload (e.g. after a
+  // stale proposal was rebuilt on `main`) does not hide them.
+  const [actionError, setActionError] = useState<string | null>(null)
   const [statusFilter, setStatusFilter] = useState<ProposalStatusFilter>("all")
   const [previewRefreshTick, setPreviewRefreshTick] = useState(0)
 
@@ -231,6 +234,7 @@ export const PreviewInspectorView: React.FC<PreviewInspectorViewProps> = ({
     const ref = { scope: pr.scope, id: pr.id }
     setManualSelected(ref)
     setActionSuccess(null)
+    setActionError(null)
     onSelectProposal?.(ref)
   }
 
@@ -242,6 +246,7 @@ export const PreviewInspectorView: React.FC<PreviewInspectorViewProps> = ({
     setPending(action)
     setActionSuccess(null)
     setError(null)
+    setActionError(null)
     try {
       const result = await copy.call(ref)
       if (result.success) {
@@ -252,22 +257,28 @@ export const PreviewInspectorView: React.FC<PreviewInspectorViewProps> = ({
           )
         )
       } else {
-        setError(result.message || copy.failure)
+        setActionError(result.message || copy.failure)
       }
     } catch (err) {
-      setError(errorMessage(err, copy.failure))
+      setActionError(errorMessage(err, copy.failure))
+      // A 409 merge may have rebuilt a stale branch on `main` and restarted its preview: show
+      // the new diff and preview run.
+      if (action === "merge" && err instanceof ApiError && err.status === 409) {
+        refreshPreview()
+      }
     } finally {
       setPending(null)
     }
   }
 
-  const errorAlert = error && (
+  const shownError = actionError ?? error
+  const errorAlert = shownError && (
     <div
       role="alert"
       className="p-4 bg-red-950/40 border border-red-500/30 rounded-xl text-red-300 text-xs flex items-center space-x-2 text-left"
     >
       <AlertTriangle className="h-4 w-4 text-red-400 shrink-0" />
-      <span className="break-words min-w-0">{error}</span>
+      <span className="break-words min-w-0">{shownError}</span>
     </div>
   )
 

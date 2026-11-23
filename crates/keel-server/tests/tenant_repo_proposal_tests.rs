@@ -1485,3 +1485,404 @@ async fn the_admin_listing_includes_tenants_being_created() {
         "{list}"
     );
 }
+
+/// Simulates PKO finishing the preview of `commit` on the preview `Stack` `name`.
+fn finish_preview(fx: &Fx, name: &str, commit: &str) {
+    let stack = fx.cluster.stack(name).expect("preview Stack");
+    let generation = stack["metadata"]["generation"].as_i64().unwrap_or(1);
+    fx.cluster.set_stack_status(
+        name,
+        json!({
+            "lastUpdate": {
+                "state": "succeeded",
+                "generation": generation,
+                "lastAttemptedCommit": commit,
+            },
+        }),
+    );
+}
+
+fn git_rev(bare: &Path, rev: &str) -> String {
+    let out = std::process::Command::new("git")
+        .arg("--git-dir")
+        .arg(bare)
+        .args(["rev-parse", "--verify", rev])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{rev}");
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+async fn merge(state: &AppState, cookie: &str, tenant: &str, id: &str) -> (StatusCode, Value) {
+    send(
+        state,
+        cookie,
+        Method::POST,
+        &format!("/api/v1/tenants/{tenant}/proposals/{id}/merge"),
+        None,
+    )
+    .await
+}
+
+/// Snag #9 of the v0.12.0 dry run: a second proposal opened from the same `main` conflicts with
+/// the first one in the generated index once that merges. Merging it rebuilds the branch on the
+/// new `main`, re-runs its preview at the new head and asks for a new review; the next merge
+/// succeeds with both proposals' entries in the index.
+#[tokio::test]
+async fn sequential_proposals_are_rebuilt_on_main_and_re_previewed_before_merge() {
+    let fx = fixture().await;
+    let admin = admin(&fx.state).await;
+    let mut branches = Vec::new();
+    for name in ["vm1", "vm2"] {
+        let (status, body) = propose(
+            &fx.state,
+            &admin,
+            "acme",
+            json!({ "catalogId": "proxmox-vm", "name": name, "values": { "cores": 1 } }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        branches.push(body["branch"].as_str().unwrap().to_string());
+    }
+    let bare = fx.tenant_bare("acme");
+    let reviewed = git_rev(&bare, &branches[1]);
+
+    let (status, body) = merge(&fx.state, &admin, "acme", "1").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let main_after_first = git_rev(&bare, "main");
+
+    // The stale proposal is rebuilt, not merged.
+    let (status, body) = merge(&fx.state, &admin, "acme", "2").await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    let error = body["error"].as_str().unwrap();
+    assert!(error.contains("tenants/acme/kustomization.yaml"), "{error}");
+    assert!(error.contains("new PKO preview is running"), "{error}");
+    assert_eq!(git_rev(&bare, "main"), main_after_first, "nothing merged");
+    let rebuilt = git_rev(&bare, &branches[1]);
+    assert_ne!(rebuilt, reviewed);
+    assert_eq!(
+        git_rev(&bare, &format!("{rebuilt}^")),
+        main_after_first,
+        "one commit on top of the new main"
+    );
+    // The proposal keeps its author; the merging user is the committer of the rebuild.
+    let identity = |rev: &str, format: &str| {
+        let out = std::process::Command::new("git")
+            .arg("--git-dir")
+            .arg(&bare)
+            .args(["log", "-1", &format!("--format={format}"), rev])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    assert_eq!(
+        identity(&rebuilt, "%an <%ae>"),
+        identity(&reviewed, "%an <%ae>")
+    );
+    let index = git_show(&bare, &format!("{rebuilt}:tenants/acme/kustomization.yaml")).unwrap();
+    assert!(index.contains("infra/vm1/"), "{index}");
+    assert!(index.contains("infra/vm2/"), "{index}");
+    assert!(!index.contains("<<<<<<<"), "{index}");
+
+    // The preview now previews exactly the rebuilt head.
+    let preview = fx
+        .cluster
+        .stack("preview-stack-pr-acme-2")
+        .expect("preview");
+    assert_eq!(preview["spec"]["commit"], rebuilt.as_str(), "{preview}");
+    assert_eq!(
+        preview["metadata"]["annotations"]["keel.io/head-sha"],
+        rebuilt.as_str()
+    );
+    assert_eq!(preview["metadata"]["labels"]["keel.io/pr-id"], "acme-2");
+    assert_eq!(
+        preview["metadata"]["annotations"]["keel.io/rebuilt-head"],
+        rebuilt.as_str()
+    );
+
+    // Preview-before-merge: nobody has seen the rebuilt head yet, so merging it again right
+    // away is refused while its PKO preview is pending.
+    let (status, body) = merge(&fx.state, &admin, "acme", "2").await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    let error = body["error"].as_str().unwrap();
+    assert!(error.contains("PKO preview is still pending"), "{error}");
+    assert_eq!(git_rev(&bare, "main"), main_after_first, "nothing merged");
+    assert_eq!(git_rev(&bare, &branches[1]), rebuilt, "not rebuilt again");
+
+    // After PKO previewed the rebuilt head, the merge goes through with both entries.
+    finish_preview(&fx, "preview-stack-pr-acme-2", &rebuilt);
+    let (status, body) = merge(&fx.state, &admin, "acme", "2").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["proposal"]["state"], "merged");
+    let index = git_show(&bare, "main:tenants/acme/kustomization.yaml").unwrap();
+    assert!(index.contains("infra/vm1/"), "{index}");
+    assert!(index.contains("infra/vm2/"), "{index}");
+    assert!(git_show(&bare, "main:tenants/acme/infra/vm2/stack.yaml").is_some());
+}
+
+/// A conflict outside the generated index (two edits of the same app) is user content: the merge
+/// is refused with the conflicting files and the way out, and the branch is left alone.
+#[tokio::test]
+async fn conflicting_user_content_is_reported_without_touching_the_branch() {
+    let fx = fixture().await;
+    let admin = admin(&fx.state).await;
+    let web = |replicas: u32| json!({ "catalogId": "web", "values": { "replicas": replicas } });
+    let (status, body) = propose(&fx.state, &admin, "acme", web(2)).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = merge(&fx.state, &admin, "acme", "1").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let mut branches = Vec::new();
+    for replicas in [3, 4] {
+        let (status, body) = propose(&fx.state, &admin, "acme", web(replicas)).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        branches.push(body["branch"].as_str().unwrap().to_string());
+    }
+    let (status, body) = merge(&fx.state, &admin, "acme", "2").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let bare = fx.tenant_bare("acme");
+    let head = git_rev(&bare, &branches[1]);
+    let (status, body) = merge(&fx.state, &admin, "acme", "3").await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    let error = body["error"].as_str().unwrap();
+    assert!(
+        error.contains("tenants/acme/apps/web/values.yaml"),
+        "{error}"
+    );
+    assert!(error.contains("propose the change again"), "{error}");
+    assert_eq!(git_rev(&bare, &branches[1]), head, "branch untouched");
+    let values = git_show(&bare, "main:tenants/acme/apps/web/values.yaml").unwrap();
+    assert!(values.contains('3'), "{values}");
+
+    // The working tree is back on a clean `main`: the next proposal works.
+    let (status, body) = propose(&fx.state, &admin, "acme", web(5)).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+}
+
+/// A proposal behind `main` without any conflict merges where the forge can merge it; the Local
+/// Git provider only fast-forwards, so Keel rebuilds the branch there and asks for a review.
+#[tokio::test]
+async fn conflict_free_stale_proposals_are_rebuilt_when_the_forge_refuses_them() {
+    let fx = fixture().await;
+    let admin = admin(&fx.state).await;
+    let (status, body) = propose(
+        &fx.state,
+        &admin,
+        "acme",
+        json!({ "catalogId": "web", "values": { "replicas": 2 } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = merge(&fx.state, &admin, "acme", "1").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // An edit (values only) and a new Stack, both from the same `main`.
+    let (status, edit) = propose(
+        &fx.state,
+        &admin,
+        "acme",
+        json!({ "catalogId": "web", "values": { "replicas": 3 } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{edit}");
+    let (status, body) = propose(
+        &fx.state,
+        &admin,
+        "acme",
+        json!({ "catalogId": "proxmox-vm", "name": "vm1", "values": { "cores": 1 } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = merge(&fx.state, &admin, "acme", "3").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = merge(&fx.state, &admin, "acme", "2").await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    let error = body["error"].as_str().unwrap();
+    assert!(error.contains("the forge refused to merge it"), "{error}");
+    assert!(error.contains("Review the updated diff"), "{error}");
+    let bare = fx.tenant_bare("acme");
+    let branch = edit["branch"].as_str().unwrap();
+    assert_eq!(
+        git_rev(&bare, &format!("{branch}^")),
+        git_rev(&bare, "main")
+    );
+
+    let (status, body) = merge(&fx.state, &admin, "acme", "2").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let values = git_show(&bare, "main:tenants/acme/apps/web/values.yaml").unwrap();
+    assert!(values.contains('3'), "{values}");
+    assert!(git_show(&bare, "main:tenants/acme/infra/vm1/stack.yaml").is_some());
+}
+
+/// Records `delete_tenant_stack` calls so merge-time Stack deletions can be asserted.
+#[derive(Default)]
+struct RecordingStateProvider {
+    deleted: std::sync::Mutex<Vec<(String, String)>>,
+}
+
+#[async_trait::async_trait]
+impl keel_server::ClusterStateProvider for RecordingStateProvider {
+    async fn list_stacks(
+        &self,
+        _tenant: Option<&str>,
+        _provider: Option<&str>,
+    ) -> Result<Vec<keel_server::StackSummary>, keel_server::ServerError> {
+        Ok(Vec::new())
+    }
+
+    async fn list_releases(
+        &self,
+        _tenant: Option<&str>,
+    ) -> Result<Vec<keel_server::ReleaseSummary>, keel_server::ServerError> {
+        Ok(Vec::new())
+    }
+
+    async fn delete_tenant_stack(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> Result<bool, keel_server::ServerError> {
+        self.deleted
+            .lock()
+            .unwrap()
+            .push((namespace.to_string(), name.to_string()));
+        Ok(true)
+    }
+}
+
+/// The exact v0.12.0 dry-run scenario (snag #9): two Stack deletions opened from the same `main`
+/// rewrite adjacent lines of `tenants/<id>/kustomization.yaml`. After the first merges, the
+/// second conflicts only in that index; Keel rebuilds it with an empty index (no conflict
+/// markers), and once its preview finished the merge removes the second live Stack.
+#[tokio::test]
+async fn sequential_stack_deletions_are_rebuilt_to_an_empty_index_and_merge() {
+    let fx = fixture().await;
+    let recorder = Arc::new(RecordingStateProvider::default());
+    let state = fx.state.clone().with_state_provider(recorder.clone());
+    let admin = admin(&state).await;
+    for (id, name) in [("1", "vm1"), ("2", "vm2")] {
+        let (status, body) = propose(
+            &state,
+            &admin,
+            "acme",
+            json!({ "catalogId": "proxmox-vm", "name": name, "values": { "cores": 1 } }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let (status, body) = merge(&state, &admin, "acme", id).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    let bare = fx.tenant_bare("acme");
+    let index = git_show(&bare, "main:tenants/acme/kustomization.yaml").unwrap();
+    assert!(
+        index.contains("infra/vm1/") && index.contains("infra/vm2/"),
+        "{index}"
+    );
+
+    let mut ids = Vec::new();
+    for name in ["vm1", "vm2"] {
+        let (status, body) = send(
+            &state,
+            &admin,
+            Method::DELETE,
+            &format!("/api/v1/stacks/tenant-acme/{name}"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        ids.push(body["proposal"]["id"].as_str().unwrap().to_string());
+    }
+    let (status, body) = merge(&state, &admin, "acme", &ids[0]).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let main_after_first = git_rev(&bare, "main");
+
+    let (status, body) = merge(&state, &admin, "acme", &ids[1]).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    let error = body["error"].as_str().unwrap();
+    assert!(error.contains("Keel rebuilt branch"), "{error}");
+    assert!(
+        error.contains("only in tenants/acme/kustomization.yaml"),
+        "{error}"
+    );
+    let pr = fx
+        .tenant_provider("acme")
+        .get_pull_request(&ids[1])
+        .await
+        .unwrap();
+    let rebuilt = git_rev(&bare, &pr.source_branch);
+    assert_eq!(git_rev(&bare, &format!("{rebuilt}^")), main_after_first);
+    let index = git_show(&bare, &format!("{rebuilt}:tenants/acme/kustomization.yaml")).unwrap();
+    assert!(!index.contains("<<<<<<<"), "{index}");
+    assert!(!index.contains("infra/vm"), "{index}");
+    assert_eq!(
+        index,
+        keel_kube::build_tenant_repo_kustomization_yaml("acme", &[]).unwrap(),
+        "resources: []"
+    );
+
+    let preview = format!("preview-stack-pr-acme-{}", ids[1]);
+    if fx.cluster.stack(&preview).is_some() {
+        finish_preview(&fx, &preview, &rebuilt);
+    }
+    let (status, body) = merge(&state, &admin, "acme", &ids[1]).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(git_show(&bare, "main:tenants/acme/infra/vm2/stack.yaml").is_none());
+    let deleted = recorder.deleted.lock().unwrap().clone();
+    assert!(
+        deleted.contains(&("tenant-acme".to_string(), "vm2".to_string())),
+        "{deleted:?}"
+    );
+}
+
+/// Keel only rewrites its own proposal branches: a human-opened branch that fell behind `main`
+/// is reported (with the way out), never replaced by a rebuilt commit.
+#[tokio::test]
+async fn stale_branches_keel_did_not_open_are_never_rewritten() {
+    let fx = fixture().await;
+    let admin = admin(&fx.state).await;
+    let bare = fx.tenant_bare("acme");
+    let seed = fx.root.join("human-branch");
+    let git = GitRunner::new();
+    git.clone(bare.to_str().unwrap(), &seed).await.unwrap();
+    let branch = "feature/manual-notes";
+    git.checkout_new_branch(&seed, branch).await.unwrap();
+    write(&seed, "tenants/acme/NOTES.md", "notes\n").await;
+    git.add(&seed, ["."]).await.unwrap();
+    git.commit(
+        &seed,
+        "docs: notes",
+        &CommitAuthor::new("Human", "human@example.com"),
+    )
+    .await
+    .unwrap();
+    git.push(&seed, "origin", branch).await.unwrap();
+    let manual = fx
+        .tenant_provider("acme")
+        .create_pull_request(CreatePrRequest::new("docs: notes", "", branch).with_tenant("acme"))
+        .await
+        .unwrap();
+
+    // `main` moves on: the human branch is behind (conflict-free), and the Local Git provider
+    // only fast-forwards.
+    let (status, body) = propose(
+        &fx.state,
+        &admin,
+        "acme",
+        json!({ "catalogId": "web", "values": { "replicas": 2 } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let id = body["proposal"]["id"].as_str().unwrap().to_string();
+    let (status, body) = merge(&fx.state, &admin, "acme", &id).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let head = git_rev(&bare, branch);
+    let (status, body) = merge(&fx.state, &admin, "acme", &manual.id).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    let error = body["error"].as_str().unwrap();
+    assert!(error.contains("was not opened by Keel"), "{error}");
+    assert!(error.contains("merge or rebase 'main'"), "{error}");
+    assert_eq!(git_rev(&bare, branch), head, "branch untouched");
+}

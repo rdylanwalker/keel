@@ -35,9 +35,23 @@ keel auth status
 | :--- | :--- |
 | `keel proposal list [--tenant <id>] [--status open\|merged\|closed\|all] [--output table\|json]` | Lists proposals with their tenant and repository. Without `--tenant`, lists every repository you can see (cluster admins: the platform repository and every tenant repository); repositories the forge could not list are reported on stderr. Defaults to `--status open`. |
 | `keel proposal show <PR> --tenant <id> [--output table\|json]` | Shows one proposal. PR numbers are per repository: `--tenant` is the tenant whose repository holds the PR, or `management` for platform-repository PRs (catalog, management add-ons, tenant stubs). |
-| `keel proposal merge <PR> --tenant <id> [--output ...]` | Merges an open proposal in the `--tenant` repository. The server pins the merge to the head SHA it reviewed, so the merge is refused if the branch moved after verification. Requires cluster admin or `tenant-<id>-admin` (tenant repository PRs whose changes stay under `tenants/<id>/`). |
+| `keel proposal merge <PR> --tenant <id> [--output ...]` | Merges an open proposal in the `--tenant` repository. The server pins the merge to the head SHA it reviewed, so the merge is refused if the branch moved after verification. A proposal that fell behind `main` is rebuilt and re-previewed instead of merged (see below). Requires cluster admin or `tenant-<id>-admin` (tenant repository PRs whose changes stay under `tenants/<id>/`). |
 | `keel proposal close <PR> --tenant <id> [--output ...]` | Closes (rejects) an open proposal. Its ephemeral preview is garbage-collected. |
 | `keel preview status --pr <PR> --tenant <id> [--watch]` | Renders the preview diff (`+` create, `~` update, `-` delete, `!` replace) and whether it came from a real PKO run or was simulated. `--watch` streams SSE progress until the preview finishes. |
+
+### Merging a proposal that is behind `main`
+
+Every proposal rewrites its tenant's generated `kustomization.yaml` index. If you open two proposals from the same `main` and merge the first, the second one usually conflicts in that index. When you merge it, Keel does not merge it. Instead Keel:
+
+1. rebuilds the branch as one commit on top of the current `main`, re-applying the proposal's index entries to `main`'s index;
+2. re-runs the preview at the new head;
+3. answers `409` with a message like `Keel rebuilt branch '...' on the current 'main' (new head ...)`.
+
+Check the new preview (`keel preview status --pr <PR> --tenant <id> --watch`), then run `keel proposal merge` again. Until that preview has finished, the merge is refused with `409`, because nobody has reviewed the rebuilt head yet. The rebuilt commit keeps the proposal's author; you are recorded as its committer. The same happens when a proposal is behind `main` without a conflict and the forge refuses to merge it because it is behind (the Local Git provider only fast-forwards). Refusals for other reasons, such as missing approvals or required status checks, are reported as they are.
+
+Keel only rebuilds branches it opened (`keel/<tenant>/...`). For any other branch that fell behind `main`, merge or rebase `main` into the branch yourself, then merge again.
+
+If the proposal conflicts with `main` in any other file, for example because two proposals changed the same app's `values.yaml`, the merge is refused with the conflicting files and the branch is left alone. Close the proposal and propose the change again.
 
 ## Catalog, Applications & Infrastructure
 

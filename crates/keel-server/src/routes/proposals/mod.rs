@@ -10,6 +10,7 @@ mod pr;
 mod preview;
 mod preview_inputs;
 mod secrets;
+mod stale;
 mod tenant_stack;
 
 pub use create::create_proposal;

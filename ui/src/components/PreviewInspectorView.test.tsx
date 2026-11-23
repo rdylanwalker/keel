@@ -239,6 +239,24 @@ describe("PreviewInspectorView component", () => {
     })
   })
 
+  it("reloads the preview when a merge rebuilt a stale branch, keeping the message", async () => {
+    vi.mocked(api.getProposals).mockResolvedValue(mockProposals)
+    vi.mocked(api.getProposalPreview).mockResolvedValue(mockPreview)
+    const rebuilt =
+      "PR #101 conflicts with changes merged into 'main' after it was opened. Keel rebuilt branch 'keel/acme/x' on the current 'main' (new head 0123456789ab). A new PKO preview is running for the updated branch; review it and merge again when it completes."
+    vi.mocked(api.mergeProposal).mockRejectedValue(new ApiError(409, rebuilt))
+
+    renderWithAuthz(<PreviewInspectorView />)
+    await screen.findByText("PR #101: Deploy Redis Cache")
+    await waitFor(() => expect(api.getProposalPreview).toHaveBeenCalledTimes(1))
+    fireEvent.click(screen.getByRole("button", { name: /Merge PR/i }))
+
+    await waitFor(() => expect(api.getProposalPreview).toHaveBeenCalledTimes(2))
+    await waitFor(() => {
+      expect(screen.getByRole("alert")).toHaveTextContent("Keel rebuilt branch")
+    })
+  })
+
   it("shows the correlation id for 5xx action errors", async () => {
     vi.mocked(api.getProposals).mockResolvedValue(mockProposals)
     vi.mocked(api.getProposalPreview).mockResolvedValue(mockPreview)

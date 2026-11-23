@@ -7,6 +7,7 @@
 mod bootstrap;
 mod catalog;
 mod crypto;
+mod kustomize;
 mod management_addon;
 mod models;
 pub mod yaml;
@@ -33,6 +34,9 @@ pub use catalog::{
 };
 pub use crypto::{
     EnvelopeCrypto, SopsConfig, SopsCreationRule, SopsManager, generate_admin_password, sha256_hex,
+};
+pub use kustomize::{
+    merge_kustomization_index, merge_kustomization_resources, parse_kustomization_index,
 };
 pub use management_addon::{
     MANAGEMENT_CORE_ADDONS_DIR, ManagementAddonKind, ManagementAddonRef,

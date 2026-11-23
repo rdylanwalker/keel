@@ -5186,6 +5186,80 @@ async fn test_pr_diff_is_merge_base_and_merge_deletes_stacks_from_diff() {
     assert!(!diff.contains("tenants/acme/apps/redis"), "{diff}");
 }
 
+/// Snag #9 of the v0.12.0 dry run in the platform repository (Local Git provider): two
+/// deletions opened from the same `main` conflict in `tenants/kustomization.yaml` once the first
+/// merges. The second merge rebuilds the branch on `main` (index re-merged) and asks for a new
+/// review; merging again then succeeds.
+#[tokio::test]
+async fn test_stale_deletion_proposal_is_rebuilt_on_main_before_merge() {
+    let fixture = setup_fixture().await;
+    let state = fixture.state.clone();
+    let app = build_router(state.clone());
+    let cookie = login_and_get_cookie(&fixture).await;
+
+    let mut ids = Vec::new();
+    for uri in [
+        "/api/v1/stacks/tenant-acme/net",
+        "/api/v1/releases/tenant-acme/redis",
+    ] {
+        let (status, body) = send_json(&app, Method::DELETE, uri, &cookie, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        ids.push(body["proposal"]["id"].as_str().unwrap().to_string());
+    }
+    let merge_uri = |id: &str| format!("/api/v1/tenants/acme/proposals/{id}/merge");
+    let (status, body) = send_json(&app, Method::POST, &merge_uri(&ids[0]), &cookie, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = send_json(&app, Method::POST, &merge_uri(&ids[1]), &cookie, None).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    let error = body["error"].as_str().unwrap();
+    // Not adjacent in this index: conflict-free, but the Local Git provider only fast-forwards.
+    assert!(error.contains("the forge refused to merge it"), "{error}");
+    assert!(error.contains("Keel rebuilt branch"), "{error}");
+
+    let (status, body) = send_json(&app, Method::POST, &merge_uri(&ids[1]), &cookie, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["proposal"]["state"], "merged");
+    for gone in ["tenants/acme/infra/net", "tenants/acme/apps/redis"] {
+        assert!(!state.repo_workdir.join(gone).exists(), "{gone}");
+    }
+
+    // Two installs both create the index (this fixture has none yet): a conflict Keel re-merges.
+    let mut ids = Vec::new();
+    for name in ["dash1", "dash2"] {
+        let (status, body) = send_json(
+            &app,
+            Method::POST,
+            "/api/v1/tenants/acme/proposals",
+            &cookie,
+            Some(json!({ "catalogId": "grafana", "name": name, "values": { "replicas": 1 } })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        ids.push(body["proposal"]["id"].as_str().unwrap().to_string());
+    }
+    let (status, body) = send_json(&app, Method::POST, &merge_uri(&ids[0]), &cookie, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = send_json(&app, Method::POST, &merge_uri(&ids[1]), &cookie, None).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    let error = body["error"].as_str().unwrap();
+    assert!(
+        error.contains("only in tenants/kustomization.yaml"),
+        "{error}"
+    );
+    let (status, body) = send_json(&app, Method::POST, &merge_uri(&ids[1]), &cookie, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let resources = tenants_kustomization_resources(&fixture);
+    for name in ["dash1", "dash2"] {
+        assert!(
+            resources
+                .iter()
+                .any(|r| r.starts_with(&format!("acme/apps/{name}/"))),
+            "{name}: {resources:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn test_reject_response_is_camel_case_and_titles_are_conventional() {
     let fixture = setup_fixture().await;

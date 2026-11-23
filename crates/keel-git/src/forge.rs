@@ -160,6 +160,31 @@ impl ForgeError {
     fn unsupported(operation: &str) -> Self {
         Self::Unsupported(operation.to_string())
     }
+
+    /// `true` for a merge refusal caused by the PR branch being behind its target branch: the
+    /// Local Git provider's fast-forward refusal, Forgejo/Gitea's "Please try again later"
+    /// (mergeability check pending), GitHub's "not up to date" / "Base branch was modified" and
+    /// GitLab's rebase-required refusals. Branch protection, missing approvals or status checks,
+    /// a moved PR head and any other policy refusal are `false`: bringing the branch up to date
+    /// would not change them.
+    pub fn is_behind_target_refusal(&self) -> bool {
+        let Self::MergeConflict(_, reason) = self else {
+            return false;
+        };
+        let reason = reason.to_ascii_lowercase();
+        [
+            "not possible to fast-forward",
+            "non-fast-forward",
+            "please try again later",
+            "not up to date with the base branch",
+            "base branch was modified",
+            "must be rebased",
+            "rebase the source branch",
+            "branch cannot be merged",
+        ]
+        .iter()
+        .any(|needle| reason.contains(needle))
+    }
 }
 
 /// Result of [`ForgeProvider::ensure_repository`].
@@ -600,6 +625,38 @@ pub(crate) fn matches_tenant(pr: &PullRequestInfo, tenant: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn behind_target_refusals_are_told_apart_from_policy_refusals() {
+        let refusal = |reason: &str| ForgeError::MergeConflict("5".to_string(), reason.to_string());
+        for behind in [
+            "fatal: Not possible to fast-forward, aborting.",
+            r#"{"message":"Please try again later"}"#,
+            "the forge still reports the PR as not mergeable after waiting 20s ...: Please try again later",
+            r#"{"message":"Head branch is not up to date with the base branch"}"#,
+            r#"{"message":"Base branch was modified. Review and try the merge again."}"#,
+            r#"{"message":"Branch cannot be merged"}"#,
+        ] {
+            assert!(refusal(behind).is_behind_target_refusal(), "{behind}");
+        }
+        for policy in [
+            r#"{"message":"At least 1 approving review is required by reviewers with write access."}"#,
+            r#"{"message":"Required status check \"ci\" is expected."}"#,
+            r#"{"message":"Head branch was modified. Review and try the merge again."}"#,
+            "source branch head moved: expected abc, found def; re-review required",
+            r#"{"message":"Method Not Allowed"}"#,
+            r#"{"message":"Not all required approvals have been given"}"#,
+        ] {
+            assert!(!refusal(policy).is_behind_target_refusal(), "{policy}");
+        }
+        assert!(
+            !ForgeError::Api {
+                status: 409,
+                message: "Please try again later".to_string()
+            }
+            .is_behind_target_refusal()
+        );
+    }
 
     #[test]
     fn test_pr_models_builders_and_tenant_matching() {

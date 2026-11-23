@@ -35,6 +35,10 @@ use crate::tenant_repos::TenantRepoForge;
 /// Scope of platform-repository proposals (reserved tenant id).
 pub const PLATFORM_SCOPE: &str = MANAGEMENT_TENANT;
 
+/// Branch every working tree (platform checkout, tenant repository clones) is kept on between
+/// operations; proposal work always resets back to it.
+pub const WORKTREE_BRANCH: &str = "main";
+
 /// A proposal route scope.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ProposalScope {
@@ -258,7 +262,7 @@ impl ScopeRepo {
             None => {
                 state
                     .git_runner
-                    .sync_branch_from_remote(&self.workdir, "origin", "main")
+                    .sync_branch_from_remote(&self.workdir, "origin", WORKTREE_BRANCH)
                     .await?;
             }
         }
@@ -280,7 +284,7 @@ impl ScopeRepo {
                 .unwrap_or(false)
             && state
                 .git_runner
-                .reset_branch_to_remote_ref(&self.workdir, "origin", "main")
+                .reset_branch_to_remote_ref(&self.workdir, "origin", WORKTREE_BRANCH)
                 .await
                 .is_ok()
         {

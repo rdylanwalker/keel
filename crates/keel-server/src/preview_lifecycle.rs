@@ -205,6 +205,135 @@ pub async fn launch_pko_preview(
     run
 }
 
+/// Annotation of a preview `Stack` re-pinned to a PR head Keel rebuilt itself (a stale proposal
+/// rebuilt on `main`): nobody reviewed that head yet, so its merge waits until the PKO preview
+/// of it has finished ([`rebuilt_head_preview_pending`]).
+pub const ANNOTATION_REBUILT_HEAD: &str = "keel.io/rebuilt-head";
+
+/// Re-runs the live preview of `preview_key` at `head_sha` after Keel replaced the PR head
+/// (a stale proposal rebuilt on `main`): the preview `Stack` is re-applied pinned to the new
+/// head (`spec.commit`, also for a preview that tracked the PR branch, so the spec and thus
+/// `metadata.generation` always change and PKO starts a new run) with the `keel.io/head-sha`
+/// and [`ANNOTATION_REBUILT_HEAD`] annotations, so PKO previews exactly the commit that will
+/// be merged. `None` when the PR has no preview `Stack` (a Flux-only change, whose
+/// creation-time synthesized report stays and whose Git diff is recomputed on read, or no live
+/// cluster) or its spec has no Git source to re-pin.
+pub async fn rerun_preview_at_commit(
+    state: &AppState,
+    preview_key: &str,
+    head_sha: &str,
+) -> Option<PreviewRunStatus> {
+    let cluster = state.preview_cluster.clone()?;
+    let stack_name = preview_stack_name(preview_key);
+    let live = cluster
+        .get_preview_stack(&stack_name)
+        .await
+        .ok()
+        .flatten()?;
+    let doc = repinned_preview_stack(&live, head_sha)?;
+    let run = match cluster.apply_preview(&doc).await {
+        Ok(()) => PreviewRunStatus {
+            phase: PreviewPhase::Pending,
+            message: Some(
+                "Preview Stack re-pinned to the updated PR head; waiting for PKO".to_string(),
+            ),
+            stack: Some(format!("{KEEL_PREVIEWS_NAMESPACE}/{stack_name}")),
+            commit: Some(head_sha.to_string()),
+            update: None,
+        },
+        Err(e) => {
+            tracing::warn!(preview_key, error = %e, "failed to re-apply the preview Stack at the updated PR head");
+            PreviewRunStatus::apply_failed(format!("Re-applying preview Stack failed: {e}"))
+        }
+    };
+    publish_phase(state, preview_key, &stack_name, &run);
+    if run.phase == PreviewPhase::Pending {
+        spawn_preview_watch(state.clone(), preview_key.to_string(), stack_name);
+    }
+    Some(run)
+}
+
+/// The applyable part of a live preview `Stack` (`apiVersion`, `kind`, name, namespace, labels,
+/// annotations, `spec`) pinned to `head_sha`: `spec.commit` with a full-history checkout
+/// (`shallow: false`, like [`keel_pko::PkoGitSource::commit`]) replacing a tracked `branch`, and
+/// the `keel.io/head-sha` / [`ANNOTATION_REBUILT_HEAD`] annotations. Server-populated metadata
+/// and `status` are dropped. `None` without a Git source (`spec.projectRepo`).
+fn repinned_preview_stack(live: &serde_json::Value, head_sha: &str) -> Option<serde_json::Value> {
+    use serde_json::{Value, json};
+    let meta = live.get("metadata")?;
+    let mut spec = live.get("spec")?.clone();
+    let spec_map = spec.as_object_mut()?;
+    spec_map.get("projectRepo").and_then(Value::as_str)?;
+    spec_map.remove("branch");
+    spec_map.insert("commit".to_string(), Value::String(head_sha.to_string()));
+    spec_map.insert("shallow".to_string(), Value::Bool(false));
+    let mut annotations = meta
+        .get("annotations")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    for key in [ANNOTATION_HEAD_SHA, ANNOTATION_REBUILT_HEAD] {
+        annotations.insert(key.to_string(), Value::String(head_sha.to_string()));
+    }
+    Some(json!({
+        "apiVersion": live.get("apiVersion")?,
+        "kind": live.get("kind")?,
+        "metadata": {
+            "name": meta.get("name")?,
+            "namespace": meta.get("namespace")?,
+            "labels": meta.get("labels").cloned().unwrap_or_else(|| json!({})),
+            "annotations": annotations,
+        },
+        "spec": spec,
+    }))
+}
+
+/// The run of the preview of `preview_key` when the merge of `head_sha` must wait for it: the
+/// preview `Stack` was re-pinned to `head_sha` by a stale-proposal rebuild
+/// ([`ANNOTATION_REBUILT_HEAD`]) and PKO has not finished previewing that commit yet. `None`
+/// otherwise (no live cluster or preview `Stack`, another head, or the run is over).
+pub async fn rebuilt_head_preview_pending(
+    state: &AppState,
+    preview_key: &str,
+    head_sha: &str,
+) -> Option<PreviewRunStatus> {
+    let cluster = state.preview_cluster.clone()?;
+    let stack = cluster
+        .get_preview_stack(&preview_stack_name(preview_key))
+        .await
+        .ok()
+        .flatten()?;
+    let update = match select_update_name(&stack) {
+        Some(name) => cluster.get_update(&name).await.ok().flatten(),
+        None => None,
+    };
+    let run = map_pko_preview_status(&stack, update.as_ref());
+    rebuilt_head_awaits_preview(&stack, &run, head_sha).then_some(run)
+}
+
+/// `true` while the preview `Stack` was re-pinned to the rebuilt `head_sha` and neither a
+/// published result nor a finished run for that commit exists.
+fn rebuilt_head_awaits_preview(
+    stack: &serde_json::Value,
+    run: &PreviewRunStatus,
+    head_sha: &str,
+) -> bool {
+    let same = |sha: &str| sha.eq_ignore_ascii_case(head_sha);
+    let annotation = |key: &str| {
+        stack
+            .pointer("/metadata/annotations")
+            .and_then(|a| a.get(key))
+            .and_then(serde_json::Value::as_str)
+    };
+    if !annotation(ANNOTATION_REBUILT_HEAD).is_some_and(same) {
+        return false;
+    }
+    if annotation(ANNOTATION_REPORTED_COMMIT).is_some_and(same) {
+        return false;
+    }
+    !(run.phase.is_terminal() && run.commit.as_deref().is_none_or(same))
+}
+
 /// Polls one preview until its run is terminal and published (or [`PREVIEW_WATCH_TIMEOUT`]).
 pub fn spawn_preview_watch(state: AppState, pr_id: String, stack_name: String) {
     tokio::spawn(async move {
@@ -584,5 +713,138 @@ mod tests {
             telemetry_status(PreviewPhase::Running),
             CrdReconcileStatus::Previewing
         );
+    }
+
+    #[test]
+    fn repinned_preview_stacks_keep_the_spec_and_drop_server_fields() {
+        let live = serde_json::json!({
+            "apiVersion": "pulumi.com/v1",
+            "kind": "Stack",
+            "metadata": {
+                "name": "preview-stack-pr-acme-2",
+                "namespace": "keel-previews",
+                "uid": "u-1",
+                "resourceVersion": "42",
+                "managedFields": [{}],
+                "finalizers": ["finalizer.stack.pulumi.com"],
+                "labels": { "keel.io/pr-id": "acme-2" },
+                "annotations": { "keel.io/head-sha": "old", "keel.io/preview-reported-commit": "old" },
+            },
+            "spec": {
+                "preview": true,
+                "projectRepo": "https://forge.local/acme/gitops.git",
+                "commit": "old",
+                "shallow": false,
+                "repoDir": "tenants/acme/infra/vm2",
+            },
+            "status": { "lastUpdate": {} },
+        });
+        let doc = repinned_preview_stack(&live, "new").unwrap();
+        assert_eq!(doc["spec"]["commit"], "new");
+        assert_eq!(doc["spec"]["shallow"], false);
+        assert_eq!(
+            doc["metadata"]["annotations"]["keel.io/rebuilt-head"],
+            "new"
+        );
+        assert_eq!(doc["spec"]["preview"], true);
+        assert_eq!(doc["spec"]["repoDir"], "tenants/acme/infra/vm2");
+        assert_eq!(doc["metadata"]["annotations"]["keel.io/head-sha"], "new");
+        assert_eq!(
+            doc["metadata"]["annotations"]["keel.io/preview-reported-commit"],
+            "old"
+        );
+        assert_eq!(doc["metadata"]["labels"]["keel.io/pr-id"], "acme-2");
+        for dropped in ["uid", "resourceVersion", "managedFields", "finalizers"] {
+            assert!(doc["metadata"].get(dropped).is_none(), "{dropped}");
+        }
+        assert!(doc.get("status").is_none());
+
+        // A branch-tracking preview (platform repository) is switched to the commit pin: the
+        // spec changes, so the generation moves and PKO starts a new run.
+        let mut branch = live.clone();
+        branch["spec"] = serde_json::json!({
+            "preview": true,
+            "projectRepo": "https://forge.local/keel/gitops.git",
+            "branch": "keel/acme/x",
+            "shallow": true,
+        });
+        let doc = repinned_preview_stack(&branch, "new").unwrap();
+        assert_eq!(doc["spec"]["commit"], "new");
+        assert!(doc["spec"].get("branch").is_none());
+        assert_eq!(doc["spec"]["shallow"], false);
+        assert_ne!(doc["spec"], branch["spec"]);
+        assert!(repinned_preview_stack(&serde_json::json!({}), "new").is_none());
+        let mut no_source = live.clone();
+        no_source["spec"] = serde_json::json!({ "preview": true });
+        assert!(repinned_preview_stack(&no_source, "new").is_none());
+    }
+
+    /// A branch-tracking preview with an old `Succeeded` run, re-pinned to a rebuilt head: the
+    /// old run no longer counts (new generation), and the merge of the rebuilt head waits until
+    /// PKO previewed that commit.
+    #[test]
+    fn rebuilt_heads_wait_for_their_own_preview_run() {
+        let live = serde_json::json!({
+            "apiVersion": "pulumi.com/v1",
+            "kind": "Stack",
+            "metadata": {
+                "name": "preview-stack-pr-platform-7",
+                "namespace": "keel-previews",
+                "generation": 1,
+                "labels": { "keel.io/pr-id": "platform-7" },
+                "annotations": {
+                    "keel.io/head-sha": "old",
+                    "keel.io/preview-reported-commit": "old",
+                },
+            },
+            "spec": {
+                "preview": true,
+                "projectRepo": "https://forge.local/keel/gitops.git",
+                "branch": "keel/acme/x",
+            },
+            "status": {
+                "lastUpdate": {
+                    "state": "succeeded",
+                    "generation": 1,
+                    "lastAttemptedCommit": "old",
+                },
+            },
+        });
+        let run = map_pko_preview_status(&live, None);
+        assert_eq!(run.phase, PreviewPhase::Succeeded);
+        assert!(
+            !rebuilt_head_awaits_preview(&live, &run, "old"),
+            "not rebuilt"
+        );
+
+        // The API server bumps the generation on the spec change and keeps the old status.
+        let mut stack = repinned_preview_stack(&live, "new").unwrap();
+        stack["metadata"]["generation"] = serde_json::json!(2);
+        stack["status"] = live["status"].clone();
+        let run = map_pko_preview_status(&stack, None);
+        assert_eq!(run.phase, PreviewPhase::Pending, "{run:?}");
+        assert!(rebuilt_head_awaits_preview(&stack, &run, "new"));
+        assert!(rebuilt_head_awaits_preview(&stack, &run, "NEW"));
+        // Another head (a later push) is not this gate's business.
+        assert!(!rebuilt_head_awaits_preview(&stack, &run, "other"));
+
+        // Running, then finished for the rebuilt commit.
+        stack["status"] = serde_json::json!({ "currentUpdate": { "name": "u2", "commit": "new" } });
+        let run = map_pko_preview_status(&stack, None);
+        assert_eq!(run.phase, PreviewPhase::Running);
+        assert!(rebuilt_head_awaits_preview(&stack, &run, "new"));
+        stack["status"] = serde_json::json!({
+            "lastUpdate": { "state": "failed", "generation": 2, "lastAttemptedCommit": "new" },
+        });
+        let run = map_pko_preview_status(&stack, None);
+        assert_eq!(run.phase, PreviewPhase::Failed);
+        assert!(!rebuilt_head_awaits_preview(&stack, &run, "new"));
+
+        // Published results for the rebuilt commit always release the merge.
+        stack["status"] = serde_json::json!({});
+        stack["metadata"]["annotations"]["keel.io/preview-reported-commit"] =
+            serde_json::json!("new");
+        let run = map_pko_preview_status(&stack, None);
+        assert!(!rebuilt_head_awaits_preview(&stack, &run, "new"));
     }
 }

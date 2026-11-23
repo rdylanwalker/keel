@@ -17,6 +17,7 @@ use crate::routes::load_provider_registry;
 use crate::state::AppState;
 
 use super::pr::audit_proposal_event;
+use super::stale::{BranchFreshness, branch_freshness, rebuild_stale_proposal};
 
 /// Response body of the merge, reject and reopen routes.
 #[derive(Debug, Serialize)]
@@ -316,7 +317,7 @@ pub async fn merge_proposal(
     // One refresh per merge: a tenant administrator's verification just fetched the repository
     // (its objects hold the verified head); otherwise refresh once here and reuse that tree for
     // the head commit and the Stack deletion plan.
-    let (head_sha, stack_deletions) = {
+    let (head_sha, stack_deletions, freshness) = {
         let _guard = repo.lock(&state).await;
         let (head_sha, ready) = match verified_sha {
             Some(sha) => (
@@ -334,15 +335,88 @@ pub async fn merge_proposal(
             Some(sha) if ready => plan_stack_deletions_for_pr(&state, &repo, &pr, sha).await,
             _ => Vec::new(),
         };
-        (head_sha, deletions)
+        // A branch opened before other proposals merged (snag #9 of the v0.12.0 dry run).
+        let freshness = match head_sha.as_deref() {
+            Some(sha) if ready => branch_freshness(&state, &repo, &pr, sha).await,
+            _ => BranchFreshness::Current,
+        };
+        (head_sha, deletions, freshness)
     };
 
+    // Preview-before-merge for heads Keel produced itself (`NFR-REL-02`): a stale proposal
+    // rebuilt on `main` merges only once the PKO preview of the rebuilt head has finished.
+    if let Some(sha) = head_sha.as_deref()
+        && let Some(run) = crate::preview_lifecycle::rebuilt_head_preview_pending(
+            &state,
+            &repo.preview_key(&pr.id)?,
+            sha,
+        )
+        .await
+    {
+        return Err(ServerError::Conflict(format!(
+            "PR #{} was rebuilt by Keel on '{}' (head {}) and its PKO preview is still {}. \
+             Wait for it to finish (`keel preview status --pr {} --tenant {} --watch`), review it, \
+             then merge again.",
+            pr.id,
+            pr.target_branch,
+            &sha[..sha.len().min(12)],
+            run.phase.label().to_ascii_lowercase(),
+            pr.id,
+            scope.as_str(),
+        )));
+    }
+
+    if let (BranchFreshness::Conflicts(paths), Some(sha)) = (&freshness, head_sha.as_deref()) {
+        return Err(rebuild_stale_proposal(
+            &state,
+            &repo,
+            &auth,
+            &pr,
+            sha,
+            &format!(
+                "conflicts with changes merged into '{}' after it was opened (only in {})",
+                pr.target_branch,
+                paths.join(", ")
+            ),
+        )
+        .await);
+    }
+
     // The forge refuses the merge if the PR head moved after verification.
-    let merged = repo
+    let merged = match repo
         .forge
         .merge_pull_request(&pr.id, head_sha.as_deref())
-        .await?;
+        .await
+    {
+        Ok(merged) => merged,
+        // Behind but conflict-free, and refused because it is behind (the Local Git provider
+        // only fast-forwards; a forge whose mergeability check never settles; "not up to date"
+        // protection): rebuild on the target branch. Policy refusals (approvals, status checks)
+        // are reported as they are: a rebuild would not lift them.
+        Err(err)
+            if freshness == BranchFreshness::BehindClean
+                && err.is_behind_target_refusal()
+                && head_sha.is_some() =>
+        {
+            let sha = head_sha.as_deref().unwrap_or_default();
+            tracing::info!(pr_id = %pr.id, error = %err, "forge refused a merge of a PR behind its target branch");
+            return Err(rebuild_stale_proposal(
+                &state,
+                &repo,
+                &auth,
+                &pr,
+                sha,
+                &format!(
+                    "is behind '{}' and the forge refused to merge it",
+                    pr.target_branch
+                ),
+            )
+            .await);
+        }
+        Err(err) => return Err(err.into()),
+    };
     state.proposal_cache.invalidate(&repo.repository().label);
+    super::preview::forget_read_fetches(&repo.workdir);
     audit_proposal_event("merge", &auth, &repo, &merged);
 
     for del in &stack_deletions {

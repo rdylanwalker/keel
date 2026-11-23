@@ -840,6 +840,297 @@ impl GitRunner {
         Ok(out.trim().to_string())
     }
 
+    /// `true` when `ancestor` is reachable from `descendant`
+    /// (`git merge-base --is-ancestor <ancestor> <descendant>`).
+    pub async fn is_ancestor(
+        &self,
+        work_dir: &Path,
+        ancestor: &str,
+        descendant: &str,
+    ) -> Result<bool, GitError> {
+        validate_git_ref(ancestor, "ancestor")?;
+        validate_git_ref(descendant, "descendant")?;
+        let out = self
+            .exec_raw(
+                Some(work_dir),
+                "merge-base",
+                &["merge-base", "--is-ancestor", ancestor, descendant],
+                &[],
+            )
+            .await?;
+        match out.exit_code {
+            Some(0) => Ok(true),
+            Some(1) => Ok(false),
+            _ => Err(out.into_error("merge-base")),
+        }
+    }
+
+    /// Paths a merge of `theirs` into `ours` would leave conflicted, computed in the object
+    /// database without touching the worktree, the index or any ref
+    /// (`git merge-tree --write-tree --name-only`, Git 2.38+). Empty when the merge is clean.
+    pub async fn merge_conflicts(
+        &self,
+        work_dir: &Path,
+        ours: &str,
+        theirs: &str,
+    ) -> Result<Vec<String>, GitError> {
+        validate_git_ref(ours, "ours")?;
+        validate_git_ref(theirs, "theirs")?;
+        let out = self
+            .exec_raw(
+                Some(work_dir),
+                "merge-tree",
+                &[
+                    "merge-tree",
+                    "--write-tree",
+                    "--name-only",
+                    "--no-messages",
+                    ours,
+                    theirs,
+                ],
+                &[],
+            )
+            .await?;
+        match out.exit_code {
+            Some(0) => Ok(Vec::new()),
+            // First line: the (conflicted) tree id; then one conflicted path per line.
+            Some(1) => Ok(out
+                .stdout
+                .lines()
+                .skip(1)
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(ToOwned::to_owned)
+                .collect()),
+            _ => Err(out.into_error("merge-tree")),
+        }
+    }
+
+    /// Discards local changes, checks out commit `ours` on a detached `HEAD` and starts merging
+    /// `theirs` into it without committing (`git merge --no-commit --no-ff`). Returns the
+    /// conflicted paths (empty when the merge applied cleanly). The merge stays in progress
+    /// either way: resolve and stage the conflicted paths, then [`Self::write_tree`]; always
+    /// finish with [`Self::abort_merge`].
+    pub async fn start_detached_merge(
+        &self,
+        work_dir: &Path,
+        ours: &str,
+        theirs: &str,
+    ) -> Result<Vec<String>, GitError> {
+        validate_git_ref(ours, "ours")?;
+        validate_git_ref(theirs, "theirs")?;
+        self.abort_merge(work_dir).await?;
+        self.exec(
+            Some(work_dir),
+            "checkout",
+            &["checkout", "--detach", ours, "--"],
+            &[],
+        )
+        .await?;
+        // No commit is created, but `git merge` still resolves an identity on some versions.
+        let envs = [
+            ("GIT_AUTHOR_NAME", "Keel"),
+            ("GIT_AUTHOR_EMAIL", "keel@keel.local"),
+            ("GIT_COMMITTER_NAME", "Keel"),
+            ("GIT_COMMITTER_EMAIL", "keel@keel.local"),
+        ];
+        let out = self
+            .exec_raw(
+                Some(work_dir),
+                "merge",
+                &[
+                    "-c",
+                    "rerere.enabled=false",
+                    "merge",
+                    "--no-commit",
+                    "--no-ff",
+                    "--no-edit",
+                    theirs,
+                ],
+                &envs,
+            )
+            .await?;
+        match out.exit_code {
+            Some(0) => Ok(Vec::new()),
+            Some(1) => {
+                let unmerged = self
+                    .exec(
+                        Some(work_dir),
+                        "diff",
+                        &["diff", "--name-only", "--diff-filter=U"],
+                        &[],
+                    )
+                    .await?;
+                let paths: Vec<String> = unmerged
+                    .lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty())
+                    .map(ToOwned::to_owned)
+                    .collect();
+                if paths.is_empty() {
+                    Err(out.into_error("merge"))
+                } else {
+                    Ok(paths)
+                }
+            }
+            _ => Err(out.into_error("merge")),
+        }
+    }
+
+    /// Content of `repo_rel_path` at merge `stage` (1 = common base, 2 = ours, 3 = theirs) of a
+    /// conflicted index entry; `None` when that side has no such file.
+    pub async fn read_conflict_stage(
+        &self,
+        work_dir: &Path,
+        stage: u8,
+        repo_rel_path: &str,
+    ) -> Result<Option<String>, GitError> {
+        if !(1..=3).contains(&stage) {
+            return Err(GitError::InvalidArgument {
+                field: "stage",
+                reason: format!("merge stage must be 1, 2 or 3, got {stage}"),
+            });
+        }
+        validate_repo_rel_path(repo_rel_path, "repo_rel_path")?;
+        let spec = format!(":{stage}:{repo_rel_path}");
+        match self
+            .exec(Some(work_dir), "show", &["show", &spec], &[])
+            .await
+        {
+            Ok(content) => Ok(Some(content)),
+            Err(GitError::CommandFailed { .. }) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Writes the index as a tree object and returns its id (`git write-tree`); fails while
+    /// conflicted entries remain.
+    pub async fn write_tree(&self, work_dir: &Path) -> Result<String, GitError> {
+        let out = self
+            .exec(Some(work_dir), "write-tree", &["write-tree"], &[])
+            .await?;
+        Ok(out.trim().to_string())
+    }
+
+    /// Creates a commit object for `tree` with the single parent `parent` (no ref is moved;
+    /// `git commit-tree`) and returns its id. Each paragraph becomes one `-m` paragraph;
+    /// `author` and `committer` may differ (a rebuilt commit keeps its original author).
+    pub async fn commit_tree(
+        &self,
+        work_dir: &Path,
+        tree: &str,
+        parent: &str,
+        paragraphs: &[&str],
+        author: &CommitAuthor,
+        committer: &CommitAuthor,
+    ) -> Result<String, GitError> {
+        validate_object_id(tree, "tree")?;
+        validate_git_ref(parent, "parent")?;
+        let paragraphs: Vec<&str> = paragraphs
+            .iter()
+            .map(|p| p.trim())
+            .filter(|p| !p.is_empty())
+            .collect();
+        if paragraphs.is_empty() {
+            return Err(GitError::InvalidArgument {
+                field: "message",
+                reason: "commit message must be non-empty".to_string(),
+            });
+        }
+        // Validates the identity (no control characters or option injection).
+        author.to_git_author_flag()?;
+        committer.to_git_author_flag()?;
+        let mut args = vec!["commit-tree", tree, "-p", parent];
+        for p in &paragraphs {
+            args.push("-m");
+            args.push(p);
+        }
+        let envs = [
+            ("GIT_AUTHOR_NAME", author.name.trim()),
+            ("GIT_AUTHOR_EMAIL", author.email.trim()),
+            ("GIT_COMMITTER_NAME", committer.name.trim()),
+            ("GIT_COMMITTER_EMAIL", committer.email.trim()),
+        ];
+        let out = self
+            .exec(Some(work_dir), "commit-tree", &args, &envs)
+            .await?;
+        Ok(out.trim().to_string())
+    }
+
+    /// Abandons an in-progress merge (if any) and discards every local change
+    /// (`git merge --abort`, `git reset --hard`, `git clean -fd`).
+    pub async fn abort_merge(&self, work_dir: &Path) -> Result<(), GitError> {
+        let _ = self
+            .exec(Some(work_dir), "merge", &["merge", "--abort"], &[])
+            .await;
+        self.exec(Some(work_dir), "reset", &["reset", "--hard"], &[])
+            .await?;
+        self.exec(Some(work_dir), "clean", &["clean", "-fd"], &[])
+            .await?;
+        Ok(())
+    }
+
+    /// Author identity of commit `rev` (`git log -1 --format=%an%x00%ae`).
+    pub async fn commit_author(
+        &self,
+        work_dir: &Path,
+        rev: &str,
+    ) -> Result<CommitAuthor, GitError> {
+        validate_git_ref(rev, "rev")?;
+        let out = self
+            .exec(
+                Some(work_dir),
+                "log",
+                &["log", "-1", "--format=%an%x00%ae", rev, "--"],
+                &[],
+            )
+            .await?;
+        let line = out.trim_end_matches(['\r', '\n']);
+        let (name, email) = line.split_once('\0').unwrap_or((line, ""));
+        Ok(CommitAuthor::new(name, email))
+    }
+
+    /// Subject line of commit `rev` (`git log -1 --format=%s`).
+    pub async fn commit_subject(&self, work_dir: &Path, rev: &str) -> Result<String, GitError> {
+        validate_git_ref(rev, "rev")?;
+        let out = self
+            .exec(
+                Some(work_dir),
+                "log",
+                &["log", "-1", "--format=%s", rev, "--"],
+                &[],
+            )
+            .await?;
+        Ok(out.trim().to_string())
+    }
+
+    /// Points `refs/heads/<branch>` of `remote` at `commit`, replacing its history only while the
+    /// remote branch is still at `expected_old` (`git push --force-with-lease=<ref>:<old>`), so
+    /// a concurrent push to the branch is never overwritten.
+    pub async fn push_commit_with_lease(
+        &self,
+        work_dir: &Path,
+        remote: &str,
+        commit: &str,
+        branch: &str,
+        expected_old: &str,
+    ) -> Result<(), GitError> {
+        validate_git_ref(remote, "remote")?;
+        validate_object_id(commit, "commit")?;
+        validate_git_ref(branch, "branch")?;
+        validate_object_id(expected_old, "expected_old")?;
+        let lease = format!("--force-with-lease=refs/heads/{branch}:{expected_old}");
+        let refspec = format!("{commit}:refs/heads/{branch}");
+        self.exec(
+            Some(work_dir),
+            "push",
+            &["push", &lease, "--", remote, &refspec],
+            &[],
+        )
+        .await?;
+        Ok(())
+    }
+
     /// Lists file paths deleted on `head_ref` since it diverged from `base_ref`
     /// (`git diff --name-only --diff-filter=D <base_ref>...<head_ref>`).
     pub async fn diff_deleted_files(
@@ -1110,13 +1401,15 @@ impl GitRunner {
     }
 
     /// Executes `git` directly via `tokio::process::Command` with argument vectors and ephemeral auth.
-    async fn exec(
+    /// Runs `git` and returns its exit code and (redacted) output whatever the exit status, for
+    /// commands whose non-zero exit codes carry meaning (`merge`, `merge-base --is-ancestor`).
+    async fn exec_raw(
         &self,
         work_dir: Option<&Path>,
         subcommand: &str,
         args: &[&str],
         extra_envs: &[(&str, &str)],
-    ) -> Result<String, GitError> {
+    ) -> Result<RawGitOutput, GitError> {
         for arg in args {
             if arg.contains('\0') || arg.contains('\n') || arg.contains('\r') {
                 return Err(GitError::InvalidArgument {
@@ -1156,22 +1449,55 @@ impl GitRunner {
         let redact_tokens = auth_guard.redact_tokens.clone();
         drop(auth_guard);
 
-        if output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-            Ok(redact_sensitive(stdout, &redact_tokens))
+        Ok(RawGitOutput {
+            exit_code: output.status.code(),
+            stdout: redact_sensitive(
+                String::from_utf8_lossy(&output.stdout).into_owned(),
+                &redact_tokens,
+            ),
+            stderr: redact_sensitive(
+                String::from_utf8_lossy(&output.stderr).trim().to_string(),
+                &redact_tokens,
+            ),
+        })
+    }
+
+    async fn exec(
+        &self,
+        work_dir: Option<&Path>,
+        subcommand: &str,
+        args: &[&str],
+        extra_envs: &[(&str, &str)],
+    ) -> Result<String, GitError> {
+        let out = self
+            .exec_raw(work_dir, subcommand, args, extra_envs)
+            .await?;
+        if out.exit_code == Some(0) {
+            Ok(out.stdout)
         } else {
-            let stderr_raw = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            let stdout_raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            let combined = if stderr_raw.is_empty() {
-                stdout_raw
-            } else {
-                stderr_raw
-            };
-            Err(GitError::CommandFailed {
-                subcommand: subcommand.to_string(),
-                exit_code: output.status.code(),
-                stderr: redact_sensitive(combined, &redact_tokens),
-            })
+            Err(out.into_error(subcommand))
+        }
+    }
+}
+
+/// Exit code and output of a `git` invocation ([`GitRunner::exec_raw`]).
+struct RawGitOutput {
+    exit_code: Option<i32>,
+    stdout: String,
+    stderr: String,
+}
+
+impl RawGitOutput {
+    fn into_error(self, subcommand: &str) -> GitError {
+        let stderr = if self.stderr.is_empty() {
+            self.stdout.trim().to_string()
+        } else {
+            self.stderr
+        };
+        GitError::CommandFailed {
+            subcommand: subcommand.to_string(),
+            exit_code: self.exit_code,
+            stderr,
         }
     }
 }
@@ -1611,6 +1937,142 @@ mod tests {
             password_or_token: "secret".to_string(),
         });
         assert!(format!("{:?}", authed.credentials()).contains("[REDACTED]"));
+    }
+
+    #[tokio::test]
+    async fn detached_merges_report_conflicts_and_rebuild_branches_with_a_lease() {
+        let tmp = TempDir::new().unwrap();
+        let bare = tmp.path().join("origin.git");
+        let work = tmp.path().join("work");
+        let runner = GitRunner::new();
+        runner.init_bare(&bare).await.unwrap();
+        runner
+            .init_worktree_with_remote(&work, "main", bare.to_str().unwrap())
+            .await
+            .unwrap();
+        let author = CommitAuthor::new("Dev", "dev@keel.io");
+        let index = "resources:\n  - a.yaml\n  - b.yaml\n";
+        tokio::fs::write(work.join("kustomization.yaml"), index)
+            .await
+            .unwrap();
+        tokio::fs::write(work.join("notes.txt"), "base\n")
+            .await
+            .unwrap();
+        runner.add(&work, ["."]).await.unwrap();
+        let base = runner.commit(&work, "chore: base", &author).await.unwrap();
+
+        // Two branches from the same base both edit the index (and one also edits notes).
+        runner.checkout_new_branch(&work, "one").await.unwrap();
+        tokio::fs::write(work.join("kustomization.yaml"), "resources:\n  - b.yaml\n")
+            .await
+            .unwrap();
+        runner.add(&work, ["."]).await.unwrap();
+        let one = runner.commit(&work, "feat: drop a", &author).await.unwrap();
+        runner.checkout_branch(&work, "main").await.unwrap();
+        runner.checkout_new_branch(&work, "two").await.unwrap();
+        tokio::fs::write(work.join("kustomization.yaml"), "resources:\n  - a.yaml\n")
+            .await
+            .unwrap();
+        runner.add(&work, ["."]).await.unwrap();
+        let two = runner.commit(&work, "feat: drop b", &author).await.unwrap();
+        runner.push(&work, "origin", "two").await.unwrap();
+
+        assert!(runner.is_ancestor(&work, &base, &one).await.unwrap());
+        assert!(!runner.is_ancestor(&work, &one, &two).await.unwrap());
+        assert!(
+            runner
+                .merge_conflicts(&work, &base, &one)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            runner.merge_conflicts(&work, &two, &one).await.unwrap(),
+            vec!["kustomization.yaml".to_string()]
+        );
+
+        // The real merge reports the same path and exposes every stage.
+        let conflicted = runner
+            .start_detached_merge(&work, &two, &one)
+            .await
+            .unwrap();
+        assert_eq!(conflicted, vec!["kustomization.yaml".to_string()]);
+        let stage = |n| runner.read_conflict_stage(&work, n, "kustomization.yaml");
+        assert_eq!(stage(1).await.unwrap().as_deref(), Some(index));
+        assert_eq!(
+            stage(2).await.unwrap().as_deref(),
+            Some("resources:\n  - a.yaml\n")
+        );
+        assert_eq!(
+            stage(3).await.unwrap().as_deref(),
+            Some("resources:\n  - b.yaml\n")
+        );
+        assert!(runner.write_tree(&work).await.is_err(), "conflicts remain");
+        tokio::fs::write(work.join("kustomization.yaml"), "resources: []\n")
+            .await
+            .unwrap();
+        runner.add(&work, ["kustomization.yaml"]).await.unwrap();
+        let tree = runner.write_tree(&work).await.unwrap();
+        let rebuilt = runner
+            .commit_tree(
+                &work,
+                &tree,
+                &one,
+                &["feat: drop b", "Rebuilt on one."],
+                &CommitAuthor::new("Original Author", "orig@example.com"),
+                &author,
+            )
+            .await
+            .unwrap();
+        runner.abort_merge(&work).await.unwrap();
+        assert_eq!(
+            runner.commit_subject(&work, &rebuilt).await.unwrap(),
+            "feat: drop b"
+        );
+        assert_eq!(
+            runner.commit_author(&work, &rebuilt).await.unwrap(),
+            CommitAuthor::new("Original Author", "orig@example.com")
+        );
+        assert!(runner.is_ancestor(&work, &one, &rebuilt).await.unwrap());
+        assert_eq!(
+            runner
+                .read_file_at_ref(&work, &rebuilt, "kustomization.yaml")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("resources: []\n")
+        );
+
+        // The lease refuses a stale expectation and replaces the branch otherwise.
+        assert!(
+            runner
+                .push_commit_with_lease(&work, "origin", &rebuilt, "two", &one)
+                .await
+                .is_err()
+        );
+        runner
+            .push_commit_with_lease(&work, "origin", &rebuilt, "two", &two)
+            .await
+            .unwrap();
+        runner.fetch(&work, "origin").await.unwrap();
+        assert_eq!(
+            runner.rev_parse(&work, "origin/two").await.unwrap(),
+            rebuilt
+        );
+
+        // A clean merge leaves nothing conflicted.
+        assert!(
+            runner
+                .start_detached_merge(&work, &base, &one)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        runner.abort_merge(&work).await.unwrap();
+        assert!(
+            runner.read_conflict_stage(&work, 4, "x").await.is_err(),
+            "stages are 1..=3"
+        );
     }
 
     #[tokio::test]

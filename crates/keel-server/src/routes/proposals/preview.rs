@@ -328,6 +328,15 @@ type FetchDebounceMap = std::collections::HashMap<(std::path::PathBuf, String), 
 static LAST_READ_FETCH: std::sync::LazyLock<std::sync::Mutex<FetchDebounceMap>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(FetchDebounceMap::new()));
 
+/// Drops the read-fetch debounce of `workdir`, so the next read fetches every branch again: called
+/// after Keel itself moved a branch (merge, stale-proposal rebuild) so diffs never lag behind it.
+pub(super) fn forget_read_fetches(workdir: &Path) {
+    LAST_READ_FETCH
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .retain(|(dir, _), _| dir != workdir);
+}
+
 /// Fetches `branches` into [`READ_REF_NAMESPACE`] **without** taking `git_lock`, debounced per
 /// `(workdir, branch)` and bounded by a short timeout. Failures are logged and tolerated: callers
 /// fall back to the last known `origin/*` refs.
