@@ -1184,12 +1184,18 @@ mod tests {
         let KubeError::PreviewSourceUnavailable(msg) = &err else {
             panic!("unexpected error {err:?}");
         };
-        assert!(msg.contains("tenant-acme/keel-gitops"), "{msg}");
+        assert!(
+            msg.contains("tenant-acme/keel-gitops"),
+            "unexpected refusal message"
+        );
         assert!(
             msg.contains("no fallback to the platform repository"),
-            "{msg}"
+            "unexpected refusal message"
         );
-        assert!(msg.contains("git-credentials"), "{msg}");
+        assert!(
+            msg.contains("git-credentials"),
+            "unexpected refusal message"
+        );
 
         for bad in [
             tenant_repo("tenant-acme", "keel-gitops", None, None),
@@ -1274,8 +1280,14 @@ spec:
         );
         match source.pko_project_repo(None) {
             Err(KubeError::TenantSourceUnavailable(msg)) => {
-                assert!(msg.contains("forge.publicUrl"), "{msg}");
-                assert!(msg.contains("tenant-default/keel-gitops"), "{msg}");
+                assert!(
+                    msg.contains("forge.publicUrl"),
+                    "unexpected refusal message"
+                );
+                assert!(
+                    msg.contains("tenant-default/keel-gitops"),
+                    "unexpected refusal message"
+                );
             }
             other => panic!("expected TenantSourceUnavailable, got {other:?}"),
         }
@@ -1362,7 +1374,7 @@ spec:
             assert!(
                 msg.contains("re-run `keel bootstrap init` with `--with-forge`")
                     && msg.contains("network `--git-url`"),
-                "{msg}"
+                "refusal explains how to re-bootstrap with a reachable repository"
             );
         }
         // SSH sources would need an `identity` key the platform-written Secret does not have.

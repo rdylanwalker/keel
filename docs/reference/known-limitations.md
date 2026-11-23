@@ -4,7 +4,6 @@ Keel is alpha software. This page collects the limitations and open bugs a user 
 
 ## Releases and Scope
 
-- **These docs are ahead of v0.12.0.** They describe the next release. On v0.12.0, step 7 of the Quick Start (the `podinfo` canary) fails, and `keel serve` can leave its `kubectl port-forward` processes running after signals other than Ctrl+C. Use a newer release when one is published.
 - **No upgrade path.** A release marked breaking in the changelog (a `!` or `BREAKING CHANGE` entry) does not migrate clusters, GitOps repositories or tenant repositories. Start over with a fresh `keel bootstrap init` on a new cluster and a new repository.
 - **Local Docker socket flag is unsafe for tenants.** `--local-dev-docker-socket-exception`, used in the Quick Start for nested `kind` clusters, exposes the host Docker socket without authentication to PKO workspace pods and to any tenant pod that sets the workspace label. That is root on the host, so tenant isolation does not hold with this flag. Use it on throwaway machines only.
 - **Single-node management cluster.** The management cluster is a single node with no high availability.

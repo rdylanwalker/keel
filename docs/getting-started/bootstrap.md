@@ -227,7 +227,7 @@ The `forgejo.keel.local` entry is needed so PR links printed by the CLI and show
 keel serve --repo-dir ./keel-gitops    # binds 127.0.0.1:8080 by default
 ```
 
-Stop it with **Ctrl+C**, `SIGTERM` or `SIGHUP`; each stops its `kubectl port-forward` processes. Only `kill -9` leaves them running, and the next start then names the busy port (`8888` or `3000`). v0.12.0 cleans up only on Ctrl+C.
+Stop it with **Ctrl+C**, `SIGTERM` or `SIGHUP`; each stops its `kubectl port-forward` processes. Only `kill -9` leaves them running, and the next start then names the busy port (`8888` or `3000`).
 
 When a Kubernetes cluster is reachable (through `KUBECONFIG` or in-cluster config), `keel serve`:
 
