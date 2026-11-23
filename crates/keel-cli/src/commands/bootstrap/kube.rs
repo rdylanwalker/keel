@@ -238,9 +238,45 @@ impl Drop for TempPortForward {
     }
 }
 
-fn pick_local_port(preferred: u16) -> Result<u16, CliError> {
-    let listener = std::net::TcpListener::bind(("127.0.0.1", preferred))
-        .or_else(|_| std::net::TcpListener::bind("127.0.0.1:0"))?;
+/// Which host port a `kubectl port-forward` listens on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LocalPort {
+    /// Prefer this port, falling back (with a warning) to a random free port when it is taken.
+    Preferred(u16),
+    /// Exactly this port (e.g. `8888`, baked into the OIDC issuer URL); taken means an error.
+    Required(u16),
+}
+
+/// Explains a busy host port: usually an orphaned `kubectl port-forward` from an earlier
+/// `keel serve`/`keel bootstrap` that was killed without cleaning up its children.
+pub(crate) fn port_in_use_hint(port: u16) -> String {
+    format!(
+        "host port 127.0.0.1:{port} is already in use, most likely by an orphaned `kubectl \
+         port-forward` left behind by an earlier `keel serve` (check with `ss -ltnp \
+         'sport = :{port}'` or `lsof -i :{port}`; stop it with `pkill -f \
+         'kubectl.*port-forward.*{port}:'`)"
+    )
+}
+
+fn pick_local_port(port: LocalPort) -> Result<u16, CliError> {
+    let preferred = match port {
+        LocalPort::Preferred(p) | LocalPort::Required(p) => p,
+    };
+    let listener = match std::net::TcpListener::bind(("127.0.0.1", preferred)) {
+        Ok(listener) => listener,
+        Err(_) if matches!(port, LocalPort::Required(_)) => {
+            return Err(CliError::Execution(port_in_use_hint(preferred)));
+        }
+        Err(_) => {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+            tracing::warn!(
+                fallback_port = listener.local_addr()?.port(),
+                "{}; using a random free port instead",
+                port_in_use_hint(preferred)
+            );
+            listener
+        }
+    };
     Ok(listener.local_addr()?.port())
 }
 
@@ -250,10 +286,10 @@ pub(crate) async fn start_port_forward(
     target: KubeTarget<'_>,
     namespace: &str,
     resource: &str,
-    preferred_local_port: u16,
+    local_port: LocalPort,
     remote_port: u16,
 ) -> Result<TempPortForward, CliError> {
-    let local_port = pick_local_port(preferred_local_port)?;
+    let local_port = pick_local_port(local_port)?;
     let mut cmd = target.cmd();
     cmd.args([
         "-n",
@@ -291,7 +327,7 @@ pub(crate) async fn start_forgejo_port_forward(
         KubeTarget::new(context, kubeconfig),
         KEEL_SYSTEM_NAMESPACE,
         "svc/forgejo-http",
-        3000,
+        LocalPort::Preferred(3000),
         3000,
     )
     .await?;
@@ -347,10 +383,41 @@ pub(crate) async fn start_gateway_port_forward(
         target,
         KEEL_SYSTEM_NAMESPACE,
         &format!("svc/{svc_name}"),
-        8888,
+        // The OIDC issuer (`https://idp.keel.local:8888/...`) names this port.
+        LocalPort::Required(8888),
         8888,
     )
     .await
+}
+
+#[cfg(test)]
+mod local_port_tests {
+    use super::*;
+
+    /// A taken required port (8888, named by the OIDC issuer) is reported with the orphaned
+    /// port-forward hint instead of silently moving to a random port; a taken preferred port
+    /// falls back to a free one.
+    #[test]
+    fn busy_ports_are_reported_or_replaced() {
+        let busy = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = busy.local_addr().unwrap().port();
+
+        let err = pick_local_port(LocalPort::Required(port))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(&format!("127.0.0.1:{port} is already in use")),
+            "{err}"
+        );
+        assert!(err.contains("orphaned `kubectl port-forward`"), "{err}");
+        assert!(err.contains(&format!("port-forward.*{port}:")), "{err}");
+
+        let fallback = pick_local_port(LocalPort::Preferred(port)).unwrap();
+        assert_ne!(fallback, port);
+
+        drop(busy);
+        assert_eq!(pick_local_port(LocalPort::Required(port)).unwrap(), port);
+    }
 }
 
 #[cfg(test)]

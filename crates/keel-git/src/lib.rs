@@ -25,8 +25,8 @@ pub use forgejo_admin::{
     AccessTokenInfo, ProvisionOutcome, ServiceUserSpec, StrayCredentialReport, TeamSpec,
 };
 pub use git::{
-    CommitAuthor, GitCredentials, GitError, GitRunner, ensure_workdir_from_remote,
-    parse_proposal_branch_tenant, validate_git_ref,
+    CommitAuthor, GitCredentials, GitError, GitRunner, REMOTE_CREDENTIAL_STORE_FILE,
+    ensure_workdir_from_remote, parse_proposal_branch_tenant, validate_git_ref,
 };
 pub use local::LocalGitProvider;
 pub use remote::{

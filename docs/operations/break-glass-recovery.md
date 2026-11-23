@@ -75,7 +75,7 @@ keel bootstrap recover \
 
 The dry run prints the backend URL (`s3://pulumi-state/stage0/keel-mgmt?endpoint=...`), the stacks it will recover, the prerequisites, and the exact `pulumi` argv it would run. Secrets are passed only through environment variables and stdin, and never appear in argv.
 
-Without `--stack`, the dry run currently lists only `stage0-control-plane-<cluster>`, while a real run recovers every `control-plane*` stack in the escrow manifest (for example also `stage0-control-plane-forgejo-<cluster>` and `stage0-control-plane-rauthy-<cluster>`).
+Without `--stack`, a real run recovers every `control-plane*` stack in the escrow manifest (`s3://pulumi-state/stage0/<cluster>/manifest.json`: `stage0-control-plane-<cluster>`, plus `stage0-control-plane-forgejo-<cluster>` and `stage0-control-plane-rauthy-<cluster>` when bootstrap installed them). The dry run shows the same list: with `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` set it reads the manifest, otherwise it lists every control-plane stack Keel can create and says so. If the manifest cannot be read (S3 port-forward not up yet, unrelated AWS keys exported), the dry run still prints the plan with that candidate list and names the S3 error. (v0.12.0's dry run listed only `stage0-control-plane-<cluster>`.)
 
 ### 5. Execute
 

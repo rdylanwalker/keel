@@ -2227,7 +2227,7 @@ spec:
             ),
             (
                 "../../deploy/catalog/infra/proxmox-k3s-cluster/catalog.yaml",
-                InfraResourceKind::Cluster,
+                InfraResourceKind::Vm,
                 false,
             ),
             (

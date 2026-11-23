@@ -1,7 +1,8 @@
-# Proxmox VE k3s Workload Cluster Pulumi Stack (`bpg/proxmox` bridge)
+# Proxmox VE VM Pulumi Stack (`bpg/proxmox` bridge): one VM cloned from a cloud-init template,
+# meant as a k3s node. It installs no k3s and exports no kubeconfig.
 name: proxmox-k3s-cluster
 runtime: yaml
-description: Provision a k3s workload cluster VM on Proxmox VE via bpg/proxmox
+description: Clone one Proxmox VE VM (for a k3s node; no k3s installed) via bpg/proxmox
 
 packages:
   proxmox:

@@ -106,7 +106,7 @@ keel bootstrap init \
 keel serve --repo-dir ./keel-gitops     # http://127.0.0.1:8080
 ```
 
-Stop it with **Ctrl+C**. Other signals can leave its `kubectl port-forward` processes running.
+Stop it with **Ctrl+C**. On v0.12.0 other signals can leave its `kubectl port-forward` processes running.
 
 **5. Log in.** The CLI prints the login URL and tries to open your browser (on WSL2 through `wslview`; otherwise open the printed URL in your Windows browser, or pass `--no-browser`). Sign in with the admin credentials. The IdP uses a self-signed certificate, so expect a browser warning for `https://idp.keel.local:8888`.
 

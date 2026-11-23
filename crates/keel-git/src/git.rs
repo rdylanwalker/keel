@@ -340,6 +340,37 @@ fn validate_remote_url(remote_url: &str) -> Result<(), GitError> {
     Ok(())
 }
 
+/// Repository-local git-credential-store file (inside the git dir) written by
+/// [`GitRunner::configure_remote_credential_store`].
+pub const REMOTE_CREDENTIAL_STORE_FILE: &str = "keel-credentials";
+
+/// Writes `contents` to `path`, readable and writable by the current user only (`0600` on Unix).
+async fn write_private_file(path: &Path, contents: &[u8]) -> Result<(), GitError> {
+    let path = path.to_path_buf();
+    let contents = contents.to_vec();
+    tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        use std::io::Write;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            opts.mode(0o600);
+            let mut file = opts.open(&path)?;
+            // `mode` only applies on creation; tighten a pre-existing file too.
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            file.write_all(&contents)
+        }
+        #[cfg(not(unix))]
+        {
+            opts.open(&path)?.write_all(&contents)
+        }
+    })
+    .await
+    .map_err(|e| GitError::Io(std::io::Error::other(e)))??;
+    Ok(())
+}
+
 /// Direct `git` CLI runner executing commands via `tokio::process::Command::new("git")`
 /// with explicit argument vectors (never invoking a shell).
 #[derive(Debug, Clone)]
@@ -1400,6 +1431,161 @@ impl GitRunner {
         Ok(())
     }
 
+    /// Makes `remote` (an `http(s)://` URL) of the working copy at `work_dir` usable for a human
+    /// `git pull`/`git push` without ever putting the secret in the remote URL: writes a `0600`
+    /// git-credential-store file ([`REMOTE_CREDENTIAL_STORE_FILE`], inside the repository's git
+    /// dir, so it is never committed) holding exactly one entry for the remote's origin, and
+    /// points a repository-local, URL-scoped `credential.<origin>.helper` at it (after an empty
+    /// value that drops inherited global helpers for that origin). Keel-owned helper entries for
+    /// other origins (e.g. an earlier port-forward port) are removed. Returns the store path.
+    pub async fn configure_remote_credential_store(
+        &self,
+        work_dir: &Path,
+        remote: &str,
+        username: &str,
+        secret: &str,
+    ) -> Result<PathBuf, GitError> {
+        let invalid = |field: &'static str, reason: &str| GitError::InvalidArgument {
+            field,
+            reason: reason.to_string(),
+        };
+        if username.is_empty() || secret.is_empty() {
+            return Err(invalid(
+                "credential",
+                "username and secret must not be empty",
+            ));
+        }
+        let remote_url = self.get_remote_url(work_dir, remote).await?;
+        let parsed = url::Url::parse(&remote_url)
+            .map_err(|_| invalid("remote_url", "remote is not an http(s) URL"))?;
+        if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+            return Err(invalid("remote_url", "remote is not an http(s) URL"));
+        }
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            return Err(invalid(
+                "remote_url",
+                "remote URL must not embed credentials",
+            ));
+        }
+        let origin = parsed.origin().ascii_serialization();
+        let (store, helper) = self.remote_credential_store_helper(work_dir).await?;
+
+        let mut entry = url::Url::parse(&origin)
+            .map_err(|_| invalid("remote_url", "remote origin is not a valid URL"))?;
+        entry
+            .set_username(username)
+            .and_then(|()| entry.set_password(Some(secret)))
+            .map_err(|()| invalid("credential", "cannot encode the credential"))?;
+        let line = format!("{}\n", entry.as_str().trim_end_matches('/'));
+        write_private_file(&store, line.as_bytes()).await?;
+
+        // Drop Keel's helper from any other origin of this repository.
+        let key = format!("credential.{origin}.helper");
+        self.unset_credential_helper_keys(work_dir, &helper, Some(&key))
+            .await?;
+        self.exec(
+            Some(work_dir),
+            "config",
+            &["config", "--local", "--replace-all", &key, ""],
+            &[],
+        )
+        .await?;
+        self.exec(
+            Some(work_dir),
+            "config",
+            &["config", "--local", "--add", &key, &helper],
+            &[],
+        )
+        .await?;
+        Ok(store)
+    }
+
+    /// Undoes [`Self::configure_remote_credential_store`]: unsets every repository-local
+    /// `credential.<origin>.helper` key pointing at Keel's store (with the empty reset value Keel
+    /// added before it) and deletes the store file. Idempotent; returns whether a store file was
+    /// removed. `keel serve` calls it on shutdown so the platform token neither outlives the
+    /// port-forward it was scoped to (a later `git pull` would offer it to whatever process then
+    /// listens on that loopback port) nor stays on disk outside Kubernetes Secrets.
+    pub async fn remove_remote_credential_store(&self, work_dir: &Path) -> Result<bool, GitError> {
+        let (store, helper) = self.remote_credential_store_helper(work_dir).await?;
+        self.unset_credential_helper_keys(work_dir, &helper, None)
+            .await?;
+        match tokio::fs::remove_file(&store).await {
+            Ok(()) => Ok(true),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    /// Path of Keel's credential store for the working copy at `work_dir` and the
+    /// `credential.helper` value pointing at it.
+    async fn remote_credential_store_helper(
+        &self,
+        work_dir: &Path,
+    ) -> Result<(PathBuf, String), GitError> {
+        let git_dir = self
+            .exec(
+                Some(work_dir),
+                "rev-parse",
+                &["rev-parse", "--absolute-git-dir"],
+                &[],
+            )
+            .await?;
+        let store = PathBuf::from(git_dir.trim()).join(REMOTE_CREDENTIAL_STORE_FILE);
+        let store_str = store
+            .to_str()
+            .filter(|p| !p.contains(['\'', '\n', '\r', '\0']))
+            .ok_or_else(|| GitError::InvalidArgument {
+                field: "git_dir",
+                reason: "repository path must be valid UTF-8 without quotes or newlines"
+                    .to_string(),
+            })?;
+        // git runs non-`!` helpers as `git credential-<helper>` through its shell; the path is
+        // single-quoted and cannot contain a quote.
+        let helper = format!("store --file='{store_str}'");
+        Ok((store, helper))
+    }
+
+    /// Unsets (all values of) every repository-local `credential.*.helper` key that has `helper`
+    /// as one of its values, except `keep`.
+    async fn unset_credential_helper_keys(
+        &self,
+        work_dir: &Path,
+        helper: &str,
+        keep: Option<&str>,
+    ) -> Result<(), GitError> {
+        let existing = self
+            .exec_raw(
+                Some(work_dir),
+                "config",
+                &[
+                    "config",
+                    "--local",
+                    "--get-regexp",
+                    r"^credential\..*\.helper$",
+                ],
+                &[],
+            )
+            .await?;
+        let keys: std::collections::BTreeSet<&str> = existing
+            .stdout
+            .lines()
+            .filter_map(|l| l.split_once(' '))
+            .filter(|(k, v)| *v == helper && keep.is_none_or(|keep| !k.eq_ignore_ascii_case(keep)))
+            .map(|(k, _)| k)
+            .collect();
+        for key in keys {
+            self.exec(
+                Some(work_dir),
+                "config",
+                &["config", "--local", "--unset-all", key],
+                &[],
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
     /// Executes `git` directly via `tokio::process::Command` with argument vectors and ephemeral auth.
     /// Runs `git` and returns its exit code and (redacted) output whatever the exit status, for
     /// commands whose non-zero exit codes carry meaning (`merge`, `merge-base --is-ancestor`).
@@ -1937,6 +2123,131 @@ mod tests {
             password_or_token: "secret".to_string(),
         });
         assert!(format!("{:?}", authed.credentials()).contains("[REDACTED]"));
+    }
+
+    /// A human `git pull` in the working copy gets the forge credential from a repository-local
+    /// `0600` store scoped to the remote's origin; the remote URL never carries the secret, and a
+    /// moved origin (another port-forward port) drops the stale helper.
+    #[tokio::test]
+    async fn remote_credential_store_is_private_and_origin_scoped() {
+        let tmp = TempDir::new().unwrap();
+        let work = tmp.path().join("work");
+        let runner = GitRunner::new();
+        runner
+            .init_worktree_with_remote(&work, "main", "http://127.0.0.1:3000/keel/infra-gitops.git")
+            .await
+            .unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&work)
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("HOME", tmp.path())
+                .output()
+                .unwrap();
+            String::from_utf8(out.stdout).unwrap()
+        };
+        let fill = |port: u16| {
+            let mut child = std::process::Command::new("git")
+                .args(["credential", "fill"])
+                .current_dir(&work)
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("HOME", tmp.path())
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            use std::io::Write;
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(format!("protocol=http\nhost=127.0.0.1:{port}\n\n").as_bytes())
+                .unwrap();
+            String::from_utf8(child.wait_with_output().unwrap().stdout).unwrap()
+        };
+
+        let store = runner
+            .configure_remote_credential_store(&work, "origin", "keel", "s3cr+t/tok")
+            .await
+            .unwrap();
+        assert!(store.ends_with(format!(".git/{REMOTE_CREDENTIAL_STORE_FILE}")));
+        assert_eq!(
+            std::fs::read_to_string(&store).unwrap(),
+            "http://keel:s3cr+t%2Ftok@127.0.0.1:3000\n"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&store).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        assert_eq!(
+            git(&["remote", "get-url", "origin"]).trim(),
+            "http://127.0.0.1:3000/keel/infra-gitops.git"
+        );
+        let helpers = git(&[
+            "config",
+            "--get-all",
+            "credential.http://127.0.0.1:3000.helper",
+        ]);
+        assert_eq!(helpers, format!("\nstore --file='{}'\n", store.display()));
+        let filled = fill(3000);
+        assert!(filled.contains("username=keel\n"), "{filled}");
+        assert!(filled.contains("password=s3cr+t/tok\n"), "{filled}");
+
+        // The port-forward moved: only the new origin keeps a helper and an entry.
+        runner
+            .set_remote_url(
+                &work,
+                "origin",
+                "http://127.0.0.1:41673/keel/infra-gitops.git",
+            )
+            .await
+            .unwrap();
+        runner
+            .configure_remote_credential_store(&work, "origin", "keel", "rotated")
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&store).unwrap(),
+            "http://keel:rotated@127.0.0.1:41673\n"
+        );
+        assert!(
+            git(&[
+                "config",
+                "--get-all",
+                "credential.http://127.0.0.1:3000.helper"
+            ])
+            .is_empty()
+        );
+        assert!(fill(41673).contains("password=rotated\n"));
+
+        // Shutdown cleanup removes the helper (with its reset value) and the store, idempotently.
+        assert!(runner.remove_remote_credential_store(&work).await.unwrap());
+        assert!(!store.exists());
+        assert!(
+            git(&["config", "--local", "--get-regexp", r"^credential\."])
+                .trim()
+                .is_empty()
+        );
+        assert!(!fill(41673).contains("password="));
+        assert!(!runner.remove_remote_credential_store(&work).await.unwrap());
+
+        // Remotes the store cannot serve are refused.
+        runner
+            .set_remote_url(&work, "origin", "/srv/keel-gitops.git")
+            .await
+            .unwrap();
+        assert!(
+            runner
+                .configure_remote_credential_store(&work, "origin", "keel", "x")
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

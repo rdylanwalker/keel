@@ -18,7 +18,7 @@ use axum::Router;
 use axum::routing::{delete, get, post, put};
 use tower_http::trace::TraceLayer;
 
-pub use auth::{SESSION_COOKIE_NAME, SessionClaims, encrypt_session_token};
+pub use auth::{SESSION_COOKIE_NAME, SessionClaims, check_oidc_discovery, encrypt_session_token};
 pub use error::ServerError;
 pub use preview_lifecycle::{
     PREVIEW_RECONCILE_INTERVAL, gc_preview_for_pr, reconcile_previews_once,

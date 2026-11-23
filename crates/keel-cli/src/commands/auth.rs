@@ -298,6 +298,19 @@ pub(crate) async fn execute_auth_login_with(
         listener.local_addr()?.port()
     );
     let login_url = build_cli_login_url(&base_url, &redirect_uri, &pkce, args.force_prompt);
+    // Second preflight: the login endpoint itself answers `503` (no redirect) when the server
+    // cannot reach the IdP's discovery document; report it here instead of opening a browser on
+    // an error page and waiting for a callback that never comes. The flow it starts is stateless
+    // (an unused PKCE cookie), so probing it is harmless.
+    let probe = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(15))
+        .build()?;
+    if let Ok(resp) = probe.get(&login_url).send().await
+        && resp.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE
+    {
+        return Err(extract_api_error(resp).await);
+    }
     open_url(&login_url);
 
     let code = tokio::time::timeout(
@@ -504,6 +517,44 @@ mod tests {
             parse_callback_request("GET /callback?state=x HTTP/1.1"),
             CallbackResult::Error(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn login_reports_unreachable_idp_without_opening_a_browser() {
+        let app = Router::new().route(
+            CLI_LOGIN_PATH,
+            get(|| async {
+                (
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({"error": "OIDC discovery for the configured issuer `https://idp.keel.local` failed"})),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let dir = std::env::temp_dir().join(format!("keel-auth-test-{}", uuid::Uuid::new_v4()));
+        let ctx = CliContext::with_credentials_path(dir.join("creds.json"));
+        let args = AuthLoginArgs {
+            server: format!("http://127.0.0.1:{}", addr.port()),
+            no_browser: true,
+            force_prompt: false,
+            timeout_secs: 20,
+        };
+        let opened = std::sync::atomic::AtomicBool::new(false);
+        let err = execute_auth_login_with(&args, &ctx, |_| {
+            opened.store(true, std::sync::atomic::Ordering::SeqCst);
+        })
+        .await
+        .unwrap_err();
+        assert!(!opened.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(
+            err.to_string()
+                .contains("OIDC discovery for the configured issuer"),
+            "{err}"
+        );
+        server.abort();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]

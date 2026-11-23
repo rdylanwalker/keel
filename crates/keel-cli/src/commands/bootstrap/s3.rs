@@ -20,7 +20,7 @@ use serde_json::json;
 use sha2::Sha256;
 use zeroize::Zeroizing;
 
-use super::kube::{KubeTarget, SecretWrite, TempPortForward, start_port_forward};
+use super::kube::{KubeTarget, LocalPort, SecretWrite, TempPortForward, start_port_forward};
 use crate::commands::CliError;
 
 /// Default S3 region used for SeaweedFS (matches the in-cluster PKO backend URL).
@@ -570,7 +570,7 @@ pub(crate) async fn start_seaweedfs_s3_port_forward(
         target,
         KEEL_SYSTEM_NAMESPACE,
         SEAWEEDFS_S3_SERVICE,
-        18333,
+        LocalPort::Preferred(18333),
         SEAWEEDFS_S3_PORT,
     )
     .await

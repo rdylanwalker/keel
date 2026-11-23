@@ -15,8 +15,10 @@ import {
 
 /**
  * Mocked-harness scope: no cluster is connected, so Flagger analysis/rollback cannot run here.
- * These specs cover the GitOps side (Canary manifests in the PR) and the SSE transport; the live
- * Progressing -> Ready / rollback lifecycle is exercised by 07-kind-live-e2e.
+ * These specs cover the GitOps side (Canary manifests in the PR) and the SSE transport. The live
+ * suite (07-kind-live-e2e) only goes as far as a deployed Canary reaching `Initialized` (and the
+ * workload cluster's canary Kustomization becoming Ready); no spec drives a canary analysis,
+ * promotion or rollback, so that lifecycle is untested.
  */
 test.describe('04 - Flagger Canary Lifecycle & Live SSE Event Stream', () => {
   test('04.1 - Releases and SSE stream require auth; /metrics is public', async ({ request }) => {

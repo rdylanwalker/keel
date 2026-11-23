@@ -443,49 +443,215 @@ fn build_oidc_http_client(
         .map_err(|e| ServerError::Internal(format!("Failed to construct HTTP client: {e}")))
 }
 
-async fn resolve_oidc_endpoints(issuer_url: &str, ca_pem: Option<&[u8]>) -> ResolvedOidcEndpoints {
+/// Renders an error and its `source()` chain (`reqwest` hides the DNS/connect cause there).
+fn error_chain(err: &(dyn std::error::Error + 'static)) -> String {
+    let mut out = err.to_string();
+    let mut source = err.source();
+    while let Some(cause) = source {
+        let text = cause.to_string();
+        if !out.contains(&text) {
+            out.push_str(": ");
+            out.push_str(&text);
+        }
+        source = cause.source();
+    }
+    out
+}
+
+/// `cause` (an [`error_chain`] rendering) says the host name did not resolve.
+fn is_dns_failure(cause: &str) -> bool {
+    let cause = cause.to_ascii_lowercase();
+    [
+        "dns error",
+        "failed to lookup",
+        "name or service not known",
+        "no such host",
+    ]
+    .iter()
+    .any(|needle| cause.contains(needle))
+}
+
+/// Operator-facing explanation of a failed OIDC discovery for `issuer`. The hosts-file hint for
+/// local bootstraps (e.g. `idp.keel.local`) is only given when the issuer host is a DNS name
+/// other than `localhost` and the cause is a resolution failure; otherwise the IdP (or the
+/// `keel serve` port-forward) on `host:port` is reported as unreachable.
+pub fn oidc_discovery_failure_message(issuer: &str, cause: &str) -> String {
+    let issuer = issuer.trim_end_matches('/');
+    let parsed = reqwest::Url::parse(issuer).ok();
+    let host = parsed.as_ref().and_then(|u| u.host());
+    let host_port = parsed
+        .as_ref()
+        .and_then(|u| {
+            let host = u.host_str()?;
+            Some(match u.port_or_known_default() {
+                Some(port) => format!("{host}:{port}"),
+                None => host.to_string(),
+            })
+        })
+        .unwrap_or_else(|| issuer.to_string());
+    let prefix = format!(
+        "OIDC discovery failed for issuer `{issuer}` ({cause}), so logins cannot start. \
+         keel-server must reach `{issuer}/.well-known/openid-configuration` itself."
+    );
+    match host {
+        Some(url::Host::Domain(name))
+            if !name.eq_ignore_ascii_case("localhost") && is_dns_failure(cause) =>
+        {
+            format!(
+                "{prefix} `{name}` does not resolve on the machine running keel-server: for a \
+                 local kind bootstrap add `127.0.0.1 {name}` to /etc/hosts there (the `keel \
+                 serve` process needs it, not only the browser), make sure the IdP is up, then \
+                 retry the login"
+            )
+        }
+        _ => format!(
+            "{prefix} Make sure the IdP (or the `keel serve` port-forward to it) is listening \
+             on `{host_port}` and that no other process holds that port, then retry the login"
+        ),
+    }
+}
+
+/// Fixed, client-facing text for a failed OIDC discovery: the cause (DNS/connect/TLS detail,
+/// internal hosts) and the operator fix are only logged server-side (`NFR-SEC-05`).
+fn oidc_discovery_client_message(issuer: &str) -> String {
+    format!(
+        "OIDC discovery for the configured issuer `{}` failed, so logins cannot start; see the \
+         keel-server (`keel serve`) log for the cause and fix",
+        issuer.trim_end_matches('/')
+    )
+}
+
+/// Resolves the IdP endpoints from its OIDC discovery document. There is no guessed fallback:
+/// an unreachable or invalid discovery document is an error whose message names the cause.
+async fn resolve_oidc_endpoints(
+    issuer_url: &str,
+    ca_pem: Option<&[u8]>,
+) -> Result<ResolvedOidcEndpoints, String> {
     let issuer = issuer_url.trim_end_matches('/');
     let discovery_url = format!("{issuer}/.well-known/openid-configuration");
-    if let Ok(client) = build_oidc_http_client(2, ca_pem)
-        && let Ok(resp) = client.get(&discovery_url).send().await
-        && resp.status().is_success()
-        && let Ok(doc) = resp.json::<OidcDiscoveryDocument>().await
+    let client = build_oidc_http_client(2, ca_pem).map_err(|e| e.to_string())?;
+    let resp = client
+        .get(&discovery_url)
+        .send()
+        .await
+        .map_err(|e| error_chain(&e))?;
+    if !resp.status().is_success() {
+        return Err(format!("`{discovery_url}` returned HTTP {}", resp.status()));
+    }
+    let doc = resp.json::<OidcDiscoveryDocument>().await.map_err(|e| {
+        format!(
+            "`{discovery_url}` is not a valid discovery document: {}",
+            error_chain(&e)
+        )
+    })?;
+    let expected_issuer = doc
+        .issuer
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| issuer.to_string());
+    // When `keel serve` port-forwards an in-cluster Dex instance to `127.0.0.1`,
+    // Dex's discovery document advertises its configured issuer URL (e.g.
+    // `.svc.cluster.local` or `dex.keel.local`), which a host browser without
+    // custom `/etc/hosts` entries cannot resolve.
+    if (issuer.starts_with("http://127.0.0.1:") || issuer.starts_with("http://localhost:"))
+        && !doc.authorization_endpoint.starts_with(issuer)
     {
-        let expected_issuer = doc
-            .issuer
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-            .unwrap_or_else(|| issuer.to_string());
-        // When `keel serve` port-forwards an in-cluster Dex instance to `127.0.0.1`,
-        // Dex's discovery document advertises its configured issuer URL (e.g.
-        // `.svc.cluster.local` or `dex.keel.local`), which a host browser without
-        // custom `/etc/hosts` entries cannot resolve.
-        if (issuer.starts_with("http://127.0.0.1:") || issuer.starts_with("http://localhost:"))
-            && !doc.authorization_endpoint.starts_with(issuer)
-        {
-            return ResolvedOidcEndpoints {
-                authorization_endpoint: format!("{issuer}/auth"),
-                token_endpoint: format!("{issuer}/token"),
-                jwks_uri: format!("{issuer}/keys"),
-                expected_issuer,
-            };
-        }
-        return ResolvedOidcEndpoints {
-            authorization_endpoint: doc.authorization_endpoint,
-            token_endpoint: doc.token_endpoint,
-            jwks_uri: doc.jwks_uri.unwrap_or_else(|| format!("{issuer}/keys")),
+        return Ok(ResolvedOidcEndpoints {
+            authorization_endpoint: format!("{issuer}/auth"),
+            token_endpoint: format!("{issuer}/token"),
+            jwks_uri: format!("{issuer}/keys"),
             expected_issuer,
-        };
+        });
     }
-    // Standard Dex OIDC endpoints fallback
-    ResolvedOidcEndpoints {
-        authorization_endpoint: format!("{issuer}/auth"),
-        token_endpoint: format!("{issuer}/token"),
-        jwks_uri: format!("{issuer}/keys"),
-        expected_issuer: issuer.to_string(),
+    Ok(ResolvedOidcEndpoints {
+        authorization_endpoint: doc.authorization_endpoint,
+        token_endpoint: doc.token_endpoint,
+        jwks_uri: doc.jwks_uri.unwrap_or_else(|| format!("{issuer}/keys")),
+        expected_issuer,
+    })
+}
+
+/// Startup probe for `keel serve`: `Err` carries [`oidc_discovery_failure_message`] when the
+/// configured issuer's discovery document cannot be fetched.
+pub async fn check_oidc_discovery(issuer_url: &str, ca_pem: Option<&[u8]>) -> Result<(), String> {
+    resolve_oidc_endpoints(issuer_url, ca_pem)
+        .await
+        .map(|_| ())
+        .map_err(|cause| oidc_discovery_failure_message(issuer_url, &cause))
+}
+
+/// [`resolve_oidc_endpoints`] for the login/callback handlers: a failure is logged loudly (with
+/// its cause and fix) and becomes a `503` with a fixed message instead of a redirect to a
+/// guessed endpoint.
+async fn resolve_oidc_endpoints_or_unavailable(
+    issuer_url: &str,
+    ca_pem: Option<&[u8]>,
+) -> Result<ResolvedOidcEndpoints, ServerError> {
+    resolve_oidc_endpoints(issuer_url, ca_pem)
+        .await
+        .map_err(|cause| {
+            tracing::warn!("{}", oidc_discovery_failure_message(issuer_url, &cause));
+            ServerError::ServiceUnavailable(oidc_discovery_client_message(issuer_url))
+        })
+}
+
+/// The request comes from a browser navigation (`Accept` includes `text/html`).
+fn accepts_html(headers: &HeaderMap) -> bool {
+    headers
+        .get(ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.to_ascii_lowercase().contains("text/html"))
+}
+
+fn escape_html(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            c => out.push(c),
+        }
     }
+    out
+}
+
+/// Error response for the browser-navigated auth endpoints (`/auth/login`, `/auth/cli/login`,
+/// `/auth/callback`): a minimal, escaped `text/html` page when a browser navigated there (a raw
+/// JSON document is no error page), the regular JSON error otherwise. Both carry the same
+/// client-safe reason and status.
+fn browser_error_response(headers: &HeaderMap, err: ServerError) -> Response {
+    if !accepts_html(headers) {
+        return err.into_response();
+    }
+    let reason = err.client_safe_reason();
+    let status = err.into_response().status();
+    let body = format!(
+        "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">\
+         <title>Keel sign-in unavailable</title></head><body>\
+         <h1>Keel sign-in failed</h1><p>{}</p><p><a href=\"/\">Back to Keel</a></p>\
+         </body></html>\n",
+        escape_html(&reason)
+    );
+    (
+        status,
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                HeaderValue::from_static("text/html; charset=utf-8"),
+            ),
+            (
+                axum::http::header::CACHE_CONTROL,
+                HeaderValue::from_static("no-store"),
+            ),
+        ],
+        body,
+    )
+        .into_response()
 }
 
 /// Response body for `GET /api/v1/auth/status`.
@@ -600,7 +766,7 @@ pub async fn oidc_login(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<OidcLoginQuery>,
-) -> Result<Response, ServerError> {
+) -> Response {
     begin_oidc_flow(
         &state,
         &headers,
@@ -609,6 +775,7 @@ pub async fn oidc_login(
         None,
     )
     .await
+    .unwrap_or_else(|err| browser_error_response(&headers, err))
 }
 
 /// Query parameters for `GET /api/v1/auth/cli/login` (RFC 8252 loopback CLI login).
@@ -636,6 +803,16 @@ pub async fn cli_login(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<CliLoginQuery>,
+) -> Response {
+    cli_login_inner(&state, &headers, query)
+        .await
+        .unwrap_or_else(|err| browser_error_response(&headers, err))
+}
+
+async fn cli_login_inner(
+    state: &AppState,
+    headers: &HeaderMap,
+    query: CliLoginQuery,
 ) -> Result<Response, ServerError> {
     let redirect_uri = validate_cli_loopback_redirect_uri(&query.redirect_uri)?;
     if !is_valid_cli_state(&query.state) {
@@ -658,8 +835,8 @@ pub async fn cli_login(
         ));
     }
     begin_oidc_flow(
-        &state,
-        &headers,
+        state,
+        headers,
         None,
         query.prompt.as_deref(),
         Some(CliLoginBinding {
@@ -727,7 +904,9 @@ async fn begin_oidc_flow(
     );
     let pkce_cookie = build_pkce_cookie_header(&encrypted_pkce, PKCE_TTL_SECONDS, secure)?;
 
-    let endpoints = resolve_oidc_endpoints(&oidc.issuer_url, state.oidc_ca_pem.as_deref()).await;
+    let endpoints =
+        resolve_oidc_endpoints_or_unavailable(&oidc.issuer_url, state.oidc_ca_pem.as_deref())
+            .await?;
     let authorization_endpoint = endpoints.authorization_endpoint;
     let scopes = oidc.scopes.join("%20");
     let sep = if authorization_endpoint.contains('?') {
@@ -793,6 +972,16 @@ pub async fn oidc_callback(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<OidcCallbackQuery>,
+) -> Response {
+    oidc_callback_inner(&state, &headers, query)
+        .await
+        .unwrap_or_else(|err| browser_error_response(&headers, err))
+}
+
+async fn oidc_callback_inner(
+    state: &AppState,
+    headers: &HeaderMap,
+    query: OidcCallbackQuery,
 ) -> Result<Response, ServerError> {
     if let Some(err) = query.error {
         return Err(ServerError::Unauthorized(format!(
@@ -816,7 +1005,7 @@ pub async fn oidc_callback(
         ));
     };
 
-    let pkce_cookie_raw = extract_cookie_value(&headers, PKCE_COOKIE_NAME)
+    let pkce_cookie_raw = extract_cookie_value(headers, PKCE_COOKIE_NAME)
         .ok_or_else(|| ServerError::Unauthorized("Missing OIDC PKCE state cookie".to_string()))?;
     let session_key = state.secret_store.get_or_create_session_key().await?;
 
@@ -842,7 +1031,9 @@ pub async fn oidc_callback(
         ));
     }
 
-    let endpoints = resolve_oidc_endpoints(&oidc.issuer_url, state.oidc_ca_pem.as_deref()).await;
+    let endpoints =
+        resolve_oidc_endpoints_or_unavailable(&oidc.issuer_url, state.oidc_ca_pem.as_deref())
+            .await?;
     let client = build_oidc_http_client(5, state.oidc_ca_pem.as_deref())?;
     let token_res = client
         .post(&endpoints.token_endpoint)
@@ -898,7 +1089,7 @@ pub async fn oidc_callback(
         exp: Utc::now().timestamp() + SESSION_TTL_SECONDS,
     };
 
-    let secure = is_secure_request(&headers);
+    let secure = is_secure_request(headers);
     if let Some(cli) = pkce.cli {
         // CLI loopback login: hand the browser a one-time code bound to the CLI's PKCE challenge
         // and loopback URI; no browser session cookie is issued.
@@ -2413,5 +2604,77 @@ mod tests {
         assert!(constant_time_eq(b"abc", b"abc"));
         assert!(!constant_time_eq(b"abc", b"abd"));
         assert!(!constant_time_eq(b"abc", b"ab"));
+    }
+
+    #[test]
+    fn discovery_failure_message_gives_hosts_hint_only_for_unresolved_dns_names() {
+        let dns = "error sending request: client error (Connect): dns error: failed to lookup \
+                   address information: Name or service not known";
+        let msg = oidc_discovery_failure_message("https://idp.keel.local:8888/auth/v1/", dns);
+        assert!(
+            msg.contains("`127.0.0.1 idp.keel.local` to /etc/hosts"),
+            "{msg}"
+        );
+
+        // Connection refused on a resolvable host (e.g. 8888 held by another process).
+        let refused = "error sending request: client error (Connect): tcp connect error: \
+                       Connection refused (os error 111)";
+        let msg = oidc_discovery_failure_message("https://idp.keel.local:8888/auth/v1", refused);
+        assert!(!msg.contains("/etc/hosts"), "{msg}");
+        assert!(msg.contains("listening on `idp.keel.local:8888`"), "{msg}");
+
+        // IP-literal and localhost issuers never get the hosts-file advice.
+        for issuer in ["http://127.0.0.1:5556", "http://localhost:5556/dex"] {
+            for cause in [dns, refused] {
+                let msg = oidc_discovery_failure_message(issuer, cause);
+                assert!(!msg.contains("/etc/hosts"), "{msg}");
+                assert!(msg.contains(":5556`"), "{msg}");
+            }
+        }
+        let msg = oidc_discovery_failure_message("https://idp.example.com", refused);
+        assert!(msg.contains("`idp.example.com:443`"), "{msg}");
+    }
+
+    #[test]
+    fn discovery_client_message_hides_the_cause() {
+        let msg = oidc_discovery_client_message("https://idp.keel.local/");
+        assert_eq!(
+            msg,
+            "OIDC discovery for the configured issuer `https://idp.keel.local` failed, so logins \
+             cannot start; see the keel-server (`keel serve`) log for the cause and fix"
+        );
+    }
+
+    #[test]
+    fn browser_error_response_renders_escaped_html_only_for_browser_navigations() {
+        let err = || ServerError::ServiceUnavailable("<script>alert('x')</script> & co".into());
+        let mut headers = HeaderMap::new();
+        let json = browser_error_response(&headers, err());
+        assert_eq!(json.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            json.headers()[axum::http::header::CONTENT_TYPE]
+                .to_str()
+                .unwrap()
+                .starts_with("application/json")
+        );
+
+        headers.insert(
+            ACCEPT,
+            HeaderValue::from_static("text/html,application/xhtml+xml,*/*;q=0.8"),
+        );
+        let html = browser_error_response(&headers, err());
+        assert_eq!(html.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            html.headers()[axum::http::header::CONTENT_TYPE],
+            "text/html; charset=utf-8"
+        );
+        let body =
+            futures::executor::block_on(axum::body::to_bytes(html.into_body(), 64 * 1024)).unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!body.contains("<script>"), "{body}");
+        assert!(
+            body.contains("&lt;script&gt;alert(&#39;x&#39;)&lt;/script&gt; &amp; co"),
+            "{body}"
+        );
     }
 }

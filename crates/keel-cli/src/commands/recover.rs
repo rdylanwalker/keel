@@ -60,18 +60,6 @@ fn validate_recover_args(args: &BootstrapRecoverArgs) -> Result<(S3Endpoint, Str
 
 /// Builds the explicit `pulumi` argv sequence for recovering `stacks` (zero shell, `NFR-SEC-06`).
 /// The backend is selected through `PULUMI_BACKEND_URL`, so no `pulumi login` is needed.
-pub fn build_pulumi_recover_argv(
-    args: &BootstrapRecoverArgs,
-) -> Result<(String, Vec<Vec<String>>), CliError> {
-    let (_, backend_url) = validate_recover_args(args)?;
-    let stacks = if args.stacks.is_empty() {
-        vec![stage0_stack_name("control-plane", &args.cluster_name)]
-    } else {
-        args.stacks.iter().map(|s| s.trim().to_string()).collect()
-    };
-    Ok((backend_url, plan_commands(args, &stacks)))
-}
-
 fn plan_commands(args: &BootstrapRecoverArgs, stacks: &[String]) -> Vec<Vec<String>> {
     let v = |parts: &[&str]| parts.iter().map(|s| s.to_string()).collect::<Vec<_>>();
     let mut cmds = Vec::new();
@@ -172,15 +160,120 @@ fn prerequisites_text(cluster: &str) -> String {
     format!(
         "Prerequisites:\n\
          \x20 - `pulumi` on PATH\n\
-         \x20 - AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY: S3 keys for the state bucket (SeaweedFS admin keys from\n\
+         \x20 - AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY: S3 keys for the state bucket (SeaweedFS admin keys:\n\
+         \x20   fields `admin_access_key_id` / `admin_secret_access_key` of the Secret\n\
          \x20   keel-system/s3-state-backend-seaweedfs-s3-secret, or your escrowed copy)\n\
          \x20 - Passphrase: PULUMI_CONFIG_PASSPHRASE, --passphrase-file, or ~/.config/keel/stage0/{cluster}/pulumi-passphrase\n\
          \x20 - --kubeconfig/--context for the target cluster if it changed since bootstrap\n"
     )
 }
 
+/// The escrow manifest (`<prefix>/manifest.json`) listing the escrowed Stage 0 stacks.
+async fn fetch_escrow_manifest(
+    client: &S3Client,
+    bucket: &str,
+    prefix: &str,
+) -> Result<Option<Value>, CliError> {
+    Ok(client
+        .get_object(bucket, &format!("{prefix}/manifest.json"), None)
+        .await?
+        .and_then(|raw| serde_json::from_slice(&raw).ok()))
+}
+
+/// Stacks a recovery without `--stack` re-runs: every escrowed control-plane stack, `control-plane`
+/// first. The cluster-provisioning stack (kind/cloud) is only re-run on request.
+fn recover_stacks(manifest: Option<&Value>, cluster: &str) -> Vec<String> {
+    let Some(list) = manifest
+        .and_then(|m| m.get("stacks"))
+        .and_then(Value::as_array)
+    else {
+        return vec![stage0_stack_name("control-plane", cluster)];
+    };
+    let mut stacks: Vec<String> = list
+        .iter()
+        .filter_map(|e| e.get("stack").and_then(Value::as_str).map(str::to_string))
+        .filter(|s| program_takes_kubeconfig(s, cluster))
+        .collect();
+    stacks.sort_by_key(|n| n != &stage0_stack_name("control-plane", cluster));
+    stacks
+}
+
+/// Every control-plane stack `keel bootstrap init` can escrow (the dry run's list without S3
+/// credentials to read the manifest).
+fn candidate_control_plane_stacks(cluster: &str) -> Vec<String> {
+    STAGE0_CONTROL_PLANE_PROGRAMS
+        .iter()
+        .map(|program| stage0_stack_name(program, cluster))
+        .collect()
+}
+
+/// Control-plane Stage 0 programs Keel ships, in recovery order.
+const STAGE0_CONTROL_PLANE_PROGRAMS: [&str; 3] = [
+    "control-plane",
+    "control-plane-forgejo",
+    "control-plane-rauthy",
+];
+
+/// Stacks the dry run lists, with a note on where the list came from. Read-only and never
+/// fatal: with S3 credentials it reads the same escrow manifest the real run recovers from, and
+/// falls back to every candidate control-plane stack (naming the S3 error) when that read fails
+/// (port-forward not up yet, unrelated AWS keys exported, ...).
+async fn dry_run_stacks(
+    args: &BootstrapRecoverArgs,
+    endpoint: &S3Endpoint,
+    prefix: &str,
+    creds: Option<S3Credentials>,
+) -> (Vec<String>, Option<String>) {
+    if !args.stacks.is_empty() {
+        return (
+            args.stacks.iter().map(|s| s.trim().to_string()).collect(),
+            None,
+        );
+    }
+    let manifest_url = format!("s3://{}/{prefix}/manifest.json", args.bucket);
+    let candidates = |why: String| {
+        (
+            candidate_control_plane_stacks(&args.cluster_name),
+            Some(format!(
+                "{why}; listing candidates: the real run recovers the control-plane stacks \
+                 listed in {manifest_url} (forgejo/rauthy only when bootstrapped with them)"
+            )),
+        )
+    };
+    let Some(creds) = creds else {
+        return candidates(
+            "AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY not set (set them for the exact list)"
+                .to_string(),
+        );
+    };
+    let manifest = match S3Client::new(endpoint.clone(), &args.region, creds) {
+        Ok(client) => fetch_escrow_manifest(&client, &args.bucket, prefix).await,
+        Err(err) => Err(err),
+    };
+    match manifest {
+        Ok(Some(manifest)) => (
+            recover_stacks(Some(&manifest), &args.cluster_name),
+            Some(format!("from {manifest_url}")),
+        ),
+        Ok(None) => (
+            recover_stacks(None, &args.cluster_name),
+            Some(format!("no {manifest_url}; default")),
+        ),
+        Err(err) => candidates(format!("could not read {manifest_url} ({err})")),
+    }
+}
+
 /// Executes `keel bootstrap recover`.
 pub async fn execute_bootstrap_recover(args: &BootstrapRecoverArgs) -> Result<String, CliError> {
+    execute_bootstrap_recover_with(args, S3Credentials::from_env()).await
+}
+
+/// [`execute_bootstrap_recover`] with injected S3 credentials (tests never read the ambient
+/// `AWS_*` environment).
+async fn execute_bootstrap_recover_with(
+    args: &BootstrapRecoverArgs,
+    creds: Option<S3Credentials>,
+) -> Result<String, CliError> {
     let (endpoint, backend_url) = validate_recover_args(args)?;
     let prefix = stage0_s3_prefix(&args.cluster_name);
 
@@ -192,13 +285,13 @@ pub async fn execute_bootstrap_recover(args: &BootstrapRecoverArgs) -> Result<St
     output.push_str(&format!("Backend URL:   {backend_url}\n"));
 
     if args.dry_run {
-        let (_, cmds) = build_pulumi_recover_argv(args)?;
-        let stacks = if args.stacks.is_empty() {
-            vec![stage0_stack_name("control-plane", &args.cluster_name)]
-        } else {
-            args.stacks.clone()
-        };
-        output.push_str(&format!("Stacks:        {}\n\n", stacks.join(", ")));
+        let (stacks, origin) = dry_run_stacks(args, &endpoint, &prefix, creds).await;
+        let cmds = plan_commands(args, &stacks);
+        output.push_str(&format!("Stacks:        {}\n", stacks.join(", ")));
+        if let Some(origin) = origin {
+            output.push_str(&format!("               ({origin})\n"));
+        }
+        output.push('\n');
         output.push_str(&prerequisites_text(&args.cluster_name));
         output.push_str(
             "\nPlan (dry run; PULUMI_BACKEND_URL / credentials / passphrase passed via env):\n",
@@ -209,7 +302,7 @@ pub async fn execute_bootstrap_recover(args: &BootstrapRecoverArgs) -> Result<St
         return Ok(output);
     }
 
-    let creds = S3Credentials::from_env().ok_or_else(|| {
+    let creds = creds.ok_or_else(|| {
         CliError::Validation(format!(
             "AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY must be set for the S3 state backend.\n{}",
             prerequisites_text(&args.cluster_name)
@@ -218,27 +311,11 @@ pub async fn execute_bootstrap_recover(args: &BootstrapRecoverArgs) -> Result<St
     let client = S3Client::new(endpoint.clone(), &args.region, creds.clone())?;
 
     // Discover stacks from the escrow manifest when not given explicitly.
-    let manifest: Option<Value> = client
-        .get_object(&args.bucket, &format!("{prefix}/manifest.json"), None)
-        .await?
-        .and_then(|raw| serde_json::from_slice(&raw).ok());
+    let manifest = fetch_escrow_manifest(&client, &args.bucket, &prefix).await?;
     let stacks: Vec<String> = if !args.stacks.is_empty() {
         args.stacks.iter().map(|s| s.trim().to_string()).collect()
-    } else if let Some(list) = manifest
-        .as_ref()
-        .and_then(|m| m.get("stacks"))
-        .and_then(Value::as_array)
-    {
-        // Control-plane first; the cluster-provisioning stack (kind/cloud) is only re-run on request.
-        let mut s: Vec<String> = list
-            .iter()
-            .filter_map(|e| e.get("stack").and_then(Value::as_str).map(str::to_string))
-            .filter(|s| program_takes_kubeconfig(s, &args.cluster_name))
-            .collect();
-        s.sort_by_key(|n| n != &stage0_stack_name("control-plane", &args.cluster_name));
-        s
     } else {
-        vec![stage0_stack_name("control-plane", &args.cluster_name)]
+        recover_stacks(manifest.as_ref(), &args.cluster_name)
     };
     output.push_str(&format!("Stacks:        {}\n", stacks.join(", ")));
 
@@ -463,8 +540,28 @@ mod tests {
             "--state-version",
             "v1",
         ]);
-        let out = execute_bootstrap_recover(&args).await.unwrap();
-        assert!(out.contains("Stacks:        stage0-control-plane-keel-mgmt\n"));
+        let out = execute_bootstrap_recover_with(&args, None).await.unwrap();
+        // Without S3 credentials the dry run lists every control-plane stack the real run may
+        // recover (it reads the escrow manifest), not just `control-plane`.
+        assert!(out.contains(
+            "Stacks:        stage0-control-plane-keel-mgmt, stage0-control-plane-forgejo-keel-mgmt, stage0-control-plane-rauthy-keel-mgmt\n"
+        ), "{out}");
+        assert!(
+            out.contains("s3://pulumi-state/stage0/keel-mgmt/manifest.json"),
+            "{out}"
+        );
+        for stack in candidate_control_plane_stacks("keel-mgmt") {
+            assert!(
+                out.contains(&format!(
+                    "pulumi up --yes --non-interactive --stack {stack}"
+                )),
+                "{out}"
+            );
+        }
+        assert!(
+            out.contains("`admin_access_key_id` / `admin_secret_access_key`"),
+            "{out}"
+        );
         assert!(out.contains("Backend URL:   s3://pulumi-state/stage0/keel-mgmt?endpoint=127.0.0.1:8333&region=us-east-1&s3ForcePathStyle=true&disableSSL=true"));
         assert!(out.contains(
             "pulumi refresh --yes --non-interactive --stack stage0-control-plane-keel-mgmt"
@@ -475,11 +572,117 @@ mod tests {
         assert!(!out.contains("pulumi login"));
     }
 
+    fn test_creds() -> S3Credentials {
+        S3Credentials {
+            access_key: "test-access".to_string(),
+            secret_key: zeroize::Zeroizing::new("test-secret".to_string()),
+        }
+    }
+
+    /// With S3 credentials the dry run lists exactly the escrowed control-plane stacks.
+    #[tokio::test]
+    async fn credentialed_dry_run_reads_the_escrow_manifest() {
+        let manifest = serde_json::json!({"stacks": [
+            {"stack": "stage0-kind-keel-mgmt"},
+            {"stack": "stage0-control-plane-forgejo-keel-mgmt"},
+            {"stack": "stage0-control-plane-keel-mgmt"},
+        ]});
+        let app = axum::Router::new().fallback(move |uri: axum::http::Uri| {
+            let manifest = manifest.clone();
+            async move {
+                assert!(
+                    uri.path().ends_with("/stage0/keel-mgmt/manifest.json"),
+                    "{uri}"
+                );
+                axum::Json(manifest)
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let mut args = parse(&["--dry-run", "--kubeconfig", "/tmp/kc"]);
+        args.s3_endpoint = format!("http://127.0.0.1:{port}");
+        let out = execute_bootstrap_recover_with(&args, Some(test_creds()))
+            .await
+            .unwrap();
+        assert!(
+            out.contains(
+                "Stacks:        stage0-control-plane-keel-mgmt, stage0-control-plane-forgejo-keel-mgmt\n"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains("(from s3://pulumi-state/stage0/keel-mgmt/manifest.json)"),
+            "{out}"
+        );
+        assert!(!out.contains("stage0-kind-keel-mgmt"), "{out}");
+        server.abort();
+    }
+
+    /// An unreachable S3 endpoint (port-forward not up, unrelated AWS keys) never aborts the
+    /// dry run: it lists the candidates and names the S3 error.
+    #[tokio::test]
+    async fn credentialed_dry_run_survives_an_unreachable_s3_endpoint() {
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let mut args = parse(&["--dry-run", "--kubeconfig", "/tmp/kc"]);
+        args.s3_endpoint = format!("http://127.0.0.1:{port}");
+        let out = execute_bootstrap_recover_with(&args, Some(test_creds()))
+            .await
+            .unwrap();
+        assert!(
+            out.contains(&format!(
+                "Stacks:        {}\n",
+                candidate_control_plane_stacks("keel-mgmt").join(", ")
+            )),
+            "{out}"
+        );
+        assert!(
+            out.contains("could not read s3://pulumi-state/stage0/keel-mgmt/manifest.json ("),
+            "{out}"
+        );
+        assert!(out.contains("listing candidates"), "{out}");
+        assert!(!out.contains("test-secret"), "{out}");
+        assert!(out.contains("Plan (dry run"), "{out}");
+    }
+
+    /// The real run and the credentialed dry run share one stack list: every escrowed
+    /// control-plane stack, `control-plane` first, never the cluster-provisioning stack.
+    #[test]
+    fn recover_stacks_follow_the_escrow_manifest() {
+        let manifest = serde_json::json!({"stacks": [
+            {"stack": "stage0-kind-keel-mgmt"},
+            {"stack": "stage0-control-plane-rauthy-keel-mgmt"},
+            {"stack": "stage0-control-plane-forgejo-keel-mgmt"},
+            {"stack": "stage0-control-plane-keel-mgmt"},
+        ]});
+        assert_eq!(
+            recover_stacks(Some(&manifest), "keel-mgmt"),
+            [
+                "stage0-control-plane-keel-mgmt",
+                "stage0-control-plane-rauthy-keel-mgmt",
+                "stage0-control-plane-forgejo-keel-mgmt",
+            ]
+        );
+        assert_eq!(
+            recover_stacks(None, "keel-mgmt"),
+            ["stage0-control-plane-keel-mgmt"]
+        );
+        // Every candidate is a program Keel can re-materialize.
+        for stack in candidate_control_plane_stacks("keel-mgmt") {
+            let program = program_from_stack_name(&stack, "keel-mgmt").unwrap();
+            assert!(embedded_program_yaml(&program).is_some(), "{program}");
+        }
+    }
+
     #[tokio::test]
     async fn validation_errors_name_the_right_flag() {
         let mut args = parse(&["--dry-run"]);
         args.s3_endpoint = "ftp://s3.local".into();
-        let err = execute_bootstrap_recover(&args)
+        let err = execute_bootstrap_recover_with(&args, None)
             .await
             .unwrap_err()
             .to_string();
@@ -488,10 +691,10 @@ mod tests {
 
         let mut args = parse(&["--dry-run"]);
         args.stacks = vec!["--malicious".into()];
-        assert!(execute_bootstrap_recover(&args).await.is_err());
+        assert!(execute_bootstrap_recover_with(&args, None).await.is_err());
         args.stacks = vec!["management-cluster-core".into()];
         assert!(
-            execute_bootstrap_recover(&args)
+            execute_bootstrap_recover_with(&args, None)
                 .await
                 .unwrap_err()
                 .to_string()
@@ -500,7 +703,7 @@ mod tests {
 
         let mut args = parse(&["--dry-run"]);
         args.snapshot = Some("../x".into());
-        assert!(execute_bootstrap_recover(&args).await.is_err());
+        assert!(execute_bootstrap_recover_with(&args, None).await.is_err());
     }
 
     #[tokio::test]
@@ -509,7 +712,7 @@ mod tests {
             return;
         }
         let args = parse(&[]);
-        let err = execute_bootstrap_recover(&args)
+        let err = execute_bootstrap_recover_with(&args, None)
             .await
             .unwrap_err()
             .to_string();

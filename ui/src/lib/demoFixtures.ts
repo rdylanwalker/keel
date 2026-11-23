@@ -305,14 +305,14 @@ export const DEFAULT_CATALOG: CatalogItem[] = [
   },
   {
     id: "proxmox-k3s-cluster",
-    name: "Proxmox VE k3s Workload Cluster",
+    name: "Proxmox VE VM (for k3s, VM only)",
     description:
-      "Provision a multi-node k3s workload cluster on Proxmox VE via bpg/proxmox OpenTofu/Terraform bridge.",
+      "Clone one VM from a cloud-init template on Proxmox VE via the bpg/proxmox OpenTofu/Terraform bridge, as a node to install k3s on. Installs no Kubernetes and exports no kubeconfig.",
     type: "infra",
-    category: "kubernetes-cluster",
+    category: "compute",
     version: "1.0.0",
     provider: "proxmox",
-    resourceKind: "cluster",
+    resourceKind: "vm",
     pulumiRuntime: "yaml",
     entrypoint: "Pulumi.yaml",
     protectByDefault: true,
@@ -323,7 +323,7 @@ export const DEFAULT_CATALOG: CatalogItem[] = [
       properties: {
         clusterName: {
           type: "string",
-          title: "Cluster Name",
+          title: "Cluster Name (VM name prefix)",
           pattern: "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$",
         },
         nodeName: {
@@ -339,14 +339,14 @@ export const DEFAULT_CATALOG: CatalogItem[] = [
         },
         cores: {
           type: "integer",
-          title: "vCPU Cores per Node",
+          title: "vCPU Cores",
           default: 4,
           minimum: 2,
           maximum: 32,
         },
         memoryMb: {
           type: "integer",
-          title: "Memory (MiB) per Node",
+          title: "Memory (MiB)",
           default: 8192,
           minimum: 2048,
         },

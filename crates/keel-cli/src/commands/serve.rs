@@ -455,9 +455,29 @@ pub(crate) async fn build_serve_state(
                 "http://127.0.0.1:{}/{}/{}.git",
                 pf.local_port, slug.owner, slug.repo
             );
-            let _ = git_runner
+            if git_runner
                 .set_remote_url(&repo_workdir, "origin", &local_remote)
-                .await;
+                .await
+                .is_ok()
+                && let Some(token) = resolved_token.as_deref().filter(|t| !t.trim().is_empty())
+            {
+                // A human `git pull` in the working copy authenticates through a repository-local
+                // 0600 credential store, never a token in the remote URL.
+                match git_runner
+                    .configure_remote_credential_store(&repo_workdir, "origin", "keel", token)
+                    .await
+                {
+                    Ok(store) => tracing::info!(
+                        remote = %local_remote,
+                        store = %store.display(),
+                        "Configured a repository-local git credential for the working copy's origin (pullable while `keel serve` runs)"
+                    ),
+                    Err(err) => tracing::warn!(
+                        error = %err,
+                        "Could not configure a git credential for the working copy's origin; `git pull` there will prompt for credentials"
+                    ),
+                }
+            }
         }
         port_forwards.push(pf);
     }
@@ -477,7 +497,13 @@ pub(crate) async fn build_serve_state(
                 port_forwards.push(pf);
             }
             Err(err) => {
-                tracing::warn!(error = %err, "Failed to start automatic port-forward to Envoy Gateway (keel-ingress:8888)");
+                tracing::warn!(
+                    issuer = %oidc.issuer_url,
+                    "Failed to start the automatic port-forward to Envoy Gateway (keel-ingress:8888): \
+                     {err}. Browser logins and OIDC discovery for this issuer only work while \
+                     something else serves the gateway on 127.0.0.1:8888; stop any orphaned \
+                     port-forward and restart `keel serve`"
+                );
             }
         }
     }
@@ -709,7 +735,58 @@ pub async fn execute_serve_until<F>(args: &ServeArgs, shutdown: F) -> Result<Soc
 where
     F: Future<Output = ()> + Send + 'static,
 {
+    // Watch for shutdown before startup: building the state starts `kubectl port-forward`
+    // children and may wait ~20 s per forward, and a signal in that window must still end in a
+    // clean return (dropping the guards) once startup finishes, never in an orphaning default
+    // signal death.
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        shutdown.await;
+        let _ = shutdown_tx.send(true);
+    });
     let (state, _forge_pf) = build_serve_state(args, true).await?;
+    let git_runner = Clone::clone(&state.git_runner);
+    let repo_workdir = state.repo_workdir.clone();
+    let served = serve_built_state(args, state, &mut shutdown_rx).await;
+    // The working copy's credential store is scoped to this run's port-forward origin; remove
+    // it so the platform token does not outlive the forward (see
+    // `GitRunner::remove_remote_credential_store`).
+    match git_runner
+        .remove_remote_credential_store(&repo_workdir)
+        .await
+    {
+        Ok(true) => tracing::info!("Removed the working copy's git credential store"),
+        Ok(false) => {}
+        Err(err) => tracing::warn!(
+            error = %err,
+            "Could not remove the working copy's git credential store; delete .git/{} by hand",
+            keel_git::REMOTE_CREDENTIAL_STORE_FILE
+        ),
+    }
+    served
+}
+
+/// Serves `state` on `args.bind` until `shutdown_rx` turns `true`.
+async fn serve_built_state(
+    args: &ServeArgs,
+    state: keel_server::AppState,
+    shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
+) -> Result<SocketAddr, CliError> {
+    if *shutdown_rx.borrow() {
+        tracing::info!("Shutdown requested during startup");
+    }
+    // A login against an unreachable IdP (typically `idp.keel.local` missing from /etc/hosts)
+    // fails with a 503 pointing at this log; log the cause and fix at startup too, without
+    // delaying it.
+    if let Some(oidc) = state.oidc_config.read().await.clone().filter(|c| c.enabled) {
+        let ca_pem = state.oidc_ca_pem.clone();
+        tokio::spawn(async move {
+            match keel_server::check_oidc_discovery(&oidc.issuer_url, ca_pem.as_deref()).await {
+                Ok(()) => tracing::info!(issuer = %oidc.issuer_url, "OIDC discovery succeeded"),
+                Err(msg) => tracing::warn!("{msg}"),
+            }
+        });
+    }
     // Restart-/replica-safe preview GC + result publication driven by cluster state and forge
     // PR states (OPEN-10). No-op without a live cluster.
     let preview_reconciler = keel_server::spawn_preview_reconciler(
@@ -722,12 +799,6 @@ where
 
     println!("Keel Control Plane listening on http://{local_addr}");
     tracing::info!(%local_addr, "Listening for Keel HTTP/SSE connections");
-    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
-    tokio::spawn(async move {
-        shutdown.await;
-        let _ = shutdown_tx.send(true);
-    });
-
     let mut graceful_rx = shutdown_rx.clone();
     let mut serve_fut = std::pin::pin!(std::future::IntoFuture::into_future(
         axum::serve(listener, router).with_graceful_shutdown(async move {
@@ -753,13 +824,45 @@ where
     Ok(local_addr)
 }
 
-/// Runs `keel serve` until `SIGINT` (`Ctrl+C`) is received.
+/// Runs `keel serve` until `SIGINT` (`Ctrl+C`), `SIGTERM` or `SIGHUP` is received. Returning
+/// (instead of dying on the signal) drops the [`TempPortForward`] guards, which kill the
+/// `kubectl port-forward` children; otherwise they outlive the server and keep holding
+/// `127.0.0.1:8888`/`:3000`.
 pub async fn execute_serve(args: &ServeArgs) -> Result<String, CliError> {
-    let addr = execute_serve_until(args, async {
-        let _ = tokio::signal::ctrl_c().await;
-    })
-    .await?;
+    let addr = execute_serve_until(args, shutdown_signal()).await?;
     Ok(format!("Keel server on {addr} shut down cleanly."))
+}
+
+/// Resolves on the first `SIGINT`, `SIGTERM` or `SIGHUP` (only `Ctrl+C` off Unix). The Unix
+/// handlers are registered when this is called (not when the future is first polled), so the
+/// default "terminate" disposition is replaced before startup begins.
+fn shutdown_signal() -> impl Future<Output = ()> + Send + 'static {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let streams = (
+            signal(SignalKind::interrupt()),
+            signal(SignalKind::terminate()),
+            signal(SignalKind::hangup()),
+        );
+        async move {
+            let (Ok(mut int), Ok(mut term), Ok(mut hup)) = streams else {
+                let _ = tokio::signal::ctrl_c().await;
+                return;
+            };
+            tokio::select! {
+                _ = int.recv() => tracing::info!("Received SIGINT; shutting down"),
+                _ = term.recv() => tracing::info!("Received SIGTERM; shutting down"),
+                _ = hup.recv() => tracing::info!("Received SIGHUP; shutting down"),
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        async move {
+            let _ = tokio::signal::ctrl_c().await;
+        }
+    }
 }
 
 #[cfg(test)]

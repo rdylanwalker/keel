@@ -1746,9 +1746,27 @@ spec:
         )
         .await
         .unwrap();
+        // The server resolves the IdP endpoints from its discovery document (no guessed
+        // fallback), so serve one.
+        let idp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let issuer = format!("http://127.0.0.1:{}", idp.local_addr().unwrap().port());
+        let discovery = serde_json::json!({
+            "issuer": issuer,
+            "authorization_endpoint": format!("{issuer}/authorize"),
+            "token_endpoint": format!("{issuer}/token"),
+            "jwks_uri": format!("{issuer}/keys"),
+        });
+        let idp_router = axum::Router::new().route(
+            "/.well-known/openid-configuration",
+            axum::routing::get(move || {
+                let doc = discovery.clone();
+                async move { axum::Json(doc) }
+            }),
+        );
+        tokio::spawn(async move { axum::serve(idp, idp_router).await });
         state = state.with_oidc_config(Some(OidcConfig {
             enabled: true,
-            issuer_url: "https://idp.acme.io".to_string(),
+            issuer_url: issuer.clone(),
             client_id: "keel-cli".to_string(),
             redirect_url: "http://127.0.0.1:8080/api/v1/auth/callback".to_string(),
             scopes: vec!["openid".to_string(), "profile".to_string()],
@@ -1791,7 +1809,10 @@ spec:
             .and_then(|v| v.to_str().ok())
             .unwrap()
             .to_string();
-        assert!(authorize_url.starts_with("https://idp.acme.io/auth"));
+        assert!(
+            authorize_url.starts_with(&format!("{issuer}/authorize?")),
+            "{authorize_url}"
+        );
         assert!(authorize_url.contains("code_challenge_method=S256"));
 
         let _ = tx.send(());

@@ -2117,10 +2117,17 @@ fn format_bootstrap_init_summary(
     if let Some(ep) = &conn.server_endpoint {
         out.push_str(&format!("API Endpoint:    {ep}\n"));
     }
-    out.push_str(&format!(
-        "Flux Polling:    interval={} (outbound pull-polling active)\n",
-        artifacts.flux_git_repository.spec.interval
-    ));
+    let flux_source = &artifacts.flux_git_repository.spec;
+    if addons::flux_can_reach_git_url(&flux_source.url) {
+        out.push_str(&format!(
+            "Flux Polling:    interval={} (outbound pull-polling active)\n",
+            flux_source.interval
+        ));
+    } else {
+        out.push_str(
+            "Flux Polling:    inactive (GitOps repository is a local path in-cluster Flux cannot reach; merges are never deployed)\n",
+        );
+    }
     out.push_str(&format!(
         "Kyverno Guard:   {} ClusterPolicies enforced (docker-socket exception: {})\n",
         artifacts.kyverno_bundle.cluster_policies.len(),
@@ -3059,6 +3066,40 @@ mod security_hardening_tests {
             assert!(
                 keel_server_token_source(&args) == *expected,
                 "token source case #{i}"
+            );
+        }
+    }
+
+    /// The summary only claims Flux pull-polling when in-cluster Flux can reach the repository; a
+    /// local-path repository says polling is inactive instead of contradicting the later note.
+    #[tokio::test]
+    async fn summary_flux_polling_line_matches_repository_reachability() {
+        let cfg = BootstrapConfig::new(keel_core::BootstrapTargetKind::Kubeconfig);
+        let conn = ClusterConnection {
+            target: keel_core::BootstrapTargetKind::Kubeconfig,
+            cluster_name: "keel-mgmt".to_string(),
+            kubeconfig_yaml: String::new(),
+            kubeconfig_path: None,
+            context: None,
+            server_endpoint: None,
+        };
+        for (url, active) in [
+            ("https://git.example.org/keel/gitops.git", true),
+            ("/tmp/work/keel-gitops.git", false),
+        ] {
+            let a = synthesize_seed_control_plane(&cfg, Some(url), Stage0Ingress::default())
+                .await
+                .unwrap();
+            let summary = format_bootstrap_init_summary(&conn, &a, None);
+            assert_eq!(
+                summary.contains("Flux Polling:    interval=1m (outbound pull-polling active)"),
+                active,
+                "{url}: {summary}"
+            );
+            assert_eq!(
+                summary.contains("Flux Polling:    inactive (GitOps repository is a local path"),
+                !active,
+                "{url}: {summary}"
             );
         }
     }

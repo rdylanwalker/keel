@@ -33,6 +33,12 @@ pub const DEFAULT_FLUX_POLL_INTERVAL: &str = keel_core::DEFAULT_POLL_INTERVAL;
 pub const DEFAULT_PREVIEW_SERVICE_ACCOUNT: &str = "keel-preview-readonly";
 /// Default ServiceAccount used by the seed management cluster core stack.
 pub const DEFAULT_MANAGEMENT_SERVICE_ACCOUNT: &str = "keel-management-pko";
+/// Pinned PKO v2 workspace image (`workspaceTemplate.spec.image`) for every Keel-synthesized
+/// Stack. PKO's default is the moving `pulumi/pulumi:latest-nonroot` (about 3.5 GB compressed),
+/// which silently changes the Pulumi CLI under running Stacks; the `-nonroot` variant matches the
+/// `restricted` workspace pod (`runAsUser: 1000`). Bumped by Renovate (`renovate.json`).
+// renovate: datasource=docker depName=pulumi/pulumi
+pub const PKO_WORKSPACE_IMAGE: &str = "pulumi/pulumi:3.277.0-nonroot";
 /// 10-minute termination grace period for clean Pulumi state unlocks (`NFR-REL-04`).
 pub const DEFAULT_TERMINATION_GRACE_PERIOD_SECONDS: u64 = 600;
 
@@ -857,6 +863,9 @@ pub struct WorkspacePodTemplate {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PkoWorkspaceTemplateSpec {
+    /// Workspace container image ([`PKO_WORKSPACE_IMAGE`] for Keel-synthesized Stacks).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
     pub pod_template: WorkspacePodTemplate,
 }
 
@@ -878,6 +887,7 @@ impl PkoWorkspaceTemplate {
     pub fn restricted(passphrase_secret_name: &str) -> Self {
         Self {
             spec: PkoWorkspaceTemplateSpec {
+                image: Some(PKO_WORKSPACE_IMAGE.to_string()),
                 pod_template: WorkspacePodTemplate {
                     spec: WorkspacePodSpec {
                         termination_grace_period_seconds: DEFAULT_TERMINATION_GRACE_PERIOD_SECONDS,
@@ -2144,6 +2154,43 @@ mod tests {
         PkoGitSource::branch("https://forge.internal/keel/infra.git", "main", repo_dir)
     }
 
+    /// The workspace image pin is the line Renovate's Rust-constant regex manager bumps, and the
+    /// bump is a manually reviewed PR (`renovate.json`).
+    #[test]
+    fn pko_workspace_image_pin_is_renovate_annotated() {
+        let source = include_str!("stack.rs");
+        let lines: Vec<&str> = source.lines().collect();
+        let annotated = lines.windows(2).any(|pair| {
+            pair[0] == "// renovate: datasource=docker depName=pulumi/pulumi"
+                && pair[1]
+                    == format!("pub const PKO_WORKSPACE_IMAGE: &str = \"{PKO_WORKSPACE_IMAGE}\";")
+        });
+        assert!(
+            annotated,
+            "PKO_WORKSPACE_IMAGE lacks its Renovate annotation"
+        );
+        let renovate: serde_json::Value =
+            serde_json::from_str(include_str!("../../../renovate.json")).unwrap();
+        assert!(
+            renovate["customManagers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m["managerFilePatterns"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|p| p.as_str().unwrap().contains("crates/")))
+        );
+        let rule = renovate["packageRules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["matchDepNames"] == serde_json::json!(["pulumi/pulumi"]))
+            .expect("pulumi/pulumi packageRule");
+        assert_eq!(rule["automerge"], false);
+    }
+
     #[test]
     fn preview_keys_are_repository_scoped_and_names_stay_dns_safe() {
         assert_eq!(preview_key(None, "#12").unwrap(), "12");
@@ -2267,6 +2314,19 @@ mod tests {
         assert_eq!(
             json["spec"]["workspaceTemplate"]["spec"]["podTemplate"]["spec"]["terminationGracePeriodSeconds"],
             600
+        );
+        // Pinned workspace image, never PKO's moving `latest-nonroot` default.
+        assert_eq!(
+            json["spec"]["workspaceTemplate"]["spec"]["image"],
+            PKO_WORKSPACE_IMAGE
+        );
+        let tag = PKO_WORKSPACE_IMAGE
+            .strip_prefix("pulumi/pulumi:")
+            .and_then(|t| t.strip_suffix("-nonroot"))
+            .unwrap();
+        assert!(
+            tag.split('.').count() == 3 && tag.split('.').all(|p| p.parse::<u32>().is_ok()),
+            "{PKO_WORKSPACE_IMAGE} must pin an exact Pulumi version"
         );
         assert_eq!(
             json["spec"]["workspaceTemplate"]["spec"]["podTemplate"]["spec"]["securityContext"]["runAsNonRoot"],

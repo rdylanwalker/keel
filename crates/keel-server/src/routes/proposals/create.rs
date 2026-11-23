@@ -24,9 +24,9 @@ use crate::error::ServerError;
 use crate::preview_lifecycle::launch_pko_preview;
 use crate::proposal_repo::{ScopeRepo, TenantIndex};
 use crate::routes::{
-    attach_infra_secret_refs, create_dir_all_contained, load_catalog_manifest_for_tenant,
-    next_unique_branch_timestamp, read_contained_optional, read_contained_to_string,
-    resolve_tenant_resource_dir, stage_commit_push_in, write_contained,
+    attach_infra_secret_refs, create_dir_all_contained, exists_contained,
+    load_catalog_manifest_for_tenant, next_unique_branch_timestamp, read_contained_optional,
+    read_contained_to_string, resolve_tenant_resource_dir, stage_commit_push_in, write_contained,
 };
 use crate::state::AppState;
 
@@ -43,7 +43,7 @@ use super::manifests::{
     remove_stale_entries, render_manifest_app, write_relative_files,
 };
 use super::pr::{OpenedProposal, PushedProposal, open_proposal_pr, publish_proposal};
-use super::preview::synthesize_proposal_report;
+use super::preview::{ProposedChange, synthesize_proposal_report};
 use super::preview_inputs::{
     apply_preview_source_trust, attach_preview_cluster_inputs, plan_preview_credentials,
 };
@@ -789,7 +789,7 @@ pub async fn create_proposal(
         CatalogManifest::Bundle(_) => unreachable!("handled above"),
     };
 
-    let (commit_sha, is_update) = {
+    let (commit_sha, is_update, previous_rendered_manifests) = {
         let workdir = repo.workdir.as_path();
         state
             .git_runner
@@ -797,7 +797,14 @@ pub async fn create_proposal(
             .await?;
 
         let target_dir = workdir.join(&rel_dir);
-        let is_update = tokio::fs::try_exists(&target_dir).await.unwrap_or(false);
+        let is_update = exists_contained(workdir, &target_dir).await?;
+        // The instance's rendered documents on `main`, so the preview diffs against them. The read
+        // is contained: a committed symlink escaping the worktree is refused, never followed.
+        let previous_rendered_manifests = if is_update {
+            read_contained_optional(workdir, &target_dir.join("manifests.yaml")).await?
+        } else {
+            None
+        };
         create_dir_all_contained(workdir, &target_dir).await?;
 
         let mut staged_paths = Vec::new();
@@ -1196,7 +1203,7 @@ pub async fn create_proposal(
         );
         let sha = stage_commit_push_in(&state, workdir, &auth, &branch, &commit_msg, &staged_paths)
             .await?;
-        (sha, is_update)
+        (sha, is_update, previous_rendered_manifests)
     };
     drop(repo_guard);
 
@@ -1298,9 +1305,13 @@ pub async fn create_proposal(
     let report = synthesize_proposal_report(
         &preview_key,
         &req.tenant,
-        preview_resource_type,
-        &instance_name,
-        rendered_manifest_template_yaml.as_deref(),
+        &ProposedChange {
+            resource_type: preview_resource_type,
+            instance_name: &instance_name,
+            is_update,
+            rendered_manifests: rendered_manifest_template_yaml.as_deref(),
+            previous_rendered_manifests: previous_rendered_manifests.as_deref(),
+        },
         run,
     );
 

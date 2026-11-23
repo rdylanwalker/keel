@@ -1,13 +1,16 @@
-# Proxmox VE k3s Workload Cluster Blueprint (`SDD.md` §4.1)
+# Proxmox VE VM blueprint for a future k3s node (`SDD.md` §4.1). It clones ONE VM from a
+# cloud-init template and stops there: no k3s is installed and no kubeconfig is exported, so the
+# result is a VM (`resourceKind: vm`), not a cluster apps can be deployed onto. Install k3s on the
+# VM yourself and attach it to Keel as a cluster.
 apiVersion: keel.io/v1alpha1
 kind: CatalogInfraBlueprint
 metadata:
   id: proxmox-k3s-cluster
-  name: Proxmox VE k3s Workload Cluster
-  description: Provision a multi-node k3s workload cluster on Proxmox VE via bpg/proxmox OpenTofu/Terraform bridge.
-  category: kubernetes-cluster
+  name: Proxmox VE VM (for k3s, VM only)
+  description: Clone one VM from a cloud-init template on Proxmox VE via the bpg/proxmox OpenTofu/Terraform bridge, as a node to install k3s on. Installs no Kubernetes and exports no kubeconfig.
+  category: compute
   provider: proxmox
-  resourceKind: cluster
+  resourceKind: vm
 spec:
   pulumiRuntime: yaml
   entrypoint: Pulumi.yaml
@@ -25,7 +28,7 @@ spec:
     properties:
       clusterName:
         type: string
-        title: Cluster Name
+        title: Cluster Name (VM name prefix)
         pattern: "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"
       nodeName:
         type: string
@@ -38,13 +41,13 @@ spec:
         minimum: 100
       cores:
         type: integer
-        title: vCPU Cores per Node
+        title: vCPU Cores
         default: 4
         minimum: 2
         maximum: 32
       memoryMb:
         type: integer
-        title: Memory (MiB) per Node
+        title: Memory (MiB)
         default: 8192
         minimum: 2048
       sshPublicKey:

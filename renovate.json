@@ -238,6 +238,28 @@
       "automerge": false
     },
     {
+      "description": "PKO workspace image (pulumi/pulumi, pinned in keel-pko): every Pulumi CLI bump changes what tenant Stacks and previews run, so it is reviewed manually",
+      "matchManagers": [
+        "custom.regex"
+      ],
+      "matchDepNames": [
+        "pulumi/pulumi"
+      ],
+      "groupName": "pko-workspace-image",
+      "automerge": false
+    },
+    {
+      "description": "Container images pinned in Stage 0 raw manifests (deploy/bootstrap/manifests, e.g. the alpine/socat local docker-socket proxy, which mounts the host Docker socket and is root-equivalent on the host): every tag or digest bump is reviewed manually, never auto-merged",
+      "matchManagers": [
+        "kubernetes"
+      ],
+      "matchFileNames": [
+        "deploy/bootstrap/manifests/**"
+      ],
+      "groupName": "stage0-manifest-images",
+      "automerge": false
+    },
+    {
       "description": "Pinned semantic-release toolchain (release/package.json + package-lock.json)",
       "matchManagers": [
         "npm"
@@ -279,6 +301,21 @@
       "matchStrings": [
         "# renovate: datasource=(?<datasource>[a-z-]+?) depName=(?<depName>\\S+?)(?: registryUrl=(?<registryUrl>\\S+?))?\\s+version: \"?(?<currentValue>[^\\s\"]+)\"?"
       ]
+    },
+    {
+      "customType": "regex",
+      "description": "Container images pinned in Rust constants annotated with `// renovate: datasource=... depName=...` on the line above (the value may carry the image name: `\"pulumi/pulumi:<version>-nonroot\"` bumps only the tag)",
+      "managerFilePatterns": [
+        "/^crates/[^/]+/src/.+\\.rs$/"
+      ],
+      "matchStrings": [
+        "// renovate: datasource=(?<datasource>[a-z-]+?) depName=(?<depName>\\S+?)\\s+(?:pub(?:\\(crate\\))? )?const [A-Z0-9_]+: &str = \"(?:[^\":]+:)?(?<currentValue>[^\"]+)\";"
+      ]
     }
-  ]
+  ],
+  "kubernetes": {
+    "managerFilePatterns": [
+      "/^deploy/bootstrap/manifests/[^/]+\\.yaml$/"
+    ]
+  }
 }

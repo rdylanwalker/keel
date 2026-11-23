@@ -18,55 +18,106 @@ use crate::error::ServerError;
 use crate::proposal_repo::{ProposalScope, ScopeRepo};
 use crate::state::AppState;
 
+/// What a proposal changes, compared against the target branch (`main`).
+pub(super) struct ProposedChange<'a> {
+    /// Resource type of the proposed top-level object (`HelmRelease`, `Stack`, ...).
+    pub resource_type: &'a str,
+    pub instance_name: &'a str,
+    /// The instance directory already exists on `main` (an edit, not a first install).
+    pub is_update: bool,
+    /// Rendered manifest documents the proposal commits (`manifests.yaml`), if any.
+    pub rendered_manifests: Option<&'a str>,
+    /// The instance's rendered manifest documents on `main`, if any.
+    pub previous_rendered_manifests: Option<&'a str>,
+}
+
+/// `apiVersion`/`kind`/`namespace`/`name` identity of a rendered manifest document.
+fn manifest_identity(doc: &Value, default_name: &str) -> (String, String, String, String) {
+    let field = |ptr: &str| doc.pointer(ptr).and_then(Value::as_str);
+    (
+        field("/apiVersion").unwrap_or("v1").to_string(),
+        field("/kind").unwrap_or("Resource").to_string(),
+        field("/metadata/namespace").unwrap_or_default().to_string(),
+        field("/metadata/name").unwrap_or(default_name).to_string(),
+    )
+}
+
 /// Builds the creation-time report: a control-plane synthesis (`source: synthesized`) listing
 /// the proposed top-level object plus every rendered manifest document (UI-14), annotated with
-/// the PKO run status. Real PKO results replace it once the run finishes.
+/// the PKO run status. Operations compare against `main`: an edit of an existing instance is an
+/// update (`~`), a rendered document is created, updated, unchanged or deleted depending on the
+/// instance's documents on `main`. Real PKO results replace it once the run finishes.
 pub(super) fn synthesize_proposal_report(
     pr_id: &str,
     tenant: &str,
-    resource_type: &str,
-    instance_name: &str,
-    rendered_manifests: Option<&str>,
+    change: &ProposedChange<'_>,
     run: PreviewRunStatus,
 ) -> PreviewReport {
+    let ProposedChange {
+        resource_type,
+        instance_name,
+        is_update,
+        rendered_manifests,
+        previous_rendered_manifests,
+    } = *change;
     let mut resources = vec![ResourceDiff {
         urn: format!("urn:pulumi:pr-{pr_id}::{tenant}::{resource_type}::{instance_name}"),
         resource_type: resource_type.to_string(),
         name: instance_name.to_string(),
-        op: ChangeOp::Create,
+        op: if is_update {
+            ChangeOp::Update
+        } else {
+            ChangeOp::Create
+        },
         changed_fields: vec!["spec".to_string()],
     }];
-    if let Some(rendered) = rendered_manifests
-        && let Ok(docs) = validate_k8s_manifests_yaml(rendered)
-    {
-        for doc in docs {
-            let api_v = doc
-                .get("apiVersion")
-                .and_then(Value::as_str)
-                .unwrap_or("v1");
-            let kind = doc
-                .get("kind")
-                .and_then(Value::as_str)
-                .unwrap_or("Resource");
-            let name = doc
-                .pointer("/metadata/name")
-                .and_then(Value::as_str)
-                .unwrap_or(instance_name);
-            let k8s_type = format!("kubernetes:{api_v}:{kind}");
-            resources.push(ResourceDiff {
-                urn: format!("urn:pulumi:pr-{pr_id}::{tenant}::{k8s_type}::{name}"),
-                resource_type: k8s_type,
-                name: name.to_string(),
-                op: ChangeOp::Create,
-                changed_fields: vec!["metadata".to_string(), "spec".to_string()],
-            });
+    let parse = |raw: Option<&str>| {
+        raw.and_then(|r| validate_k8s_manifests_yaml(r).ok())
+            .unwrap_or_default()
+    };
+    let mut previous: Vec<_> = parse(previous_rendered_manifests)
+        .into_iter()
+        .map(|doc| (manifest_identity(&doc, instance_name), doc))
+        .collect();
+    let mut push = |(api_v, kind, _ns, name): (String, String, String, String), op| {
+        let k8s_type = format!("kubernetes:{api_v}:{kind}");
+        resources.push(ResourceDiff {
+            urn: format!("urn:pulumi:pr-{pr_id}::{tenant}::{k8s_type}::{name}"),
+            resource_type: k8s_type,
+            name,
+            op,
+            changed_fields: if op == ChangeOp::Same {
+                Vec::new()
+            } else {
+                vec!["metadata".to_string(), "spec".to_string()]
+            },
+        });
+    };
+    for doc in parse(rendered_manifests) {
+        let id = manifest_identity(&doc, instance_name);
+        let op = match previous.iter().position(|(prev_id, _)| *prev_id == id) {
+            Some(i) if previous.remove(i).1 == doc => ChangeOp::Same,
+            Some(_) => ChangeOp::Update,
+            None => ChangeOp::Create,
+        };
+        push(id, op);
+    }
+    for (id, _) in previous {
+        push(id, ChangeOp::Delete);
+    }
+    let mut summary = PreviewSummary::default();
+    for r in &resources {
+        match r.op {
+            ChangeOp::Create => summary.create += 1,
+            ChangeOp::Update => summary.update += 1,
+            ChangeOp::Delete => summary.delete += 1,
+            ChangeOp::Replace => summary.replace += 1,
+            ChangeOp::Same => summary.same += 1,
+            ChangeOp::Drift => summary.drift += 1,
         }
     }
     PreviewReport {
-        summary: PreviewSummary {
-            create: resources.len(),
-            ..PreviewSummary::default()
-        },
+        summary,
         resources,
         source: PreviewSource::Synthesized,
         run: Some(run),
@@ -481,6 +532,88 @@ async fn compute_pr_git_diff(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ops(report: &PreviewReport) -> Vec<(String, ChangeOp)> {
+        report
+            .resources
+            .iter()
+            .map(|r| (r.name.clone(), r.op))
+            .collect()
+    }
+
+    /// An edit of an existing instance previews as an update against `main`, never as a create
+    /// (dry-run snag: "update podinfo" showed `+ Create HelmRelease`).
+    #[test]
+    fn proposal_report_compares_against_main() {
+        let run = || PreviewRunStatus::not_executed("Flux-managed change");
+        let hr = "flux:helm.toolkit.fluxcd.io/v2:HelmRelease";
+        let first = synthesize_proposal_report(
+            "1",
+            "default",
+            &ProposedChange {
+                resource_type: hr,
+                instance_name: "podinfo",
+                is_update: false,
+                rendered_manifests: None,
+                previous_rendered_manifests: None,
+            },
+            run(),
+        );
+        assert_eq!(ops(&first), [("podinfo".to_string(), ChangeOp::Create)]);
+        assert_eq!(first.summary.create, 1);
+
+        let edit = synthesize_proposal_report(
+            "3",
+            "default",
+            &ProposedChange {
+                resource_type: hr,
+                instance_name: "podinfo",
+                is_update: true,
+                rendered_manifests: None,
+                previous_rendered_manifests: None,
+            },
+            run(),
+        );
+        assert_eq!(ops(&edit), [("podinfo".to_string(), ChangeOp::Update)]);
+        assert_eq!((edit.summary.create, edit.summary.update), (0, 1));
+        let md = format_markdown_report(&edit, "3");
+        assert!(
+            md.contains("`~ 1 Update`") && md.contains("`+ 0 Create`"),
+            "{md}"
+        );
+
+        // Rendered documents: changed -> update, identical -> unchanged, new -> create, gone ->
+        // delete.
+        let cm = |name: &str, v: &str| {
+            format!("apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: {name}\ndata:\n  k: {v}\n")
+        };
+        let before = [cm("changed", "a"), cm("same", "a"), cm("gone", "a")].join("---\n");
+        let after = [cm("changed", "b"), cm("same", "a"), cm("new", "a")].join("---\n");
+        let report = synthesize_proposal_report(
+            "4",
+            "default",
+            &ProposedChange {
+                resource_type: "pulumi:pulumi.com/v1:Stack",
+                instance_name: "echo",
+                is_update: true,
+                rendered_manifests: Some(&after),
+                previous_rendered_manifests: Some(&before),
+            },
+            run(),
+        );
+        assert_eq!(
+            ops(&report),
+            [
+                ("echo".to_string(), ChangeOp::Update),
+                ("changed".to_string(), ChangeOp::Update),
+                ("same".to_string(), ChangeOp::Same),
+                ("new".to_string(), ChangeOp::Create),
+                ("gone".to_string(), ChangeOp::Delete),
+            ]
+        );
+        let s = &report.summary;
+        assert_eq!((s.create, s.update, s.same, s.delete), (1, 2, 1, 1));
+    }
 
     #[test]
     fn synthesized_preview_markdown_is_marked_simulated() {

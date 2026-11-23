@@ -227,13 +227,14 @@ The `forgejo.keel.local` entry is needed so PR links printed by the CLI and show
 keel serve --repo-dir ./keel-gitops    # binds 127.0.0.1:8080 by default
 ```
 
-Stop it with **Ctrl+C**. Other signals can leave its `kubectl port-forward` processes running, and the next start then cannot use port `8888`.
+Stop it with **Ctrl+C** (or `SIGTERM`). On v0.12.0 other signals can leave its `kubectl port-forward` processes running, and the next start then cannot use port `8888`; newer releases clean them up on `SIGTERM`/`SIGHUP` and name a busy port at startup.
 
 When a Kubernetes cluster is reachable (through `KUBECONFIG` or in-cluster config), `keel serve`:
 
 - overlays live **Flux CD** (`Kustomization`, `HelmRelease`) and **PKO v2** (`Stack`) conditions as `Synced`, `Ready`, `Reconciling`, or `Error`. It shows `Pending` while it is offline.
 - opens background `kubectl port-forward` tunnels to **Forgejo** (`--with-forge`, `127.0.0.1:3000` or an ephemeral port) and **Envoy Gateway** (`keel-ingress`, `127.0.0.1:8888` for `https://idp.keel.local:8888`) when it runs on localhost.
-- trusts the Stage 0 ingress CA from `keel-system/keel-wildcard-tls` for its OIDC calls.
+- points the `origin` of the working copy (`--repo-dir`) at the Forgejo port-forward and stores the Forgejo token for it in a repository-local Git credential file (`.git/keel-credentials`, mode `0600`, scoped to that origin; never in the remote URL), so `git pull` in `./keel-gitops` works while the server runs. `keel serve` deletes the file and the helper again when it stops (only a killed process, e.g. `kill -9`, leaves them; then delete `.git/keel-credentials` by hand).
+- trusts the Stage 0 ingress CA from `keel-system/keel-wildcard-tls` for its OIDC calls, and checks the issuer's OIDC discovery document at startup. If it cannot be fetched (typically `idp.keel.local` missing from `/etc/hosts` on this machine), it logs a warning with the cause and the fix, and logins answer `503` (an error page in the browser; `keel auth login` prints it) pointing at that log.
 - re-applies the Kyverno `restrict-pulumi-providers` policy from `providers/registry.yaml`. Pulumi's built-in providers, including `kubernetes`, are always allowed.
 - starts the preview reconciler, which garbage-collects previews of merged or closed PRs every 60 s.
 

@@ -185,8 +185,15 @@ pub fn tenant_git_source_from_manifest(
     // The Flux URL may be the in-cluster Forgejo `http://` Service; PKO Stacks clone the URL
     // derived from it by [`TenantGitSource::pko_project_repo`].
     if let Err(e) = keel_pko::validate_flux_git_source_url(&source.url) {
-        return Err(unavailable(&format!(
-            "has a Flux Git source that is not a network Git URL ({e})"
+        // Almost always a Local Git provider bootstrap (`--repo-dir` only): a host path that
+        // neither Flux nor PKO workspace pods can clone. Only a re-bootstrap fixes it.
+        return Err(KubeError::TenantSourceUnavailable(format!(
+            "tenant `{tenant}` has a Flux Git source (`{path}`) that is not a network Git URL \
+             ({e}). This happens when `keel bootstrap init` ran with only a local `--repo-dir` \
+             (Local Git provider, development only): in-cluster Flux and PKO cannot clone a host \
+             path, so Pulumi Stacks and previews cannot run and merged changes are never \
+             deployed. Fix: re-run `keel bootstrap init` with `--with-forge` (in-cluster \
+             Forgejo) or with a network `--git-url`, then retry"
         )));
     }
     // This resolver serves only Local Git provider tenants (D8), whose source is the platform
@@ -1350,6 +1357,12 @@ spec:
             assert!(
                 msg.contains("not a network Git URL"),
                 "local/helper URL refused as non-network"
+            );
+            // The refusal says how to fix it: re-bootstrap with a reachable repository.
+            assert!(
+                msg.contains("re-run `keel bootstrap init` with `--with-forge`")
+                    && msg.contains("network `--git-url`"),
+                "{msg}"
             );
         }
         // SSH sources would need an `identity` key the platform-written Secret does not have.

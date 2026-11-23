@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use axum::body::Body;
-use axum::http::header::{CONTENT_TYPE, COOKIE, LOCATION, SET_COOKIE};
+use axum::http::header::{ACCEPT, CONTENT_TYPE, COOKIE, LOCATION, SET_COOKIE};
 use axum::http::{Method, Request, StatusCode};
 use http_body_util::BodyExt;
 use keel_core::{AuthPhase, OidcConfig};
@@ -16,6 +16,28 @@ use keel_server::{
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tower::ServiceExt;
+
+/// Serves a minimal OIDC discovery document on `127.0.0.1` and returns its issuer URL; login
+/// redirects need a reachable discovery document (there is no guessed endpoint fallback).
+async fn spawn_mock_oidc_discovery() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let issuer = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let doc = json!({
+        "issuer": issuer,
+        "authorization_endpoint": format!("{issuer}/authorize"),
+        "token_endpoint": format!("{issuer}/token"),
+        "jwks_uri": format!("{issuer}/keys"),
+    });
+    let router = axum::Router::new().route(
+        "/.well-known/openid-configuration",
+        axum::routing::get(move || {
+            let doc = doc.clone();
+            async move { axum::Json(doc) }
+        }),
+    );
+    tokio::spawn(async move { axum::serve(listener, router).await });
+    issuer
+}
 
 struct TestFixture {
     _temp_dir: TempDir,
@@ -503,7 +525,7 @@ async fn test_session_cookie_auth_middleware_and_status() {
     // Subsequent /api/v1/auth/login with keel_logged_out=1 appends prompt=login
     *fixture.state.oidc_config.write().await = Some(OidcConfig {
         enabled: true,
-        issuer_url: "https://idp.keel.local/realms/keel".to_string(),
+        issuer_url: spawn_mock_oidc_discovery().await,
         client_id: "keel-ui".to_string(),
         redirect_url: "https://keel.local/api/v1/auth/callback".to_string(),
         scopes: vec!["openid".to_string()],
@@ -548,10 +570,74 @@ async fn test_oidc_pkce_login_scaffolding() {
         .unwrap();
     assert_eq!(disabled_res.status(), StatusCode::SERVICE_UNAVAILABLE);
 
-    // Enable OIDC -> 302 redirect with PKCE S256 & encrypted keel_pkce cookie
+    // Unreachable IdP (its host does not resolve) -> 503 with a fixed message (the cause and the
+    // hosts-file fix are only logged), never a redirect to a guessed `{issuer}/auth` endpoint.
     *fixture.state.oidc_config.write().await = Some(OidcConfig {
         enabled: true,
-        issuer_url: "https://idp.keel.local/realms/keel".to_string(),
+        issuer_url: "https://idp.keel.invalid:8888/auth/v1".to_string(),
+        client_id: "keel-ui".to_string(),
+        redirect_url: "https://keel.local/api/v1/auth/callback".to_string(),
+        scopes: vec!["openid".to_string()],
+    });
+    let unreachable = build_router(fixture.state.clone())
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/auth/login")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unreachable.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(unreachable.headers().get(LOCATION).is_none());
+    let body: Value =
+        serde_json::from_slice(&unreachable.into_body().collect().await.unwrap().to_bytes())
+            .unwrap();
+    let error = body["error"].as_str().unwrap();
+    assert!(
+        error.contains(
+            "OIDC discovery for the configured issuer `https://idp.keel.invalid:8888/auth/v1` failed"
+        ),
+        "{error}"
+    );
+    assert!(error.contains("log for the cause and fix"), "{error}");
+    for detail in ["/etc/hosts", "dns", "lookup", "error sending request"] {
+        assert!(!error.contains(detail), "{error}");
+    }
+
+    // A browser navigation gets the same reason as a minimal HTML error page.
+    let page = build_router(fixture.state.clone())
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/auth/login")
+                .header(ACCEPT, "text/html,application/xhtml+xml,*/*;q=0.8")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(page.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        page.headers().get(CONTENT_TYPE).unwrap(),
+        "text/html; charset=utf-8"
+    );
+    let html = String::from_utf8(
+        page.into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(html.contains("Keel sign-in failed"), "{html}");
+    assert!(html.contains("log for the cause and fix"), "{html}");
+
+    // Enable OIDC -> 302 redirect with PKCE S256 & encrypted keel_pkce cookie
+    let issuer = spawn_mock_oidc_discovery().await;
+    *fixture.state.oidc_config.write().await = Some(OidcConfig {
+        enabled: true,
+        issuer_url: issuer.clone(),
         client_id: "keel-ui".to_string(),
         redirect_url: "https://keel.local/api/v1/auth/callback".to_string(),
         scopes: vec!["openid".to_string(), "profile".to_string()],
@@ -569,6 +655,10 @@ async fn test_oidc_pkce_login_scaffolding() {
         .unwrap();
     assert_eq!(res.status(), StatusCode::FOUND);
     let location = res.headers().get(LOCATION).unwrap().to_str().unwrap();
+    assert!(
+        location.starts_with(&format!("{issuer}/authorize?")),
+        "{location}"
+    );
     assert!(location.contains("code_challenge_method=S256"));
     assert!(location.contains("client_id=keel-ui"));
     let pkce_cookie = res.headers().get(SET_COOKIE).unwrap().to_str().unwrap();
@@ -8222,6 +8312,56 @@ spec:
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// An update proposal reads the instance's committed `manifests.yaml` (to diff the preview against
+/// it) through the containment helpers: a symlink escaping the worktree is refused, never followed
+/// into the preview report. A Helm instance never writes `manifests.yaml`, so only that read can
+/// touch the symlink.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_update_proposal_refuses_escaping_instance_manifests_symlink() {
+    let fixture = setup_fixture().await;
+    let cookie = login_and_get_cookie(&fixture).await;
+    let workdir = fixture.state.repo_workdir.clone();
+    let git = &fixture.state.git_runner;
+    git.checkout_branch(&workdir, "main").await.unwrap();
+
+    let outside = TempDir::new().unwrap();
+    let outside_manifest = outside.path().join("token.yaml");
+    tokio::fs::write(
+        &outside_manifest,
+        "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: outside-secret-marker\n",
+    )
+    .await
+    .unwrap();
+    let instance_dir = workdir.join("tenants/acme/apps/grafana-leaky");
+    tokio::fs::create_dir_all(&instance_dir).await.unwrap();
+    std::os::unix::fs::symlink(&outside_manifest, instance_dir.join("manifests.yaml")).unwrap();
+    git.add(&workdir, ["tenants/acme/apps/grafana-leaky"])
+        .await
+        .unwrap();
+    git.commit(
+        &workdir,
+        "test: add an instance whose manifests.yaml escapes the worktree",
+        &CommitAuthor::new("Keel Seed", "seed@keel.local"),
+    )
+    .await
+    .unwrap();
+    git.push(&workdir, "origin", "main").await.unwrap();
+
+    let (status, body) = send_text(
+        &fixture,
+        &cookie,
+        Method::POST,
+        "/api/v1/tenants/acme/proposals",
+        json!({ "tenant": "acme", "catalogId": "grafana", "name": "grafana-leaky",
+                "values": { "replicas": 2 } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(body.contains("escapes"), "{body}");
+    assert!(!body.contains("outside-secret-marker"), "{body}");
 }
 
 /// Catalog authoring round-trips `placementScope` into `spec.placement.scope`.

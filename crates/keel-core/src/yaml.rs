@@ -76,11 +76,14 @@ fn visit_strings(value: &mut Value, f: &mut impl FnMut(&str) -> Option<String>) 
 }
 
 /// Whether go-yaml (v2/v3) would resolve the plain scalar `s` to something other than a string
-/// while `noyalib` keeps it plain: integers and floats written with `_` digit separators, and
-/// YAML 1.1 timestamps.
+/// while `noyalib` keeps it plain: YAML 1.1 booleans, integers and floats written with `_` digit
+/// separators, and YAML 1.1 timestamps.
 /// Forms `noyalib` already quotes (YAML 1.2 numbers, `true`, `null`, ...) may also match; quoting
 /// them again is harmless.
 fn is_yaml11_non_string(s: &str) -> bool {
+    if is_yaml11_bool(s) {
+        return true;
+    }
     if s.contains('_') {
         // go-yaml strips every `_` before trying integer and float parsing.
         let stripped = s.replace('_', "");
@@ -89,6 +92,22 @@ fn is_yaml11_non_string(s: &str) -> bool {
         }
     }
     is_yaml11_timestamp(s)
+}
+
+/// The exact YAML 1.1 boolean plain scalars (go-yaml v2's resolve table, which
+/// `sigs.k8s.io/yaml` and therefore Helm, kustomize and kubectl use): `y`/`yes`/`true`/`on` and
+/// `n`/`no`/`false`/`off`, each only in lower, Capitalized or UPPER case. Mixed case (`yEs`) and
+/// longer words (`onward`) are strings in YAML 1.1 too. This applies to mapping keys as much as to
+/// values: go-yaml v2 reads the key `on:` as the boolean `true`, which `sigs.k8s.io/yaml` then
+/// turns into the JSON key `"true"`.
+fn is_yaml11_bool(s: &str) -> bool {
+    const WORDS: [&str; 8] = ["y", "yes", "true", "on", "n", "no", "false", "off"];
+    let lower = s.to_ascii_lowercase();
+    WORDS.contains(&lower.as_str()) && {
+        let mut capitalized = lower.clone();
+        capitalized[..1].make_ascii_uppercase();
+        s == lower || s == capitalized || s == s.to_ascii_uppercase()
+    }
 }
 
 /// `strconv.ParseInt(s, 0, 64)` syntax: optional sign, then decimal digits or a
@@ -261,8 +280,8 @@ mod tests {
 
     #[test]
     fn to_yaml_documents_joins_newline_terminated_documents_with_separators() {
-        let out = to_yaml_documents([json!({"kind": "A"}), json!({"kind": "B", "n": 1})]).unwrap();
-        assert_eq!(out, "kind: A\n---\nkind: B\nn: 1\n");
+        let out = to_yaml_documents([json!({"kind": "A"}), json!({"kind": "B", "m": 1})]).unwrap();
+        assert_eq!(out, "kind: A\n---\nkind: B\nm: 1\n");
         assert_eq!(split_yaml_documents(&out).len(), 2);
         assert_eq!(
             to_yaml_documents(Vec::<serde_json::Value>::new()).unwrap(),
@@ -287,19 +306,50 @@ mod tests {
             "2001-12-14t21:59:43.10-05:00",
             "2001-12-14T21:59:43Z",
             "2001-12-14 21:59:43",
+            // YAML 1.1 booleans (go-yaml v2 / sigs.k8s.io/yaml), every accepted casing.
+            "y",
+            "Y",
+            "yes",
+            "Yes",
+            "YES",
+            "n",
+            "N",
+            "no",
+            "No",
+            "NO",
+            "on",
+            "On",
+            "ON",
+            "off",
+            "Off",
+            "OFF",
+            "True",
+            "FALSE",
         ] {
             let out = to_string(&json!({ "k": s, s: "v", "list": [s] })).unwrap();
             let quoted = serde_json::Value::from(s).to_string();
-            assert_eq!(
-                out,
-                format!("{quoted}: v\nk: {quoted}\nlist:\n  - {quoted}"),
-                "{s}"
-            );
+            let mut lines: Vec<&str> = out.lines().collect();
+            lines.sort_unstable();
+            let mut expected = [
+                format!("{quoted}: v"),
+                format!("k: {quoted}"),
+                "list:".to_string(),
+                format!("  - {quoted}"),
+            ];
+            expected.sort_unstable();
+            assert_eq!(lines, expected, "{s}");
             let back: serde_json::Value = noyalib::from_str(&out).unwrap();
             assert_eq!(back, json!({ "k": s, s: "v", "list": [s] }), "{s}");
         }
         // Strings no YAML reader takes as a non-string stay plain.
         for s in [
+            "yEs",
+            "oN",
+            "nO",
+            "oFF",
+            "yes!",
+            "nope",
+            "ok",
             "1.2.3",
             "v1_000",
             "a_b",
@@ -315,13 +365,27 @@ mod tests {
         assert_eq!(out, "a: __keel_yaml11_0_0__\nb: \"1_000\"");
     }
 
+    /// Real booleans stay YAML booleans; only strings that read as booleans are quoted, whether
+    /// they are values or keys (a Helm values key `on` would otherwise become `"true"`).
+    #[test]
+    fn to_string_quotes_yaml11_boolean_lookalike_strings_only() {
+        let value = json!({"enabled": true, "country": "NO", "toggle": "off", "on": {"n": false}});
+        let out = to_string(&value).unwrap();
+        assert_eq!(
+            out,
+            "country: \"NO\"\nenabled: true\n\"on\":\n  \"n\": false\ntoggle: \"off\""
+        );
+        let back: serde_json::Value = noyalib::from_str(&out).unwrap();
+        assert_eq!(back, value);
+    }
+
     #[test]
     fn to_string_serializes_integers_above_i64_max() {
-        let out = to_string(&json!({ "n": u64::MAX })).unwrap();
-        assert_eq!(out, format!("n: {}", u64::MAX));
+        let out = to_string(&json!({ "max": u64::MAX })).unwrap();
+        assert_eq!(out, format!("max: {}", u64::MAX));
         assert_eq!(
-            to_yaml_documents([json!({ "n": u64::MAX })]).unwrap(),
-            format!("n: {}\n", u64::MAX)
+            to_yaml_documents([json!({ "max": u64::MAX })]).unwrap(),
+            format!("max: {}\n", u64::MAX)
         );
     }
 

@@ -535,10 +535,7 @@ pub(crate) async fn install_stage0_core_addons(
         .await?;
 
     let repo_url = &artifacts.flux_git_repository.spec.url;
-    if ["http://", "https://", "ssh://", "git://"]
-        .iter()
-        .any(|p| repo_url.starts_with(p))
-    {
+    if flux_can_reach_git_url(repo_url) {
         if let Some(token) = git_token.map(str::trim).filter(|t| !t.is_empty()) {
             // Platform `flux-system` source only; tenant-default gets its own repository-scoped
             // credential (`bootstrap::tenant_repo`).
@@ -557,6 +554,14 @@ pub(crate) async fn install_stage0_core_addons(
     }
 
     Ok(notes)
+}
+
+/// `true` when in-cluster Flux can pull the GitOps repository at `repo_url` (a network URL); a
+/// local filesystem path is reachable only from the host running `keel bootstrap init`.
+pub(crate) fn flux_can_reach_git_url(repo_url: &str) -> bool {
+    ["http://", "https://", "ssh://", "git://"]
+        .iter()
+        .any(|p| repo_url.starts_with(p))
 }
 
 /// Bootstrap note for a GitOps repository on the local filesystem: Flux cannot reach it, so it
@@ -868,5 +873,52 @@ mod tests {
         assert!(
             rewrite_corefile(&updated, &["idp.keel.local", "forgejo.keel.local"], "x").is_none()
         );
+    }
+
+    /// The docker-socket proxy image (root-equivalent on the host) is digest-pinned, and
+    /// Renovate's kubernetes manager that bumps it never auto-merges: every bump is reviewed.
+    #[test]
+    fn local_docker_proxy_image_is_pinned_and_bumps_are_reviewed() {
+        let image = LOCAL_DOCKER_PROXY_YAML
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("image: "))
+            .expect("socat image");
+        assert!(image.starts_with("alpine/socat:"), "{image}");
+        assert!(!image.contains(":latest"), "{image}");
+        assert!(image.contains("@sha256:"), "{image}");
+
+        let renovate: Value =
+            serde_json::from_str(include_str!("../../../../../renovate.json")).unwrap();
+        assert!(
+            renovate["kubernetes"]["managerFilePatterns"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|p| p.as_str().unwrap().contains("deploy/bootstrap/manifests"))
+        );
+        let rule = renovate["packageRules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| {
+                r["matchManagers"] == serde_json::json!(["kubernetes"])
+                    && r["matchFileNames"] == serde_json::json!(["deploy/bootstrap/manifests/**"])
+            })
+            .expect("kubernetes-manager packageRule for deploy/bootstrap/manifests");
+        assert_eq!(rule["automerge"], false);
+        // No later rule re-enables automerge for these files.
+        let later_automerge = renovate["packageRules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .skip_while(|r| *r != rule)
+            .skip(1)
+            .filter(|r| r["automerge"] == true)
+            .any(|r| {
+                r.get("matchManagers")
+                    .and_then(Value::as_array)
+                    .is_none_or(|m| m.iter().any(|m| m == "kubernetes"))
+            });
+        assert!(!later_automerge);
     }
 }
