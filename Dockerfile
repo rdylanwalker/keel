@@ -89,7 +89,7 @@ RUN --mount=type=cache,id=keel-cargo-registry,target=/usr/local/cargo/registry \
 FROM ${STATIC_IMAGE} AS static
 LABEL org.opencontainers.image.title="keel" \
       org.opencontainers.image.description="Keel GitOps control plane (static binary only)" \
-      org.opencontainers.image.licenses="Apache-2.0"
+      org.opencontainers.image.licenses="MIT"
 COPY --from=rust-build /out/keel /usr/local/bin/keel
 USER 65532:65532
 WORKDIR /home/nonroot
@@ -102,7 +102,7 @@ CMD ["serve", "--bind", "0.0.0.0:8080"]
 FROM ${RUNTIME_IMAGE} AS runtime
 LABEL org.opencontainers.image.title="keel" \
       org.opencontainers.image.description="Keel GitOps control plane (keel serve)" \
-      org.opencontainers.image.licenses="Apache-2.0"
+      org.opencontainers.image.licenses="MIT"
 RUN apk add --no-cache git openssh-client sops age ca-certificates-bundle
 COPY --from=rust-build /out/keel /usr/local/bin/keel
 USER 65532:65532

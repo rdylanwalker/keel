@@ -68,7 +68,7 @@ kind get clusters
 
 With a tenant namespace ready (such as `default` or `dev-team`), deploy **Podinfo** (`podinfo`) using an upstream Helm chart with Flagger + Envoy Gateway progressive delivery enabled.
 
-> **v0.12.0 bug:** a canary app in a tenant namespace on the management cluster fails because the tenant ServiceAccount cannot manage Flagger `Canary` objects. Apply the [RBAC workaround](../reference/known-limitations.md#canary-apps-on-the-management-cluster) before this walkthrough. Add `127.0.0.1 podinfo.keel.local` to your `hosts` file as well.
+> Add `127.0.0.1 podinfo.keel.local` to your `hosts` file before this walkthrough.
 
 ### Step 1: Initial Canary Deployment
 
@@ -77,21 +77,13 @@ If you followed step 7 of the [README Quick Start](https://github.com/rdylanwalk
 1. In **Catalog & Form Wizard**, select your target tenant (e.g., `default`) and choose **Podinfo Microservice** (`podinfo`).
 2. Check **Enable Flagger Canary**.
 3. Fill in the form (`Replica Count`: `2`, `Ingress Hostname`: `podinfo.keel.local`, `API Secret Token`: any 8+ character secret, and keep the pre-filled `restricted` PSS `Container Security Context` defaults).
-4. Click **Submit & Open Git PR Proposal** (or via CLI). In v0.12.0 the CLI does not fill in the form's defaults, so the values file must include the `restricted` `securityContext`; without it, Kyverno rejects the Deployment. Later releases fill in the defaults on the server, and keeping them in the file does no harm:
+4. Click **Submit & Open Git PR Proposal** (or via CLI). The server fills in the catalog's [schema defaults](../catalog/overview.md#schema-defaults) on a first install, as the form does, so the CLI values file only needs what you change and the API token, which has no default:
 
 ```bash
 cat <<'EOF' > podinfo-values.yaml
 replicaCount: 2
 ingressHost: podinfo.keel.local
 apiToken: demo-podinfo-token
-securityContext:
-  allowPrivilegeEscalation: false
-  runAsNonRoot: true
-  runAsUser: 100
-  capabilities:
-    drop: [ALL]
-  seccompProfile:
-    type: RuntimeDefault
 EOF
 
 keel app install \
@@ -106,7 +98,7 @@ keel proposal merge <PR_NUMBER> --tenant default --server http://127.0.0.1:8080
 ```
 
 5. Inspect the PR diff in **PR & Preview Inspector**—which synthesizes `helmrelease-canary.yaml`, `canary.yaml`, `networkpolicy-canary.yaml`, and, when the form's `apiToken` secret is set, the SOPS-encrypted `secrets.enc.yaml` Secret (listed in the tenant repository's `tenants/<id>/kustomization.yaml` and merged into the release through `HelmRelease.spec.valuesFrom`)—and click **Merge PR**.
-6. In **Topology Map**, wait for `podinfo` to reach `Ready` / `Initialized` in the **Flagger Canary Traffic Rollouts (Envoy Gateway)** panel (about a minute and a half after the merge). If it stays `Pending`, see [Known Limitations](../reference/known-limitations.md#other-app-limitations) for how to read the Flux error.
+6. In **Topology Map**, wait for `podinfo` to reach `Ready` / `Initialized` in the **Flagger Canary Traffic Rollouts (Envoy Gateway)** panel (about a minute and a half after the merge). If it stays `Pending`, `keel app list --tenant <id>` shows the Flux error in its `MESSAGE` column (the status tooltip in the web UI).
 7. Open `https://podinfo.keel.local:8888` (accept the certificate warning) or run `curl -k https://podinfo.keel.local:8888/version`. The app is served over HTTPS only.
 
 ### Step 2: Demonstrate a Live Canary Traffic Rollout

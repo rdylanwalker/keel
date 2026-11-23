@@ -192,7 +192,7 @@ If you put a proxy in front of `keel-server` that rewrites CSP, keep `'wasm-unsa
 
 ## Progressive Delivery (Flagger + Envoy Gateway)
 
-> **v0.12.0 bug:** v0.12.0 ships neither the role nor the policy below, so canary apps in tenant namespaces on the management cluster fail to apply. See the [workaround](../reference/known-limitations.md#canary-apps-on-the-management-cluster). Canary analysis, promotion and rollback are not covered by automated tests.
+> Canary analysis, promotion and rollback are not covered by automated tests.
 
 Applications whose `CatalogApplication` sets `spec.progressiveDelivery.flaggerSupported: true` can opt into canary rollouts (`--canary` in the CLI, or **Enable Flagger Canary** in the GUI). Keel then generates:
 

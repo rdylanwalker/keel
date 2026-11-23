@@ -139,7 +139,7 @@ The first preview can sit silently for a few minutes while the cluster pulls the
 
 **7. Deploy `podinfo` with a canary rollout** into the same tenant on the management cluster. The catalog fills in every value you leave out (two replicas, the host name `podinfo.keel.local` and a restricted security context), so the values file only needs the API token, which has no default.
 
-> **Needs a release newer than v0.12.0.** v0.12.0 neither fills in catalog defaults for CLI installs nor lets tenants manage Flagger canaries. On v0.12.0, apply the [RBAC workaround](./docs/reference/known-limitations.md#canary-apps-on-the-management-cluster) first and use the full values file from [Things to Try](./docs/getting-started/things-to-try.md#2-deploy-an-application-with-canary-rollouts-podinfo); otherwise Kyverno rejects the Deployment and the canary is forbidden.
+> **Step 7 needs a release newer than v0.12.0.** On v0.12.0, Kyverno rejects the Deployment and the canary is forbidden; skip this step until the next release.
 
 <!-- quickstart:step podinfo run -->
 ```bash

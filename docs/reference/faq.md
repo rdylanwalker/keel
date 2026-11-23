@@ -1,6 +1,6 @@
 # FAQ
 
-Short, honest answers to the questions people ask first. This page describes v0.12.0.
+Short, honest answers to the questions people ask first.
 
 ## Is it production ready?
 
@@ -41,7 +41,7 @@ Keel is much narrower than Backstage or Port and is self-hosted only. Kratix is 
 
 ## Why is the footprint so large for a homelab?
 
-The local setup needs about 12 GB of free memory; the management node alone peaks at about 7 GiB ([measurements](https://github.com/rdylanwalker/keel#requirements)). Keel installs a full control plane: Flux, PKO, S3 storage for Pulumi state, Kyverno policies, cert-manager, Envoy Gateway, Prometheus and Flagger for canaries, an identity provider and, optionally, Forgejo. In v0.12.0 the only optional parts are the identity provider (`--oidc-provider none`, or bring your own with `--oidc-issuer`) and Forgejo (`--with-forge`). There is no slim mode yet.
+The local setup needs about 12 GB of free memory; the management node alone peaks at about 7 GiB ([measurements](https://github.com/rdylanwalker/keel#requirements)). Keel installs a full control plane: Flux, PKO, S3 storage for Pulumi state, Kyverno policies, cert-manager, Envoy Gateway, Prometheus and Flagger for canaries, an identity provider and, optionally, Forgejo. The only optional parts are the identity provider (`--oidc-provider none`, or bring your own with `--oidc-issuer`) and Forgejo (`--with-forge`). There is no slim mode yet.
 
 ## Is it secure? It holds my forge tokens.
 
