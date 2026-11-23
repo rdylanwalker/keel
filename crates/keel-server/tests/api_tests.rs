@@ -7361,6 +7361,98 @@ spec:
     );
 }
 
+/// The real `kind-canary-platform` bundle: `canary-gateway-config`'s schema defaults
+/// (`kubeconfigSecretName: workload-dev-kubeconfig`, `kubeconfigSecretNamespace: tenant-default`)
+/// are filled in on a first install, but the bundle's `targetClusterFrom` wiring must still win,
+/// or the stack mounts a Secret the cluster item never writes (live E2E 07.1 regression).
+#[tokio::test]
+async fn test_bundle_target_cluster_wiring_overrides_item_schema_defaults() {
+    let fixture = setup_fixture().await;
+    let cookie = login_and_get_cookie(&fixture).await;
+    commit_to_main(
+        &fixture,
+        &[
+            (
+                "catalog/bundles/kind-canary-platform/catalog.yaml",
+                include_str!("../../../deploy/catalog/bundles/kind-canary-platform/catalog.yaml"),
+            ),
+            (
+                "catalog/apps/envoy-gateway/catalog.yaml",
+                include_str!("../../../deploy/catalog/apps/envoy-gateway/catalog.yaml"),
+            ),
+            (
+                "catalog/apps/prometheus/catalog.yaml",
+                include_str!("../../../deploy/catalog/apps/prometheus/catalog.yaml"),
+            ),
+            (
+                "catalog/apps/flagger/catalog.yaml",
+                include_str!("../../../deploy/catalog/apps/flagger/catalog.yaml"),
+            ),
+            (
+                "catalog/infra/kind-cluster/catalog.yaml",
+                include_str!("../../../deploy/catalog/infra/kind-cluster/catalog.yaml"),
+            ),
+            (
+                "catalog/infra/kind-cluster/Pulumi.yaml",
+                include_str!("../../../deploy/catalog/infra/kind-cluster/Pulumi.yaml"),
+            ),
+            (
+                "catalog/infra/canary-gateway-config/catalog.yaml",
+                include_str!("../../../deploy/catalog/infra/canary-gateway-config/catalog.yaml"),
+            ),
+            (
+                "catalog/infra/canary-gateway-config/Pulumi.yaml",
+                include_str!("../../../deploy/catalog/infra/canary-gateway-config/Pulumi.yaml"),
+            ),
+        ],
+        "feat(catalog): kind-canary-platform bundle",
+    )
+    .await;
+
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "kind-canary-platform", "kind": "bundle",
+                "name": "e2e-lab", "values": {} }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    checkout_proposal_branch(&fixture, &body).await;
+
+    let stack = |item: &str| {
+        let path = fixture
+            .state
+            .repo_workdir
+            .join(format!("tenants/acme/bundles/e2e-lab/{item}/stack.yaml"));
+        noyalib::from_str::<Value>(&std::fs::read_to_string(path).unwrap()).unwrap()
+    };
+    let cluster = stack("cluster");
+    assert_eq!(
+        cluster["spec"]["config"]["kubeconfigSecretName"],
+        "e2e-lab-cluster-kubeconfig"
+    );
+    let config = stack("canary-config");
+    assert_eq!(
+        config["spec"]["config"]["kubeconfigSecretName"],
+        "e2e-lab-cluster-kubeconfig"
+    );
+    assert_eq!(
+        config["spec"]["config"]["kubeconfigSecretNamespace"],
+        "tenant-acme"
+    );
+    // Other schema defaults still apply.
+    assert_eq!(config["spec"]["config"]["gatewayNamespace"], "keel-system");
+    let volumes = &config["spec"]["workspaceTemplate"]["spec"]["podTemplate"]["spec"]["volumes"];
+    assert!(
+        volumes
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v["secret"]["secretName"] == "e2e-lab-cluster-kubeconfig"),
+        "{volumes}"
+    );
+}
+
 /// Manifest apps inside bundles use the same split layout (config Kustomization first).
 #[tokio::test]
 async fn test_bundle_manifest_app_item_uses_split_config_layout() {

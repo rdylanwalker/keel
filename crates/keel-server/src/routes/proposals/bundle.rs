@@ -570,32 +570,19 @@ pub(super) async fn create_bundle_proposal(
                 stack_params
                     .config
                     .insert("keel:provider".to_string(), bp.metadata.provider.clone());
-                if bp.spec.outputs.iter().any(|o| o == "kubeconfig")
+                // Where the item's kubeconfig Secret lives is bundle wiring, not a value: it is
+                // applied after the item values below, so a schema default such as
+                // canary-gateway-config's `kubeconfigSecretName: workload-dev-kubeconfig` cannot
+                // point the stack at a Secret the bundle's cluster item never writes.
+                let kubeconfig_wiring = if bp.spec.outputs.iter().any(|o| o == "kubeconfig")
                     || target_cluster_sources.contains(item.id.as_str())
                 {
-                    stack_params.config.insert(
-                        "kubeconfigSecretName".to_string(),
-                        format!("{item_resource_name}-kubeconfig"),
-                    );
-                    stack_params
-                        .config
-                        .insert("kubeconfigSecretNamespace".to_string(), tenant_ns.clone());
+                    Some(format!("{item_resource_name}-kubeconfig"))
                 } else if let Some(cluster_item) = &item.target_cluster_from {
-                    stack_params.config.insert(
-                        "kubeconfigSecretName".to_string(),
-                        format!("{instance_name}-{cluster_item}-kubeconfig"),
-                    );
-                    stack_params
-                        .config
-                        .insert("kubeconfigSecretNamespace".to_string(), tenant_ns.clone());
-                } else if let Some(target) = remote_target_cluster(req.target_cluster.as_deref()) {
-                    stack_params
-                        .config
-                        .insert("kubeconfigSecretName".to_string(), target.to_string());
-                    stack_params
-                        .config
-                        .insert("kubeconfigSecretNamespace".to_string(), tenant_ns.clone());
-                }
+                    Some(format!("{instance_name}-{cluster_item}-kubeconfig"))
+                } else {
+                    remote_target_cluster(req.target_cluster.as_deref()).map(str::to_string)
+                };
                 if bp.metadata.provider == "kind" {
                     stack_params.docker_host = state.docker_proxy_url.clone();
                 }
@@ -616,6 +603,14 @@ pub(super) async fn create_bundle_proposal(
                         };
                         stack_params.config.insert(k.clone(), str_val);
                     }
+                }
+                if let Some(secret_name) = kubeconfig_wiring {
+                    stack_params
+                        .config
+                        .insert("kubeconfigSecretName".to_string(), secret_name);
+                    stack_params
+                        .config
+                        .insert("kubeconfigSecretNamespace".to_string(), tenant_ns.clone());
                 }
                 let mut stack = synthesize_tenant_stack(&stack_params)?;
                 apply_tenant_source_trust(&mut stack, &stack_source);
