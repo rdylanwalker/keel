@@ -161,6 +161,7 @@ Next: use the web UI, drive a live canary traffic rollout and create tenants in 
 <!-- quickstart:step cleanup teardown -->
 ```bash
 # Stop keel serve with Ctrl+C first.
+keel auth logout                                    # removes the stored session token
 kind delete cluster --name workload-dev
 kind delete cluster --name keel-mgmt
 rm -rf ~/keel-try ~/.config/keel/stage0/keel-mgmt   # repos and Stage 0 state
