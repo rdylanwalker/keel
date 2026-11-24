@@ -758,6 +758,12 @@ mod tests {
         let _default_mgr = SopsManager::default();
     }
 
+    /// `ETXTBSY` ("Text file busy") on Linux.
+    #[cfg(unix)]
+    const fn libc_etxtbsy() -> i32 {
+        26
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn test_sops_manager_with_mock_binaries() {
@@ -791,6 +797,20 @@ mod tests {
             let mut perms = tokio::fs::metadata(path).await.unwrap().permissions();
             perms.set_mode(0o755);
             tokio::fs::set_permissions(path, perms).await.unwrap();
+        }
+
+        // A test thread that forks while a script above is still open for writing leaves the
+        // child holding a writable fd until it execs, and exec of the script then fails with
+        // ETXTBSY. Wait until both scripts can be executed.
+        for path in [&mock_keygen, &mock_sops] {
+            for attempt in 0.. {
+                match std::process::Command::new(path).output() {
+                    Err(e) if e.raw_os_error() == Some(libc_etxtbsy()) && attempt < 200 => {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                    _ => break,
+                }
+            }
         }
 
         let manager = SopsManager::with_binaries(&mock_sops, &mock_keygen);
