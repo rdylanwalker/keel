@@ -69,9 +69,9 @@ pub enum Commands {
     Auth(AuthArgs),
     /// Start the stateless Axum API/SSE server and embedded React SPA
     Serve(ServeArgs),
-    /// List and provision multi-provider Pulumi Kubernetes Operator (PKO v2) stacks
+    /// List, provision, and destroy multi-provider Pulumi Kubernetes Operator (PKO v2) stacks
     Infra(InfraArgs),
-    /// Install catalog applications via Pull Requests and list deployed releases
+    /// Install and delete catalog applications via Pull Requests and list deployed releases
     App(AppArgs),
     /// Inspect ephemeral PKO v2 PR preview diffs and status
     Preview(PreviewArgs),
@@ -432,6 +432,8 @@ pub enum InfraCommands {
     List(InfraListArgs),
     /// Validate parameters against a blueprint JSONSchema and open a provisioning PR
     Provision(InfraProvisionArgs),
+    /// Open a removal PR for a provisioned stack (PKO runs `pulumi destroy` once it is merged)
+    Destroy(InfraDestroyArgs),
     /// Display SSH connection info or open an interactive SSH session to a provisioned VM stack
     Ssh(InfraSshArgs),
     /// Clear finalizers and force-delete a stuck or terminating PKO v2 Stack
@@ -475,6 +477,25 @@ pub struct InfraProvisionArgs {
     /// committed values (only the keys it sets change; `null` removes a key)
     #[arg(long)]
     pub values_file: PathBuf,
+
+    /// Keel server base URL (set via global `--server` / `KEEL_SERVER`)
+    #[arg(skip = DEFAULT_SERVER_URL.to_string())]
+    pub server: String,
+}
+
+/// Arguments for `keel infra destroy` (`SDD.md` §7.2): `DELETE /api/v1/stacks/tenant-<id>/<stack>`.
+#[derive(Args, Debug, Clone, PartialEq, Eq)]
+pub struct InfraDestroyArgs {
+    /// Infrastructure stack name (as shown by `keel infra list`)
+    pub stack_name: String,
+
+    /// Tenant owning the stack (bare id, e.g. `default`; a `tenant-` prefix is stripped)
+    #[arg(long, help = TENANT_HELP)]
+    pub tenant: String,
+
+    /// Output format (`table|json`)
+    #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+    pub output: OutputFormat,
 
     /// Keel server base URL (set via global `--server` / `KEEL_SERVER`)
     #[arg(skip = DEFAULT_SERVER_URL.to_string())]
@@ -576,6 +597,28 @@ pub enum AppCommands {
     Install(AppInstallArgs),
     /// List deployed application releases (Flux HelmReleases / Kustomizations)
     List(AppListArgs),
+    /// Open a removal PR for an installed application release (Flux prunes it once merged)
+    #[command(visible_alias = "uninstall")]
+    Delete(AppDeleteArgs),
+}
+
+/// Arguments for `keel app delete`: `DELETE /api/v1/releases/tenant-<id>/<name>`.
+#[derive(Args, Debug, Clone, PartialEq, Eq)]
+pub struct AppDeleteArgs {
+    /// Release name (as shown by `keel app list`)
+    pub name: String,
+
+    /// Tenant owning the release (bare id, e.g. `default`; a `tenant-` prefix is stripped)
+    #[arg(long, help = TENANT_HELP)]
+    pub tenant: String,
+
+    /// Output format (`table|json`)
+    #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+    pub output: OutputFormat,
+
+    /// Keel server base URL (set via global `--server` / `KEEL_SERVER`)
+    #[arg(skip = DEFAULT_SERVER_URL.to_string())]
+    pub server: String,
 }
 
 /// Arguments for `keel app list`.
@@ -1201,6 +1244,45 @@ mod tests {
             panic!("expected app install without values file");
         };
         assert_eq!(app_defaults_args.values_file, None);
+
+        let delete_cli = Cli::try_parse_from([
+            "keel", "app", "delete", "podinfo", "--tenant", "acme", "--output", "json",
+        ])
+        .unwrap();
+        let Commands::App(AppArgs {
+            command: AppCommands::Delete(delete_args),
+        }) = delete_cli.command
+        else {
+            panic!("expected app delete");
+        };
+        assert_eq!(delete_args.name, "podinfo");
+        assert_eq!(delete_args.tenant, "acme");
+        assert_eq!(delete_args.output, OutputFormat::Json);
+        let alias_cli =
+            Cli::try_parse_from(["keel", "app", "uninstall", "podinfo", "--tenant", "acme"])
+                .unwrap();
+        assert!(matches!(
+            alias_cli.command,
+            Commands::App(AppArgs {
+                command: AppCommands::Delete(_)
+            })
+        ));
+        // `--tenant` is required: a removal PR never guesses the tenant.
+        assert!(Cli::try_parse_from(["keel", "app", "delete", "podinfo"]).is_err());
+
+        let destroy_cli =
+            Cli::try_parse_from(["keel", "infra", "destroy", "dev-vm", "--tenant", "acme"])
+                .unwrap();
+        let Commands::Infra(InfraArgs {
+            command: InfraCommands::Destroy(destroy_args),
+        }) = destroy_cli.command
+        else {
+            panic!("expected infra destroy");
+        };
+        assert_eq!(destroy_args.stack_name, "dev-vm");
+        assert_eq!(destroy_args.tenant, "acme");
+        assert_eq!(destroy_args.output, OutputFormat::Table);
+        assert!(Cli::try_parse_from(["keel", "infra", "destroy", "dev-vm"]).is_err());
 
         let ssh_cli = Cli::try_parse_from([
             "keel",

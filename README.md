@@ -169,7 +169,7 @@ rm -rf ~/keel-try ~/.config/keel/stage0/keel-mgmt   # repos and Stage 0 state
 
 <!-- quickstart:end -->
 
-Remove both: a later bootstrap with the same names otherwise reuses the old bare repository, its history and the Stage 0 state. To remove a single stack or app instead, click **Delete** on it in the web UI and merge the removal PR. Flux then prunes it, and PKO runs `pulumi destroy`.
+Remove both: a later bootstrap with the same names otherwise reuses the old bare repository, its history and the Stage 0 state. To remove a single stack or app instead, click **Delete** on it in the web UI (or run `keel infra destroy <stack> --tenant <id>` / `keel app delete <release> --tenant <id>`) and merge the removal PR. Flux then prunes it, and PKO runs `pulumi destroy`.
 
 ## Maturity: what is tested
 

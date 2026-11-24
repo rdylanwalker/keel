@@ -17,8 +17,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::cli::{
-    AppInstallArgs, InfraForceDeleteArgs, InfraListArgs, InfraProvisionArgs, InfraSshArgs,
-    InfraUnlockArgs, OutputFormat, PreviewStatusArgs,
+    AppDeleteArgs, AppInstallArgs, InfraDestroyArgs, InfraForceDeleteArgs, InfraListArgs,
+    InfraProvisionArgs, InfraSshArgs, InfraUnlockArgs, OutputFormat, PreviewStatusArgs,
 };
 
 use super::{
@@ -337,6 +337,107 @@ pub async fn execute_app_install(
         args.engine.as_deref(),
     )
     .await
+}
+
+/// Executes `keel infra destroy`: opens the same removal PR as the web UI's **Delete**
+/// (`DELETE /api/v1/stacks/tenant-<id>/<stack>`). Merging it prunes the `Stack` and PKO runs
+/// `pulumi destroy` (`AGENTS.md` §3.6: never a direct commit to `main`).
+pub async fn execute_infra_destroy(
+    args: &InfraDestroyArgs,
+    ctx: &CliContext,
+) -> Result<String, CliError> {
+    submit_removal_request(
+        &args.server,
+        ctx,
+        &args.tenant,
+        "stacks",
+        &args.stack_name,
+        "stack_name",
+        args.output,
+    )
+    .await
+}
+
+/// Executes `keel app delete`: opens the same removal PR as the web UI's **Delete**
+/// (`DELETE /api/v1/releases/tenant-<id>/<name>`). Merging it lets Flux prune the release.
+pub async fn execute_app_delete(
+    args: &AppDeleteArgs,
+    ctx: &CliContext,
+) -> Result<String, CliError> {
+    submit_removal_request(
+        &args.server,
+        ctx,
+        &args.tenant,
+        "releases",
+        &args.name,
+        "name",
+        args.output,
+    )
+    .await
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DeleteResourceApiResponse {
+    proposal: PullRequestInfo,
+    branch: String,
+}
+
+/// Formats a removal proposal response (`DELETE /api/v1/{stacks,releases}/...`).
+pub(crate) fn format_removal_output(
+    raw: &Value,
+    tenant: &str,
+    format: OutputFormat,
+) -> Result<String, CliError> {
+    if format == OutputFormat::Json {
+        return Ok(serde_json::to_string_pretty(raw)?);
+    }
+    let parsed: DeleteResourceApiResponse = serde_json::from_value(raw.clone())?;
+    // The proposal scope (`ScopedProposal::scope`) names the repository holding the PR.
+    let scope = raw
+        .pointer("/proposal/scope")
+        .and_then(Value::as_str)
+        .unwrap_or(tenant);
+    let mut output = String::new();
+    output.push_str(&format!(
+        "Opened Removal Proposal PR #{}: {}\n",
+        parsed.proposal.id, parsed.proposal.title
+    ));
+    output.push_str(&format!(
+        "Branch:        {} -> {}\n",
+        parsed.branch, parsed.proposal.target_branch
+    ));
+    output.push_str(&format!("PR URL:        {}\n", parsed.proposal.url));
+    // PR numbers are per repository: the scope names the repository holding this PR.
+    output.push_str(&format!(
+        "Next:          keel preview status --pr {id} --tenant {scope} --watch; keel proposal merge {id} --tenant {scope}",
+        id = parsed.proposal.id
+    ));
+    Ok(output)
+}
+
+async fn submit_removal_request(
+    server: &str,
+    ctx: &CliContext,
+    raw_tenant: &str,
+    collection: &str,
+    name: &str,
+    name_field: &str,
+    format: OutputFormat,
+) -> Result<String, CliError> {
+    validate_dns_label(name, name_field)?;
+    let tenant = normalize_tenant_arg(raw_tenant);
+    validate_dns_label(&tenant, "tenant")?;
+    let base_url = normalize_server_url(server)?;
+    let endpoint = format!("{base_url}/api/v1/{collection}/tenant-{tenant}/{name}");
+    let resp = attach_auth(ctx.http.delete(&endpoint), ctx, &base_url)
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        return Err(extract_api_error(resp).await);
+    }
+    let raw: Value = resp.json().await?;
+    format_removal_output(&raw, &tenant, format)
 }
 
 async fn fetch_catalog(base_url: &str, ctx: &CliContext) -> Result<CatalogApiResponse, CliError> {

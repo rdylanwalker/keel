@@ -157,7 +157,7 @@ You can use the same management cluster to provision cloud infrastructure. This 
 
 ### Step 4: Clean Up Cloud Resources
 
-When you are done testing, click **Delete** on the `eks-sandbox` stack in **Topology Map** and merge the removal PR. PKO v2 then destroys the EKS cluster and VPC.
+When you are done testing, click **Delete** on the `eks-sandbox` stack in **Topology Map** (or run `keel infra destroy <stack> --tenant default` with the stack name from `keel infra list`) and merge the removal PR. PKO v2 then destroys the EKS cluster and VPC.
 
 ---
 
@@ -285,7 +285,7 @@ keel infra provision \
 keel preview status --pr <PR_NUMBER> --tenant <TENANT> --watch --server http://127.0.0.1:8080
 ```
 
-`GOOGLE_CREDENTIALS` (marked `"writeOnly": true` and `"format": "password"`) is encrypted with SOPS + `age` into `secret.enc.yaml` and bound to `Stack.spec.envRefs`, while `vmName`, `project`, and `zone` populate `Stack.spec.config`. Merge the PR to create the VM. When you are done, click **Delete** on the stack in **Topology Map** and merge the removal PR so PKO v2 runs `pulumi destroy`.
+`GOOGLE_CREDENTIALS` (marked `"writeOnly": true` and `"format": "password"`) is encrypted with SOPS + `age` into `secret.enc.yaml` and bound to `Stack.spec.envRefs`, while `vmName`, `project`, and `zone` populate `Stack.spec.config`. Merge the PR to create the VM. When you are done, click **Delete** on the stack in **Topology Map** (or run `keel infra destroy <stack> --tenant default` with the stack name from `keel infra list`) and merge the removal PR so PKO v2 runs `pulumi destroy`.
 
 ---
 

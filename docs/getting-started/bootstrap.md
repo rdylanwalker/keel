@@ -375,4 +375,4 @@ kind delete cluster --name keel-mgmt
 rm -rf ./keel-gitops ./keel-gitops.git ./keel-gitops-tenant-repos ~/.config/keel/stage0/keel-mgmt
 ```
 
-If you keep the Stage 0 state directory or the bare repository, a later bootstrap with the same names reuses them, including the old Git history. To remove a single stack or app instead, click **Delete** on it in the web UI and merge the removal PR (see [Provisioning Workflow](provisioning.md#6-edit-reconcile-or-delete-deployed-resources)).
+If you keep the Stage 0 state directory or the bare repository, a later bootstrap with the same names reuses them, including the old Git history. To remove a single stack or app instead, click **Delete** on it in the web UI (or run `keel infra destroy <stack> --tenant <id>` / `keel app delete <release> --tenant <id>`) and merge the removal PR (see [Provisioning Workflow](provisioning.md#6-edit-reconcile-or-delete-deployed-resources)).

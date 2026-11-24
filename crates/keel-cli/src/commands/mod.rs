@@ -36,8 +36,9 @@ use bootstrap::execute_bootstrap_init;
 use recover::execute_bootstrap_recover;
 use serve::execute_serve;
 use workloads::{
-    execute_app_install, execute_infra_force_delete, execute_infra_list, execute_infra_provision,
-    execute_infra_ssh, execute_infra_unlock, execute_preview_status,
+    execute_app_delete, execute_app_install, execute_infra_destroy, execute_infra_force_delete,
+    execute_infra_list, execute_infra_provision, execute_infra_ssh, execute_infra_unlock,
+    execute_preview_status,
 };
 
 /// Unified error type returned by `keel` CLI command handlers.
@@ -493,6 +494,7 @@ pub async fn dispatch(cli: &Cli, ctx: &CliContext) -> Result<String, CliError> {
             InfraCommands::Provision(args) => {
                 execute_infra_provision(&with_server!(args), ctx).await
             }
+            InfraCommands::Destroy(args) => execute_infra_destroy(&with_server!(args), ctx).await,
             InfraCommands::Ssh(args) => execute_infra_ssh(&with_server!(args), ctx).await,
             InfraCommands::ForceDelete(args) => {
                 execute_infra_force_delete(&with_server!(args), ctx).await
@@ -502,6 +504,7 @@ pub async fn dispatch(cli: &Cli, ctx: &CliContext) -> Result<String, CliError> {
         Commands::App(a) => match &a.command {
             AppCommands::Install(args) => execute_app_install(&with_server!(args), ctx).await,
             AppCommands::List(args) => execute_app_list(&with_server!(args), ctx).await,
+            AppCommands::Delete(args) => execute_app_delete(&with_server!(args), ctx).await,
         },
         Commands::Preview(p) => match &p.command {
             PreviewCommands::Status(args) => execute_preview_status(&with_server!(args), ctx).await,
@@ -1548,6 +1551,49 @@ spec:
         let list_json_out = dispatch(&list_json_cli, &ctx).await.unwrap();
         assert!(list_json_out.contains("\"postgres-managed\""));
 
+        // 7a. `keel infra destroy` opens the web UI's removal PR for the merged stack; it never
+        // touches `main` directly, and unknown releases are reported by `keel app delete`.
+        let destroy_cli = Cli::try_parse_from([
+            "keel",
+            "infra",
+            "destroy",
+            "postgres-managed",
+            "--tenant",
+            "acme",
+            "--server",
+            &server_url,
+        ])
+        .unwrap();
+        let destroy_out = dispatch(&destroy_cli, &ctx).await.unwrap();
+        assert!(
+            destroy_out.contains("Opened Removal Proposal PR #")
+                && destroy_out.contains("delete stack postgres-managed")
+                && destroy_out.contains("--tenant acme --watch"),
+            "{destroy_out}"
+        );
+        assert!(
+            tokio::fs::try_exists(work_dir.join("tenants/acme/infra/postgres-managed"))
+                .await
+                .unwrap(),
+            "destroy must not change main before the removal PR is merged"
+        );
+        let missing_app_cli = Cli::try_parse_from([
+            "keel",
+            "app",
+            "delete",
+            "no-such-app",
+            "--tenant",
+            "acme",
+            "--server",
+            &server_url,
+        ])
+        .unwrap();
+        let missing_err = dispatch(&missing_app_cli, &ctx)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(missing_err.contains("not found"), "{missing_err}");
+
         // 7b. `keel infra ssh` against live server (table, json, command, overrides, and flag-injection rejection)
         // Non-VM stacks (postgres-managed is a Service) and unknown stacks are rejected instead of
         // fabricating a `<stack>.<tenant>.local` target (`OPEN-17`).
@@ -2422,5 +2468,141 @@ spec:
         .unwrap();
         let out = dispatch(&cli, &ctx).await.unwrap();
         assert!(out.contains("PR #42") || out.contains("my-vm"));
+    }
+
+    #[tokio::test]
+    async fn app_delete_and_infra_destroy_open_removal_proposals_against_mock_server() {
+        use axum::Router;
+        use axum::routing::delete;
+        use clap::Parser;
+
+        fn removal_response(kind: &str, name: &str) -> serde_json::Value {
+            json!({
+                "id": name,
+                "namespace": "tenant-acme",
+                "branch": format!("keel/acme/delete-{name}-1"),
+                "proposal": {
+                    "id": "7",
+                    "title": format!("chore(acme): delete {kind} {name}"),
+                    "body": "Automated decommission proposal",
+                    "state": "open",
+                    "sourceBranch": format!("keel/acme/delete-{name}-1"),
+                    "targetBranch": "main",
+                    "headSha": "abc123",
+                    "tenant": "acme",
+                    "url": "http://forge.local/acme/pulls/7",
+                    "createdAt": "2026-01-01T00:00:00Z",
+                    "updatedAt": "2026-01-01T00:00:00Z",
+                    "scope": "acme",
+                    "repository": { "label": "keel-tenants/acme" }
+                }
+            })
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_url = format!("http://127.0.0.1:{}", addr.port());
+        let app = Router::new()
+            .route(
+                "/api/v1/releases/tenant-acme/podinfo",
+                delete(|headers: axum::http::HeaderMap| async move {
+                    assert_eq!(headers.get("authorization").unwrap(), "Bearer test-bearer");
+                    axum::Json(removal_response("release", "podinfo"))
+                }),
+            )
+            .route(
+                "/api/v1/stacks/tenant-acme/dev-vm",
+                delete(|| async { axum::Json(removal_response("stack", "dev-vm")) }),
+            )
+            .route(
+                "/api/v1/releases/tenant-acme/locked",
+                delete(|| async {
+                    (
+                        axum::http::StatusCode::FORBIDDEN,
+                        axum::Json(
+                            json!({ "error": "Release 'locked' is labelled keel.io/protect" }),
+                        ),
+                    )
+                }),
+            );
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let tmp = TempTestDir::new("cli-removal");
+        let ctx = CliContext::with_credentials_path(tmp.path().join("creds.json"));
+        ctx.save_session_token(&server_url, "test-bearer").unwrap();
+
+        // `uninstall` is an alias of `app delete`; a `tenant-` prefix is stripped.
+        for verb in ["delete", "uninstall"] {
+            let cli = Cli::try_parse_from([
+                "keel",
+                "app",
+                verb,
+                "podinfo",
+                "--tenant",
+                "tenant-acme",
+                "--server",
+                &server_url,
+            ])
+            .unwrap();
+            let out = dispatch(&cli, &ctx).await.unwrap();
+            assert!(
+                out.contains("Opened Removal Proposal PR #7: chore(acme): delete release podinfo")
+                    && out.contains("keel/acme/delete-podinfo-1 -> main")
+                    && out.contains("PR URL:        http://forge.local/acme/pulls/7")
+                    && out.contains(
+                        "keel preview status --pr 7 --tenant acme --watch; keel proposal merge 7 --tenant acme"
+                    ),
+                "{out}"
+            );
+        }
+
+        let cli = Cli::try_parse_from([
+            "keel",
+            "infra",
+            "destroy",
+            "dev-vm",
+            "--tenant",
+            "acme",
+            "--output",
+            "json",
+            "--server",
+            &server_url,
+        ])
+        .unwrap();
+        let out = dispatch(&cli, &ctx).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed["proposal"]["id"], "7");
+        assert_eq!(parsed["branch"], "keel/acme/delete-dev-vm-1");
+
+        // Server refusals (protected releases, tenant access) surface as errors.
+        let cli = Cli::try_parse_from([
+            "keel",
+            "app",
+            "delete",
+            "locked",
+            "--tenant",
+            "acme",
+            "--server",
+            &server_url,
+        ])
+        .unwrap();
+        let err = dispatch(&cli, &ctx).await.unwrap_err().to_string();
+        assert!(err.contains("keel.io/protect"), "{err}");
+
+        // Names are validated client-side before any request.
+        let cli = Cli::try_parse_from([
+            "keel",
+            "app",
+            "delete",
+            "../etc",
+            "--tenant",
+            "acme",
+            "--server",
+            &server_url,
+        ])
+        .unwrap();
+        assert!(dispatch(&cli, &ctx).await.is_err());
     }
 }
