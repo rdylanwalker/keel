@@ -22,7 +22,7 @@ Stage 0 stacks are named `stage0-<program>-<cluster>`. Examples are `stage0-cont
 
 During escrow, Keel turns on **bucket versioning** for `pulumi-state`, so every `pulumi up` keeps an older object version you can return to. If the S3 backend rejects versioning, Keel instead writes timestamped snapshots to `stage0/<cluster>/snapshots/<stack>/<timestamp>.json`. The bootstrap summary says which mode is active.
 
-> **Escrow the passphrase.** On the first run, `keel bootstrap init` prints a one-time notice with the passphrase location. Copy the passphrase into your password manager or vault. Without it, no copy of the state can be decrypted once the workstation and the in-cluster Secret are gone.
+> **Escrow the passphrase.** When it generates the passphrase, `keel bootstrap init` prints a notice with the passphrase location, and repeats it on later runs until one completes (a failed run prints it to stderr). Copy the passphrase into your password manager or vault. Without it, no copy of the state can be decrypted once the workstation and the in-cluster Secret are gone.
 
 ## Runbook
 

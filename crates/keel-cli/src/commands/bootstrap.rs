@@ -19,8 +19,8 @@ use base64::engine::general_purpose::STANDARD;
 use keel_core::{
     AuthPhase, BootstrapConfig, BootstrapTarget, ClusterConnection, DEFAULT_POLL_INTERVAL,
     FLUX_SYSTEM_NAMESPACE, ForgeConfig, ForgeKind, KEEL_SYSTEM_NAMESPACE, KeelConfig, OidcConfig,
-    ProviderRegistry, STAGE0_PASSPHRASE_FILE, SopsConfig, SopsManager, bootstrap_target_factory,
-    generate_admin_password, stage0_cluster_dir_in, stage0_state_root,
+    ProviderRegistry, SopsConfig, SopsManager, bootstrap_target_factory, generate_admin_password,
+    stage0_state_root,
 };
 use keel_git::{CommitAuthor, GitCredentials, GitRunner, parse_remote_repo_url};
 use keel_kube::{
@@ -290,6 +290,11 @@ impl std::fmt::Debug for SeedControlPlaneArtifacts {
 pub struct SeedRepoInitResult {
     pub repo_dir: PathBuf,
     pub bare_repo_dir: PathBuf,
+    /// The working copy's `origin` after bootstrap: the local bare repository (Local Git
+    /// provider) or the forge's repository URL (`forge.repoUrl`).
+    pub origin_url: String,
+    /// Whether the seed commit reached `origin`.
+    pub pushed: bool,
     pub initial_commit_sha: String,
     pub written_files: Vec<String>,
 }
@@ -1016,6 +1021,31 @@ pub(crate) fn validate_keel_server_git_url(raw: &str) -> Result<(), CliError> {
     Ok(())
 }
 
+/// Rejects a `--git-url` that embeds credentials, in every bootstrap mode: the URL is written
+/// to `keel.yaml` and the Flux `GitRepository`, logged on push failures and printed in the
+/// summary, so a token in it would leak (`NFR-SEC-05`). HTTP(S) userinfo of any kind is
+/// refused (a bare `https://<token>@host` is a credential too); other URL schemes may name a
+/// user (`ssh://git@host/...`) but never a password. Local paths and scp-style remotes are
+/// not URLs and pass through.
+pub(crate) fn validate_git_url_has_no_credentials(
+    args: &BootstrapInitArgs,
+) -> Result<(), CliError> {
+    let Some(raw) = args.git_url.as_deref().map(str::trim) else {
+        return Ok(());
+    };
+    let Ok(parsed) = url::Url::parse(raw) else {
+        return Ok(());
+    };
+    let http = matches!(parsed.scheme(), "http" | "https");
+    if parsed.password().is_some() || (http && !parsed.username().is_empty()) {
+        return Err(CliError::Validation(
+            "--git-url must not embed credentials (they would be committed to keel.yaml and              printed); pass --git-token / KEEL_GIT_TOKEN instead"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Validates `--with-keel-server` against the Git mode before anything is provisioned.
 /// `tenant-default` gets its own repository on every remote forge, which needs forge API access:
 /// with an external `--git-url` (not the in-cluster Forgejo, not a local path), `--git-token`
@@ -1576,8 +1606,10 @@ async fn initialize_seed_git_repo(
         )
         .await?;
 
-    if artifacts.keel_config.forge.provider == ForgeKind::Local {
+    let mut pushed = true;
+    let origin_url = if artifacts.keel_config.forge.provider == ForgeKind::Local {
         git.push(repo_dir, "origin", "HEAD:refs/heads/main").await?;
+        bare_repo_dir.to_string_lossy().into_owned()
     } else {
         let remote_url = &artifacts.keel_config.forge.repo_url;
         if let Some(push_url) = push_url_override {
@@ -1593,13 +1625,17 @@ async fn initialize_seed_git_repo(
                     error = %err,
                     "Seed commit created locally on `main`, but initial push to remote `origin` failed; push manually once the remote repository and credentials are ready"
                 );
+                pushed = false;
             }
         }
-    }
+        remote_url.clone()
+    };
 
     Ok(SeedRepoInitResult {
         repo_dir: repo_dir.to_path_buf(),
         bare_repo_dir,
+        origin_url,
+        pushed,
         initial_commit_sha: commit_sha,
         written_files,
     })
@@ -1744,8 +1780,18 @@ pub async fn execute_bootstrap_init_with_target(
     args: &BootstrapInitArgs,
     target: &dyn BootstrapTarget,
 ) -> Result<BootstrapInitOutcome, CliError> {
+    execute_bootstrap_init_with_target_in(&stage0_state_root(), args, target).await
+}
+
+/// [`execute_bootstrap_init_with_target`] against an explicit Stage 0 state root (tests).
+async fn execute_bootstrap_init_with_target_in(
+    stage0_root: &Path,
+    args: &BootstrapInitArgs,
+    target: &dyn BootstrapTarget,
+) -> Result<BootstrapInitOutcome, CliError> {
     let cfg = args.to_bootstrap_config();
     cfg.validate()?;
+    validate_git_url_has_no_credentials(args)?;
     validate_keel_server_args(args)?;
     validate_tenant_default_forge_args(args)?;
     let ingress = match args.oidc_public_url.as_deref() {
@@ -1761,27 +1807,57 @@ pub async fn execute_bootstrap_init_with_target(
         "Executing Stage 0 bootstrap initialization"
     );
 
-    // Sample before any Stage 0 Pulumi run so a passphrase generated during this invocation
-    // (by the target driver or the control-plane stacks) triggers the one-time escrow notice.
-    let passphrase_preexisted = std::env::var_os("PULUMI_CONFIG_PASSPHRASE").is_some()
-        || stage0_cluster_dir_in(&stage0_state_root(), &cfg.cluster_name)
-            .join(STAGE0_PASSPHRASE_FILE)
-            .is_file();
     if !args.skip_core_install && cfg.target == keel_core::BootstrapTargetKind::Kind {
-        keel_core::clear_stale_kind_stage0_state_in(&stage0_state_root(), &cfg.cluster_name).await;
+        keel_core::clear_stale_kind_stage0_state_in(stage0_root, &cfg.cluster_name).await;
     }
     let stage0 = if !args.skip_core_install {
         // Resolves/generates the passphrase before the target
         // driver runs Pulumi, so both use the same durable state root and passphrase.
-        Some(state::Stage0Context::prepare(
+        Some(state::Stage0Context::prepare_in(
+            stage0_root,
             &cfg.cluster_name,
-            passphrase_preexisted,
         )?)
     } else {
         None
     };
 
-    let connection = target.provision_cluster(&cfg).await?;
+    let result = bootstrap_init_after_prepare(args, target, &cfg, ingress, stage0.as_ref()).await;
+    if let Some(notice) = settle_escrow_notice(stage0.as_ref(), &result) {
+        // The failure path never reaches the summary: the passphrase file already exists, so
+        // the operator must learn where it is now (path only, never the value).
+        eprintln!("{notice}");
+    }
+    result
+}
+
+/// Decides what happens to a pending passphrase escrow notice once `keel bootstrap init` ends:
+/// a run whose summary carries the notice (success, or [`CliError::Incomplete`], whose output is
+/// still printed) acknowledges it; any other failure returns it for stderr and keeps it pending
+/// so the next run repeats it.
+fn settle_escrow_notice(
+    stage0: Option<&state::Stage0Context>,
+    result: &Result<BootstrapInitOutcome, CliError>,
+) -> Option<String> {
+    let stage0 = stage0?;
+    match result {
+        Ok(_) | Err(CliError::Incomplete { .. }) => {
+            stage0.acknowledge_escrow_notice();
+            None
+        }
+        Err(_) => stage0.escrow_notice(false),
+    }
+}
+
+/// Everything after the Stage 0 context is prepared: provisioning, add-ons, seed repository,
+/// tenant-default, S3 escrow and the summary.
+async fn bootstrap_init_after_prepare(
+    args: &BootstrapInitArgs,
+    target: &dyn BootstrapTarget,
+    cfg: &BootstrapConfig,
+    ingress: Stage0Ingress,
+    stage0: Option<&state::Stage0Context>,
+) -> Result<BootstrapInitOutcome, CliError> {
+    let connection = target.provision_cluster(cfg).await?;
 
     #[cfg(debug_assertions)]
     if cfg.target.as_str() == "kind" {
@@ -1800,7 +1876,7 @@ pub async fn execute_bootstrap_init_with_target(
             .map(|p| p.to_string_lossy().into_owned())
     };
     let mut artifacts =
-        synthesize_seed_control_plane(&cfg, repo_url_override.as_deref(), ingress).await?;
+        synthesize_seed_control_plane(cfg, repo_url_override.as_deref(), ingress).await?;
 
     if let Some(git_url) = args.git_url.as_deref() {
         let (kind, api_url) = infer_forge_config(
@@ -1830,9 +1906,7 @@ pub async fn execute_bootstrap_init_with_target(
         connection.kubeconfig_path.as_deref(),
     );
     if !args.skip_core_install {
-        let stage0 = stage0
-            .as_ref()
-            .expect("Stage 0 context is prepared when core install runs");
+        let stage0 = stage0.expect("Stage 0 context is prepared when core install runs");
         notes.extend(
             addons::install_stage0_core_addons(
                 &connection,
@@ -2020,7 +2094,7 @@ pub async fn execute_bootstrap_init_with_target(
 
     // Escrow Stage 0 state to the in-cluster versioned S3 bucket (break-glass, NFR-REL-01).
     if !args.skip_core_install
-        && let Some(stage0) = stage0.as_ref()
+        && let Some(stage0) = stage0
     {
         match state::sync_stage0_state_to_s3(kube_target, stage0).await {
             Ok(report) => {
@@ -2049,7 +2123,7 @@ pub async fn execute_bootstrap_init_with_target(
                 notes.push(msg);
             }
         }
-        if let Some(notice) = stage0.escrow_notice() {
+        if let Some(notice) = stage0.escrow_notice(true) {
             notes.push(notice);
         }
     }
@@ -2139,12 +2213,7 @@ fn format_bootstrap_init_summary(
         artifacts.management_stack.is_protected()
     ));
     if let Some(repo) = seed_repo {
-        out.push_str(&format!(
-            "Seed Git Repo:   {} (origin: {}, commit: {})\n",
-            repo.repo_dir.display(),
-            repo.bare_repo_dir.display(),
-            repo.initial_commit_sha
-        ));
+        out.push_str(&format_seed_repo_summary(repo));
     }
     let ingress = &artifacts.ingress;
     if let Some(ref rauthy) = artifacts.rauthy_config {
@@ -2186,6 +2255,272 @@ fn format_bootstrap_init_summary(
         ));
     }
     out
+}
+
+/// `Seed Git Repo` / `Git Origin` summary lines: the working copy and its real `origin`, with
+/// how to reach it from this workstation.
+fn format_seed_repo_summary(repo: &SeedRepoInitResult) -> String {
+    let mut out = format!(
+        "Seed Git Repo:   {} (commit: {})\n",
+        repo.repo_dir.display(),
+        repo.initial_commit_sha
+    );
+    let origin = repo.origin_url.as_str();
+    let how = if !origin.contains("://") && !origin.contains('@') {
+        "local bare repository; Local Git provider, development only".to_string()
+    } else if origin.contains(".svc.cluster.local") {
+        let local = parse_remote_repo_url(origin)
+            .map(|slug| format!("http://127.0.0.1:3000/{}.git", slug.project_path))
+            .unwrap_or_else(|_| "http://127.0.0.1:3000/...".to_string());
+        format!(
+            "in-cluster Forgejo, not reachable from this workstation directly; `keel serve` \
+             port-forwards it and rewrites origin to {local} (another port if 3000 is taken); \
+             that remote only works while `keel serve` runs"
+        )
+    } else if repo.pushed {
+        "remote forge".to_string()
+    } else {
+        "remote forge; the initial push FAILED: push `main` from the working copy once the \
+         repository and credentials are ready"
+            .to_string()
+    };
+    out.push_str(&format!("Git Origin:      {origin} ({how})\n"));
+    out
+}
+
+#[cfg(test)]
+mod seed_repo_summary_tests {
+    use super::*;
+
+    fn repo(origin: &str, pushed: bool) -> SeedRepoInitResult {
+        SeedRepoInitResult {
+            repo_dir: PathBuf::from("/work/keel-gitops"),
+            bare_repo_dir: PathBuf::from("/work/keel-gitops.git"),
+            origin_url: origin.to_string(),
+            pushed,
+            initial_commit_sha: "abc123".to_string(),
+            written_files: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn in_cluster_forgejo_origin_is_shown_with_the_keel_serve_route() {
+        let out = format_seed_repo_summary(&repo(
+            "http://forgejo-http.keel-system.svc.cluster.local:3000/keel/infra-gitops.git",
+            true,
+        ));
+        assert!(out.contains("Seed Git Repo:   /work/keel-gitops (commit: abc123)"));
+        assert!(out.contains(
+            "Git Origin:      http://forgejo-http.keel-system.svc.cluster.local:3000/keel/infra-gitops.git"
+        ));
+        assert!(out.contains("`keel serve`"));
+        assert!(out.contains("http://127.0.0.1:3000/keel/infra-gitops.git"));
+        // FU-2: the leftover local bare clone source is not the origin.
+        assert!(!out.contains("/work/keel-gitops.git"));
+    }
+
+    #[test]
+    fn local_provider_origin_is_the_bare_repository() {
+        let out = format_seed_repo_summary(&repo("/work/keel-gitops.git", true));
+        assert!(out.contains("Git Origin:      /work/keel-gitops.git (local bare repository"));
+    }
+
+    #[test]
+    fn external_forge_origin_reports_a_failed_push() {
+        let ok = format_seed_repo_summary(&repo("https://github.com/acme/gitops.git", true));
+        assert!(ok.contains("Git Origin:      https://github.com/acme/gitops.git (remote forge)"));
+        let failed = format_seed_repo_summary(&repo("https://github.com/acme/gitops.git", false));
+        assert!(failed.contains("initial push FAILED"));
+    }
+}
+
+#[cfg(test)]
+mod escrow_notice_settle_tests {
+    use super::*;
+
+    /// FU-1: only a run whose summary carried the notice acknowledges it; any other failure
+    /// returns it for stderr and keeps it pending for the next run.
+    #[test]
+    fn failed_runs_keep_the_notice_and_return_it_for_stderr() {
+        if std::env::var_os("PULUMI_CONFIG_PASSPHRASE").is_some() {
+            eprintln!("SKIPPED: PULUMI_CONFIG_PASSPHRASE set");
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("keel-cli-settle-{}", uuid::Uuid::new_v4()));
+        let ctx = state::Stage0Context::prepare_in(&root, "settle").unwrap();
+        let failed: Result<BootstrapInitOutcome, CliError> =
+            Err(CliError::Execution("docker is not running".to_string()));
+        let notice = settle_escrow_notice(Some(&ctx), &failed).expect("notice on failure");
+        assert!(notice.contains(&ctx.passphrase_file().display().to_string()));
+        assert!(!notice.contains(ctx.passphrase.expose()));
+
+        let retry = state::Stage0Context::prepare_in(&root, "settle").unwrap();
+        assert!(
+            retry.escrow_notice_pending,
+            "re-run must still owe the notice"
+        );
+        let incomplete: Result<BootstrapInitOutcome, CliError> = Err(CliError::Incomplete {
+            output: "summary".to_string(),
+            message: "tenant-default".to_string(),
+        });
+        assert!(settle_escrow_notice(Some(&retry), &incomplete).is_none());
+
+        let after = state::Stage0Context::prepare_in(&root, "settle").unwrap();
+        assert!(!after.escrow_notice_pending);
+        assert!(settle_escrow_notice(Some(&after), &failed).is_none());
+        assert!(settle_escrow_notice(None, &failed).is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    pub(super) struct FailingTarget;
+
+    #[async_trait::async_trait]
+    impl BootstrapTarget for FailingTarget {
+        fn kind(&self) -> keel_core::BootstrapTargetKind {
+            keel_core::BootstrapTargetKind::Kind
+        }
+
+        async fn provision_cluster(
+            &self,
+            _cfg: &BootstrapConfig,
+        ) -> Result<keel_core::ClusterConnection, keel_core::CoreError> {
+            Err(keel_core::CoreError::Validation(
+                "docker is not running".to_string(),
+            ))
+        }
+
+        async fn teardown(&self, _cfg: &BootstrapConfig) -> Result<(), keel_core::CoreError> {
+            Ok(())
+        }
+    }
+
+    /// Wiring: a full (`skip_core_install: false`) run whose provisioning fails keeps the
+    /// marker and returns the provisioning error (not `Incomplete`), so the next run repeats
+    /// the notice.
+    #[tokio::test]
+    async fn failed_provisioning_keeps_the_escrow_marker() {
+        if std::env::var_os("PULUMI_CONFIG_PASSPHRASE").is_some() {
+            eprintln!("SKIPPED: PULUMI_CONFIG_PASSPHRASE set");
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("keel-cli-wire-{}", uuid::Uuid::new_v4()));
+        let args = BootstrapInitArgs {
+            target: keel_core::BootstrapTargetKind::Kind,
+            cluster_name: "wire-test".to_string(),
+            kubeconfig: None,
+            context: None,
+            proxmox_url: None,
+            region: None,
+            distro: None,
+            with_forge: false,
+            with_keel_server: false,
+            oidc_issuer: None,
+            oidc_provider: crate::cli::OidcProviderArg::Rauthy,
+            oidc_client_id: None,
+            oidc_public_url: None,
+            admin_username: None,
+            admin_password: None,
+            local_dev_docker_socket_exception: false,
+            repo_dir: None,
+            skip_core_install: false,
+            git_url: None,
+            forge_type: None,
+            forge_api_url: None,
+            git_token: None,
+            pulumi_program_dir: None,
+        };
+        let err = execute_bootstrap_init_with_target_in(&root, &args, &FailingTarget)
+            .await
+            .unwrap_err();
+        assert!(!matches!(err, CliError::Incomplete { .. }));
+        assert!(err.to_string().contains("docker is not running"), "{err}");
+        let dir = keel_core::stage0_cluster_dir_in(&root, "wire-test");
+        assert!(dir.join(keel_core::STAGE0_PASSPHRASE_FILE).is_file());
+        assert!(
+            dir.join(keel_core::STAGE0_ESCROW_NOTICE_PENDING_FILE)
+                .is_file()
+        );
+        let retry = state::Stage0Context::prepare_in(&root, "wire-test").unwrap();
+        assert!(retry.escrow_notice_pending);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod git_url_credentials_tests {
+    use super::*;
+
+    fn args_with(url: Option<&str>) -> BootstrapInitArgs {
+        BootstrapInitArgs {
+            target: keel_core::BootstrapTargetKind::Kind,
+            cluster_name: "c".to_string(),
+            kubeconfig: None,
+            context: None,
+            proxmox_url: None,
+            region: None,
+            distro: None,
+            with_forge: false,
+            with_keel_server: false,
+            oidc_issuer: None,
+            oidc_provider: crate::cli::OidcProviderArg::Rauthy,
+            oidc_client_id: None,
+            oidc_public_url: None,
+            admin_username: None,
+            admin_password: None,
+            local_dev_docker_socket_exception: false,
+            repo_dir: None,
+            skip_core_install: true,
+            git_url: url.map(str::to_string),
+            forge_type: None,
+            forge_api_url: None,
+            git_token: None,
+            pulumi_program_dir: None,
+        }
+    }
+
+    #[test]
+    fn credential_bearing_git_urls_are_rejected_in_every_mode() {
+        for bad in [
+            "https://user:ghp_secret@github.com/acme/gitops.git",
+            "https://ghp_secret@github.com/acme/gitops.git",
+            "http://oauth2:tok@gitlab.example.com/acme/gitops.git",
+            "ssh://git:hunter2@github.com/acme/gitops.git",
+        ] {
+            let err = validate_git_url_has_no_credentials(&args_with(Some(bad)))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("must not embed credentials"), "{bad}: {err}");
+            assert!(!err.contains("secret") && !err.contains("hunter2"), "{err}");
+        }
+        for ok in [
+            None,
+            Some("https://github.com/acme/gitops.git"),
+            Some("ssh://git@github.com/acme/gitops.git"),
+            Some("git@github.com:acme/gitops.git"),
+            Some("/srv/git/gitops.git"),
+            Some("./keel-gitops.git"),
+        ] {
+            assert!(
+                validate_git_url_has_no_credentials(&args_with(ok)).is_ok(),
+                "{ok:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn bootstrap_init_refuses_a_credential_bearing_git_url_before_provisioning() {
+        let args = args_with(Some("https://user:ghp_secret@github.com/acme/gitops.git"));
+        let root = std::env::temp_dir().join(format!("keel-cli-cred-{}", uuid::Uuid::new_v4()));
+        let err = execute_bootstrap_init_with_target_in(
+            &root,
+            &args,
+            &super::escrow_notice_settle_tests::FailingTarget,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, CliError::Validation(_)), "{err}");
+        assert!(!root.exists());
+    }
 }
 
 #[cfg(test)]

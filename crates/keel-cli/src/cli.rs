@@ -179,7 +179,8 @@ pub struct BootstrapInitArgs {
     #[arg(long, default_value_t = false)]
     pub skip_core_install: bool,
 
-    /// External Git repository URL (e.g. `https://github.com/org/infra-gitops.git`)
+    /// External Git repository URL (e.g. `https://github.com/org/infra-gitops.git`); must not
+    /// embed credentials (use `--git-token` / `KEEL_GIT_TOKEN`)
     #[arg(long)]
     pub git_url: Option<String>,
 

@@ -432,6 +432,12 @@ impl BootstrapTarget for PulumiBootstrapTarget {
 pub const STAGE0_BACKEND_DIR: &str = "state";
 /// File (0600) inside a cluster's Stage 0 dir holding the generated Pulumi passphrase.
 pub const STAGE0_PASSPHRASE_FILE: &str = "pulumi-passphrase";
+/// Marker (`0600`, next to [`STAGE0_PASSPHRASE_FILE`]) recording that the operator has not yet
+/// been shown the escrow notice for a generated passphrase. [`resolve_stage0_passphrase_in`]
+/// writes it before it writes a newly generated passphrase, whichever caller (CLI bootstrap or a
+/// target driver) triggered the generation; the CLI removes it only once a bootstrap summary
+/// carrying the notice was produced (`NFR-REL-01`).
+pub const STAGE0_ESCROW_NOTICE_PENDING_FILE: &str = "pulumi-passphrase.escrow-pending";
 
 /// Returns the Keel CLI config directory: `$KEEL_CONFIG_DIR`, `$XDG_CONFIG_HOME/keel`,
 /// `$HOME/.config/keel` (or `%APPDATA%\keel`), falling back to `<tmp>/keel` only if no home exists.
@@ -600,6 +606,8 @@ pub fn resolve_stage0_passphrase_in(
         )));
     }
     let generated = generate_stage0_passphrase();
+    // Marker first: a crash between the two writes can never leave an unannounced passphrase.
+    write_private_file(&cluster_dir.join(STAGE0_ESCROW_NOTICE_PENDING_FILE), b"")?;
     write_private_file(&file, format!("{generated}\n").as_bytes())?;
     Ok(Stage0Passphrase::new(
         generated,
@@ -1404,6 +1412,17 @@ contexts:
         let first = resolve_stage0_passphrase_in(&root, "pp-test").unwrap();
         assert!(first.was_generated());
         assert!(first.expose().len() >= 40);
+        // Generation (whichever caller triggers it) leaves the escrow-notice marker behind.
+        let marker =
+            stage0_cluster_dir_in(&root, "pp-test").join(STAGE0_ESCROW_NOTICE_PENDING_FILE);
+        assert!(marker.is_file());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&marker).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        std::fs::remove_file(&marker).unwrap();
         assert!(!format!("{first:?}").contains(first.expose()));
         let second = resolve_stage0_passphrase_in(&root, "pp-test").unwrap();
         assert_eq!(second.expose(), first.expose());
@@ -1411,6 +1430,14 @@ contexts:
             second.source,
             Stage0PassphraseSource::LocalFile(_)
         ));
+        // Reusing the local file never (re)creates the marker.
+        assert!(!marker.exists());
+        // An empty file (e.g. a crash mid-write) is regenerated and announced again.
+        let pp_file = stage0_cluster_dir_in(&root, "pp-test").join(STAGE0_PASSPHRASE_FILE);
+        std::fs::write(&pp_file, "\n").unwrap();
+        let regenerated = resolve_stage0_passphrase_in(&root, "pp-test").unwrap();
+        assert!(regenerated.was_generated());
+        assert!(marker.is_file());
         assert!(resolve_stage0_passphrase_in(&root, "../evil").is_err());
 
         // State without a passphrase file cannot be decrypted by a new passphrase: refuse.
@@ -1426,6 +1453,11 @@ contexts:
         assert!(
             !stage0_cluster_dir_in(&root, "old")
                 .join(STAGE0_PASSPHRASE_FILE)
+                .exists()
+        );
+        assert!(
+            !stage0_cluster_dir_in(&root, "old")
+                .join(STAGE0_ESCROW_NOTICE_PENDING_FILE)
                 .exists()
         );
         let _ = std::fs::remove_dir_all(&root);

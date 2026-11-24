@@ -104,7 +104,7 @@ keel bootstrap init \
 - `--local-dev-docker-socket-exception` lets PKO create more `kind` clusters through your Docker daemon.
 
 > **Warning: this flag gives up host and tenant isolation.** It deploys `flux-system/keel-docker-proxy`, which exposes your host Docker socket on port 2375 without authentication. Every PKO workspace pod, and any tenant pod that sets the workspace label, can reach it, and access to the Docker API amounts to root on the host. Use it only on a throwaway machine, and do not treat tenants as isolated while it is enabled. Leave it out if you do not need nested `kind` clusters.
-- The summary prints the **admin username and password** in plain text. Save them, and save the Pulumi passphrase from the one-time notice in a password manager.
+- The summary prints the **admin username and password** in plain text. Save them, and save the Pulumi passphrase from the `IMPORTANT` notice in a password manager. `Git Origin` is the repository in the in-cluster Forgejo; `keel serve` (next step) makes it reachable from your machine.
 
 **4. Start the server** in a second terminal (in the same directory) and leave it running:
 

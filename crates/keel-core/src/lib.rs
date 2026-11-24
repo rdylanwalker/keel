@@ -16,10 +16,11 @@ use thiserror::Error;
 
 pub use bootstrap::{
     BootstrapTarget, ClusterConnection, PulumiBootstrapTarget, STAGE0_BACKEND_DIR,
-    STAGE0_PASSPHRASE_FILE, Stage0Passphrase, Stage0PassphraseSource,
-    clear_stale_kind_stage0_state_in, ensure_private_dir, factory as bootstrap_target_factory,
-    keel_config_dir, resolve_stage0_passphrase_in, stage0_cluster_dir_in, stage0_program_dir_in,
-    stage0_state_root, validate_kubeconfig_yaml, write_private_file,
+    STAGE0_ESCROW_NOTICE_PENDING_FILE, STAGE0_PASSPHRASE_FILE, Stage0Passphrase,
+    Stage0PassphraseSource, clear_stale_kind_stage0_state_in, ensure_private_dir,
+    factory as bootstrap_target_factory, keel_config_dir, resolve_stage0_passphrase_in,
+    stage0_cluster_dir_in, stage0_program_dir_in, stage0_state_root, validate_kubeconfig_yaml,
+    write_private_file,
 };
 pub use catalog::{
     PartitionedValues, PreparedHelmValues, SchemaFieldError, apply_schema_defaults,

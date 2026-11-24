@@ -356,7 +356,9 @@ pub(crate) async fn provision_default_tenant_repo(
     let forge = &access.forge;
     let tenant = DEFAULT_TENANT_ID;
     let repo = forge.target(tenant).map_err(server_err)?;
-    forge
+    // Only this first ensure can observe a fresh repository (`provision_forge` below ensures it
+    // again and always sees it as existing).
+    let ensured = forge
         .admin
         .ensure_named_repository(
             &repo.owner,
@@ -396,14 +398,9 @@ pub(crate) async fn provision_default_tenant_repo(
         _ => "kept",
     };
     Ok(format!(
-        "tenant-default repository `{}` ready ({}, {}; `main` protection: {:?}; forks: {:?}); read credential {credential} in {namespace}/{} ({} transport); SOPS age key {}",
+        "tenant-default repository `{}` ready ({}; `main` protection: {:?}; forks: {:?}); read credential {credential} in {namespace}/{} ({} transport); SOPS age key {}",
         repo.full_name(),
-        if state.repository.outcome == keel_git::RepositoryEnsureOutcome::Created {
-            "created"
-        } else {
-            "existing"
-        },
-        if seeded { "seeded" } else { "already seeded" },
+        default_tenant_repo_status(ensured.outcome, seeded),
         state.main_protection,
         state.forks,
         keel_kube::TENANT_GITOPS_CREDENTIALS_SECRET_NAME,
@@ -412,10 +409,42 @@ pub(crate) async fn provision_default_tenant_repo(
     ))
 }
 
+/// How the tenant-default repository note describes the repository and its skeleton commit.
+fn default_tenant_repo_status(
+    outcome: keel_git::RepositoryEnsureOutcome,
+    seeded: bool,
+) -> &'static str {
+    match (outcome, seeded) {
+        (keel_git::RepositoryEnsureOutcome::Created, true) => "created and seeded",
+        (keel_git::RepositoryEnsureOutcome::Created, false) => "created",
+        (keel_git::RepositoryEnsureOutcome::Existed, true) => "existing, seeded",
+        (keel_git::RepositoryEnsureOutcome::Existed, false) => "existing, already seeded",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use keel_core::ForgeKind;
+
+    /// FU-3: a fresh bootstrap reports the repository as created, not existing.
+    #[test]
+    fn default_tenant_repo_status_follows_the_first_ensure() {
+        use keel_git::RepositoryEnsureOutcome::{Created, Existed};
+        assert_eq!(
+            default_tenant_repo_status(Created, true),
+            "created and seeded"
+        );
+        assert_eq!(default_tenant_repo_status(Created, false), "created");
+        assert_eq!(
+            default_tenant_repo_status(Existed, true),
+            "existing, seeded"
+        );
+        assert_eq!(
+            default_tenant_repo_status(Existed, false),
+            "existing, already seeded"
+        );
+    }
 
     fn cfg(provider: ForgeKind, repo_url: &str, public_url: Option<&str>) -> ForgeConfig {
         ForgeConfig {
