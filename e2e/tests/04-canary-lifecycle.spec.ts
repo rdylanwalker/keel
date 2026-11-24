@@ -58,6 +58,8 @@ test.describe('04 - Flagger Canary Lifecycle & Live SSE Event Stream', () => {
     expect(canary).toMatch(/provider: "?gatewayapi/);
     expect(canary).toContain('envoy-gateway-request-success-rate');
     expect(canary).toMatch(/threshold: \d+/);
+    // The catalog default `ingressHost` becomes the Canary host: never a catch-all route.
+    expect(canary).toContain('podinfo.keel.local');
 
     const np = showFile(created.branch, `${dir}/networkpolicy-canary.yaml`);
     expect(np).toContain('kind: NetworkPolicy');
@@ -92,6 +94,19 @@ test.describe('04 - Flagger Canary Lifecycle & Live SSE Event Stream', () => {
     });
     expect(rejected.status()).toBe(400);
     expect((await rejected.json()).error).toMatch(/does not support Flagger canary/);
+
+    // A canary host may not be a platform host (Kyverno would deny Flagger's route).
+    const platformHost = await api.post('/api/v1/tenants/acme/proposals', {
+      data: {
+        tenant: 'acme',
+        catalogId: 'podinfo',
+        name: uniq('idp'),
+        values: { replicas: 1, ingressHost: 'idp.keel.local' },
+        canary: true,
+      },
+    });
+    expect(platformHost.status()).toBe(400);
+    expect((await platformHost.json()).error).toMatch(/reserved platform host/);
     await api.dispose();
   });
 

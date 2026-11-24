@@ -355,6 +355,25 @@ pub(super) async fn render_manifest_app(
         rendered.push('\n');
     }
     let rendered_docs = verify_rendered_manifest_structure(&raw_manifests, &rendered)?;
+    // A route without hostnames on the shared Gateway matches every host (a catch-all over
+    // other tenants' traffic); Kyverno denies it in tenant namespaces at apply time, so fail
+    // before committing. Routes without `metadata.namespace` land in the tenant namespace.
+    let catch_all = match repo.tenant() {
+        Some(tenant) => keel_core::shared_gateway_catch_all_routes(
+            &rendered_docs,
+            &keel_core::tenant_namespace(tenant)?,
+        ),
+        None => Vec::new(),
+    };
+    if !catch_all.is_empty() {
+        return Err(ServerError::BadRequest(format!(
+            "Catalog application '{}' renders Gateway routes without hostnames on the shared \
+             keel-ingress Gateway ({}): set at least one hostname, a route without one would \
+             match every host",
+            app.metadata.id,
+            catch_all.join(", ")
+        )));
+    }
     // Tenant routes attach to the shared `keel-ingress` listeners: never let them claim a
     // platform host (IdP issuer, keel-server, Forgejo) or another workload's hostname.
     let route_hostnames = gateway_route_hostnames(&rendered_docs);
@@ -385,6 +404,8 @@ pub(super) struct HelmAppExtrasInput<'a> {
     pub(super) remote: bool,
     /// `spec.targetNamespace` of the `HelmRelease`, when set.
     pub(super) target_namespace: Option<&'a str>,
+    /// `true` when a Flagger `Canary` is generated for the release (its host is checked here).
+    pub(super) canary: bool,
 }
 
 /// Keel-generated companions of a Helm app (`runtime: helm`, `SDD.md` §5.1):
@@ -551,7 +572,19 @@ pub(super) async fn prepare_helm_app_extras(
                 .join(", ")
         )));
     }
-    ensure_tenant_route_hostnames_allowed(state, input.repo, input.app_dir, &route_hostnames)
+    // Flagger copies the canary host into the routes it writes on the management cluster's
+    // shared `keel-ingress`: it must be neither a platform host (Kyverno would deny it at apply
+    // time) nor a host another app already routes (Gateway API breaks exact-hostname ties by
+    // creation time, so an older route would keep serving it). A remote canary routes through
+    // the workload cluster's own Gateway and is only checked for a valid host.
+    let mut claimed_hostnames = route_hostnames.clone();
+    if input.canary {
+        let host = canary_host(input.app, &input.partitioned.normal_values)?;
+        if !input.remote && !claimed_hostnames.contains(&host) {
+            claimed_hostnames.push(host);
+        }
+    }
+    ensure_tenant_route_hostnames_allowed(state, input.repo, input.app_dir, &claimed_hostnames)
         .await?;
 
     let mut extras = HelmAppExtras {
@@ -670,8 +703,36 @@ pub(super) fn helm_repository_yaml(
     })
 }
 
+/// Values key of the hostname a Helm app's Flagger `Canary` (and the routes Flagger generates)
+/// serves on the shared Gateway.
+pub(super) const CANARY_HOST_VALUE: &str = "ingressHost";
+
+/// The validated canary hostname of a Helm app (the [`CANARY_HOST_VALUE`] value). A canary
+/// without a hostname would make Flagger write catch-all routes on the shared `keel-ingress`
+/// Gateway that capture other tenants' traffic, so it is required (400 otherwise).
+pub(super) fn canary_host(
+    app: &CatalogApplication,
+    normal_values: &Value,
+) -> Result<String, ServerError> {
+    let raw = normal_values
+        .get(CANARY_HOST_VALUE)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            ServerError::BadRequest(format!(
+                "Flagger canaries of '{}' need a hostname: set the '{CANARY_HOST_VALUE}' value \
+                 (e.g. {}.example.com). A canary without one would route every host on the \
+                 shared keel-ingress Gateway",
+                app.metadata.id, app.metadata.id
+            ))
+        })?;
+    Ok(keel_kube::validate_canary_host(raw)?)
+}
+
 /// Flagger `Canary` input of a Helm app: the service port from the `service.port` value (else
-/// 9898 for the podinfo chart, 80 otherwise) and the `ingressHost` value as its host.
+/// 9898 for the podinfo chart, 80 otherwise) and the [`CANARY_HOST_VALUE`] value as its host
+/// (required by [`keel_kube::synthesize_flagger_canary`]; checked earlier by [`canary_host`]).
 pub(super) fn helm_app_canary_input(
     tenant: &str,
     name: &str,
@@ -693,7 +754,7 @@ pub(super) fn helm_app_canary_input(
         .filter(|p| *p > 0)
         .unwrap_or(if chart_name == "podinfo" { 9898 } else { 80 });
     if let Some(host) = normal_values
-        .get("ingressHost")
+        .get(CANARY_HOST_VALUE)
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|s| !s.is_empty())

@@ -1389,7 +1389,7 @@ spec:
         let app_values_file = tmp.path().join("app-values.yaml");
         tokio::fs::write(
             &app_values_file,
-            "domain: auth.acme.io\nadminEmail: admin@acme.io\nreplicas: 2\n",
+            "domain: auth.acme.io\nadminEmail: admin@acme.io\nreplicas: 2\ningressHost: auth.acme.io\n",
         )
         .await
         .unwrap();

@@ -44,7 +44,8 @@ pub(super) fn ensure_rendered_manifest_placement(
 }
 
 /// Rejects route hostnames already claimed by another committed app (any tenant: a manifest app's
-/// rendered routes or a Helm app's `keel.io/route-hostnames` annotation) under
+/// rendered routes, a Helm app's `keel.io/route-hostnames` annotation or the hosts of a
+/// management-cluster Flagger `Canary`, see [`claims_route_hostnames`]) under
 /// `tenants/`. `own_rel_dir` (the instance being created/edited) is skipped. Reads the checked-out
 /// default branch; open PRs are not considered, the Kyverno `restrict-tenant-route-hostnames`
 /// policy still guards platform hosts at admission.
@@ -72,9 +73,14 @@ async fn ensure_route_hostnames_unclaimed(
                 continue;
             }
             let file_name = entry.file_name();
-            let is_helm_release =
-                file_name == "helmrelease.yaml" || file_name == "helmrelease-canary.yaml";
-            if !file_type.is_file() || !(file_name == "manifests.yaml" || is_helm_release) {
+            let remote_canary = || {
+                path.parent()
+                    .and_then(Path::parent)
+                    .is_some_and(|app_dir| app_dir.join(REMOTE_CANARY_KUSTOMIZATION).is_file())
+            };
+            if !file_type.is_file()
+                || !claims_route_hostnames(&file_name.to_string_lossy(), remote_canary)
+            {
                 continue;
             }
             let Ok(contents) = tokio::fs::read_to_string(&path).await else {
@@ -298,6 +304,23 @@ pub(super) async fn ensure_tenant_route_hostnames_allowed(
     if route_hostnames.is_empty() {
         return Ok(());
     }
+    ensure_route_hostnames_not_reserved(state, route_hostnames).await?;
+    ensure_route_hostnames_unclaimed(&repo.workdir, rel_dir, route_hostnames).await?;
+    if repo.is_dedicated() {
+        ensure_route_hostnames_unclaimed(&state.repo_workdir, rel_dir, route_hostnames).await?;
+        ensure_route_hostnames_unclaimed_by_other_tenants(state, repo.tenant(), route_hostnames)
+            .await?;
+    }
+    Ok(())
+}
+
+/// Rejects route hostnames that are unresolved, empty, or claim a platform host (IdP issuer,
+/// keel-server, Forgejo, exactly or through a wildcard), as the Kyverno
+/// `restrict-tenant-route-hostnames` policy would at admission.
+async fn ensure_route_hostnames_not_reserved(
+    state: &AppState,
+    route_hostnames: &[String],
+) -> Result<(), ServerError> {
     let reserved = {
         let oidc = state.oidc_config.read().await;
         platform_reserved_hostnames(
@@ -306,12 +329,6 @@ pub(super) async fn ensure_tenant_route_hostnames_allowed(
         )
     };
     validate_route_hostnames(route_hostnames, &reserved)?;
-    ensure_route_hostnames_unclaimed(&repo.workdir, rel_dir, route_hostnames).await?;
-    if repo.is_dedicated() {
-        ensure_route_hostnames_unclaimed(&state.repo_workdir, rel_dir, route_hostnames).await?;
-        ensure_route_hostnames_unclaimed_by_other_tenants(state, repo.tenant(), route_hostnames)
-            .await?;
-    }
     Ok(())
 }
 
@@ -386,15 +403,17 @@ async fn ensure_route_hostnames_unclaimed_by_other_tenants(
             .list_files_at_ref(&dir, rev, "tenants")
             .await
             .unwrap_or_default();
-        for path in files {
+        for path in &files {
             let file_name = path.rsplit('/').next().unwrap_or_default();
-            if !matches!(
-                file_name,
-                "manifests.yaml" | "helmrelease.yaml" | "helmrelease-canary.yaml"
-            ) {
+            let remote_canary = || {
+                path.rsplitn(3, '/').nth(2).is_some_and(|app_dir| {
+                    files.contains(&format!("{app_dir}/{REMOTE_CANARY_KUSTOMIZATION}"))
+                })
+            };
+            if !claims_route_hostnames(file_name, remote_canary) {
                 continue;
             }
-            let Ok(Some(contents)) = state.git_runner.read_file_at_ref(&dir, rev, &path).await
+            let Ok(Some(contents)) = state.git_runner.read_file_at_ref(&dir, rev, path).await
             else {
                 continue;
             };
@@ -409,9 +428,45 @@ async fn ensure_route_hostnames_unclaimed_by_other_tenants(
     Ok(())
 }
 
-/// Hostnames a committed app file claims: a Helm app's `keel.io/route-hostnames` annotation or a
-/// manifest app's rendered Gateway API routes.
+/// Flux `Kustomization` file of a remote canary (next to its `canary/` directory, see
+/// `build_remote_canary_files`).
+const REMOTE_CANARY_KUSTOMIZATION: &str = "canary-kustomization.yaml";
+
+/// `true` for committed app files whose content claims route hostnames on the management
+/// cluster's shared Gateway: `manifests.yaml`, `helmrelease.yaml`, `helmrelease-canary.yaml` and a
+/// management-cluster Flagger `canary.yaml` (Flagger copies its hosts into the routes it writes).
+/// `remote_canary` tells whether a `canary.yaml` belongs to a remote canary (`<app>/canary/`,
+/// with `<app>/canary-kustomization.yaml`), whose routes live on the workload cluster's Gateway.
+fn claims_route_hostnames(file_name: &str, remote_canary: impl FnOnce() -> bool) -> bool {
+    match file_name {
+        "manifests.yaml" | "helmrelease.yaml" | "helmrelease-canary.yaml" => true,
+        "canary.yaml" => !remote_canary(),
+        _ => false,
+    }
+}
+
+/// Hostnames a committed app file claims: a Helm app's `keel.io/route-hostnames` annotation, a
+/// Flagger `Canary`'s `spec.service.hosts` or a manifest app's rendered Gateway API routes.
 fn claimed_route_hostnames(file_name: &str, contents: &str) -> Vec<String> {
+    if file_name == "canary.yaml" {
+        return validate_k8s_manifests_yaml(contents)
+            .map(|docs| {
+                docs.iter()
+                    .filter(|d| {
+                        d.get("kind").and_then(Value::as_str) == Some("Canary")
+                            && d.get("apiVersion")
+                                .and_then(Value::as_str)
+                                .is_some_and(|v| v.starts_with("flagger.app/"))
+                    })
+                    .filter_map(|d| d.pointer("/spec/service/hosts").and_then(Value::as_array))
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .map(|h| h.trim().to_ascii_lowercase())
+                    .filter(|h| !h.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+    }
     if file_name == "helmrelease.yaml" || file_name == "helmrelease-canary.yaml" {
         // Helm apps record the hostnames their chart routes (`spec.gatewayRoutes`).
         return noyalib::from_str::<Value>(contents)
@@ -531,6 +586,84 @@ mod tests {
                 "tenants/other/apps/web-config",
                 "web-config",
                 true
+            )
+            .await
+            .is_ok()
+        );
+    }
+
+    /// Management-cluster Flagger Canaries claim their hosts (Flagger copies them into routes
+    /// on the shared Gateway); remote canaries (`<app>/canary/canary.yaml`) do not, and the app
+    /// being edited is skipped.
+    #[tokio::test]
+    async fn canary_hosts_are_claimed_route_hostnames() {
+        let mut input = keel_kube::FlaggerCanarySpecInput::new("acme", "shop");
+        input.hosts.push("shop.example.com".to_string());
+        let canary = keel_kube::synthesize_flagger_canary_yaml(&input).unwrap();
+        assert_eq!(
+            claimed_route_hostnames("canary.yaml", &canary),
+            ["shop.example.com"]
+        );
+        assert!(claims_route_hostnames("canary.yaml", || false));
+        assert!(!claims_route_hostnames("canary.yaml", || true));
+        assert!(!claims_route_hostnames("networkpolicy-canary.yaml", || {
+            false
+        }));
+
+        let repo = tempfile::tempdir().unwrap();
+        let write = |rel: &str, contents: &str| {
+            let path = repo.path().join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, contents).unwrap();
+        };
+        write("tenants/acme/apps/shop/canary.yaml", &canary);
+        // A remote canary of another app on the same host routes on the workload cluster.
+        let mut remote = keel_kube::FlaggerCanarySpecInput::new("other", "remote");
+        remote.hosts.push("remote.example.com".to_string());
+        write(
+            "tenants/other/apps/remote/canary/canary.yaml",
+            &keel_kube::synthesize_flagger_canary_yaml(&remote).unwrap(),
+        );
+        write(
+            "tenants/other/apps/remote/canary-kustomization.yaml",
+            "{}\n",
+        );
+
+        let root = repo.path().to_path_buf();
+        let hosts = |h: &str| vec![h.to_string()];
+        let err = ensure_route_hostnames_unclaimed(
+            &root,
+            "tenants/other/apps/web",
+            &hosts("shop.example.com"),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("tenants/acme/apps/shop"), "{err}");
+        // A wildcard covering the canary host conflicts too.
+        assert!(
+            ensure_route_hostnames_unclaimed(
+                &root,
+                "tenants/other/apps/web",
+                &hosts("*.example.com")
+            )
+            .await
+            .is_err()
+        );
+        // Editing the canary app itself, or a host only a remote canary uses, is fine.
+        assert!(
+            ensure_route_hostnames_unclaimed(
+                &root,
+                "tenants/acme/apps/shop",
+                &hosts("shop.example.com")
+            )
+            .await
+            .is_ok()
+        );
+        assert!(
+            ensure_route_hostnames_unclaimed(
+                &root,
+                "tenants/acme/apps/web",
+                &hosts("remote.example.com")
             )
             .await
             .is_ok()

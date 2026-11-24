@@ -2478,50 +2478,55 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
         'restrict-tenant-flagger-canaries must exist',
       ).toBe(true);
       // Mirrors `keel_kube::synthesize_flagger_canary`; `analysisExtra` lines are appended to
-      // `spec.analysis`.
+      // `spec.analysis`. `hosts: []` omits `spec.service.hosts`.
       const canary = (
         opts: {
           gatewayNs?: string;
           templateNs?: string;
           query?: boolean;
+          hosts?: string[];
           analysisExtra?: string[];
         } = {},
-      ) => [
-        'apiVersion: flagger.app/v1beta1',
-        'kind: Canary',
-        'metadata:',
-        '  name: keel-e2e-probe',
-        `  namespace: ${tenantNs}`,
-        'spec:',
-        '  provider: gatewayapi:v1',
-        '  targetRef:',
-        '    apiVersion: apps/v1',
-        '    kind: Deployment',
-        '    name: keel-e2e-probe',
-        '  service:',
-        '    port: 9898',
-        '    targetPort: 9898',
-        '    gatewayRefs:',
-        '      - name: keel-ingress',
-        `        namespace: ${opts.gatewayNs ?? 'keel-system'}`,
-        '        group: gateway.networking.k8s.io',
-        '        kind: Gateway',
-        '  analysis:',
-        '    interval: 30s',
-        '    threshold: 5',
-        '    maxWeight: 50',
-        '    stepWeight: 10',
-        '    metrics:',
-        '      - name: envoy-request-success-rate',
-        '        templateRef:',
-        '          name: envoy-gateway-request-success-rate',
-        `          namespace: ${opts.templateNs ?? 'keel-system'}`,
-        ...(opts.query ? ['        query: up'] : []),
-        '        thresholdRange:',
-        '          min: 99',
-        '        interval: 2m',
-        ...(opts.analysisExtra ?? []),
-      ];
+      ) => {
+        const hosts = opts.hosts ?? ['keel-e2e-probe.keel.local'];
+        return [
+          'apiVersion: flagger.app/v1beta1',
+          'kind: Canary',
+          'metadata:',
+          '  name: keel-e2e-probe',
+          `  namespace: ${tenantNs}`,
+          'spec:',
+          '  provider: gatewayapi:v1',
+          '  targetRef:',
+          '    apiVersion: apps/v1',
+          '    kind: Deployment',
+          '    name: keel-e2e-probe',
+          '  service:',
+          '    port: 9898',
+          '    targetPort: 9898',
+          '    gatewayRefs:',
+          '      - name: keel-ingress',
+          `        namespace: ${opts.gatewayNs ?? 'keel-system'}`,
+          '        group: gateway.networking.k8s.io',
+          '        kind: Gateway',
+          ...(hosts.length > 0 ? ['    hosts:', ...hosts.map((h) => `      - "${h}"`)] : []),
+          '  analysis:',
+          '    interval: 30s',
+          '    threshold: 5',
+          '    maxWeight: 50',
+          '    stepWeight: 10',
+          '    metrics:',
+          '      - name: envoy-request-success-rate',
+          '        templateRef:',
+          '          name: envoy-gateway-request-success-rate',
+          `          namespace: ${opts.templateNs ?? 'keel-system'}`,
+          ...(opts.query ? ['        query: up'] : []),
+          '        thresholdRange:',
+          '          min: 99',
+          '        interval: 2m',
+          ...(opts.analysisExtra ?? []),
+        ];
+      };
       const canaryDenied = /restrict-tenant-flagger-canaries|Tenant Flagger Canar/;
       const ok = dryRunApply([`--as=${tenantSa}`], canary());
       expect(ok.ok, `Keel-shaped Canary (dry run) must pass: ${ok.out}`).toBe(true);
@@ -2540,14 +2545,44 @@ test.describe('07 - Live kind Management + Workload Cluster E2E (GUI + CLI)', ()
         ['inline query', canary({ query: true })],
         ['foreign templateRef', canary({ templateNs: 'tenant-default' })],
         ['foreign gateway', canary({ gatewayNs: 'tenant-default' })],
+        // Flagger copies the hosts into its routes: none would be a catch-all on keel-ingress.
+        ['no hosts', canary({ hosts: [] })],
+        ['TLD wildcard host', canary({ hosts: ['*.com'] })],
       ];
       for (const [name, manifest] of bad) {
         const res = dryRunApply([`--as=${tenantSa}`], manifest);
         expect(res.ok, `${name} Canary (dry run) must be denied: ${res.out}`).toBe(false);
         expect(res.out, name).toMatch(canaryDenied);
       }
+      // Any writer's route on the shared Gateway (Flagger's included) needs a concrete host.
+      const route = (hostnames: string[]) => [
+        'apiVersion: gateway.networking.k8s.io/v1',
+        'kind: HTTPRoute',
+        'metadata:',
+        '  name: keel-e2e-probe',
+        `  namespace: ${tenantNs}`,
+        'spec:',
+        '  parentRefs:',
+        '    - name: keel-ingress',
+        '      namespace: keel-system',
+        ...(hostnames.length > 0 ? ['  hostnames:', ...hostnames.map((h) => `    - "${h}"`)] : []),
+        '  rules:',
+        '    - backendRefs:',
+        '        - name: keel-e2e-probe',
+        '          port: 9898',
+      ];
+      const routeOk = dryRunApply([`--as=${tenantSa}`], route(['keel-e2e-probe.keel.local']));
+      expect(routeOk.ok, `HTTPRoute with a host (dry run) must pass: ${routeOk.out}`).toBe(true);
+      for (const [name, hostnames] of [
+        ['host-less', []],
+        ['TLD wildcard', ['*.com']],
+      ] as Array<[string, string[]]>) {
+        const res = dryRunApply([`--as=${tenantSa}`], route(hostnames));
+        expect(res.ok, `${name} HTTPRoute (dry run) must be denied: ${res.out}`).toBe(false);
+        expect(res.out, name).toMatch(/restrict-tenant-route-hostnames|Tenant routes/);
+      }
       logStep(
-        `${tenantNs} Canaries: tenant SA admitted for the Keel shape; webhook, inline query, foreign template and gateway denied`,
+        `${tenantNs} Canaries: tenant SA admitted for the Keel shape; webhook, inline query, foreign template and gateway, missing and wildcard hosts denied; host-less and TLD-wildcard routes denied`,
       );
     });
   });

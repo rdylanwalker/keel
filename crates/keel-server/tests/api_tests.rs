@@ -1764,8 +1764,10 @@ spec:
         .unwrap();
     assert_eq!(merge_res.status(), StatusCode::OK);
 
-    // 3. Propose the bundle and verify Flagger Canary + NetworkPolicy + helmrelease-canary.yaml
-    let prop_res = app
+    // 3. A canary item without an `ingressHost` is rejected before anything is committed:
+    // Flagger would write catch-all routes on the shared keel-ingress Gateway.
+    let hostless_res = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method(Method::POST)
@@ -1781,6 +1783,43 @@ spec:
                         "values": {
                             "vm": { "cores": 2 },
                             "web": { "replicas": 2 }
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(hostless_res.status(), StatusCode::BAD_REQUEST);
+    let hostless_body: Value =
+        serde_json::from_slice(&hostless_res.into_body().collect().await.unwrap().to_bytes())
+            .unwrap();
+    assert!(
+        hostless_body["error"]
+            .as_str()
+            .unwrap()
+            .contains("need a hostname: set the 'ingressHost' value"),
+        "{hostless_body}"
+    );
+
+    // 4. Propose the bundle and verify Flagger Canary + NetworkPolicy + helmrelease-canary.yaml
+    let prop_res = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/tenants/acme/proposals")
+                .header(COOKIE, &cookie)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "catalogId": "canary-bundle",
+                        "kind": "bundle",
+                        "tenant": "acme",
+                        "name": "canary-stack",
+                        "values": {
+                            "vm": { "cores": 2 },
+                            "web": { "replicas": 2, "ingressHost": "web.acme.example" }
                         }
                     })
                     .to_string(),
@@ -1816,6 +1855,11 @@ spec:
     assert!(canary_yaml.contains("kind: Canary"));
     assert!(canary_yaml.contains("name: canary-stack-web"));
     assert!(canary_yaml.contains("keel.io/bundle: canary-stack"));
+    let canary_doc: Value = noyalib::from_str(&canary_yaml).unwrap();
+    assert_eq!(
+        canary_doc["spec"]["service"]["hosts"],
+        json!(["web.acme.example"])
+    );
     assert!(
         tokio::fs::try_exists(item_dir.join("networkpolicy-canary.yaml"))
             .await
@@ -3975,7 +4019,7 @@ async fn test_remote_canary_kustomization_creates_target_namespace_first() {
                         "canary": true,
                         "targetCluster": "workload-kubeconfig",
                         "targetNamespace": "staging-obs",
-                        "values": { "replicas": 2 }
+                        "values": { "replicas": 2, "ingressHost": "grafana.edge.example" }
                     })
                     .to_string(),
                 ))
@@ -4199,6 +4243,138 @@ spec:
         .await
         .unwrap();
     assert_eq!(bad_res.status(), StatusCode::BAD_REQUEST);
+}
+
+/// ADDON-7: a Flagger Canary without hostnames makes Flagger write catch-all routes on the shared
+/// keel-ingress Gateway, so canary proposals need a concrete, non-platform `ingressHost`, and
+/// manifest apps may not render host-less routes on the shared Gateway. Nothing is committed.
+#[tokio::test]
+async fn test_canary_and_route_proposals_reject_catch_all_hosts() {
+    let fixture = setup_fixture().await;
+    let cookie = login_and_get_cookie(&fixture).await;
+    let cases = [
+        (
+            json!({ "replicas": 2 }),
+            None,
+            "need a hostname: set the 'ingressHost' value",
+        ),
+        (
+            json!({ "replicas": 2, "ingressHost": "  " }),
+            None,
+            "need a hostname",
+        ),
+        (
+            json!({ "replicas": 2, "ingressHost": "*.acme.example" }),
+            None,
+            "must be a concrete DNS name",
+        ),
+        (
+            json!({ "replicas": 2, "ingressHost": "idp.keel.local" }),
+            None,
+            "reserved platform host",
+        ),
+        // Remote canaries attach to the workload cluster's own keel-ingress: still a host.
+        (
+            json!({ "replicas": 2 }),
+            Some("workload-kubeconfig"),
+            "need a hostname",
+        ),
+    ];
+    for (values, target_cluster, expected) in cases {
+        let mut req = json!({ "tenant": "acme", "catalogId": "grafana", "kind": "app",
+                              "name": "grafana-canary-host", "canary": true, "values": values });
+        if let Some(cluster) = target_cluster {
+            req["targetCluster"] = json!(cluster);
+            req["targetNamespace"] = json!("obs");
+        }
+        let (status, body) = post_proposal(&fixture, &cookie, req.clone()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{req}: {body}");
+        assert!(body.contains(expected), "{req}: {body}");
+    }
+    assert!(
+        !fixture
+            .state
+            .repo_workdir
+            .join("tenants/acme/apps/grafana-canary-host")
+            .exists()
+    );
+
+    commit_to_main(
+        &fixture,
+        &[
+            (
+                "catalog/apps/open-route/catalog.yaml",
+                r#"apiVersion: keel.io/v1alpha1
+kind: CatalogApplication
+metadata:
+  id: open-route
+  name: Open Route
+  category: platform
+  runtime: manifest
+spec:
+  defaultEngine: flux
+  schema:
+    type: object
+    properties: {}
+"#,
+            ),
+            (
+                "catalog/apps/open-route/manifests.yaml",
+                r#"apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: open-route
+spec:
+  parentRefs:
+    - name: keel-ingress
+      namespace: keel-system
+  rules:
+    - backendRefs:
+        - name: open-route
+          port: 80
+"#,
+            ),
+        ],
+        "feat(catalog): host-less route app",
+    )
+    .await;
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "open-route", "kind": "app", "values": {} }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body.contains("without hostnames") && body.contains("HTTPRoute/open-route"),
+        "{body}"
+    );
+
+    // A host another app's management-cluster Canary already serves cannot be claimed again
+    // (Gateway API keeps the older route on an exact-hostname tie): neither by a canary nor by
+    // a TLD-wide wildcard. The app being edited may keep its own host.
+    let mut shop = keel_kube::FlaggerCanarySpecInput::new("acme", "shop");
+    shop.hosts.push("shop.acme.example".to_string());
+    let shop_canary = keel_kube::synthesize_flagger_canary_yaml(&shop).unwrap();
+    commit_to_main(
+        &fixture,
+        &[("tenants/acme/apps/shop/canary.yaml", shop_canary.as_str())],
+        "feat(acme): shop canary",
+    )
+    .await;
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "grafana", "kind": "app",
+                "name": "grafana-canary-host", "canary": true,
+                "values": { "replicas": 2, "ingressHost": "shop.acme.example" } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(
+        body.contains("shop.acme.example") && body.contains("tenants/acme/apps/shop"),
+        "{body}"
+    );
 }
 
 #[tokio::test]
@@ -7312,7 +7488,8 @@ spec:
         &fixture,
         &cookie,
         json!({ "tenant": "acme", "catalogId": "edge-canary", "kind": "bundle",
-                "targetCluster": "edge-kubeconfig", "values": {} }),
+                "targetCluster": "edge-kubeconfig",
+                "values": { "web": { "ingressHost": "grafana.edge.example" } } }),
     )
     .await;
     assert_eq!(status, StatusCode::CREATED, "{body}");

@@ -105,6 +105,18 @@ const CEL_REQUEST_NAMESPACE: &str = "(has(request.namespace) ? request.namespace
 /// so controllers can finish deleting objects (and tenant namespaces never hang in `Terminating`).
 const CEL_SPEC_PRESERVING_UPDATE: &str = "(request.operation == 'UPDATE' && (has(object.metadata.deletionTimestamp) || (has(object.spec) ? object.spec : {}) == (has(oldObject.spec) ? oldObject.spec : {})))";
 
+/// CEL: an `UPDATE` that leaves `spec` unchanged, **without** the deletion exemption of
+/// [`CEL_SPEC_PRESERVING_UPDATE`]. Used by rules that must also hold while an object is being
+/// deleted: a tenant can keep an object in `Terminating` with its own finalizer, so exempting
+/// every update during deletion would let it rewrite `spec` freely. Finalizer removal only
+/// changes metadata, so cleanup still passes.
+const CEL_SPEC_UNCHANGED_UPDATE: &str = "(request.operation == 'UPDATE' && (has(object.spec) ? object.spec : {}) == (has(oldObject.spec) ? oldObject.spec : {}))";
+
+/// CEL regex (standard `matches`, no string extensions) of a route hostname wildcard that covers
+/// a whole top-level domain (`*.com`) or everything (`*`): practically a catch-all on a shared
+/// Gateway listener. Must stay in sync with `keel_core::is_tld_wide_wildcard`.
+const CEL_TLD_WIDE_WILDCARD_REGEX: &str = "^[*]([.][^.]*)?$";
+
 pub const RULE_DISALLOW_PRIVILEGED: &str = "disallow-privileged";
 pub const RULE_DISALLOW_HOST_PATH_AND_DOCKER_SOCKET: &str = "disallow-host-path-and-docker-socket";
 
@@ -1080,7 +1092,18 @@ pub fn build_protect_platform_owned_tenant_objects_policy() -> Value {
 /// creation time, so a tenant route on a platform host (e.g. the IdP issuer) could take over that
 /// host when the platform route is re-created. This policy denies, in `tenant-*` namespaces, any
 /// route hostname equal to a reserved platform host or a wildcard (`*.<suffix>`) covering one.
-/// The deny list is precomputed (no CEL string extensions needed). Fails closed.
+///
+/// It also denies tenant routes that attach to a Gateway in another namespace (the shared
+/// `keel-system/keel-ingress`) without any `spec.hostnames`: such a route matches every host on
+/// the shared listeners and would capture other tenants' traffic. This covers every writer,
+/// including Flagger, which copies a `Canary`'s `spec.service.hosts` into the routes it generates
+/// (`restrict-tenant-flagger-canaries` requires those hosts). Tenant route hostnames may not be a
+/// wildcard covering a whole top-level domain (`*.com`), which is practically a catch-all too.
+/// These two rules skip only updates that leave `spec` unchanged (finalizer removal included, so
+/// cleanup never hangs); unlike most tenant policies they also hold on objects being deleted, so a
+/// tenant cannot hold a route in `Terminating` with its own finalizer and then drop its hostnames.
+/// The deny list is precomputed (no CEL string extensions needed; the wildcard check uses the
+/// standard `matches`). Fails closed.
 pub fn build_restrict_tenant_route_hostnames_policy<S: AsRef<str>>(
     reserved_hostnames: &[S],
 ) -> Result<Value, KubeError> {
@@ -1157,12 +1180,32 @@ pub fn build_restrict_tenant_route_hostnames_policy<S: AsRef<str>>(
                 {
                     "name": "hostnames",
                     "expression": "has(object.spec.hostnames) ? object.spec.hostnames : []"
+                },
+                {
+                    // Not CEL_SPEC_PRESERVING_UPDATE: a tenant could otherwise hold a route in
+                    // `Terminating` with its own finalizer and then drop its hostnames.
+                    "name": "specUnchanged",
+                    "expression": CEL_SPEC_UNCHANGED_UPDATE
+                },
+                {
+                    // A parentRef to a Gateway outside the route's namespace (a missing
+                    // `namespace` means the route's own; missing `kind`/`group` mean Gateway).
+                    "name": "attachesToSharedGateway",
+                    "expression": format!("has(object.spec.parentRefs) && object.spec.parentRefs.exists(p, has(p.namespace) && p.namespace != {CEL_REQUEST_NAMESPACE} && (!has(p.kind) || p.kind == 'Gateway') && (!has(p.group) || p.group == 'gateway.networking.k8s.io'))")
                 }
             ],
             "validations": [
                 {
                     "expression": "variables.hostnames.all(h, !(h in variables.deniedHostnames))",
                     "message": "Tenant routes may not claim reserved platform hostnames (IdP, keel-server, Forgejo) or wildcards covering them."
+                },
+                {
+                    "expression": format!("variables.specUnchanged || variables.hostnames.all(h, !h.matches('{CEL_TLD_WIDE_WILDCARD_REGEX}'))"),
+                    "message": "Tenant routes may not use a wildcard hostname covering a whole top-level domain (`*.com`): it would capture every unclaimed host under it on the shared Gateway."
+                },
+                {
+                    "expression": "variables.specUnchanged || !variables.attachesToSharedGateway || size(variables.hostnames) > 0",
+                    "message": "Tenant routes attached to a shared Gateway (keel-system/keel-ingress) must set `spec.hostnames`: a route without hostnames matches every host and would capture other tenants' traffic (Flagger Canaries need `spec.service.hosts`)."
                 }
             ]
         }
@@ -1186,13 +1229,18 @@ pub fn build_restrict_tenant_route_hostnames_policy<S: AsRef<str>>(
 ///   and carries neither an inline `query` nor `templateVariables` (otherwise the tenant runs
 ///   arbitrary PromQL against the shared Prometheus and reads other tenants' metrics back through
 ///   Canary events and status);
-/// * `spec.analysis.alerts` only reference `AlertProvider`s in the Canary's own namespace.
+/// * `spec.analysis.alerts` only reference `AlertProvider`s in the Canary's own namespace;
+/// * `spec.service.hosts` holds at least one non-empty hostname without a wildcard: Flagger copies
+///   them into the routes it generates, and a route without hostnames is a catch-all on the
+///   shared Gateway. This rule also holds on Canaries being deleted (only spec-preserving updates
+///   skip it).
 ///
 /// Updates that leave `spec` unchanged (finalizers, annotations, Flagger's own metadata writes)
-/// and objects being deleted always pass. Hostnames of the routes Flagger generates are checked
-/// by `restrict-tenant-route-hostnames`, which matches route writes in `tenant-*` namespaces
-/// whoever the writer is. Fails closed; the `matchConditions` keep platform namespaces out of the
-/// webhook (anti-lockout, `NFR-REL-01`).
+/// and (except for the hosts rule) objects being deleted always pass. The routes Flagger generates are checked again by
+/// `restrict-tenant-route-hostnames` (reserved platform hosts, no host-less route on the shared
+/// Gateway, no TLD-wide wildcard), which matches route writes in `tenant-*` namespaces whoever the
+/// writer is. Fails closed; the `matchConditions` keep platform namespaces out of the webhook
+/// (anti-lockout, `NFR-REL-01`).
 pub fn build_restrict_tenant_flagger_canaries_policy() -> Value {
     let ns = KEEL_SYSTEM_NAMESPACE;
     let gateway = KEEL_INGRESS_GATEWAY_NAME;
@@ -1241,6 +1289,12 @@ pub fn build_restrict_tenant_flagger_canaries_policy() -> Value {
                     "expression": CEL_SPEC_PRESERVING_UPDATE
                 },
                 {
+                    // The hosts rule must also hold on objects being deleted (see
+                    // CEL_SPEC_UNCHANGED_UPDATE).
+                    "name": "specUnchanged",
+                    "expression": CEL_SPEC_UNCHANGED_UPDATE
+                },
+                {
                     "name": "spec",
                     "expression": "has(object.spec) ? object.spec : {}"
                 },
@@ -1261,6 +1315,10 @@ pub fn build_restrict_tenant_flagger_canaries_policy() -> Value {
                 {
                     "expression": format!("variables.exempt || (has(variables.service.gatewayRefs) && size(variables.service.gatewayRefs) > 0 && variables.service.gatewayRefs.all(g, has(g.name) && g.name == '{gateway}' && has(g.namespace) && g.namespace == '{ns}' && (!has(g.kind) || g.kind == 'Gateway') && (!has(g.group) || g.group == 'gateway.networking.k8s.io')))"),
                     "message": format!("Tenant Flagger Canaries may only route through the shared `{ns}/{gateway}` Gateway (`spec.service.gatewayRefs`).")
+                },
+                {
+                    "expression": "variables.specUnchanged || (has(variables.service.hosts) && size(variables.service.hosts) > 0 && variables.service.hosts.all(h, h != '' && !h.contains('*')))",
+                    "message": format!("Tenant Flagger Canaries must set `spec.service.hosts` to concrete hostnames (no wildcard): the routes Flagger generates would otherwise match every host (or a whole domain) on the shared `{ns}/{gateway}` Gateway.")
                 },
                 {
                     "expression": "variables.exempt || !has(variables.analysis.webhooks) || size(variables.analysis.webhooks) == 0",
@@ -2709,6 +2767,36 @@ mod tests {
                 "spec.provider",
             ),
             (
+                "no hosts",
+                Box::new(|c| {
+                    c["spec"]["service"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("hosts");
+                }),
+                "spec.service.hosts",
+            ),
+            (
+                "empty hosts",
+                Box::new(|c| c["spec"]["service"]["hosts"] = json!([])),
+                "spec.service.hosts",
+            ),
+            (
+                "blank host",
+                Box::new(|c| c["spec"]["service"]["hosts"] = json!(["web.acme.example", ""])),
+                "spec.service.hosts",
+            ),
+            (
+                "wildcard host",
+                Box::new(|c| c["spec"]["service"]["hosts"] = json!(["*.com"])),
+                "spec.service.hosts",
+            ),
+            (
+                "subdomain wildcard host",
+                Box::new(|c| c["spec"]["service"]["hosts"] = json!(["*.acme.example"])),
+                "spec.service.hosts",
+            ),
+            (
                 "foreign alert provider",
                 Box::new(|c| {
                     c["spec"]["analysis"]["alerts"] = json!([{
@@ -2760,6 +2848,265 @@ mod tests {
         assert_eq!(
             evaluate_validating_policy(&policy, "CREATE", "keel-system", &bad, None),
             Ok(())
+        );
+    }
+
+    fn tenant_route(kind: &str, hostnames: Option<Value>, parent_refs: Value) -> Value {
+        let mut route = json!({
+            "apiVersion": "gateway.networking.k8s.io/v1",
+            "kind": kind,
+            "metadata": { "name": "web", "namespace": "tenant-acme" },
+            "spec": {
+                "parentRefs": parent_refs,
+                "rules": [{ "backendRefs": [{ "name": "web", "port": 80 }] }]
+            }
+        });
+        if let Some(hostnames) = hostnames {
+            route["spec"]["hostnames"] = hostnames;
+        }
+        route
+    }
+
+    #[test]
+    fn restrict_tenant_route_hostnames_policy_denies_catch_all_routes_on_shared_gateway() {
+        let policy =
+            build_restrict_tenant_route_hostnames_policy(&default_reserved_route_hostnames())
+                .unwrap();
+        let shared =
+            json!([{ "name": "keel-ingress", "namespace": "keel-system", "sectionName": "https" }]);
+        let catch_all = "must set `spec.hostnames`";
+        for kind in ["HTTPRoute", "GRPCRoute", "TLSRoute"] {
+            // Missing or empty hostnames on keel-ingress: denied (any writer, incl. Flagger).
+            for hostnames in [None, Some(json!([]))] {
+                let route = tenant_route(kind, hostnames, shared.clone());
+                let denied =
+                    evaluate_validating_policy(&policy, "CREATE", "tenant-acme", &route, None)
+                        .expect_err(kind);
+                assert!(denied.iter().any(|m| m.contains(catch_all)), "{denied:?}");
+            }
+            // With a hostname: admitted.
+            let route = tenant_route(kind, Some(json!(["web.acme.example"])), shared.clone());
+            assert_eq!(
+                evaluate_validating_policy(&policy, "CREATE", "tenant-acme", &route, None),
+                Ok(())
+            );
+        }
+        // Explicit default kind/group still count as the shared Gateway.
+        let explicit = json!([{ "group": "gateway.networking.k8s.io", "kind": "Gateway", "name": "keel-ingress", "namespace": "keel-system" }]);
+        assert!(
+            evaluate_validating_policy(
+                &policy,
+                "CREATE",
+                "tenant-acme",
+                &tenant_route("HTTPRoute", None, explicit),
+                None
+            )
+            .is_err()
+        );
+        // A route that only attaches inside its own namespace (no cross-namespace Gateway) or to
+        // a Service (GAMMA) is not a shared-listener catch-all.
+        for local in [
+            json!([{ "name": "own-gateway" }]),
+            json!([{ "name": "own-gateway", "namespace": "tenant-acme" }]),
+            json!([{ "group": "", "kind": "Service", "name": "web", "namespace": "keel-system" }]),
+        ] {
+            assert_eq!(
+                evaluate_validating_policy(
+                    &policy,
+                    "CREATE",
+                    "tenant-acme",
+                    &tenant_route("HTTPRoute", None, local.clone()),
+                    None
+                ),
+                Ok(()),
+                "{local}"
+            );
+        }
+        // Spec-preserving updates and deletion of a pre-existing host-less route always pass.
+        let old = tenant_route("HTTPRoute", None, shared.clone());
+        let mut annotated = old.clone();
+        annotated["metadata"]["annotations"] = json!({ "flagger.app/x": "y" });
+        assert_eq!(
+            evaluate_validating_policy(&policy, "UPDATE", "tenant-acme", &annotated, Some(&old)),
+            Ok(())
+        );
+        let mut deleting = old.clone();
+        deleting["metadata"]["deletionTimestamp"] = json!("2026-01-01T00:00:00Z");
+        assert_eq!(
+            evaluate_validating_policy(&policy, "UPDATE", "tenant-acme", &deleting, Some(&old)),
+            Ok(())
+        );
+        // A route held in `Terminating` (tenant finalizer) cannot drop its hostnames: only
+        // spec-preserving updates are exempt, finalizer removal still passes.
+        let hosted_terminating = {
+            let mut r = tenant_route(
+                "HTTPRoute",
+                Some(json!(["web.acme.example"])),
+                shared.clone(),
+            );
+            r["metadata"]["finalizers"] = json!(["acme.example/hold"]);
+            r["metadata"]["deletionTimestamp"] = json!("2026-01-01T00:00:00Z");
+            r
+        };
+        for hostnames in [None, Some(json!([]))] {
+            let mut dropped = tenant_route("HTTPRoute", hostnames, shared.clone());
+            dropped["metadata"] = hosted_terminating["metadata"].clone();
+            let denied = evaluate_validating_policy(
+                &policy,
+                "UPDATE",
+                "tenant-acme",
+                &dropped,
+                Some(&hosted_terminating),
+            )
+            .expect_err("terminating route dropping hostnames");
+            assert!(denied.iter().any(|m| m.contains(catch_all)), "{denied:?}");
+        }
+        let mut released = hosted_terminating.clone();
+        released["metadata"]["finalizers"] = json!([]);
+        assert_eq!(
+            evaluate_validating_policy(
+                &policy,
+                "UPDATE",
+                "tenant-acme",
+                &released,
+                Some(&hosted_terminating)
+            ),
+            Ok(())
+        );
+        // Dropping the hostnames of an admitted route is denied.
+        let hosted = tenant_route(
+            "HTTPRoute",
+            Some(json!(["web.acme.example"])),
+            shared.clone(),
+        );
+        assert!(
+            evaluate_validating_policy(&policy, "UPDATE", "tenant-acme", &old, Some(&hosted))
+                .is_err()
+        );
+        // Reserved platform hosts stay denied; platform namespaces never reach the policy.
+        let idp = tenant_route("HTTPRoute", Some(json!(["idp.keel.local"])), shared.clone());
+        assert!(evaluate_validating_policy(&policy, "CREATE", "tenant-acme", &idp, None).is_err());
+        assert_eq!(
+            evaluate_validating_policy(
+                &policy,
+                "CREATE",
+                "keel-system",
+                &tenant_route("HTTPRoute", None, shared),
+                None
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn restrict_tenant_route_hostnames_policy_denies_tld_wide_wildcards() {
+        let policy =
+            build_restrict_tenant_route_hostnames_policy(&default_reserved_route_hostnames())
+                .unwrap();
+        let shared = json!([{ "name": "keel-ingress", "namespace": "keel-system" }]);
+        for hostnames in [
+            json!(["*.com"]),
+            json!(["web.acme.example", "*.io"]),
+            json!(["*.dev", "*.net"]),
+        ] {
+            for parents in [shared.clone(), json!([{ "name": "own-gateway" }])] {
+                let route = tenant_route("HTTPRoute", Some(hostnames.clone()), parents);
+                let denied =
+                    evaluate_validating_policy(&policy, "CREATE", "tenant-acme", &route, None)
+                        .expect_err("TLD-wide wildcard");
+                assert!(
+                    denied.iter().any(|m| m.contains("whole top-level domain")),
+                    "{hostnames}: {denied:?}"
+                );
+            }
+        }
+        // A wildcard under a registrable domain (two labels after `*.`) is admitted.
+        let route = tenant_route("HTTPRoute", Some(json!(["*.acme.example"])), shared.clone());
+        assert_eq!(
+            evaluate_validating_policy(&policy, "CREATE", "tenant-acme", &route, None),
+            Ok(())
+        );
+        // Turning an admitted route into a TLD-wide wildcard is denied, even while terminating.
+        let mut terminating = route.clone();
+        terminating["metadata"]["deletionTimestamp"] = json!("2026-01-01T00:00:00Z");
+        let mut widened = terminating.clone();
+        widened["spec"]["hostnames"] = json!(["*.com"]);
+        assert!(
+            evaluate_validating_policy(
+                &policy,
+                "UPDATE",
+                "tenant-acme",
+                &widened,
+                Some(&terminating)
+            )
+            .is_err()
+        );
+    }
+
+    /// A Canary held in `Terminating` cannot drop or widen its hosts.
+    #[test]
+    fn restrict_tenant_flagger_canaries_policy_keeps_hosts_while_terminating() {
+        let policy = build_restrict_tenant_flagger_canaries_policy();
+        let mut terminating = synthesized_canary();
+        terminating["metadata"]["finalizers"] = json!(["acme.example/hold"]);
+        terminating["metadata"]["deletionTimestamp"] = json!("2026-01-01T00:00:00Z");
+        for hosts in [json!([]), json!(["*.com"])] {
+            let mut bad = terminating.clone();
+            bad["spec"]["service"]["hosts"] = hosts.clone();
+            let denied = evaluate_validating_policy(
+                &policy,
+                "UPDATE",
+                "tenant-acme",
+                &bad,
+                Some(&terminating),
+            )
+            .expect_err("terminating canary changing hosts");
+            assert!(
+                denied.iter().any(|m| m.contains("spec.service.hosts")),
+                "{hosts}: {denied:?}"
+            );
+        }
+        let mut released = terminating.clone();
+        released["metadata"]["finalizers"] = json!([]);
+        assert_eq!(
+            evaluate_validating_policy(
+                &policy,
+                "UPDATE",
+                "tenant-acme",
+                &released,
+                Some(&terminating)
+            ),
+            Ok(())
+        );
+    }
+
+    /// The route Flagger generates from a Keel-synthesized Canary (hostnames = `spec.service.hosts`)
+    /// is admitted; the one it would generate without hosts is not.
+    #[test]
+    fn flagger_generated_routes_from_synthesized_canaries_are_admitted() {
+        let policy =
+            build_restrict_tenant_route_hostnames_policy(&default_reserved_route_hostnames())
+                .unwrap();
+        let canary = synthesized_canary();
+        let parent_refs = canary["spec"]["service"]["gatewayRefs"].clone();
+        let route = tenant_route(
+            "HTTPRoute",
+            Some(canary["spec"]["service"]["hosts"].clone()),
+            parent_refs.clone(),
+        );
+        assert_eq!(
+            evaluate_validating_policy(&policy, "CREATE", "tenant-acme", &route, None),
+            Ok(())
+        );
+        assert!(
+            evaluate_validating_policy(
+                &policy,
+                "CREATE",
+                "tenant-acme",
+                &tenant_route("HTTPRoute", None, parent_refs),
+                None
+            )
+            .is_err()
         );
     }
 }

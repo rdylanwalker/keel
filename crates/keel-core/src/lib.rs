@@ -25,13 +25,14 @@ pub use bootstrap::{
 pub use catalog::{
     PartitionedValues, PreparedHelmValues, SchemaFieldError, apply_schema_defaults,
     changed_immutable_values, extract_manifest_variables, gateway_route_hostnames,
-    helm_secret_value_fragments, is_secret_schema_node, keel_ingress_parent_refs,
-    manifest_cluster_scoped_kinds, merge_values_patch, parse_catalog, parse_catalog_application,
-    parse_catalog_blueprint, parse_catalog_bundle, partition_values_by_schema,
-    platform_reserved_hostnames, prepare_helm_values, render_helm_values_yaml,
-    render_manifest_template, resolve_helm_gateway_routes, route_hostname_matches,
-    strip_null_values, undeclared_value_paths, validate_k8s_manifests_yaml,
-    validate_route_hostnames, validate_schema_values, verify_rendered_manifest_structure,
+    helm_secret_value_fragments, is_secret_schema_node, is_tld_wide_wildcard,
+    keel_ingress_parent_refs, manifest_cluster_scoped_kinds, merge_values_patch, parse_catalog,
+    parse_catalog_application, parse_catalog_blueprint, parse_catalog_bundle,
+    partition_values_by_schema, platform_reserved_hostnames, prepare_helm_values,
+    render_helm_values_yaml, render_manifest_template, resolve_helm_gateway_routes,
+    route_hostname_matches, shared_gateway_catch_all_routes, strip_null_values,
+    undeclared_value_paths, validate_k8s_manifests_yaml, validate_route_hostnames,
+    validate_schema_values, verify_rendered_manifest_structure,
 };
 pub use crypto::{
     EnvelopeCrypto, SopsConfig, SopsCreationRule, SopsManager, generate_admin_password, sha256_hex,

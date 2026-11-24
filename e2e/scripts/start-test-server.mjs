@@ -392,6 +392,12 @@ spec:
         minimum: 1
         maximum: 10
         default: 2
+      ingressHost:
+        type: string
+        title: Canary Host
+        description: Hostname a Flagger canary serves on the shared keel-ingress Gateway.
+        format: hostname
+        default: podinfo.keel.local
       ingress:
         type: object
         title: Ingress

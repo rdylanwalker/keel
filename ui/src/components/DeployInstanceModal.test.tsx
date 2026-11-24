@@ -182,20 +182,38 @@ describe("DeployInstanceModal component", () => {
       />
     )
 
+    // No hostname field until the canary is enabled (the schema has no ingressHost).
+    expect(screen.queryByLabelText(/Canary Hostname/i)).not.toBeInTheDocument()
     const canaryCheckbox = screen.getByLabelText(/Enable Flagger Canary/i)
     expect(canaryCheckbox).not.toBeChecked()
     fireEvent.click(canaryCheckbox)
     expect(canaryCheckbox).toBeChecked()
 
-    fireEvent.click(
-      screen.getByRole("button", { name: /Submit & Open Git PR Proposal/i })
-    )
+    // A canary without a hostname would be a catch-all route: the form blocks the submit.
+    const submit = screen.getByRole("button", {
+      name: /Submit & Open Git PR Proposal/i,
+    })
+    fireEvent.click(submit)
+    await waitFor(() => {
+      expect(
+        screen.getAllByText(/Canary Hostname is required/i).length
+      ).toBeGreaterThan(0)
+    })
+    expect(api.createProposal).not.toHaveBeenCalled()
+
+    fireEvent.change(screen.getByLabelText(/Canary Hostname/i), {
+      target: { value: "podinfo.acme.example" },
+    })
+    fireEvent.click(submit)
     await waitFor(() => {
       expect(api.createProposal).toHaveBeenCalledWith(
         expect.objectContaining({
           catalogId: "podinfo",
           tenant: "acme",
           canary: true,
+          values: expect.objectContaining({
+            ingressHost: "podinfo.acme.example",
+          }),
         })
       )
     })

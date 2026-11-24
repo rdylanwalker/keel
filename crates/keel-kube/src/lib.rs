@@ -64,7 +64,7 @@ pub use tenant::{
     synthesize_flux_kustomization_yaml, synthesize_flux_manifest_app_kustomizations,
     synthesize_helm_app_network_policy_yaml, synthesize_helm_release_yaml,
     synthesize_remote_target_namespace, synthesize_remote_target_namespace_yaml, tenant_namespace,
-    tenant_s3_backend_url,
+    tenant_s3_backend_url, validate_canary_host,
 };
 // PKO SSH known-hosts helpers: not wired up yet (SDD.md "known gap"); kept as the planned fix.
 pub use tenant_repo::{

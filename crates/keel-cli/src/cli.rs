@@ -767,7 +767,9 @@ pub struct AppInstallArgs {
     #[arg(long)]
     pub values_file: PathBuf,
 
-    /// Enable Flagger + Envoy Gateway progressive canary rollout
+    /// Enable Flagger + Envoy Gateway progressive canary rollout. The canary serves the host in
+    /// the app's `ingressHost` value, which it requires (a concrete DNS name that is neither a
+    /// platform host nor routed by another app)
     #[arg(long, default_value_t = false)]
     pub canary: bool,
 

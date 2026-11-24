@@ -352,6 +352,7 @@ pub async fn create_proposal(
                         stored_secret: stored_manifest_secret.as_ref(),
                         remote: remote_target_cluster(req.target_cluster.as_deref()).is_some(),
                         target_namespace,
+                        canary: req.canary,
                     },
                 )
                 .await?,

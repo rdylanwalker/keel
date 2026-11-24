@@ -17,6 +17,10 @@ import { errorMessage } from "../lib/errors"
 import { toErrorSchema } from "../lib/formErrors"
 import { validateManifestValues } from "../lib/manifestVars"
 import { extractSchemaDefaults } from "../lib/schemaBuilder"
+import {
+  withBundleCanaryHostsRequired,
+  withCanaryHostRequired,
+} from "../lib/canaryHost"
 import { jsonToYaml } from "../lib/utils"
 import {
   buildSecretAwareUiSchema,
@@ -211,13 +215,24 @@ const DeployInstanceModalBody: React.FC<DeployInstanceModalProps> = (props) => {
       return next
     })
 
-  const formSchema = useMemo(
-    () =>
-      (isEditMode
-        ? relaxSecretRequirements(activeItem?.schema)
-        : activeItem?.schema) as RJSFSchema | undefined,
-    [activeItem?.schema, isEditMode]
-  )
+  // Canaries need a hostname (a host-less Flagger route would catch every host on the shared
+  // Gateway), so the form requires `ingressHost` while the canary is enabled.
+  const canaryEnabled =
+    !isManagementAddon &&
+    activeItem?.type === "app" &&
+    Boolean(activeItem.flaggerSupported) &&
+    target.enableCanary
+  const itemSchema = activeItem?.schema
+  const itemType = activeItem?.type
+  const bundleItems = activeItem?.bundleItems
+  const formSchema = useMemo(() => {
+    const base = isEditMode ? relaxSecretRequirements(itemSchema) : itemSchema
+    const withHosts =
+      itemType === "bundle"
+        ? withBundleCanaryHostsRequired(base, bundleItems)
+        : withCanaryHostRequired(base, canaryEnabled)
+    return withHosts as RJSFSchema | undefined
+  }, [itemSchema, itemType, bundleItems, isEditMode, canaryEnabled])
   const formUiSchema = useMemo(
     () =>
       buildSecretAwareUiSchema(activeItem?.schema, activeItem?.uiSchema, {

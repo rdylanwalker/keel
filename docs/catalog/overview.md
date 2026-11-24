@@ -146,8 +146,8 @@ spec:
     chart: podinfo
     version: 6.7.1
   progressiveDelivery:
-    supported: true
-    defaultPort: 9898
+    flaggerSupported: true
+    defaultCanary: false
   schema:
     type: object
     properties:
@@ -155,7 +155,13 @@ spec:
         type: integer
         title: Replicas
         default: 2
+      ingressHost:
+        type: string
+        format: hostname
+        default: podinfo.keel.local
 ```
+
+A canary (`--canary`, **Enable Flagger Canary**, or `canary: true` on a bundle item) of an app with `flaggerSupported: true` serves the host in its `ingressHost` value through the shared `keel-ingress` Gateway. Without a host, Flagger would create routes that match every host on the Gateway, so a canary proposal without a concrete `ingressHost` (a DNS name with no wildcard, scheme or port) is rejected with `400`. On the management cluster the host also must not be a platform host or a host another committed app already routes (`409`). Give `flaggerSupported` apps an `ingressHost` property; when the schema has none, the Deploy dialog adds a required **Canary Hostname** field while the canary is enabled.
 
 ### Placement (`spec.placement.scope`)
 
@@ -315,7 +321,7 @@ In the Web UI (**Catalog & Form Wizard → + Add Catalog Item → Application �
 Properties marked `"writeOnly": true` or `"format": "password"` are automatically partitioned from non-secret variables:
 - In the **Flux engine path**, non-secret variables are written to `config/values-configmap.yaml` (`kind: ConfigMap`, `<instance>-values`), while secret variables are encrypted with the tenant's `age` key into `config/secrets.enc.yaml` (`kind: Secret`, `<instance>-secrets`). A separate `<instance>-config` Flux `Kustomization` (`config-kustomization.yaml`) applies both in the tenant namespace of the management cluster, decrypting the Secret with the tenant `sops-age` Secret (`spec.decryption`, `provider: sops`). The app `Kustomization` (`flux-kustomization.yaml`) `dependsOn` `<instance>-config` and substitutes from both with `optional: false`, so the values exist before the first reconcile. Leave secret placeholders (`${secretField}`) in the template: Flux substitutes them at reconcile time, so they never appear in Git. Do not give a secret placeholder a `:=` default (Keel would render it at proposal time); an optional top-level secret field that is left unset is stored as an empty value in `<instance>-secrets`, so its placeholder becomes `""`. Write templates so that an empty value safely means "no credential" (for example, an unset token disables the feature, never authentication). Keel synthesizes the empty value only when `""` satisfies the field's schema: give a secret that must not be empty a `minLength: 1` (or a pattern that rejects `""`) and leaving it unset fails the proposal with `400` instead. An empty stored value does not count as stored on **Edit**, so if the catalog later makes the field `required`, the edit must set it. Secret fields in manifest templates are supported only by the Flux engine (Keel rejects `engine: pulumi`). Remote `targetCluster`s work: the Secret stays on the management cluster, but the substituted values reach the workload cluster inside the rendered manifests, as Helm values would. Remote apps also get a `namespace.yaml` that creates the target namespace first. Plaintext secret values must not contain `${`, since Flux also substitutes the decrypted Secret. On **Edit**, a secret field left blank keeps its stored value (Keel keeps or re-encrypts the committed Secret); fill in only the secrets you want to change. Bundle items that reference a manifest app cannot set `canary: true` or `bindValues` (Helm apps only).
 - **Instance names:** Keel derives Flux `Kustomization` names from instance names (`<name>`, `<name>-config` for manifest apps and bundle items, `<name>-canary`, and `<bundle>-<item>` for bundle items). A proposal is rejected with `409` when one of them is already used by another instance of the tenant, or when a new instance is named `<other>-config`/`<other>-canary` of an existing instance (or the other way round).
-- **Route hostnames:** a manifest app's `HTTPRoute`/`GRPCRoute` hostnames must be concrete at proposal time, must not be (or wildcard-cover) a platform host (`idp.`/`keel.`/`forgejo.` under the Keel domain or the configured IdP host), and must not already be routed by another committed app (in any tenant's repository; if a tenant repository cannot be read, the proposal fails with `503` and can be retried). The Kyverno policy `restrict-tenant-route-hostnames` enforces the platform-host rule at admission. Tenant ServiceAccounts get `httproutes`/`grpcroutes` through `ClusterRole/keel-tenant-gateway-routes` (aggregated into `admin`).
+- **Route hostnames:** a manifest app's route that attaches to a Gateway in another namespace (the shared `keel-system/keel-ingress`) must list at least one hostname, otherwise the proposal is rejected with `400` (a route without hostnames would catch every host). A manifest app's `HTTPRoute`/`GRPCRoute` hostnames must be concrete at proposal time, must not be (or wildcard-cover) a platform host (`idp.`/`keel.`/`forgejo.` under the Keel domain or the configured IdP host), must not be a wildcard over a whole top-level domain (`*.com`), and must not already be routed by another committed app (including a canary's `ingressHost`) (in any tenant's repository; if a tenant repository cannot be read, the proposal fails with `503` and can be retried). The Kyverno policy `restrict-tenant-route-hostnames` enforces the platform-host rule at admission. Tenant ServiceAccounts get `httproutes`/`grpcroutes` through `ClusterRole/keel-tenant-gateway-routes` (aggregated into `admin`).
 - In the **Pulumi engine path**, secret variables are encrypted into `secrets.enc.yaml` and bound via `Stack.spec.envRefs`.
 
 ### Choosing Between Execution Engines (`Flux` vs. `Pulumi`)

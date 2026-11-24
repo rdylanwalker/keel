@@ -392,6 +392,7 @@ pub(super) async fn create_bundle_proposal(
                             stored_secret: stored_item_secrets.get(&item.id),
                             remote: item_kube_config.is_some(),
                             target_namespace: item_target_namespace.as_deref(),
+                            canary: item.canary,
                         },
                     )
                     .await?;

@@ -33,12 +33,12 @@ Keel is alpha software. This page collects the limitations and open bugs a user 
 - **Forgejo repository names are visible to other tenants.** A tenant's repository-scoped Forgejo token can read the name and description of other tenant repositories, but not their content.
 - **Misleading forge error text.** Some token and repository errors are reported as `Invalid pull request input`.
 - **Tenants created through the API on the Local Git provider.** They have no tenant Git source: Pulumi Stacks and previews return `409`, and Flux manifest apps never reconcile. Helm apps work.
+- **Route hosts are first come, first served.** Keel refuses a proposal whose route or canary host another committed app already routes, but it does not see open proposals, and Kyverno does not enforce host uniqueness. A tenant that writes routes directly (for example by merging its own PR outside Keel) can claim a host first. On an exact-hostname tie, Gateway API keeps the older route, so that tenant then serves another tenant's host.
 - More tenancy gaps, such as the operator token on external forges and the platform `age` key, are listed in [Security & Tenancy: Residual exposure](../operations/security-and-tenancy.md#residual-exposure).
 
 ## Apps and Canaries
 
 - **Editing a Helm app replaces all its secrets.** When you edit a Helm app, re-enter every secret field: secrets you leave blank are dropped.
-- **Set a host for every canary.** A canary without `ingressHost` creates an `HTTPRoute` without a host name, which matches every host on the shared `keel-ingress` Gateway.
 - **Canary analysis is not tested.** E2E checks that a canary deploys and initializes, but not traffic shifting, promotion or rollback.
 - **Apps are served over HTTPS only.** Canary apps are reachable through `keel-ingress` at `https://<host>:8888` on local `kind`. Plain HTTP on port 8888 does not respond.
 

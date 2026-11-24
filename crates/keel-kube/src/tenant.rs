@@ -909,7 +909,38 @@ impl FlaggerCanarySpecInput {
     }
 }
 
+/// Validates one Flagger `Canary` hostname (`spec.service.hosts[]`) and returns it trimmed and
+/// lower-cased: a concrete DNS name (no wildcard, no port), at most 253 characters, made of
+/// 1-63 character `[a-z0-9-]` labels that neither start nor end with `-`, with at least two
+/// labels. Flagger copies these hosts into the `hostnames` of the routes it writes on the shared
+/// Gateway, so a wildcard would claim a whole domain.
+pub fn validate_canary_host(raw: &str) -> Result<String, KubeError> {
+    let host = raw.trim().to_ascii_lowercase();
+    let valid_label = |label: &str| {
+        !label.is_empty()
+            && label.len() <= 63
+            && label
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+    };
+    if host.is_empty()
+        || host.len() > 253
+        || !host.contains('.')
+        || !host.split('.').all(valid_label)
+    {
+        return Err(KubeError::InvalidInput(format!(
+            "Flagger Canary hostname '{}' must be a concrete DNS name such as \
+             podinfo.example.com (no wildcard, scheme or port)",
+            raw.trim()
+        )));
+    }
+    Ok(host)
+}
+
 /// Synthesizes a Flagger `Canary` (`flagger.app/v1beta1`) manifest for Envoy Gateway + Prometheus.
+/// Fails unless `input.hosts` holds at least one valid hostname ([`validate_canary_host`]).
 pub fn synthesize_flagger_canary(input: &FlaggerCanarySpecInput) -> Result<Value, KubeError> {
     let namespace = tenant_namespace(&input.tenant_id)?;
     validate_resource_name("release_name", &input.release_name)?;
@@ -941,15 +972,22 @@ pub fn synthesize_flagger_canary(input: &FlaggerCanarySpecInput) -> Result<Value
             }
         ]),
     );
-    let clean_hosts: Vec<String> = input
+    // Flagger copies `spec.service.hosts` into the `hostnames` of the routes it generates; a
+    // route without hostnames would match every host on the shared Gateway (a catch-all that
+    // captures other tenants' traffic), so at least one concrete hostname is required.
+    let clean_hosts = input
         .hosts
         .iter()
-        .map(|h| h.trim().to_string())
-        .filter(|h| !h.is_empty())
-        .collect();
-    if !clean_hosts.is_empty() {
-        service.insert("hosts".to_string(), json!(clean_hosts));
+        .map(|h| validate_canary_host(h))
+        .collect::<Result<Vec<String>, KubeError>>()?;
+    if clean_hosts.is_empty() {
+        return Err(KubeError::InvalidInput(format!(
+            "Flagger Canary '{}' needs at least one hostname: a route without hostnames would \
+             match every host on the shared `{}/{}` Gateway",
+            input.release_name, input.gateway_namespace, input.gateway_name
+        )));
     }
+    service.insert("hosts".to_string(), json!(clean_hosts));
 
     let mut labels = tenant_common_labels(&input.tenant_id);
     for (k, v) in &input.extra_labels {
@@ -2244,8 +2282,9 @@ mod tests {
         }
 
         // Every kind the synthesized Canary needs is covered by this role.
-        let canary =
-            synthesize_flagger_canary(&FlaggerCanarySpecInput::new("acme", "web")).unwrap();
+        let mut canary_input = FlaggerCanarySpecInput::new("acme", "web");
+        canary_input.hosts.push("web.acme.example".to_string());
+        let canary = synthesize_flagger_canary(&canary_input).unwrap();
         let api_version = canary["apiVersion"].as_str().unwrap();
         assert_eq!(api_version.split('/').next(), Some("flagger.app"));
         assert_eq!(canary["kind"], "Canary");
@@ -2810,6 +2849,39 @@ mod tests {
             "keel-system"
         );
         assert_eq!(np["spec"]["ingress"][0]["ports"][0]["port"], 9898);
+    }
+
+    #[test]
+    fn flagger_canary_requires_a_concrete_hostname() {
+        // No host (or only blank ones): Flagger would write a catch-all route on keel-ingress.
+        let mut input = FlaggerCanarySpecInput::new("default", "podinfo");
+        let err = synthesize_flagger_canary(&input).unwrap_err();
+        assert!(
+            matches!(&err, KubeError::InvalidInput(m) if m.contains("needs at least one hostname")),
+            "{err:?}"
+        );
+        input.hosts = vec!["  ".to_string()];
+        assert!(synthesize_flagger_canary(&input).is_err());
+        for bad in [
+            "*.example.com",
+            "*",
+            "localhost",
+            "podinfo.example.com:443",
+            "https://podinfo.example.com",
+            "-bad.example.com",
+            "bad_host.example.com",
+            "a..example.com",
+        ] {
+            input.hosts = vec![bad.to_string()];
+            assert!(synthesize_flagger_canary(&input).is_err(), "{bad}");
+        }
+        // Hosts are trimmed and lower-cased.
+        input.hosts = vec![" PodInfo.Example.COM ".to_string()];
+        let canary = synthesize_flagger_canary(&input).unwrap();
+        assert_eq!(
+            canary["spec"]["service"]["hosts"],
+            json!(["podinfo.example.com"])
+        );
     }
 
     #[test]

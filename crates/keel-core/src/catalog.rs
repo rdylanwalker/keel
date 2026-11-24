@@ -947,6 +947,60 @@ pub fn gateway_route_hostnames(docs: &[Value]) -> Vec<String> {
     hosts
 }
 
+/// `<Kind>/<name>` of every Gateway API route document in `docs` that attaches to a Gateway in
+/// another namespace (the shared `keel-system/keel-ingress`) without any `spec.hostnames`. Such a
+/// route matches every host on the shared listeners (a catch-all capturing other tenants'
+/// traffic); the Kyverno `restrict-tenant-route-hostnames` policy denies it in tenant namespaces,
+/// so proposals reject it before anything is committed. A `parentRef` counts as cross-namespace
+/// when it names a `namespace` other than the route's own (its `metadata.namespace`, else
+/// `default_namespace`, the namespace the route is applied into) and its `kind`/`group` are
+/// Gateway API `Gateway` (or unset), exactly as the Kyverno rule decides.
+pub fn shared_gateway_catch_all_routes(docs: &[Value], default_namespace: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    for doc in docs {
+        let kind = doc.get("kind").and_then(Value::as_str).unwrap_or_default();
+        let is_route = doc
+            .get("apiVersion")
+            .and_then(Value::as_str)
+            .is_some_and(|v| v.starts_with("gateway.networking.k8s.io/"))
+            && GATEWAY_ROUTE_KINDS.contains(&kind);
+        if !is_route {
+            continue;
+        }
+        let spec = doc.get("spec");
+        let has_hostnames = spec
+            .and_then(|s| s.get("hostnames"))
+            .and_then(Value::as_array)
+            .is_some_and(|h| !h.is_empty());
+        if has_hostnames {
+            continue;
+        }
+        let route_ns = doc
+            .pointer("/metadata/namespace")
+            .and_then(Value::as_str)
+            .unwrap_or(default_namespace);
+        let shared = spec
+            .and_then(|s| s.get("parentRefs"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .any(|p| {
+                let field = |k: &str| p.get(k).and_then(Value::as_str);
+                field("namespace").is_some_and(|ns| ns != route_ns)
+                    && field("kind").is_none_or(|k| k == "Gateway")
+                    && field("group").is_none_or(|g| g == "gateway.networking.k8s.io")
+            });
+        if shared {
+            let name = doc
+                .pointer("/metadata/name")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            found.push(format!("{kind}/{name}"));
+        }
+    }
+    found
+}
+
 /// Host of an absolute URL (`https://user@host:port/path` → `host`), lower-cased.
 fn url_host(url: &str) -> Option<String> {
     let rest = url.trim().split_once("://").map_or(url.trim(), |(_, r)| r);
@@ -1008,6 +1062,12 @@ pub fn validate_route_hostnames(
                 "Route hostname '{hostname}' must be a concrete DNS name at proposal time"
             )));
         }
+        if is_tld_wide_wildcard(hostname) {
+            return Err(CoreError::Validation(format!(
+                "Route hostname '{hostname}' is a wildcard covering a whole top-level domain; \
+                 it would capture every unclaimed host under it on the shared Gateway"
+            )));
+        }
         if let Some(host) = reserved
             .iter()
             .find(|r| route_hostname_matches(hostname, r))
@@ -1018,6 +1078,15 @@ pub fn validate_route_hostnames(
         }
     }
     Ok(())
+}
+
+/// `true` for a route hostname wildcard covering everything (`*`) or a whole top-level domain
+/// (`*.com`): practically a catch-all on a shared Gateway listener. The Kyverno
+/// `restrict-tenant-route-hostnames` policy denies the same hostnames in tenant namespaces.
+pub fn is_tld_wide_wildcard(hostname: &str) -> bool {
+    hostname.strip_prefix('*').is_some_and(|rest| {
+        rest.is_empty() || rest.strip_prefix('.').is_some_and(|tld| !tld.contains('.'))
+    })
 }
 
 /// `parentRefs` pinning a tenant route to both HTTPS listeners of the shared
@@ -2474,6 +2543,10 @@ spec:
     fn route_hostname_validation_rejects_platform_hosts_and_wildcards() {
         let reserved = platform_reserved_hostnames(["https://idp.keel.local:8888/auth/v1"]);
         assert!(validate_route_hostnames(&["rauthy-acme.keel.local".into()], &reserved).is_ok());
+        // A wildcard under a registrable domain is fine; one over a whole TLD is a catch-all.
+        assert!(validate_route_hostnames(&["*.acme.example".into()], &reserved).is_ok());
+        assert!(is_tld_wide_wildcard("*.com") && is_tld_wide_wildcard("*"));
+        assert!(!is_tld_wide_wildcard("*.acme.example") && !is_tld_wide_wildcard("web.com"));
         for bad in [
             "idp.keel.local",
             "keel.keel.local",
@@ -2481,6 +2554,9 @@ spec:
             "*.keel.local",
             "${hostname}",
             "",
+            "*",
+            "*.com",
+            "*.local",
         ] {
             assert!(
                 validate_route_hostnames(&[bad.to_string()], &reserved).is_err(),
@@ -2510,6 +2586,52 @@ spec:
             vec![
                 "auth.example.org".to_string(),
                 "grpc.example.org".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn shared_gateway_catch_all_routes_finds_host_less_routes_on_shared_gateways() {
+        let shared = json!([{ "name": "keel-ingress", "namespace": "keel-system" }]);
+        let docs = vec![
+            // Host-less on keel-ingress: catch-all.
+            json!({"apiVersion": "gateway.networking.k8s.io/v1", "kind": "HTTPRoute",
+                   "metadata": {"name": "open"}, "spec": {"parentRefs": shared}}),
+            json!({"apiVersion": "gateway.networking.k8s.io/v1", "kind": "GRPCRoute",
+                   "metadata": {"name": "grpc", "namespace": "tenant-acme"},
+                   "spec": {"hostnames": [], "parentRefs": [
+                       {"group": "gateway.networking.k8s.io", "kind": "Gateway",
+                        "name": "edge", "namespace": "platform-gw"}]}}),
+            // With hostnames: fine.
+            json!({"apiVersion": "gateway.networking.k8s.io/v1", "kind": "HTTPRoute",
+                   "metadata": {"name": "hosted"},
+                   "spec": {"hostnames": ["web.example.org"], "parentRefs": shared}}),
+            // Same-namespace Gateway, implicit namespace, or a Service parent: not shared.
+            json!({"apiVersion": "gateway.networking.k8s.io/v1", "kind": "HTTPRoute",
+                   "metadata": {"name": "own", "namespace": "apps"},
+                   "spec": {"parentRefs": [{"name": "gw", "namespace": "apps"}]}}),
+            json!({"apiVersion": "gateway.networking.k8s.io/v1", "kind": "HTTPRoute",
+                   "metadata": {"name": "implicit"}, "spec": {"parentRefs": [{"name": "gw"}]}}),
+            json!({"apiVersion": "gateway.networking.k8s.io/v1", "kind": "HTTPRoute",
+                   "metadata": {"name": "mesh"}, "spec": {"parentRefs": [
+                       {"group": "", "kind": "Service", "name": "web", "namespace": "keel-system"}]}}),
+            json!({"apiVersion": "v1", "kind": "Service", "metadata": {"name": "svc"},
+                   "spec": {"parentRefs": shared}}),
+            // Implicit namespace (applied into the tenant namespace): a Gateway in any other
+            // namespace is shared, one in the tenant namespace is not.
+            json!({"apiVersion": "gateway.networking.k8s.io/v1", "kind": "HTTPRoute",
+                   "metadata": {"name": "foreign"},
+                   "spec": {"parentRefs": [{"name": "edge", "namespace": "other-gw"}]}}),
+            json!({"apiVersion": "gateway.networking.k8s.io/v1", "kind": "HTTPRoute",
+                   "metadata": {"name": "own-explicit"},
+                   "spec": {"parentRefs": [{"name": "gw", "namespace": "tenant-acme"}]}}),
+        ];
+        assert_eq!(
+            shared_gateway_catch_all_routes(&docs, "tenant-acme"),
+            vec![
+                "HTTPRoute/open".to_string(),
+                "GRPCRoute/grpc".to_string(),
+                "HTTPRoute/foreign".to_string()
             ]
         );
     }
