@@ -1219,6 +1219,23 @@ spec:
         )
         .unwrap();
         assert!(prepared.values_yaml.contains("admin@acme.io"));
+        // No values at all (`keel app install` without `--values-file`, FU-7): fine when every
+        // required field has a default ...
+        defaulted.spec.schema["properties"]["domain"]["default"] = json!("auth.example.com");
+        let prepared = validate_application_values(&defaulted, &json!({}), false).unwrap();
+        assert!(prepared.values_yaml.contains("auth.example.com"));
+        // ... and names every required field without one otherwise.
+        let missing = validate_application_values(&app, &json!({}), false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            missing.contains("\"domain\" is a required property"),
+            "{missing}"
+        );
+        assert!(
+            missing.contains("\"adminEmail\" is a required property"),
+            "{missing}"
+        );
 
         let bp = parse_catalog_blueprint(SAMPLE_BLUEPRINT_CATALOG_YAML).unwrap();
         assert!(
@@ -1412,6 +1429,30 @@ spec:
         let app_out = dispatch(&app_cli, &ctx).await.unwrap();
         assert!(app_out.contains("Opened Proposal PR #2"));
         assert!(app_out.contains("helm.toolkit.fluxcd.io/v2:HelmRelease"));
+
+        // 4b. Without `--values-file` the required fields lacking a default are named (FU-7).
+        let no_values_cli = Cli::try_parse_from([
+            "keel",
+            "app",
+            "install",
+            "--app",
+            "authentik",
+            "--tenant",
+            "acme",
+            "--server",
+            &server_url,
+        ])
+        .unwrap();
+        let no_values_err = dispatch(&no_values_cli, &ctx)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            no_values_err.contains("\"domain\" is a required property")
+                && no_values_err.contains("\"adminEmail\" is a required property")
+                && no_values_err.contains("no --values-file given"),
+            "{no_values_err}"
+        );
 
         // 5. `keel preview status --pr 1` without watch
         let prev_cli = Cli::try_parse_from([

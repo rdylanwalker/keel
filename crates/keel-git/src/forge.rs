@@ -118,7 +118,7 @@ pub enum ForgeError {
     #[error("Pull request '{0}' not found")]
     NotFound(String),
 
-    #[error("Invalid pull request input: {0}")]
+    #[error("Invalid forge request input: {0}")]
     InvalidInput(String),
 
     #[error("Pull request '{0}' cannot be modified or merged while in state '{1}'")]
@@ -656,6 +656,17 @@ mod tests {
             }
             .is_behind_target_refusal()
         );
+    }
+
+    /// ADDON-19: token and repository input errors are not "pull request" errors.
+    #[test]
+    fn invalid_input_wording_is_forge_neutral() {
+        let err = ForgeError::InvalidInput("repository name 'a/b' is not a DNS label".into());
+        assert_eq!(
+            err.to_string(),
+            "Invalid forge request input: repository name 'a/b' is not a DNS label"
+        );
+        assert!(!err.to_string().contains("pull request"));
     }
 
     #[test]

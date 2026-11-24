@@ -46,6 +46,15 @@ pub struct LiveResourceInfo {
     /// Why the object is not Ready (`Reason: message` of its `Ready` condition), see
     /// [`extract_not_ready_message`].
     pub message: Option<String>,
+    /// Kind of the live object (`HelmRelease`, `Kustomization`, `Stack`, ...), if known.
+    pub kind: Option<String>,
+    /// App instance this object configures (the `keel.io/config-for` label of an app's
+    /// `<instance>-config` Kustomization). Such objects belong to their parent app row and are
+    /// not user-facing releases of their own.
+    pub config_for: Option<String>,
+    /// App runtime recorded on the object (its `keel.io/runtime` label, e.g. `manifest`), so a
+    /// release no longer declared in Git keeps reporting the runtime its Git row had.
+    pub runtime: Option<String>,
 }
 
 impl LiveResourceInfo {
@@ -61,6 +70,9 @@ impl LiveResourceInfo {
             tenant: None,
             provider: None,
             message: None,
+            kind: None,
+            config_for: None,
+            runtime: None,
         }
     }
 }
@@ -783,6 +795,15 @@ impl KubeClusterStatusReader {
                         tenant: labels.and_then(|l| l.get("keel.io/tenant")).cloned(),
                         provider: extract_stack_provider(labels, &item.data),
                         message: extract_not_ready_message(&item.data),
+                        kind: Some(kind.to_string()),
+                        config_for: labels
+                            .and_then(|l| l.get("keel.io/config-for"))
+                            .map(|v| v.trim().to_string())
+                            .filter(|v| !v.is_empty()),
+                        runtime: labels
+                            .and_then(|l| l.get("keel.io/runtime"))
+                            .map(|v| v.trim().to_string())
+                            .filter(|v| !v.is_empty()),
                     },
                 );
             }
@@ -2790,6 +2811,30 @@ current-context: workload
                             {
                                 "apiVersion": "kustomize.toolkit.fluxcd.io/v1",
                                 "kind": "Kustomization",
+                                "metadata": {
+                                    "name": "echo",
+                                    "namespace": "tenant-a",
+                                    "labels": { "keel.io/runtime": "manifest" }
+                                },
+                                "status": {
+                                    "conditions": [{ "type": "Ready", "status": "True", "reason": "ReconciliationSucceeded" }]
+                                }
+                            },
+                            {
+                                "apiVersion": "kustomize.toolkit.fluxcd.io/v1",
+                                "kind": "Kustomization",
+                                "metadata": {
+                                    "name": "echo-config",
+                                    "namespace": "tenant-a",
+                                    "labels": { "keel.io/config-for": "echo" }
+                                },
+                                "status": {
+                                    "conditions": [{ "type": "Ready", "status": "True", "reason": "ReconciliationSucceeded" }]
+                                }
+                            },
+                            {
+                                "apiVersion": "kustomize.toolkit.fluxcd.io/v1",
+                                "kind": "Kustomization",
                                 "metadata": { "name": "stack-wrapper", "namespace": "tenant-a" },
                                 "spec": {
                                     "healthChecks": [{ "kind": "Stack", "name": "my-stack" }]
@@ -3101,6 +3146,21 @@ current-context: workload
         assert!(
             !kustomizations.contains_key(&("tenant-a".to_string(), "stack-wrapper".to_string()))
         );
+        let config = kustomizations
+            .get(&("tenant-a".to_string(), "echo-config".to_string()))
+            .unwrap();
+        assert_eq!(config.status, LiveResourceStatus::Ready);
+        assert!(!config.terminating);
+        assert_eq!(config.kind.as_deref(), Some("Kustomization"));
+        assert_eq!(config.config_for.as_deref(), Some("echo"));
+        assert_eq!(config.runtime, None);
+        let echo = &kustomizations[&("tenant-a".to_string(), "echo".to_string())];
+        assert_eq!(echo.runtime.as_deref(), Some("manifest"));
+        assert_eq!(echo.config_for, None);
+        let podinfo = &helm_only[&("tenant-a".to_string(), "podinfo".to_string())];
+        assert_eq!(podinfo.kind.as_deref(), Some("HelmRelease"));
+        assert_eq!(podinfo.config_for, None);
+        assert_eq!(podinfo.runtime, None);
 
         let canaries = reader.canary_statuses().await;
         let canary = canaries

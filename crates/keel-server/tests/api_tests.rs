@@ -973,6 +973,32 @@ async fn test_proposal_create_preview_merge_and_stacks_releases() {
     // Only the preview Stack: previews clone through PKO `gitSource` (no Flux GitRepository).
     assert_eq!(merge_json["gcPlan"]["targets"].as_array().unwrap().len(), 1);
 
+    // 6b. Merging it again is refused plainly, without asking the forge (FU-6).
+    for action in ["merge", "reject"] {
+        let again = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/api/v1/tenants/management/proposals/{pr_id}/{action}"
+                    ))
+                    .header(COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(again.status(), StatusCode::CONFLICT, "{action}");
+        let again_json: Value =
+            serde_json::from_slice(&again.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(
+            again_json["error"],
+            format!("Proposal #{pr_id} is already merged"),
+            "{action}"
+        );
+    }
+
     // 7. Stacks & Releases endpoints
     let stacks_res = app
         .clone()
@@ -3407,6 +3433,128 @@ async fn test_tenant_admin_scoped_merge_reject_reopen_and_escalation_guards() {
         .await
         .unwrap();
     assert_eq!(admin_merge_res.status(), StatusCode::OK);
+
+    // A tenant admin merging (or reopening) the merged PR gets a plain 409 (FU-6).
+    for action in ["merge", "reopen"] {
+        let again = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/api/v1/tenants/acme/proposals/{acme_pr_id}/{action}"
+                    ))
+                    .header(COOKIE, &acme_admin_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(again.status(), StatusCode::CONFLICT, "{action}");
+        let body: Value =
+            serde_json::from_slice(&again.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(
+            body["error"],
+            format!("Proposal #{acme_pr_id} is already merged")
+        );
+    }
+
+    // Another tenant's admin gets a uniform 404 for acme's PR in the shared repository: PR
+    // ownership is checked before its state, so the state does not leak.
+    let default_admin_cookie = login_with_groups(
+        &fixture,
+        "admin@default.local",
+        vec!["tenant-default-admin"],
+    )
+    .await;
+    for action in ["merge", "reject", "reopen"] {
+        let foreign = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/api/v1/tenants/default/proposals/{acme_pr_id}/{action}"
+                    ))
+                    .header(COOKIE, &default_admin_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(foreign.status(), StatusCode::NOT_FOUND, "{action}");
+        let body: Value =
+            serde_json::from_slice(&foreign.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        let error = body["error"].as_str().unwrap();
+        assert!(!error.contains("merged"), "{action}: {error}");
+    }
+
+    // A closed PR attributed to acme whose branch is not `keel/acme/...` (e.g. opened by the
+    // platform) is a 403 for acme's admin, not a 409 revealing that it is closed.
+    let foreign_branch = "platform/acme-tweak-1700000002";
+    {
+        let _guard = fixture.state.git_lock.lock().await;
+        let dir = &fixture.state.repo_workdir;
+        let git = &fixture.state.git_runner;
+        git.sync_branch_from_remote(dir, "origin", "main")
+            .await
+            .unwrap();
+        git.checkout_new_branch(dir, foreign_branch).await.unwrap();
+        tokio::fs::write(dir.join("tenants/acme/notes.txt"), "platform note\n")
+            .await
+            .unwrap();
+        git.add(dir, ["tenants/acme/notes.txt"]).await.unwrap();
+        git.commit(
+            dir,
+            "chore(acme): platform note",
+            &keel_git::CommitAuthor::new("Platform", "platform@keel.local"),
+        )
+        .await
+        .unwrap();
+        git.push(dir, "origin", foreign_branch).await.unwrap();
+        git.checkout_branch(dir, "main").await.unwrap();
+    }
+    let foreign_pr = fixture
+        .state
+        .forge
+        .create_pull_request(
+            keel_git::CreatePrRequest::new("Platform note", "test", foreign_branch)
+                .with_tenant("acme"),
+        )
+        .await
+        .unwrap();
+    fixture
+        .state
+        .forge
+        .close_pull_request(&foreign_pr.id)
+        .await
+        .unwrap();
+    for action in ["merge", "reject", "reopen"] {
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/api/v1/tenants/acme/proposals/{}/{action}",
+                        foreign_pr.id
+                    ))
+                    .header(COOKIE, &acme_admin_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN, "{action}");
+        let body: Value =
+            serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        let error = body["error"].as_str().unwrap();
+        assert!(
+            error.contains("is not scoped to tenant 'acme'"),
+            "{action}: {error}"
+        );
+    }
 
     // 5. `tenant-acme-admin` CANNOT merge a PR that modifies `tenants/acme/rbac.yaml`
     let rbac_branch = "keel/acme/escalate-rbac-1700000001";

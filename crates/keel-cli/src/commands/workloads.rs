@@ -294,7 +294,11 @@ pub async fn execute_app_install(
     if let Some(ref eng) = args.engine {
         eng.parse::<keel_core::ManifestEngine>()?;
     }
-    let values = load_values_file(&args.values_file).await?;
+    // Without a values file the server applies the catalog schema defaults (FU-7).
+    let values = match &args.values_file {
+        Some(path) => load_values_file(path).await?,
+        None => json!({}),
+    };
     let base_url = normalize_server_url(&args.server)?;
 
     // Fetch catalog to validate application JSONSchema and canary capability client-side
@@ -309,7 +313,18 @@ pub async fn execute_app_install(
                 args.app
             ))
         })?;
-    let _prepared = validate_application_values(app, &values, args.canary)?;
+    let _prepared = validate_application_values(app, &values, args.canary).map_err(|err| {
+        match (&args.values_file, err) {
+            // Name what to do: the missing fields have no schema default.
+            (None, CliError::Core(core @ keel_core::CoreError::SchemaValidation(_))) => {
+                CliError::Validation(format!(
+                    "{core} (no --values-file given: set required values without a catalog \
+                     default in one)"
+                ))
+            }
+            (_, err) => err,
+        }
+    })?;
 
     submit_proposal_request(
         &base_url,

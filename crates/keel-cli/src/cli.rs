@@ -762,10 +762,12 @@ pub struct AppInstallArgs {
     #[arg(long, help = TENANT_HELP)]
     pub tenant: String,
 
-    /// Path to YAML or JSON Helm/Kustomize values override file. On an existing instance it is
-    /// merged over the committed values (only the keys it sets change; `null` removes a key)
+    /// Path to YAML or JSON Helm/Kustomize values override file. Optional: without it the
+    /// catalog schema defaults apply (required fields without a default must be set here). On an
+    /// existing instance it is merged over the committed values (only the keys it sets change;
+    /// `null` removes a key)
     #[arg(long)]
-    pub values_file: PathBuf,
+    pub values_file: Option<PathBuf>,
 
     /// Enable Flagger + Envoy Gateway progressive canary rollout. The canary serves the host in
     /// the app's `ingressHost` value, which it requires (a concrete DNS name that is neither a
@@ -1160,7 +1162,7 @@ mod tests {
         };
         assert_eq!(app_args.app, "authentik");
         assert_eq!(app_args.tenant, "acme");
-        assert_eq!(app_args.values_file, PathBuf::from("authentik.yaml"));
+        assert_eq!(app_args.values_file, Some(PathBuf::from("authentik.yaml")));
         assert!(app_args.canary);
         assert_eq!(app_args.engine, None);
 
@@ -1185,6 +1187,19 @@ mod tests {
             panic!("expected app install with engine");
         };
         assert_eq!(app_engine_args.engine.as_deref(), Some("pulumi"));
+
+        // `--values-file` is optional: schema defaults apply (FU-7).
+        let app_defaults_cli = Cli::try_parse_from([
+            "keel", "app", "install", "--app", "podinfo", "--tenant", "acme",
+        ])
+        .unwrap();
+        let Commands::App(AppArgs {
+            command: AppCommands::Install(app_defaults_args),
+        }) = app_defaults_cli.command
+        else {
+            panic!("expected app install without values file");
+        };
+        assert_eq!(app_defaults_args.values_file, None);
 
         let ssh_cli = Cli::try_parse_from([
             "keel",

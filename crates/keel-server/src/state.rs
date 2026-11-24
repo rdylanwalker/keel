@@ -780,11 +780,16 @@ impl RepoClusterStateProvider {
                     continue;
                 }
                 // `<instance>-config` Kustomizations (SOPS secrets of an app) are part of the
-                // app they configure, not releases of their own.
+                // app they configure, not releases of their own. Only that exact shape counts,
+                // as for live objects (`live_config_parent`).
                 if kind == "Kustomization"
-                    && val
+                    && let Some(parent) = val
                         .pointer("/metadata/labels/keel.io~1config-for")
-                        .is_some_and(|v| !v.is_null())
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|p| !p.is_empty())
+                    && val.pointer("/metadata/name").and_then(Value::as_str)
+                        == Some(keel_kube::manifest_app_config_kustomization_name(parent).as_str())
                 {
                     continue;
                 }
@@ -1024,6 +1029,78 @@ impl KubeClusterStateProvider {
         Self { repo, live }
     }
 
+    /// Why a release's `<name>-config` Kustomization (labelled `keel.io/config-for: <name>`)
+    /// keeps its configuration (SOPS secrets / values) from being applied, if it failed.
+    fn config_failure_note(
+        live: &HashMap<(String, String), LiveResourceInfo>,
+        rel: &ReleaseSummary,
+    ) -> Option<String> {
+        let config_name = format!("{}-config", rel.name);
+        let info = live.get(&(rel.namespace.clone(), config_name.clone()))?;
+        if info.config_for.as_deref() != Some(rel.name.as_str()) {
+            return None;
+        }
+        if info.status != LiveResourceStatus::Error {
+            return None;
+        }
+        let what = format!(
+            "Latest configuration not applied: Kustomization {}/{config_name} failed",
+            rel.namespace
+        );
+        Some(match &info.message {
+            Some(m) => format!("{what}: {m}"),
+            None => what,
+        })
+    }
+
+    /// Parent app of a live `<instance>-config` Kustomization: only a `Kustomization` named
+    /// `<config-for>-config` (the shape Keel generates) counts, so any other object carrying a
+    /// `keel.io/config-for` label is still listed like any other release.
+    fn live_config_parent<'a>(name: &str, info: &'a LiveResourceInfo) -> Option<&'a str> {
+        let parent = info.config_for.as_deref()?;
+        (info.kind.as_deref() == Some("Kustomization")
+            && name == keel_kube::manifest_app_config_kustomization_name(parent))
+        .then_some(parent)
+    }
+
+    /// Row for a live tenant object no longer declared in Git `main`: `Deleting` with a
+    /// `deletionTimestamp`, else `Orphaned` (awaiting Flux prune). The runtime is the object's
+    /// `keel.io/runtime` label (what its Git row reported), else derived from its kind.
+    fn live_only_release(ns: &str, name: &str, info: &LiveResourceInfo) -> ReleaseSummary {
+        let runtime = info.runtime.clone().unwrap_or_else(|| {
+            match info.kind.as_deref() {
+                Some("Kustomization") => "kustomize",
+                _ => "helm",
+            }
+            .to_string()
+        });
+        ReleaseSummary {
+            name: name.to_string(),
+            namespace: ns.to_string(),
+            tenant: ns.strip_prefix("tenant-").map(str::to_owned),
+            chart: name.to_string(),
+            version: None,
+            runtime,
+            canary: false,
+            canary_weight: None,
+            canary_phase: None,
+            primary_version: None,
+            error_rate: None,
+            latency_ms: None,
+            target_cluster: None,
+            bundle: None,
+            bundle_item: None,
+            last_synced: info.last_synced.clone(),
+            status: if info.terminating {
+                "Deleting".to_string()
+            } else {
+                STACK_STATUS_ORPHANED.to_string()
+            },
+            status_message: info.message.clone(),
+            ..ReleaseSummary::default()
+        }
+    }
+
     fn status_label(status: &LiveResourceStatus) -> String {
         match status {
             LiveResourceStatus::Synced => "Synced".to_string(),
@@ -1197,9 +1274,19 @@ impl KubeClusterStateProvider {
                     rel.status_message = cinfo.message.clone();
                 }
             }
+            // An app's `<instance>-config` Kustomization (its SOPS secrets / values) is folded
+            // into the app row: when it fails the app's latest configuration is not applied,
+            // so say why on the parent row instead of listing it separately.
+            if let Some(note) = Self::config_failure_note(&live, rel) {
+                rel.status_message = Some(match rel.status_message.take() {
+                    Some(own) => format!("{own}; {note}"),
+                    None => note,
+                });
+            }
         }
         // Keep any live tenant-* release that is absent from Git `main` (awaiting Flux prune or mid-termination),
         // but ignore Flux `Kustomization` wrappers that back PKO `Stack`s (e.g. bundle infra steps).
+        let mut config_objects = Vec::new();
         for ((ns, name), info) in &live {
             if !ns.starts_with("tenant-") {
                 continue;
@@ -1210,6 +1297,12 @@ impl KubeClusterStateProvider {
             }
             // The platform-owned root Kustomization of a tenant repository is not a release.
             if name == keel_kube::TENANT_ROOT_KUSTOMIZATION_NAME {
+                continue;
+            }
+            // An app's `<instance>-config` Kustomization belongs to its parent app row; decided
+            // once every parent row is known.
+            if let Some(parent) = Self::live_config_parent(name, info) {
+                config_objects.push((ns, name, info, parent));
                 continue;
             }
             if live_stacks.contains_key(&(ns.clone(), name.clone()))
@@ -1223,26 +1316,24 @@ impl KubeClusterStateProvider {
                 .iter()
                 .any(|r| r.namespace == *ns && r.name == *name)
             {
-                releases.push(ReleaseSummary {
-                    name: name.clone(),
-                    namespace: ns.clone(),
-                    tenant: inferred_tenant.map(str::to_owned),
-                    chart: name.clone(),
-                    version: None,
-                    runtime: "helm".to_string(),
-                    canary: false,
-                    canary_weight: None,
-                    canary_phase: None,
-                    primary_version: None,
-                    error_rate: None,
-                    latency_ms: None,
-                    target_cluster: None,
-                    bundle: None,
-                    bundle_item: None,
-                    last_synced: info.last_synced.clone(),
-                    status: "Deleting".to_string(),
-                    ..ReleaseSummary::default()
-                });
+                let mut rel = Self::live_only_release(ns, name, info);
+                if let Some(note) = Self::config_failure_note(&live, &rel) {
+                    rel.status_message = Some(match rel.status_message.take() {
+                        Some(own) => format!("{own}; {note}"),
+                        None => note,
+                    });
+                }
+                releases.push(rel);
+            }
+        }
+        // A config object whose parent app has no row (removed from Git and already pruned) is
+        // listed on its own so a stuck one (finalizer, failed prune) stays visible.
+        for (ns, name, info, parent) in config_objects {
+            if !releases
+                .iter()
+                .any(|r| r.namespace == *ns && (r.name == parent || r.name == *name))
+            {
+                releases.push(Self::live_only_release(ns, name, info));
             }
         }
         Ok(releases)
@@ -2133,6 +2224,159 @@ mod tests {
                 .get("statusMessage")
                 .is_none()
         );
+    }
+
+    /// FU-5 (fresh-user dry run): an app's live `<instance>-config` Kustomization is folded into
+    /// the app row (from Git or live-only) when that row exists and listed on its own otherwise;
+    /// live-only releases report their `keel.io/runtime` (else kind-derived runtime) and
+    /// `Orphaned` unless they carry a `deletionTimestamp`.
+    #[tokio::test]
+    async fn list_releases_folds_config_kustomizations_and_reports_orphans_honestly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("tenants/acme/apps/echo");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("flux.yaml"),
+            "apiVersion: kustomize.toolkit.fluxcd.io/v1\nkind: Kustomization\nmetadata:\n  name: echo\n  namespace: tenant-acme\n  labels:\n    keel.io/runtime: manifest\nspec:\n  path: ./apps/echo/manifests\n---\napiVersion: kustomize.toolkit.fluxcd.io/v1\nkind: Kustomization\nmetadata:\n  name: echo-config\n  namespace: tenant-acme\n  labels:\n    keel.io/config-for: echo\nspec:\n  path: ./apps/echo/config\n",
+        )
+        .unwrap();
+        let mut ready_config = LiveResourceInfo::from_status(LiveResourceStatus::Ready);
+        ready_config.kind = Some("Kustomization".to_string());
+        ready_config.config_for = Some("echo".to_string());
+        let mut failed_config = LiveResourceInfo::from_status(LiveResourceStatus::Error);
+        failed_config.kind = Some("Kustomization".to_string());
+        failed_config.config_for = Some("web".to_string());
+        failed_config.message = Some("BuildFailed: secrets.enc.yaml: sops decrypt".to_string());
+        let mut orphan_kustomization = LiveResourceInfo::from_status(LiveResourceStatus::Ready);
+        orphan_kustomization.kind = Some("Kustomization".to_string());
+        // A removed manifest app keeps the runtime its Git row reported.
+        let mut orphan_manifest = LiveResourceInfo::from_status(LiveResourceStatus::Ready);
+        orphan_manifest.kind = Some("Kustomization".to_string());
+        orphan_manifest.runtime = Some("manifest".to_string());
+        // Only a Kustomization named `<config-for>-config` is folded: any other labelled object
+        // is listed like every other orphan.
+        let mut labelled_helm = LiveResourceInfo::from_status(LiveResourceStatus::Ready);
+        labelled_helm.kind = Some("HelmRelease".to_string());
+        labelled_helm.config_for = Some("echo".to_string());
+        let mut misnamed_config = LiveResourceInfo::from_status(LiveResourceStatus::Ready);
+        misnamed_config.kind = Some("Kustomization".to_string());
+        misnamed_config.config_for = Some("echo".to_string());
+        // A live-only app whose config failed: the config is folded into the orphaned parent.
+        let mut api_config = failed_config.clone();
+        api_config.config_for = Some("api".to_string());
+        let mut deleting_helm = LiveResourceInfo::from_status(LiveResourceStatus::Deleting);
+        deleting_helm.kind = Some("HelmRelease".to_string());
+        let live = HashMap::from([
+            (
+                ("tenant-acme".to_string(), "echo".to_string()),
+                LiveResourceInfo::from_status(LiveResourceStatus::Ready),
+            ),
+            (
+                ("tenant-acme".to_string(), "echo-config".to_string()),
+                ready_config,
+            ),
+            // A failed config whose parent app is gone is listed on its own (FU-5).
+            (
+                ("tenant-acme".to_string(), "web-config".to_string()),
+                failed_config.clone(),
+            ),
+            (
+                ("tenant-acme".to_string(), "api".to_string()),
+                orphan_manifest.clone(),
+            ),
+            (
+                ("tenant-acme".to_string(), "api-config".to_string()),
+                api_config,
+            ),
+            (
+                ("tenant-acme".to_string(), "landing".to_string()),
+                orphan_manifest,
+            ),
+            (
+                ("tenant-acme".to_string(), "sneaky".to_string()),
+                labelled_helm,
+            ),
+            (
+                ("tenant-acme".to_string(), "sneaky-config".to_string()),
+                misnamed_config,
+            ),
+            (
+                ("tenant-acme".to_string(), "old".to_string()),
+                orphan_kustomization,
+            ),
+            (
+                ("tenant-acme".to_string(), "gone".to_string()),
+                deleting_helm,
+            ),
+        ]);
+        let provider = KubeClusterStateProvider::new(
+            RepoClusterStateProvider::new(tmp.path()),
+            Arc::new(ReleaseDetailLive(live.clone())),
+        );
+        let releases = provider.list_releases(None).await.unwrap();
+        let names: Vec<&str> = releases.iter().map(|r| r.name.as_str()).collect();
+        assert!(!names.contains(&"echo-config"), "{names:?}");
+        assert!(!names.contains(&"api-config"), "{names:?}");
+        let by_name = |n: &str| releases.iter().find(|r| r.name == n).unwrap();
+        let web_config = by_name("web-config");
+        assert_eq!(web_config.runtime, "kustomize");
+        assert_eq!(web_config.status, STACK_STATUS_ORPHANED);
+        assert_eq!(
+            web_config.status_message.as_deref(),
+            Some("BuildFailed: secrets.enc.yaml: sops decrypt")
+        );
+        let api = by_name("api");
+        assert_eq!(api.runtime, "manifest");
+        assert_eq!(api.status, STACK_STATUS_ORPHANED);
+        assert_eq!(
+            api.status_message.as_deref(),
+            Some(
+                "Latest configuration not applied: Kustomization tenant-acme/api-config \
+                 failed: BuildFailed: secrets.enc.yaml: sops decrypt"
+            )
+        );
+        let landing = by_name("landing");
+        assert_eq!(landing.runtime, "manifest");
+        assert_eq!(landing.status_message, None);
+        let sneaky = by_name("sneaky");
+        assert_eq!(sneaky.runtime, "helm");
+        assert_eq!(sneaky.status, STACK_STATUS_ORPHANED);
+        assert_eq!(by_name("sneaky-config").runtime, "kustomize");
+        let echo = by_name("echo");
+        assert_eq!(echo.runtime, "manifest");
+        assert_eq!(echo.status, "Ready");
+        assert_eq!(echo.status_message, None);
+        let old = by_name("old");
+        assert_eq!(old.runtime, "kustomize");
+        assert_eq!(old.status, STACK_STATUS_ORPHANED);
+        let gone = by_name("gone");
+        assert_eq!(gone.runtime, "helm");
+        assert_eq!(gone.status, "Deleting");
+
+        // A failing config Kustomization is reported on its parent app row.
+        let mut live = live;
+        live.insert(
+            ("tenant-acme".to_string(), "echo-config".to_string()),
+            LiveResourceInfo {
+                config_for: Some("echo".to_string()),
+                ..failed_config
+            },
+        );
+        let provider = KubeClusterStateProvider::new(
+            RepoClusterStateProvider::new(tmp.path()),
+            Arc::new(ReleaseDetailLive(live)),
+        );
+        let releases = provider.list_releases(Some("acme")).await.unwrap();
+        let echo = releases.iter().find(|r| r.name == "echo").unwrap();
+        assert_eq!(echo.status, "Ready");
+        assert_eq!(
+            echo.status_message.as_deref(),
+            Some(
+                "Latest configuration not applied: Kustomization tenant-acme/echo-config \
+                 failed: BuildFailed: secrets.enc.yaml: sops decrypt"
+            )
+        );
+        assert!(!releases.iter().any(|r| r.name == "echo-config"));
     }
 
     #[test]

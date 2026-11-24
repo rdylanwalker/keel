@@ -4,7 +4,8 @@ use axum::Json;
 use axum::extract::{Path as AxumPath, State};
 use keel_core::{tenant_namespace, validate_dns_label};
 use keel_git::{
-    PullRequestInfo, PullRequestState, parse_proposal_branch_tenant, validate_commit_sha,
+    ForgeError, ForgeProvider, PullRequestInfo, PullRequestState, parse_proposal_branch_tenant,
+    validate_commit_sha,
 };
 use keel_pko::GcPlan;
 use serde::Serialize;
@@ -171,11 +172,41 @@ fn validate_tenant_repo_pr_paths(
     Ok(())
 }
 
+/// Why an action that needs a PR in another state is refused (`409 Conflict`).
+fn pr_state_conflict(pr_id: &str, actual: &PullRequestState) -> String {
+    match actual {
+        PullRequestState::Merged => format!("Proposal #{pr_id} is already merged"),
+        PullRequestState::Closed => format!("Proposal #{pr_id} is closed"),
+        PullRequestState::Open => format!("Proposal #{pr_id} is already open"),
+    }
+}
+
+/// Turns a forge merge refusal into `409 Proposal #N is already merged/closed` when the PR
+/// stopped being open since it was checked (a concurrent merge or close); a real conflict on a
+/// still-open PR keeps the forge's message.
+async fn explain_merge_refusal(
+    forge: &dyn ForgeProvider,
+    pr_id: &str,
+    err: ForgeError,
+) -> ServerError {
+    match forge.get_pull_request(pr_id).await {
+        Ok(now) if now.state != PullRequestState::Open => {
+            ServerError::Conflict(pr_state_conflict(&now.id, &now.state))
+        }
+        _ => err.into(),
+    }
+}
+
 /// Authorizes `merge_proposal`, `reject_proposal`, and `reopen_proposal`: cluster admins
 /// (`keel-admins`) for every scope; tenant admins (`tenant-<id>-admin`) only in their tenant's
 /// scope and only for PRs whose verified file changes stay inside the tenant (its own
 /// repository: `tenants/<id>/` only; the Local Git provider's platform repository: see
 /// [`validate_tenant_admin_pr_paths`]).
+///
+/// A PR not in `expected_state` is refused with `409 Conflict` (e.g. "Proposal #3 is already
+/// merged"); for tenant administrators only after the PR's ownership (target branch and, in the
+/// shared platform repository, the `keel/<tenant>/...` source branch) is confirmed, so another
+/// tenant's PR is a uniform `403`.
 ///
 /// Returns the PR and, for tenant administrators, the exact source-branch head SHA whose file
 /// scope was verified, so callers can pin the subsequent forge operation to that commit.
@@ -192,27 +223,39 @@ async fn require_pr_tenant_admin_access(
     }
     // Direct lookup: paginated list scans could miss older PRs (OPEN-18).
     let pr = repo.get_pull_request(pr_id).await?;
+    // Checked before acting so the forge is never asked to e.g. merge a merged PR (FU-6: it
+    // answered with an opaque "Merge conflict ... {\"message\":\"\"}").
+    let state_conflict = |pr: &PullRequestInfo| match &expected_state {
+        Some(expected) if pr.state != *expected => {
+            Err(ServerError::Conflict(pr_state_conflict(&pr.id, &pr.state)))
+        }
+        _ => Ok(()),
+    };
     if auth.is_admin() {
+        state_conflict(&pr)?;
         return Ok((pr, None));
-    }
-    if let Some(expected) = expected_state
-        && pr.state != expected
-    {
-        return Err(ServerError::NotFound(format!(
-            "Pull request '{pr_id}' is not {expected}"
-        )));
     }
     let Some(tenant) = repo.tenant() else {
         return Err(ServerError::Forbidden(
             "Administrator privileges required for this operation".to_string(),
         ));
     };
+    // Cheap ownership checks come before the state conflict so a tenant administrator cannot
+    // learn the state of another tenant's (or the platform's) PR in the shared repository.
     if pr.target_branch != "main" {
         return Err(ServerError::Forbidden(format!(
             "Tenant administrators can only manage PRs targeting 'main' (PR #{pr_id} targets '{}')",
             pr.target_branch
         )));
     }
+    // The PR must belong to the tenant (`keel/<id>/...`) in the shared platform repository.
+    if !repo.is_dedicated() && parse_proposal_branch_tenant(&pr.source_branch) != Some(tenant) {
+        return Err(ServerError::Forbidden(format!(
+            "PR #{pr_id} branch '{}' is not scoped to tenant '{tenant}'",
+            pr.source_branch
+        )));
+    }
+    state_conflict(&pr)?;
     let (head_sha, changed_files, kustomization_diff) = {
         let _guard = repo.lock(state).await;
         if !repo.refresh(state).await.unwrap_or(false) {
@@ -261,13 +304,6 @@ async fn require_pr_tenant_admin_access(
     if repo.is_dedicated() {
         validate_tenant_repo_pr_paths(tenant, &changed_files)?;
     } else {
-        // The PR must belong to the tenant (`keel/<id>/...`) in the shared platform repository.
-        if parse_proposal_branch_tenant(&pr.source_branch) != Some(tenant) {
-            return Err(ServerError::Forbidden(format!(
-                "PR #{pr_id} branch '{}' is not scoped to tenant '{tenant}'",
-                pr.source_branch
-            )));
-        }
         validate_tenant_admin_pr_paths(tenant, &changed_files, kustomization_diff.as_deref())?;
     }
     Ok((pr, Some(head_sha)))
@@ -412,6 +448,11 @@ pub async fn merge_proposal(
                 ),
             )
             .await);
+        }
+        // Merged or closed concurrently since the state check above: say so instead of
+        // relaying the forge's (often empty) refusal.
+        Err(err @ ForgeError::MergeConflict(..)) => {
+            return Err(explain_merge_refusal(repo.forge.as_ref(), &pr.id, err).await);
         }
         Err(err) => return Err(err.into()),
     };
@@ -693,6 +734,133 @@ async fn plan_stack_deletions_for_pr(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `get_pull_request` answers `Open` first (the pre-merge check), then `then`; merges are
+    /// refused with an opaque `MergeConflict`.
+    struct RacingForge {
+        gets: std::sync::atomic::AtomicUsize,
+        then: PullRequestState,
+    }
+
+    fn racing_pr(id: &str, state: PullRequestState) -> PullRequestInfo {
+        PullRequestInfo {
+            id: id.to_string(),
+            title: "t".to_string(),
+            body: String::new(),
+            state,
+            source_branch: "keel/acme/app-web-1".to_string(),
+            target_branch: "main".to_string(),
+            head_sha: String::new(),
+            tenant: Some("acme".to_string()),
+            url: String::new(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            comments: Vec::new(),
+            diff_stat: None,
+            merge_commit_sha: None,
+            base_sha: None,
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ForgeProvider for RacingForge {
+        async fn create_pull_request(
+            &self,
+            _req: keel_git::CreatePrRequest,
+        ) -> Result<PullRequestInfo, ForgeError> {
+            unreachable!()
+        }
+        async fn get_pull_request(&self, pr_id: &str) -> Result<PullRequestInfo, ForgeError> {
+            let n = self.gets.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(racing_pr(
+                pr_id,
+                if n == 0 {
+                    PullRequestState::Open
+                } else {
+                    self.then
+                },
+            ))
+        }
+        async fn post_preview_comment(&self, _pr_id: &str, _md: &str) -> Result<(), ForgeError> {
+            Ok(())
+        }
+        async fn list_pull_requests(
+            &self,
+            _tenant: Option<&str>,
+            _state: Option<PullRequestState>,
+        ) -> Result<Vec<PullRequestInfo>, ForgeError> {
+            unreachable!()
+        }
+        async fn merge_pull_request(
+            &self,
+            pr_id: &str,
+            _sha: Option<&str>,
+        ) -> Result<PullRequestInfo, ForgeError> {
+            Err(ForgeError::MergeConflict(
+                pr_id.to_string(),
+                r#"{"message":""}"#.to_string(),
+            ))
+        }
+        async fn close_pull_request(&self, _pr_id: &str) -> Result<PullRequestInfo, ForgeError> {
+            unreachable!()
+        }
+        async fn reopen_pull_request(&self, _pr_id: &str) -> Result<PullRequestInfo, ForgeError> {
+            unreachable!()
+        }
+        async fn ensure_repository(
+            &self,
+            _private: bool,
+        ) -> Result<keel_git::RepositoryEnsureOutcome, ForgeError> {
+            unreachable!()
+        }
+    }
+
+    async fn race_merge(then: PullRequestState) -> ServerError {
+        let forge = RacingForge {
+            gets: std::sync::atomic::AtomicUsize::new(0),
+            then,
+        };
+        let pr = forge.get_pull_request("7").await.unwrap();
+        assert_eq!(pr.state, PullRequestState::Open);
+        let err = forge.merge_pull_request(&pr.id, None).await.unwrap_err();
+        explain_merge_refusal(&forge, &pr.id, err).await
+    }
+
+    #[tokio::test]
+    async fn merge_refusals_after_a_concurrent_merge_or_close_name_the_state() {
+        match race_merge(PullRequestState::Merged).await {
+            ServerError::Conflict(msg) => assert_eq!(msg, "Proposal #7 is already merged"),
+            other => panic!("unexpected {other:?}"),
+        }
+        match race_merge(PullRequestState::Closed).await {
+            ServerError::Conflict(msg) => assert_eq!(msg, "Proposal #7 is closed"),
+            other => panic!("unexpected {other:?}"),
+        }
+        // A real conflict on a still-open PR keeps the forge's refusal.
+        match race_merge(PullRequestState::Open).await {
+            ServerError::Forge(ForgeError::MergeConflict(id, reason)) => {
+                assert_eq!(id, "7");
+                assert_eq!(reason, r#"{"message":""}"#);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pr_state_conflicts_name_the_actual_state() {
+        assert_eq!(
+            pr_state_conflict("3", &PullRequestState::Merged),
+            "Proposal #3 is already merged"
+        );
+        assert_eq!(
+            pr_state_conflict("4", &PullRequestState::Closed),
+            "Proposal #4 is closed"
+        );
+        assert_eq!(
+            pr_state_conflict("5", &PullRequestState::Open),
+            "Proposal #5 is already open"
+        );
+    }
 
     #[test]
     fn tenant_repository_prs_stay_inside_the_tenant_directory() {
