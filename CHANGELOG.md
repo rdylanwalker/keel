@@ -1,3 +1,17 @@
+## [0.12.2](https://github.com/rdylanwalker/keel/compare/v0.12.1...v0.12.2) (2026-11-24)
+
+### Bug Fixes
+
+* **catalog:** make the HTTP Echo api token genuinely optional ([0b74854](https://github.com/rdylanwalker/keel/commit/0b748547eebc11b7f43ee96973a7eccc7b0b0e86))
+* clearer CLI/API behaviour for app listings, merges, installs and forge errors ([16b2976](https://github.com/rdylanwalker/keel/commit/16b29764e009ef7dbd4e89f75496f75367779438)), closes [#N](https://github.com/rdylanwalker/keel/issues/N)
+* **cli:** keep the Stage 0 passphrase notice until it is shown and correct bootstrap summary details ([b7a35e1](https://github.com/rdylanwalker/keel/commit/b7a35e1cd31328ed12a4d1143da79818c6eff3bd))
+* **kube:** refuse host-less canary routes on the shared gateway ([27a583b](https://github.com/rdylanwalker/keel/commit/27a583b5fcbfd8f741f4c5f48a93d6f547923932))
+* **server:** retry OIDC discovery while a fresh IdP warms up ([76e96c9](https://github.com/rdylanwalker/keel/commit/76e96c977cb9e2de12c0793070caab43f95699cb))
+
+### Reverts
+
+* Revert "fix(server): retry OIDC discovery while a fresh IdP warms up" ([573d8bd](https://github.com/rdylanwalker/keel/commit/573d8bd634877b3d92dafcae200826a3ac567422))
+
 ## [0.12.1](https://github.com/rdylanwalker/keel/compare/v0.12.0...v0.12.1) (2026-11-23)
 
 ### Bug Fixes
