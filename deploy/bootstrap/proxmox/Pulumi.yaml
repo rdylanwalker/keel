@@ -1,8 +1,17 @@
 # Stage 0 Proxmox VE Seed Management Cluster Bootstrap (`SDD.md` §2.1, `NFR-REL-01`)
-# Provisions a protected k3s/Talos management control-plane VM via bpg/proxmox OpenTofu/Terraform bridge.
+# Provisions a protected single-node k3s management control-plane VM via the bpg/proxmox
+# OpenTofu/Terraform bridge. The VM is cloned from a cloud-init template (with
+# qemu-guest-agent) whose built-in cloud-init drive injects a generated SSH key; k3s is then
+# installed over SSH (no `snippets` datastore or PVE-node SSH access is needed) and the
+# kubeconfig is exported as a secret output.
+#
+# Provider credentials come from the environment (`PROXMOX_VE_API_TOKEN`, or
+# `PROXMOX_VE_USERNAME` + `PROXMOX_VE_PASSWORD`; `PROXMOX_VE_INSECURE=true` for a self-signed
+# PVE certificate). `keel bootstrap init --proxmox-url` sets `proxmox:endpoint`; otherwise set
+# `PROXMOX_VE_ENDPOINT`.
 name: keel-stage0-proxmox
 runtime: yaml
-description: Stage 0 seed management cluster bootstrap on Proxmox VE (bpg/proxmox)
+description: Stage 0 seed management cluster (k3s) on Proxmox VE (bpg/proxmox)
 
 packages:
   proxmox:
@@ -19,15 +28,19 @@ config:
   nodeName:
     type: string
     default: pve1
+  # Must be free. 9000 is the template ID most PVE cloud-init guides use.
   vmId:
     type: integer
-    default: 9000
+    default: 9100
   templateVmId:
     type: integer
-    default: 900
+    default: 9000
   datastoreId:
     type: string
     default: local-lvm
+  networkBridge:
+    type: string
+    default: vmbr0
   cores:
     type: integer
     default: 4
@@ -37,15 +50,31 @@ config:
   diskSizeGb:
     type: integer
     default: 64
-  sshPublicKey:
+  # Must be the template's boot-disk interface: bpg/proxmox matches clone disks by interface,
+  # so any other value adds a blank disk and leaves the boot disk at the image size.
+  # `scsi0` matches the usual `qm set <id> --scsi0 ...` cloud-init template recipe.
+  diskInterface:
     type: string
+    default: scsi0
+  sshUser:
+    type: string
+    default: keel
   distro:
     type: string
     default: k3s
 
+variables:
+  # Guest-agent addresses per interface; index 0 is the loopback, index 1 the first NIC.
+  controlPlaneIp: ${seedControlPlaneVm.ipv4Addresses[1][0]}
+
 resources:
+  controlPlaneSshKey:
+    type: tls:index:PrivateKey
+    properties:
+      algorithm: ED25519
+
   seedControlPlaneVm:
-    type: proxmox:Vm/virtualMachine:VirtualMachine
+    type: proxmox:index/virtualEnvironmentVm:VirtualEnvironmentVm
     options:
       protect: true
     properties:
@@ -68,14 +97,16 @@ resources:
         type: x86-64-v2-AES
       memory:
         dedicated: ${memoryMb}
+      # PVE's default for new VMs; lets `iothread` apply to SCSI disks.
+      scsiHardware: virtio-scsi-single
       disks:
         - datastoreId: ${datastoreId}
-          interface: virtio0
+          interface: ${diskInterface}
           size: ${diskSizeGb}
           iothread: true
           discard: "on"
       networkDevices:
-        - bridge: vmbr0
+        - bridge: ${networkBridge}
           model: virtio
       initialization:
         datastoreId: ${datastoreId}
@@ -83,11 +114,65 @@ resources:
           - ipv4:
               address: dhcp
         userAccount:
-          username: keel
+          username: ${sshUser}
           keys:
-            - ${sshPublicKey}
+            - ${controlPlaneSshKey.publicKeyOpenssh}
+
+  installK3s:
+    type: command:remote:Command
+    options:
+      protect: true
+      # The install runs once. Editing the script (e.g. adding `--disable=traefik`) or a new
+      # DHCP lease must not re-run it against an existing protected node when
+      # `keel bootstrap recover` re-runs `pulumi up`; migrate live nodes by hand
+      # (docs/getting-started/bootstrap.md "k3s Packaged Components").
+      ignoreChanges:
+        - create
+        - connection
+    properties:
+      connection:
+        host: ${controlPlaneIp}
+        user: ${sshUser}
+        privateKey: ${controlPlaneSshKey.privateKeyOpenssh}
+      create: |
+        set -eu
+        cloud-init status --wait >/dev/null 2>&1 || true
+        if [ ! -f /etc/rancher/k3s/k3s.yaml ]; then
+          curl -sfL https://get.k3s.io | sudo INSTALL_K3S_EXEC="server --disable=traefik --tls-san=${controlPlaneIp} --write-kubeconfig-mode=644" sh -
+        fi
+
+  fetchKubeconfig:
+    type: command:remote:Command
+    options:
+      dependsOn:
+        - ${installK3s}
+      # stdout is the k3s admin kubeconfig: keep it encrypted in state and out of the logs.
+      additionalSecretOutputs:
+        - stdout
+    properties:
+      logging: none
+      connection:
+        host: ${controlPlaneIp}
+        user: ${sshUser}
+        privateKey: ${controlPlaneSshKey.privateKeyOpenssh}
+      create: |
+        for i in $(seq 1 60); do
+          if [ -s /etc/rancher/k3s/k3s.yaml ]; then
+            sed "s/127.0.0.1/${controlPlaneIp}/g" /etc/rancher/k3s/k3s.yaml
+            exit 0
+          fi
+          sleep 5
+        done
+        echo "Timed out waiting for /etc/rancher/k3s/k3s.yaml" >&2
+        exit 1
 
 outputs:
   clusterName: ${clusterName}
   vmId: ${seedControlPlaneVm.vmId}
   ipv4Addresses: ${seedControlPlaneVm.ipv4Addresses}
+  controlPlaneIp: ${controlPlaneIp}
+  sshHost: ${controlPlaneIp}
+  sshUser: ${sshUser}
+  sshPort: 22
+  kubeconfig:
+    fn::secret: ${fetchKubeconfig.stdout}

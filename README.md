@@ -180,7 +180,7 @@ The live E2E suite (`e2e/tests/07-kind-live-e2e.spec.ts`) and a literal run of t
 | Stage 0 on local `kind` | **Tested** (live E2E) |
 | Stage 0 on an existing cluster (`--target kubeconfig`, for example k3d, k3s, Talos, managed Kubernetes) | Experimental: implemented, not covered by E2E. A k3d example is documented. |
 | Stage 0 on AWS / GCP / Azure | Experimental: installs single-node k3s on a 4 GB VM (`t3.medium`, `e2-medium`, `Standard_B2s`; not free tier), which is likely too small given the memory figures above. Never run in CI; only the program files are checked. |
-| Stage 0 on Proxmox VE / Hetzner | **VM only.** Creates the VM, installs no Kubernetes, then stops with an error. Install k3s yourself and use `--target kubeconfig`. |
+| Stage 0 on Proxmox VE / Hetzner | Experimental: installs single-node k3s on an 8 GB VM (Proxmox needs a cloud-init template with `qemu-guest-agent`). Never run in CI; only the program files are checked. |
 | In-cluster Forgejo (`--with-forge`) | **Tested.** Its storage is ephemeral by default. |
 | GitHub, GitLab, external Forgejo | Experimental: integration-tested against a mock forge only. |
 | Gitea | Works for the platform repository; **not supported** for per-tenant repositories. |

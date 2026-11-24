@@ -129,7 +129,12 @@ resources:
 
   fetchKubeconfig:
     type: command:remote:Command
+    options:
+      # stdout is the k3s admin kubeconfig: keep it encrypted in state and out of the logs.
+      additionalSecretOutputs:
+        - stdout
     properties:
+      logging: none
       connection:
         host: ${seedControlPlaneVm.networkInterfaces[0].accessConfigs[0].natIp}
         user: ${sshUser}

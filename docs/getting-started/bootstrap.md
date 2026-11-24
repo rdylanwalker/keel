@@ -24,7 +24,7 @@ For a local `kind` management cluster plus one workload `kind` cluster (measured
 | Local `kind` | `--target kind` | Tested in live E2E (with `--with-forge`) |
 | Existing cluster | `--target kubeconfig` | Experimental: existing `k3s`, `k3d`, `Talos`, or managed Kubernetes cluster; not covered by E2E |
 | AWS / GCP / Azure | `--target aws\|gcp\|azure` | Experimental and untested: single-node `k3s` on a 4 GB VM |
-| Proxmox VE / Hetzner | `--target proxmox\|hetzner` | VM only: creates the VM, installs no Kubernetes, then stops with an error (see below) |
+| Proxmox VE / Hetzner | `--target proxmox\|hetzner` | Experimental and untested: single-node `k3s` on an 8 GB VM |
 
 ## 1. Initialize the Management Cluster
 
@@ -140,7 +140,7 @@ keel bootstrap init \
 
 #### k3s Packaged Components
 
-The AWS, Azure, and GCP programs install single-node `k3s` on first boot with `INSTALL_K3S_EXEC="server --disable=traefik ..."`:
+The AWS, Azure, GCP, Hetzner, and Proxmox VE programs install single-node `k3s` with `INSTALL_K3S_EXEC="server --disable=traefik ..."` (cloud-init on first boot; on Proxmox VE once over SSH after cloud-init finishes):
 
 | k3s packaged component | Status | Owner |
 | --- | --- | --- |
@@ -152,9 +152,82 @@ The AWS, Azure, and GCP programs install single-node `k3s` on first boot with `I
 
 These k3s-owned components are reconciled by k3s from `/var/lib/rancher/k3s/server/manifests`, not by Flux, and are not Keel catalog add-ons. Do not delete them, and do not install a second ingress controller on the management cluster.
 
-`--target hetzner` and `--target proxmox` only provision the protected VM; they do not install `k3s` and export no kubeconfig, so `keel bootstrap init` stops with an error after the VM is created. Install your distribution of choice on the node yourself (for `k3s`, pass `--disable=traefik`, or `--k3s-arg "--disable=traefik@server:*"` for `k3d`). Then attach it with `--target kubeconfig`.
+For an existing cluster you installed yourself, pass `--disable=traefik` to `k3s` (or `--k3s-arg "--disable=traefik@server:*"` for `k3d`) and attach it with `--target kubeconfig`.
 
 > **Existing clusters:** the install script runs only on first boot, and the node resources ignore later changes to it (`ignoreChanges`), so `keel bootstrap recover` never restarts or replaces a protected node because of a script edit. Nodes created before Traefik was disabled keep it until you migrate them by hand. Add `disable: [traefik]` to `/etc/rancher/k3s/config.yaml` and run `systemctl restart k3s`. If `kubectl -n kube-system get helmchart traefik traefik-crd` still returns either chart, delete it.
+
+### Proxmox VE and Hetzner
+
+`--target proxmox` (`deploy/bootstrap/proxmox/Pulumi.yaml`, `bpg/proxmox` 0.71.0 through the Pulumi Terraform bridge) and `--target hetzner` (`deploy/bootstrap/hetzner/Pulumi.yaml`, `pulumi/hcloud`) work like the cloud targets: they create a protected VM, install single-node `k3s`, read `/etc/rancher/k3s/k3s.yaml` over SSH with its `127.0.0.1` server rewritten to the node IP, export it as the secret `kubeconfig` stack output (the fetch step logs nothing and its output is encrypted in the Stage 0 state), and `keel bootstrap init` continues with the seed install on that cluster.
+
+> **Experimental and untested.** No automated test runs these programs; CI only checks the files. Please [report the result](https://github.com/rdylanwalker/keel/issues/new/choose) if you try them.
+
+**SSH access.** Both programs generate an ED25519 key pair (`tls:index:PrivateKey`); nothing has to be passed in. The public key goes onto the node (Proxmox cloud-init user, Hetzner project SSH key `<cluster>-cp`). The private key exists only in the encrypted Stage 0 Pulumi state and is never printed or exported.
+
+**Network.** Your workstation must reach the node on TCP `22` (SSH, to install `k3s` on Proxmox and to read the kubeconfig) and `6443` (Kubernetes API, used by the rest of the bootstrap and by `keel serve`). The node needs outbound HTTPS to `get.k3s.io` and the container registries.
+
+**Program settings.** `keel bootstrap init` sets `clusterName`, plus `proxmox:endpoint`, `region` and `distro` when `--proxmox-url`, `--region` or `--distro` is given; every other setting below has a default. Neither program reads `region` (Hetzner uses `location`). To change one, copy the program directory, edit the `default:` values, and pass the copy with `--pulumi-program-dir`. Both targets install `k3s`, so `--distro talos` is refused unless you pass your own program; for Talos, install it yourself and use `--target kubeconfig`.
+
+#### Proxmox VE (`--target proxmox`)
+
+Clones a 4 vCPU / 8 GB VM (`vmId` 9100, 64 GB boot disk on `scsi0` in `local-lvm`, DHCP on `vmbr0`) on node `pve1` from template `9000`, injects the SSH key for user `keel` through the VM's built-in cloud-init drive, waits for cloud-init, and installs `k3s` over SSH. No `snippets` datastore and no SSH access to the Proxmox node are needed.
+
+- **Template:** VM `9000` (`templateVmId`) must be a cloud-init image (for example the Ubuntu 24.04 cloud image) with `qemu-guest-agent` installed and enabled, and its boot disk must be on `scsi0` (`diskInterface`). The provider matches the clone's disks to the template's by interface: if the template boots from another interface (for example `virtio0`), the clone gets an extra blank 64 GB disk and keeps booting from the small image disk, so set `diskInterface` to the template's boot interface in a copied program. VM ID `9100` (`vmId`) must be free. If your template has another ID, copy the program and change `templateVmId`. The VM address is the first IPv4 address the guest agent reports for the first NIC. Give the VM a DHCP reservation: the kubeconfig and the k3s certificate (`--tls-san`) use that address.
+
+  A template that matches the defaults, built on the Proxmox node:
+
+  ```bash
+  wget https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img
+  virt-customize -a noble-server-cloudimg-amd64.img --install qemu-guest-agent   # from libguestfs-tools
+  qm create 9000 --name ubuntu-2404-cloudinit --memory 2048 --net0 virtio,bridge=vmbr0 \
+    --scsihw virtio-scsi-single --agent enabled=1 --serial0 socket --vga serial0
+  qm set 9000 --scsi0 local-lvm:0,import-from=$PWD/noble-server-cloudimg-amd64.img
+  qm set 9000 --ide2 local-lvm:cloudinit --boot order=scsi0
+  qm template 9000
+  ```
+
+- **No host firewall.** Unlike the AWS, GCP and Hetzner programs, the Proxmox program creates no firewall: SSH (`22`) and the k3s API (`6443`) are open to everything that can reach the VM on `networkBridge`. Put the VM on a VLAN or behind a PVE firewall that allows them only from your management workstation.
+- **Credentials** come from the environment: `PROXMOX_VE_API_TOKEN` (or `PROXMOX_VE_USERNAME` and `PROXMOX_VE_PASSWORD`), plus `PROXMOX_VE_INSECURE=true` for a self-signed PVE certificate. `--proxmox-url` sets the API endpoint; without it, set `PROXMOX_VE_ENDPOINT`.
+- **Token privileges:** the token must be able to clone, configure, start, and read guest-agent data from the VM. Without the guest-agent privilege the provider never sees the VM address, and the run times out waiting for the agent, which looks like a template problem. One way to set this up (on PVE 8, replace `VM.GuestAgent.Audit` with `VM.Monitor`):
+
+  ```bash
+  pveum role add KeelStage0 -privs "Datastore.AllocateSpace Datastore.Audit SDN.Use Sys.Audit \
+    VM.Allocate VM.Audit VM.Clone VM.Config.CDROM VM.Config.CPU VM.Config.Cloudinit VM.Config.Disk \
+    VM.Config.HWType VM.Config.Memory VM.Config.Network VM.Config.Options VM.PowerMgmt VM.GuestAgent.Audit"
+  pveum user add keel@pve
+  pveum aclmod / -user keel@pve -role KeelStage0
+  pveum user token add keel@pve stage0 --privsep 0   # the token inherits the user's role
+  ```
+
+- **Settings:** `nodeName`, `vmId`, `templateVmId`, `datastoreId`, `networkBridge`, `cores`, `memoryMb`, `diskSizeGb`, `diskInterface`, `sshUser`.
+
+```bash
+export PROXMOX_VE_API_TOKEN='keel@pve!stage0=<token-secret>'
+export PROXMOX_VE_INSECURE=true   # self-signed PVE certificate only
+
+keel bootstrap init \
+  --target proxmox \
+  --proxmox-url https://pve.example.com:8006 \
+  --cluster-name keel-mgmt \
+  --repo-dir ./keel-gitops
+```
+
+#### Hetzner Cloud (`--target hetzner`)
+
+Creates a `cx32` server (4 vCPU / 8 GB, `ubuntu-24.04`, `fsn1`) with delete and rebuild protection, installs `k3s` from cloud-init `userData`, and attaches a protected firewall when the server is created, so the node is filtered from first boot. The firewall opens `22` and `6443` to `allowedManagementCidrs` (default: anywhere) and `443` to everyone; narrow `allowedManagementCidrs` to your address in a copied program for anything but a throwaway test. SSH uses `root`.
+
+- **Credentials:** `HCLOUD_TOKEN` (a read/write project API token).
+- **Settings:** `location`, `serverType`, `image`, `sshUser`, `allowedManagementCidrs`. `--region` is ignored; set `location` instead.
+- **Plugins:** besides `hcloud`, `command` and `tls`, the program uses the `std` provider to turn the firewall ID into the integer the server takes; Pulumi downloads it on the first run.
+
+```bash
+export HCLOUD_TOKEN="<project-api-token>"
+
+keel bootstrap init \
+  --target hetzner \
+  --cluster-name keel-mgmt \
+  --repo-dir ./keel-gitops
+```
 
 ### Core Controllers Installed Out of the Box
 

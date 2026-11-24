@@ -128,7 +128,8 @@ pub struct BootstrapInitArgs {
     #[arg(long)]
     pub region: Option<String>,
 
-    /// Kubernetes distribution for VM-backed targets (`k3s|talos`)
+    /// Kubernetes distribution for VM-backed targets (`k3s`; `talos` only with a custom
+    /// `--pulumi-program-dir`)
     #[arg(long)]
     pub distro: Option<BootstrapDistro>,
 

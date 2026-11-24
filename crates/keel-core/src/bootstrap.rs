@@ -231,8 +231,12 @@ impl PulumiBootstrapTarget {
         if let Some(region) = &cfg.region {
             pairs.push(("region".to_string(), region.clone()));
         }
-        if let Some(proxmox_url) = &cfg.proxmox_url {
-            pairs.push(("proxmoxUrl".to_string(), proxmox_url.clone()));
+        // `--proxmox-url` configures the default bpg/proxmox provider; credentials stay in the
+        // environment (`PROXMOX_VE_API_TOKEN`, ...) and never reach Pulumi config.
+        if self.target == BootstrapTargetKind::Proxmox
+            && let Some(proxmox_url) = &cfg.proxmox_url
+        {
+            pairs.push(("proxmox:endpoint".to_string(), proxmox_url.clone()));
         }
         if let Some(distro) = &cfg.distro {
             pairs.push(("distro".to_string(), distro.to_string()));
@@ -921,6 +925,8 @@ users:
     fn k3s_stage0_targets_disable_bundled_traefik_only() {
         // (target, resource that runs the k3s install script, its ignored boot-script input)
         let expected = [
+            // Proxmox installs over SSH (no snippets datastore needed) from a one-shot command.
+            (BootstrapTargetKind::Proxmox, "installK3s", "create"),
             (BootstrapTargetKind::Aws, "seedControlPlaneNode", "userData"),
             (
                 BootstrapTargetKind::Gcp,
@@ -931,6 +937,11 @@ users:
                 BootstrapTargetKind::Azure,
                 "seedControlPlaneVm",
                 "osProfile.customData",
+            ),
+            (
+                BootstrapTargetKind::Hetzner,
+                "seedControlPlaneServer",
+                "userData",
             ),
         ];
         let mut installing = Vec::new();
@@ -1017,6 +1028,7 @@ users:
             BootstrapTargetKind::Aws,
             BootstrapTargetKind::Gcp,
             BootstrapTargetKind::Azure,
+            BootstrapTargetKind::Hetzner,
         ] {
             let program = PulumiBootstrapTarget::new(kind)
                 .embedded_pulumi_yaml()
@@ -1026,6 +1038,195 @@ users:
                 "{kind}: k3s --tls-san must reference the escaped shell PUBLIC_IP"
             );
         }
+        // Proxmox installs over SSH and knows the guest-agent address up front.
+        let pve = PulumiBootstrapTarget::new(BootstrapTargetKind::Proxmox)
+            .embedded_pulumi_yaml()
+            .unwrap();
+        assert!(pve.contains("--tls-san=${controlPlaneIp}"));
+    }
+
+    /// Every VM-backed Stage 0 program must hand `provision_cluster` a reachable kubeconfig
+    /// (`pulumi stack output kubeconfig --show-secrets`) and must run unattended: `keel bootstrap
+    /// init` sets only `clusterName` (plus a few flag-driven keys), so no config may be required.
+    #[test]
+    fn vm_stage0_programs_export_a_secret_kubeconfig_and_need_no_extra_config() {
+        use noyalib::Value;
+        let vm_targets = [
+            BootstrapTargetKind::Proxmox,
+            BootstrapTargetKind::Aws,
+            BootstrapTargetKind::Gcp,
+            BootstrapTargetKind::Azure,
+            BootstrapTargetKind::Hetzner,
+        ];
+        for kind in vm_targets {
+            let program = PulumiBootstrapTarget::new(kind)
+                .embedded_pulumi_yaml()
+                .unwrap();
+            let doc: Value = noyalib::from_str(program)
+                .unwrap_or_else(|e| panic!("{kind}: Pulumi.yaml does not parse: {e}"));
+            assert_eq!(doc["runtime"].as_str(), Some("yaml"), "{kind}");
+
+            let config = doc["config"].as_mapping().expect("config block");
+            for (key, spec) in config {
+                assert!(
+                    !spec["default"].is_null(),
+                    "{kind}: config '{}' has no default, so bootstrap init cannot run it",
+                    key
+                );
+            }
+            assert!(config.contains_key("clusterName"), "{kind}");
+
+            // Generated SSH key: the private half only ever lives in (encrypted) Pulumi state.
+            let resources = &doc["resources"];
+            assert_eq!(
+                resources["controlPlaneSshKey"]["type"].as_str(),
+                Some("tls:index:PrivateKey"),
+                "{kind}"
+            );
+            let fetch = &resources["fetchKubeconfig"];
+            assert_eq!(
+                fetch["type"].as_str(),
+                Some("command:remote:Command"),
+                "{kind}"
+            );
+            assert_eq!(
+                fetch["properties"]["connection"]["privateKey"].as_str(),
+                Some("${controlPlaneSshKey.privateKeyOpenssh}"),
+                "{kind}"
+            );
+            // stdout is the admin kubeconfig: secret in state, never logged as a diagnostic
+            // (`run_pulumi` surfaces Pulumi's stdout on failure).
+            assert_eq!(
+                fetch["properties"]["logging"].as_str(),
+                Some("none"),
+                "{kind}: fetchKubeconfig must not log stdout"
+            );
+            let secret_outputs: Vec<&str> = fetch["options"]["additionalSecretOutputs"]
+                .as_sequence()
+                .unwrap_or_else(|| panic!("{kind}: fetchKubeconfig needs additionalSecretOutputs"))
+                .iter()
+                .filter_map(Value::as_str)
+                .collect();
+            assert!(secret_outputs.contains(&"stdout"), "{kind}");
+            let create = fetch["properties"]["create"].as_str().unwrap();
+            assert!(create.contains("/etc/rancher/k3s/k3s.yaml"), "{kind}");
+            assert!(
+                create.contains("s/127.0.0.1/${"),
+                "{kind}: rewrite to the node IP"
+            );
+
+            let outputs = &doc["outputs"];
+            assert_eq!(
+                outputs["kubeconfig"]["fn::secret"].as_str(),
+                Some("${fetchKubeconfig.stdout}"),
+                "{kind}: kubeconfig must be a secret output"
+            );
+            for key in ["clusterName", "sshHost", "sshUser", "sshPort"] {
+                assert!(!outputs[key].is_null(), "{kind}: missing output {key}");
+            }
+            for (key, value) in outputs.as_mapping().unwrap() {
+                assert!(
+                    !value.as_str().unwrap_or_default().contains("privateKey"),
+                    "{kind}: output '{}' must not export the SSH private key",
+                    key
+                );
+            }
+        }
+
+        // Provider-specific shape the drivers rely on.
+        let pve: Value = noyalib::from_str(
+            PulumiBootstrapTarget::new(BootstrapTargetKind::Proxmox)
+                .embedded_pulumi_yaml()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            pve["packages"]["proxmox"]["parameters"][0].as_str(),
+            Some("bpg/proxmox")
+        );
+        let vm = &pve["resources"]["seedControlPlaneVm"];
+        assert_eq!(
+            vm["type"].as_str(),
+            Some("proxmox:index/virtualEnvironmentVm:VirtualEnvironmentVm")
+        );
+        assert_eq!(vm["options"]["protect"], Value::Bool(true));
+        assert_eq!(vm["properties"]["agent"]["enabled"], Value::Bool(true));
+        assert_eq!(
+            vm["properties"]["initialization"]["userAccount"]["keys"][0].as_str(),
+            Some("${controlPlaneSshKey.publicKeyOpenssh}")
+        );
+        assert_eq!(
+            pve["variables"]["controlPlaneIp"].as_str(),
+            Some("${seedControlPlaneVm.ipv4Addresses[1][0]}")
+        );
+        assert_eq!(
+            pve["resources"]["fetchKubeconfig"]["options"]["dependsOn"][0].as_str(),
+            Some("${installK3s}")
+        );
+        // bpg/proxmox matches clone disks by interface: the resized disk must be the
+        // template's boot disk (configurable, default = the usual `--scsi0` template recipe).
+        assert_eq!(
+            vm["properties"]["disks"][0]["interface"].as_str(),
+            Some("${diskInterface}")
+        );
+        assert_eq!(
+            pve["config"]["diskInterface"]["default"].as_str(),
+            Some("scsi0")
+        );
+        assert_eq!(
+            vm["properties"]["scsiHardware"].as_str(),
+            Some("virtio-scsi-single")
+        );
+        // 9000 is the template ID of the common PVE cloud-init guides; the new VM avoids it.
+        assert_eq!(
+            pve["config"]["templateVmId"]["default"].as_i64(),
+            Some(9000)
+        );
+        assert_ne!(
+            pve["config"]["vmId"]["default"].as_i64(),
+            pve["config"]["templateVmId"]["default"].as_i64()
+        );
+
+        let hz: Value = noyalib::from_str(
+            PulumiBootstrapTarget::new(BootstrapTargetKind::Hetzner)
+                .embedded_pulumi_yaml()
+                .unwrap(),
+        )
+        .unwrap();
+        let server = &hz["resources"]["seedControlPlaneServer"];
+        assert_eq!(server["options"]["protect"], Value::Bool(true));
+        assert_eq!(
+            server["properties"]["sshKeys"][0].as_str(),
+            Some("${controlPlaneHcloudSshKey.id}")
+        );
+        assert_eq!(
+            hz["resources"]["fetchKubeconfig"]["properties"]["connection"]["host"].as_str(),
+            Some("${seedControlPlaneServer.ipv4Address}")
+        );
+        // The firewall (22 and 6443 for the workstation) is attached at creation, not by an
+        // asynchronous label selector, so the node is never unfiltered.
+        let fw = &hz["resources"]["controlPlaneFirewall"];
+        assert_eq!(fw["options"]["protect"], Value::Bool(true));
+        assert!(
+            !fw["properties"]
+                .as_mapping()
+                .unwrap()
+                .contains_key("applyTos")
+        );
+        let attach = &server["properties"]["firewallIds"][0]["fn::invoke"];
+        assert_eq!(attach["function"].as_str(), Some("std:parseint"));
+        assert_eq!(
+            attach["arguments"]["input"].as_str(),
+            Some("${controlPlaneFirewall.id}")
+        );
+        assert_eq!(attach["return"].as_str(), Some("result"));
+        let ports: Vec<&str> = fw["properties"]["rules"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .filter_map(|r| r["port"].as_str())
+            .collect();
+        assert!(ports.contains(&"22") && ports.contains(&"6443"));
     }
 
     #[test]
@@ -1095,18 +1296,30 @@ users:
         pve_cfg.cluster_name = "pve-mgmt".to_string();
         pve_cfg.region = Some("eu-central".to_string());
         pve_cfg.proxmox_url = Some("https://pve.example.com:8006".to_string());
-        pve_cfg.distro = Some(crate::models::BootstrapDistro::Talos);
+        pve_cfg.distro = Some(crate::models::BootstrapDistro::K3s);
         assert_eq!(
             pve_driver.build_config_set_pairs(&pve_cfg).unwrap(),
             vec![
                 ("clusterName".to_string(), "pve-mgmt".to_string()),
                 ("region".to_string(), "eu-central".to_string()),
                 (
-                    "proxmoxUrl".to_string(),
+                    "proxmox:endpoint".to_string(),
                     "https://pve.example.com:8006".to_string()
                 ),
-                ("distro".to_string(), "talos".to_string()),
+                ("distro".to_string(), "k3s".to_string()),
             ]
+        );
+        // The built-in Proxmox program installs k3s, so Talos is refused up front.
+        pve_cfg.distro = Some(crate::models::BootstrapDistro::Talos);
+        assert!(pve_driver.build_config_set_pairs(&pve_cfg).is_err());
+
+        // `--proxmox-url` only configures the Proxmox provider.
+        let hz_driver = PulumiBootstrapTarget::new(BootstrapTargetKind::Hetzner);
+        let mut hz_cfg = BootstrapConfig::new(BootstrapTargetKind::Hetzner);
+        hz_cfg.proxmox_url = Some("https://pve.example.com:8006".to_string());
+        assert_eq!(
+            hz_driver.build_config_set_pairs(&hz_cfg).unwrap(),
+            vec![("clusterName".to_string(), "keel-mgmt".to_string())]
         );
 
         // Wrong target rejected
@@ -1387,6 +1600,73 @@ contexts:
 
         let _ = tokio::fs::remove_dir_all(driver.state_dir(&cfg)).await;
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    /// Proxmox and Hetzner run their embedded k3s programs and hand the exported kubeconfig to
+    /// the seed install exactly like the cloud targets (no "VM only" stop).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn vm_targets_provision_from_embedded_program_and_return_kubeconfig() {
+        use std::os::unix::fs::PermissionsExt;
+
+        const NODE_KUBECONFIG: &str = "apiVersion: v1\nkind: Config\nclusters:\n  - name: default\n    cluster:\n      server: https://203.0.113.10:6443\ncontexts:\n  - name: default\n    context:\n      cluster: default\n      user: default\ncurrent-context: default\nusers:\n  - name: default\n";
+
+        for (kind, extra) in [
+            (
+                BootstrapTargetKind::Proxmox,
+                "config set proxmox:endpoint https://pve.example.com:8006",
+            ),
+            (BootstrapTargetKind::Hetzner, "config set clusterName"),
+        ] {
+            let temp_dir =
+                std::env::temp_dir().join(format!("keel-vm-target-{}", uuid::Uuid::new_v4()));
+            tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+            let log_file = temp_dir.join("invocations.log");
+            let script = format!(
+                "#!/bin/sh\necho \"$@\" >> \"{}\"\nif [ \"$1\" = \"stack\" ] && [ \"$2\" = \"output\" ]; then\n  [ \"$3\" = \"kubeconfig\" ] && [ \"$4\" = \"--show-secrets\" ] || exit 1\n  cat << 'EOF'\n{}EOF\nfi\nexit 0\n",
+                log_file.display(),
+                NODE_KUBECONFIG
+            );
+            let mock = temp_dir.join("mock-pulumi");
+            let mock_tmp = temp_dir.join("mock-pulumi.tmp");
+            std::fs::write(&mock_tmp, script.as_bytes()).unwrap();
+            std::fs::set_permissions(&mock_tmp, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::rename(&mock_tmp, &mock).unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+
+            let driver = PulumiBootstrapTarget::with_binary(kind, &mock)
+                .with_state_root(temp_dir.join("stage0-root"));
+            let mut cfg = BootstrapConfig::new(kind);
+            cfg.cluster_name = format!("vm-{}", uuid::Uuid::new_v4().simple());
+            cfg.proxmox_url = Some("https://pve.example.com:8006".to_string());
+
+            let conn = driver.provision_cluster(&cfg).await.unwrap();
+            assert_eq!(conn.target, kind);
+            assert_eq!(conn.kubeconfig_yaml, NODE_KUBECONFIG);
+            assert_eq!(conn.context.as_deref(), Some("default"));
+            assert_eq!(
+                conn.server_endpoint.as_deref(),
+                Some("https://203.0.113.10:6443")
+            );
+
+            // The embedded program (with the k3s install) is what Pulumi ran.
+            let materialized =
+                stage0_program_dir_in(&driver.cluster_dir(&cfg), kind.as_str()).join("Pulumi.yaml");
+            assert_eq!(
+                tokio::fs::read_to_string(&materialized).await.unwrap(),
+                driver.embedded_pulumi_yaml().unwrap()
+            );
+            let logged = tokio::fs::read_to_string(&log_file).await.unwrap();
+            assert!(logged.lines().any(|l| l.starts_with(extra)), "{kind}");
+            assert!(logged.contains("up --yes --non-interactive"));
+            assert!(logged.contains("stack output kubeconfig --show-secrets"));
+            assert_eq!(
+                logged.contains("proxmox:endpoint"),
+                kind == BootstrapTargetKind::Proxmox
+            );
+
+            let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+        }
     }
 
     #[test]

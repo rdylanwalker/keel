@@ -1,7 +1,10 @@
 # Stage 0 Hetzner Cloud Seed Management Cluster Bootstrap (`SDD.md` §2.1, `NFR-REL-01`)
+# Provisions a protected single-node k3s server (installed by cloud-init `userData`) behind a
+# protected firewall attached at creation and exports its kubeconfig as a secret output. The API token comes from
+# `HCLOUD_TOKEN`.
 name: keel-stage0-hetzner
 runtime: yaml
-description: Stage 0 Hetzner Cloud seed management cluster with protected server and firewall
+description: Stage 0 Hetzner Cloud seed management cluster (k3s) with protected server and firewall
 
 config:
   clusterName:
@@ -16,8 +19,9 @@ config:
   image:
     type: string
     default: ubuntu-24.04
-  sshKeyName:
+  sshUser:
     type: string
+    default: root
   allowedManagementCidrs:
     type: array
     items:
@@ -28,6 +32,19 @@ config:
       - ::/0
 
 resources:
+  controlPlaneSshKey:
+    type: tls:index:PrivateKey
+    properties:
+      algorithm: ED25519
+
+  controlPlaneHcloudSshKey:
+    type: hcloud:index:SshKey
+    properties:
+      name: ${clusterName}-cp
+      publicKey: ${controlPlaneSshKey.publicKeyOpenssh}
+      labels:
+        managed-by: keel
+
   controlPlaneFirewall:
     type: hcloud:index:Firewall
     options:
@@ -57,6 +74,12 @@ resources:
     type: hcloud:index:Server
     options:
       protect: true
+      # The k3s install script only runs on first boot. Editing it (e.g. adding
+      # `--disable=traefik`) must not replace an existing protected server when
+      # `keel bootstrap recover` re-runs `pulumi up`; migrate live nodes by hand
+      # (docs/getting-started/bootstrap.md "k3s Packaged Components").
+      ignoreChanges:
+        - userData
     properties:
       name: ${clusterName}-cp-01
       serverType: ${serverType}
@@ -65,14 +88,61 @@ resources:
       deleteProtection: true
       rebuildProtection: true
       sshKeys:
-        - ${sshKeyName}
+        - ${controlPlaneHcloudSshKey.id}
+      # Attached at creation, so SSH and the k3s API are filtered from first boot (a label
+      # selector applies asynchronously and would match any server carrying the label).
+      # `firewallIds` takes integers; Pulumi YAML has no built-in conversion from the string
+      # resource ID, so `std:parseint` converts it (unknown during preview, resolved on `up`).
       firewallIds:
-        - ${controlPlaneFirewall.id}
+        - fn::invoke:
+            function: std:parseint
+            arguments:
+              input: ${controlPlaneFirewall.id}
+              base: 10
+            return: result
+      publicNets:
+        - ipv4Enabled: true
+          ipv6Enabled: true
+      userData: |
+        #!/bin/bash
+        set -euo pipefail
+        PUBLIC_IP=$(curl -sf http://169.254.169.254/hetzner/v1/metadata/public-ipv4 || curl -sf https://ifconfig.me)
+        curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="server --disable=traefik --tls-san=$${PUBLIC_IP} --write-kubeconfig-mode=644" sh -
       labels:
         managed-by: keel
         keel-protect: "true"
+        keel-cluster: ${clusterName}
+
+  fetchKubeconfig:
+    type: command:remote:Command
+    options:
+      # stdout is the k3s admin kubeconfig: keep it encrypted in state and out of the logs.
+      additionalSecretOutputs:
+        - stdout
+    properties:
+      logging: none
+      connection:
+        host: ${seedControlPlaneServer.ipv4Address}
+        user: ${sshUser}
+        privateKey: ${controlPlaneSshKey.privateKeyOpenssh}
+      create: |
+        for i in $(seq 1 60); do
+          if [ -s /etc/rancher/k3s/k3s.yaml ]; then
+            sed "s/127.0.0.1/${seedControlPlaneServer.ipv4Address}/g" /etc/rancher/k3s/k3s.yaml
+            exit 0
+          fi
+          sleep 5
+        done
+        echo "Timed out waiting for /etc/rancher/k3s/k3s.yaml" >&2
+        exit 1
 
 outputs:
   clusterName: ${clusterName}
   ipv4Address: ${seedControlPlaneServer.ipv4Address}
   ipv6Address: ${seedControlPlaneServer.ipv6Address}
+  controlPlanePublicIp: ${seedControlPlaneServer.ipv4Address}
+  sshHost: ${seedControlPlaneServer.ipv4Address}
+  sshUser: ${sshUser}
+  sshPort: 22
+  kubeconfig:
+    fn::secret: ${fetchKubeconfig.stdout}

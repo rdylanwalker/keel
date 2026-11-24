@@ -55,7 +55,7 @@ No. Keel has no telemetry or analytics. It talks to your cluster, your forge and
 
 ## Does it work on k3s, Talos, my existing cluster or Proxmox?
 
-Experimentally. `--target kubeconfig` attaches to an existing cluster (k3s, k3d, Talos, managed Kubernetes); it is implemented but not covered by E2E. `--target proxmox` and `--target hetzner` only create the VM; install k3s yourself and then attach with `--target kubeconfig`. The cloud targets (`aws`, `gcp`, `azure`) are untested. Reports are welcome through the [Bootstrap Friction issue form](https://github.com/rdylanwalker/keel/issues/new/choose).
+Experimentally. `--target kubeconfig` attaches to an existing cluster (k3s, k3d, Talos, managed Kubernetes); it is implemented but not covered by E2E. `--target proxmox`, `--target hetzner` and the cloud targets (`aws`, `gcp`, `azure`) create a VM and install single-node k3s on it; they are untested. For Talos, install it yourself and attach with `--target kubeconfig`. Reports are welcome through the [Bootstrap Friction issue form](https://github.com/rdylanwalker/keel/issues/new/choose).
 
 ## Can I upgrade between releases?
 

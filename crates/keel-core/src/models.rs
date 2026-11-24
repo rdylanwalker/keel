@@ -294,6 +294,20 @@ impl BootstrapConfig {
             ));
         }
 
+        // The embedded Stage 0 programs install single-node k3s; only a custom
+        // `--pulumi-program-dir` (or `--target kubeconfig`) can bring another distribution.
+        if self.distro == Some(BootstrapDistro::Talos)
+            && self.target.requires_stage0_infra()
+            && self.pulumi_program_dir.is_none()
+        {
+            return Err(CoreError::Validation(format!(
+                "distro 'talos' is not supported by the built-in '{}' Stage 0 program (it installs \
+                 k3s); install Talos yourself and use --target kubeconfig, or pass \
+                 --pulumi-program-dir",
+                self.target
+            )));
+        }
+
         if let Some(issuer) = &self.oidc_issuer {
             let trimmed = issuer.trim();
             if !(trimmed.starts_with("https://") || trimmed.starts_with("http://")) {
@@ -2659,6 +2673,22 @@ mod tests {
         assert!(bad_pve.validate().is_err());
         bad_pve.proxmox_url = Some("https://pve.local:8006".to_string());
         assert!(bad_pve.validate().is_ok());
+
+        // The embedded VM programs install k3s: Talos needs a custom program or `kubeconfig`.
+        for target in [BootstrapTargetKind::Proxmox, BootstrapTargetKind::Hetzner] {
+            let mut talos = BootstrapConfig::new(target);
+            talos.distro = Some(BootstrapDistro::Talos);
+            let err = talos.validate().unwrap_err().to_string();
+            assert!(err.contains("--target kubeconfig"), "{err}");
+            talos.pulumi_program_dir = Some(PathBuf::from("/opt/talos-program"));
+            assert!(talos.validate().is_ok());
+            talos.pulumi_program_dir = None;
+            talos.distro = Some(BootstrapDistro::K3s);
+            assert!(talos.validate().is_ok());
+        }
+        let mut talos_kc = BootstrapConfig::new(BootstrapTargetKind::Kubeconfig);
+        talos_kc.distro = Some(BootstrapDistro::Talos);
+        assert!(talos_kc.validate().is_ok());
     }
 
     #[test]
