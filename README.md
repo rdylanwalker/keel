@@ -187,7 +187,7 @@ The live E2E suite (`e2e/tests/07-kind-live-e2e.spec.ts`) and a literal run of t
 | Local Git only (`--repo-dir` without a forge) | UI testing only: Flux cannot read it, and it has no tenant isolation. |
 | Workload `kind` clusters (`kind-cluster` blueprint, Terraform bridge) | **Tested** |
 | Cloud VM blueprints (`aws-vm`, `gcp-vm`, `azure-vm`, free-tier defaults) | Experimental: a manual, opt-in live test exists (`pnpm --dir e2e test:live:cloud`) but does not run in CI. |
-| EKS / GKE / AKS, Proxmox and other blueprints | Untested. The Proxmox blueprint creates a VM only. Hetzner and Cloudflare are provider entries with doc examples. |
+| EKS / GKE / AKS, Proxmox and other blueprints | Untested. The Proxmox blueprint installs single-node `k3s` like the Stage 0 Proxmox target. Hetzner and Cloudflare are provider entries with doc examples. |
 | Adding other OpenTofu/Terraform providers | Implemented; only the bundled `tehcyx/kind` provider is exercised live. |
 | Flagger canaries | Deploys and initializes in E2E; traffic shifting, promotion and rollback are not tested. |
 | `keel bootstrap recover` | Dry run in E2E; a real run succeeded in a manual v0.12.0 test. |

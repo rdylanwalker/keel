@@ -2573,6 +2573,7 @@ spec:
         reg.set_enabled("aws", true);
         reg.set_enabled("gcp", true);
         reg.set_enabled("azure", true);
+        reg.set_enabled("proxmox", true);
         tokio::fs::create_dir_all(workdir.join("providers"))
             .await
             .unwrap();
@@ -2583,8 +2584,14 @@ spec:
         .await
         .unwrap();
 
-        // Copy aws-eks-cluster, gcp-gke-cluster, and azure-aks-cluster blueprints into workdir
-        for bp_id in ["aws-eks-cluster", "gcp-gke-cluster", "azure-aks-cluster"] {
+        // Copy the aws-eks-cluster, gcp-gke-cluster, azure-aks-cluster and proxmox-k3s-cluster
+        // blueprints into workdir
+        for bp_id in [
+            "aws-eks-cluster",
+            "gcp-gke-cluster",
+            "azure-aks-cluster",
+            "proxmox-k3s-cluster",
+        ] {
             let dest_dir = workdir.join("catalog/infra").join(bp_id);
             tokio::fs::create_dir_all(&dest_dir).await.unwrap();
             let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -2766,6 +2773,16 @@ spec:
                     "nodeCount": 2
                 }),
             ),
+            (
+                "proxmox-k3s-cluster",
+                serde_json::json!({
+                    "clusterName": "pve-prod",
+                    "nodeName": "pve1",
+                    "templateVmId": 9000,
+                    "kubernetesVersion": "v1.35",
+                    "sshPublicKey": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExample operator"
+                }),
+            ),
         ] {
             let (status, Json(prop)) = create_proposal(
                 global_admin.clone(),
@@ -2778,7 +2795,7 @@ spec:
                     name: Some(catalog_id.to_string()),
                     title: None,
                     body: None,
-                    values,
+                    values: values.clone(),
                     canary: false,
                     target_cluster: None,
                     version: None,
@@ -2797,19 +2814,19 @@ spec:
                     .config
                     .get("kubernetesVersion")
                     .map(String::as_str),
-                Some("1.35")
+                values["kubernetesVersion"].as_str()
             );
+            // Every cluster blueprint outputs `kubeconfig`, so Keel names the kubeconfig Secret
+            // the program writes for Flux (`<instance>-kubeconfig` in the tenant namespace).
+            let expected_secret = format!("{catalog_id}-kubeconfig");
             assert_eq!(
                 prop.preview_stack
                     .spec
                     .config
                     .get("kubeconfigSecretName")
                     .map(String::as_str),
-                prop.preview_stack
-                    .spec
-                    .config
-                    .get("kubeconfigSecretName")
-                    .map(String::as_str)
+                Some(expected_secret.as_str()),
+                "{catalog_id}"
             );
         }
     }

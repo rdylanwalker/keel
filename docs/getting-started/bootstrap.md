@@ -200,6 +200,7 @@ Clones a 4 vCPU / 8 GB VM (`vmId` 9100, 64 GB boot disk on `scsi0` in `local-lvm
   ```
 
 - **Settings:** `nodeName`, `vmId`, `templateVmId`, `datastoreId`, `networkBridge`, `cores`, `memoryMb`, `diskSizeGb`, `diskInterface`, `sshUser`.
+- **Workload clusters:** once the management cluster runs, the seeded [`proxmox-k3s-cluster` blueprint](../catalog/provider-examples.md#proxmox-ve-k3s-cluster-proxmox) builds more single-node `k3s` clusters on the same template the same way, from the tenant's PKO workspace instead of your workstation.
 
 ```bash
 export PROXMOX_VE_API_TOKEN='keel@pve!stage0=<token-secret>'

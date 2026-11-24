@@ -1025,56 +1025,122 @@ outputs:
 
 ---
 
-## Proxmox VE VM for k3s (`proxmox`)
+## Proxmox VE k3s Cluster (`proxmox`)
 
-Place in `catalog/infra/proxmox-k3s/`. This blueprint creates a VM only; it does not install k3s. It is not covered by automated tests.
+Seeded as `catalog/infra/proxmox-k3s-cluster/`. It clones one VM from a cloud-init template, installs single-node `k3s` (`--disable=traefik`) over SSH and writes the admin kubeconfig, with its `127.0.0.1` server rewritten to the VM address, to the tenant's kubeconfig Secret. The result is a workload cluster like `kind-cluster`: pick it as the target cluster of an app. It works like the [Stage 0 Proxmox target](../getting-started/bootstrap.md#proxmox-ve---target-proxmox), but runs in the tenant's PKO workspace pod. It is not covered by automated tests.
+
+- **Template:** the same as for Stage 0: a cloud-init image with `qemu-guest-agent` installed and enabled, boot disk on `scsi0` (`diskInterface`), default VM ID `9000` (`templateVmId`). Proxmox VE picks the new VM's ID. Give the VM a DHCP reservation: the kubeconfig and the k3s certificate (`--tls-san`) use the address the guest agent reports for the first NIC.
+- **Credentials:** `PROXMOX_VE_ENDPOINT` and `PROXMOX_VE_API_TOKEN` are secret fields, injected into the workspace pod as environment variables of the same name. The token needs the privileges listed for [Stage 0](../getting-started/bootstrap.md#proxmox-ve---target-proxmox), including guest-agent read access. Turn on *Skip Proxmox VE TLS Verification* (`proxmoxInsecure`) for a self-signed API certificate.
+- **SSH:** the program generates an ED25519 key pair (`tls:index:PrivateKey`) that only lives in the encrypted Stack state; its public key and your *Operator SSH Public Key* are added for `sshUser` (default `keel`) through the VM's cloud-init drive. `k3s` is installed once: later edits to the install script or a new DHCP lease do not re-run it.
+- **Kubernetes version:** `kubernetesVersion` is a k3s release channel (`v1.35` installs the latest `v1.35.x+k3s` release). It applies only when the cluster is created: the install step ignores later changes, so editing it on an existing instance shows no diff in the preview, merges cleanly and leaves k3s at its original version. Upgrade k3s on the node yourself (for example with the [k3s system-upgrade-controller](https://docs.k3s.io/upgrades/automated)), or create a new instance.
+- **Kubeconfig:** the `kubeconfig` output and the `<instance>-kubeconfig` Secret hold the k3s admin kubeconfig (a cluster-admin client certificate). The fetch step logs nothing, and its output is a Pulumi secret. The program also binds the tenant's `tenant-<id>-sa` identity to `cluster-admin` on the new cluster, as `kind-cluster` does, so Flux can impersonate it there.
+- **Network:** the PKO workspace pod must reach the Proxmox VE API and the VM on TCP `22` and `6443`; its NetworkPolicy allows private addresses on 22, 443, 6443 and 8006 only. Flux on the management cluster must reach the VM on `6443`. The program creates no host firewall, so SSH and the k3s API (whose admin kubeconfig is cluster-admin) are open to everything that can reach the VM's bridge or VLAN. That is wider than the cloud VM programs, whose security groups limit 22 and 6443 to `allowedManagementCidrs`. Put the VM on an isolated VLAN or add PVE firewall rules that admit 22 and 6443 only from the PKO workspace and Flux source addresses.
 
 ### `catalog.yaml`
 
 ```yaml
+# Proxmox VE single-node k3s workload cluster blueprint (`SDD.md` §4.1, `NFR-EXT-02`). It clones
+# one VM from a cloud-init template, installs k3s over SSH with a generated key (like the Stage 0
+# Proxmox program) and writes the admin kubeconfig to the tenant's kubeconfig Secret, so the
+# result is a cluster apps can target, like `kind-cluster` and the managed-cluster blueprints.
 apiVersion: keel.io/v1alpha1
 kind: CatalogInfraBlueprint
 metadata:
-  id: proxmox-k3s
-  name: Proxmox VE k3s Node
-  description: Provision a Proxmox VE virtual machine ready for k3s.
-  category: compute
+  id: proxmox-k3s-cluster
+  name: Proxmox VE k3s Cluster (single node)
+  description: Clone one VM from a cloud-init template on Proxmox VE via the bpg/proxmox OpenTofu/Terraform bridge and install single-node k3s on it as a workload cluster.
+  category: kubernetes-cluster
   provider: proxmox
+  resourceKind: cluster
 spec:
   pulumiRuntime: yaml
   entrypoint: Pulumi.yaml
-  protectByDefault: false
+  protectByDefault: true
   outputs:
+    - clusterName
+    - endpoint
+    - kubeconfig
+    - controlPlaneIp
     - vmId
+    - sshHost
+    - sshUser
+    - sshPort
   schema:
     type: object
     required:
-      - vmName
+      - clusterName
       - nodeName
-      - cores
-      - memoryMb
-      - PROXMOX_VE_ENDPOINT
-      - PROXMOX_VE_API_TOKEN
+      - templateVmId
+      - kubernetesVersion
+      - sshPublicKey
     properties:
-      vmName:
+      clusterName:
         type: string
-        title: VM Name
-        default: k3s-worker-01
+        title: Cluster Name (VM name prefix)
+        pattern: "^[a-z0-9]([a-z0-9-]{0,55}[a-z0-9])?$"
       nodeName:
         type: string
-        title: Proxmox Node
-        default: pve
+        title: Proxmox Target Node
+        default: pve1
+      templateVmId:
+        type: integer
+        title: Cloud-Init Template VM ID
+        description: Template with cloud-init and qemu-guest-agent; its boot disk must be on the Boot Disk Interface.
+        default: 9000
+        minimum: 100
+      datastoreId:
+        type: string
+        title: Datastore
+        description: Datastore for the cloned disk and the cloud-init drive.
+        default: local-lvm
+      networkBridge:
+        type: string
+        title: Network Bridge
+        default: vmbr0
       cores:
         type: integer
         title: vCPU Cores
         default: 4
-        minimum: 1
+        minimum: 2
         maximum: 32
       memoryMb:
         type: integer
-        title: Memory (MB)
+        title: Memory (MiB)
         default: 8192
-        minimum: 1024
+        minimum: 2048
+      diskSizeGb:
+        type: integer
+        title: Boot Disk Size (GiB)
+        description: Must be at least the template's disk size.
+        default: 32
+        minimum: 10
+      diskInterface:
+        type: string
+        title: Boot Disk Interface
+        description: The template's boot-disk interface (bpg/proxmox matches cloned disks by interface).
+        default: scsi0
+      kubernetesVersion:
+        type: string
+        title: Kubernetes Version (k3s channel)
+        description: k3s release channel; the latest k3s patch release of that Kubernetes minor is installed. Applies only when the cluster is created; changing it later does not upgrade k3s.
+        default: v1.35
+        enum:
+          - v1.36
+          - v1.35
+          - v1.34
+          - v1.33
+      sshUser:
+        type: string
+        title: SSH Username
+        default: keel
+      sshPublicKey:
+        type: string
+        title: Operator SSH Public Key
+      proxmoxInsecure:
+        type: boolean
+        title: Skip Proxmox VE TLS Verification
+        description: Accept a self-signed Proxmox VE API certificate.
+        default: false
       PROXMOX_VE_ENDPOINT:
         type: string
         title: Proxmox VE API Endpoint
@@ -1082,52 +1148,250 @@ spec:
       PROXMOX_VE_API_TOKEN:
         type: string
         title: Proxmox VE API Token
-        format: password
         writeOnly: true
+        format: password
   uiSchema:
+    sshPublicKey:
+      ui:widget: textarea
+      ui:help: "Your ed25519 or RSA public key, added next to the key Pulumi generates to install k3s."
     PROXMOX_VE_ENDPOINT:
-      ui:placeholder: "https://pve.example.local:8006/api2/json"
-      ui:help: "Injected as PROXMOX_VE_ENDPOINT via Stack.spec.envRefs."
+      ui:placeholder: "https://pve.example.local:8006/"
+      ui:help: "Injected as PROXMOX_VE_ENDPOINT via Stack.spec.envRefs. The PKO workspace must reach it."
     PROXMOX_VE_API_TOKEN:
       ui:widget: password
-      ui:help: "Format: user@realm!tokenid=uuid. Encrypted via SOPS + age."
+      ui:help: "Format: user@realm!tokenid=uuid. Encrypted via SOPS + tenant age key before committing to Git."
 ```
 
 ### `Pulumi.yaml`
 
 ```yaml
-name: proxmox-k3s
+# Proxmox VE single-node k3s workload cluster (`SDD.md` §4.1, `NFR-EXT-02`) via the bpg/proxmox
+# OpenTofu/Terraform bridge. The VM is cloned from a cloud-init template (with
+# qemu-guest-agent) whose built-in cloud-init drive injects a generated SSH key plus the
+# operator's key; k3s is then installed over SSH from the PKO workspace (no `snippets` datastore
+# or PVE-node SSH access is needed), like the Stage 0 Proxmox program. The admin kubeconfig is
+# rewritten to the VM address, written to the tenant's kubeconfig Secret for Flux and exported
+# as a secret output.
+#
+# Provider credentials come from the workspace environment: the blueprint's secret fields
+# `PROXMOX_VE_ENDPOINT` and `PROXMOX_VE_API_TOKEN` become `Stack.spec.envRefs` of the same name.
+name: proxmox-k3s-cluster
 runtime: yaml
-description: Proxmox VE VM via bpg/proxmox OpenTofu bridge
+description: Single-node k3s workload cluster on a Proxmox VE VM (bpg/proxmox)
+
 packages:
-  proxmoxve:
+  proxmox:
     source: terraform-provider
+    version: 1.5.1
     parameters:
       - bpg/proxmox
+      - 0.71.0
+
 config:
-  vmName:
+  clusterName:
     type: string
   nodeName:
     type: string
-    default: pve
+    default: pve1
+  templateVmId:
+    type: integer
+    default: 9000
+  datastoreId:
+    type: string
+    default: local-lvm
+  networkBridge:
+    type: string
+    default: vmbr0
   cores:
     type: integer
     default: 4
   memoryMb:
     type: integer
     default: 8192
+  diskSizeGb:
+    type: integer
+    default: 32
+  # Must be the template's boot-disk interface: bpg/proxmox matches clone disks by interface,
+  # so any other value adds a blank disk and leaves the boot disk at the image size.
+  diskInterface:
+    type: string
+    default: scsi0
+  sshUser:
+    type: string
+    default: keel
+  sshPublicKey:
+    type: string
+  # k3s release channel (one per Kubernetes minor, https://update.k3s.io/v1-release/channels).
+  # Used only by the one-shot install (installK3s ignores `create` changes): changing it later
+  # does not upgrade k3s.
+  kubernetesVersion:
+    type: string
+    default: v1.35
+  proxmoxInsecure:
+    type: boolean
+    default: false
+  kubeconfigSecretName:
+    type: string
+    default: proxmox-k3s-cluster-kubeconfig
+  kubeconfigSecretNamespace:
+    type: string
+    default: tenant-default
+
+variables:
+  # Guest-agent addresses per interface; index 0 is the loopback, index 1 the first NIC.
+  controlPlaneIp: ${k3sControlPlaneVm.ipv4Addresses[1][0]}
+  # k3s admin kubeconfig with the API server rewritten from 127.0.0.1 to the VM address.
+  workloadKubeconfig:
+    fn::secret: ${fetchKubeconfig.stdout}
+
 resources:
-  vm:
-    type: proxmoxve:vm:VirtualMachine
+  # Endpoint and API token are read from PROXMOX_VE_ENDPOINT / PROXMOX_VE_API_TOKEN.
+  pveProvider:
+    type: pulumi:providers:proxmox
     properties:
-      name: ${vmName}
+      insecure: ${proxmoxInsecure}
+
+  # Key Pulumi uses to install k3s and read the kubeconfig. The private half only ever lives in
+  # the (encrypted) Stack state.
+  controlPlaneSshKey:
+    type: tls:index:PrivateKey
+    properties:
+      algorithm: ED25519
+
+  k3sControlPlaneVm:
+    type: proxmox:index/virtualEnvironmentVm:VirtualEnvironmentVm
+    options:
+      provider: ${pveProvider}
+    properties:
+      name: ${clusterName}-cp-01
       nodeName: ${nodeName}
+      description: Keel k3s workload cluster ${clusterName} (single node)
+      tags:
+        - keel-workload
+        - k3s
+      onBoot: true
+      agent:
+        enabled: true
+      clone:
+        vmId: ${templateVmId}
+        full: true
       cpu:
         cores: ${cores}
+        type: x86-64-v2-AES
       memory:
         dedicated: ${memoryMb}
+      # PVE's default for new VMs; lets `iothread` apply to SCSI disks.
+      scsiHardware: virtio-scsi-single
+      disks:
+        - datastoreId: ${datastoreId}
+          interface: ${diskInterface}
+          size: ${diskSizeGb}
+          iothread: true
+          discard: "on"
+      networkDevices:
+        - bridge: ${networkBridge}
+          model: virtio
+      initialization:
+        datastoreId: ${datastoreId}
+        ipConfigs:
+          - ipv4:
+              address: dhcp
+        userAccount:
+          username: ${sshUser}
+          keys:
+            - ${controlPlaneSshKey.publicKeyOpenssh}
+            - ${sshPublicKey}
+
+  installK3s:
+    type: command:remote:Command
+    options:
+      # The install runs once. Editing the script or a new DHCP lease must not re-run it
+      # against an existing node on the next resync.
+      ignoreChanges:
+        - create
+        - connection
+    properties:
+      connection:
+        host: ${controlPlaneIp}
+        user: ${sshUser}
+        privateKey: ${controlPlaneSshKey.privateKeyOpenssh}
+      create: |
+        set -eu
+        cloud-init status --wait >/dev/null 2>&1 || true
+        if [ ! -f /etc/rancher/k3s/k3s.yaml ]; then
+          curl -sfL https://get.k3s.io | sudo INSTALL_K3S_CHANNEL="${kubernetesVersion}" INSTALL_K3S_EXEC="server --disable=traefik --tls-san=${controlPlaneIp} --write-kubeconfig-mode=644" sh -
+        fi
+
+  fetchKubeconfig:
+    type: command:remote:Command
+    options:
+      dependsOn:
+        - ${installK3s}
+      # stdout is the k3s admin kubeconfig: keep it encrypted in state and out of the logs.
+      additionalSecretOutputs:
+        - stdout
+    properties:
+      logging: none
+      connection:
+        host: ${controlPlaneIp}
+        user: ${sshUser}
+        privateKey: ${controlPlaneSshKey.privateKeyOpenssh}
+      create: |
+        for i in $(seq 1 60); do
+          if [ -s /etc/rancher/k3s/k3s.yaml ]; then
+            sed "s/127.0.0.1/${controlPlaneIp}/g" /etc/rancher/k3s/k3s.yaml
+            exit 0
+          fi
+          sleep 5
+        done
+        echo "Timed out waiting for /etc/rancher/k3s/k3s.yaml" >&2
+        exit 1
+
+  kubeconfigSecret:
+    type: kubernetes:core/v1:Secret
+    properties:
+      metadata:
+        name: ${kubeconfigSecretName}
+        namespace: ${kubeconfigSecretNamespace}
+      stringData:
+        kubeconfig: ${workloadKubeconfig}
+
+  # Kubernetes provider for the new workload cluster (the PKO workspace reaches the VM on 6443).
+  workloadProvider:
+    type: pulumi:providers:kubernetes
+    properties:
+      kubeconfig: ${workloadKubeconfig}
+
+  # Flux reconciles tenant HelmReleases/Kustomizations on this cluster through the kubeconfig
+  # Secret while impersonating the owning tenant's ServiceAccount
+  # (`system:serviceaccount:tenant-<id>:tenant-<id>-sa`, Flux multi-tenancy lockdown). The tenant
+  # owns this cluster outright (it holds its admin kubeconfig), so that identity is cluster-admin.
+  tenantFluxAccess:
+    type: kubernetes:rbac.authorization.k8s.io/v1:ClusterRoleBinding
+    options:
+      provider: ${workloadProvider}
+    properties:
+      metadata:
+        name: keel-tenant-flux
+      roleRef:
+        apiGroup: rbac.authorization.k8s.io
+        kind: ClusterRole
+        name: cluster-admin
+      subjects:
+        - kind: ServiceAccount
+          name: ${kubeconfigSecretNamespace}-sa
+          namespace: ${kubeconfigSecretNamespace}
+
 outputs:
-  vmId: ${vm.vmId}
+  clusterName: ${clusterName}
+  endpoint: https://${controlPlaneIp}:6443
+  controlPlaneIp: ${controlPlaneIp}
+  vmId: ${k3sControlPlaneVm.vmId}
+  sshHost: ${controlPlaneIp}
+  sshUser: ${sshUser}
+  sshPort: 22
+  kubeconfig:
+    fn::secret: ${fetchKubeconfig.stdout}
 ```
 
 ---

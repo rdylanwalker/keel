@@ -2296,8 +2296,8 @@ spec:
             ),
             (
                 "../../deploy/catalog/infra/proxmox-k3s-cluster/catalog.yaml",
-                InfraResourceKind::Vm,
-                false,
+                InfraResourceKind::Cluster,
+                true,
             ),
             (
                 "../../deploy/catalog/infra/aws-eks-cluster/catalog.yaml",
@@ -2396,6 +2396,24 @@ spec:
                     .expect("Missing kubeconfigSecret in cluster blueprint");
                 let resource_type = kubeconfig_secret.get("type").unwrap().as_str().unwrap();
                 assert_eq!(resource_type, "kubernetes:core/v1:Secret");
+
+                // Keel sets these when the blueprint outputs `kubeconfig` (proposal flow), so the
+                // program must declare them or Pulumi rejects the Stack config.
+                for key in ["kubeconfigSecretName", "kubeconfigSecretNamespace"] {
+                    assert!(
+                        parsed_pulumi
+                            .get("config")
+                            .and_then(|c| c.get(key))
+                            .is_some(),
+                        "cluster blueprint {} must declare config.{key}",
+                        bp.metadata.id
+                    );
+                }
+                assert!(
+                    bp.spec.outputs.iter().any(|o| o == "kubeconfig"),
+                    "cluster blueprint {} must output kubeconfig",
+                    bp.metadata.id
+                );
             }
 
             // Test protected/tenant serialization round-trips
@@ -2403,6 +2421,178 @@ spec:
             let parsed2 = parse_catalog_blueprint(&roundtrip).unwrap();
             assert_eq!(bp.metadata.protected, parsed2.metadata.protected);
             assert_eq!(bp.metadata.tenant, parsed2.metadata.tenant);
+        }
+    }
+
+    /// The seeded Proxmox blueprint is a real k3s cluster (LIVE-10): it installs k3s over SSH
+    /// with a generated key, keeps the admin kubeconfig secret and out of the logs, and writes it
+    /// to the tenant kubeconfig Secret Flux targets, like the Stage 0 Proxmox program.
+    #[test]
+    fn proxmox_k3s_blueprint_installs_k3s_and_exports_a_secret_kubeconfig() {
+        use noyalib::Value;
+        let dir = std::path::Path::new("../../deploy/catalog/infra/proxmox-k3s-cluster");
+        let bp =
+            parse_catalog_blueprint(&std::fs::read_to_string(dir.join("catalog.yaml")).unwrap())
+                .unwrap();
+        let doc: Value =
+            noyalib::from_str(&std::fs::read_to_string(dir.join("Pulumi.yaml")).unwrap()).unwrap();
+
+        assert_eq!(
+            bp.effective_resource_kind(),
+            crate::models::InfraResourceKind::Cluster
+        );
+        assert_eq!(
+            doc["packages"]["proxmox"]["parameters"][0].as_str(),
+            Some("bpg/proxmox")
+        );
+
+        // Every non-secret form field is a declared Pulumi config key (populated into
+        // `Stack.spec.config`); secret fields become env refs and must not be config keys.
+        let config = doc["config"].as_mapping().unwrap();
+        let props = bp.spec.schema["properties"].as_object().unwrap();
+        for (key, prop) in props {
+            let secret = prop.get("writeOnly").and_then(|v| v.as_bool()) == Some(true)
+                || prop.get("format").and_then(|v| v.as_str()) == Some("password");
+            assert_eq!(
+                config.contains_key(key.as_str()),
+                !secret,
+                "schema property {key}: secret={secret}"
+            );
+        }
+        for secret in ["PROXMOX_VE_ENDPOINT", "PROXMOX_VE_API_TOKEN"] {
+            assert_eq!(props[secret]["writeOnly"], serde_json::json!(true));
+        }
+        assert_eq!(props["PROXMOX_VE_API_TOKEN"]["format"], "password");
+        // Config without a default must be a required form field.
+        let required: Vec<&str> = bp.spec.schema["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        for (key, spec) in config {
+            if spec.get("default").is_none() {
+                assert!(
+                    required.contains(&key.as_str()),
+                    "config {key} needs a default"
+                );
+            }
+        }
+        // Defaults of the form and the program agree.
+        for (key, prop) in props {
+            if let (Some(form), Some(spec)) = (prop.get("default"), config.get(key.as_str())) {
+                let program = &spec["default"];
+                let same = match form {
+                    serde_json::Value::String(s) => program.as_str() == Some(s.as_str()),
+                    serde_json::Value::Number(n) => program.as_i64() == n.as_i64(),
+                    serde_json::Value::Bool(b) => program.as_bool() == Some(*b),
+                    _ => false,
+                };
+                assert!(
+                    same,
+                    "default of {key} differs between catalog.yaml and Pulumi.yaml"
+                );
+            }
+        }
+
+        let resources = &doc["resources"];
+        assert_eq!(
+            resources["controlPlaneSshKey"]["type"].as_str(),
+            Some("tls:index:PrivateKey")
+        );
+        let vm = &resources["k3sControlPlaneVm"];
+        assert_eq!(
+            vm["type"].as_str(),
+            Some("proxmox:index/virtualEnvironmentVm:VirtualEnvironmentVm")
+        );
+        assert_eq!(vm["properties"]["agent"]["enabled"], Value::Bool(true));
+        assert_eq!(
+            vm["properties"]["initialization"]["userAccount"]["keys"][0].as_str(),
+            Some("${controlPlaneSshKey.publicKeyOpenssh}")
+        );
+        assert_eq!(
+            doc["variables"]["controlPlaneIp"].as_str(),
+            Some("${k3sControlPlaneVm.ipv4Addresses[1][0]}")
+        );
+
+        let install = resources["installK3s"]["properties"]["create"]
+            .as_str()
+            .unwrap();
+        assert!(install.contains("INSTALL_K3S_CHANNEL=\"${kubernetesVersion}\""));
+        // The install ignores `create` changes, so the channel only applies at creation; the
+        // form must say so instead of implying an edit upgrades k3s.
+        assert!(
+            resources["installK3s"]["options"]["ignoreChanges"]
+                .as_sequence()
+                .unwrap()
+                .iter()
+                .any(|v| v.as_str() == Some("create"))
+        );
+        assert!(
+            props["kubernetesVersion"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("does not upgrade k3s")
+        );
+        assert!(install.contains(
+            "server --disable=traefik --tls-san=${controlPlaneIp} --write-kubeconfig-mode=644"
+        ));
+
+        let fetch = &resources["fetchKubeconfig"];
+        assert_eq!(fetch["type"].as_str(), Some("command:remote:Command"));
+        assert_eq!(
+            fetch["options"]["dependsOn"][0].as_str(),
+            Some("${installK3s}")
+        );
+        assert_eq!(
+            fetch["properties"]["connection"]["privateKey"].as_str(),
+            Some("${controlPlaneSshKey.privateKeyOpenssh}")
+        );
+        assert_eq!(fetch["properties"]["logging"].as_str(), Some("none"));
+        assert_eq!(
+            fetch["options"]["additionalSecretOutputs"][0].as_str(),
+            Some("stdout")
+        );
+        let create = fetch["properties"]["create"].as_str().unwrap();
+        assert!(create.contains("/etc/rancher/k3s/k3s.yaml"));
+        assert!(create.contains("s/127.0.0.1/${controlPlaneIp}/g"));
+
+        // Flux reads the kubeconfig Secret; Pulumi reaches the new cluster with the same one.
+        assert_eq!(
+            doc["variables"]["workloadKubeconfig"]["fn::secret"].as_str(),
+            Some("${fetchKubeconfig.stdout}")
+        );
+        let secret = &resources["kubeconfigSecret"]["properties"];
+        assert_eq!(
+            secret["metadata"]["name"].as_str(),
+            Some("${kubeconfigSecretName}")
+        );
+        assert_eq!(
+            secret["metadata"]["namespace"].as_str(),
+            Some("${kubeconfigSecretNamespace}")
+        );
+        assert_eq!(
+            secret["stringData"]["kubeconfig"].as_str(),
+            Some("${workloadKubeconfig}")
+        );
+        assert_eq!(
+            resources["tenantFluxAccess"]["properties"]["subjects"][0]["name"].as_str(),
+            Some("${kubeconfigSecretNamespace}-sa")
+        );
+
+        let outputs = &doc["outputs"];
+        assert_eq!(
+            outputs["kubeconfig"]["fn::secret"].as_str(),
+            Some("${fetchKubeconfig.stdout}")
+        );
+        for out in &bp.spec.outputs {
+            assert!(outputs.get(out.as_str()).is_some(), "missing output {out}");
+        }
+        for (key, value) in outputs.as_mapping().unwrap() {
+            assert!(
+                !value.as_str().unwrap_or_default().contains("privateKey"),
+                "output {key} must not export the SSH private key"
+            );
         }
     }
 

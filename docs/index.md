@@ -29,7 +29,7 @@ flowchart TB
 2. **[Provisioning Workflow](getting-started/provisioning.md)** — Enable providers, create tenants, submit infrastructure & application PRs, inspect Git + PKO v2 diffs, and merge changes.
 3. **[Things to Try](getting-started/things-to-try.md)** — Hands-on walkthroughs starting from a local `kind` management cluster (second `kind` cluster, `podinfo` canary rollout, AWS EKS, and custom blueprints).
 4. **[Catalog Overview](catalog/overview.md)** — Understand `CatalogInfraBlueprint` and `CatalogApplication` (`keel.io/v1alpha1`), JSON Schema forms, and SOPS/`age` secret encryption.
-5. **[Provider Blueprint Examples](catalog/provider-examples.md)** — Ready-to-use `catalog.yaml` + `Pulumi.yaml` blueprints for **kind**, **AWS (EKS)**, **GCP (GKE)**, **Azure (AKS)**, a **Proxmox VE** VM (k3s not installed), a **Hetzner Cloud** server, and a **Cloudflare** DNS record. Only the `kind` blueprint is tested end to end.
+5. **[Provider Blueprint Examples](catalog/provider-examples.md)** — Ready-to-use `catalog.yaml` + `Pulumi.yaml` blueprints for **kind**, **AWS (EKS)**, **GCP (GKE)**, **Azure (AKS)**, a single-node **Proxmox VE** `k3s` cluster, a **Hetzner Cloud** server, and a **Cloudflare** DNS record. Only the `kind` blueprint is tested end to end.
 6. **[Pre-Merge PKO Previews](getting-started/previews.md)**: how real `pulumi preview` runs work, what `source` / `run.phase` mean, and their limitations.
 7. **[Web Portal](getting-started/web-ui.md)**: views, schema-driven forms, role-aware controls, the SSH terminal, and demo mode.
 8. **[Security, Tenancy & Canary](operations/security-and-tenancy.md)**: least-privilege tenant credentials, IdP group mapping, Kyverno policies, SSH host-key verification, and Flagger canary rollouts.

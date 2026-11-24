@@ -127,6 +127,15 @@ describe("DEFAULT_CATALOG mirrors deploy/catalog", () => {
     }
   )
 
+  it("mirrors the full proxmox-k3s-cluster form, not a subset", () => {
+    // Demo mode (and screenshots) must show the same Proxmox form as a real install.
+    const item = DEFAULT_CATALOG.find((i) => i.id === "proxmox-k3s-cluster")
+    expect(item).toBeDefined()
+    const doc = loadDoc("infra", "proxmox-k3s-cluster")
+    expect(item?.schema).toEqual(doc.spec.schema)
+    expect(item?.uiSchema).toEqual(doc.spec.uiSchema)
+  })
+
   it("covers apps, infra blueprints, a bundle and at least one secret field", () => {
     const types = new Set(DEFAULT_CATALOG.map((item) => item.type))
     expect(types).toEqual(new Set(["app", "infra", "bundle"]))

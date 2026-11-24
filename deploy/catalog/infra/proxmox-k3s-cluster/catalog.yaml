@@ -1,35 +1,42 @@
-# Proxmox VE VM blueprint for a future k3s node (`SDD.md` §4.1). It clones ONE VM from a
-# cloud-init template and stops there: no k3s is installed and no kubeconfig is exported, so the
-# result is a VM (`resourceKind: vm`), not a cluster apps can be deployed onto. Install k3s on the
-# VM yourself and attach it to Keel as a cluster.
+# Proxmox VE single-node k3s workload cluster blueprint (`SDD.md` §4.1, `NFR-EXT-02`). It clones
+# one VM from a cloud-init template, installs k3s over SSH with a generated key (like the Stage 0
+# Proxmox program) and writes the admin kubeconfig to the tenant's kubeconfig Secret, so the
+# result is a cluster apps can target, like `kind-cluster` and the managed-cluster blueprints.
 apiVersion: keel.io/v1alpha1
 kind: CatalogInfraBlueprint
 metadata:
   id: proxmox-k3s-cluster
-  name: Proxmox VE VM (for k3s, VM only)
-  description: Clone one VM from a cloud-init template on Proxmox VE via the bpg/proxmox OpenTofu/Terraform bridge, as a node to install k3s on. Installs no Kubernetes and exports no kubeconfig.
-  category: compute
+  name: Proxmox VE k3s Cluster (single node)
+  description: Clone one VM from a cloud-init template on Proxmox VE via the bpg/proxmox OpenTofu/Terraform bridge and install single-node k3s on it as a workload cluster.
+  category: kubernetes-cluster
   provider: proxmox
-  resourceKind: vm
+  resourceKind: cluster
 spec:
   pulumiRuntime: yaml
   entrypoint: Pulumi.yaml
   protectByDefault: true
   outputs:
     - clusterName
+    - endpoint
+    - kubeconfig
     - controlPlaneIp
+    - vmId
+    - sshHost
+    - sshUser
+    - sshPort
   schema:
     type: object
     required:
       - clusterName
       - nodeName
       - templateVmId
+      - kubernetesVersion
       - sshPublicKey
     properties:
       clusterName:
         type: string
         title: Cluster Name (VM name prefix)
-        pattern: "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"
+        pattern: "^[a-z0-9]([a-z0-9-]{0,55}[a-z0-9])?$"
       nodeName:
         type: string
         title: Proxmox Target Node
@@ -37,8 +44,18 @@ spec:
       templateVmId:
         type: integer
         title: Cloud-Init Template VM ID
-        default: 900
+        description: Template with cloud-init and qemu-guest-agent; its boot disk must be on the Boot Disk Interface.
+        default: 9000
         minimum: 100
+      datastoreId:
+        type: string
+        title: Datastore
+        description: Datastore for the cloned disk and the cloud-init drive.
+        default: local-lvm
+      networkBridge:
+        type: string
+        title: Network Bridge
+        default: vmbr0
       cores:
         type: integer
         title: vCPU Cores
@@ -50,10 +67,55 @@ spec:
         title: Memory (MiB)
         default: 8192
         minimum: 2048
+      diskSizeGb:
+        type: integer
+        title: Boot Disk Size (GiB)
+        description: Must be at least the template's disk size.
+        default: 32
+        minimum: 10
+      diskInterface:
+        type: string
+        title: Boot Disk Interface
+        description: The template's boot-disk interface (bpg/proxmox matches cloned disks by interface).
+        default: scsi0
+      kubernetesVersion:
+        type: string
+        title: Kubernetes Version (k3s channel)
+        description: k3s release channel; the latest k3s patch release of that Kubernetes minor is installed. Applies only when the cluster is created; changing it later does not upgrade k3s.
+        default: v1.35
+        enum:
+          - v1.36
+          - v1.35
+          - v1.34
+          - v1.33
+      sshUser:
+        type: string
+        title: SSH Username
+        default: keel
       sshPublicKey:
         type: string
         title: Operator SSH Public Key
+      proxmoxInsecure:
+        type: boolean
+        title: Skip Proxmox VE TLS Verification
+        description: Accept a self-signed Proxmox VE API certificate.
+        default: false
+      PROXMOX_VE_ENDPOINT:
+        type: string
+        title: Proxmox VE API Endpoint
+        writeOnly: true
+      PROXMOX_VE_API_TOKEN:
+        type: string
+        title: Proxmox VE API Token
+        writeOnly: true
+        format: password
   uiSchema:
     sshPublicKey:
       ui:widget: textarea
-      ui:help: "ed25519 or RSA public key injected via cloud-init."
+      ui:help: "Your ed25519 or RSA public key, added next to the key Pulumi generates to install k3s."
+    PROXMOX_VE_ENDPOINT:
+      ui:placeholder: "https://pve.example.local:8006/"
+      ui:help: "Injected as PROXMOX_VE_ENDPOINT via Stack.spec.envRefs. The PKO workspace must reach it."
+    PROXMOX_VE_API_TOKEN:
+      ui:widget: password
+      ui:help: "Format: user@realm!tokenid=uuid. Encrypted via SOPS + tenant age key before committing to Git."
