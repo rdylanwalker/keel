@@ -768,13 +768,28 @@ test.describe('09 - README Quick Start (live, executed literally)', () => {
           .poll(() => kindClusters(s.env), { timeout: 15 * 60_000, intervals: [5_000] })
           .toContain(WORKLOAD_CLUSTER);
         const wlKubeconfig = path.join(s.root, 'workload-dev.kubeconfig');
-        fs.writeFileSync(
-          wlKubeconfig,
-          execFileSync('kind', ['get', 'kubeconfig', '--name', WORKLOAD_CLUSTER], {
-            encoding: 'utf8',
-            env: s.env,
-          }),
-        );
+        // kind lists the cluster as soon as its node containers exist, before kubeadm has
+        // written /etc/kubernetes/admin.conf, so the kubeconfig is not readable right away.
+        await expect
+          .poll(
+            () => {
+              try {
+                fs.writeFileSync(
+                  wlKubeconfig,
+                  execFileSync('kind', ['get', 'kubeconfig', '--name', WORKLOAD_CLUSTER], {
+                    encoding: 'utf8',
+                    env: s.env,
+                    stdio: ['ignore', 'pipe', 'pipe'],
+                  }),
+                );
+                return true;
+              } catch {
+                return false;
+              }
+            },
+            { timeout: 5 * 60_000, intervals: [5_000] },
+          )
+          .toBe(true);
         await expect
           .poll(() => nodesReady(s, wlKubeconfig), { timeout: 5 * 60_000, intervals: [5_000] })
           .toBe(true);
