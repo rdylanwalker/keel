@@ -14,7 +14,7 @@
 
 use std::sync::Arc;
 
-use k8s_openapi::api::core::v1::Secret;
+use k8s_openapi::api::core::v1::{ConfigMap, Secret};
 use keel_core::{
     ForgeConfig, KEEL_SYSTEM_NAMESPACE, TENANT_REPO_READER_SECRET_NAME, TENANT_REPOS_ORG,
 };
@@ -329,6 +329,37 @@ impl keel_server::TenantCredentialSecrets for KubectlCredentialSecrets<'_> {
     async fn replace(&self, _tenant: &str, secret: Secret) -> Result<(), keel_server::ServerError> {
         self.write(&secret, true).await.map(|_| ())
     }
+    /// `kubectl apply` as the bootstrap operator: public host keys only (no secret material in
+    /// the last-applied annotation), in `keel-system`, which the tenant reconciler cannot write.
+    async fn put_pko_operator_known_hosts(
+        &self,
+        config_map: ConfigMap,
+    ) -> Result<(), keel_server::ServerError> {
+        let yaml = pko_operator_known_hosts_manifest(&config_map)?;
+        self.target.apply(&yaml).await.map_err(cli_to_server)
+    }
+}
+
+/// Manifest for [`KubectlCredentialSecrets::put_pko_operator_known_hosts`]; refuses anything but
+/// `keel-system/keel-pko-ssh-known-hosts`.
+fn pko_operator_known_hosts_manifest(
+    config_map: &ConfigMap,
+) -> Result<String, keel_server::ServerError> {
+    let meta = &config_map.metadata;
+    if meta.name.as_deref() != Some(keel_kube::PKO_OPERATOR_SSH_KNOWN_HOSTS_CONFIGMAP)
+        || meta.namespace.as_deref() != Some(keel_core::KEEL_SYSTEM_NAMESPACE)
+    {
+        return Err(keel_server::ServerError::Internal(format!(
+            "refusing to apply a ConfigMap other than `{}/{}`",
+            keel_core::KEEL_SYSTEM_NAMESPACE,
+            keel_kube::PKO_OPERATOR_SSH_KNOWN_HOSTS_CONFIGMAP
+        )));
+    }
+    let mut doc = serde_json::to_value(config_map)
+        .map_err(|e| keel_server::ServerError::Internal(e.to_string()))?;
+    doc["apiVersion"] = "v1".into();
+    doc["kind"] = "ConfigMap".into();
+    keel_core::yaml::to_string(&doc).map_err(|e| keel_server::ServerError::Internal(e.to_string()))
 }
 
 impl KubectlCredentialSecrets<'_> {
@@ -426,6 +457,28 @@ fn default_tenant_repo_status(
 mod tests {
     use super::*;
     use keel_core::ForgeKind;
+
+    #[test]
+    fn pko_operator_known_hosts_manifest_is_only_the_keel_system_config_map() {
+        let source = keel_kube::TenantRepoSource::new(
+            "default",
+            "ssh://git@github.com/acme/infra-gitops-tenant-default.git",
+        )
+        .unwrap();
+        let line = "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl\n";
+        let doc = keel_kube::build_pko_operator_known_hosts_configmap(&[(&source, line)]).unwrap();
+        let cm: ConfigMap = serde_json::from_value(doc).unwrap();
+        let yaml = pko_operator_known_hosts_manifest(&cm).unwrap();
+        let parsed: serde_json::Value = noyalib::from_str(&yaml).unwrap();
+        assert_eq!(parsed["apiVersion"], "v1");
+        assert_eq!(parsed["kind"], "ConfigMap");
+        assert_eq!(parsed["metadata"]["namespace"], "keel-system");
+        assert_eq!(parsed["metadata"]["name"], "keel-pko-ssh-known-hosts");
+        assert_eq!(parsed["data"]["known_hosts"], line);
+        let mut other = cm;
+        other.metadata.namespace = Some("tenant-default".to_string());
+        assert!(pko_operator_known_hosts_manifest(&other).is_err());
+    }
 
     /// FU-3: a fresh bootstrap reports the repository as created, not existing.
     #[test]

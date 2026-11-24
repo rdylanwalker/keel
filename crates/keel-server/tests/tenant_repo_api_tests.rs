@@ -30,6 +30,9 @@ use tower::ServiceExt;
 
 const HOST_KEY: &str =
     "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl";
+/// GitHub's host key after a (simulated) rotation.
+const ROTATED_HOST_KEY: &str =
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFnlA8GQQr+oPZQglSMbLvfj4kl6/mLgPbpzmKC0yBP5";
 const STRAY_KEY: &str =
     "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl stray";
 const FORGE_ORIGIN: &str = "https://forgejo.keel.local:8888";
@@ -48,6 +51,8 @@ struct ForgeLog {
     deploy_keys: Mutex<Vec<DeployKeyInfo>>,
     fail_mint: AtomicBool,
     protected: AtomicBool,
+    /// Published SSH host keys (`GET /meta`); `None` means `[HOST_KEY]`.
+    host_keys: Mutex<Option<Vec<String>>>,
 }
 
 impl ForgeLog {
@@ -260,7 +265,14 @@ impl ForgeProvider for MockForge {
         Ok(ForkPolicyOutcome::AlreadyDisabled)
     }
     async fn ssh_host_keys(&self) -> Result<Vec<String>, ForgeError> {
-        Ok(vec![HOST_KEY.to_string()])
+        self.log.record("ssh_host_keys");
+        Ok(self
+            .log
+            .host_keys
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| vec![HOST_KEY.to_string()]))
     }
 }
 
@@ -293,6 +305,13 @@ impl SecretBackend for FailingCredentialStore {
     }
     async fn namespace_exists(&self, namespace: &str) -> Result<bool, KubeError> {
         SecretBackend::namespace_exists(&self.inner, namespace).await
+    }
+    async fn upsert_config_map(
+        &self,
+        namespace: &str,
+        config_map: k8s_openapi::api::core::v1::ConfigMap,
+    ) -> Result<(), KubeError> {
+        self.inner.upsert_config_map(namespace, config_map).await
     }
 }
 
@@ -498,6 +517,14 @@ fn git_show(repo: &std::path::Path, rev_path: &str) -> Option<String> {
     out.status
         .success()
         .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// `known_hosts` of `keel-system/keel-pko-ssh-known-hosts` (PKO operator branch tracking).
+async fn operator_known_hosts(store: &InMemorySecretStore) -> Option<String> {
+    store
+        .inspect_config_map("keel-system", "keel-pko-ssh-known-hosts")
+        .await
+        .map(|cm| cm.data.unwrap()["known_hosts"].clone())
 }
 
 async fn credentials(store: &InMemorySecretStore, tenant: &str) -> Option<Secret> {
@@ -734,6 +761,8 @@ async fn gitlab_tenant_uses_a_project_deploy_token() {
     let secret = credentials(&fx.store, "web").await.unwrap();
     assert_eq!(data(&secret, "username"), "gitlab+deploy-token-1");
     assert!(!secret.data.as_ref().unwrap().contains_key("ca.crt"));
+    // HTTPS tenant repositories need no PKO operator host keys.
+    assert_eq!(operator_known_hosts(&fx.store).await, None);
 }
 
 #[tokio::test]
@@ -767,6 +796,56 @@ async fn github_tenant_uses_a_read_only_deploy_key_with_pinned_host_keys() {
         )
     );
     assert_eq!(annotation(&secret, "keel.io/credential-id"), keys[0].id);
+    // The PKO operator trusts the same platform-published host keys for branch tracking, and the
+    // host keys of the freshly issued credential are reused (one `GET /meta`).
+    assert_eq!(
+        operator_known_hosts(&fx.store).await.as_deref(),
+        Some(format!("github.com {HOST_KEY}\n").as_str())
+    );
+    assert_eq!(
+        fx.log
+            .calls()
+            .iter()
+            .filter(|c| *c == "ssh_host_keys")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn pko_operator_known_hosts_are_restored_and_refreshed_from_the_forge() {
+    let fx = fixture(TenantRepoForgeKind::GitHub).await;
+    create_and_merge(&fx.state, "web").await;
+    // A deleted ConfigMap is restored on the next reconcile, even when the credential is kept.
+    fx.store
+        .remove_config_map("keel-system", "keel-pko-ssh-known-hosts")
+        .await;
+    let (status, again, _) = create(&fx.state, "web").await;
+    assert!(status.is_success(), "{again}");
+    assert_eq!(again["repository"]["cluster"]["credential"], "existed");
+    assert_eq!(
+        operator_known_hosts(&fx.store).await.as_deref(),
+        Some(format!("github.com {HOST_KEY}\n").as_str())
+    );
+
+    // GitHub rotates its host keys: `keel tenant repair-credentials` refreshes the operator's
+    // known_hosts (and the tenant's Secret) from the forge, never from the tenant namespace.
+    *fx.log.host_keys.lock().unwrap() = Some(vec![ROTATED_HOST_KEY.to_string()]);
+    let (status, repaired, _) = send(
+        &fx.state,
+        Method::POST,
+        "/api/v1/tenants/web/credentials/repair",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{repaired}");
+    let rotated = format!("github.com {ROTATED_HOST_KEY}\n");
+    assert_eq!(
+        operator_known_hosts(&fx.store).await.as_deref(),
+        Some(rotated.as_str())
+    );
+    let secret = credentials(&fx.store, "web").await.unwrap();
+    assert_eq!(data(&secret, "known_hosts"), rotated);
 }
 
 #[tokio::test]

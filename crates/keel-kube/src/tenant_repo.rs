@@ -30,9 +30,7 @@ use std::fmt;
 
 use keel_core::KEEL_SYSTEM_NAMESPACE;
 use keel_pko::{
-    KEEL_SSH_KNOWN_HOSTS_FILE, KEEL_SSH_KNOWN_HOSTS_MOUNT_PATH, KEEL_SSH_KNOWN_HOSTS_VOLUME_NAME,
     PkoEnvRef, PkoGitAuth, PkoGitBasicAuth, PkoGitSource, PkoGitSshAuth, PkoWorkspaceTemplate,
-    SSH_KNOWN_HOSTS_ENV,
 };
 use serde_json::{Value, json};
 
@@ -1005,8 +1003,8 @@ fn validate_tenant_repo_dir(tenant_id: &str, repo_dir: &str) -> Result<(), KubeE
 
 /// `gitSource` of a tenant PKO `Stack` cloning its own repository: tracks `main` (shallow),
 /// `repoDir` inside `tenants/<id>/`, `gitAuth` from `tenant-<id>/keel-gitops-credentials`. For
-/// SSH also apply [`tenant_repo_workspace_template`] (workspace `known_hosts`) and
-/// [`merge_pko_operator_ssh_known_hosts_values`] (operator branch tracking).
+/// SSH also apply [`tenant_repo_workspace_template`] (workspace `known_hosts`); the operator
+/// tracks the branch with the host keys of [`build_pko_operator_known_hosts_configmap`].
 pub fn tenant_repo_stack_git_source(
     source: &TenantRepoSource,
     repo_dir: &str,
@@ -1067,8 +1065,8 @@ pub fn tenant_repo_workspace_template(
     }
 }
 
-/// `true` when some tenant repository is reached over SSH, i.e. the PKO operator needs
-/// `SSH_KNOWN_HOSTS` ([`merge_pko_operator_ssh_known_hosts_values`]) to track its branch.
+/// `true` when some tenant repository is reached over SSH, i.e. the PKO operator needs the
+/// host keys of [`build_pko_operator_known_hosts_configmap`] to track its branch.
 pub fn pko_operator_needs_ssh_known_hosts(sources: &[TenantRepoSource]) -> bool {
     sources
         .iter()
@@ -1077,7 +1075,12 @@ pub fn pko_operator_needs_ssh_known_hosts(sources: &[TenantRepoSource]) -> bool 
 
 /// Synthesizes `keel-system/keel-pko-ssh-known-hosts` (key `known_hosts`): the public SSH host
 /// keys of every SSH tenant repository (deduplicated, sorted), read by the PKO operator through
-/// `SSH_KNOWN_HOSTS` for **every** tenant's branch tracking.
+/// `SSH_KNOWN_HOSTS` for **every** tenant's branch tracking. The operator mounts it statically
+/// (`deploy/seed/core-addons/pko.yaml` and the Stage 0 `control-plane` program: `extraEnv`
+/// `SSH_KNOWN_HOSTS=/etc/keel-ssh/known_hosts`, `extraVolumes` with `optional: true` so the
+/// operator, which also runs the protected management Stack, starts without it: anti-lockout).
+/// The kubelet refreshes the mounted file when the ConfigMap changes and go-git reads it on
+/// every SSH connection, so no operator restart or HelmRelease edit is needed.
 ///
 /// Each `(source, known_hosts)` pair may only contribute entries for exactly that source's host
 /// ([`TenantRepoSource::ssh_known_hosts_host`]); anything else is refused. The `known_hosts`
@@ -1121,60 +1124,6 @@ pub fn build_pko_operator_known_hosts_configmap(
         },
         "data": { SSH_KNOWN_HOSTS_KEY: content },
     }))
-}
-
-/// Upserts the PKO operator SSH host-key trust into the `pulumi-kubernetes-operator` HelmRelease
-/// `values` (alongside the existing `SSL_CERT_DIR` Keel CA trust, which is kept):
-/// `extraEnv` `SSH_KNOWN_HOSTS=/etc/keel-ssh/known_hosts`, `extraVolumes` from
-/// [`PKO_OPERATOR_SSH_KNOWN_HOSTS_CONFIGMAP`] (`optional: true`, so the operator, which also runs
-/// the protected management Stack, starts without it: anti-lockout) and the read-only mount.
-/// Idempotent. Only needed when [`pko_operator_needs_ssh_known_hosts`].
-pub fn merge_pko_operator_ssh_known_hosts_values(values: &mut Value) -> Result<(), KubeError> {
-    if values.is_null() {
-        *values = json!({});
-    }
-    let obj = values.as_object_mut().ok_or_else(|| {
-        KubeError::InvalidInput("PKO HelmRelease values are not a map".to_string())
-    })?;
-    let upsert = |obj: &mut serde_json::Map<String, Value>, key: &str, item: Value| {
-        let list = obj.entry(key).or_insert_with(|| json!([]));
-        let items = list.as_array_mut().ok_or_else(|| {
-            KubeError::InvalidInput(format!("PKO HelmRelease values `{key}` is not a list"))
-        })?;
-        items.retain(|i| i.get("name") != item.get("name"));
-        items.push(item);
-        Ok::<(), KubeError>(())
-    };
-    upsert(
-        obj,
-        "extraEnv",
-        json!({
-            "name": SSH_KNOWN_HOSTS_ENV,
-            "value": format!("{KEEL_SSH_KNOWN_HOSTS_MOUNT_PATH}/{KEEL_SSH_KNOWN_HOSTS_FILE}"),
-        }),
-    )?;
-    upsert(
-        obj,
-        "extraVolumes",
-        json!({
-            "name": KEEL_SSH_KNOWN_HOSTS_VOLUME_NAME,
-            "configMap": {
-                "name": PKO_OPERATOR_SSH_KNOWN_HOSTS_CONFIGMAP,
-                "optional": true,
-                "items": [{ "key": SSH_KNOWN_HOSTS_KEY, "path": KEEL_SSH_KNOWN_HOSTS_FILE }],
-            },
-        }),
-    )?;
-    upsert(
-        obj,
-        "extraVolumeMounts",
-        json!({
-            "name": KEEL_SSH_KNOWN_HOSTS_VOLUME_NAME,
-            "mountPath": KEEL_SSH_KNOWN_HOSTS_MOUNT_PATH,
-            "readOnly": true,
-        }),
-    )?;
-    Ok(())
 }
 
 #[cfg(test)]

@@ -163,8 +163,9 @@ pub fn management_addon_mutable_values(id: &str) -> Option<&'static [&'static st
             "/resources|tolerations|nodeSelector|affinity|topologySpreadConstraints",
             "/persistence/size|storageClass|accessModes|labels",
         ]),
-        // PKO runs every management/tenant Stack. Its operator CA trust (`extraEnv`
-        // `SSL_CERT_DIR`, `extraVolumes`/`extraVolumeMounts` of the public `keel-ca-bundle`),
+        // PKO runs every management/tenant Stack. Its operator CA and SSH host-key trust
+        // (`extraEnv` `SSL_CERT_DIR`/`SSH_KNOWN_HOSTS`, `extraVolumes`/`extraVolumeMounts` of the
+        // public `keel-ca-bundle` and `keel-pko-ssh-known-hosts`),
         // security contexts, RBAC and service account decide which Git endpoints it trusts and
         // what it may do, so only replicas (`replicaCount`, the key the chart reads), log
         // settings, sizing and scheduling are mutable. The `catalog/core` upgrade form schema

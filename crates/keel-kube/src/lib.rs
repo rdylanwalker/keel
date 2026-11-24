@@ -66,10 +66,11 @@ pub use tenant::{
     synthesize_remote_target_namespace, synthesize_remote_target_namespace_yaml, tenant_namespace,
     tenant_s3_backend_url, validate_canary_host,
 };
-// PKO SSH known-hosts helpers: not wired up yet (SDD.md "known gap"); kept as the planned fix.
+// PKO operator SSH host keys (`keel-system/keel-pko-ssh-known-hosts`, written by
+// `keel_server::tenant_repos` for SSH tenant repositories, mounted statically into the operator).
 pub use tenant_repo::{
     PKO_OPERATOR_SSH_KNOWN_HOSTS_CONFIGMAP, build_pko_operator_known_hosts_configmap,
-    merge_pko_operator_ssh_known_hosts_values, pko_operator_needs_ssh_known_hosts,
+    pko_operator_needs_ssh_known_hosts,
 };
 pub use tenant_repo::{
     SSH_IDENTITY_PUB_KEY, TENANT_GITOPS_CREDENTIALS_SECRET_NAME, TENANT_REPO_STUB_FILES,

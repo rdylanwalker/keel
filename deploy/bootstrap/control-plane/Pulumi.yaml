@@ -255,17 +255,33 @@ resources:
         # system roots: the controller resolves tenant/preview Stack branches (go-git ls-remote)
         # against the in-cluster Forgejo HTTPS ingress (`forge.publicUrl`). `optional`, so the
         # operator also starts before the bundle exists or without a local CA.
+        # SSH host keys for the same branch tracking over SSH (GitHub tenant repositories, go-git
+        # reads `SSH_KNOWN_HOSTS`): keel-server / `keel bootstrap init` write the public host keys of
+        # the platform forge to `keel-system/keel-pko-ssh-known-hosts` when tenants use SSH. Also
+        # `optional` (anti-lockout): without it HTTPS sources are unaffected and SSH ones fail closed.
         extraEnv:
           - name: SSL_CERT_DIR
             value: /etc/ssl/certs:/etc/keel-ca
+          - name: SSH_KNOWN_HOSTS
+            value: /etc/keel-ssh/known_hosts
         extraVolumes:
           - name: keel-ca
             configMap:
               name: keel-ca-bundle
               optional: true
+          - name: keel-ssh-known-hosts
+            configMap:
+              name: keel-pko-ssh-known-hosts
+              optional: true
+              items:
+                - key: known_hosts
+                  path: known_hosts
         extraVolumeMounts:
           - name: keel-ca
             mountPath: /etc/keel-ca
+            readOnly: true
+          - name: keel-ssh-known-hosts
+            mountPath: /etc/keel-ssh
             readOnly: true
 
   s3StateBackend:

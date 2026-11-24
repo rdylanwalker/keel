@@ -50,7 +50,7 @@ Previews never receive control-plane credentials:
 - The PR comment table and GUI show only what PKO prints in its workspace log, up to the last 4000 lines.
 - A preview needs the tenant's repository credential (`tenant-<id>/keel-gitops-credentials`). If it is missing or unusable, the preview is reported as `notExecuted` with the reason; run `keel tenant repair-credentials <id>` to re-mint it. Keel never falls back to the platform repository or a platform token.
 - Every proposal for a tenant (Helm, manifest, bundle and Stack) is refused with `409 Conflict` until the skeleton PR in the tenant's repository (adding `tenants/<id>/kustomization.yaml`) is merged. Pulumi Stack proposals also need the platform stub PR merged, so that the tenant's `keel-gitops` source points at the tenant repository; until then they are refused with `409 Conflict` (logged with `audit="stack-source-denied"`). See [Create a tenant](provisioning.md#2-create-a-tenant) for the merge order.
-- GitHub-hosted tenant repositories are cloned over SSH. Previews pin the PR commit and mount the pinned host keys, but the PKO operator does not get those host keys yet, so GitHub-hosted tenant Stacks are not verified end to end.
+- GitHub-hosted tenant repositories are cloned over SSH. Previews pin the PR commit and mount the pinned host keys. Tenant Stacks follow `main`, which the PKO operator checks with the same host keys from `keel-system/keel-pko-ssh-known-hosts`.
 - With the development-only Local Git provider, tenants created through the API have no Git source of their own, so their Pulumi Stacks and Pulumi-engine apps are refused with `409`.
 
 ## Deep Links

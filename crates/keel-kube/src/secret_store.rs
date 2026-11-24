@@ -13,7 +13,7 @@ use aes_gcm::aead::{Aead, Payload};
 use aes_gcm::{Aes256Gcm, Key, KeyInit, Nonce};
 use async_trait::async_trait;
 use k8s_openapi::ByteString;
-use k8s_openapi::api::core::v1::Secret;
+use k8s_openapi::api::core::v1::{ConfigMap, Secret};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use keel_core::KEEL_SYSTEM_NAMESPACE;
 use kube::api::PostParams;
@@ -267,6 +267,11 @@ pub trait SecretStateStore: Send + Sync {
         tenant_id: &str,
         secret: Secret,
     ) -> Result<bool, KubeError>;
+
+    /// Creates or replaces `keel-system/keel-pko-ssh-known-hosts` (built by
+    /// [`crate::build_pko_operator_known_hosts_configmap`]: public SSH host keys the PKO operator
+    /// trusts for tenant branch tracking). Refuses any other ConfigMap.
+    async fn put_pko_operator_known_hosts(&self, config_map: ConfigMap) -> Result<(), KubeError>;
 }
 
 /// Result of [`SecretStateStore::ensure_pulumi_passphrase`]. Never carries the passphrase.
@@ -364,6 +369,17 @@ pub trait SecretBackend: Send + Sync {
     ) -> Result<Secret, KubeError>;
     /// `true` when `namespace` exists (in-memory stores: unless marked absent).
     async fn namespace_exists(&self, namespace: &str) -> Result<bool, KubeError>;
+    /// Creates or replaces a (non-secret) ConfigMap. Backends that never write platform
+    /// ConfigMaps (Stage 0 S3 identity operations) keep the default, which refuses.
+    async fn upsert_config_map(
+        &self,
+        namespace: &str,
+        _config_map: ConfigMap,
+    ) -> Result<(), KubeError> {
+        Err(KubeError::Unavailable(format!(
+            "this secret backend cannot write ConfigMaps in `{namespace}`"
+        )))
+    }
 }
 
 /// Production `SecretStateStore` backed by the Kubernetes API server (`kube::Api<Secret>`).
@@ -440,11 +456,44 @@ impl SecretBackend for K8sSecretStore {
         let api: Api<k8s_openapi::api::core::v1::Namespace> = Api::all(self.client.clone());
         Ok(api.get_opt(namespace).await?.is_some())
     }
+
+    async fn upsert_config_map(
+        &self,
+        namespace: &str,
+        mut config_map: ConfigMap,
+    ) -> Result<(), KubeError> {
+        let name =
+            config_map.metadata.name.clone().ok_or_else(|| {
+                KubeError::InvalidInput("ConfigMap metadata.name is required".into())
+            })?;
+        // Every writer (keel-server tasks, the CLI, `kubectl apply` at Stage 0) stores the same
+        // public data, so the replace is unconditional: no `resourceVersion`/`uid` precondition
+        // that a concurrent writer could turn into a 409 between a read and the write.
+        config_map.metadata.resource_version = None;
+        config_map.metadata.uid = None;
+        let api: Api<ConfigMap> = Api::namespaced(self.client.clone(), namespace);
+        let params = PostParams::default();
+        match api.replace(&name, &params, &config_map).await {
+            Ok(_) => return Ok(()),
+            Err(kube::Error::Api(err)) if err.code == 404 => {}
+            Err(err) => return Err(KubeError::Kube(err)),
+        }
+        match api.create(&params, &config_map).await {
+            Ok(_) => Ok(()),
+            // Created concurrently since the replace saw 404: overwrite it the same way.
+            Err(kube::Error::Api(err)) if err.code == 409 => {
+                api.replace(&name, &params, &config_map).await?;
+                Ok(())
+            }
+            Err(err) => Err(KubeError::Kube(err)),
+        }
+    }
 }
 
 #[derive(Default)]
 struct InMemoryState {
     secrets: HashMap<(String, String), Secret>,
+    config_maps: HashMap<(String, String), ConfigMap>,
     revision_counter: u64,
     /// Namespaces reported as missing by [`SecretBackend::namespace_exists`] (tests).
     absent_namespaces: std::collections::HashSet<String>,
@@ -484,6 +533,25 @@ impl InMemorySecretStore {
         } else {
             guard.absent_namespaces.insert(namespace.to_string());
         }
+    }
+
+    /// Inspects a ConfigMap written through [`SecretBackend::upsert_config_map`] (tests).
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn inspect_config_map(&self, namespace: &str, name: &str) -> Option<ConfigMap> {
+        let guard = self.state.read().await;
+        guard
+            .config_maps
+            .get(&(namespace.to_string(), name.to_string()))
+            .cloned()
+    }
+
+    /// Removes the ConfigMap `namespace/name` (tests: simulate a deleted ConfigMap).
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn remove_config_map(&self, namespace: &str, name: &str) {
+        let mut guard = self.state.write().await;
+        guard
+            .config_maps
+            .remove(&(namespace.to_string(), name.to_string()));
     }
 
     /// Removes `namespace/name` (tests: simulate a lost Secret).
@@ -575,6 +643,28 @@ impl SecretBackend for InMemorySecretStore {
             .await
             .absent_namespaces
             .contains(namespace))
+    }
+
+    async fn upsert_config_map(
+        &self,
+        namespace: &str,
+        mut config_map: ConfigMap,
+    ) -> Result<(), KubeError> {
+        let name =
+            config_map.metadata.name.clone().ok_or_else(|| {
+                KubeError::InvalidInput("ConfigMap metadata.name is required".into())
+            })?;
+        let mut guard = self.state.write().await;
+        if guard.absent_namespaces.contains(namespace) {
+            return Err(in_memory_missing_namespace(namespace));
+        }
+        guard.revision_counter += 1;
+        config_map.metadata.namespace = Some(namespace.to_string());
+        config_map.metadata.resource_version = Some(guard.revision_counter.to_string());
+        guard
+            .config_maps
+            .insert((namespace.to_string(), name), config_map);
+        Ok(())
     }
 }
 
@@ -706,6 +796,20 @@ impl<B: SecretBackend> SecretStateStore for B {
         let wanted = credential_id(&secret);
         let stored = self.create_secret_if_absent(&namespace, secret).await?;
         Ok(wanted.is_some() && credential_id(&stored) == wanted)
+    }
+
+    async fn put_pko_operator_known_hosts(&self, config_map: ConfigMap) -> Result<(), KubeError> {
+        let meta = &config_map.metadata;
+        if meta.name.as_deref() != Some(crate::tenant_repo::PKO_OPERATOR_SSH_KNOWN_HOSTS_CONFIGMAP)
+            || meta.namespace.as_deref() != Some(KEEL_SYSTEM_NAMESPACE)
+        {
+            return Err(KubeError::InvalidInput(format!(
+                "refusing to write a ConfigMap other than `{KEEL_SYSTEM_NAMESPACE}/{}`",
+                crate::tenant_repo::PKO_OPERATOR_SSH_KNOWN_HOSTS_CONFIGMAP
+            )));
+        }
+        self.upsert_config_map(KEEL_SYSTEM_NAMESPACE, config_map)
+            .await
     }
 }
 
@@ -1337,6 +1441,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pko_operator_known_hosts_put_refuses_other_config_maps() {
+        let store = InMemorySecretStore::new();
+        let source = crate::TenantRepoSource::new(
+            "acme",
+            "ssh://git@github.com/acme-org/infra-gitops-tenant-acme.git",
+        )
+        .unwrap();
+        let line = "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl\n";
+        let doc = crate::build_pko_operator_known_hosts_configmap(&[(&source, line)]).unwrap();
+        let cm: ConfigMap = serde_json::from_value(doc).unwrap();
+        store
+            .put_pko_operator_known_hosts(cm.clone())
+            .await
+            .unwrap();
+        // Idempotent replace.
+        store
+            .put_pko_operator_known_hosts(cm.clone())
+            .await
+            .unwrap();
+        let stored = store
+            .inspect_config_map(KEEL_SYSTEM_NAMESPACE, "keel-pko-ssh-known-hosts")
+            .await
+            .unwrap();
+        assert_eq!(stored.data.unwrap()["known_hosts"], line);
+
+        let mut renamed = cm.clone();
+        renamed.metadata.name = Some("keel-ca-bundle".to_string());
+        assert!(store.put_pko_operator_known_hosts(renamed).await.is_err());
+        let mut moved = cm;
+        moved.metadata.namespace = Some("tenant-acme".to_string());
+        assert!(store.put_pko_operator_known_hosts(moved).await.is_err());
+        assert!(
+            store
+                .inspect_config_map(KEEL_SYSTEM_NAMESPACE, "keel-ca-bundle")
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn tenant_gitops_credentials_put_refuses_other_secrets() {
         let store = InMemorySecretStore::new();
         let source = crate::TenantRepoSource::new(
@@ -1862,5 +2006,153 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(passphrase_of(&bad), "");
+    }
+
+    /// `K8sSecretStore` over a scripted API server: each request pops the next `(status, body)`
+    /// and is recorded as `(method, path, request body)`.
+    type RecordedRequests = Arc<std::sync::Mutex<Vec<(String, String, serde_json::Value)>>>;
+
+    fn scripted_k8s_store(
+        responses: Vec<(u16, serde_json::Value)>,
+    ) -> (K8sSecretStore, RecordedRequests) {
+        let recorded: RecordedRequests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let queue = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from(
+            responses,
+        )));
+        let rec = recorded.clone();
+        let service = tower::service_fn(move |req: http::Request<kube::client::Body>| {
+            let rec = rec.clone();
+            let queue = queue.clone();
+            async move {
+                let method = req.method().to_string();
+                let path = req.uri().path().to_string();
+                let bytes = req.into_body().collect_bytes().await.unwrap();
+                let body = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+                rec.lock().unwrap().push((method, path, body));
+                let (status, body) = queue
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .expect("unscripted request");
+                Ok::<_, std::convert::Infallible>(
+                    http::Response::builder()
+                        .status(status)
+                        .header("content-type", "application/json")
+                        .body(kube::client::Body::from(body.to_string().into_bytes()))
+                        .unwrap(),
+                )
+            }
+        });
+        (
+            K8sSecretStore::new(Client::new(service, "default")),
+            recorded,
+        )
+    }
+
+    fn api_status(code: u16, reason: &str) -> (u16, serde_json::Value) {
+        (
+            code,
+            serde_json::json!({
+                "kind": "Status", "apiVersion": "v1", "status": "Failure",
+                "reason": reason, "code": code, "message": reason
+            }),
+        )
+    }
+
+    fn known_hosts_config_map(resource_version: Option<&str>) -> ConfigMap {
+        ConfigMap {
+            metadata: ObjectMeta {
+                name: Some("keel-pko-ssh-known-hosts".into()),
+                resource_version: resource_version.map(str::to_string),
+                uid: resource_version.map(|_| "stale-uid".to_string()),
+                ..Default::default()
+            },
+            data: Some(BTreeMap::from([(
+                "known_hosts".to_string(),
+                "github.com ssh-ed25519 AAAA".to_string(),
+            )])),
+            ..Default::default()
+        }
+    }
+
+    fn stored_config_map() -> (u16, serde_json::Value) {
+        (
+            200,
+            serde_json::json!({
+                "apiVersion": "v1", "kind": "ConfigMap",
+                "metadata": { "name": "keel-pko-ssh-known-hosts", "resourceVersion": "9" }
+            }),
+        )
+    }
+
+    const KNOWN_HOSTS_PATH: &str =
+        "/api/v1/namespaces/keel-system/configmaps/keel-pko-ssh-known-hosts";
+
+    #[tokio::test]
+    async fn k8s_upsert_config_map_replaces_unconditionally_without_a_read() {
+        let (store, recorded) = scripted_k8s_store(vec![stored_config_map()]);
+        store
+            .upsert_config_map(KEEL_SYSTEM_NAMESPACE, known_hosts_config_map(Some("3")))
+            .await
+            .unwrap();
+        let recorded = recorded.lock().unwrap();
+        assert_eq!(recorded.len(), 1, "{recorded:?}");
+        let (method, path, body) = &recorded[0];
+        assert_eq!((method.as_str(), path.as_str()), ("PUT", KNOWN_HOSTS_PATH));
+        // No optimistic-lock precondition a concurrent writer could turn into a 409.
+        assert!(body["metadata"].get("resourceVersion").is_none(), "{body}");
+        assert!(body["metadata"].get("uid").is_none(), "{body}");
+        assert_eq!(body["data"]["known_hosts"], "github.com ssh-ed25519 AAAA");
+    }
+
+    #[tokio::test]
+    async fn k8s_upsert_config_map_creates_when_missing() {
+        let (store, recorded) =
+            scripted_k8s_store(vec![api_status(404, "NotFound"), stored_config_map()]);
+        store
+            .upsert_config_map(KEEL_SYSTEM_NAMESPACE, known_hosts_config_map(None))
+            .await
+            .unwrap();
+        let recorded = recorded.lock().unwrap();
+        let calls: Vec<_> = recorded
+            .iter()
+            .map(|(m, p, _)| (m.as_str(), p.as_str()))
+            .collect();
+        assert_eq!(
+            calls,
+            vec![
+                ("PUT", KNOWN_HOSTS_PATH),
+                ("POST", "/api/v1/namespaces/keel-system/configmaps"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn k8s_upsert_config_map_overwrites_a_concurrently_created_config_map() {
+        let (store, recorded) = scripted_k8s_store(vec![
+            api_status(404, "NotFound"),
+            api_status(409, "AlreadyExists"),
+            stored_config_map(),
+        ]);
+        store
+            .upsert_config_map(KEEL_SYSTEM_NAMESPACE, known_hosts_config_map(None))
+            .await
+            .unwrap();
+        let recorded = recorded.lock().unwrap();
+        assert_eq!(recorded.len(), 3, "{recorded:?}");
+        let (method, path, body) = &recorded[2];
+        assert_eq!((method.as_str(), path.as_str()), ("PUT", KNOWN_HOSTS_PATH));
+        assert!(body["metadata"].get("resourceVersion").is_none(), "{body}");
+    }
+
+    #[tokio::test]
+    async fn k8s_upsert_config_map_surfaces_other_api_errors() {
+        let (store, recorded) = scripted_k8s_store(vec![api_status(403, "Forbidden")]);
+        let err = store
+            .upsert_config_map(KEEL_SYSTEM_NAMESPACE, known_hosts_config_map(None))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, KubeError::Kube(_)), "{err:?}");
+        assert_eq!(recorded.lock().unwrap().len(), 1);
     }
 }

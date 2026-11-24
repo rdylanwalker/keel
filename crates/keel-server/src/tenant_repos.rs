@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use k8s_openapi::api::core::v1::Secret;
+use k8s_openapi::api::core::v1::{ConfigMap, Secret};
 use keel_core::SopsManager;
 use keel_git::{
     BranchProtectionOutcome, ForgeError, ForgeProvider, ForkPolicyOutcome, GitRunner,
@@ -29,7 +29,8 @@ use keel_git::{
 };
 use keel_kube::{
     SecretStateStore, TenantAgeKey, TenantGitopsCredentialStatus, TenantRepoCredential,
-    TenantRepoSource, tenant_gitops_credentials_secret, tenant_gitops_credentials_status,
+    TenantRepoSource, build_pko_operator_known_hosts_configmap, pko_operator_needs_ssh_known_hosts,
+    tenant_gitops_credentials_secret, tenant_gitops_credentials_status,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -678,13 +679,9 @@ pub async fn issue_credential(
                     "GitHub tenant repositories need an SSH clone base".to_string(),
                 ));
             };
-            let host_keys = forge
-                .admin
-                .ssh_host_keys()
+            let known_hosts = forge_known_hosts(forge, host, *port)
                 .await
                 .map_err(err("SSH host key lookup"))?;
-            let refs: Vec<&str> = host_keys.iter().map(String::as_str).collect();
-            let known_hosts = known_hosts_file(host, *port, &refs)?;
             let title = format!("{TENANT_DEPLOY_KEY_TITLE_PREFIX}{tenant}");
             let pair = generate_ed25519_key_pair(&title)?;
             let ensured = forge
@@ -703,6 +700,63 @@ pub async fn issue_credential(
             })
         }
     }
+}
+
+/// `known_hosts` file for the platform forge's SSH endpoint `host:port`, from the host keys the
+/// forge publishes (GitHub `GET /meta`; never trust-on-first-use). Public data.
+async fn forge_known_hosts(
+    forge: &TenantRepoForge,
+    host: &str,
+    port: u16,
+) -> Result<String, ForgeError> {
+    let host_keys = forge.admin.ssh_host_keys().await?;
+    let refs: Vec<&str> = host_keys.iter().map(String::as_str).collect();
+    known_hosts_file(host, port, &refs)
+}
+
+/// Writes `keel-system/keel-pko-ssh-known-hosts`, the public SSH host keys the PKO operator
+/// trusts when it tracks the `main` branch of SSH (GitHub) tenant repositories (mounted
+/// statically through `SSH_KNOWN_HOSTS`, `deploy/seed/core-addons/pko.yaml`). The keys come from
+/// the **platform** forge configuration (`known_hosts`, or the forge's published host keys),
+/// never from a Secret in a tenant namespace. Every tenant repository lives on the one platform
+/// forge, so the ConfigMap always holds exactly that host's current keys (rewritten on every
+/// credential reconcile, so `keel tenant repair-credentials` also refreshes rotated keys).
+/// No-op for HTTPS forges.
+pub async fn ensure_pko_operator_known_hosts(
+    forge: &TenantRepoForge,
+    tenant: &str,
+    known_hosts: Option<&str>,
+    secrets: &dyn TenantCredentialSecrets,
+) -> Result<(), ServerError> {
+    let source = forge.source(tenant)?;
+    if !pko_operator_needs_ssh_known_hosts(std::slice::from_ref(&source)) {
+        return Ok(());
+    }
+    let known_hosts = match (known_hosts, &forge.clone_base) {
+        (Some(known_hosts), _) => known_hosts.to_string(),
+        (None, TenantRepoCloneBase::Ssh { host, port }) => {
+            forge_known_hosts(forge, host, *port).await.map_err(|e| {
+                provisioning_error(
+                    tenant,
+                    &forge
+                        .target(tenant)
+                        .map(|t| t.full_name())
+                        .unwrap_or_default(),
+                    "SSH host key lookup",
+                    e,
+                )
+            })?
+        }
+        (None, _) => {
+            return Err(ServerError::Internal(
+                "SSH tenant repositories need an SSH clone base".to_string(),
+            ));
+        }
+    };
+    let doc = build_pko_operator_known_hosts_configmap(&[(&source, known_hosts.as_str())])?;
+    let config_map: ConfigMap = serde_json::from_value(doc)
+        .map_err(|e| ServerError::Internal(format!("PKO known_hosts ConfigMap: {e}")))?;
+    secrets.put_pko_operator_known_hosts(config_map).await
 }
 
 /// Revokes a credential issued by [`issue_credential`] (missing is success).
@@ -825,6 +879,9 @@ pub trait TenantCredentialSecrets: Send + Sync {
     async fn create_if_absent(&self, tenant: &str, secret: Secret) -> Result<bool, ServerError>;
     /// Replaces an unusable Secret.
     async fn replace(&self, tenant: &str, secret: Secret) -> Result<(), ServerError>;
+    /// Creates or replaces `keel-system/keel-pko-ssh-known-hosts` (public host keys only,
+    /// [`ensure_pko_operator_known_hosts`]).
+    async fn put_pko_operator_known_hosts(&self, config_map: ConfigMap) -> Result<(), ServerError>;
 }
 
 /// [`TenantCredentialSecrets`] backed by a [`SecretStateStore`] (keel-server).
@@ -843,6 +900,9 @@ impl TenantCredentialSecrets for StoreCredentialSecrets<'_> {
     }
     async fn replace(&self, tenant: &str, secret: Secret) -> Result<(), ServerError> {
         Ok(self.0.put_tenant_gitops_credentials(tenant, secret).await?)
+    }
+    async fn put_pko_operator_known_hosts(&self, config_map: ConfigMap) -> Result<(), ServerError> {
+        Ok(self.0.put_pko_operator_known_hosts(config_map).await?)
     }
 }
 
@@ -888,12 +948,27 @@ pub async fn rotate_tenant_credential(
     store_tenant_credential(forge, tenant, secrets, true).await
 }
 
+/// [`store_credential_secret`], then (SSH forges) the PKO operator host keys
+/// ([`ensure_pko_operator_known_hosts`]), reusing the host keys of a freshly issued credential.
 async fn store_tenant_credential(
     forge: &TenantRepoForge,
     tenant: &str,
     secrets: &dyn TenantCredentialSecrets,
     force: bool,
 ) -> Result<StepOutcome, ServerError> {
+    let (outcome, known_hosts) = store_credential_secret(forge, tenant, secrets, force).await?;
+    ensure_pko_operator_known_hosts(forge, tenant, known_hosts.as_deref(), secrets).await?;
+    Ok(outcome)
+}
+
+/// Keeps or (re-)issues the credential Secret; returns the outcome and, when this call issued an
+/// SSH credential that was stored, its `known_hosts` (platform forge host keys).
+async fn store_credential_secret(
+    forge: &TenantRepoForge,
+    tenant: &str,
+    secrets: &dyn TenantCredentialSecrets,
+    force: bool,
+) -> Result<(StepOutcome, Option<String>), ServerError> {
     let source = forge.source(tenant)?;
     let existing = secrets.read(tenant).await?;
     let ssh = forge.credential_kind() == RepoCredentialKind::SshDeployKey;
@@ -907,11 +982,11 @@ async fn store_tenant_credential(
             match (credential_id, ssh, fingerprint) {
                 (Some(id), true, Some(fp)) => {
                     retire_stray_credentials(forge, tenant, Some(&id), Some(&fp)).await?;
-                    return Ok(StepOutcome::Existed);
+                    return Ok((StepOutcome::Existed, None));
                 }
                 (Some(id), false, _) => {
                     retire_stray_credentials(forge, tenant, Some(&id), None).await?;
-                    return Ok(StepOutcome::Existed);
+                    return Ok((StepOutcome::Existed, None));
                 }
                 (id, _, _) => {
                     tracing::warn!(
@@ -951,7 +1026,7 @@ async fn store_tenant_credential(
         Ok(false) => {
             // Another writer stored its credential first: keep it, revoke ours.
             revoke_credential(forge, tenant, &issued.id).await?;
-            return Ok(StepOutcome::Existed);
+            return Ok((StepOutcome::Existed, None));
         }
         Err(err) => {
             if let Err(revoke_err) = revoke_credential(forge, tenant, &issued.id).await {
@@ -983,7 +1058,11 @@ async fn store_tenant_credential(
         outcome = ?outcome,
         "Stored tenant repository read credential"
     );
-    Ok(outcome)
+    let known_hosts = match issued.credential {
+        TenantRepoCredential::SshDeployKey { known_hosts, .. } => Some(known_hosts),
+        _ => None,
+    };
+    Ok((outcome, known_hosts))
 }
 
 /// Outcome of a runtime provisioning step.

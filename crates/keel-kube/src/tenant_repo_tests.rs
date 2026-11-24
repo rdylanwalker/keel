@@ -1,4 +1,8 @@
 use super::*;
+use keel_pko::{
+    KEEL_SSH_KNOWN_HOSTS_FILE, KEEL_SSH_KNOWN_HOSTS_MOUNT_PATH, KEEL_SSH_KNOWN_HOSTS_VOLUME_NAME,
+    SSH_KNOWN_HOSTS_ENV,
+};
 
 const FORGEJO_URL: &str =
     "https://forgejo.keel.local:8888/keel-tenants/infra-gitops-tenant-acme.git";
@@ -547,42 +551,76 @@ fn workspace_template_adds_known_hosts_only_for_ssh() {
     );
 }
 
-#[test]
-fn pko_operator_known_hosts_values_are_merged_idempotently() {
+/// HelmRelease `values` of the PKO operator: the Flux seed and the Stage 0 `control-plane`
+/// Pulumi release (Flux adopts it in place, so both must carry the same trust wiring).
+fn pko_operator_values() -> Vec<(&'static str, Value)> {
     let seed: Value =
         keel_core::split_yaml_documents(include_str!("../../../deploy/seed/core-addons/pko.yaml"))
             .iter()
             .map(|d| noyalib::from_str::<Value>(d).unwrap())
             .find(|d| d["kind"] == "HelmRelease")
             .unwrap();
-    let mut values = seed["spec"]["values"].clone();
-    merge_pko_operator_ssh_known_hosts_values(&mut values).unwrap();
-    merge_pko_operator_ssh_known_hosts_values(&mut values).unwrap();
-    let env = values["extraEnv"].as_array().unwrap();
-    // The Keel CA trust stays; SSH_KNOWN_HOSTS is added once.
-    assert_eq!(env.len(), 2);
-    assert!(env.contains(&json!({"name": "SSL_CERT_DIR", "value": "/etc/ssl/certs:/etc/keel-ca"})));
-    assert!(
-        env.contains(&json!({"name": "SSH_KNOWN_HOSTS", "value": "/etc/keel-ssh/known_hosts"}))
-    );
-    let volumes = values["extraVolumes"].as_array().unwrap();
-    assert_eq!(volumes.len(), 2);
-    assert!(volumes.contains(&json!({
-        "name": "keel-ssh-known-hosts",
-        "configMap": {
-            "name": "keel-pko-ssh-known-hosts",
-            "optional": true,
-            "items": [{"key": "known_hosts", "path": "known_hosts"}]
-        }
-    })));
-    assert_eq!(values["extraVolumeMounts"].as_array().unwrap().len(), 2);
-    assert_eq!(values["rbac"]["createClusterAggregationRoles"], true);
+    let program: Value = noyalib::from_str(include_str!(
+        "../../../deploy/bootstrap/control-plane/Pulumi.yaml"
+    ))
+    .unwrap();
+    let stage0 = program["resources"]
+        .as_object()
+        .unwrap()
+        .values()
+        .find(|r| r["properties"]["name"] == "pulumi-kubernetes-operator")
+        .expect("Stage 0 PKO release");
+    vec![
+        ("seed", seed["spec"]["values"].clone()),
+        ("stage0", stage0["properties"]["values"].clone()),
+    ]
+}
 
-    let mut empty = Value::Null;
-    merge_pko_operator_ssh_known_hosts_values(&mut empty).unwrap();
-    assert_eq!(empty["extraEnv"].as_array().unwrap().len(), 1);
-    let mut bad = json!({"extraEnv": {"not": "a list"}});
-    assert!(merge_pko_operator_ssh_known_hosts_values(&mut bad).is_err());
+#[test]
+fn pko_operator_statically_mounts_the_optional_known_hosts_configmap() {
+    let file = format!("{KEEL_SSH_KNOWN_HOSTS_MOUNT_PATH}/{KEEL_SSH_KNOWN_HOSTS_FILE}");
+    for (which, values) in pko_operator_values() {
+        let env = values["extraEnv"].as_array().unwrap();
+        // The Keel CA trust stays next to the SSH host keys.
+        assert!(
+            env.contains(&json!({"name": "SSL_CERT_DIR", "value": "/etc/ssl/certs:/etc/keel-ca"})),
+            "{which}"
+        );
+        assert!(
+            env.contains(&json!({"name": SSH_KNOWN_HOSTS_ENV, "value": file})),
+            "{which}"
+        );
+        // `optional: true`: the operator (which also runs the protected management Stack) must
+        // start before any SSH tenant exists (anti-lockout).
+        assert!(
+            values["extraVolumes"].as_array().unwrap().contains(&json!({
+                "name": KEEL_SSH_KNOWN_HOSTS_VOLUME_NAME,
+                "configMap": {
+                    "name": PKO_OPERATOR_SSH_KNOWN_HOSTS_CONFIGMAP,
+                    "optional": true,
+                    "items": [{"key": "known_hosts", "path": KEEL_SSH_KNOWN_HOSTS_FILE}]
+                }
+            })),
+            "{which}"
+        );
+        // A directory mount (never `subPath`), so ConfigMap updates reach the running operator.
+        assert!(
+            values["extraVolumeMounts"]
+                .as_array()
+                .unwrap()
+                .contains(&json!({
+                    "name": KEEL_SSH_KNOWN_HOSTS_VOLUME_NAME,
+                    "mountPath": KEEL_SSH_KNOWN_HOSTS_MOUNT_PATH,
+                    "readOnly": true
+                })),
+            "{which}"
+        );
+        assert_eq!(values["rbac"]["createClusterAggregationRoles"], true);
+    }
+    let [(_, seed), (_, stage0)] = <[_; 2]>::try_from(pko_operator_values()).unwrap();
+    for key in ["extraEnv", "extraVolumes", "extraVolumeMounts"] {
+        assert_eq!(seed[key], stage0[key], "{key}");
+    }
 
     assert!(!pko_operator_needs_ssh_known_hosts(&[https()]));
     assert!(pko_operator_needs_ssh_known_hosts(&[https(), ssh()]));
