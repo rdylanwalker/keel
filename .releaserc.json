@@ -30,6 +30,7 @@
       "@semantic-release/release-notes-generator",
       {
         "preset": "conventionalcommits",
+        "parserOpts": { "issuePrefixes": ["GH-"] },
         "presetConfig": {
           "types": [
             { "type": "feat", "section": "Features" },

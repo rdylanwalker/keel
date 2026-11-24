@@ -7,6 +7,7 @@
 // way @semantic-release/core's loadPlugin() does at runtime, and asserts that:
 //   * release notes list ⚠ BREAKING CHANGES → Features → Bug Fixes → Performance
 //     Improvements → Reverts, and hidden types (chore, docs, ...) stay out of the notes;
+//   * "#N" in a commit body is not rendered as an issue reference;
 //   * the commit analyzer bumps breaking → minor (pre-1.0), feat → minor,
 //     fix/perf/revert → patch and chore → no release.
 import { existsSync, readFileSync } from "node:fs";
@@ -92,6 +93,17 @@ assert.ok(
   bangOnly.includes("BREAKING CHANGES") &&
     bangOnly.indexOf("BREAKING CHANGES") < bangOnly.indexOf("### Features"),
   `feat! must render a leading BREAKING CHANGES section:\n${bangOnly}`,
+);
+
+// Numbered items in a commit body ("finding #2") are not issue references: before this
+// rule, v0.14.0's notes claimed a fix "closes #2 #3" and linked unrelated issues.
+const numbered = await generateNotes(
+  notesCfg,
+  ctx([mk("fix(kube): recover stalled stacks\n\nFixes review findings #2 and #3.")]),
+);
+assert.ok(
+  !/closes|issues\/2|#2/.test(numbered),
+  `"#N" in a commit body must not render as an issue reference:\n${numbered}`,
 );
 
 // --- commit analyzer: release types ---------------------------------------------
