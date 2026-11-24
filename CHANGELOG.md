@@ -1,3 +1,32 @@
+## [0.14.0](https://github.com/rdylanwalker/keel/compare/v0.13.0...v0.14.0) (2026-11-24)
+
+### ⚠ BREAKING CHANGES
+
+* **kube:** the protect-control-plane Kyverno policy and the
+keel-server-reconcile-only ValidatingAdmissionPolicy now allow keel-server
+only the new pulumi.com/reconciliation-request annotation on
+flux-system/keel-system Stacks. On an existing cluster, Reconcile Now on
+those Stacks (for example management-cluster-core) is denied until you
+re-run keel bootstrap init, or re-apply
+deploy/seed/kyverno-policies/protect-control-plane.yaml and the
+keel-server catalog app. Keel is alpha, so no migration code is included.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+* **bootstrap:** the patch changes kindConfig, which is
+a replace-on-change property of kind:index:Cluster. Re-running
+`keel bootstrap init --target kind` against a management cluster
+created by an earlier version fails because mgmtCluster is
+protect: true; delete the cluster and bootstrap again. Existing
+kind-cluster blueprint stacks are replaced on their next update.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+### Bug Fixes
+
+* **bootstrap:** pull images in parallel on kind nodes ([471e2bd](https://github.com/rdylanwalker/keel/commit/471e2bdd94454dee4c6ae73b9de476caefec24b0))
+* **kube:** re-reconcile tenant Stacks when their git credentials return ([80cab65](https://github.com/rdylanwalker/keel/commit/80cab6565c5dc31b7968357f596b561c763cfb6e)), closes [#2](https://github.com/rdylanwalker/keel/issues/2) [#3](https://github.com/rdylanwalker/keel/issues/3)
+* **pko:** give the operator GitHub known_hosts for SSH tenant repositories ([00aa263](https://github.com/rdylanwalker/keel/commit/00aa263cd484baef1407504d96c491ab1ab723b4))
+
 ## [0.13.0](https://github.com/rdylanwalker/keel/compare/v0.12.2...v0.13.0) (2026-11-24)
 
 ### Features

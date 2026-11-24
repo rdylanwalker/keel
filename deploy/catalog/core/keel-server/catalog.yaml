@@ -17,7 +17,7 @@ metadata:
 spec:
   upstream:
     image: ghcr.io/rdylanwalker/keel
-    version: "0.13.0"
+    version: "0.14.0"
   progressiveDelivery:
     flaggerSupported: false
     defaultCanary: false
