@@ -1,3 +1,10 @@
+## [0.13.0](https://github.com/rdylanwalker/keel/compare/v0.12.2...v0.13.0) (2026-11-24)
+
+### Features
+
+* **bootstrap:** install k3s and export the kubeconfig on Proxmox and Hetzner ([e2ea5bd](https://github.com/rdylanwalker/keel/commit/e2ea5bdf11b232927a1a1a95c79622b396b76176))
+* **catalog:** proxmox-k3s-cluster blueprint installs k3s and exports a kubeconfig ([c787217](https://github.com/rdylanwalker/keel/commit/c787217de509563dc6bb03d651ae64d1390eda44))
+
 ## [0.12.2](https://github.com/rdylanwalker/keel/compare/v0.12.1...v0.12.2) (2026-11-24)
 
 ### Bug Fixes
