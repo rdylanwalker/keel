@@ -573,52 +573,13 @@ async fn resolve_oidc_endpoints(
     })
 }
 
-/// Discovery attempts per login/callback request. A freshly bootstrapped IdP (or the gateway in
-/// front of it) can time out for a few seconds after its pod turns Ready; retrying briefly keeps
-/// the first login after `keel bootstrap init` from landing on the "sign-in failed" page.
-const LOGIN_DISCOVERY_ATTEMPTS: u32 = 3;
-/// Discovery attempts for the `keel serve` startup probe (background, so it can wait longer).
-const STARTUP_DISCOVERY_ATTEMPTS: u32 = 20;
-const DISCOVERY_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
-
-/// [`resolve_oidc_endpoints`] retried up to `attempts` times, `delay` apart (DNS resolution
-/// failures are not retried). Returns the last failure's cause.
-async fn resolve_oidc_endpoints_with_retry(
-    issuer_url: &str,
-    ca_pem: Option<&[u8]>,
-    attempts: u32,
-    delay: std::time::Duration,
-) -> Result<ResolvedOidcEndpoints, String> {
-    let mut attempt = 1;
-    loop {
-        match resolve_oidc_endpoints(issuer_url, ca_pem).await {
-            Ok(endpoints) => return Ok(endpoints),
-            // An unresolvable host (typically a missing /etc/hosts entry) will not fix itself
-            // within seconds; report it at once.
-            Err(cause) if attempt >= attempts.max(1) || is_dns_failure(&cause) => {
-                return Err(cause);
-            }
-            Err(cause) => {
-                tracing::debug!(attempt, %cause, "OIDC discovery failed; retrying");
-                attempt += 1;
-                tokio::time::sleep(delay).await;
-            }
-        }
-    }
-}
-
 /// Startup probe for `keel serve`: `Err` carries [`oidc_discovery_failure_message`] when the
 /// configured issuer's discovery document cannot be fetched.
 pub async fn check_oidc_discovery(issuer_url: &str, ca_pem: Option<&[u8]>) -> Result<(), String> {
-    resolve_oidc_endpoints_with_retry(
-        issuer_url,
-        ca_pem,
-        STARTUP_DISCOVERY_ATTEMPTS,
-        DISCOVERY_RETRY_DELAY,
-    )
-    .await
-    .map(|_| ())
-    .map_err(|cause| oidc_discovery_failure_message(issuer_url, &cause))
+    resolve_oidc_endpoints(issuer_url, ca_pem)
+        .await
+        .map(|_| ())
+        .map_err(|cause| oidc_discovery_failure_message(issuer_url, &cause))
 }
 
 /// [`resolve_oidc_endpoints`] for the login/callback handlers: a failure is logged loudly (with
@@ -628,17 +589,12 @@ async fn resolve_oidc_endpoints_or_unavailable(
     issuer_url: &str,
     ca_pem: Option<&[u8]>,
 ) -> Result<ResolvedOidcEndpoints, ServerError> {
-    resolve_oidc_endpoints_with_retry(
-        issuer_url,
-        ca_pem,
-        LOGIN_DISCOVERY_ATTEMPTS,
-        DISCOVERY_RETRY_DELAY,
-    )
-    .await
-    .map_err(|cause| {
-        tracing::warn!("{}", oidc_discovery_failure_message(issuer_url, &cause));
-        ServerError::ServiceUnavailable(oidc_discovery_client_message(issuer_url))
-    })
+    resolve_oidc_endpoints(issuer_url, ca_pem)
+        .await
+        .map_err(|cause| {
+            tracing::warn!("{}", oidc_discovery_failure_message(issuer_url, &cause));
+            ServerError::ServiceUnavailable(oidc_discovery_client_message(issuer_url))
+        })
 }
 
 /// The request comes from a browser navigation (`Accept` includes `text/html`).
@@ -2648,49 +2604,6 @@ mod tests {
         assert!(constant_time_eq(b"abc", b"abc"));
         assert!(!constant_time_eq(b"abc", b"abd"));
         assert!(!constant_time_eq(b"abc", b"ab"));
-    }
-
-    #[tokio::test]
-    async fn discovery_retry_recovers_from_an_idp_that_is_still_starting() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        let hits = std::sync::Arc::new(AtomicUsize::new(0));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let issuer = format!("http://{}", listener.local_addr().unwrap());
-        let doc_issuer = issuer.clone();
-        let counter = hits.clone();
-        let app = axum::Router::new().route(
-            "/.well-known/openid-configuration",
-            axum::routing::get(move || {
-                let counter = counter.clone();
-                let issuer = doc_issuer.clone();
-                async move {
-                    if counter.fetch_add(1, Ordering::SeqCst) < 2 {
-                        return Err(axum::http::StatusCode::SERVICE_UNAVAILABLE);
-                    }
-                    Ok(axum::Json(serde_json::json!({
-                        "issuer": issuer,
-                        "authorization_endpoint": format!("{issuer}/authorize"),
-                        "token_endpoint": format!("{issuer}/token"),
-                        "jwks_uri": format!("{issuer}/jwks"),
-                    })))
-                }
-            }),
-        );
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-
-        let delay = std::time::Duration::from_millis(10);
-        let err = resolve_oidc_endpoints_with_retry(&issuer, None, 2, delay)
-            .await
-            .err()
-            .expect("two 503s exhaust two attempts");
-        assert!(err.contains("503"), "{err}");
-        assert_eq!(hits.load(Ordering::SeqCst), 2);
-
-        let endpoints = resolve_oidc_endpoints_with_retry(&issuer, None, 4, delay)
-            .await
-            .unwrap();
-        assert_eq!(endpoints.token_endpoint, format!("{issuer}/token"));
-        assert_eq!(hits.load(Ordering::SeqCst), 3);
     }
 
     #[test]
