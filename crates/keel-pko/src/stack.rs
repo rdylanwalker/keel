@@ -46,6 +46,15 @@ pub const DEFAULT_TERMINATION_GRACE_PERIOD_SECONDS: u64 = 600;
 pub const LABEL_MANAGED_BY: &str = "app.kubernetes.io/managed-by";
 pub const LABEL_STACK_ROLE: &str = "keel.io/stack-role";
 pub const LABEL_PROTECT: &str = "keel.io/protect";
+/// PKO v2 reconcile-request annotation (`shared.ReconcileRequestAnnotation`): any new value makes
+/// the operator reconcile the `Stack` again without a spec change, including a `Stack` stalled
+/// with `SpecInvalid` (which PKO otherwise never retries until the spec changes).
+pub const ANNOTATION_RECONCILE_REQUEST: &str = "pulumi.com/reconciliation-request";
+/// PKO v2 `Stack` condition type set when reconciliation is stalled (not retried).
+pub const STACK_CONDITION_STALLED: &str = "Stalled";
+/// PKO v2 `Stalled` reason for an unresolvable spec (for example a missing or incomplete `gitAuth`
+/// Secret; `envRefs`/Secret `config` refs are not read by the controller and never cause it).
+pub const STACK_STALLED_SPEC_INVALID_REASON: &str = "SpecInvalid";
 /// `Stack` `spec.config` keys Keel also treats as anti-lockout protection (force-delete and
 /// preview GC). Previews never inherit them, and tenants may not set them
 /// (Kyverno `restrict-tenant-pulumi-objects`).

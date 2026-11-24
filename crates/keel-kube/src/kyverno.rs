@@ -334,9 +334,9 @@ pub fn build_protect_control_plane_policy() -> Value {
                     // GitRepository URL) would be applied by the cluster-admin
                     // `kustomize-controller` (privilege escalation, NFR-SEC-04).
                     "expression": format!(
-                        "!(request.operation == 'UPDATE' && ((has(request.namespace) ? request.namespace : '') == '{FLUX_SYSTEM_NAMESPACE}' || (has(request.namespace) ? request.namespace : '') == '{KEEL_SYSTEM_NAMESPACE}') && has(request.userInfo) && has(request.userInfo.username) && request.userInfo.username == 'system:serviceaccount:{KEEL_SYSTEM_NAMESPACE}:keel-server' && ((request.kind.group == 'kustomize.toolkit.fluxcd.io' && request.kind.kind == 'Kustomization') || (request.kind.group == 'helm.toolkit.fluxcd.io' && request.kind.kind == 'HelmRelease') || request.kind.group == 'source.toolkit.fluxcd.io' || (request.kind.group == 'pulumi.com' && request.kind.kind == 'Stack')) && !((has(object.spec) ? object.spec : {{}}) == (has(oldObject.spec) ? oldObject.spec : {{}}) && (has(object.metadata.labels) ? object.metadata.labels : {{}}) == (has(oldObject.metadata.labels) ? oldObject.metadata.labels : {{}}) && (has(object.metadata.finalizers) ? object.metadata.finalizers : []) == (has(oldObject.metadata.finalizers) ? oldObject.metadata.finalizers : []) && (has(object.metadata.annotations) ? object.metadata.annotations : {{}}).all(k, k == 'reconcile.fluxcd.io/requestedAt' || k == 'pulumi.com/reconcile-request' || (has(oldObject.metadata.annotations) && k in oldObject.metadata.annotations && oldObject.metadata.annotations[k] == object.metadata.annotations[k])) && (has(oldObject.metadata.annotations) ? oldObject.metadata.annotations : {{}}).all(k, k == 'reconcile.fluxcd.io/requestedAt' || k == 'pulumi.com/reconcile-request' || (has(object.metadata.annotations) && k in object.metadata.annotations))))"
+                        "!(request.operation == 'UPDATE' && ((has(request.namespace) ? request.namespace : '') == '{FLUX_SYSTEM_NAMESPACE}' || (has(request.namespace) ? request.namespace : '') == '{KEEL_SYSTEM_NAMESPACE}') && has(request.userInfo) && has(request.userInfo.username) && request.userInfo.username == 'system:serviceaccount:{KEEL_SYSTEM_NAMESPACE}:keel-server' && ((request.kind.group == 'kustomize.toolkit.fluxcd.io' && request.kind.kind == 'Kustomization') || (request.kind.group == 'helm.toolkit.fluxcd.io' && request.kind.kind == 'HelmRelease') || request.kind.group == 'source.toolkit.fluxcd.io' || (request.kind.group == 'pulumi.com' && request.kind.kind == 'Stack')) && !((has(object.spec) ? object.spec : {{}}) == (has(oldObject.spec) ? oldObject.spec : {{}}) && (has(object.metadata.labels) ? object.metadata.labels : {{}}) == (has(oldObject.metadata.labels) ? oldObject.metadata.labels : {{}}) && (has(object.metadata.finalizers) ? object.metadata.finalizers : []) == (has(oldObject.metadata.finalizers) ? oldObject.metadata.finalizers : []) && (has(object.metadata.annotations) ? object.metadata.annotations : {{}}).all(k, k == 'reconcile.fluxcd.io/requestedAt' || k == 'pulumi.com/reconciliation-request' || (has(oldObject.metadata.annotations) && k in oldObject.metadata.annotations && oldObject.metadata.annotations[k] == object.metadata.annotations[k])) && (has(oldObject.metadata.annotations) ? oldObject.metadata.annotations : {{}}).all(k, k == 'reconcile.fluxcd.io/requestedAt' || k == 'pulumi.com/reconciliation-request' || (has(object.metadata.annotations) && k in object.metadata.annotations))))"
                     ),
-                    "message": "keel-server may only request reconciliation (`reconcile.fluxcd.io/requestedAt` / `pulumi.com/reconcile-request` annotations) on control-plane Flux objects and Stacks; spec, label, finalizer and other annotation changes must go through a GitOps PR."
+                    "message": "keel-server may only request reconciliation (`reconcile.fluxcd.io/requestedAt` / `pulumi.com/reconciliation-request` annotations) on control-plane Flux objects and Stacks; spec, label, finalizer and other annotation changes must go through a GitOps PR."
                 }
             ]
         }
@@ -1797,7 +1797,7 @@ mod tests {
             "object.metadata.labels",
             "object.metadata.finalizers",
             "k == 'reconcile.fluxcd.io/requestedAt'",
-            "k == 'pulumi.com/reconcile-request'",
+            "k == 'pulumi.com/reconciliation-request'",
         ] {
             assert!(server_guard.contains(needle), "{needle}");
         }
@@ -2317,7 +2317,7 @@ mod tests {
         }
         // Only the Flux reconcile annotation, never PKO's or a wildcard.
         assert_eq!(cel.matches("k == '").count(), 2);
-        assert!(!cel.contains("pulumi.com/reconcile-request"));
+        assert!(!cel.contains("pulumi.com/reconciliation-request"));
         assert!(!cel.contains("CREATE") && !cel.contains("DELETE"));
     }
 

@@ -11,6 +11,7 @@ mod routes;
 mod security;
 mod spa;
 mod ssh;
+mod stack_recovery;
 mod state;
 mod tenant_repos;
 
@@ -23,6 +24,10 @@ pub use error::ServerError;
 pub use preview_lifecycle::{
     PREVIEW_RECONCILE_INTERVAL, gc_preview_for_pr, reconcile_previews_once,
     spawn_preview_reconciler,
+};
+pub use stack_recovery::{
+    STALLED_STACK_RECOVERY_INTERVAL, recover_stalled_stacks_once, recover_tenant_stalled_stacks,
+    spawn_stalled_stack_recovery,
 };
 pub use state::{
     AppState, ClusterStateProvider, KubeClusterStateProvider, ReleaseSummary,

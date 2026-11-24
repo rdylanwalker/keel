@@ -665,7 +665,7 @@ pub async fn reconcile_previews_once(state: &AppState) -> PreviewReconcileOutcom
     outcome
 }
 
-fn jitter(base: Duration) -> Duration {
+pub(crate) fn jitter(base: Duration) -> Duration {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.subsec_nanos() as u64)

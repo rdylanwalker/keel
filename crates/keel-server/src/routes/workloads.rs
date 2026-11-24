@@ -981,7 +981,7 @@ pub struct ReconcileStackResponse {
 
 /// `POST /api/v1/stacks/{namespace}/{name}/reconcile`
 ///
-/// Annotates a PKO v2 `Stack` with `pulumi.com/reconcile-request` to trigger
+/// Annotates a PKO v2 `Stack` with `pulumi.com/reconciliation-request` to trigger
 /// immediate reconciliation without restarting the workspace pod.
 pub async fn reconcile_stack(
     auth: AuthSession,

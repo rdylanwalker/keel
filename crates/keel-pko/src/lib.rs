@@ -18,7 +18,7 @@ pub use run::{
     build_pko_preview_report, map_pko_preview_status, plan_preview_reconcile, select_update_name,
 };
 pub use stack::{
-    CONFIG_PROTECT_KEYS, CrObjectMeta, DEFAULT_FLUX_POLL_INTERVAL,
+    ANNOTATION_RECONCILE_REQUEST, CONFIG_PROTECT_KEYS, CrObjectMeta, DEFAULT_FLUX_POLL_INTERVAL,
     DEFAULT_MANAGEMENT_SERVICE_ACCOUNT, DEFAULT_PREVIEW_SERVICE_ACCOUNT, EphemeralPreviewParams,
     FLUX_GIT_REPO_API_VERSION, FLUX_GIT_REPO_KIND, FluxGitRepository, FluxGitRepositoryRef,
     FluxGitRepositorySpec, IN_CLUSTER_S3_BACKEND_URL, KEEL_SSH_KNOWN_HOSTS_FILE,
@@ -27,10 +27,11 @@ pub use stack::{
     PKO_WORKSPACE_IMAGE, PLATFORM_REPO_LABEL, PULUMI_PASSPHRASE_SECRET_KEY,
     PULUMI_PASSPHRASE_SECRET_NAME, PkoEnvRef, PkoGitAuth, PkoGitBasicAuth, PkoGitSource,
     PkoGitSshAuth, PkoStack, PkoWorkspaceTemplate, PreviewSecretCopy, PreviewStack,
-    SSH_KNOWN_HOSTS_ENV, TenantStackParams, attach_github_token_env_ref,
-    attach_s3_credentials_env_refs, build_preview_branch, is_ssh_git_url, is_tenant_scoped_backend,
-    parse_preview_key, pko_project_repo_url, preview_key, preview_secret_copy_name,
-    preview_stack_name, synthesize_ephemeral_preview, synthesize_k8s_manifest_pulumi_yaml,
+    SSH_KNOWN_HOSTS_ENV, STACK_CONDITION_STALLED, STACK_STALLED_SPEC_INVALID_REASON,
+    TenantStackParams, attach_github_token_env_ref, attach_s3_credentials_env_refs,
+    build_preview_branch, is_ssh_git_url, is_tenant_scoped_backend, parse_preview_key,
+    pko_project_repo_url, preview_key, preview_secret_copy_name, preview_stack_name,
+    synthesize_ephemeral_preview, synthesize_k8s_manifest_pulumi_yaml,
     synthesize_management_core_stack, synthesize_tenant_stack, validate_flux_git_source_url,
     validate_git_source_url,
 };

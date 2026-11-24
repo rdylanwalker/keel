@@ -906,6 +906,8 @@ pub async fn create_tenant(
         ));
     }
     ensure_tenant_state_identities(&state, &tenant, &namespace).await;
+    // A Secret this request (re)wrote may unblock Stacks PKO stalled on it (ADDON-15).
+    crate::stack_recovery::recover_tenant_stalled_stacks(&state, &tenant).await;
 
     tracing::info!(
         target: "keel::audit",
@@ -1002,6 +1004,8 @@ async fn create_monorepo_tenant(
     )
     .await?;
     ensure_tenant_state_identities(&state, &tenant, &namespace).await;
+    // A Secret this request (re)wrote may unblock Stacks PKO stalled on it (ADDON-15).
+    crate::stack_recovery::recover_tenant_stalled_stacks(&state, &tenant).await;
     Ok((
         StatusCode::CREATED,
         Json(CreateTenantResponse {
@@ -1202,6 +1206,9 @@ pub async fn repair_tenant_credentials(
         || committed_platform_stub_state(&state, &id),
     )
     .await?;
+    // PKO never retries a Stack stalled on the missing Secret on its own (ADDON-15).
+    let stalled_stacks_nudged =
+        crate::stack_recovery::recover_tenant_stalled_stacks(&state, &id).await;
     tracing::info!(
         target: "keel::audit",
         action = "tenant.credential.repair",
@@ -1209,6 +1216,7 @@ pub async fn repair_tenant_credentials(
         tenant = %id,
         credential = ?cluster.credential,
         sops_age = ?cluster.sops_age,
+        stalled_stacks_nudged,
         "Repaired tenant runtime credentials"
     );
     Ok(Json(RepairTenantCredentialsResponse {

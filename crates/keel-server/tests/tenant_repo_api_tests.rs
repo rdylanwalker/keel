@@ -19,7 +19,9 @@ use keel_git::{
     RepositoryInfo, RepositoryOptions, RepositoryTarget, ssh_public_key_fingerprint,
 };
 use keel_kube::SecretBackend;
-use keel_kube::{InMemorySecretStore, KubeError, SecretStateStore, TelemetryMux};
+use keel_kube::{
+    InMemorySecretStore, KubeError, SecretStateStore, StackRecoveryCluster, TelemetryMux,
+};
 use keel_server::{
     AppState, SESSION_COOKIE_NAME, SessionClaims, TenantRepoCloneBase, TenantRepoForge,
     TenantRepoForgeKind, TenantRepoNaming, TenantRepos, build_router, encrypt_session_token,
@@ -1215,6 +1217,50 @@ async fn repair_credentials_rotates_a_valid_credential_and_revokes_the_old_one()
     }
 }
 
+/// PKO as seen by the stalled-Stack recovery: one `tenant-web` Stack stalled on the missing
+/// `keel-gitops-credentials`, Secrets read live from the in-memory store.
+struct StalledStackCluster {
+    store: Arc<InMemorySecretStore>,
+    requests: Mutex<Vec<(String, String, String)>>,
+}
+
+#[async_trait]
+impl StackRecoveryCluster for StalledStackCluster {
+    async fn list_stacks(&self, namespace: Option<&str>) -> Result<Vec<Value>, KubeError> {
+        assert_eq!(
+            namespace,
+            Some("tenant-web"),
+            "scoped to the repaired tenant"
+        );
+        Ok(vec![json!({
+            "metadata": {"namespace": "tenant-web", "name": "net"},
+            "status": {"conditions": [{
+                "type": "Stalled", "status": "True", "reason": "SpecInvalid",
+                "message": "resolving gitAuth password: unable to get secret tenant-web/keel-gitops-credentials: secrets \"keel-gitops-credentials\" not found"
+            }]}
+        })])
+    }
+    async fn secret_revision(&self, ns: &str, name: &str) -> Result<Option<String>, KubeError> {
+        Ok(self
+            .store
+            .inspect_raw_secret(ns, name)
+            .await
+            .map(|_| "1".to_string()))
+    }
+    async fn request_stack_reconcile(
+        &self,
+        ns: &str,
+        name: &str,
+        request: &str,
+    ) -> Result<(), KubeError> {
+        self.requests
+            .lock()
+            .unwrap()
+            .push((ns.into(), name.into(), request.into()));
+        Ok(())
+    }
+}
+
 #[tokio::test]
 async fn repair_credentials_recreates_lost_secrets_and_refuses_pending_tenants() {
     let fx = fixture(TenantRepoForgeKind::Forgejo).await;
@@ -1223,8 +1269,18 @@ async fn repair_credentials_recreates_lost_secrets_and_refuses_pending_tenants()
         .remove_secret("tenant-web", "keel-gitops-credentials")
         .await;
     fx.store.remove_secret("tenant-web", "sops-age").await;
+    // ADDON-15: the repair must nudge the Stack PKO stalled on the lost Secret, and only after
+    // the Secret is back (the recovery skips Stacks whose Secret is still missing).
+    let pko = Arc::new(StalledStackCluster {
+        store: fx.store.clone(),
+        requests: Mutex::default(),
+    });
+    let state = fx
+        .state
+        .clone()
+        .with_stack_recovery(Some(pko.clone() as Arc<dyn StackRecoveryCluster>));
     let (status, repaired, _) = send(
-        &fx.state,
+        &state,
         Method::POST,
         "/api/v1/tenants/web/credentials/repair",
         None,
@@ -1242,6 +1298,14 @@ async fn repair_credentials_recreates_lost_secrets_and_refuses_pending_tenants()
     assert_eq!(repaired["sopsAge"], "created");
     assert!(credentials(&fx.store, "web").await.is_some());
     assert_eq!(fx.log.live_tokens.lock().unwrap().len(), 1);
+    assert_eq!(
+        *pko.requests.lock().unwrap(),
+        [(
+            "tenant-web".to_string(),
+            "net".to_string(),
+            "keel-secret-restored:keel-gitops-credentials@1".to_string()
+        )]
+    );
 
     // A tenant whose namespace does not exist yet (stub PR not merged) is a conflict.
     fx.store.set_namespace_present("tenant-new", false).await;

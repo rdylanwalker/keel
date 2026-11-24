@@ -702,6 +702,10 @@ pub(crate) async fn build_serve_state(
         state = state.with_preview_cluster(Some(Arc::new(keel_kube::KubePreviewCluster::new(
             reader.client().clone(),
         ))));
+        // Tenant Stacks PKO stalled on a since-restored Secret get one reconcile request (ADDON-15).
+        state = state.with_stack_recovery(Some(Arc::new(keel_kube::KubeStackRecovery::new(
+            reader.client().clone(),
+        ))));
         state = state.with_state_provider(Arc::new(KubeClusterStateProvider::new(
             repo_state_provider,
             Arc::new(reader),
@@ -793,6 +797,12 @@ async fn serve_built_state(
         state.clone(),
         keel_server::PREVIEW_RECONCILE_INTERVAL,
     );
+    // Tenant Stacks stalled (`SpecInvalid`) on a Secret that exists again (ADDON-15). No-op
+    // without a live cluster.
+    let stack_recovery = keel_server::spawn_stalled_stack_recovery(
+        state.clone(),
+        keel_server::STALLED_STACK_RECOVERY_INTERVAL,
+    );
     let router = build_router(state);
     let listener = tokio::net::TcpListener::bind(&args.bind).await?;
     let local_addr = listener.local_addr()?;
@@ -818,7 +828,7 @@ async fn serve_built_state(
             }
         }
     }
-    if let Some(handle) = preview_reconciler {
+    for handle in [preview_reconciler, stack_recovery].into_iter().flatten() {
         handle.abort();
     }
     Ok(local_addr)

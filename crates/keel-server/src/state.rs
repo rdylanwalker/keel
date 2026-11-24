@@ -1571,6 +1571,9 @@ pub struct AppState {
     pub preview_cache: Arc<RwLock<HashMap<String, CachedPreview>>>,
     /// Live ephemeral PKO preview runner (`None` without a cluster ⇒ synthesized previews only).
     pub preview_cluster: Option<Arc<dyn keel_kube::PreviewCluster>>,
+    /// Requests reconciliation of tenant PKO Stacks stalled on a since-restored Secret
+    /// (`crate::stack_recovery`; `None` without a live cluster).
+    pub stack_recovery: Option<Arc<dyn keel_kube::StackRecoveryCluster>>,
     /// Fail closed (`409`) on Pulumi Stack proposals whose tenant has no
     /// `keel-pulumi-passphrase` Secret. Defaults to `true`; only cluster-less local dev (in-memory
     /// Secret store, Stacks are never applied) turns it off.
@@ -1619,6 +1622,7 @@ impl AppState {
             git_lock: Arc::new(Mutex::new(())),
             preview_cache: Arc::new(RwLock::new(HashMap::new())),
             preview_cluster: None,
+            stack_recovery: None,
             require_pulumi_passphrase: true,
             tenant_repos,
             proposal_cache: Arc::default(),
@@ -1637,6 +1641,15 @@ impl AppState {
         cluster: Option<Arc<dyn keel_kube::PreviewCluster>>,
     ) -> Self {
         self.preview_cluster = cluster;
+        self
+    }
+
+    /// Configures the stalled tenant Stack recovery (`crate::stack_recovery`).
+    pub fn with_stack_recovery(
+        mut self,
+        cluster: Option<Arc<dyn keel_kube::StackRecoveryCluster>>,
+    ) -> Self {
+        self.stack_recovery = cluster;
         self
     }
 

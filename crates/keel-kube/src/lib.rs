@@ -6,6 +6,7 @@
 //! - Multi-tenant namespace/RBAC/quota/network-policy & Flux `HelmRelease` synthesis (`tenant`),
 //! - Per-tenant repository stubs, `keel-gitops-credentials` and PKO tenant-repo sources (`tenant_repo`),
 //! - Kyverno admission policies & explicit local-dev Docker socket `PolicyException` (`kyverno`),
+//! - Requests reconciliation of tenant PKO Stacks stalled on a since-restored Secret (`stack_recovery`),
 //! - Real-time CRD condition normalization & SSE telemetry broadcaster (`telemetry`).
 
 mod ca_bundle;
@@ -14,6 +15,7 @@ mod live;
 mod preview_runner;
 mod s3_identity;
 mod secret_store;
+mod stack_recovery;
 mod telemetry;
 mod tenant;
 mod tenant_repo;
@@ -49,6 +51,11 @@ pub use secret_store::{
     PULUMI_PASSPHRASE_SECRET_NAME, S3_CREDENTIALS_SECRET_NAME, SecretBackend, SecretStateStore,
     TENANT_SOPS_AGE_SECRET_NAME, TenantAgeKey, UserGitCredentials, build_pulumi_passphrase_secret,
     build_tenant_age_key_secret, generate_pulumi_passphrase, user_git_creds_secret_name,
+};
+pub use stack_recovery::{
+    KubeStackRecovery, MAX_RECONCILE_ATTEMPTS, StackRecoveryCluster, StalledStackNudge,
+    plan_stalled_stack_nudges, reconcile_request_attempt, reconcile_request_value,
+    recover_stalled_stacks, secrets_named_in_stall_message, stack_stalled_on_secrets,
 };
 pub use telemetry::{CrdReconcileStatus, CrdWatchEvent, TelemetryMux, WatchedCrdKind};
 pub use tenant::{

@@ -196,7 +196,7 @@ rules:
   # Reconcile requests on platform Kustomizations / HelmReleases / sources and the
   # management-core Stack. Management add-on upgrades and rollbacks go through Git PRs, never
   # through these objects. The Kyverno `protect-control-plane` policy limits these patches to the
-  # `reconcile.fluxcd.io/requestedAt` / `pulumi.com/reconcile-request` annotations: a spec change
+  # `reconcile.fluxcd.io/requestedAt` / `pulumi.com/reconciliation-request` annotations: a spec change
   # here would be applied by the cluster-admin `kustomize-controller`.
   - apiGroups: ["kustomize.toolkit.fluxcd.io"]
     resources: ["kustomizations"]

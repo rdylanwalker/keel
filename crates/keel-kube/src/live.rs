@@ -258,7 +258,7 @@ pub trait LiveStatusSource: Send + Sync {
         ))
     }
 
-    /// Annotates a PKO v2 `Stack` with `pulumi.com/reconcile-request`.
+    /// Annotates a PKO v2 `Stack` with `pulumi.com/reconciliation-request`.
     async fn reconcile_stack(&self, _namespace: &str, _name: &str) -> Result<String, KubeError> {
         Err(KubeError::Unavailable(
             "Live Kubernetes cluster connection required to reconcile stack".to_string(),
@@ -1292,7 +1292,7 @@ impl LiveStatusSource for KubeClusterStatusReader {
         let patch = json!({
             "metadata": {
                 "annotations": {
-                    "pulumi.com/reconcile-request": requested_at
+                    keel_pko::ANNOTATION_RECONCILE_REQUEST: requested_at
                 }
             }
         });
@@ -1412,7 +1412,7 @@ impl LiveStatusSource for KubeClusterStatusReader {
         let reconcile_patch = json!({
             "metadata": {
                 "annotations": {
-                    "pulumi.com/reconcile-request": requested_at
+                    keel_pko::ANNOTATION_RECONCILE_REQUEST: requested_at
                 }
             }
         });
