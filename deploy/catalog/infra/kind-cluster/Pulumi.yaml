@@ -38,17 +38,34 @@ variables:
         - fn::split:
             - ${workloadCluster.endpoint}
             - ${workloadCluster.kubeconfig}
+  # Pull images in parallel on every node (kubelet defaults to one at a time), so a large image
+  # does not hold up every other pod on a fresh cluster.
+  kubeletParallelImagePulls:
+    - |
+      kind: KubeletConfiguration
+      serializeImagePulls: false
+      maxParallelImagePulls: 5
   nodeTopologies:
     - - role: control-plane
+        kubeadmConfigPatches: ${kubeletParallelImagePulls}
     - - role: control-plane
+        kubeadmConfigPatches: ${kubeletParallelImagePulls}
       - role: worker
+        kubeadmConfigPatches: ${kubeletParallelImagePulls}
     - - role: control-plane
+        kubeadmConfigPatches: ${kubeletParallelImagePulls}
       - role: worker
+        kubeadmConfigPatches: ${kubeletParallelImagePulls}
       - role: worker
+        kubeadmConfigPatches: ${kubeletParallelImagePulls}
     - - role: control-plane
+        kubeadmConfigPatches: ${kubeletParallelImagePulls}
       - role: worker
+        kubeadmConfigPatches: ${kubeletParallelImagePulls}
       - role: worker
+        kubeadmConfigPatches: ${kubeletParallelImagePulls}
       - role: worker
+        kubeadmConfigPatches: ${kubeletParallelImagePulls}
 
 resources:
   workloadCluster:

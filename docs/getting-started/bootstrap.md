@@ -43,7 +43,7 @@ keel bootstrap init \
 
 > **Warning: `--local-dev-docker-socket-exception` gives up host and tenant isolation.** `keel-docker-proxy` exposes the host Docker socket on port 2375 without authentication. Its NetworkPolicy admits every PKO workspace pod, selected by a label that any tenant pod can also set, and Docker API access amounts to root on the host. Use the flag only on a throwaway machine, do not treat tenants as isolated while it is enabled, and leave it out if you do not need nested `kind` clusters.
 
-This takes about 3 minutes on a host that already has the `kindest/node` image. `--with-forge` installs an in-cluster Forgejo so Flux can pull the repository and PRs work; without it (or a network `--git-url`), Flux cannot read the repository and nothing you merge is deployed (see [In-Cluster Flux Pull-Polling](#core-controllers-installed-out-of-the-box) below).
+This takes about 3 minutes on a host that already has the `kindest/node` image. The node's kubelet pulls up to 5 images in parallel (`serializeImagePulls: false`; kubelet's default is one at a time), so a large image such as the PKO workspace does not hold up other pods. The `kind-cluster` workload blueprint configures every node the same way. `--with-forge` installs an in-cluster Forgejo so Flux can pull the repository and PRs work; without it (or a network `--git-url`), Flux cannot read the repository and nothing you merge is deployed (see [In-Cluster Flux Pull-Polling](#core-controllers-installed-out-of-the-box) below).
 
 ### Existing Cluster (`kubeconfig`)
 

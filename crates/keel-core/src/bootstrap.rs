@@ -998,6 +998,88 @@ users:
         }
     }
 
+    /// Asserts every kind node in `nodes` carries a KubeletConfiguration patch that turns off
+    /// serialized image pulls. A `${name}` patch list is resolved from the program's `variables`.
+    fn assert_kind_nodes_pull_images_in_parallel(
+        doc: &noyalib::Value,
+        nodes: &[noyalib::Value],
+        ctx: &str,
+    ) {
+        assert!(!nodes.is_empty(), "{ctx}: no kind nodes");
+        for node in nodes {
+            let role = node["role"].as_str().unwrap_or_default();
+            let mut patches = &node["kubeadmConfigPatches"];
+            if let Some(reference) = patches.as_str() {
+                let name = reference
+                    .strip_prefix("${")
+                    .and_then(|r| r.strip_suffix('}'))
+                    .unwrap_or_else(|| panic!("{ctx}/{role}: unexpected patch value {reference}"));
+                patches = &doc["variables"][name];
+            }
+            let kubelet = patches
+                .as_sequence()
+                .unwrap_or_else(|| panic!("{ctx}/{role}: node has no kubeadmConfigPatches"))
+                .iter()
+                .filter_map(|p| p.as_str())
+                .map(|p| noyalib::from_str::<noyalib::Value>(p).unwrap())
+                .find(|p| p["kind"].as_str() == Some("KubeletConfiguration"))
+                .unwrap_or_else(|| panic!("{ctx}/{role}: no KubeletConfiguration patch"));
+            assert_eq!(
+                kubelet["serializeImagePulls"],
+                noyalib::Value::Bool(false),
+                "{ctx}/{role}: kubelet must pull images in parallel (ADDON-17)"
+            );
+            let max = kubelet["maxParallelImagePulls"]
+                .as_i64()
+                .unwrap_or_default();
+            assert!(
+                (2..=10).contains(&max),
+                "{ctx}/{role}: maxParallelImagePulls should be a small bound, got {max}"
+            );
+        }
+    }
+
+    /// Fresh kind nodes must not pull images one at a time, or a large image (the PKO workspace)
+    /// holds up every other pod for minutes. Covers the Stage 0 management cluster and every
+    /// node topology of the `kind-cluster` workload blueprint, control-plane and workers alike.
+    #[test]
+    fn kind_clusters_pull_images_in_parallel() {
+        use noyalib::Value;
+        let program = PulumiBootstrapTarget::new(BootstrapTargetKind::Kind)
+            .embedded_pulumi_yaml()
+            .unwrap();
+        let mgmt: Value = noyalib::from_str(program).unwrap();
+        let nodes = mgmt["resources"]["mgmtCluster"]["properties"]["kindConfig"]["nodes"]
+            .as_sequence()
+            .expect("mgmt kind nodes");
+        assert_kind_nodes_pull_images_in_parallel(&mgmt, nodes, "stage0 kind");
+
+        let blueprint: Value = noyalib::from_str(include_str!(
+            "../../../deploy/catalog/infra/kind-cluster/Pulumi.yaml"
+        ))
+        .unwrap();
+        let select = blueprint["resources"]["workloadCluster"]["properties"]["kindConfig"]["nodes"]
+            ["fn::select"]
+            .as_sequence()
+            .expect("kind-cluster nodes select a topology");
+        assert_eq!(select[1].as_str(), Some("${nodeTopologies}"));
+        let topologies = blueprint["variables"]["nodeTopologies"]
+            .as_sequence()
+            .unwrap();
+        assert_eq!(topologies.len(), 4, "workerCount 0..=3");
+        for (workers, topology) in topologies.iter().enumerate() {
+            let nodes = topology.as_sequence().unwrap();
+            let roles: Vec<&str> = nodes.iter().filter_map(|n| n["role"].as_str()).collect();
+            assert_eq!(roles[0], "control-plane");
+            assert_eq!(roles.iter().filter(|r| **r == "worker").count(), workers);
+            assert_kind_nodes_pull_images_in_parallel(
+                &blueprint,
+                nodes,
+                &format!("kind-cluster workers={workers}"),
+            );
+        }
+    }
+
     /// Pulumi YAML interpolates every `${...}` in any string, so a shell
     /// variable in an embedded boot script must be escaped as `$${VAR}`.
     /// Otherwise `pulumi preview`/`up` fails with an unknown-reference error.

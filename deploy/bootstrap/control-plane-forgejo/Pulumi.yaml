@@ -57,7 +57,7 @@ resources:
       namespace: keel-system
       createNamespace: true
       waitForJobs: true
-      # Fresh kind nodes pull images one at a time (kubelet serializeImagePulls); leave room.
+      # First image pulls on a fresh cluster are slow (k3s VM targets still pull one at a time).
       timeout: 600
       values:
         gitea:

@@ -143,17 +143,33 @@ config:
     type: string
     default: tenant-default
 variables:
+  # kubelet pulls images one at a time by default; pull in parallel on every node.
+  kubeletParallelImagePulls:
+    - |
+      kind: KubeletConfiguration
+      serializeImagePulls: false
+      maxParallelImagePulls: 5
   nodeTopologies:
     - - role: control-plane
+        kubeadmConfigPatches: ${kubeletParallelImagePulls}
     - - role: control-plane
+        kubeadmConfigPatches: ${kubeletParallelImagePulls}
       - role: worker
+        kubeadmConfigPatches: ${kubeletParallelImagePulls}
     - - role: control-plane
+        kubeadmConfigPatches: ${kubeletParallelImagePulls}
       - role: worker
+        kubeadmConfigPatches: ${kubeletParallelImagePulls}
       - role: worker
+        kubeadmConfigPatches: ${kubeletParallelImagePulls}
     - - role: control-plane
+        kubeadmConfigPatches: ${kubeletParallelImagePulls}
       - role: worker
+        kubeadmConfigPatches: ${kubeletParallelImagePulls}
       - role: worker
+        kubeadmConfigPatches: ${kubeletParallelImagePulls}
       - role: worker
+        kubeadmConfigPatches: ${kubeletParallelImagePulls}
 resources:
   workloadCluster:
     type: kind:index:Cluster

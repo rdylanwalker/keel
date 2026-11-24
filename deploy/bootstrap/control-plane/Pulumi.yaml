@@ -130,7 +130,7 @@ resources:
       namespace: flux-system
       createNamespace: true
       waitForJobs: true
-      # Fresh kind nodes pull images one at a time (kubelet serializeImagePulls); leave room.
+      # First image pulls on a fresh cluster are slow (k3s VM targets still pull one at a time).
       timeout: 600
       values:
         # Multi-tenancy lockdown (NFR-SEC-02): adds `--no-cross-namespace-refs=true` and
@@ -186,7 +186,7 @@ resources:
       namespace: keel-system
       createNamespace: false
       waitForJobs: true
-      # Fresh kind nodes pull images one at a time (kubelet serializeImagePulls); leave room.
+      # First image pulls on a fresh cluster are slow (k3s VM targets still pull one at a time).
       timeout: 600
       values:
         # Keel only uses the CEL `policies.kyverno.io/v1` policy types. Kyverno 1.20 no longer
@@ -234,7 +234,7 @@ resources:
       namespace: keel-system
       createNamespace: true
       waitForJobs: true
-      # Fresh kind nodes pull images one at a time (kubelet serializeImagePulls); leave room.
+      # First image pulls on a fresh cluster are slow (k3s VM targets still pull one at a time).
       timeout: 600
       values:
         replicaCount: 1
@@ -296,7 +296,7 @@ resources:
       namespace: keel-system
       createNamespace: true
       waitForJobs: true
-      # Fresh kind nodes pull images one at a time (kubelet serializeImagePulls); leave room.
+      # First image pulls on a fresh cluster are slow (k3s VM targets still pull one at a time).
       timeout: 600
       values:
         s3:
@@ -353,7 +353,7 @@ resources:
       namespace: keel-system
       createNamespace: true
       waitForJobs: true
-      # Fresh kind nodes pull images one at a time (kubelet serializeImagePulls); leave room.
+      # First image pulls on a fresh cluster are slow (k3s VM targets still pull one at a time).
       timeout: 600
 
   prometheus:
@@ -383,7 +383,7 @@ resources:
       namespace: keel-system
       createNamespace: true
       waitForJobs: true
-      # Fresh kind nodes pull images one at a time (kubelet serializeImagePulls); leave room.
+      # First image pulls on a fresh cluster are slow (k3s VM targets still pull one at a time).
       timeout: 600
       values:
         alertmanager:
@@ -428,7 +428,7 @@ resources:
       namespace: keel-system
       createNamespace: true
       waitForJobs: true
-      # Fresh kind nodes pull images one at a time (kubelet serializeImagePulls); leave room.
+      # First image pulls on a fresh cluster are slow (k3s VM targets still pull one at a time).
       timeout: 600
       values:
         meshProvider: gatewayapi:v1
@@ -463,7 +463,7 @@ resources:
       namespace: keel-system
       createNamespace: true
       waitForJobs: true
-      # Fresh kind nodes pull images one at a time (kubelet serializeImagePulls); leave room.
+      # First image pulls on a fresh cluster are slow (k3s VM targets still pull one at a time).
       timeout: 600
       values:
         crds:
