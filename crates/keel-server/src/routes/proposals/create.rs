@@ -244,7 +244,7 @@ pub async fn create_proposal(
     };
     match &stored_manifest_secret {
         Some(stored) => validate_schema_values(
-            &relax_stored_secret_requirements(schema, &stored.keys),
+            &relax_stored_secret_requirements(schema, &stored.valued_keys),
             &req.values,
         )?,
         None => validate_schema_values(schema, &req.values)?,
@@ -321,6 +321,7 @@ pub async fn create_proposal(
             &req.tenant,
             &tenant_ns,
             &infra_secret_name,
+            schema,
             &partitioned.secret_field_paths,
             &partitioned.secret_values,
             stored_manifest_secret.as_ref(),

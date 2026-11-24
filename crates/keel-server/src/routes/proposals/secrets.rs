@@ -73,6 +73,19 @@ pub(super) struct StoredManifestAppSecret {
     ciphertext: String,
     /// `stringData` / `data` keys (SOPS keeps key names in plaintext).
     pub(super) keys: std::collections::BTreeSet<String>,
+    /// The `keys` holding a non-empty value. SOPS leaves an empty string unencrypted (`""`), so
+    /// a manifest app's unset optional secret (stored as `""`) is told apart without decrypting.
+    /// Only these count as stored when relaxing `required` on Edit.
+    pub(super) valued_keys: std::collections::BTreeSet<String>,
+}
+
+/// Whether a SOPS-encrypted `stringData` / `data` value holds an empty string.
+fn is_empty_sops_value(value: &Value) -> bool {
+    match value {
+        Value::Null => true,
+        Value::String(s) => s.is_empty() || s.starts_with("ENC[AES256_GCM,data:,"),
+        _ => false,
+    }
 }
 
 /// Reads the committed `<name>-secrets` `Secret` of the Flux manifest app or Helm app in
@@ -97,16 +110,27 @@ pub(super) async fn read_stored_manifest_app_secret(
     if doc.get("sops").is_none() || doc.get("kind").and_then(Value::as_str) != Some("Secret") {
         return None;
     }
-    let keys: std::collections::BTreeSet<String> = ["stringData", "data"]
+    let entries: Vec<(&String, &Value)> = ["stringData", "data"]
         .iter()
         .filter_map(|field| doc.get(*field).and_then(Value::as_object))
-        .flat_map(|m| m.keys().cloned())
+        .flat_map(|m| m.iter())
         .collect();
-    (!keys.is_empty()).then_some(StoredManifestAppSecret { ciphertext, keys })
+    let keys: std::collections::BTreeSet<String> =
+        entries.iter().map(|(k, _)| (*k).clone()).collect();
+    let valued_keys = entries
+        .iter()
+        .filter(|(_, v)| !is_empty_sops_value(v))
+        .map(|(k, _)| (*k).clone())
+        .collect();
+    (!keys.is_empty()).then_some(StoredManifestAppSecret {
+        ciphertext,
+        keys,
+        valued_keys,
+    })
 }
 
-/// Returns `schema` with every secret property whose value is already stored (`stored_keys`)
-/// removed from its parent's `required`: like the UI's edit form, a blank secret field keeps the
+/// Returns `schema` with every secret property whose value is already stored (`stored_keys`, a
+/// [`StoredManifestAppSecret::valued_keys`]: an empty stored value does not count) removed from its parent's `required`: like the UI's edit form, a blank secret field keeps the
 /// stored value. Secret fields without a stored value stay required. A manifest app stores
 /// top-level fields (`adminPassword`); a Helm app stores dot paths (`gitea.admin.password`), so
 /// nested objects are relaxed too.
@@ -144,27 +168,75 @@ pub(super) fn relax_stored_secret_requirements(
 
 /// Resolves the SOPS-encrypted `<name>-secrets` `Secret` to commit for a Flux manifest app.
 /// See [`resolve_tenant_app_secret`].
+///
+/// Every top-level secret field (a `${field}` placeholder candidate) always has a key in the
+/// Secret: an optional secret that was never set is stored as `""`. Flux substitutes the empty
+/// value instead of failing the build with `variable not set`, and the catalog template stays
+/// unchanged (no `${field:=}` default, which Keel would render at proposal time). The empty value
+/// is only synthesized when `""` satisfies the field's own `schema` constraints (e.g. a
+/// `minLength: 1` token must be set), so a catalog that rules out an empty secret fails closed
+/// at proposal time instead of deploying without the credential.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn resolve_manifest_app_secret(
     state: &AppState,
     tenant: &str,
     tenant_ns: &str,
     secret_name: &str,
+    schema: &Value,
     schema_secret_paths: &[String],
     secret_values: &Value,
     stored: Option<&StoredManifestAppSecret>,
 ) -> Result<Option<String>, ServerError> {
+    let submitted = render_secret_string_data(secret_values);
+    let empty_defaults: Vec<String> = manifest_placeholder_secret_fields(schema_secret_paths)
+        .into_iter()
+        .filter(|key| !submitted.contains_key(key) && !stored.is_some_and(|s| s.keys.contains(key)))
+        .collect();
+    ensure_empty_secret_allowed(schema, &empty_defaults)?;
     Ok(resolve_tenant_app_secret(
         state,
         tenant,
         tenant_ns,
         secret_name,
         schema_secret_paths,
-        render_secret_string_data(secret_values),
+        submitted,
+        &empty_defaults,
         stored,
     )
     .await?
     .map(|(ciphertext, _)| ciphertext))
+}
+
+/// Fails when `""` violates the schema of one of the unset top-level secret `fields` (only errors
+/// at the field itself count; the object's other fields are not part of the probe).
+fn ensure_empty_secret_allowed(schema: &Value, fields: &[String]) -> Result<(), ServerError> {
+    for field in fields {
+        let probe = json!({ field.as_str(): "" });
+        let pointer = format!("/{}", field.replace('~', "~0").replace('/', "~1"));
+        let rejected = match keel_core::validate_schema_values(schema, &probe) {
+            Ok(()) => false,
+            Err(keel_core::CoreError::SchemaValidation(errors)) => {
+                errors.iter().any(|e| e.field_path == pointer)
+            }
+            Err(e) => return Err(e.into()),
+        };
+        if rejected {
+            return Err(ServerError::BadRequest(format!(
+                "Secret field '{field}' is not set, and its catalog schema does not allow the empty value Keel would substitute for it; set a value"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Top-level secret fields of a manifest app schema: the only ones a `${field}` placeholder can
+/// name (nested and array paths contain `.` / `[`).
+fn manifest_placeholder_secret_fields(schema_secret_paths: &[String]) -> Vec<String> {
+    schema_secret_paths
+        .iter()
+        .filter(|p| !p.contains(['.', '[']))
+        .cloned()
+        .collect()
 }
 
 /// Resolves the SOPS-encrypted `<name>-secrets` `Secret` (and its keys) to commit for an app
@@ -176,6 +248,11 @@ pub(super) async fn resolve_manifest_app_secret(
 /// * Stored, every stored key re-submitted: a fresh `Secret` of the submitted values.
 /// * Stored, some keys re-submitted: the stored `Secret` is decrypted with the tenant `age` key,
 ///   the submitted keys are overlaid, and the result is re-encrypted.
+///
+/// Every `empty_defaults` key that is neither submitted nor stored is added as `""` (a Flux
+/// manifest app's unset optional secrets); a stored `Secret` lacking such a key is merged and
+/// re-encrypted.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn resolve_tenant_app_secret(
     state: &AppState,
     tenant: &str,
@@ -183,14 +260,21 @@ pub(super) async fn resolve_tenant_app_secret(
     secret_name: &str,
     schema_secret_paths: &[String],
     submitted: std::collections::BTreeMap<String, String>,
+    empty_defaults: &[String],
     stored: Option<&StoredManifestAppSecret>,
 ) -> Result<Option<(String, std::collections::BTreeSet<String>)>, ServerError> {
     if schema_secret_paths.is_empty() {
         return Ok(None);
     }
+    let missing_defaults: Vec<&String> = empty_defaults
+        .iter()
+        .filter(|key| {
+            !submitted.contains_key(*key) && !stored.is_some_and(|s| s.keys.contains(*key))
+        })
+        .collect();
     let mut merged = match stored {
-        None if submitted.is_empty() => return Ok(None),
-        Some(stored) if submitted.is_empty() => {
+        None if submitted.is_empty() && missing_defaults.is_empty() => return Ok(None),
+        Some(stored) if submitted.is_empty() && missing_defaults.is_empty() => {
             return Ok(Some((stored.ciphertext.clone(), stored.keys.clone())));
         }
         Some(stored) if !stored.keys.iter().all(|k| submitted.contains_key(k)) => {
@@ -204,6 +288,9 @@ pub(super) async fn resolve_tenant_app_secret(
             p == key || p.starts_with(&format!("{key}.")) || p.starts_with(&format!("{key}["))
         })
     });
+    for key in missing_defaults {
+        merged.insert(key.clone(), String::new());
+    }
     merged.extend(submitted);
     let keys = merged.keys().cloned().collect();
     let merged_values = Value::Object(
@@ -326,6 +413,82 @@ mod tests {
         assert_eq!(
             relax_stored_secret_requirements(&no_required, &stored),
             no_required
+        );
+    }
+
+    #[test]
+    fn empty_sops_values_are_detected_without_decrypting() {
+        assert!(is_empty_sops_value(&json!("")));
+        assert!(is_empty_sops_value(&Value::Null));
+        assert!(is_empty_sops_value(&json!(
+            "ENC[AES256_GCM,data:,iv:abc=,tag:def==,type:str]"
+        )));
+        assert!(!is_empty_sops_value(&json!(
+            "ENC[AES256_GCM,data:scE=,iv:abc=,tag:def==,type:str]"
+        )));
+    }
+
+    #[tokio::test]
+    async fn stored_empty_placeholders_are_not_valued_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = dir.path().join("tenants/acme/apps/echo");
+        std::fs::create_dir_all(app.join(keel_kube::MANIFEST_APP_CONFIG_DIR)).unwrap();
+        std::fs::write(app.join("manifests.yaml"), "").unwrap();
+        std::fs::write(
+            app.join(keel_kube::MANIFEST_APP_CONFIG_DIR)
+                .join("secrets.enc.yaml"),
+            "apiVersion: v1\nkind: Secret\nmetadata:\n  name: echo-secrets\nstringData:\n  apiToken: \"\"\n  password: ENC[AES256_GCM,data:scE=,iv:a,tag:b,type:str]\nsops:\n  version: 3.13.3\n",
+        )
+        .unwrap();
+        let stored = read_stored_manifest_app_secret(dir.path(), "tenants/acme/apps/echo")
+            .await
+            .unwrap();
+        assert_eq!(
+            stored.keys,
+            std::collections::BTreeSet::from(["apiToken".to_string(), "password".to_string()])
+        );
+        assert_eq!(
+            stored.valued_keys,
+            std::collections::BTreeSet::from(["password".to_string()])
+        );
+    }
+
+    #[test]
+    fn unset_secret_must_accept_an_empty_value() {
+        let schema = json!({
+            "type": "object",
+            "required": ["echoText"],
+            "properties": {
+                "echoText": { "type": "string" },
+                "apiToken": { "type": "string", "writeOnly": true, "pattern": "^[a-z]{0,8}$" },
+                "webhook": { "type": "string", "writeOnly": true, "minLength": 1 },
+            },
+        });
+        // The probe ignores the object's other required fields.
+        ensure_empty_secret_allowed(&schema, &["apiToken".to_string()]).unwrap();
+        ensure_empty_secret_allowed(&schema, &[]).unwrap();
+        let err =
+            ensure_empty_secret_allowed(&schema, &["apiToken".to_string(), "webhook".to_string()])
+                .unwrap_err();
+        assert!(
+            matches!(&err, ServerError::BadRequest(msg) if msg.contains("'webhook'")),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn only_top_level_secret_fields_are_placeholder_defaults() {
+        let paths = [
+            "apiToken",
+            "auth.password",
+            "keys[]",
+            "keys[].secret",
+            "webhook",
+        ]
+        .map(String::from);
+        assert_eq!(
+            manifest_placeholder_secret_fields(&paths),
+            vec!["apiToken".to_string(), "webhook".to_string()]
         );
     }
 }

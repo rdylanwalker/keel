@@ -307,12 +307,11 @@ Deploy raw Kubernetes YAML templates without packaging a Helm chart, choosing be
 
 ### Step 1: Deploy via the Web Portal
 1. In **Catalog & Form Wizard**, select target tenant `default`, or a tenant you created (both engines work in every tenant).
-2. Locate the **HTTP Echo Server** (`http-echo-manifest`) application blueprint.
-3. In the deploy modal, configure the parameters:
-   - **Application Name:** `echo-demo`
-   - **Service Port:** `8080`
-   - **Echo Message:** `"Hello from Keel Manifest Template!"`
-   - **Optional Secret API Token:** any value (`[A-Za-z0-9+/=_.-]`, up to 128 characters). It is committed only SOPS-encrypted (`config/secrets.enc.yaml`); on the Flux engine the `<instance>-config` Kustomization decrypts it with the tenant's `sops-age` key and Flux substitutes it into the `http-echo-api-token` Secret (`ECHO_API_TOKEN` in the pod).
+2. Locate the **HTTP Echo Raw Manifest** (`http-echo-manifest`) application blueprint.
+3. In the deploy modal, set **Instance Name** to `echo-demo` and configure the parameters:
+   - **Echo Response Message** (`echoText`): `Hello from Keel Manifest Template!`
+   - **Pod Replicas** (`replicas`): `1` (1 to 5)
+   - **Optional Secret API Token** (`apiToken`): leave it empty, or enter any value (`[A-Za-z0-9+/=_.-]`, up to 128 characters). It is committed only SOPS-encrypted (`config/secrets.enc.yaml`); on the Flux engine the `<instance>-config` Kustomization decrypts it with the tenant's `sops-age` key and Flux substitutes it into the `http-echo-api-token` Secret (`ECHO_API_TOKEN` in the pod). Left empty, it is stored as an empty value and substituted as `""`. Secret fields need the Flux engine: Keel rejects a token with `--engine pulumi`.
 4. Notice the **Action Engine** selector:
    - **Flux CD Kustomization (`flux`):** Generates `manifests.yaml`, non-secret substitutions in `config/values-configmap.yaml` (applied first by an `<instance>-config` Kustomization), and a Flux `Kustomization` that depends on it and uses `postBuild.substituteFrom`.
    - **Pulumi PKO Stack (`pulumi`):** Generates `Pulumi.yaml` wrapping the rendered manifests in `kubernetes:yaml/v2:ConfigGroup` with a PKO v2 `Stack` and ephemeral PR preview diffing.
@@ -325,9 +324,9 @@ Submit the proposal directly via the CLI:
 
 ```bash
 cat <<'EOF' > /tmp/echo-values.yaml
-app_name: echo-cli
-port: 8080
-message: "Hello from CLI Manifest Deployment"
+echoText: "Hello from CLI Manifest Deployment"
+replicas: 1
+# apiToken: my-token   # optional secret (Flux engine only); left out, it is substituted as ""
 EOF
 
 # Option A: Deploy using Flux CD engine
@@ -347,7 +346,7 @@ keel app install \
   --server http://127.0.0.1:8080
 ```
 
-Verify in **Topology Map** that `echo-demo` transitions from `Pending` → `Synced` / `Ready`.
+The CLI names the instance after the catalog app (`http-echo-manifest`), so pick one of the two options. Verify in **Topology Map** that `echo-demo` (and `http-echo-manifest`) transitions from `Pending` → `Synced` / `Ready`.
 
 ---
 

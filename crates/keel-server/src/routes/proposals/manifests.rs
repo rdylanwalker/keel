@@ -577,6 +577,8 @@ pub(super) async fn prepare_helm_app_extras(
         &secret_name,
         &input.partitioned.secret_field_paths,
         fragments,
+        // Helm apps leave unset secrets to the chart defaults.
+        &[],
         input.stored_secret,
     )
     .await?;

@@ -7765,6 +7765,366 @@ async fn test_manifest_app_edit_keeps_stored_secrets() {
     assert_eq!(doc["metadata"]["name"], "rauthy-secrets");
 }
 
+/// Decrypts a committed tenant SOPS Secret into its `stringData`.
+async fn decrypt_tenant_secret_string_data(fixture: &TestFixture, ciphertext: &str) -> Value {
+    let age_key = fixture
+        .state
+        .secret_store
+        .get_tenant_age_key("acme")
+        .await
+        .unwrap()
+        .unwrap();
+    let plain = keel_core::SopsManager::new()
+        .decrypt_yaml(&age_key.secret_key, ciphertext)
+        .await
+        .unwrap();
+    noyalib::from_str::<Value>(&plain).unwrap()["stringData"].clone()
+}
+
+/// FU-4: an optional secret field left unset still gets a key (`""`) in the `<instance>-secrets`
+/// Secret, so Flux substitutes an empty value instead of failing the build with `variable not
+/// set`. A later edit that sets it stores the value; a catalog that gains an optional secret
+/// re-encrypts the stored Secret with the new key added.
+#[tokio::test]
+async fn test_manifest_app_optional_secret_left_unset_is_substituted_empty() {
+    let fixture = setup_fixture().await;
+    let cookie = login_and_get_cookie(&fixture).await;
+    let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../deploy/catalog/apps/http-echo-manifest");
+    let catalog = std::fs::read_to_string(base.join("catalog.yaml")).unwrap();
+    let manifests = std::fs::read_to_string(base.join("manifests.yaml")).unwrap();
+    commit_to_main(
+        &fixture,
+        &[
+            (
+                "catalog/apps/http-echo-manifest/catalog.yaml",
+                catalog.as_str(),
+            ),
+            (
+                "catalog/apps/http-echo-manifest/manifests.yaml",
+                manifests.as_str(),
+            ),
+        ],
+        "feat(catalog): add http-echo-manifest",
+    )
+    .await;
+    let workdir = fixture.state.repo_workdir.clone();
+    let dir = workdir.join("tenants/acme/apps/echo");
+    let secret_path = dir.join("config/secrets.enc.yaml");
+
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "http-echo-manifest", "name": "echo",
+                "values": { "echoText": "hi", "replicas": 1 } }),
+    )
+    .await;
+    if sops_unavailable(status, &body) {
+        return;
+    }
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    checkout_proposal_branch(&fixture, &body).await;
+    // The placeholder stays for Flux and the Secret source exists, with an empty value.
+    assert!(
+        std::fs::read_to_string(dir.join("manifests.yaml"))
+            .unwrap()
+            .contains("${apiToken}")
+    );
+    let stored = std::fs::read_to_string(&secret_path).unwrap();
+    assert_eq!(sops_secret_keys(&stored), vec!["apiToken".to_string()]);
+    assert_eq!(
+        decrypt_tenant_secret_string_data(&fixture, &stored).await,
+        json!({ "apiToken": "" })
+    );
+    let fk: Value =
+        noyalib::from_str(&std::fs::read_to_string(dir.join("flux-kustomization.yaml")).unwrap())
+            .unwrap();
+    assert!(
+        fk["spec"]["postBuild"]["substituteFrom"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["kind"] == "Secret" && s["name"] == "echo-secrets")
+    );
+    // The `<instance>-config` Kustomization applies the Secret: it must list the file.
+    let config_kustomization: Value =
+        noyalib::from_str(&std::fs::read_to_string(dir.join("config/kustomization.yaml")).unwrap())
+            .unwrap();
+    assert!(
+        config_kustomization["resources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r == "secrets.enc.yaml"),
+        "{config_kustomization}"
+    );
+    merge_proposal_and_sync(&fixture, &cookie, &body).await;
+
+    // An edit that leaves it blank keeps the stored Secret unchanged; setting it stores it.
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "http-echo-manifest", "name": "echo",
+                "values": { "echoText": "hello", "replicas": 1 } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    checkout_proposal_branch(&fixture, &body).await;
+    assert_eq!(std::fs::read_to_string(&secret_path).unwrap(), stored);
+    fixture
+        .state
+        .git_runner
+        .checkout_branch(&workdir, "main")
+        .await
+        .unwrap();
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "http-echo-manifest", "name": "echo",
+                "values": { "echoText": "hi", "replicas": 1, "apiToken": "tok-123" } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    checkout_proposal_branch(&fixture, &body).await;
+    assert_eq!(
+        decrypt_tenant_secret_string_data(
+            &fixture,
+            &std::fs::read_to_string(&secret_path).unwrap()
+        )
+        .await,
+        json!({ "apiToken": "tok-123" })
+    );
+
+    // The catalog gains a second optional secret: an edit that submits no secrets adds it empty
+    // and keeps the stored one.
+    fixture
+        .state
+        .git_runner
+        .checkout_branch(&workdir, "main")
+        .await
+        .unwrap();
+    let extended = catalog.replace(
+        "      apiToken:\n",
+        "      webhookToken:\n        type: string\n        writeOnly: true\n      apiToken:\n",
+    );
+    assert_ne!(extended, catalog);
+    commit_to_main(
+        &fixture,
+        &[(
+            "catalog/apps/http-echo-manifest/catalog.yaml",
+            extended.as_str(),
+        )],
+        "feat(catalog): add webhookToken",
+    )
+    .await;
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "http-echo-manifest", "name": "echo",
+                "values": { "echoText": "hi", "replicas": 2 } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    checkout_proposal_branch(&fixture, &body).await;
+    assert_eq!(
+        decrypt_tenant_secret_string_data(
+            &fixture,
+            &std::fs::read_to_string(&secret_path).unwrap()
+        )
+        .await,
+        json!({ "apiToken": "", "webhookToken": "" })
+    );
+
+    // The catalog later makes the token required: the stored empty placeholder is not a stored
+    // value, so an edit must set it.
+    fixture
+        .state
+        .git_runner
+        .checkout_branch(&workdir, "main")
+        .await
+        .unwrap();
+    let required = catalog.replace(
+        "    required:\n      - echoText\n",
+        "    required:\n      - apiToken\n      - echoText\n",
+    );
+    assert_ne!(required, catalog);
+    commit_to_main(
+        &fixture,
+        &[(
+            "catalog/apps/http-echo-manifest/catalog.yaml",
+            required.as_str(),
+        )],
+        "feat(catalog): require apiToken",
+    )
+    .await;
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "http-echo-manifest", "name": "echo",
+                "values": { "echoText": "hi", "replicas": 1 } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert!(body.contains("apiToken"), "{body}");
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "http-echo-manifest", "name": "echo",
+                "values": { "echoText": "hi", "replicas": 1, "apiToken": "tok-456" } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    checkout_proposal_branch(&fixture, &body).await;
+    assert_eq!(
+        decrypt_tenant_secret_string_data(
+            &fixture,
+            &std::fs::read_to_string(&secret_path).unwrap()
+        )
+        .await,
+        json!({ "apiToken": "tok-456" })
+    );
+}
+
+/// An unset optional manifest secret is substituted as `""` only when the field's schema allows
+/// an empty value; otherwise the proposal fails closed instead of deploying without it.
+#[tokio::test]
+async fn test_manifest_app_unset_secret_must_allow_empty_value() {
+    let fixture = setup_fixture().await;
+    let cookie = login_and_get_cookie(&fixture).await;
+    let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../deploy/catalog/apps/http-echo-manifest");
+    let catalog = std::fs::read_to_string(base.join("catalog.yaml"))
+        .unwrap()
+        .replace("{0,128}", "{1,128}");
+    let manifests = std::fs::read_to_string(base.join("manifests.yaml")).unwrap();
+    commit_to_main(
+        &fixture,
+        &[
+            (
+                "catalog/apps/http-echo-manifest/catalog.yaml",
+                catalog.as_str(),
+            ),
+            (
+                "catalog/apps/http-echo-manifest/manifests.yaml",
+                manifests.as_str(),
+            ),
+        ],
+        "feat(catalog): add http-echo-manifest with a non-empty token",
+    )
+    .await;
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "http-echo-manifest", "name": "echo",
+                "values": { "echoText": "hi", "replicas": 1 } }),
+    )
+    .await;
+    if sops_unavailable(status, &body) {
+        return;
+    }
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body.contains("Secret field 'apiToken' is not set"),
+        "{body}"
+    );
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "http-echo-manifest", "name": "echo",
+                "values": { "echoText": "hi", "replicas": 1, "apiToken": "tok" } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+}
+
+/// Bundle items that reference a manifest app store an unset optional secret as `""` too.
+#[tokio::test]
+async fn test_bundle_manifest_app_item_optional_secret_left_unset_is_substituted_empty() {
+    let fixture = setup_fixture().await;
+    let cookie = login_and_get_cookie(&fixture).await;
+    let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../deploy/catalog/apps/http-echo-manifest");
+    let catalog = std::fs::read_to_string(base.join("catalog.yaml")).unwrap();
+    let manifests = std::fs::read_to_string(base.join("manifests.yaml")).unwrap();
+    commit_to_main(
+        &fixture,
+        &[
+            (
+                "catalog/apps/http-echo-manifest/catalog.yaml",
+                catalog.as_str(),
+            ),
+            (
+                "catalog/apps/http-echo-manifest/manifests.yaml",
+                manifests.as_str(),
+            ),
+            (
+                "catalog/bundles/echo-only/catalog.yaml",
+                r#"apiVersion: keel.io/v1alpha1
+kind: CatalogBundle
+metadata:
+  id: echo-only
+  name: Echo Only
+  category: utilities
+spec:
+  items:
+    - id: web
+      kind: app
+      catalogRef: http-echo-manifest
+  schema:
+    type: object
+    properties:
+      web:
+        type: object
+        required: [echoText, replicas]
+        properties:
+          echoText:
+            type: string
+          replicas:
+            type: integer
+          apiToken:
+            type: string
+            writeOnly: true
+"#,
+            ),
+        ],
+        "feat(catalog): echo-only bundle",
+    )
+    .await;
+    let workdir = fixture.state.repo_workdir.clone();
+    let item_dir = workdir.join("tenants/acme/bundles/echo-only/web");
+
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "echo-only", "kind": "bundle",
+                "values": { "web": { "echoText": "hi", "replicas": 1 } } }),
+    )
+    .await;
+    if sops_unavailable(status, &body) {
+        return;
+    }
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    checkout_proposal_branch(&fixture, &body).await;
+    let stored = std::fs::read_to_string(item_dir.join("config/secrets.enc.yaml")).unwrap();
+    let doc: Value = noyalib::from_str(&stored).unwrap();
+    assert_eq!(doc["metadata"]["name"], "echo-only-web-secrets");
+    assert_eq!(
+        decrypt_tenant_secret_string_data(&fixture, &stored).await,
+        json!({ "apiToken": "" })
+    );
+    let fk: Value = noyalib::from_str(
+        &std::fs::read_to_string(item_dir.join("flux-kustomization.yaml")).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        fk["spec"]["postBuild"]["substituteFrom"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["kind"] == "Secret" && s["name"] == "echo-only-web-secrets")
+    );
+}
+
 /// Bundle edits keep a manifest-app item's stored secrets the same way.
 #[tokio::test]
 async fn test_bundle_manifest_app_item_edit_keeps_stored_secrets() {

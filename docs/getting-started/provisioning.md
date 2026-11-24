@@ -128,9 +128,9 @@ keel app install \
 #### Raw Kubernetes Manifest Template (`--engine flux` or `--engine pulumi`)
 ```bash
 cat <<'EOF' > echo-values.yaml
-app_name: echo-demo
-port: 8080
-message: "Hello from Keel Manifest Template!"
+echoText: "Hello from Keel Manifest Template!"
+replicas: 1
+# apiToken: my-token   # optional secret (Flux engine only); left out, it is substituted as ""
 EOF
 
 # Deploy via Flux CD Kustomization with postBuild substitution

@@ -103,7 +103,7 @@ pub(super) async fn create_bundle_proposal(
             .get_mut("properties")
             .and_then(|p| p.get_mut(&item.id))
         {
-            *item_schema = relax_stored_secret_requirements(item_schema, &stored.keys);
+            *item_schema = relax_stored_secret_requirements(item_schema, &stored.valued_keys);
         }
         stored_item_secrets.insert(item.id.clone(), stored);
     }
@@ -219,6 +219,9 @@ pub(super) async fn create_bundle_proposal(
             item_values
         };
         let partitioned = partition_values_by_schema(sub_schema, &item_values)?;
+        // Owned: `ref_manifest` is consumed below; a manifest-app item checks its unset optional
+        // secrets against it.
+        let item_schema = sub_schema.clone();
         let values_yaml = render_helm_values_yaml(&partitioned.normal_values)?;
         let mut helm_item_tenant_resources: Vec<&'static str> = Vec::new();
         let mut bundle_labels = std::collections::BTreeMap::new();
@@ -325,6 +328,7 @@ pub(super) async fn create_bundle_proposal(
                         &req.tenant,
                         &tenant_ns,
                         &keel_kube::manifest_app_secrets_name(&item_resource_name),
+                        &item_schema,
                         &partitioned.secret_field_paths,
                         &partitioned.secret_values,
                         stored_item_secrets.get(&item.id),
