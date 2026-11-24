@@ -1398,6 +1398,14 @@ impl GitRunner {
         Ok(())
     }
 
+    /// Fast-forwards the checked-out branch of the working copy at `work_dir` from its upstream
+    /// (`git pull --ff-only`), as a human `git pull` would: the repository's own credential
+    /// helpers apply, prompts are disabled. Returns git's (redacted) stdout.
+    pub async fn pull_ff_only(&self, work_dir: &Path) -> Result<String, GitError> {
+        self.exec(Some(work_dir), "pull", &["pull", "--ff-only"], &[])
+            .await
+    }
+
     /// Reads the configured URL for `remote` (`git remote get-url -- <remote>`).
     pub async fn get_remote_url(&self, work_dir: &Path, remote: &str) -> Result<String, GitError> {
         validate_git_ref(remote, "remote")?;
@@ -2248,6 +2256,54 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn pull_ff_only_fast_forwards_and_refuses_diverged_history() {
+        let tmp = TempDir::new().unwrap();
+        let bare = tmp.path().join("origin.git");
+        let first = tmp.path().join("first");
+        let second = tmp.path().join("second");
+        let runner = GitRunner::new();
+        let author = CommitAuthor::new("Dev", "dev@keel.io");
+        runner.init_bare(&bare).await.unwrap();
+        runner
+            .init_worktree_with_remote(&first, "main", bare.to_str().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(first.join("a.txt"), "a\n").await.unwrap();
+        runner.add(&first, ["."]).await.unwrap();
+        runner.commit(&first, "chore: a", &author).await.unwrap();
+        runner
+            .push(&first, "origin", "HEAD:refs/heads/main")
+            .await
+            .unwrap();
+        runner.clone(bare.to_str().unwrap(), &second).await.unwrap();
+
+        tokio::fs::write(first.join("b.txt"), "b\n").await.unwrap();
+        runner.add(&first, ["."]).await.unwrap();
+        runner.commit(&first, "chore: b", &author).await.unwrap();
+        runner
+            .push(&first, "origin", "HEAD:refs/heads/main")
+            .await
+            .unwrap();
+        runner.pull_ff_only(&second).await.unwrap();
+        assert!(second.join("b.txt").exists());
+
+        // A local commit on top of a remote one that is not in it cannot be fast-forwarded.
+        tokio::fs::write(first.join("c.txt"), "c\n").await.unwrap();
+        runner.add(&first, ["."]).await.unwrap();
+        runner.commit(&first, "chore: c", &author).await.unwrap();
+        runner
+            .push(&first, "origin", "HEAD:refs/heads/main")
+            .await
+            .unwrap();
+        tokio::fs::write(second.join("d.txt"), "d\n").await.unwrap();
+        runner.add(&second, ["."]).await.unwrap();
+        runner.commit(&second, "chore: d", &author).await.unwrap();
+        let err = runner.pull_ff_only(&second).await.unwrap_err();
+        assert!(matches!(err, GitError::CommandFailed { .. }), "{err}");
+        assert!(!second.join("c.txt").exists());
     }
 
     #[tokio::test]

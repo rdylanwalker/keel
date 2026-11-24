@@ -82,6 +82,8 @@ pub enum Commands {
     /// Tenant operations (credential repair)
     #[command(visible_alias = "tenants")]
     Tenant(TenantArgs),
+    /// Work with the local GitOps working copy (`--repo-dir` of `keel bootstrap init`)
+    Gitops(GitopsArgs),
 }
 
 /// `keel bootstrap` subcommands.
@@ -778,6 +780,38 @@ pub enum TenantCommands {
     /// Re-mint a tenant's repository read credential and its cluster Secret (all tenants when no
     /// id is given; platform admin only)
     RepairCredentials(TenantRepairCredentialsArgs),
+}
+
+/// `keel gitops` subcommands.
+#[derive(Args, Debug, Clone, PartialEq, Eq)]
+pub struct GitopsArgs {
+    #[command(subcommand)]
+    pub command: GitopsCommands,
+}
+
+/// Subcommands under `keel gitops`.
+#[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
+pub enum GitopsCommands {
+    /// Fast-forward the working copy from its origin (`git pull --ff-only`). With the in-cluster
+    /// Forgejo and no `keel serve` running, opens a temporary port-forward and Git credential for
+    /// the pull and removes both afterwards
+    Pull(GitopsPullArgs),
+}
+
+/// Arguments for `keel gitops pull`.
+#[derive(Args, Debug, Clone, PartialEq, Eq)]
+pub struct GitopsPullArgs {
+    /// Local GitOps working copy (the `--repo-dir` of `keel bootstrap init`)
+    #[arg(long, default_value = "keel-gitops")]
+    pub repo_dir: PathBuf,
+
+    /// Kubeconfig context of the management cluster (default: the current context)
+    #[arg(long)]
+    pub context: Option<String>,
+
+    /// Kubeconfig file of the management cluster (default: `KUBECONFIG` / `~/.kube/config`)
+    #[arg(long)]
+    pub kubeconfig: Option<PathBuf>,
 }
 
 /// Arguments for `keel tenant repair-credentials` (calls keel-server; platform admin only).

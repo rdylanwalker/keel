@@ -3,8 +3,10 @@
 mod api;
 mod auth;
 mod bootstrap;
+mod gitops;
 mod recover;
 mod serve;
+mod signal;
 mod workloads;
 
 use std::collections::BTreeMap;
@@ -22,8 +24,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::cli::{
-    AppCommands, AuthCommands, BootstrapCommands, CatalogCommands, Cli, Commands, InfraCommands,
-    PreviewCommands, ProposalCommands, TenantCommands,
+    AppCommands, AuthCommands, BootstrapCommands, CatalogCommands, Cli, Commands, GitopsCommands,
+    InfraCommands, PreviewCommands, ProposalCommands, TenantCommands,
 };
 
 use api::{
@@ -33,6 +35,7 @@ use api::{
 };
 use auth::{execute_auth_login, execute_auth_logout, execute_auth_status};
 use bootstrap::execute_bootstrap_init;
+use gitops::execute_gitops_pull;
 use recover::execute_bootstrap_recover;
 use serve::execute_serve;
 use workloads::{
@@ -523,6 +526,9 @@ pub async fn dispatch(cli: &Cli, ctx: &CliContext) -> Result<String, CliError> {
             TenantCommands::RepairCredentials(args) => {
                 execute_tenant_repair_credentials(&with_server!(args), ctx).await
             }
+        },
+        Commands::Gitops(g) => match &g.command {
+            GitopsCommands::Pull(args) => execute_gitops_pull(args).await,
         },
     }
 }

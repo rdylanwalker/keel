@@ -83,6 +83,12 @@ The CLI does not create or delete tenants: use **+ New Tenant** in the portal (s
 | :--- | :--- |
 | `keel serve [--bind <ADDR>] [--repo-dir <DIR>] [--bare-repo <DIR>] [--config <FILE>] [--git-token <TOKEN>] [--git-url <URL>] [--git-username <USER>]` | Starts the stateless API/SSE server and the embedded SPA. `--bind` defaults to `127.0.0.1:8080`. `--git-token` can also be set with `KEEL_GIT_TOKEN`. `--git-url` / `KEEL_GIT_URL` sets up `--repo-dir` from a remote GitOps repository: it clones when the directory is missing or empty and fetches otherwise. Credentials come only from `KEEL_GIT_TOKEN`, never from the URL. `--git-username` / `KEEL_GIT_USERNAME` is the HTTPS username paired with the token (default `keel`). See [Running keel-server In-Cluster](../operations/in-cluster-server.md). |
 
+## GitOps Working Copy
+
+| Command | Description |
+| :--- | :--- |
+| `keel gitops pull [--repo-dir <DIR>] [--context <CTX>] [--kubeconfig <FILE>]` | Fast-forwards the local working copy (`--repo-dir`, default `./keel-gitops`) from its origin with `git pull --ff-only`. With the in-cluster Forgejo (`--with-forge`) and no `keel serve` running, it reads the Forgejo token from `keel-system/forge-token` through `kubectl` (`--context` / `--kubeconfig`), opens a temporary port-forward to Forgejo, points `origin` at it, and writes the token to the repository-local credential file `.git/keel-credentials` for the pull only. Afterwards it removes the file and its helper, points `origin` back where it was and closes the forward, also when the pull fails or is stopped with Ctrl+C, `SIGTERM` or `SIGHUP` (only `kill -9` leaves the file; rerun the command to clear it). While `keel serve` runs (it holds a lock on `.git/keel-serve.lock`, so a killed server's orphaned port-forward is not mistaken for it), it pulls through the server's forward and credential instead. Local bare repositories and external forges are pulled directly with your own Git credentials. The token is never printed or put in the remote URL. |
+
 ## Stage 0 Bootstrap & Recovery
 
 | Command | Description |

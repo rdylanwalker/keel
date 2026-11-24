@@ -35,6 +35,7 @@ use super::bootstrap::{
     FORGE_TOKEN_SECRET_NAME, TempPortForward, default_bare_repo_for_workdir,
     start_forgejo_port_forward, start_gateway_port_forward,
 };
+use super::gitops::ServeLock;
 use super::{CliError, absolutize_path, is_relative_local_remote};
 
 fn build_forge_provider(
@@ -234,12 +235,21 @@ fn remote_bootstrap_runner(url: &str, token: Option<&str>, username: Option<&str
     }
 }
 
-/// Builds a configured stateless [`AppState`] from [`ServeArgs`] (`SDD.md` §6.3, §7.2), plus any
-/// in-cluster port-forwards that must stay alive for as long as the state is in use.
+/// What must stay alive for as long as a built [`AppState`] is in use: the in-cluster
+/// port-forwards and, while the working copy's `origin` points at the Forgejo forward, the
+/// [`ServeLock`] that tells `keel gitops pull` a live `keel serve` owns its credential store.
+#[derive(Default)]
+pub(crate) struct ServeGuards {
+    port_forwards: Vec<TempPortForward>,
+    serve_lock: Option<ServeLock>,
+}
+
+/// Builds a configured stateless [`AppState`] from [`ServeArgs`] (`SDD.md` §6.3, §7.2), plus the
+/// [`ServeGuards`] that must stay alive for as long as the state is in use.
 pub(crate) async fn build_serve_state(
     args: &ServeArgs,
     enable_in_cluster_port_forward: bool,
-) -> Result<(AppState, Vec<TempPortForward>), CliError> {
+) -> Result<(AppState, ServeGuards), CliError> {
     if args.bind.trim().is_empty() || !args.bind.contains(':') {
         return Err(CliError::Validation(format!(
             "bind address must be in '<host>:<port>' format, got '{}'",
@@ -429,7 +439,7 @@ pub(crate) async fn build_serve_state(
             .await;
     }
 
-    let mut port_forwards: Vec<TempPortForward> = Vec::new();
+    let mut guards = ServeGuards::default();
     let mut api_url_override: Option<String> = None;
     // Inside a Pod the in-cluster Service DNS resolves directly; port-forwards are a laptop aid.
     let running_in_pod = std::env::var_os("KUBERNETES_SERVICE_HOST").is_some();
@@ -438,11 +448,7 @@ pub(crate) async fn build_serve_state(
         && remote_git_url.is_none()
         && kube_reader.is_some()
         && let Some(ref cfg) = parsed_keel_cfg
-        && cfg
-            .forge
-            .api_url
-            .as_deref()
-            .is_some_and(|u| u.contains(".svc.cluster.local"))
+        && super::gitops::is_in_cluster_forge(cfg)
         && let Ok(pf) = start_forgejo_port_forward(None, None).await
     {
         tracing::info!(
@@ -461,6 +467,15 @@ pub(crate) async fn build_serve_state(
                 .is_ok()
                 && let Some(token) = resolved_token.as_deref().filter(|t| !t.trim().is_empty())
             {
+                // Taken before the store is written: `keel gitops pull` treats a store without a
+                // held lock as the leftover of a killed server and replaces it.
+                match ServeLock::acquire(&repo_workdir) {
+                    Ok(lock) => guards.serve_lock = Some(lock),
+                    Err(err) => tracing::warn!(
+                        error = %err,
+                        "Could not lock the working copy for this `keel serve`; `keel gitops pull` will not use its forward"
+                    ),
+                }
                 // A human `git pull` in the working copy authenticates through a repository-local
                 // 0600 credential store, never a token in the remote URL.
                 match git_runner
@@ -470,7 +485,7 @@ pub(crate) async fn build_serve_state(
                     Ok(store) => tracing::info!(
                         remote = %local_remote,
                         store = %store.display(),
-                        "Configured a repository-local git credential for the working copy's origin (pullable while `keel serve` runs)"
+                        "Configured a repository-local git credential for the working copy's origin (pullable while `keel serve` runs; otherwise use `keel gitops pull`)"
                     ),
                     Err(err) => tracing::warn!(
                         error = %err,
@@ -479,7 +494,7 @@ pub(crate) async fn build_serve_state(
                 }
             }
         }
-        port_forwards.push(pf);
+        guards.port_forwards.push(pf);
     }
 
     if enable_in_cluster_port_forward
@@ -494,7 +509,7 @@ pub(crate) async fn build_serve_state(
                     local_port = pf.local_port,
                     "Started automatic port-forward to Envoy Gateway (keel-ingress:8888) for Rauthy OIDC"
                 );
-                port_forwards.push(pf);
+                guards.port_forwards.push(pf);
             }
             Err(err) => {
                 tracing::warn!(
@@ -731,7 +746,7 @@ pub(crate) async fn build_serve_state(
         }
     }
 
-    Ok((state, port_forwards))
+    Ok((state, guards))
 }
 
 /// Binds `keel-server` on `args.bind` and runs until `shutdown` resolves.
@@ -748,7 +763,7 @@ where
         shutdown.await;
         let _ = shutdown_tx.send(true);
     });
-    let (state, _forge_pf) = build_serve_state(args, true).await?;
+    let (state, _guards) = build_serve_state(args, true).await?;
     let git_runner = Clone::clone(&state.git_runner);
     let repo_workdir = state.repo_workdir.clone();
     let served = serve_built_state(args, state, &mut shutdown_rx).await;
@@ -839,40 +854,8 @@ async fn serve_built_state(
 /// `kubectl port-forward` children; otherwise they outlive the server and keep holding
 /// `127.0.0.1:8888`/`:3000`.
 pub async fn execute_serve(args: &ServeArgs) -> Result<String, CliError> {
-    let addr = execute_serve_until(args, shutdown_signal()).await?;
+    let addr = execute_serve_until(args, super::signal::shutdown_signal()).await?;
     Ok(format!("Keel server on {addr} shut down cleanly."))
-}
-
-/// Resolves on the first `SIGINT`, `SIGTERM` or `SIGHUP` (only `Ctrl+C` off Unix). The Unix
-/// handlers are registered when this is called (not when the future is first polled), so the
-/// default "terminate" disposition is replaced before startup begins.
-fn shutdown_signal() -> impl Future<Output = ()> + Send + 'static {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
-        let streams = (
-            signal(SignalKind::interrupt()),
-            signal(SignalKind::terminate()),
-            signal(SignalKind::hangup()),
-        );
-        async move {
-            let (Ok(mut int), Ok(mut term), Ok(mut hup)) = streams else {
-                let _ = tokio::signal::ctrl_c().await;
-                return;
-            };
-            tokio::select! {
-                _ = int.recv() => tracing::info!("Received SIGINT; shutting down"),
-                _ = term.recv() => tracing::info!("Received SIGTERM; shutting down"),
-                _ = hup.recv() => tracing::info!("Received SIGHUP; shutting down"),
-            }
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        async move {
-            let _ = tokio::signal::ctrl_c().await;
-        }
-    }
 }
 
 #[cfg(test)]

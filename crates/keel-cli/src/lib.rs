@@ -75,4 +75,34 @@ mod tests {
             assert!(Cli::try_parse_from(["keel", "tenant", removed, "--tenant", "x"]).is_err());
         }
     }
+
+    #[test]
+    fn gitops_pull_defaults_to_the_bootstrap_working_copy() {
+        let cli = Cli::try_parse_from(["keel", "gitops", "pull"]).unwrap();
+        let Commands::Gitops(g) = cli.command else {
+            panic!("expected gitops command");
+        };
+        let crate::cli::GitopsCommands::Pull(args) = g.command;
+        assert_eq!(args.repo_dir, std::path::PathBuf::from("keel-gitops"));
+        assert!(args.context.is_none() && args.kubeconfig.is_none());
+        let cli = Cli::try_parse_from([
+            "keel",
+            "gitops",
+            "pull",
+            "--repo-dir",
+            "/srv/gitops",
+            "--context",
+            "kind-keel",
+            "--kubeconfig",
+            "/tmp/kc",
+        ])
+        .unwrap();
+        let Commands::Gitops(g) = cli.command else {
+            panic!("expected gitops command");
+        };
+        let crate::cli::GitopsCommands::Pull(args) = g.command;
+        assert_eq!(args.repo_dir, std::path::PathBuf::from("/srv/gitops"));
+        assert_eq!(args.context.as_deref(), Some("kind-keel"));
+        assert_eq!(args.kubeconfig, Some(std::path::PathBuf::from("/tmp/kc")));
+    }
 }
