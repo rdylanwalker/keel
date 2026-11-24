@@ -32,9 +32,10 @@ use crate::state::AppState;
 
 use super::bundle::create_bundle_proposal;
 use super::guards::{
-    ensure_cluster_scoped_manifest_app_not_installed, ensure_flux_kustomization_names_unclaimed,
-    ensure_no_derived_name_sibling, ensure_rendered_manifest_placement,
-    ensure_tenant_repo_initialised, remote_target_cluster, reserved_flux_kustomization_names,
+    ensure_app_placement, ensure_cluster_singleton_not_installed,
+    ensure_flux_kustomization_names_unclaimed, ensure_no_derived_name_sibling,
+    ensure_rendered_manifest_placement, ensure_tenant_repo_initialised, is_cluster_singleton_app,
+    remote_target_cluster, reserved_flux_kustomization_names,
 };
 use super::manifests::{
     FLUX_MANIFEST_APP_KUSTOMIZATION_FILES, FluxManifestAppFiles, FluxManifestAppLayoutInput,
@@ -150,8 +151,12 @@ pub async fn create_proposal(
 
     let (schema, action_label, is_app, manifest_engine) = match &manifest {
         CatalogManifest::Application(app) => {
-            app.ensure_placement_allows(remote_target_cluster(req.target_cluster.as_deref()))
-                .map_err(|e| ServerError::BadRequest(e.to_string()))?;
+            ensure_app_placement(
+                &state.repo_workdir,
+                app,
+                remote_target_cluster(req.target_cluster.as_deref()),
+            )
+            .await?;
             // `spec.placement.namespace`: default an omitted targetNamespace to the app's
             // dedicated namespace and reject any other one (never the shared `tenant-<id>`).
             req.target_namespace = app
@@ -395,9 +400,9 @@ pub async fn create_proposal(
             app.ensure_manifest_namespaces(&rendered)
                 .map_err(|e| ServerError::BadRequest(e.to_string()))?;
             if let Some(kc) = &remote_kc
-                && app.spec.placement.requires_remote_cluster()
+                && is_cluster_singleton_app(&state.repo_workdir, app).await
             {
-                ensure_cluster_scoped_manifest_app_not_installed(
+                ensure_cluster_singleton_not_installed(
                     &repo.workdir,
                     &req.tenant,
                     &rel_dir,
@@ -641,6 +646,16 @@ pub async fn create_proposal(
                 .or_else(|| app.spec.upstream.version.clone());
             hr_input.crds = app.spec.crd_policy;
             if let Some(target) = remote_target_cluster(req.target_cluster.as_deref()) {
+                if is_cluster_singleton_app(&state.repo_workdir, app).await {
+                    ensure_cluster_singleton_not_installed(
+                        &repo.workdir,
+                        &req.tenant,
+                        &rel_dir,
+                        &app.metadata.id,
+                        target,
+                    )
+                    .await?;
+                }
                 hr_input.kube_config = Some(RemoteKubeConfigRef::with_key(target, "kubeconfig"));
             }
             if let Some(target_ns) = req
@@ -660,6 +675,10 @@ pub async fn create_proposal(
             if let Some(ref extras) = helm_extras {
                 extras.apply_to(&mut hr_input);
             }
+            // Identifies the instance's catalog app for the once-per-cluster guard.
+            hr_input
+                .extra_labels
+                .insert("keel.io/catalog-id".to_string(), req.catalog_id.clone());
             let hr_yaml = synthesize_helm_release_yaml(&hr_input)?;
             (
                 rel_dir,

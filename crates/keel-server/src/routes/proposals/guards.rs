@@ -4,8 +4,8 @@
 use std::path::Path;
 
 use keel_core::{
-    gateway_route_hostnames, platform_reserved_hostnames, validate_dns_label,
-    validate_k8s_manifests_yaml, validate_route_hostnames,
+    AppRuntime, CatalogApplication, gateway_route_hostnames, platform_reserved_hostnames,
+    validate_dns_label, validate_k8s_manifests_yaml, validate_route_hostnames,
 };
 use serde_json::Value;
 
@@ -223,16 +223,90 @@ pub(super) async fn ensure_flux_kustomization_names_unclaimed(
     Ok(())
 }
 
-/// Rejects a second instance of the `scope: cluster` manifest app `catalog_id` on the workload
-/// cluster behind the tenant's kubeconfig Secret `kube_config_secret`: another committed Flux app
-/// `Kustomization` of `tenant` (outside `own_rel_dir`, the instance being created/edited) with the
-/// same `keel.io/catalog-id` label and `spec.kubeConfig.secretRef.name` gives `409`. Such apps
-/// ship fixed-name cluster-wide objects (`ClusterRole`s, admission policies, a fixed-name
-/// `Secret`), so two instances would overwrite each other and deleting either would prune the
-/// other's objects. The kubeconfig Secret name identifies the cluster only within one tenant
-/// (another tenant's Secret of the same name may point elsewhere), so other tenants are not
-/// checked.
-pub(super) async fn ensure_cluster_scoped_manifest_app_not_installed(
+/// `true` when the self-service catalog app `catalog_id` mirrors a management-plane add-on of
+/// the same ID (`catalog/core/<id>/catalog.yaml` in the platform repository `platform_workdir`),
+/// e.g. `kyverno`, `pulumi-kubernetes-operator`, `flux2` or `keel-server`.
+pub(super) async fn is_management_addon_twin(platform_workdir: &Path, catalog_id: &str) -> bool {
+    validate_dns_label(catalog_id, "catalog_id").is_ok()
+        && tokio::fs::try_exists(
+            platform_workdir
+                .join("catalog/core")
+                .join(catalog_id)
+                .join("catalog.yaml"),
+        )
+        .await
+        .unwrap_or(false)
+}
+
+/// `true` when a second instance of `app` on one workload cluster must be refused (see
+/// [`ensure_cluster_singleton_not_installed`]): every `scope: cluster` manifest app (fixed-name
+/// cluster-wide objects, e.g. `keel-server`) and every `scope: cluster` Helm app that mirrors a
+/// management-plane add-on (`kyverno`, `pulumi-kubernetes-operator`, `flux2`, `cert-manager`,
+/// `envoy-gateway`, `flagger`, `prometheus`: operators that own their CRDs, webhooks and
+/// controllers once per cluster). Other `scope: cluster` Helm apps (e.g. `dex`) name their
+/// cluster-wide objects after the release and may run more than once.
+pub(super) async fn is_cluster_singleton_app(
+    platform_workdir: &Path,
+    app: &CatalogApplication,
+) -> bool {
+    app.spec.placement.requires_remote_cluster()
+        && (app.metadata.runtime == AppRuntime::Manifest
+            || is_management_addon_twin(platform_workdir, &app.metadata.id).await)
+}
+
+/// [`CatalogApplication::ensure_placement_allows`] with the management-plane twin hint: a
+/// `scope: cluster` twin of a `catalog/core/` add-on proposed onto the management cluster is
+/// refused (`400`, unchanged) with a message saying the add-on is already managed there and
+/// pointing at Edit on its management add-on row of the Topology Map.
+pub(super) async fn ensure_app_placement(
+    platform_workdir: &Path,
+    app: &CatalogApplication,
+    remote_target: Option<&str>,
+) -> Result<(), ServerError> {
+    let Err(err) = app.ensure_placement_allows(remote_target) else {
+        return Ok(());
+    };
+    let hint = management_twin_placement_hint(platform_workdir, &app.metadata.id).await;
+    Err(ServerError::BadRequest(format!("{err}{hint}")))
+}
+
+/// Suffix of a management-cluster placement `400` for `catalog_id`: for a twin of a
+/// `catalog/core/` add-on, says the add-on is already managed on the management cluster and
+/// points at Edit on its management add-on row; empty otherwise.
+pub(super) async fn management_twin_placement_hint(
+    platform_workdir: &Path,
+    catalog_id: &str,
+) -> String {
+    if is_management_addon_twin(platform_workdir, catalog_id).await {
+        format!(
+            ". '{catalog_id}' is already managed on the management cluster as a \
+             management-plane add-on: change it with Edit on its management add-on row (listed \
+             first under Topology Map → Deployed Application Releases, admins only) instead"
+        )
+    } else {
+        String::new()
+    }
+}
+
+/// Flux objects of a committed app directory that may record its catalog ID
+/// (`keel.io/catalog-id`) and remote cluster (`spec.kubeConfig.secretRef.name`).
+const CLUSTER_SINGLETON_OBJECT_FILES: [&str; 3] = [
+    "flux-kustomization.yaml",
+    "helmrelease.yaml",
+    "helmrelease-canary.yaml",
+];
+
+/// Rejects a second instance of the cluster singleton app `catalog_id` (see
+/// [`is_cluster_singleton_app`]) on the workload cluster behind the tenant's kubeconfig Secret
+/// `kube_config_secret`: another committed Flux app `Kustomization` or `HelmRelease` of `tenant`
+/// (outside `own_rel_dir`, the instance being created/edited) with the same `keel.io/catalog-id`
+/// label and `spec.kubeConfig.secretRef.name` gives `409`. Such apps ship fixed-name cluster-wide
+/// objects (`ClusterRole`s, CRDs, admission webhooks and policies, a fixed-name `Secret`), so two
+/// instances would overwrite each other (or fight over the same CRDs) and deleting either would
+/// prune the other's objects. The kubeconfig Secret name identifies the cluster only within one
+/// tenant (another tenant's Secret of the same name may point elsewhere), so other tenants are
+/// not checked.
+pub(super) async fn ensure_cluster_singleton_not_installed(
     repo_workdir: &Path,
     tenant: &str,
     own_rel_dir: &str,
@@ -256,7 +330,11 @@ pub(super) async fn ensure_cluster_scoped_manifest_app_not_installed(
                 }
                 continue;
             }
-            if !file_type.is_file() || entry.file_name() != "flux-kustomization.yaml" {
+            if !file_type.is_file()
+                || !CLUSTER_SINGLETON_OBJECT_FILES
+                    .iter()
+                    .any(|name| entry.file_name() == *name)
+            {
                 continue;
             }
             let Ok(raw) = tokio::fs::read_to_string(&path).await else {
@@ -281,8 +359,9 @@ pub(super) async fn ensure_cluster_scoped_manifest_app_not_installed(
                     .unwrap_or_default();
                 return Err(ServerError::Conflict(format!(
                     "Catalog application '{catalog_id}' installs cluster-wide objects and is \
-                     already installed on target cluster '{kube_config_secret}' by '{owner}'; \
-                     install it once per cluster (edit that instance instead)"
+                     already managed on target cluster '{kube_config_secret}' by '{owner}'; \
+                     install it once per cluster: change that instance with Edit on its row \
+                     instead"
                 )));
             }
         }

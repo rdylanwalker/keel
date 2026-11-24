@@ -11014,3 +11014,219 @@ async fn test_keel_server_catalog_app_installs_once_per_cluster() {
     assert_eq!(status, StatusCode::CREATED, "{body}");
     git.checkout_branch(&workdir, "main").await.unwrap();
 }
+
+/// `scope: cluster` Helm twins of management add-ons (here `kyverno`) are cluster singletons:
+/// their `HelmRelease` carries `keel.io/catalog-id`, a second instance (single app or bundle
+/// item) on the same workload cluster is refused with `409`, the management cluster is refused
+/// with a hint at the management add-on row, and other `scope: cluster` Helm apps (no
+/// `catalog/core/` twin) may still run twice on one cluster.
+#[tokio::test]
+async fn test_helm_management_addon_twin_installs_once_per_cluster() {
+    let fixture = setup_fixture().await;
+    let cookie = login_and_get_cookie(&fixture).await;
+    let ops_chart = "apiVersion: keel.io/v1alpha1\nkind: CatalogApplication\nmetadata:\n  id: ops-chart\n  name: Ops\n  description: d\n  category: platform\n  runtime: helm\nspec:\n  upstream:\n    chart: ops\n    repoURL: https://charts.example.com\n    version: \"1.0.0\"\n  placement:\n    scope: cluster\n  schema:\n    type: object\n    properties: {}\n";
+    let bundle = "apiVersion: keel.io/v1alpha1\nkind: CatalogBundle\nmetadata:\n  id: policy-stack\n  name: Policy Stack\n  category: platform\nspec:\n  items:\n    - id: policies\n      kind: app\n      catalogRef: kyverno\n  schema:\n    type: object\n    properties: {}\n";
+    let twin_bundle = "apiVersion: keel.io/v1alpha1\nkind: CatalogBundle\nmetadata:\n  id: double-policy\n  name: Double Policy\n  category: platform\nspec:\n  items:\n    - id: first\n      kind: app\n      catalogRef: kyverno\n    - id: second\n      kind: app\n      catalogRef: kyverno\n  schema:\n    type: object\n    properties: {}\n";
+    commit_to_main(
+        &fixture,
+        &[
+            (
+                "catalog/apps/kyverno/catalog.yaml",
+                include_str!("../../../deploy/catalog/apps/kyverno/catalog.yaml"),
+            ),
+            (
+                "catalog/core/kyverno/catalog.yaml",
+                include_str!("../../../deploy/catalog/core/kyverno/catalog.yaml"),
+            ),
+            ("catalog/apps/ops-chart/catalog.yaml", ops_chart),
+            ("catalog/bundles/policy-stack/catalog.yaml", bundle),
+            ("catalog/bundles/double-policy/catalog.yaml", twin_bundle),
+        ],
+        "feat(catalog): add kyverno twin",
+    )
+    .await;
+    let git = &fixture.state.git_runner;
+    let workdir = fixture.state.repo_workdir.clone();
+
+    // The management cluster already runs the core add-on.
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "kyverno", "values": {} }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("spec.placement.scope: cluster"), "{body}");
+    assert!(
+        body.contains("already managed on the management cluster"),
+        "{body}"
+    );
+    assert!(
+        body.contains("Topology Map → Deployed Application Releases"),
+        "{body}"
+    );
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "policy-stack", "kind": "bundle", "values": {} }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("Bundle item 'policies'"), "{body}");
+    assert!(
+        body.contains("already managed on the management cluster"),
+        "{body}"
+    );
+
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "kyverno", "targetCluster": "team-a-kubeconfig",
+                "values": {} }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    checkout_proposal_branch(&fixture, &body).await;
+    let hr: Value = noyalib::from_str(
+        &std::fs::read_to_string(workdir.join("tenants/acme/apps/kyverno/helmrelease.yaml"))
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(hr["metadata"]["labels"]["keel.io/catalog-id"], "kyverno");
+    merge_proposal_and_sync(&fixture, &cookie, &body).await;
+    let head_before = git.rev_parse(&workdir, "HEAD").await.unwrap();
+
+    // A second instance on the same cluster: single app and bundle item.
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "kyverno", "name": "kyverno-2",
+                "targetCluster": "team-a-kubeconfig", "values": {} }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body.contains("once per cluster"), "{body}");
+    assert!(body.contains("already managed on target cluster"), "{body}");
+    assert!(body.contains("tenants/acme/apps/kyverno"), "{body}");
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "policy-stack", "kind": "bundle",
+                "targetCluster": "team-a-kubeconfig", "values": {} }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body.contains("tenants/acme/apps/kyverno"), "{body}");
+    assert_eq!(git.rev_parse(&workdir, "HEAD").await.unwrap(), head_before);
+
+    // Editing the installed instance is not a second install.
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "kyverno", "targetCluster": "team-a-kubeconfig",
+                "values": {} }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    git.checkout_branch(&workdir, "main").await.unwrap();
+
+    // Another workload cluster of the same tenant.
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "kyverno", "name": "kyverno-b",
+                "targetCluster": "team-b-kubeconfig", "values": {} }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    git.checkout_branch(&workdir, "main").await.unwrap();
+
+    // Two singleton items of one bundle request on the same cluster.
+    let head_before = git.rev_parse(&workdir, "HEAD").await.unwrap();
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "double-policy", "kind": "bundle",
+                "targetCluster": "team-c-kubeconfig", "values": {} }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(
+        body.contains(
+            "Bundle items 'first' and 'second' both install catalog application 'kyverno'"
+        ),
+        "{body}"
+    );
+    assert!(body.contains("once per cluster"), "{body}");
+    assert_eq!(git.rev_parse(&workdir, "HEAD").await.unwrap(), head_before);
+
+    // A committed bundle item is a singleton instance too: its HelmRelease carries the label
+    // and blocks a later standalone instance or another bundle on that cluster.
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "policy-stack", "kind": "bundle",
+                "targetCluster": "team-c-kubeconfig", "values": {} }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    checkout_proposal_branch(&fixture, &body).await;
+    let hr: Value = noyalib::from_str(
+        &std::fs::read_to_string(
+            workdir.join("tenants/acme/bundles/policy-stack/policies/helmrelease.yaml"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(hr["metadata"]["labels"]["keel.io/catalog-id"], "kyverno");
+    merge_proposal_and_sync(&fixture, &cookie, &body).await;
+    let head_before = git.rev_parse(&workdir, "HEAD").await.unwrap();
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "kyverno", "name": "kyverno-c",
+                "targetCluster": "team-c-kubeconfig", "values": {} }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(
+        body.contains("tenants/acme/bundles/policy-stack/policies"),
+        "{body}"
+    );
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "policy-stack", "kind": "bundle",
+                "name": "policy-stack-2", "targetCluster": "team-c-kubeconfig", "values": {} }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(
+        body.contains("tenants/acme/bundles/policy-stack/policies"),
+        "{body}"
+    );
+    assert_eq!(git.rev_parse(&workdir, "HEAD").await.unwrap(), head_before);
+    // Editing the committed bundle is not a second install.
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "policy-stack", "kind": "bundle",
+                "targetCluster": "team-c-kubeconfig", "values": {} }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    git.checkout_branch(&workdir, "main").await.unwrap();
+
+    // A `scope: cluster` Helm app without a management twin is not a singleton.
+    for name in ["ops-1", "ops-2"] {
+        let (status, body) = post_proposal(
+            &fixture,
+            &cookie,
+            json!({ "tenant": "acme", "catalogId": "ops-chart", "name": name,
+                    "targetCluster": "team-a-kubeconfig", "values": {} }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{name}: {body}");
+        merge_proposal_and_sync(&fixture, &cookie, &body).await;
+    }
+}

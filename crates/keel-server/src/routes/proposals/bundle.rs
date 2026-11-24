@@ -29,9 +29,9 @@ use crate::routes::{
 use crate::state::AppState;
 
 use super::guards::{
-    ensure_cluster_scoped_manifest_app_not_installed, ensure_flux_kustomization_names_unclaimed,
-    ensure_no_derived_name_sibling, ensure_rendered_manifest_placement, remote_target_cluster,
-    reserved_flux_kustomization_names,
+    ensure_cluster_singleton_not_installed, ensure_flux_kustomization_names_unclaimed,
+    ensure_no_derived_name_sibling, ensure_rendered_manifest_placement, is_cluster_singleton_app,
+    management_twin_placement_hint, remote_target_cluster, reserved_flux_kustomization_names,
 };
 use super::manifests::{
     FLUX_MANIFEST_APP_KUSTOMIZATION_FILES, FluxManifestAppLayoutInput, HelmAppExtrasInput,
@@ -186,6 +186,11 @@ pub(super) async fn create_bundle_proposal(
     let mut prepared_items = Vec::with_capacity(ordered_items.len());
     // Items deployed as manifest apps (no HelmRelease to `dependsOn`); filled in topological order.
     let mut manifest_app_items = std::collections::HashSet::new();
+    // Cluster singleton items of this request by (catalog ID, kubeconfig Secret) -> item ID: the
+    // committed-tree guard skips the bundle's own directory, so repeats within one request are
+    // caught here.
+    let mut singleton_items: std::collections::HashMap<(String, String), String> =
+        std::collections::HashMap::new();
     for item in ordered_items {
         let item_values = req
             .values
@@ -263,10 +268,36 @@ pub(super) async fn create_bundle_proposal(
                         .map(|target| RemoteKubeConfigRef::with_key(target, "kubeconfig"))
                 };
                 if item_kube_config.is_none() && app.spec.placement.requires_remote_cluster() {
+                    let hint =
+                        management_twin_placement_hint(&state.repo_workdir, &app.metadata.id).await;
                     return Err(ServerError::BadRequest(format!(
-                        "Bundle item '{}' references catalog application '{}' with spec.placement.scope: cluster (cluster-scoped resources); it requires targetClusterFrom or a remote targetCluster",
+                        "Bundle item '{}' references catalog application '{}' with spec.placement.scope: cluster (cluster-scoped resources); it requires targetClusterFrom or a remote targetCluster{hint}",
                         item.id, app.metadata.id
                     )));
+                }
+                // Operators that own cluster-wide objects run once per workload cluster.
+                if let Some(kc) = &item_kube_config
+                    && is_cluster_singleton_app(&state.repo_workdir, &app).await
+                {
+                    ensure_cluster_singleton_not_installed(
+                        &repo.workdir,
+                        &req.tenant,
+                        &bundle_rel_dir,
+                        &app.metadata.id,
+                        &kc.secret_name,
+                    )
+                    .await?;
+                    if let Some(first) = singleton_items.insert(
+                        (app.metadata.id.clone(), kc.secret_name.clone()),
+                        item.id.clone(),
+                    ) {
+                        return Err(ServerError::Conflict(format!(
+                            "Bundle items '{first}' and '{}' both install catalog application \
+                             '{}', which installs cluster-wide objects, on target cluster '{}'; \
+                             install it once per cluster",
+                            item.id, app.metadata.id, kc.secret_name
+                        )));
+                    }
                 }
                 // `spec.placement.namespace` defaults/pins the item's remote namespace.
                 let item_target_namespace = app
@@ -320,18 +351,6 @@ pub(super) async fn create_bundle_proposal(
                     app.ensure_manifest_namespaces(&rendered).map_err(|e| {
                         ServerError::BadRequest(format!("Bundle item '{}': {e}", item.id))
                     })?;
-                    if let Some(kc) = &item_kube_config
-                        && app.spec.placement.requires_remote_cluster()
-                    {
-                        ensure_cluster_scoped_manifest_app_not_installed(
-                            &repo.workdir,
-                            &req.tenant,
-                            &bundle_rel_dir,
-                            &app.metadata.id,
-                            &kc.secret_name,
-                        )
-                        .await?;
-                    }
                     let encrypted_secret = resolve_manifest_app_secret(
                         &state,
                         &req.tenant,
@@ -422,6 +441,10 @@ pub(super) async fn create_bundle_proposal(
                     hr_input.chart_version = app.spec.upstream.version.clone();
                     hr_input.crds = app.spec.crd_policy;
                     hr_input.extra_labels = bundle_labels.clone();
+                    // Identifies the item's catalog app for the once-per-cluster guard.
+                    hr_input
+                        .extra_labels
+                        .insert("keel.io/catalog-id".to_string(), app.metadata.id.clone());
                     hr_input.kube_config = item_kube_config;
                     hr_input.target_namespace = item_target_namespace.clone();
 

@@ -389,7 +389,7 @@ Tenants can run their own [Rauthy](https://github.com/sebadob/rauthy) identity p
 
 | Entry | Where it appears | Purpose |
 | :--- | :--- | :--- |
-| `catalog/core/rauthy` | **Topology Map → Management Plane add-ons** (admins only) | Keel's own IdP in `keel-system` (Stage 0); version-only upgrades through reviewed PRs |
+| `catalog/core/rauthy` | Edit on its management add-on row, listed first under **Topology Map → Deployed Application Releases** (admins only) | Keel's own IdP in `keel-system` (Stage 0); version-only upgrades through reviewed PRs |
 | `catalog/apps/rauthy` | **Catalog & Form Wizard** (any tenant) | A tenant-owned Rauthy in `tenant-<id>`, installed and edited like any other catalog app |
 
 Both pin the same `ghcr.io/sebadob/rauthy` image tag. The tenant app is a single-node Rauthy (Hiqlite storage on a PersistentVolumeClaim). Replicas are not configurable because Hiqlite raft membership is configuration-driven.
