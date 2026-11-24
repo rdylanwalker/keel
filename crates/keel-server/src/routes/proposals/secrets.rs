@@ -166,6 +166,60 @@ pub(super) fn relax_stored_secret_requirements(
     out
 }
 
+/// Returns `values` without the blank secret fields whose value is stored (`stored_keys`, a
+/// [`StoredManifestAppSecret::keys`] set: top-level fields of a manifest app, dot paths of a Helm
+/// app). Like an omitted field, a blank secret on Edit keeps the stored value instead of failing
+/// the schema (`minLength`, `pattern`). Blank means `null`, `[]`, `{}`, or `""` when the field's
+/// own schema rejects `""`. A `""` the field's schema accepts is kept in `values`: it is the
+/// one way to clear a stored optional secret (an unset token that disables a feature).
+/// Non-secret fields and blank secrets without a stored value are left untouched.
+pub(super) fn drop_blank_stored_secret_values(
+    schema: &Value,
+    values: &Value,
+    stored_keys: &std::collections::BTreeSet<String>,
+) -> Value {
+    fn is_blank(value: &Value, schema: &Value) -> bool {
+        match value {
+            Value::Null => true,
+            // `""` clears the stored value when the field allows it (see above).
+            Value::String(s) => {
+                s.is_empty() && keel_core::validate_schema_values(schema, value).is_err()
+            }
+            Value::Array(a) => a.is_empty(),
+            Value::Object(o) => o.is_empty(),
+            _ => false,
+        }
+    }
+    fn strip(
+        schema: &Value,
+        values: &mut Value,
+        prefix: &str,
+        stored_keys: &std::collections::BTreeSet<String>,
+    ) {
+        let (Some(props), Some(obj)) = (
+            schema.get("properties").and_then(Value::as_object),
+            values.as_object_mut(),
+        ) else {
+            return;
+        };
+        for (key, child_schema) in props {
+            let path = format!("{prefix}{key}");
+            if keel_core::is_secret_schema_node(child_schema) {
+                if stored_keys.contains(&path)
+                    && obj.get(key).is_some_and(|v| is_blank(v, child_schema))
+                {
+                    obj.remove(key);
+                }
+            } else if let Some(child) = obj.get_mut(key) {
+                strip(child_schema, child, &format!("{path}."), stored_keys);
+            }
+        }
+    }
+    let mut out = values.clone();
+    strip(schema, &mut out, "", stored_keys);
+    out
+}
+
 /// Resolves the SOPS-encrypted `<name>-secrets` `Secret` to commit for a Flux manifest app.
 /// See [`resolve_tenant_app_secret`].
 ///
@@ -413,6 +467,95 @@ mod tests {
         assert_eq!(
             relax_stored_secret_requirements(&no_required, &stored),
             no_required
+        );
+    }
+
+    #[test]
+    fn blank_stored_secrets_are_dropped_like_omitted_fields() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "token": { "type": "string", "writeOnly": true, "minLength": 1 },
+                "optional": { "type": "string", "writeOnly": true },
+                "unstored": { "type": "string", "writeOnly": true },
+                "name": { "type": "string" },
+                "auth": {
+                    "type": "object",
+                    "properties": {
+                        "password": { "type": "string", "format": "password" },
+                        "sources": { "type": "array", "writeOnly": true },
+                        "user": { "type": "string" },
+                    },
+                },
+            },
+        });
+        let stored = std::collections::BTreeSet::from(
+            [
+                "token",
+                "optional",
+                "unstored.x",
+                "name",
+                "auth.password",
+                "auth.sources",
+            ]
+            .map(String::from),
+        );
+        let values = json!({
+            "token": "",
+            "unstored": "",
+            "name": "",
+            "auth": { "password": null, "sources": [], "user": "" },
+        });
+        assert_eq!(
+            drop_blank_stored_secret_values(&schema, &values, &stored),
+            json!({ "unstored": "", "name": "", "auth": { "user": "" } })
+        );
+        // `""` on a field that accepts it clears the stored value; `null` still keeps it.
+        let clear = json!({ "optional": "", "auth": { "password": "" } });
+        assert_eq!(
+            drop_blank_stored_secret_values(&schema, &clear, &stored),
+            clear
+        );
+        assert_eq!(
+            drop_blank_stored_secret_values(&schema, &json!({ "optional": null }), &stored),
+            json!({})
+        );
+        // A provided value replaces the stored one and is kept.
+        let provided = json!({ "token": "new", "auth": { "password": "p", "sources": [1] } });
+        assert_eq!(
+            drop_blank_stored_secret_values(&schema, &provided, &stored),
+            provided
+        );
+        // Nothing stored (first install): blank secrets stay and are validated as submitted.
+        assert_eq!(
+            drop_blank_stored_secret_values(&schema, &values, &Default::default()),
+            values
+        );
+    }
+
+    #[test]
+    fn nested_helm_secret_paths_are_relaxed_when_stored() {
+        let schema = json!({
+            "type": "object",
+            "required": ["admin"],
+            "properties": {
+                "admin": {
+                    "type": "object",
+                    "required": ["accessKey", "secretKey", "user"],
+                    "properties": {
+                        "accessKey": { "type": "string", "writeOnly": true },
+                        "secretKey": { "type": "string", "writeOnly": true },
+                        "user": { "type": "string" },
+                    },
+                },
+            },
+        });
+        let stored = std::collections::BTreeSet::from(["admin.accessKey".to_string()]);
+        let relaxed = relax_stored_secret_requirements(&schema, &stored);
+        assert_eq!(relaxed["required"], json!(["admin"]));
+        assert_eq!(
+            relaxed["properties"]["admin"]["required"],
+            json!(["secretKey", "user"])
         );
     }
 

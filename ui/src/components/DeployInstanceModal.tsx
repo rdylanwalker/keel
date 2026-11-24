@@ -225,20 +225,26 @@ const DeployInstanceModalBody: React.FC<DeployInstanceModalProps> = (props) => {
   const itemSchema = activeItem?.schema
   const itemType = activeItem?.type
   const bundleItems = activeItem?.bundleItems
+  // Edit: app (Helm and manifest) and bundle secrets left blank keep their stored values, so
+  // they are optional and hint so. Infrastructure stacks re-encrypt only the submitted
+  // secrets: their secret fields stay required and must be re-entered.
+  const keepsStoredSecrets = isEditMode && itemType !== "infra"
   const formSchema = useMemo(() => {
-    const base = isEditMode ? relaxSecretRequirements(itemSchema) : itemSchema
+    const base = keepsStoredSecrets
+      ? relaxSecretRequirements(itemSchema)
+      : itemSchema
     const withHosts =
       itemType === "bundle"
         ? withBundleCanaryHostsRequired(base, bundleItems)
         : withCanaryHostRequired(base, canaryEnabled)
     return withHosts as RJSFSchema | undefined
-  }, [itemSchema, itemType, bundleItems, isEditMode, canaryEnabled])
+  }, [itemSchema, itemType, bundleItems, keepsStoredSecrets, canaryEnabled])
   const formUiSchema = useMemo(
     () =>
       buildSecretAwareUiSchema(activeItem?.schema, activeItem?.uiSchema, {
-        editMode: isEditMode,
+        editMode: keepsStoredSecrets,
       }),
-    [activeItem?.schema, activeItem?.uiSchema, isEditMode]
+    [activeItem?.schema, activeItem?.uiSchema, keepsStoredSecrets]
   )
   const manifestTemplate =
     activeItem?.runtime === "manifest" ? activeItem.manifestsYaml : undefined

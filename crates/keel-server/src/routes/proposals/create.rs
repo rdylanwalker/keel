@@ -48,8 +48,9 @@ use super::preview_inputs::{
     apply_preview_source_trust, attach_preview_cluster_inputs, plan_preview_credentials,
 };
 use super::secrets::{
-    build_infra_secret_manifest_yaml, read_stored_manifest_app_secret,
-    relax_stored_secret_requirements, resolve_manifest_app_secret, tenant_sops_recipients,
+    build_infra_secret_manifest_yaml, drop_blank_stored_secret_values,
+    read_stored_manifest_app_secret, relax_stored_secret_requirements, resolve_manifest_app_secret,
+    tenant_sops_recipients,
 };
 use super::tenant_stack::{
     apply_tenant_source_trust, attach_tenant_stack_credentials, populate_stack_config_from_values,
@@ -236,17 +237,21 @@ pub async fn create_proposal(
         let stored = read_stored_values(&repo.workdir, &own_rel_dir).await?;
         req.values = merge_values_patch(&stored, &req.values);
     }
-    // Edit: secret fields left blank keep the committed values (the UI never receives them).
+    // Edit (Flux manifest and Helm apps): secret fields left blank or omitted keep the committed
+    // values (the UI never receives them); provided ones replace them.
     let stored_manifest_secret = if manifest_engine == Some(ManifestEngine::Flux) || is_helm_app {
         read_stored_manifest_app_secret(&repo.workdir, &own_rel_dir).await
     } else {
         None
     };
     match &stored_manifest_secret {
-        Some(stored) => validate_schema_values(
-            &relax_stored_secret_requirements(schema, &stored.valued_keys),
-            &req.values,
-        )?,
+        Some(stored) => {
+            req.values = drop_blank_stored_secret_values(schema, &req.values, &stored.keys);
+            validate_schema_values(
+                &relax_stored_secret_requirements(schema, &stored.valued_keys),
+                &req.values,
+            )?
+        }
         None => validate_schema_values(schema, &req.values)?,
     }
     let partitioned = partition_values_by_schema(schema, &req.values)?;

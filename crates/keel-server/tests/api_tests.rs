@@ -8027,12 +8027,14 @@ async fn test_manifest_app_edit_keeps_stored_secrets() {
     merge_proposal_and_sync(&fixture, &cookie, &body).await;
     let stored = std::fs::read_to_string(&secret_path).unwrap();
 
-    // Only a non-secret field changes: the ciphertext is committed unchanged.
+    // Only a non-secret field changes: the ciphertext is committed unchanged. A secret submitted
+    // blank (`""`, which its `minLength` rejects) counts as left blank, not as a new value.
+    let mut values = rauthy_values_without_secrets("login.acme.example");
+    values["adminPassword"] = json!("");
     let (status, body) = post_proposal(
         &fixture,
         &cookie,
-        json!({ "tenant": "acme", "catalogId": "rauthy",
-                "values": rauthy_values_without_secrets("login.acme.example") }),
+        json!({ "tenant": "acme", "catalogId": "rauthy", "values": values }),
     )
     .await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
@@ -8104,6 +8106,84 @@ async fn decrypt_tenant_secret_string_data(fixture: &TestFixture, ciphertext: &s
         .await
         .unwrap();
     noyalib::from_str::<Value>(&plain).unwrap()["stringData"].clone()
+}
+
+/// A stored optional secret is cleared on Edit by submitting `""` (which its schema accepts);
+/// `null`, like an omitted field, keeps it.
+#[tokio::test]
+async fn test_manifest_app_edit_clears_optional_secret_with_empty_string() {
+    let fixture = setup_fixture().await;
+    let cookie = login_and_get_cookie(&fixture).await;
+    let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../deploy/catalog/apps/http-echo-manifest");
+    let catalog = std::fs::read_to_string(base.join("catalog.yaml")).unwrap();
+    let manifests = std::fs::read_to_string(base.join("manifests.yaml")).unwrap();
+    commit_to_main(
+        &fixture,
+        &[
+            (
+                "catalog/apps/http-echo-manifest/catalog.yaml",
+                catalog.as_str(),
+            ),
+            (
+                "catalog/apps/http-echo-manifest/manifests.yaml",
+                manifests.as_str(),
+            ),
+        ],
+        "feat(catalog): add http-echo-manifest",
+    )
+    .await;
+    let workdir = fixture.state.repo_workdir.clone();
+    let secret_path = workdir.join("tenants/acme/apps/echo/config/secrets.enc.yaml");
+    let post = |values: Value| {
+        let fixture = &fixture;
+        let cookie = &cookie;
+        async move {
+            post_proposal(
+                fixture,
+                cookie,
+                json!({ "tenant": "acme", "catalogId": "http-echo-manifest", "name": "echo",
+                        "values": values }),
+            )
+            .await
+        }
+    };
+
+    let (status, body) =
+        post(json!({ "echoText": "hi", "replicas": 1, "apiToken": "tok-123" })).await;
+    if sops_unavailable(status, &body) {
+        return;
+    }
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    merge_proposal_and_sync(&fixture, &cookie, &body).await;
+    let stored = std::fs::read_to_string(&secret_path).unwrap();
+
+    // `null` keeps the stored token.
+    let (status, body) =
+        post(json!({ "echoText": "hello", "replicas": 1, "apiToken": null })).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    checkout_proposal_branch(&fixture, &body).await;
+    assert_eq!(std::fs::read_to_string(&secret_path).unwrap(), stored);
+    fixture
+        .state
+        .git_runner
+        .checkout_branch(&workdir, "main")
+        .await
+        .unwrap();
+
+    // `""` clears it.
+    let (status, body) = post(json!({ "echoText": "hello", "replicas": 1, "apiToken": "" })).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    checkout_proposal_branch(&fixture, &body).await;
+    assert_eq!(
+        decrypt_tenant_secret_string_data(
+            &fixture,
+            &std::fs::read_to_string(&secret_path).unwrap()
+        )
+        .await,
+        json!({ "apiToken": "" })
+    );
+    assert!(!body.contains("tok-123"));
 }
 
 /// FU-4: an optional secret field left unset still gets a key (`""`) in the `<instance>-secrets`
@@ -9967,6 +10047,31 @@ spec:
             .iter()
             .any(|r| r.ends_with("config-kustomization.yaml"))
     );
+
+    // Edit leaving the item's secrets blank (`""` / omitted): the stored Secret is kept as is.
+    merge_proposal_and_sync(&fixture, &cookie, &body).await;
+    let mut item = seaweedfs_values();
+    item["s3"]["credentials"]["admin"] = json!({ "accessKey": "" });
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "storage-stack", "kind": "bundle",
+                "name": "storage-stack", "values": { "s3": item } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    checkout_proposal_branch(&fixture, &body).await;
+    assert_eq!(
+        std::fs::read_to_string(dir.join("secrets.enc.yaml")).unwrap(),
+        stored
+    );
+    assert_eq!(
+        read_yaml(&dir.join("helmrelease.yaml"))["spec"]["valuesFrom"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
 }
 
 /// Regression (live E2E): a Helm app with secret fields in a tenant without a tenant
@@ -10062,6 +10167,108 @@ async fn test_helm_app_secrets_in_non_default_tenant_use_root_tenants_kustomizat
             .len(),
         2
     );
+}
+
+/// ADDON-9: editing a Helm app merges its secrets like a manifest app. A secret left blank or
+/// omitted keeps its stored value (a required one counts as present), a provided one replaces
+/// only its own key, and a provided value is still validated.
+#[tokio::test]
+async fn test_helm_app_edit_merges_stored_secrets() {
+    let fixture = setup_fixture().await;
+    let cookie = login_and_get_cookie(&fixture).await;
+    seed_builtin_helm_catalog(&fixture, "seaweedfs", SEAWEEDFS_APP_CATALOG).await;
+    let workdir = fixture.state.repo_workdir.clone();
+    let secret_path = workdir.join("tenants/acme/apps/s3/secrets.enc.yaml");
+    let post = |values: Value| {
+        let fixture = &fixture;
+        let cookie = &cookie;
+        async move {
+            post_proposal(
+                fixture,
+                cookie,
+                json!({ "tenant": "acme", "catalogId": "seaweedfs", "name": "s3", "values": values }),
+            )
+            .await
+        }
+    };
+    let without_secrets = || {
+        let mut values = seaweedfs_values();
+        values["s3"]["credentials"]["admin"] = json!({});
+        values
+    };
+
+    // A new instance still needs both required secrets.
+    let (status, body) = post(without_secrets()).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+
+    let (status, body) = post(seaweedfs_values()).await;
+    if sops_unavailable(status, &body) {
+        return;
+    }
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    merge_proposal_and_sync(&fixture, &cookie, &body).await;
+    let stored = std::fs::read_to_string(&secret_path).unwrap();
+    let keys = vec![
+        "s3.credentials.admin.accessKey".to_string(),
+        "s3.credentials.admin.secretKey".to_string(),
+    ];
+    assert_eq!(sops_secret_keys(&stored), keys);
+
+    // Both secrets left blank (one omitted, one submitted as `""`, which its pattern rejects):
+    // the required fields are satisfied by the stored values and the ciphertext is unchanged.
+    let mut values = without_secrets();
+    values["s3"]["credentials"]["admin"]["accessKey"] = json!("");
+    values["s3"]["createBuckets"] = json!([{ "name": "artifacts" }, { "name": "logs" }]);
+    let (status, body) = post(values).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    checkout_proposal_branch(&fixture, &body).await;
+    assert_eq!(std::fs::read_to_string(&secret_path).unwrap(), stored);
+    let hr = read_yaml(&workdir.join("tenants/acme/apps/s3/helmrelease.yaml"));
+    assert_eq!(hr["spec"]["valuesFrom"].as_array().unwrap().len(), 2);
+    assert!(!body.contains(SEAWEEDFS_ACCESS_KEY) && !body.contains(SEAWEEDFS_SECRET_KEY));
+    fixture
+        .state
+        .git_runner
+        .checkout_branch(&workdir, "main")
+        .await
+        .unwrap();
+
+    // Only the secret key re-entered: it replaces its own key, the access key is kept.
+    let rotated_secret_key = "cm90YXRlZHJvdGF0ZWRyb3RhdGVkcm90YXRlZA==";
+    let mut values = without_secrets();
+    values["s3"]["credentials"]["admin"]["secretKey"] = json!(rotated_secret_key);
+    let (status, body) = post(values).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    checkout_proposal_branch(&fixture, &body).await;
+    let rotated = std::fs::read_to_string(&secret_path).unwrap();
+    assert_ne!(rotated, stored);
+    assert!(!rotated.contains(rotated_secret_key));
+    assert_eq!(sops_secret_keys(&rotated), keys);
+    let secret = decrypt_tenant_secret(&fixture, &rotated).await;
+    let fragment = |key: &str| -> Value {
+        noyalib::from_str(secret["stringData"][key].as_str().unwrap()).unwrap()
+    };
+    assert_eq!(
+        fragment("s3.credentials.admin.accessKey")["s3"]["credentials"]["admin"]["accessKey"],
+        SEAWEEDFS_ACCESS_KEY
+    );
+    assert_eq!(
+        fragment("s3.credentials.admin.secretKey")["s3"]["credentials"]["admin"]["secretKey"],
+        rotated_secret_key
+    );
+    fixture
+        .state
+        .git_runner
+        .checkout_branch(&workdir, "main")
+        .await
+        .unwrap();
+
+    // A provided value is validated against the schema (no silent keep).
+    let mut values = without_secrets();
+    values["s3"]["credentials"]["admin"]["accessKey"] = json!("short");
+    let (status, body) = post(values).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert!(!body.contains(SEAWEEDFS_SECRET_KEY));
 }
 
 const KYVERNO_APP_CATALOG: &str = include_str!("../../../deploy/catalog/apps/kyverno/catalog.yaml");

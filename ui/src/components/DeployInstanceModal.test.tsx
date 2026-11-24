@@ -764,6 +764,32 @@ describe("DeployInstanceModal validation, secrets and server errors", () => {
     })
   })
 
+  it("keeps infrastructure secrets required on edit (stacks do not keep blank secrets)", async () => {
+    render(
+      <DeployInstanceModal
+        isOpen
+        onClose={vi.fn()}
+        catalogItem={{ ...secretItem, type: "infra", runtime: undefined }}
+        tenant="default"
+        isEditMode
+        initialConfig={{ name: "svc", values: { host: "h" } }}
+      />
+    )
+    const token = screen.getByLabelText(/API Secret Token/)
+    expect(token).toHaveAttribute("type", "password")
+    expect(token).not.toHaveAttribute(
+      "placeholder",
+      "Leave blank to keep existing secret"
+    )
+    fireEvent.click(
+      screen.getByRole("button", { name: /Submit & Open Git PR Proposal/i })
+    )
+    expect(
+      await screen.findByText("API Secret Token is required")
+    ).toBeInTheDocument()
+    expect(api.createProposal).not.toHaveBeenCalled()
+  })
+
   it("refills a missing schema default when an edit opens (documented in Schema Defaults)", async () => {
     vi.mocked(api.createProposal).mockResolvedValue({
       id: "1",

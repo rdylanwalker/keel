@@ -41,7 +41,8 @@ use super::manifests::{
 };
 use super::pr::{OpenedProposal, PushedProposal, open_proposal_pr, publish_proposal};
 use super::secrets::{
-    read_stored_manifest_app_secret, relax_stored_secret_requirements, resolve_manifest_app_secret,
+    drop_blank_stored_secret_values, read_stored_manifest_app_secret,
+    relax_stored_secret_requirements, resolve_manifest_app_secret,
 };
 use super::tenant_stack::{
     apply_tenant_source_trust, attach_tenant_stack_credentials, read_pulumi_project_name,
@@ -87,7 +88,8 @@ pub(super) async fn create_bundle_proposal(
         req.values = apply_schema_defaults(&bundle.spec.schema, &req.values);
     }
 
-    // Edit: secret fields of committed manifest-app items left blank keep their stored values.
+    // Edit: secret fields of committed manifest-app and Helm items left blank or omitted keep
+    // their stored values.
     let mut stored_item_secrets = std::collections::BTreeMap::new();
     let mut validation_schema = bundle.spec.schema.clone();
     for item in &bundle.spec.items {
@@ -103,6 +105,10 @@ pub(super) async fn create_bundle_proposal(
             .get_mut("properties")
             .and_then(|p| p.get_mut(&item.id))
         {
+            if let Some(item_values) = req.values.get_mut(&item.id) {
+                *item_values =
+                    drop_blank_stored_secret_values(item_schema, item_values, &stored.keys);
+            }
             *item_schema = relax_stored_secret_requirements(item_schema, &stored.valued_keys);
         }
         stored_item_secrets.insert(item.id.clone(), stored);
@@ -215,6 +221,9 @@ pub(super) async fn create_bundle_proposal(
 
         let item_values = if is_new_bundle {
             apply_schema_defaults(sub_schema, &item_values)
+        } else if let Some(stored) = stored_item_secrets.get(&item.id) {
+            // Also when the bundle schema does not declare the item (catalog schema fallback).
+            drop_blank_stored_secret_values(sub_schema, &item_values, &stored.keys)
         } else {
             item_values
         };

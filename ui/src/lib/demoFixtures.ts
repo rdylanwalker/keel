@@ -716,7 +716,7 @@ export const DEFAULT_CATALOG: CatalogItem[] = [
       apiToken: {
         "ui:widget": "password",
         "ui:help":
-          "Marked writeOnly: true — automatically encrypted with SOPS + per-tenant age key before git staging (never stored in plaintext).",
+          "Marked writeOnly: true — automatically encrypted with SOPS + per-tenant age key before git staging (never stored in plaintext). Leave blank on Edit to keep it.",
       },
     },
   },
@@ -907,17 +907,17 @@ export const DEFAULT_CATALOG: CatalogItem[] = [
       encKey: {
         "ui:widget": "password",
         "ui:help":
-          "Encrypted via SOPS + per-tenant age key before committing to Git (never stored in plaintext). Re-enter the same value on every Edit.",
+          "Encrypted via SOPS + per-tenant age key before committing to Git (never stored in plaintext). Leave blank on Edit to keep it; a new value makes data encrypted with the old key unreadable.",
       },
       hiqliteSecretRaft: {
         "ui:widget": "password",
         "ui:help":
-          "Encrypted via SOPS + per-tenant age key before committing to Git.",
+          "Encrypted via SOPS + per-tenant age key before committing to Git. Leave blank on Edit to keep it.",
       },
       hiqliteSecretApi: {
         "ui:widget": "password",
         "ui:help":
-          "Encrypted via SOPS + per-tenant age key before committing to Git.",
+          "Encrypted via SOPS + per-tenant age key before committing to Git. Leave blank on Edit to keep it.",
       },
       adminPassword: {
         "ui:widget": "password",

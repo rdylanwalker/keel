@@ -70,4 +70,4 @@ spec:
       ui:help: "Routed via Envoy Gateway HTTPRoute; traffic shifts progressively when Flagger canary delivery is enabled."
     apiToken:
       ui:widget: password
-      ui:help: "Marked writeOnly: true — automatically encrypted with SOPS + per-tenant age key before git staging (never stored in plaintext)."
+      ui:help: "Marked writeOnly: true — automatically encrypted with SOPS + per-tenant age key before git staging (never stored in plaintext). Leave blank on Edit to keep it."

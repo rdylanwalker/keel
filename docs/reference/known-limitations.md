@@ -38,7 +38,8 @@ Keel is alpha software. This page collects the limitations and open bugs a user 
 
 ## Apps and Canaries
 
-- **Editing a Helm app replaces all its secrets.** When you edit a Helm app, re-enter every secret field: secrets you leave blank are dropped.
+- **Editing an infrastructure stack does not keep its secrets.** Apps (Helm and manifest) and bundle items keep a secret field left blank on Edit, but a stack re-encrypts only the secrets you submit. The web UI's Edit form keeps stack secret fields required, so re-enter every one.
+- **The web UI cannot clear a stored secret.** A secret field left blank on Edit keeps its stored value. To unset an optional secret, submit `""` for it through the API or a CLI values file.
 - **Canary analysis is not tested.** E2E checks that a canary deploys and initializes, but not traffic shifting, promotion or rollback.
 - **Apps are served over HTTPS only.** Canary apps are reachable through `keel-ingress` at `https://<host>:8888` on local `kind`. Plain HTTP on port 8888 does not respond.
 

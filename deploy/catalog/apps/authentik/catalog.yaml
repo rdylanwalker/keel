@@ -50,4 +50,4 @@ spec:
       ui:help: "Used for initial administrator recovery notifications."
     secretKey:
       ui:widget: password
-      ui:help: "Encrypted via SOPS + per-tenant age key before committing to Git."
+      ui:help: "Encrypted via SOPS + per-tenant age key before committing to Git. Leave blank on Edit to keep it."

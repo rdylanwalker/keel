@@ -136,13 +136,13 @@ spec:
       ui:help: "Exposed on the shared keel-ingress Gateway (HTTPS listeners); add a DNS / hosts entry pointing at the Gateway."
     encKey:
       ui:widget: password
-      ui:help: "Encrypted via SOPS + per-tenant age key before committing to Git (never stored in plaintext). Re-enter the same value on every Edit."
+      ui:help: "Encrypted via SOPS + per-tenant age key before committing to Git (never stored in plaintext). Leave blank on Edit to keep it; a new value makes data encrypted with the old key unreadable."
     hiqliteSecretRaft:
       ui:widget: password
-      ui:help: "Encrypted via SOPS + per-tenant age key before committing to Git."
+      ui:help: "Encrypted via SOPS + per-tenant age key before committing to Git. Leave blank on Edit to keep it."
     hiqliteSecretApi:
       ui:widget: password
-      ui:help: "Encrypted via SOPS + per-tenant age key before committing to Git."
+      ui:help: "Encrypted via SOPS + per-tenant age key before committing to Git. Leave blank on Edit to keep it."
     adminPassword:
       ui:widget: password
       ui:help: "Encrypted via SOPS + per-tenant age key before committing to Git. Change it in the Rauthy Admin UI after the first login."

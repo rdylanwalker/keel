@@ -82,13 +82,14 @@ function secretUiNode(
 ): UiSchema {
   const out: UiSchema = { ...ui }
   const types = Array.isArray(schema.type) ? schema.type : [schema.type]
-  if (
-    isSecretSchemaNode(schema) &&
-    (types.includes("string") || schema.type === undefined)
-  ) {
+  const secret = isSecretSchemaNode(schema)
+  if (secret && (types.includes("string") || schema.type === undefined)) {
     if (out["ui:widget"] === undefined) out["ui:widget"] = "password"
     if (editMode) out["ui:placeholder"] = KEEP_EXISTING_SECRET_PLACEHOLDER
   }
+  // A secret object/list is stored (and kept) as a whole: a blank field inside it keeps
+  // nothing, so its nested secrets get password widgets but no "keep" placeholder.
+  if (secret) editMode = false
   const props = asNode(schema.properties)
   if (props) {
     for (const [key, child] of Object.entries(props)) {
@@ -123,11 +124,13 @@ export function buildSecretAwareUiSchema(
 /**
  * Edit mode: existing secret values are never sent back to the browser, so secret fields
  * must not be `required` (blank keeps the stored secret). Returns a copy of `schema` with
- * every secret property removed from its parent's `required` list (recursively).
+ * every secret property removed from its parent's `required` list (recursively). The inside of
+ * a secret object/list is left as is: it is stored and replaced as a whole, so a re-entered
+ * one must be complete (the server validates it the same way).
  */
 export function relaxSecretRequirements<T>(schema: T): T {
   const node = asNode(schema)
-  if (!node) return schema
+  if (!node || isSecretSchemaNode(node)) return schema
   const out: SchemaNode = { ...node }
   const props = asNode(node.properties)
   if (props) {

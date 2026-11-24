@@ -132,4 +132,33 @@ describe("secretFields helpers", () => {
     expect(relaxed.allOf[0].required).toEqual([])
     expect(relaxSecretRequirements(undefined)).toBeUndefined()
   })
+
+  it("keeps a secret list whole: no keep placeholder or relaxed fields inside it", () => {
+    const oauth = {
+      type: "object",
+      properties: {
+        sources: {
+          type: "array",
+          writeOnly: true,
+          items: {
+            type: "object",
+            required: ["name", "secret"],
+            properties: {
+              name: { type: "string" },
+              secret: { type: "string", format: "password" },
+            },
+          },
+        },
+      },
+    }
+    const ui = buildSecretAwareUiSchema(oauth, undefined, { editMode: true })
+    expect(ui.sources).toEqual({
+      items: { secret: { "ui:widget": "password" } },
+    })
+    const relaxed = relaxSecretRequirements(oauth)
+    expect(relaxed.properties.sources.items.required).toEqual([
+      "name",
+      "secret",
+    ])
+  })
 })
