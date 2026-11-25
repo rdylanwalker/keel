@@ -30,7 +30,7 @@
       "@semantic-release/release-notes-generator",
       {
         "preset": "conventionalcommits",
-        "parserOpts": { "issuePrefixes": ["GH-"] },
+        "parserOpts": { "issuePrefixes": ["GH-"], "commentChar": "Co-Authored-By:" },
         "presetConfig": {
           "types": [
             { "type": "feat", "section": "Features" },

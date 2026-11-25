@@ -8,6 +8,8 @@
 //   * release notes list ⚠ BREAKING CHANGES → Features → Bug Fixes → Performance
 //     Improvements → Reverts, and hidden types (chore, docs, ...) stay out of the notes;
 //   * "#N" in a commit body is not rendered as an issue reference;
+//   * the Co-Authored-By trailer is not printed inside BREAKING CHANGE notes (parserOpts.commentChar
+//     drops lines starting with it; the parser matches it with startsWith, not as one character);
 //   * the commit analyzer bumps breaking → minor (pre-1.0), feat → minor,
 //     fix/perf/revert → patch and chore → no release.
 import { existsSync, readFileSync } from "node:fs";
@@ -105,6 +107,22 @@ assert.ok(
   !/closes|issues\/2|#2/.test(numbered),
   `"#N" in a commit body must not render as an issue reference:\n${numbered}`,
 );
+
+// A BREAKING CHANGE footer followed by the Co-Authored-By trailer: the note keeps its text but
+// not the trailer (v0.14.0 printed "Co-Authored-By: ..." inside both breaking notes).
+const trailered = await generateNotes(
+  notesCfg,
+  ctx([
+    mk(
+      "fix(bootstrap)!: pull in parallel\n\nBody.\n\nBREAKING CHANGE: delete the cluster\nand bootstrap again.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+    ),
+  ]),
+);
+assert.ok(
+  trailered.includes("delete the cluster") && trailered.includes("and bootstrap again."),
+  `BREAKING CHANGE note text missing:\n${trailered}`,
+);
+assert.ok(!/co-authored-by/i.test(trailered), `trailer leaked into the notes:\n${trailered}`);
 
 // --- commit analyzer: release types ---------------------------------------------
 const cases = [

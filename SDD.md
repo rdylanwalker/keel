@@ -779,7 +779,7 @@ flowchart TD
 
 ### 9.3 `semantic-release` Configuration (`.releaserc.json`)
 
-Both the commit analyzer and the release-notes generator use the `conventionalcommits` preset (`conventional-changelog-conventionalcommits`, pinned in `release/package.json`). The preset renders the `⚠ BREAKING CHANGES` note group first and then sorts commit groups in `presetConfig.types` order, so every release note and `CHANGELOG.md` entry reads **⚠ BREAKING CHANGES → Features → Bug Fixes → Performance Improvements → Reverts**. `docs`, `style`, `chore`, `refactor`, `test`, `build` and `ci` commits are hidden from the notes (they still appear if they carry a `BREAKING CHANGE`). The preset stays on 9.x while the stable `@semantic-release/release-notes-generator` (14.x) bundles `conventional-changelog-writer` 8; preset 10.x needs writer 9. Entries written before this ordering change are left as they are. `releaseRules` keeps breaking changes on a **minor** bump while Keel is pre-1.0 and adds `{ "type": "revert", "release": "patch" }` so hand-written `revert:` commits release a patch just like `git revert` commits (whose `This reverts commit <sha>.` body matches the analyzer's default revert rule). `release/verify-release-config.mjs` runs in CI (`ci.yml` *Release Config*) against the pinned `release/` toolchain, resolving plugins the same way `semantic-release` does at runtime, and asserts the note section order, the hidden types and the analyzer's bump per commit type, so Renovate updates to the release tooling cannot silently change either.
+Both the commit analyzer and the release-notes generator use the `conventionalcommits` preset (`conventional-changelog-conventionalcommits`, pinned in `release/package.json`). The preset renders the `⚠ BREAKING CHANGES` note group first and then sorts commit groups in `presetConfig.types` order, so every release note and `CHANGELOG.md` entry reads **⚠ BREAKING CHANGES → Features → Bug Fixes → Performance Improvements → Reverts**. `docs`, `style`, `chore`, `refactor`, `test`, `build` and `ci` commits are hidden from the notes (they still appear if they carry a `BREAKING CHANGE`). The preset stays on 9.x while the stable `@semantic-release/release-notes-generator` (14.x) bundles `conventional-changelog-writer` 8; preset 10.x needs writer 9. Entries written before this ordering change are left as they are. `releaseRules` keeps breaking changes on a **minor** bump while Keel is pre-1.0 and adds `{ "type": "revert", "release": "patch" }` so hand-written `revert:` commits release a patch just like `git revert` commits (whose `This reverts commit <sha>.` body matches the analyzer's default revert rule). `release/verify-release-config.mjs` runs in CI (`ci.yml` *Release Config*) against the pinned `release/` toolchain, resolving plugins the same way `semantic-release` does at runtime, and asserts the note section order, the hidden types and the analyzer's bump per commit type, so Renovate updates to the release tooling cannot silently change either. The release-notes generator sets two parser options: `issuePrefixes: ["GH-"]`, so `#N` in a commit body (for example numbered review findings) is not rendered as an issue reference, and `commentChar: "Co-Authored-By:"`, which drops that trailer line before parsing; otherwise the parser keeps every line after a `BREAKING CHANGE:` footer, trailer included, in the note. The verifier checks both.
 
 ```json
 {
@@ -814,6 +814,7 @@ Both the commit analyzer and the release-notes generator use the `conventionalco
       "@semantic-release/release-notes-generator",
       {
         "preset": "conventionalcommits",
+        "parserOpts": { "issuePrefixes": ["GH-"], "commentChar": "Co-Authored-By:" },
         "presetConfig": {
           "types": [
             { "type": "feat", "section": "Features" },
@@ -835,7 +836,7 @@ Both the commit analyzer and the release-notes generator use the `conventionalco
     [
       "@semantic-release/exec",
       {
-        "prepareCmd": "cargo set-version ${nextRelease.version} && cargo update --workspace && cargo metadata --locked --format-version 1 > /dev/null && npm --prefix ui version ${nextRelease.version} --no-git-tag-version && sed -i -E -e 's#^( +(newTag|version): )\"[^\"]*\"#\\1\"${nextRelease.version}\"#' -e 's#(ghcr\\.io/rdylanwalker/keel:)[0-9A-Za-z._-]+#\\1${nextRelease.version}#' deploy/bootstrap/keel-server/kustomization.yaml deploy/bootstrap/keel-server/deployment.yaml deploy/seed/core-addons/keel-server.yaml deploy/catalog/core/keel-server/catalog.yaml deploy/catalog/apps/keel-server/catalog.yaml deploy/catalog/apps/keel-server/manifests.yaml"
+        "prepareCmd": "cargo set-version ${nextRelease.version} && cargo update --workspace && cargo metadata --locked --format-version 1 > /dev/null && npm --prefix ui version ${nextRelease.version} --no-git-tag-version && sed -i -E -e 's#^( +(newTag|version): )\"[^\"]*\"#\\1\"${nextRelease.version}\"#' -e 's#(ghcr\\.io/rdylanwalker/keel:)[0-9A-Za-z._-]+#\\1${nextRelease.version}#' deploy/bootstrap/keel-server/kustomization.yaml deploy/bootstrap/keel-server/deployment.yaml deploy/seed/core-addons/keel-server.yaml deploy/catalog/core/keel-server/catalog.yaml deploy/catalog/apps/keel-server/catalog.yaml deploy/catalog/apps/keel-server/manifests.yaml && sed -i -E -e 's#(releases/(download|tag)/v)[0-9]+\\.[0-9]+\\.[0-9]+#\\1${nextRelease.version}#g' -e 's#(This README describes v)[0-9]+\\.[0-9]+\\.[0-9]+#\\1${nextRelease.version}#' README.md"
       }
     ],
     [
@@ -851,7 +852,8 @@ Both the commit analyzer and the release-notes generator use the `conventionalco
           "deploy/seed/core-addons/keel-server.yaml",
           "deploy/catalog/core/keel-server/catalog.yaml",
           "deploy/catalog/apps/keel-server/catalog.yaml",
-          "deploy/catalog/apps/keel-server/manifests.yaml"
+          "deploy/catalog/apps/keel-server/manifests.yaml",
+          "README.md"
         ],
         "message": "chore(release): ${nextRelease.version} [skip ci]\n\n${nextRelease.notes}"
       }
