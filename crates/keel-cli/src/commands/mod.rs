@@ -1463,6 +1463,53 @@ spec:
             "{no_values_err}"
         );
 
+        // 4c. Values whose key looks like a secret are SOPS-encrypted and reported (AST-2);
+        // `--not-secret` keeps one plaintext. The output never carries the secret value.
+        let heuristic_values_file = tmp.path().join("heuristic-values.yaml");
+        tokio::fs::write(
+            &heuristic_values_file,
+            "domain: sso.acme.io\nadminEmail: admin@acme.io\nsmtp:\n  password: CLI-HEURISTIC-PW\n  tlsSecret: smtp-tls\n",
+        )
+        .await
+        .unwrap();
+        let heuristic_cli = Cli::try_parse_from([
+            "keel",
+            "app",
+            "install",
+            "--app",
+            "authentik",
+            "--tenant",
+            "acme",
+            "--values-file",
+            heuristic_values_file.to_str().unwrap(),
+            "--not-secret",
+            "smtp.tlsSecret",
+            "--server",
+            &server_url,
+        ])
+        .unwrap();
+        match dispatch(&heuristic_cli, &ctx).await {
+            Ok(out) => {
+                assert!(out.contains("Secret handling:"), "{out}");
+                assert!(
+                    out.contains("smtp.password")
+                        && out.contains("stored encrypted with SOPS")
+                        && out.contains("--not-secret smtp.password"),
+                    "{out}"
+                );
+                assert!(
+                    out.contains("smtp.tlsSecret") && out.contains("marked not-secret by you"),
+                    "{out}"
+                );
+                assert!(!out.contains("CLI-HEURISTIC-PW"), "{out}");
+            }
+            // Without `sops`/`age` the server cannot encrypt (CI sets KEEL_REQUIRE_SOPS).
+            Err(err) => assert!(
+                std::env::var_os("KEEL_REQUIRE_SOPS").is_none(),
+                "heuristic secret install failed: {err}"
+            ),
+        }
+
         // 5. `keel preview status --pr 1` without watch
         let prev_cli = Cli::try_parse_from([
             "keel",

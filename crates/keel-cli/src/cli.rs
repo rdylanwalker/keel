@@ -480,6 +480,18 @@ pub struct InfraProvisionArgs {
     #[arg(long)]
     pub values_file: PathBuf,
 
+    /// Dot path of a value whose key looks like a secret but is not one (e.g.
+    /// `--not-secret tls.secretRefName`): it stays plaintext instead of being SOPS-encrypted.
+    /// Repeatable. Fields the catalog declares secret cannot be overridden. Replaces the
+    /// stack's saved list; omit it to keep the saved list
+    #[arg(long = "not-secret", value_name = "PATH")]
+    pub not_secret: Vec<String>,
+
+    /// Clears the saved "not secret" list (sends `nonSecretPaths: []`): every value whose key
+    /// looks like a secret is SOPS-encrypted again
+    #[arg(long, conflicts_with = "not_secret")]
+    pub clear_not_secret: bool,
+
     /// Keel server base URL (set via global `--server` / `KEEL_SERVER`)
     #[arg(skip = DEFAULT_SERVER_URL.to_string())]
     pub server: String,
@@ -856,6 +868,18 @@ pub struct AppInstallArgs {
     /// Reconciliation engine for raw Kubernetes manifest catalog apps (`flux` or `pulumi`)
     #[arg(long)]
     pub engine: Option<String>,
+
+    /// Dot path of a value whose key looks like a secret but is not one (e.g.
+    /// `--not-secret ingress.tlsSecret`): it stays plaintext in `values.yaml` instead of being
+    /// SOPS-encrypted. Repeatable. Fields the catalog declares secret cannot be overridden.
+    /// Replaces the instance's saved list; omit it to keep the saved list
+    #[arg(long = "not-secret", value_name = "PATH")]
+    pub not_secret: Vec<String>,
+
+    /// Clears the saved "not secret" list (sends `nonSecretPaths: []`): every value whose key
+    /// looks like a secret is SOPS-encrypted again
+    #[arg(long, conflicts_with = "not_secret")]
+    pub clear_not_secret: bool,
 
     /// Keel server base URL (set via global `--server` / `KEEL_SERVER`)
     #[arg(skip = DEFAULT_SERVER_URL.to_string())]
@@ -1278,6 +1302,98 @@ mod tests {
             panic!("expected app install without values file");
         };
         assert_eq!(app_defaults_args.values_file, None);
+        assert!(app_defaults_args.not_secret.is_empty());
+
+        // `--not-secret` is repeatable on `app install` and `infra provision`.
+        let not_secret_cli = Cli::try_parse_from([
+            "keel",
+            "app",
+            "install",
+            "--app",
+            "podinfo",
+            "--tenant",
+            "acme",
+            "--not-secret",
+            "ingress.tlsSecret",
+            "--not-secret",
+            "auth.tokenSecret",
+        ])
+        .unwrap();
+        let Commands::App(AppArgs {
+            command: AppCommands::Install(not_secret_args),
+        }) = not_secret_cli.command
+        else {
+            panic!("expected app install with --not-secret");
+        };
+        assert_eq!(
+            not_secret_args.not_secret,
+            vec![
+                "ingress.tlsSecret".to_string(),
+                "auth.tokenSecret".to_string()
+            ]
+        );
+        let infra_not_secret_cli = Cli::try_parse_from([
+            "keel",
+            "infra",
+            "provision",
+            "--blueprint",
+            "postgres-managed",
+            "--tenant",
+            "acme",
+            "--values-file",
+            "db.yaml",
+            "--not-secret",
+            "tokenPolicy",
+        ])
+        .unwrap();
+        let Commands::Infra(InfraArgs {
+            command: InfraCommands::Provision(infra_not_secret_args),
+        }) = infra_not_secret_cli.command
+        else {
+            panic!("expected infra provision with --not-secret");
+        };
+        assert_eq!(
+            infra_not_secret_args.not_secret,
+            vec!["tokenPolicy".to_string()]
+        );
+        assert!(!infra_not_secret_args.clear_not_secret);
+
+        // `--clear-not-secret` clears the saved list and conflicts with `--not-secret`.
+        let clear_cli = Cli::try_parse_from([
+            "keel",
+            "app",
+            "install",
+            "--app",
+            "podinfo",
+            "--tenant",
+            "acme",
+            "--clear-not-secret",
+        ])
+        .unwrap();
+        let Commands::App(AppArgs {
+            command: AppCommands::Install(clear_args),
+        }) = clear_cli.command
+        else {
+            panic!("expected app install with --clear-not-secret");
+        };
+        assert!(clear_args.clear_not_secret && clear_args.not_secret.is_empty());
+        assert!(
+            Cli::try_parse_from([
+                "keel",
+                "infra",
+                "provision",
+                "--blueprint",
+                "postgres-managed",
+                "--tenant",
+                "acme",
+                "--values-file",
+                "db.yaml",
+                "--clear-not-secret",
+                "--not-secret",
+                "tokenPolicy",
+            ])
+            .is_err()
+        );
 
         let delete_cli = Cli::try_parse_from([
             "keel", "app", "delete", "podinfo", "--tenant", "acme", "--output", "json",

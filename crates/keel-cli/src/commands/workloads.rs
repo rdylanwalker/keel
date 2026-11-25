@@ -177,6 +177,43 @@ struct CreateProposalApiResponse {
     proposal: PullRequestInfo,
     branch: String,
     report: PreviewReport,
+    #[serde(default)]
+    secret_notices: Vec<keel_core::SecretNotice>,
+}
+
+/// Renders the server's secret-handling notices (AST-2): values treated as secret only because
+/// their key looks like one, and values the user marked not secret. Never the values themselves.
+pub(crate) fn format_secret_notices(notices: &[keel_core::SecretNotice]) -> String {
+    if notices.is_empty() {
+        return String::new();
+    }
+    let width = notices.iter().map(|n| n.path.len()).max().unwrap_or(0);
+    let mut out = String::from("Secret handling:\n");
+    for notice in notices {
+        let hint = match notice.reason {
+            keel_core::SecretNoticeReason::HeuristicSecret => {
+                format!(" (not a secret? re-run with --not-secret {})", notice.path)
+            }
+            keel_core::SecretNoticeReason::MarkedNotSecret => String::new(),
+        };
+        out.push_str(&format!(
+            "  {:<width$}  {}{hint}\n",
+            notice.path, notice.message
+        ));
+    }
+    out
+}
+
+/// The `nonSecretPaths` to send: the `--not-secret` paths, `[]` for `--clear-not-secret`, or
+/// `None` (omitted: the server keeps the saved list) when neither is given.
+fn not_secret_request(not_secret: &[String], clear: bool) -> Option<&[String]> {
+    if clear {
+        Some(&[])
+    } else if not_secret.is_empty() {
+        None
+    } else {
+        Some(not_secret)
+    }
 }
 
 /// Reads and parses a YAML or JSON values file into a JSON object (`serde_json::Value`).
@@ -269,6 +306,7 @@ pub async fn execute_infra_provision(
             ))
         })?;
     validate_blueprint_values(blueprint, &values)?;
+    keel_core::validate_non_secret_paths(&blueprint.spec.schema, &args.not_secret)?;
 
     submit_proposal_request(
         &base_url,
@@ -279,6 +317,7 @@ pub async fn execute_infra_provision(
         &values,
         false,
         None,
+        not_secret_request(&args.not_secret, args.clear_not_secret),
     )
     .await
 }
@@ -325,6 +364,7 @@ pub async fn execute_app_install(
             (_, err) => err,
         }
     })?;
+    keel_core::validate_non_secret_paths(&app.spec.schema, &args.not_secret)?;
 
     submit_proposal_request(
         &base_url,
@@ -335,6 +375,7 @@ pub async fn execute_app_install(
         &values,
         args.canary,
         args.engine.as_deref(),
+        not_secret_request(&args.not_secret, args.clear_not_secret),
     )
     .await
 }
@@ -461,6 +502,7 @@ async fn submit_proposal_request(
     values: &Value,
     canary: bool,
     action_engine: Option<&str>,
+    not_secret: Option<&[String]>,
 ) -> Result<String, CliError> {
     keel_core::validate_dns_label(tenant, "tenant")?;
     let endpoint = format!("{base_url}/api/v1/tenants/{tenant}/proposals");
@@ -473,6 +515,13 @@ async fn submit_proposal_request(
         // values instead of replacing them, so omitted keys (and install defaults) are kept.
         "mergeStoredValues": true,
     });
+    // `--not-secret` replaces the instance's saved overrides and `--clear-not-secret` clears
+    // them (`[]`); without either they are kept (field omitted).
+    if let Some(paths) = not_secret
+        && let Some(obj) = req_body.as_object_mut()
+    {
+        obj.insert("nonSecretPaths".to_string(), json!(paths));
+    }
     if let Some(eng) = action_engine
         && let Some(obj) = req_body.as_object_mut()
     {
@@ -506,6 +555,11 @@ async fn submit_proposal_request(
         id = created.proposal.id
     ));
     output.push('\n');
+    let notices = format_secret_notices(&created.secret_notices);
+    if !notices.is_empty() {
+        output.push_str(&notices);
+        output.push('\n');
+    }
     output.push_str(&format_preview_table(&created.report));
 
     Ok(output)
@@ -1075,6 +1129,30 @@ mod preview_output_tests {
     use keel_pko::PreviewRunStatus;
 
     use super::*;
+
+    #[test]
+    fn not_secret_request_omits_replaces_or_clears() {
+        assert_eq!(not_secret_request(&[], false), None);
+        let empty: &[String] = &[];
+        assert_eq!(not_secret_request(&[], true), Some(empty));
+        let paths = vec!["a.token".to_string()];
+        assert_eq!(not_secret_request(&paths, false), Some(paths.as_slice()));
+    }
+
+    #[test]
+    fn secret_notices_name_paths_and_the_override_flag() {
+        assert_eq!(format_secret_notices(&[]), "");
+        let out = format_secret_notices(&[
+            keel_core::SecretNotice::heuristic_secret("auth.apiToken"),
+            keel_core::SecretNotice::marked_not_secret("tls"),
+        ]);
+        assert_eq!(
+            out,
+            "Secret handling:\n  auth.apiToken  looks like a secret; stored encrypted with SOPS \
+             (not a secret? re-run with --not-secret auth.apiToken)\n  tls            marked \
+             not-secret by you; stored in plaintext\n"
+        );
+    }
 
     #[test]
     fn preview_table_labels_simulated_vs_pko_and_only_shows_applied_stacks() {
