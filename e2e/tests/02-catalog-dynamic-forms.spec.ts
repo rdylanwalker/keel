@@ -7,6 +7,7 @@ import {
   createProposal,
   git,
   openTab,
+  proposalPath,
   showFile,
   uiLogin,
   uniq,
@@ -194,6 +195,180 @@ test.describe('02 - Catalog Dynamic Forms & PR Proposal Generation', () => {
 
     expect(treeContains(body.branch, secret)).toBe(false);
     expect(showFile(body.branch, `tenants/acme/apps/${name}/values.yaml`)).toContain('replicas: 4');
+  });
+
+  test('02.10 - Name-heuristic secrets: Sync Upstream Schema password field, inline warning, "Not a secret" override', async ({
+    page,
+  }) => {
+    await uiLogin(page, USERS.admin);
+    // The upstream chart schema is mocked (no network): it names a password field the catalog
+    // schema does not declare secret, plus a secret-looking field holding a plain name.
+    await page.route('**/api/v1/catalog/fetch-schema', (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          source: 'values.yaml',
+          schema: {
+            type: 'object',
+            properties: {
+              auth: {
+                type: 'object',
+                properties: {
+                  username: { type: 'string', title: 'Upstream DB User', default: 'app' },
+                  password: { type: 'string', title: 'Upstream DB Password', default: '' },
+                  existingSecret: { type: 'string', title: 'Existing Auth Secret', default: '' },
+                },
+              },
+              webhookSecret: { type: 'string', title: 'Webhook Secret Label', default: '' },
+            },
+          },
+        }),
+      }),
+    );
+    const modal = await openPodinfoDeployForm(page);
+    await modal.getByRole('button', { name: /Sync Upstream Schema/ }).click();
+
+    // The upstream password field is treated as secret: password input + inline warning.
+    const password = modal.getByLabel('Upstream DB Password', { exact: true });
+    await expect(password).toHaveAttribute('type', 'password');
+    const notices = modal.getByTestId('heuristic-secret-notice');
+    await expect(notices.and(modal.locator('[data-path="auth.password"]'))).toContainText(
+      /Looks like a secret: stored encrypted with SOPS/,
+    );
+    // Reference-style keys (existingSecret) are never flagged.
+    await expect(
+      modal.locator('[data-testid="heuristic-secret-notice"][data-path="auth.existingSecret"]'),
+    ).toHaveCount(0);
+    await expect(modal.getByLabel('Existing Auth Secret', { exact: true })).toHaveAttribute(
+      'type',
+      'text',
+    );
+
+    const name = uniq('heur');
+    await modal.locator('#instance-name-input').fill(name);
+    await modal.locator('#deploy-modal-tenant-select').selectOption('acme');
+    const secret = `HeurS3cret-${uniq('pw')}`;
+    await password.fill(secret);
+    await modal.getByLabel('Webhook Secret Label', { exact: true }).fill('team-hooks');
+
+    // "Not a secret" switches the field to plaintext and is sent as an override.
+    await modal.getByRole('checkbox', { name: 'Not a secret: webhookSecret' }).click();
+    await expect(modal.getByLabel('Webhook Secret Label', { exact: true })).toHaveAttribute(
+      'type',
+      'text',
+    );
+    await expect(modal.locator('[data-path="webhookSecret"]')).toContainText(/stored in plaintext/);
+
+    const preview = modal.getByLabel('values.yaml preview');
+    await expect(preview).toContainText('webhookSecret: team-hooks');
+    await expect(preview).not.toContainText(secret);
+
+    const createResponse = page.waitForResponse(
+      (r) =>
+        r.request().method() === 'POST' && /\/api\/v1\/tenants\/[^/]+\/proposals$/.test(r.url()),
+    );
+    await modal.getByRole('button', { name: /Submit & Open Git PR Proposal/i }).click();
+    const res = await createResponse;
+    expect(res.status(), await res.text()).toBe(201);
+    const sent = res.request().postDataJSON() as {
+      values: { auth?: { password?: string } };
+      nonSecretPaths?: string[];
+    };
+    expect(sent.nonSecretPaths).toEqual(['webhookSecret']);
+    expect(sent.values.auth?.password).toBe(secret);
+
+    const body = (await res.json()) as {
+      branch: string;
+      secretNotices: Array<{ path: string; reason: string; message: string }>;
+    };
+    expect(body.secretNotices).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ path: 'auth.password', reason: 'heuristicSecret' }),
+        expect.objectContaining({ path: 'webhookSecret', reason: 'markedNotSecret' }),
+      ]),
+    );
+    expect(JSON.stringify(body.secretNotices)).not.toContain(secret);
+
+    // The server's notices are shown after submit (paths and reasons, never values).
+    const shown = page.getByTestId('secret-notices');
+    await expect(shown).toContainText('auth.password');
+    await expect(shown).toContainText('webhookSecret');
+    await expect(shown).not.toContainText(secret);
+
+    // Same pipeline as declared secrets: encrypted with SOPS, plaintext nowhere in the branch;
+    // the override is persisted next to the instance.
+    const dir = `tenants/acme/apps/${name}`;
+    expect(treeContains(body.branch, secret)).toBe(false);
+    expect(showFile(body.branch, `${dir}/secrets.enc.yaml`)).toMatch(/password: ENC\[AES256_GCM,/);
+    const values = showFile(body.branch, `${dir}/values.yaml`);
+    expect(values).toContain('webhookSecret: team-hooks');
+    expect(values).not.toContain('password');
+    expect(JSON.parse(showFile(body.branch, `${dir}/secret-overrides.json`))).toEqual({
+      nonSecretPaths: ['webhookSecret'],
+    });
+  });
+
+  test('02.11 - Edit opens with server-masked secrets and the persisted "Not a secret" overrides', async ({
+    page,
+  }) => {
+    const api = await apiAs(USERS.admin);
+    const name = uniq('mask');
+    const declared = `DeclS3cret-${uniq('pw')}`;
+    const heuristic = `HeurT0ken-${uniq('tk')}`;
+    const created = await createProposal(api, {
+      tenant: 'acme',
+      catalogId: 'podinfo',
+      name,
+      values: {
+        replicas: 2,
+        adminPassword: declared,
+        auth: { apiToken: heuristic },
+        webhookSecret: 'team-hooks',
+      },
+      nonSecretPaths: ['webhookSecret'],
+    });
+    const merged = await api.post(proposalPath(created.proposal, 'merge'));
+    expect(merged.status(), await merged.text()).toBe(200);
+
+    // The config endpoint leaves every secret out and reports the persisted override.
+    const configRes = await api.get(`/api/v1/releases/tenant-acme/${name}/config`);
+    expect(configRes.status()).toBe(200);
+    const configText = await configRes.text();
+    expect(configText).not.toContain(declared);
+    expect(configText).not.toContain(heuristic);
+    const config = JSON.parse(configText) as {
+      values: Record<string, unknown>;
+      nonSecretPaths: string[];
+    };
+    expect(config.values).toMatchObject({ replicas: 2, webhookSecret: 'team-hooks' });
+    expect(config.values).not.toHaveProperty('adminPassword');
+    expect(config.nonSecretPaths).toEqual(['webhookSecret']);
+    await api.dispose();
+
+    // The GUI edit form: secrets blank with the keep-existing placeholder, override restored.
+    await uiLogin(page, USERS.admin);
+    await openTab(page, 'Topology Map');
+    const configLoaded = page.waitForResponse((r) =>
+      r.url().endsWith(`/api/v1/releases/tenant-acme/${name}/config`),
+    );
+    await page.getByRole('button', { name: `Edit release ${name}` }).click();
+    const served = await configLoaded;
+    const servedText = await served.text();
+    expect(servedText).not.toContain(declared);
+    expect(servedText).not.toContain(heuristic);
+    const modal = page.getByTestId('deploy-instance-modal');
+    await expect(modal).toBeVisible();
+    const password = modal.getByLabel('Admin Secret Password');
+    await expect(password).toHaveValue('');
+    await expect(password).toHaveAttribute('placeholder', 'Leave blank to keep existing secret');
+    await expect(
+      modal.getByRole('checkbox', { name: 'Not a secret: webhookSecret' }),
+    ).toHaveAttribute('data-state', 'checked');
+    const preview = modal.getByLabel('values.yaml preview');
+    await expect(preview).toContainText('webhookSecret: team-hooks');
+    await expect(preview).not.toContainText(declared);
+    await expect(preview).not.toContainText(heuristic);
   });
 
   test('02.6 - Deploy dialog closes with Escape without opening a PR', async ({ page }) => {
