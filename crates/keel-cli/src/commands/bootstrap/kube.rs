@@ -416,7 +416,19 @@ mod local_port_tests {
         assert_ne!(fallback, port);
 
         drop(busy);
-        assert_eq!(pick_local_port(LocalPort::Required(port)).unwrap(), port);
+        // A child forked by another test thread while `busy` was open keeps the listening socket
+        // until it `exec`s (O_CLOEXEC), so the port can stay bound for a moment after the drop.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let reacquired = loop {
+            match pick_local_port(LocalPort::Required(port)) {
+                Ok(p) => break p,
+                Err(_) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(err) => panic!("port {port} still busy after drop: {err}"),
+            }
+        };
+        assert_eq!(reacquired, port);
     }
 }
 

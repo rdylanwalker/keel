@@ -643,7 +643,14 @@ mod tests {
         // Probing must not take the lock away from its holder.
         assert!(ServeLock::is_held(&repo));
         drop(lock);
-        assert!(!ServeLock::is_held(&repo));
+        // `flock` locks belong to the open file description: a child that another test thread
+        // forks while the lock is held keeps a copy until it `exec`s (O_CLOEXEC), so the release
+        // can lag the drop by a moment. Poll instead of asserting instantly.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while ServeLock::is_held(&repo) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(!ServeLock::is_held(&repo), "lock released after drop");
         assert!(repo.join(".git").join(SERVE_LOCK_FILE).exists());
     }
 
