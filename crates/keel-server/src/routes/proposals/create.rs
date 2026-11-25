@@ -5,8 +5,7 @@ use axum::extract::{Path as AxumPath, State};
 use axum::http::StatusCode;
 use keel_core::{
     AppRuntime, CatalogManifest, ManifestEngine, SopsManager, apply_schema_defaults,
-    merge_values_patch, partition_values_by_schema, render_helm_values_yaml, tenant_namespace,
-    validate_dns_label, validate_schema_values,
+    merge_values_patch, render_helm_values_yaml, tenant_namespace, validate_dns_label,
 };
 use keel_kube::{
     FluxDependencyRef, HelmChartSourceKind, HelmChartSourceRef, HelmReleaseSpecInput,
@@ -49,9 +48,10 @@ use super::preview_inputs::{
     apply_preview_source_trust, attach_preview_cluster_inputs, plan_preview_credentials,
 };
 use super::secrets::{
-    build_infra_secret_manifest_yaml, drop_blank_stored_secret_values,
-    read_stored_manifest_app_secret, relax_stored_secret_requirements, resolve_manifest_app_secret,
-    tenant_sops_recipients,
+    EffectiveSecrets, build_infra_secret_manifest_yaml, effective_non_secret_paths,
+    heuristic_secret_hint, partition_effective_secrets, read_secret_overrides,
+    read_stored_manifest_app_secret, resolve_manifest_app_secret, tenant_sops_recipients,
+    write_secret_overrides,
 };
 use super::tenant_stack::{
     apply_tenant_source_trust, attach_tenant_stack_credentials, populate_stack_config_from_values,
@@ -249,17 +249,24 @@ pub async fn create_proposal(
     } else {
         None
     };
-    match &stored_manifest_secret {
-        Some(stored) => {
-            req.values = drop_blank_stored_secret_values(schema, &req.values, &stored.keys);
-            validate_schema_values(
-                &relax_stored_secret_requirements(schema, &stored.valued_keys),
-                &req.values,
-            )?
-        }
-        None => validate_schema_values(schema, &req.values)?,
-    }
-    let partitioned = partition_values_by_schema(schema, &req.values)?;
+    // Effective secret rules (AST-2): schema-declared secrets plus values whose key looks like a
+    // secret, minus the user's "not secret" overrides (this request's, else the persisted ones).
+    let non_secret_paths = effective_non_secret_paths(
+        schema,
+        req.non_secret_paths.as_deref(),
+        read_secret_overrides(&repo.workdir, &own_rel_dir).await,
+    )?;
+    let EffectiveSecrets {
+        partitioned,
+        notices: secret_notices,
+        non_secret_paths,
+    } = partition_effective_secrets(
+        schema,
+        &mut req.values,
+        stored_manifest_secret.as_ref(),
+        non_secret_paths,
+        true,
+    )?;
     let has_secret_fields = partitioned
         .secret_values
         .as_object()
@@ -271,8 +278,9 @@ pub async fn create_proposal(
     // closed before encrypting or committing.
     if has_secret_fields && manifest_engine == Some(ManifestEngine::Pulumi) {
         return Err(ServerError::BadRequest(format!(
-            "Catalog application '{}' has secret fields, which the Pulumi engine cannot pass into its manifest template; use the flux engine",
-            req.catalog_id
+            "Catalog application '{}' has secret fields, which the Pulumi engine cannot pass into its manifest template; use the flux engine{}",
+            req.catalog_id,
+            heuristic_secret_hint(&secret_notices)
         )));
     }
     // Multi-namespace manifest apps rely on the Flux layout (namespaces created first, no
@@ -837,6 +845,7 @@ pub async fn create_proposal(
         let values_path = target_dir.join("values.yaml");
         write_contained(workdir, &values_path, &values_yaml).await?;
         staged_paths.push(format!("{rel_dir}/values.yaml"));
+        write_secret_overrides(workdir, &rel_dir, &non_secret_paths, &mut staged_paths).await?;
 
         let manifest_filename = match manifest_engine {
             Some(ManifestEngine::Flux) => "flux-kustomization.yaml",
@@ -1341,7 +1350,7 @@ pub async fn create_proposal(
         run,
     );
 
-    Ok(publish_proposal(
+    let (status, Json(mut body)) = publish_proposal(
         &state,
         &repo,
         pr,
@@ -1350,7 +1359,9 @@ pub async fn create_proposal(
         preview_stack,
         report,
     )
-    .await)
+    .await;
+    body.secret_notices = secret_notices;
+    Ok((status, Json(body)))
 }
 
 /// The committed non-secret values of an existing instance (`<rel_dir>/values.yaml`; an absent or

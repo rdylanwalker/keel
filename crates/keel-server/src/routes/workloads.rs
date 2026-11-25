@@ -21,8 +21,8 @@ use crate::state::{AppState, MANAGEMENT_TENANT, ReleaseSummary, StackSummary};
 use crate::proposal_repo::{ScopeRepo, TenantIndex};
 
 use super::{
-    RepoReader, exists_contained, remove_dir_all_contained, resolve_tenant_resource_dir,
-    stage_commit_push_in,
+    RepoReader, exists_contained, load_catalog_manifest_for_tenant, read_contained_to_string,
+    remove_dir_all_contained, resolve_tenant_resource_dir, stage_commit_push_in,
 };
 
 /// Query parameters for `GET /api/v1/stacks`.
@@ -562,6 +562,26 @@ async fn read_stack_config(
         }
     }
 
+    // AST-1: mask with the blueprint's effective secret rules (only a blueprint shared with or
+    // owned by `tenant`; otherwise the name heuristic alone).
+    let mut schema = json!({});
+    if let Some(catalog) = catalog
+        && validate_dns_label(&catalog_id, "catalog id").is_ok()
+        && let Some(cat_raw) = catalog
+            .read(&format!("catalog/infra/{catalog_id}/catalog.yaml"))
+            .await
+        && let Ok(manifest) = parse_catalog(&cat_raw)
+        && manifest.tenant().is_none_or(|owner| owner == tenant)
+    {
+        schema = manifest_schema(&manifest).clone();
+    }
+    let stored_overrides = reader
+        .read(&format!("{dir}/{}", keel_core::SECRET_OVERRIDES_FILE))
+        .await
+        .map(|raw| keel_core::parse_secret_overrides(&raw))
+        .unwrap_or_default();
+    let (values, non_secret_paths) = mask_config_values(&schema, &values, stored_overrides);
+
     Some(ReleaseConfigResponse {
         catalog_id,
         tenant: tenant.to_string(),
@@ -572,6 +592,7 @@ async fn read_stack_config(
         canary: None,
         action_engine: None,
         values,
+        non_secret_paths,
     })
 }
 
@@ -592,7 +613,67 @@ pub struct ReleaseConfigResponse {
     pub canary: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action_engine: Option<String>,
+    /// Persisted values with every effective secret omitted ([`mask_config_values`]).
     pub values: Value,
+    /// The instance's persisted "not secret" overrides (`secret-overrides.json`, AST-2) that
+    /// still apply: name-heuristic matches the user marked not secret.
+    #[serde(default)]
+    pub non_secret_paths: Vec<String>,
+}
+
+/// The catalog JSON Schema of `manifest`.
+fn manifest_schema(manifest: &CatalogManifest) -> &Value {
+    match manifest {
+        CatalogManifest::Application(app) => &app.spec.schema,
+        CatalogManifest::InfraBlueprint(bp) => &bp.spec.schema,
+        CatalogManifest::Bundle(bundle) => &bundle.spec.schema,
+    }
+}
+
+/// The catalog schema of item `catalog_id` (`kind` hint) visible to `tenant`; `None` when the id
+/// is not a DNS label or the item is missing, unreadable or another tenant's.
+async fn catalog_schema_for_tenant(
+    state: &AppState,
+    catalog_id: &str,
+    kind: &str,
+    tenant: &str,
+) -> Option<Value> {
+    validate_dns_label(catalog_id, "catalog id").ok()?;
+    load_catalog_manifest_for_tenant(&state.repo_workdir, catalog_id, Some(kind), tenant)
+        .await
+        .ok()
+        .map(|manifest| manifest_schema(&manifest).clone())
+}
+
+/// The catalog bundle `catalog_id` visible to `tenant`, if any.
+async fn load_bundle_catalog(
+    state: &AppState,
+    catalog_id: &str,
+    tenant: &str,
+) -> Option<CatalogManifest> {
+    load_catalog_manifest_for_tenant(&state.repo_workdir, catalog_id, Some("bundle"), tenant)
+        .await
+        .ok()
+}
+
+/// Server-side mask of an instance's persisted values for the `/config` endpoints (AST-1,
+/// `NFR-SEC-05`): omits every value the effective secret rules make secret (declared by
+/// `schema`, or a name-heuristic match not in the instance's `stored_overrides`), even one
+/// committed to `values.yaml` by hand. Returns the masked values and the overrides that still
+/// apply (an override of a path `schema` now declares secret is dropped).
+fn mask_config_values(
+    schema: &Value,
+    values: &Value,
+    stored_overrides: Vec<String>,
+) -> (Value, Vec<String>) {
+    let overrides: Vec<String> = stored_overrides
+        .into_iter()
+        .filter(|p| keel_core::validate_non_secret_paths(schema, std::slice::from_ref(p)).is_ok())
+        .collect();
+    (
+        keel_core::mask_secret_values(schema, values, &overrides),
+        overrides,
+    )
 }
 
 /// `GET /api/v1/releases/{namespace}/{name}/config`
@@ -618,12 +699,13 @@ pub async fn get_release_config(
     let repo_guard = repo.lock(&state).await;
     repo.sync_main_for_read(&state).await?;
     let root = repo.workdir.as_path();
-    let app_dir = match resolve_tenant_resource_dir(root, tenant, "apps", &name).await {
-        Some(resolved) => root.join(&resolved.rel_dir),
-        None => root.join("tenants").join(tenant).join("apps").join(&name),
+    let app_rel_dir = match resolve_tenant_resource_dir(root, tenant, "apps", &name).await {
+        Some(resolved) => resolved.rel_dir,
+        None => format!("tenants/{tenant}/apps/{name}"),
     };
+    let app_dir = root.join(&app_rel_dir);
 
-    let (values, hr_doc, is_canary, action_engine) = {
+    let (values, hr_doc, is_canary, action_engine, stored_overrides) = {
         let _guard = repo_guard;
         let values_path = app_dir.join("values.yaml");
         let hr_path = app_dir.join("helmrelease.yaml");
@@ -699,7 +781,19 @@ pub async fn get_release_config(
             None
         };
 
-        (values, hr_doc, has_canary_hr || has_canary_cr, engine)
+        let stored_overrides =
+            read_contained_to_string(root, &app_dir.join(keel_core::SECRET_OVERRIDES_FILE))
+                .await
+                .map(|raw| keel_core::parse_secret_overrides(&raw))
+                .unwrap_or_default();
+
+        (
+            values,
+            hr_doc,
+            has_canary_hr || has_canary_cr,
+            engine,
+            stored_overrides,
+        )
     };
 
     let chart_name = hr_doc
@@ -759,6 +853,13 @@ pub async fn get_release_config(
         }
     }
 
+    // AST-1: mask with the effective secret rules of the app's catalog schema (an unknown or
+    // unreadable catalog item leaves only the name heuristic, never the plaintext).
+    let schema = catalog_schema_for_tenant(&state, &catalog_id, "app", tenant)
+        .await
+        .unwrap_or_else(|| json!({}));
+    let (values, non_secret_paths) = mask_config_values(&schema, &values, stored_overrides);
+
     Ok(Json(ReleaseConfigResponse {
         catalog_id,
         tenant: tenant.to_string(),
@@ -769,6 +870,7 @@ pub async fn get_release_config(
         canary: if is_canary { Some(true) } else { None },
         action_engine,
         values,
+        non_secret_paths,
     }))
 }
 
@@ -778,7 +880,124 @@ pub async fn get_release_config(
 pub struct BundleConfigResponse {
     pub tenant: String,
     pub name: String,
+    /// Per-item persisted values with every effective secret omitted ([`mask_config_values`]).
     pub values: Value,
+    /// The items' persisted "not secret" overrides that still apply, as `<item>.<path>`.
+    pub non_secret_paths: Vec<String>,
+}
+
+/// Label recording the bundle catalog item a bundle item was deployed from.
+const BUNDLE_CATALOG_ID_LABEL: &str = "keel.io/bundle-catalog-id";
+
+/// The catalog schemas that may describe bundle item `item_id` of a deployed bundle, for masking
+/// its values; the caller masks with all of them (masking can only get stricter):
+///
+/// * the item's schema in its bundle catalog item: the one named by the
+///   `keel.io/bundle-catalog-id` label of the item's committed Flux/PKO documents, else
+///   `bundle_by_name` (the bundle catalog item named like the deployment, the default instance
+///   name); its self-contained bundle-schema property, else the referenced item's schema;
+/// * the catalog item named by the documents' `keel.io/catalog-id` label.
+///
+/// Empty when none resolves (the name heuristic alone then applies).
+async fn bundle_item_schemas(
+    state: &AppState,
+    bundle_by_name: Option<&keel_core::CatalogBundle>,
+    repo_root: &std::path::Path,
+    item_dir: &std::path::Path,
+    item_id: &str,
+    tenant: &str,
+) -> Vec<Value> {
+    let mut catalog_label: Option<(String, &str)> = None;
+    let mut bundle_label: Option<String> = None;
+    for (file, kind) in [
+        ("helmrelease.yaml", "app"),
+        ("helmrelease-canary.yaml", "app"),
+        ("stack.yaml", "infra"),
+        ("flux-kustomization.yaml", "app"),
+    ] {
+        let Ok(raw) = read_contained_to_string(repo_root, &item_dir.join(file)).await else {
+            continue;
+        };
+        for doc in keel_core::split_yaml_documents(&raw)
+            .into_iter()
+            .filter_map(|doc| noyalib::from_str::<Value>(&doc).ok())
+        {
+            let label = |name: &str| {
+                doc.get("metadata")
+                    .and_then(|m| m.get("labels"))
+                    .and_then(|l| l.get(name))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            };
+            if catalog_label.is_none()
+                && let Some(id) = label("keel.io/catalog-id")
+            {
+                catalog_label = Some((id, kind));
+            }
+            if bundle_label.is_none() {
+                bundle_label = label(BUNDLE_CATALOG_ID_LABEL);
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    let labelled_bundle = match &bundle_label {
+        Some(id) if validate_dns_label(id, "bundle catalog id").is_ok() => {
+            match load_bundle_catalog(state, id, tenant).await {
+                Some(CatalogManifest::Bundle(bundle)) => Some(*bundle),
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+    let bundle = labelled_bundle.as_ref().or(bundle_by_name);
+    if let Some(bundle) = bundle
+        && let Some(item) = bundle.spec.items.iter().find(|i| i.id == item_id)
+    {
+        if let Some(schema) = bundle.item_schema(item_id) {
+            out.push(schema);
+        } else {
+            let kind = match item.kind {
+                keel_core::BundleItemKind::Infra => "infra",
+                keel_core::BundleItemKind::App => "app",
+            };
+            out.extend(catalog_schema_for_tenant(state, &item.catalog_ref, kind, tenant).await);
+        }
+    }
+    if let Some((catalog_id, kind)) = catalog_label
+        && let Some(schema) = catalog_schema_for_tenant(state, &catalog_id, kind, tenant).await
+        && !out.contains(&schema)
+    {
+        out.push(schema);
+    }
+    out
+}
+
+/// [`mask_config_values`] with every schema of `schemas` (an empty list: the name heuristic
+/// alone): a value any of them makes secret is omitted, and only overrides every schema allows
+/// still apply.
+fn mask_config_values_with_all(
+    schemas: &[Value],
+    values: &Value,
+    stored_overrides: Vec<String>,
+) -> (Value, Vec<String>) {
+    let empty = [json!({})];
+    let schemas = if schemas.is_empty() {
+        &empty[..]
+    } else {
+        schemas
+    };
+    let mut values = values.clone();
+    let mut overrides = stored_overrides;
+    for schema in schemas {
+        overrides.retain(|p| {
+            keel_core::validate_non_secret_paths(schema, std::slice::from_ref(p)).is_ok()
+        });
+    }
+    for schema in schemas {
+        values = mask_config_values(schema, &values, overrides.clone()).0;
+    }
+    (values, overrides)
 }
 
 /// `GET /api/v1/bundles/{namespace}/{name}/config`
@@ -810,7 +1029,15 @@ pub async fn get_bundle_config(
         )));
     }
 
+    // The bundle catalog item named like the deployment (the default instance name): used for
+    // items whose documents do not record their bundle catalog item.
+    let bundle_catalog = match load_bundle_catalog(&state, &name, tenant).await {
+        Some(CatalogManifest::Bundle(bundle)) => Some(*bundle),
+        _ => None,
+    };
+
     let mut values_map = serde_json::Map::new();
+    let mut non_secret_paths = Vec::new();
     let mut entries = tokio::fs::read_dir(&bundle_dir).await?;
     while let Ok(Some(entry)) = entries.next_entry().await {
         let item_path = entry.path();
@@ -827,13 +1054,39 @@ pub async fn get_bundle_config(
         } else {
             json!({})
         };
+        // AST-1: mask each item with the effective secret rules of every schema it may have.
+        let schemas = bundle_item_schemas(
+            &state,
+            bundle_catalog.as_ref(),
+            &repo.workdir,
+            &item_path,
+            &item_id,
+            tenant,
+        )
+        .await;
+        let stored_overrides = read_contained_to_string(
+            &repo.workdir,
+            &item_path.join(keel_core::SECRET_OVERRIDES_FILE),
+        )
+        .await
+        .map(|raw| keel_core::parse_secret_overrides(&raw))
+        .unwrap_or_default();
+        let (item_values, item_overrides) =
+            mask_config_values_with_all(&schemas, &item_values, stored_overrides);
+        non_secret_paths.extend(
+            item_overrides
+                .into_iter()
+                .map(|path| format!("{item_id}.{path}")),
+        );
         values_map.insert(item_id, item_values);
     }
+    non_secret_paths.sort();
 
     Ok(Json(BundleConfigResponse {
         tenant: tenant.to_string(),
         name,
         values: Value::Object(values_map),
+        non_secret_paths,
     }))
 }
 

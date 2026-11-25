@@ -1278,6 +1278,7 @@ spec:
                 target_namespace: None,
                 action_engine: None,
                 merge_stored_values: false,
+                non_secret_paths: None,
             }),
         )
         .await
@@ -1619,6 +1620,7 @@ spec:
             target_namespace: None,
             action_engine: Some("flux".to_string()),
             merge_stored_values: false,
+            non_secret_paths: None,
         };
         let (p_status, Json(flux_prop_resp)) = create_proposal(
             test_auth(),
@@ -1686,6 +1688,7 @@ spec:
             target_namespace: None,
             action_engine: Some("pulumi".to_string()),
             merge_stored_values: false,
+            non_secret_paths: None,
         };
         let (p2_status, Json(pulumi_prop_resp)) = create_proposal(
             test_auth(),
@@ -2802,6 +2805,7 @@ spec:
                     target_namespace: None,
                     action_engine: None,
                     merge_stored_values: false,
+                    non_secret_paths: None,
                 }),
             )
             .await

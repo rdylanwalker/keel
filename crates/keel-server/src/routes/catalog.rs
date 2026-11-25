@@ -1893,6 +1893,14 @@ fn chart_schema_from_files(
         let parsed: Value = serde_json::from_slice(&raw).map_err(|e| {
             ServerError::Internal(format!("invalid upstream values.schema.json: {e}"))
         })?;
+        // Fail closed (`NFR-SEC-05`): a schema whose secret fields Keel cannot find (or whose
+        // `$ref`s point outside the document) would store those secrets in plaintext.
+        keel_core::validate_secret_schema_support(&parsed).map_err(|e| match e {
+            keel_core::CoreError::Validation(msg) => ServerError::BadRequest(format!(
+                "Upstream chart '{chart}' values.schema.json cannot be imported: {msg}"
+            )),
+            other => other.into(),
+        })?;
         return Ok((parsed, "values.schema.json".to_string()));
     }
     if let Some(raw) = files.values_yaml {
@@ -2162,4 +2170,51 @@ pub async fn delete_catalog_item(
         proposal,
         branch,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn schema_files(schema: &Value) -> ChartSchemaFiles {
+        ChartSchemaFiles {
+            values_schema_json: Some(serde_json::to_vec(schema).unwrap()),
+            values_yaml: None,
+        }
+    }
+
+    #[test]
+    fn fetched_schema_with_unreachable_secret_is_rejected() {
+        let hidden = json!({
+            "type": "object",
+            "not": { "properties": { "password": { "writeOnly": true } } }
+        });
+        let err = chart_schema_from_files("demo", schema_files(&hidden)).unwrap_err();
+        let ServerError::BadRequest(msg) = err else {
+            panic!("expected a 400, got {err:?}");
+        };
+        assert!(
+            msg.contains("'demo'") && msg.contains("#/not/properties/password"),
+            "{msg}"
+        );
+
+        let remote = json!({
+            "properties": { "resources": { "$ref": "https://kubernetesjsonschema.dev/x.json" } }
+        });
+        let err = chart_schema_from_files("demo", schema_files(&remote)).unwrap_err();
+        assert!(
+            matches!(err, ServerError::BadRequest(ref m) if m.contains("not a local reference"))
+        );
+    }
+
+    #[test]
+    fn fetched_schema_with_local_ref_secret_is_returned_unchanged() {
+        let schema = json!({
+            "$defs": { "pw": { "type": "string", "writeOnly": true } },
+            "properties": { "adminPassword": { "$ref": "#/$defs/pw" } }
+        });
+        let (parsed, source) = chart_schema_from_files("demo", schema_files(&schema)).unwrap();
+        assert_eq!(parsed, schema);
+        assert_eq!(source, "values.schema.json");
+    }
 }

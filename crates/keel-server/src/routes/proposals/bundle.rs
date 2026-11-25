@@ -4,8 +4,8 @@ use axum::Json;
 use axum::http::StatusCode;
 use keel_core::{
     AppRuntime, BundleItemKind, CatalogBundle, CatalogManifest, ManifestEngine,
-    apply_schema_defaults, partition_values_by_schema, render_helm_values_yaml, tenant_namespace,
-    validate_dns_label, validate_schema_values,
+    apply_schema_defaults, render_helm_values_yaml, tenant_namespace, validate_dns_label,
+    validate_schema_values_with_secrets,
 };
 use keel_kube::{
     FluxDependencyRef, FluxHealthCheckRef, FluxKustomizationSpecInput, HelmChartSourceKind,
@@ -41,8 +41,9 @@ use super::manifests::{
 };
 use super::pr::{OpenedProposal, PushedProposal, open_proposal_pr, publish_proposal};
 use super::secrets::{
-    drop_blank_stored_secret_values, read_stored_manifest_app_secret,
-    relax_stored_secret_requirements, resolve_manifest_app_secret,
+    EffectiveSecrets, drop_blank_stored_secret_values, effective_non_secret_paths,
+    partition_effective_secrets, read_secret_overrides, read_stored_manifest_app_secret,
+    relax_stored_secret_requirements_with, resolve_manifest_app_secret, write_secret_overrides,
 };
 use super::tenant_stack::{
     apply_tenant_source_trust, attach_tenant_stack_credentials, read_pulumi_project_name,
@@ -88,8 +89,36 @@ pub(super) async fn create_bundle_proposal(
         req.values = apply_schema_defaults(&bundle.spec.schema, &req.values);
     }
 
+    // "Not secret" overrides (AST-2) are bundle paths `<item>.<path>`: split them per item.
+    let mut requested_item_overrides: Option<std::collections::BTreeMap<&str, Vec<String>>> = None;
+    if let Some(paths) = req.non_secret_paths.as_deref() {
+        let mut per_item: std::collections::BTreeMap<&str, Vec<String>> = bundle
+            .spec
+            .items
+            .iter()
+            .map(|item| (item.id.as_str(), Vec::new()))
+            .collect();
+        for path in paths {
+            let path = path.trim();
+            let target = path
+                .split_once('.')
+                .and_then(|(id, rest)| per_item.get_mut(id).map(|v| (v, rest)));
+            match target {
+                Some((list, rest)) if !rest.is_empty() => list.push(rest.to_string()),
+                _ => {
+                    return Err(ServerError::BadRequest(format!(
+                        "Not-secret path '{}' does not name a bundle item value (expected \
+                         <item>.<path>)",
+                        path.escape_default()
+                    )));
+                }
+            }
+        }
+        requested_item_overrides = Some(per_item);
+    }
+
     // Edit: secret fields of committed manifest-app and Helm items left blank or omitted keep
-    // their stored values.
+    // their stored values (declared secrets and stored heuristic secrets alike).
     let mut stored_item_secrets = std::collections::BTreeMap::new();
     let mut validation_schema = bundle.spec.schema.clone();
     for item in &bundle.spec.items {
@@ -105,15 +134,39 @@ pub(super) async fn create_bundle_proposal(
             .get_mut("properties")
             .and_then(|p| p.get_mut(&item.id))
         {
+            // The item's secrets are found in its self-contained schema: a `$ref` into the
+            // bundle's `$defs` must resolve (AST-3).
+            let standalone = keel_core::standalone_subschema(&bundle.spec.schema, item_schema);
+            let overrides = match &requested_item_overrides {
+                Some(per_item) => per_item.get(item.id.as_str()).cloned().unwrap_or_default(),
+                None => {
+                    read_secret_overrides(&repo.workdir, &format!("{bundle_rel_dir}/{}", item.id))
+                        .await
+                }
+            };
+            let stored_heuristic =
+                keel_core::stored_heuristic_secret_paths(&standalone, &stored.keys, &overrides);
             if let Some(item_values) = req.values.get_mut(&item.id) {
                 *item_values =
-                    drop_blank_stored_secret_values(item_schema, item_values, &stored.keys);
+                    drop_blank_stored_secret_values(&standalone, item_values, &stored.keys);
+                *item_values =
+                    keel_core::drop_blank_values_at_paths(item_values, &stored_heuristic);
             }
-            *item_schema = relax_stored_secret_requirements(item_schema, &stored.valued_keys);
+            let mut relaxed = relax_stored_secret_requirements_with(
+                &standalone,
+                &stored.valued_keys,
+                &stored_heuristic,
+            );
+            keel_core::restore_standalone_keywords(&mut relaxed, item_schema);
+            *item_schema = relaxed;
         }
         stored_item_secrets.insert(item.id.clone(), stored);
     }
-    validate_schema_values(&validation_schema, &req.values)?;
+    validate_schema_values_with_secrets(
+        &validation_schema,
+        &req.values,
+        &keel_core::heuristic_secret_pointers(&validation_schema, &req.values),
+    )?;
 
     // Every Flux Kustomization the bundle may create must be unique within the tenant.
     let mut reserved_names: Vec<String> = Vec::new();
@@ -172,6 +225,8 @@ pub(super) async fn create_bundle_proposal(
         /// Item-relative files/directories of other variants removed on update.
         stale: Vec<&'static str>,
         resource_type: &'static str,
+        /// The item's "not secret" overrides ([`keel_core::SECRET_OVERRIDES_FILE`]).
+        non_secret_paths: Vec<String>,
     }
 
     let mut item_kinds = std::collections::BTreeMap::new();
@@ -184,6 +239,7 @@ pub(super) async fn create_bundle_proposal(
     }
 
     let mut prepared_items = Vec::with_capacity(ordered_items.len());
+    let mut secret_notices: Vec<keel_core::SecretNotice> = Vec::new();
     // Items deployed as manifest apps (no HelmRelease to `dependsOn`); filled in topological order.
     let mut manifest_app_items = std::collections::HashSet::new();
     // Cluster singleton items of this request by (catalog ID, kubeconfig Secret) -> item ID: the
@@ -213,26 +269,53 @@ pub(super) async fn create_bundle_proposal(
         )
         .await?;
 
-        let sub_schema = bundle
-            .spec
-            .schema
-            .get("properties")
-            .and_then(|p| p.get(&item.id))
-            .unwrap_or(match &ref_manifest {
+        // The item's self-contained schema: its bundle-schema property with the bundle's
+        // `$defs`/`definitions` (local `$ref`s resolve against the bundle document, AST-3),
+        // else the referenced catalog item's schema.
+        let sub_schema_owned = bundle.item_schema(&item.id).unwrap_or_else(|| {
+            match &ref_manifest {
                 CatalogManifest::Application(a) => &a.spec.schema,
                 CatalogManifest::InfraBlueprint(b) => &b.spec.schema,
                 CatalogManifest::Bundle(b) => &b.spec.schema,
-            });
+            }
+            .clone()
+        });
+        let sub_schema = &sub_schema_owned;
 
-        let item_values = if is_new_bundle {
+        let mut item_values = if is_new_bundle {
             apply_schema_defaults(sub_schema, &item_values)
-        } else if let Some(stored) = stored_item_secrets.get(&item.id) {
-            // Also when the bundle schema does not declare the item (catalog schema fallback).
-            drop_blank_stored_secret_values(sub_schema, &item_values, &stored.keys)
         } else {
             item_values
         };
-        let partitioned = partition_values_by_schema(sub_schema, &item_values)?;
+        // Effective secret rules (AST-2): declared plus name-heuristic secrets, minus the
+        // item's "not secret" overrides; blank stored secrets keep their stored values (also
+        // when the bundle schema does not declare the item: catalog schema fallback).
+        let item_overrides = effective_non_secret_paths(
+            sub_schema,
+            requested_item_overrides.as_ref().map(|per_item| {
+                per_item
+                    .get(item.id.as_str())
+                    .map_or(&[][..], Vec::as_slice)
+            }),
+            read_secret_overrides(&repo.workdir, &item_rel_dir).await,
+        )
+        .map_err(|e| prefix_item_error(&item.id, e))?;
+        let EffectiveSecrets {
+            partitioned,
+            notices: item_notices,
+            non_secret_paths: item_non_secret_paths,
+        } = partition_effective_secrets(
+            sub_schema,
+            &mut item_values,
+            stored_item_secrets.get(&item.id),
+            item_overrides,
+            false,
+        )
+        .map_err(|e| prefix_item_error(&item.id, e))?;
+        secret_notices.extend(item_notices.into_iter().map(|mut n| {
+            n.path = format!("{}.{}", item.id, n.path);
+            n
+        }));
         // Owned: `ref_manifest` is consumed below; a manifest-app item checks its unset optional
         // secrets against it.
         let item_schema = sub_schema.clone();
@@ -241,6 +324,12 @@ pub(super) async fn create_bundle_proposal(
         let mut bundle_labels = std::collections::BTreeMap::new();
         bundle_labels.insert("keel.io/bundle".to_string(), instance_name.clone());
         bundle_labels.insert("keel.io/bundle-item".to_string(), item.id.clone());
+        // Which bundle catalog item the deployment came from (its instance name may differ):
+        // `GET /bundles/{ns}/{name}/config` masks the item with that bundle's schema.
+        bundle_labels.insert(
+            "keel.io/bundle-catalog-id".to_string(),
+            bundle.metadata.id.clone(),
+        );
 
         let (
             primary_filename,
@@ -582,6 +671,24 @@ pub(super) async fn create_bundle_proposal(
                 }
             }
             CatalogManifest::InfraBlueprint(bp) => {
+                // Bundle infra items pass only plaintext config to their Stack: a value treated
+                // as secret by its key name would silently vanish, so fail closed instead.
+                let heuristic: Vec<&str> = secret_notices
+                    .iter()
+                    .filter(|n| n.reason == keel_core::SecretNoticeReason::HeuristicSecret)
+                    .filter_map(|n| n.path.strip_prefix(&format!("{}.", item.id)))
+                    .collect();
+                if !heuristic.is_empty() {
+                    return Err(ServerError::BadRequest(format!(
+                        "Bundle item '{}' (infrastructure blueprint '{}') has values whose key \
+                         looks like a secret ({}), which bundle infrastructure items cannot \
+                         store encrypted; mark them not secret with nonSecretPaths if they are \
+                         not secrets",
+                        item.id,
+                        bp.metadata.id,
+                        heuristic.join(", ")
+                    )));
+                }
                 let blueprint_pulumi_path = state
                     .repo_workdir
                     .join("catalog/infra")
@@ -743,6 +850,7 @@ pub(super) async fn create_bundle_proposal(
         };
 
         prepared_items.push(PreparedBundleItem {
+            non_secret_paths: item_non_secret_paths,
             id: item.id.clone(),
             depends_on: item.depends_on.clone(),
             item_rel_dir,
@@ -778,6 +886,13 @@ pub(super) async fn create_bundle_proposal(
 
             write_contained(workdir, &item_dir.join("values.yaml"), &item.values_yaml).await?;
             staged_paths.push(format!("{}/values.yaml", item.item_rel_dir));
+            write_secret_overrides(
+                workdir,
+                &item.item_rel_dir,
+                &item.non_secret_paths,
+                &mut staged_paths,
+            )
+            .await?;
 
             write_contained(
                 workdir,
@@ -925,7 +1040,7 @@ pub(super) async fn create_bundle_proposal(
         )),
     };
 
-    Ok(publish_proposal(
+    let (status, Json(mut body)) = publish_proposal(
         &state,
         &repo,
         pr,
@@ -934,5 +1049,18 @@ pub(super) async fn create_bundle_proposal(
         preview_stack,
         report,
     )
-    .await)
+    .await;
+    secret_notices.sort();
+    body.secret_notices = secret_notices;
+    Ok((status, Json(body)))
+}
+
+/// Names the bundle item in a client error about its values.
+fn prefix_item_error(item_id: &str, err: ServerError) -> ServerError {
+    match err {
+        ServerError::BadRequest(msg) => {
+            ServerError::BadRequest(format!("Bundle item '{item_id}': {msg}"))
+        }
+        other => other,
+    }
 }

@@ -1439,6 +1439,102 @@ async fn test_register_catalog_app_endpoint() {
     assert_eq!(created["proposal"]["state"], "open");
 }
 
+/// AST-3 fail closed: catalog save routes reject a schema whose secret fields Keel's partitioner
+/// cannot find (here hidden under `not`) or whose `$ref` points outside the document, and accept
+/// a local `$ref` secret.
+#[tokio::test]
+async fn test_catalog_save_rejects_unreachable_secret_schemas() {
+    let fixture = setup_fixture().await;
+    let cookie = login_and_get_cookie(&fixture).await;
+    let app = build_router(fixture.state.clone());
+    let send = |method: Method, uri: &'static str, body: Value| {
+        let app = app.clone();
+        let cookie = cookie.clone();
+        async move {
+            let res = app
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .header(COOKIE, &cookie)
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = res.status();
+            let body =
+                String::from_utf8(res.into_body().collect().await.unwrap().to_bytes().to_vec())
+                    .unwrap();
+            (status, body)
+        }
+    };
+    let hidden = json!({
+        "type": "object",
+        "not": { "properties": { "adminPassword": { "type": "string", "writeOnly": true } } }
+    });
+    let remote = json!({
+        "type": "object",
+        "properties": { "auth": { "$ref": "https://schemas.example.com/auth.json" } }
+    });
+    for schema in [&hidden, &remote] {
+        let (status, body) = send(
+            Method::POST,
+            "/api/v1/catalog",
+            json!({
+                "id": "hidden-secret",
+                "name": "Hidden Secret",
+                "category": "tools",
+                "runtime": "helm",
+                "repoUrl": "https://charts.example.com",
+                "chart": "hidden",
+                "version": "1.0.0",
+                "schema": schema
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(
+            body.contains("cannot be checked for secret fields"),
+            "{body}"
+        );
+
+        let (status, body) = send(
+            Method::PUT,
+            "/api/v1/catalog/app/grafana",
+            json!({ "name": "Grafana", "category": "Monitoring", "schema": schema }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(
+            body.contains("cannot be checked for secret fields"),
+            "{body}"
+        );
+    }
+
+    let (status, body) = send(
+        Method::POST,
+        "/api/v1/catalog",
+        json!({
+            "id": "ref-secret",
+            "name": "Ref Secret",
+            "category": "tools",
+            "runtime": "helm",
+            "repoUrl": "https://charts.example.com",
+            "chart": "ref",
+            "version": "1.0.0",
+            "schema": {
+                "type": "object",
+                "$defs": { "pw": { "type": "string", "writeOnly": true } },
+                "properties": { "adminPassword": { "$ref": "#/$defs/pw" } }
+            }
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+}
+
 #[tokio::test]
 async fn test_register_catalog_infra_blueprint_endpoint() {
     let fixture = setup_fixture().await;
@@ -11229,4 +11325,810 @@ async fn test_helm_management_addon_twin_installs_once_per_cluster() {
         assert_eq!(status, StatusCode::CREATED, "{name}: {body}");
         merge_proposal_and_sync(&fixture, &cookie, &body).await;
     }
+}
+
+const HEURISTIC_TOKEN: &str = "cf-api-token-0123456789-TOP";
+
+/// `secretNotices` of a proposal response as `(path, reason)` pairs.
+fn secret_notices(body: &str) -> Vec<(String, String)> {
+    let parsed: Value = serde_json::from_str(body).unwrap();
+    parsed["secretNotices"]
+        .as_array()
+        .unwrap_or_else(|| panic!("secretNotices missing: {body}"))
+        .iter()
+        .map(|n| {
+            (
+                n["path"].as_str().unwrap().to_string(),
+                n["reason"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect()
+}
+
+/// AST-2: values the catalog schema does not declare secret, but whose key looks like a secret,
+/// are stored like declared secrets (SOPS `secrets.enc.yaml` + `valuesFrom`), never in
+/// `values.yaml` / `spec.values`, and reported in `secretNotices`. A user "not secret" override
+/// keeps a value plaintext and is persisted with the instance, so edits re-apply it; an edit
+/// leaving the heuristic secret blank keeps its stored ciphertext. Declared secrets cannot be
+/// overridden, and list-item matches fail closed.
+#[tokio::test]
+async fn test_heuristic_secrets_are_encrypted_reported_and_overridable() {
+    let fixture = setup_fixture().await;
+    let cookie = login_and_get_cookie(&fixture).await;
+    let workdir = fixture.state.repo_workdir.clone();
+    let dir = workdir.join("tenants/acme/apps/dash");
+    let values = json!({
+        "replicas": 1,
+        "auth": { "apiToken": HEURISTIC_TOKEN, "existingSecret": "dash-auth" },
+        "ingress": { "tlsSecret": "dash-tls" }
+    });
+
+    // A declared secret can never be marked not secret.
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "grafana", "name": "dash", "values": values,
+                "nonSecretPaths": ["adminPassword"] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("cannot be marked not secret"), "{body}");
+
+    // A heuristic match inside a list item cannot be stored on its own: fail closed, naming
+    // the path but never the value.
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "grafana", "name": "dash",
+                "values": { "replicas": 1, "users": [{ "name": "a", "password": "LIST-PW-1" }] } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("users[].password"), "{body}");
+    assert!(!body.contains("LIST-PW-1"), "{body}");
+
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "grafana", "name": "dash", "values": values,
+                "nonSecretPaths": ["ingress.tlsSecret"] }),
+    )
+    .await;
+    if sops_unavailable(status, &body) {
+        return;
+    }
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert!(
+        !body.contains(HEURISTIC_TOKEN),
+        "response echoes the secret"
+    );
+    assert_eq!(
+        secret_notices(&body),
+        vec![
+            ("auth.apiToken".to_string(), "heuristicSecret".to_string()),
+            (
+                "ingress.tlsSecret".to_string(),
+                "markedNotSecret".to_string()
+            ),
+        ]
+    );
+    checkout_proposal_branch(&fixture, &body).await;
+    assert!(
+        !read_tree(&dir).contains(HEURISTIC_TOKEN),
+        "heuristic secret committed in plaintext"
+    );
+    let form_values = read_yaml(&dir.join("values.yaml"));
+    assert!(
+        form_values["auth"].get("apiToken").is_none(),
+        "{form_values}"
+    );
+    assert_eq!(form_values["auth"]["existingSecret"], "dash-auth");
+    assert_eq!(form_values["ingress"]["tlsSecret"], "dash-tls");
+    let hr = read_yaml(&dir.join("helmrelease.yaml"));
+    assert!(hr["spec"]["values"]["auth"].get("apiToken").is_none());
+    assert_eq!(
+        hr["spec"]["valuesFrom"],
+        json!([{ "kind": "Secret", "name": "dash-secrets", "valuesKey": "auth.apiToken" }])
+    );
+    let stored = std::fs::read_to_string(dir.join("secrets.enc.yaml")).unwrap();
+    assert_eq!(sops_secret_keys(&stored), vec!["auth.apiToken"]);
+    let secret = decrypt_tenant_secret(&fixture, &stored).await;
+    let fragment: Value =
+        noyalib::from_str(secret["stringData"]["auth.apiToken"].as_str().unwrap()).unwrap();
+    assert_eq!(fragment["auth"]["apiToken"], HEURISTIC_TOKEN);
+    let overrides_path = dir.join(keel_core::SECRET_OVERRIDES_FILE);
+    assert_eq!(
+        keel_core::parse_secret_overrides(&std::fs::read_to_string(&overrides_path).unwrap()),
+        vec!["ingress.tlsSecret".to_string()]
+    );
+
+    // Edit leaving the heuristic secret blank, without re-sending the overrides: the stored
+    // ciphertext and the persisted override are both kept.
+    merge_proposal_and_sync(&fixture, &cookie, &body).await;
+    let mut edit = values.clone();
+    edit["auth"]["apiToken"] = json!("");
+    edit["replicas"] = json!(2);
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "grafana", "name": "dash", "values": edit }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(
+        secret_notices(&body),
+        vec![
+            ("auth.apiToken".to_string(), "heuristicSecret".to_string()),
+            (
+                "ingress.tlsSecret".to_string(),
+                "markedNotSecret".to_string()
+            ),
+        ]
+    );
+    checkout_proposal_branch(&fixture, &body).await;
+    assert_eq!(
+        std::fs::read_to_string(dir.join("secrets.enc.yaml")).unwrap(),
+        stored
+    );
+    let hr = read_yaml(&dir.join("helmrelease.yaml"));
+    assert_eq!(hr["spec"]["values"]["replicas"], 2);
+    assert_eq!(hr["spec"]["valuesFrom"].as_array().unwrap().len(), 1);
+    assert!(
+        read_yaml(&dir.join("values.yaml"))["auth"]
+            .get("apiToken")
+            .is_none()
+    );
+    assert!(overrides_path.exists());
+
+    // Edit clearing the overrides (`[]`): the former override is a heuristic secret again and
+    // the overrides file is removed.
+    merge_proposal_and_sync(&fixture, &cookie, &body).await;
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "grafana", "name": "dash", "values": edit,
+                "nonSecretPaths": [] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(
+        secret_notices(&body),
+        vec![
+            ("auth.apiToken".to_string(), "heuristicSecret".to_string()),
+            (
+                "ingress.tlsSecret".to_string(),
+                "heuristicSecret".to_string()
+            ),
+        ]
+    );
+    checkout_proposal_branch(&fixture, &body).await;
+    assert!(!overrides_path.exists());
+    assert!(read_yaml(&dir.join("values.yaml")).get("ingress").is_none());
+    let stored = std::fs::read_to_string(dir.join("secrets.enc.yaml")).unwrap();
+    assert_eq!(
+        sops_secret_keys(&stored),
+        vec!["auth.apiToken", "ingress.tlsSecret"]
+    );
+    let secret = decrypt_tenant_secret(&fixture, &stored).await;
+    let fragment: Value =
+        noyalib::from_str(secret["stringData"]["auth.apiToken"].as_str().unwrap()).unwrap();
+    assert_eq!(fragment["auth"]["apiToken"], HEURISTIC_TOKEN);
+
+    // Marking the stored heuristic secret not secret without re-entering it (the edit form shows
+    // it blank) is rejected: the stored value would silently be replaced by nothing.
+    merge_proposal_and_sync(&fixture, &cookie, &body).await;
+    for blank in [json!(""), Value::Null] {
+        let mut blank_edit = edit.clone();
+        blank_edit["auth"]["apiToken"] = blank;
+        let (status, body) = post_proposal(
+            &fixture,
+            &cookie,
+            json!({ "tenant": "acme", "catalogId": "grafana", "name": "dash",
+                    "values": blank_edit, "nonSecretPaths": ["auth.apiToken"] }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(
+            body.contains("Marked not secret but left blank: auth.apiToken"),
+            "{body}"
+        );
+    }
+    // Re-entered, it is stored in plaintext and the override is persisted.
+    let mut plain_edit = edit.clone();
+    plain_edit["auth"]["apiToken"] = json!("now-plain-token");
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "grafana", "name": "dash",
+                "values": plain_edit, "nonSecretPaths": ["auth.apiToken"] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    checkout_proposal_branch(&fixture, &body).await;
+    assert_eq!(
+        read_yaml(&dir.join("values.yaml"))["auth"]["apiToken"],
+        "now-plain-token"
+    );
+    assert_eq!(
+        keel_core::parse_secret_overrides(&std::fs::read_to_string(&overrides_path).unwrap()),
+        vec!["auth.apiToken".to_string()]
+    );
+}
+
+/// AST-2 for bundles: "not secret" paths are `<item>.<path>`, notices carry the item prefix, and
+/// each item persists its own overrides next to its values.
+#[tokio::test]
+async fn test_bundle_heuristic_secrets_and_item_overrides() {
+    let fixture = setup_fixture().await;
+    let cookie = login_and_get_cookie(&fixture).await;
+    commit_to_main(
+        &fixture,
+        &[(
+            "catalog/bundles/dash-stack/catalog.yaml",
+            r#"apiVersion: keel.io/v1alpha1
+kind: CatalogBundle
+metadata:
+  id: dash-stack
+  name: Dash Stack
+  category: observability
+spec:
+  items:
+    - id: web
+      kind: app
+      catalogRef: grafana
+  schema:
+    type: object
+"#,
+        )],
+        "feat(catalog): dash-stack bundle",
+    )
+    .await;
+    let values = json!({ "web": {
+        "replicas": 1,
+        "auth": { "apiToken": HEURISTIC_TOKEN },
+        "ingress": { "tlsSecret": "dash-tls" }
+    } });
+
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "dash-stack", "kind": "bundle", "values": values,
+                "nonSecretPaths": ["nope.ingress.tlsSecret"] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("does not name a bundle item"), "{body}");
+
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "dash-stack", "kind": "bundle", "values": values,
+                "nonSecretPaths": ["web.ingress.tlsSecret"] }),
+    )
+    .await;
+    if sops_unavailable(status, &body) {
+        return;
+    }
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert!(
+        !body.contains(HEURISTIC_TOKEN),
+        "response echoes the secret"
+    );
+    assert_eq!(
+        secret_notices(&body),
+        vec![
+            (
+                "web.auth.apiToken".to_string(),
+                "heuristicSecret".to_string()
+            ),
+            (
+                "web.ingress.tlsSecret".to_string(),
+                "markedNotSecret".to_string()
+            ),
+        ]
+    );
+    checkout_proposal_branch(&fixture, &body).await;
+    let item_dir = fixture
+        .state
+        .repo_workdir
+        .join("tenants/acme/bundles/dash-stack/web");
+    assert!(!read_tree(&item_dir).contains(HEURISTIC_TOKEN));
+    assert_eq!(
+        read_yaml(&item_dir.join("values.yaml"))["ingress"]["tlsSecret"],
+        "dash-tls"
+    );
+    let stored = std::fs::read_to_string(item_dir.join("secrets.enc.yaml")).unwrap();
+    assert_eq!(sops_secret_keys(&stored), vec!["auth.apiToken"]);
+    assert_eq!(
+        keel_core::parse_secret_overrides(
+            &std::fs::read_to_string(item_dir.join(keel_core::SECRET_OVERRIDES_FILE)).unwrap()
+        ),
+        vec!["ingress.tlsSecret".to_string()]
+    );
+}
+
+/// Bundle infra items store only plaintext Stack config, so a heuristic-secret key under one is
+/// rejected (naming the item-relative path, never echoing the value) unless marked not secret.
+#[tokio::test]
+async fn test_bundle_infra_item_rejects_heuristic_secret_keys() {
+    let fixture = setup_fixture().await;
+    let cookie = login_and_get_cookie(&fixture).await;
+    commit_to_main(
+        &fixture,
+        &[(
+            "catalog/bundles/vm-stack/catalog.yaml",
+            r#"apiVersion: keel.io/v1alpha1
+kind: CatalogBundle
+metadata:
+  id: vm-stack
+  name: VM Stack
+  category: Platform
+spec:
+  items:
+    - id: cluster
+      kind: infra
+      catalogRef: proxmox-vm
+  schema:
+    type: object
+"#,
+        )],
+        "feat(catalog): vm-stack bundle",
+    )
+    .await;
+    let values = json!({ "cluster": { "cores": 2, "apiToken": HEURISTIC_TOKEN } });
+
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "vm-stack", "kind": "bundle", "values": values }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("Bundle item 'cluster'"), "{body}");
+    assert!(body.contains("(apiToken)"), "{body}");
+    assert!(body.contains("nonSecretPaths"), "{body}");
+    assert!(!body.contains(HEURISTIC_TOKEN), "error echoes the secret");
+
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "vm-stack", "kind": "bundle", "values": values,
+                "nonSecretPaths": ["cluster.apiToken"] }),
+    )
+    .await;
+    if sops_unavailable(status, &body) {
+        return;
+    }
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(
+        secret_notices(&body),
+        vec![(
+            "cluster.apiToken".to_string(),
+            "markedNotSecret".to_string()
+        )]
+    );
+}
+
+/// AST-1: the `/config` endpoints mask with the effective secret rules (schema-declared secrets,
+/// including `$ref`s, plus name-heuristic matches minus the instance's persisted "not secret"
+/// overrides) even when a secret was committed to `values.yaml` by hand.
+#[tokio::test]
+async fn test_config_endpoints_mask_hand_committed_secrets() {
+    let fixture = setup_fixture().await;
+    let workdir = fixture.state.repo_workdir.clone();
+    let write = |rel: &'static str, body: &'static str| {
+        let path = workdir.join(rel);
+        async move {
+            tokio::fs::create_dir_all(path.parent().unwrap())
+                .await
+                .unwrap();
+            tokio::fs::write(path, body).await.unwrap();
+        }
+    };
+
+    write(
+        "catalog/apps/secure-app/catalog.yaml",
+        r##"apiVersion: keel.io/v1alpha1
+kind: CatalogApplication
+metadata:
+  id: secure-app
+  name: Secure App
+  category: demo
+  runtime: helm
+spec:
+  upstream:
+    repoURL: https://charts.example.com
+    chart: secure-app
+    version: "1.0.0"
+  schema:
+    type: object
+    $defs:
+      smtp:
+        type: object
+        properties:
+          host:
+            type: string
+          pass:
+            type: string
+            writeOnly: true
+    properties:
+      replicas:
+        type: integer
+      adminPassword:
+        type: string
+        format: password
+      smtp:
+        $ref: "#/$defs/smtp"
+      sessionSecret:
+        type: string
+        writeOnly: false
+    additionalProperties: true
+"##,
+    )
+    .await;
+    write(
+        "catalog/infra/secure-vm/catalog.yaml",
+        r#"apiVersion: keel.io/v1alpha1
+kind: CatalogInfraBlueprint
+metadata:
+  id: secure-vm
+  name: Secure VM
+  category: compute
+  provider: proxmox
+spec:
+  pulumiRuntime: yaml
+  entrypoint: Pulumi.yaml
+  schema:
+    type: object
+    properties:
+      cores:
+        type: integer
+      rootPassword:
+        type: string
+        format: password
+    additionalProperties: true
+"#,
+    )
+    .await;
+    write(
+        "catalog/bundles/secure-bundle/catalog.yaml",
+        r#"apiVersion: keel.io/v1alpha1
+kind: CatalogBundle
+metadata:
+  id: secure-bundle
+  name: Secure Bundle
+  category: Platform
+spec:
+  items:
+    - id: vm
+      kind: infra
+      catalogRef: secure-vm
+    - id: web
+      kind: app
+      catalogRef: secure-app
+  schema:
+    type: object
+    properties:
+      vm:
+        type: object
+        properties:
+          cores:
+            type: integer
+          consolePin:
+            type: string
+            writeOnly: true
+        additionalProperties: true
+"#,
+    )
+    .await;
+
+    // Hand-committed instances: secrets sit in plaintext in `values.yaml`.
+    write(
+        "tenants/acme/apps/vault/helmrelease.yaml",
+        r#"apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: vault
+  namespace: tenant-acme
+spec:
+  chart:
+    spec:
+      chart: secure-app
+      version: "1.0.0"
+"#,
+    )
+    .await;
+    write(
+        "tenants/acme/apps/vault/values.yaml",
+        r#"replicas: 2
+adminPassword: declared-admin-pw
+smtp:
+  host: smtp.example.com
+  pass: declared-ref-pw
+sessionSecret: author-plain-value
+existingSecret: vault-credentials
+webhookToken: user-plain-token
+db:
+  host: db.local
+  dbPassword: heuristic-db-pw
+users:
+  - name: alice
+    password: heuristic-list-pw
+"#,
+    )
+    .await;
+    write(
+        "tenants/acme/apps/vault/secret-overrides.json",
+        r#"{"nonSecretPaths": ["webhookToken", "adminPassword"]}"#,
+    )
+    .await;
+    write(
+        "tenants/acme/infra/secure-vm/stack.yaml",
+        r#"apiVersion: pulumi.com/v1
+kind: Stack
+metadata:
+  name: acme-secure-vm
+  namespace: tenant-acme
+  labels:
+    keel.io/tenant: acme
+    keel.io/provider: proxmox
+spec:
+  stack: keel/acme/secure-vm
+"#,
+    )
+    .await;
+    write(
+        "tenants/acme/infra/secure-vm/values.yaml",
+        r#"cores: 4
+rootPassword: declared-root-pw
+cloudInit:
+  apiKey: heuristic-api-key
+  passwordFile: /etc/pw
+"#,
+    )
+    .await;
+    write(
+        "tenants/acme/bundles/secure-bundle/vm/values.yaml",
+        "cores: 2\nconsolePin: declared-bundle-pin\nrootPassword: heuristic-bundle-root\n",
+    )
+    .await;
+    write(
+        "tenants/acme/bundles/secure-bundle/web/values.yaml",
+        "replicas: 1\nadminPassword: declared-bundle-admin\nwebhookToken: bundle-plain-token\n",
+    )
+    .await;
+    write(
+        "tenants/acme/bundles/secure-bundle/web/secret-overrides.json",
+        r#"{"nonSecretPaths": ["webhookToken"]}"#,
+    )
+    .await;
+    // A bundle deployed under another name: items resolve their schema from the catalog-id label.
+    write(
+        "tenants/acme/bundles/renamed/web/helmrelease.yaml",
+        r#"apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: renamed-web
+  namespace: tenant-acme
+  labels:
+    keel.io/bundle: renamed
+    keel.io/bundle-item: web
+    keel.io/catalog-id: secure-app
+spec:
+  chart:
+    spec:
+      chart: secure-app
+"#,
+    )
+    .await;
+    write(
+        "tenants/acme/bundles/renamed/web/values.yaml",
+        "replicas: 3\nsmtp:\n  host: mail\n  pass: declared-label-pw\n",
+    )
+    .await;
+
+    let git = &fixture.state.git_runner;
+    git.add(&workdir, ["."]).await.unwrap();
+    git.commit(
+        &workdir,
+        "chore: hand-commit instances with plaintext secrets",
+        &CommitAuthor::new("Keel Seed", "seed@keel.local"),
+    )
+    .await
+    .unwrap();
+    git.push(&workdir, "origin", "HEAD:refs/heads/main")
+        .await
+        .unwrap();
+
+    let cookie = login_and_get_cookie(&fixture).await;
+    let app = build_router(fixture.state.clone());
+    let get = |uri: &'static str| {
+        let app = app.clone();
+        let cookie = cookie.clone();
+        async move {
+            let res = app
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .header(COOKIE, &cookie)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::OK, "{uri}");
+            let raw = res.into_body().collect().await.unwrap().to_bytes();
+            let text = String::from_utf8(raw.to_vec()).unwrap();
+            for secret in [
+                "declared-admin-pw",
+                "declared-ref-pw",
+                "heuristic-db-pw",
+                "heuristic-list-pw",
+                "declared-root-pw",
+                "heuristic-api-key",
+                "declared-bundle-pin",
+                "heuristic-bundle-root",
+                "declared-bundle-admin",
+                "declared-label-pw",
+            ] {
+                assert!(!text.contains(secret), "{uri} leaked {secret}: {text}");
+            }
+            serde_json::from_str::<Value>(&text).unwrap()
+        }
+    };
+
+    let release = get("/api/v1/releases/tenant-acme/vault/config").await;
+    assert_eq!(release["catalogId"], "secure-app");
+    assert_eq!(
+        release["values"],
+        json!({
+            "replicas": 2,
+            "smtp": {"host": "smtp.example.com"},
+            "sessionSecret": "author-plain-value",
+            "existingSecret": "vault-credentials",
+            "webhookToken": "user-plain-token",
+            "db": {"host": "db.local"},
+            "users": [{"name": "alice"}]
+        })
+    );
+    // An override of a declared secret never applies and is not reported.
+    assert_eq!(release["nonSecretPaths"], json!(["webhookToken"]));
+
+    let stack = get("/api/v1/stacks/tenant-acme/secure-vm/config").await;
+    assert_eq!(stack["catalogId"], "secure-vm");
+    assert_eq!(
+        stack["values"],
+        json!({"cores": 4, "cloudInit": {"passwordFile": "/etc/pw"}})
+    );
+    assert_eq!(stack["nonSecretPaths"], json!([]));
+
+    let bundle = get("/api/v1/bundles/tenant-acme/secure-bundle/config").await;
+    assert_eq!(
+        bundle["values"],
+        json!({
+            "vm": {"cores": 2},
+            "web": {"replicas": 1, "webhookToken": "bundle-plain-token"}
+        })
+    );
+    assert_eq!(bundle["nonSecretPaths"], json!(["web.webhookToken"]));
+
+    let renamed = get("/api/v1/bundles/tenant-acme/renamed/config").await;
+    assert_eq!(
+        renamed["values"],
+        json!({"web": {"replicas": 3, "smtp": {"host": "mail"}}})
+    );
+}
+
+/// AST-3 for bundles: a bundle item's schema `$ref`s into the bundle schema's `$defs` resolve
+/// against the bundle document, so the referenced secret is SOPS-encrypted (never in
+/// `values.yaml`) and `GET /bundles/{ns}/{name}/config` masks it, also for a deployment whose
+/// instance name differs from the bundle catalog id (`keel.io/bundle-catalog-id` label). A bundle
+/// item schema whose `$ref` points elsewhere in the bundle document is rejected.
+#[tokio::test]
+async fn test_bundle_item_refs_resolve_against_bundle_defs() {
+    let fixture = setup_fixture().await;
+    let cookie = login_and_get_cookie(&fixture).await;
+    let bundle_yaml = r##"apiVersion: keel.io/v1alpha1
+kind: CatalogBundle
+metadata:
+  id: ref-stack
+  name: Ref Stack
+  category: observability
+spec:
+  items:
+    - id: web
+      kind: app
+      catalogRef: grafana
+  schema:
+    type: object
+    $defs:
+      pw:
+        type: string
+        writeOnly: true
+    properties:
+      web:
+        type: object
+        properties:
+          auth:
+            type: object
+            properties:
+              dsn:
+                $ref: "#/$defs/pw"
+"##;
+    commit_to_main(
+        &fixture,
+        &[("catalog/bundles/ref-stack/catalog.yaml", bundle_yaml)],
+        "feat(catalog): ref-stack bundle",
+    )
+    .await;
+
+    const DSN: &str = "pg://user:REF-DSN-SECRET@db";
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "ref-stack", "kind": "bundle", "name": "shop",
+                "values": { "web": { "replicas": 1, "auth": { "dsn": DSN } } } }),
+    )
+    .await;
+    if sops_unavailable(status, &body) {
+        return;
+    }
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert!(!body.contains("REF-DSN-SECRET"), "{body}");
+    // A declared secret: no heuristic notice.
+    assert_eq!(secret_notices(&body), vec![]);
+    checkout_proposal_branch(&fixture, &body).await;
+    let item_dir = fixture
+        .state
+        .repo_workdir
+        .join("tenants/acme/bundles/shop/web");
+    assert!(
+        !std::fs::read_to_string(item_dir.join("values.yaml"))
+            .unwrap()
+            .contains("REF-DSN-SECRET"),
+        "$ref'd secret committed in plaintext"
+    );
+    assert!(!read_tree(&item_dir).contains("REF-DSN-SECRET"));
+    let stored = std::fs::read_to_string(item_dir.join("secrets.enc.yaml")).unwrap();
+    assert_eq!(sops_secret_keys(&stored), vec!["auth.dsn"]);
+    let hr = read_yaml(&item_dir.join("helmrelease.yaml"));
+    assert_eq!(
+        hr["metadata"]["labels"]["keel.io/bundle-catalog-id"],
+        "ref-stack"
+    );
+    merge_proposal_and_sync(&fixture, &cookie, &body).await;
+
+    // A plaintext value committed by hand is masked by `/config` with the labelled bundle's
+    // schema: no bundle catalog item is named `shop`.
+    commit_to_main(
+        &fixture,
+        &[(
+            "tenants/acme/bundles/shop/web/values.yaml",
+            "replicas: 1\nauth:\n  dsn: HAND-COMMITTED-DSN\n",
+        )],
+        "chore: hand-commit a plaintext dsn",
+    )
+    .await;
+    let app = build_router(fixture.state.clone());
+    let (status, config) =
+        get_json_status(&app, "/api/v1/bundles/tenant-acme/shop/config", &cookie).await;
+    assert_eq!(status, StatusCode::OK, "{config}");
+    assert!(
+        !config.to_string().contains("HAND-COMMITTED-DSN"),
+        "{config}"
+    );
+    assert_eq!(
+        config["values"],
+        json!({ "web": { "replicas": 1, "auth": {} } })
+    );
+
+    // A bundle item schema referencing another part of the bundle document cannot be checked
+    // on its own: rejected at catalog parse time.
+    let bad = bundle_yaml.replace(
+        "              dsn:\n                $ref: \"#/$defs/pw\"\n",
+        "              dsn:\n                $ref: \"#/properties/web/properties/auth/properties/pw\"\n              pw:\n                $ref: \"#/$defs/pw\"\n",
+    );
+    assert_ne!(bad, bundle_yaml);
+    let err = keel_core::parse_catalog(&bad).unwrap_err().to_string();
+    assert!(err.contains("spec.schema.properties.web"), "{err}");
 }

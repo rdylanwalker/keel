@@ -134,11 +134,29 @@ pub(super) async fn read_stored_manifest_app_secret(
 /// stored value. Secret fields without a stored value stay required. A manifest app stores
 /// top-level fields (`adminPassword`); a Helm app stores dot paths (`gitea.admin.password`), so
 /// nested objects are relaxed too.
+#[cfg(test)]
 pub(super) fn relax_stored_secret_requirements(
     schema: &Value,
     stored_keys: &std::collections::BTreeSet<String>,
 ) -> Value {
-    fn relax(node: &mut Value, prefix: &str, stored_keys: &std::collections::BTreeSet<String>) {
+    relax_stored_secret_requirements_with(schema, stored_keys, &[])
+}
+
+/// [`relax_stored_secret_requirements`], also relaxing the stored heuristic secrets
+/// `heuristic_paths` (dot paths of fields the schema does not declare secret whose stored value
+/// is kept, [`keel_core::stored_heuristic_secret_paths`]).
+pub(super) fn relax_stored_secret_requirements_with(
+    schema: &Value,
+    stored_keys: &std::collections::BTreeSet<String>,
+    heuristic_paths: &[String],
+) -> Value {
+    fn relax(
+        resolver: &keel_core::SchemaResolver<'_>,
+        node: &mut Value,
+        prefix: &str,
+        stored_keys: &std::collections::BTreeSet<String>,
+        heuristic_paths: &[String],
+    ) {
         let Some(props) = node.get("properties").and_then(Value::as_object).cloned() else {
             return;
         };
@@ -149,21 +167,173 @@ pub(super) fn relax_stored_secret_requirements(
                 };
                 let path = format!("{prefix}{key}");
                 !(stored_keys.contains(&path)
-                    && props.get(key).is_some_and(keel_core::is_secret_schema_node))
+                    && (heuristic_paths.contains(&path)
+                        || props.get(key).is_some_and(|p| resolver.is_secret_node(p))))
             });
         }
         for (key, child) in &props {
-            if keel_core::is_secret_schema_node(child) {
+            if resolver.is_secret_node(child) {
                 continue;
             }
             if let Some(child_node) = node.get_mut("properties").and_then(|p| p.get_mut(key)) {
-                relax(child_node, &format!("{prefix}{key}."), stored_keys);
+                relax(
+                    resolver,
+                    child_node,
+                    &format!("{prefix}{key}."),
+                    stored_keys,
+                    heuristic_paths,
+                );
             }
         }
     }
+    let resolver = keel_core::SchemaResolver::new(schema);
     let mut out = schema.clone();
-    relax(&mut out, "", stored_keys);
+    relax(&resolver, &mut out, "", stored_keys, heuristic_paths);
     out
+}
+
+/// The user's "not secret" overrides persisted for the instance in `rel_dir`
+/// ([`keel_core::SECRET_OVERRIDES_FILE`]); none when the file is absent or malformed.
+pub(crate) async fn read_secret_overrides(repo_workdir: &Path, rel_dir: &str) -> Vec<String> {
+    let path = repo_workdir
+        .join(rel_dir)
+        .join(keel_core::SECRET_OVERRIDES_FILE);
+    read_contained_to_string(repo_workdir, &path)
+        .await
+        .map(|raw| keel_core::parse_secret_overrides(&raw))
+        .unwrap_or_default()
+}
+
+/// The "not secret" overrides that apply to a proposal: the `requested` ones (validated: a
+/// declared secret cannot be overridden) or, when the request carries none, the `stored` ones
+/// (minus any the catalog schema has since declared secret).
+pub(super) fn effective_non_secret_paths(
+    schema: &Value,
+    requested: Option<&[String]>,
+    stored: Vec<String>,
+) -> Result<Vec<String>, ServerError> {
+    match requested {
+        Some(paths) => keel_core::validate_non_secret_paths(schema, paths)
+            .map_err(|e| ServerError::BadRequest(e.to_string())),
+        None => Ok(stored
+            .into_iter()
+            .filter(|p| {
+                keel_core::validate_non_secret_paths(schema, std::slice::from_ref(p)).is_ok()
+            })
+            .collect()),
+    }
+}
+
+/// Secret handling of one instance's values: declared plus heuristic secrets (AST-2).
+pub(super) struct EffectiveSecrets {
+    pub(super) partitioned: keel_core::PartitionedValues,
+    pub(super) notices: Vec<keel_core::SecretNotice>,
+    /// Overrides to persist in [`keel_core::SECRET_OVERRIDES_FILE`] (empty: remove the file).
+    pub(super) non_secret_paths: Vec<String>,
+}
+
+/// Validates and partitions `values` (already defaulted / merged) of an instance with the
+/// effective secret rules: schema-declared secrets, plus values whose key looks like a secret
+/// ([`keel_core::partition_values_with_heuristics`]) minus the `non_secret_paths` overrides.
+///
+/// On an edit (`stored`), blank declared or heuristic secrets that have a stored value are
+/// dropped from `values` and keep their stored ciphertext (they stay secret field paths), and
+/// `required` is relaxed for them. With `validate`, `values` are checked against `schema`
+/// (bundles validate all items up front against the bundle schema instead); validation errors
+/// never echo a declared or heuristic secret.
+pub(super) fn partition_effective_secrets(
+    schema: &Value,
+    values: &mut Value,
+    stored: Option<&StoredManifestAppSecret>,
+    non_secret_paths: Vec<String>,
+    validate: bool,
+) -> Result<EffectiveSecrets, ServerError> {
+    let stored_heuristic = stored
+        .map(|s| keel_core::stored_heuristic_secret_paths(schema, &s.keys, &non_secret_paths))
+        .unwrap_or_default();
+    // Marking a stored heuristic secret not secret moves it to plaintext: the edit form shows
+    // it blank, so without a re-entered value the stored one would silently become nothing.
+    if let Some(stored) = stored {
+        let blank = keel_core::overridden_stored_secrets_left_blank(
+            schema,
+            &stored.keys,
+            &non_secret_paths,
+            values,
+        );
+        if !blank.is_empty() {
+            return Err(ServerError::BadRequest(format!(
+                "Marked not secret but left blank: {}. These values are stored encrypted; \
+                 re-enter them to store them in plaintext, or keep them secret (a blank secret \
+                 keeps its stored value)",
+                blank.join(", ")
+            )));
+        }
+    }
+    if let Some(stored) = stored {
+        *values = drop_blank_stored_secret_values(schema, values, &stored.keys);
+        *values = keel_core::drop_blank_values_at_paths(values, &stored_heuristic);
+    }
+    match stored.filter(|_| validate) {
+        Some(stored) => {
+            keel_core::validate_schema_values_with_secrets(
+                &relax_stored_secret_requirements_with(
+                    schema,
+                    &stored.valued_keys,
+                    &stored_heuristic,
+                ),
+                values,
+                &keel_core::heuristic_secret_pointers(schema, values),
+            )?;
+        }
+        None if validate => keel_core::validate_schema_values_with_secrets(
+            schema,
+            values,
+            &keel_core::heuristic_secret_pointers(schema, values),
+        )?,
+        None => {}
+    }
+    let keel_core::HeuristicPartition {
+        mut partitioned,
+        mut notices,
+        applied_non_secret_paths,
+    } = keel_core::partition_values_with_heuristics(schema, values, &non_secret_paths)
+        .map_err(|e| ServerError::BadRequest(e.to_string()))?;
+    if let Some(stored) = stored {
+        extend_secret_field_paths(&mut partitioned, schema, &stored.keys);
+        let mut paths: std::collections::BTreeSet<String> =
+            partitioned.secret_field_paths.drain(..).collect();
+        for path in stored_heuristic {
+            if !notices.iter().any(|n| n.path == path) {
+                notices.push(keel_core::SecretNotice::heuristic_secret(&path));
+            }
+            paths.insert(path);
+        }
+        partitioned.secret_field_paths = paths.into_iter().collect();
+        notices.sort();
+    }
+    Ok(EffectiveSecrets {
+        partitioned,
+        notices,
+        non_secret_paths: applied_non_secret_paths,
+    })
+}
+
+/// Adds the stored secret keys (`stored_keys`, dot paths) that `schema` still declares secret to
+/// `partitioned.secret_field_paths`: a secret without a static schema name
+/// (`patternProperties`/`additionalProperties`) that is left blank on an edit keeps its stored
+/// value instead of being dropped as "no longer a secret field".
+pub(super) fn extend_secret_field_paths(
+    partitioned: &mut keel_core::PartitionedValues,
+    schema: &Value,
+    stored_keys: &std::collections::BTreeSet<String>,
+) {
+    let mut paths: std::collections::BTreeSet<String> =
+        partitioned.secret_field_paths.drain(..).collect();
+    paths.extend(keel_core::stored_secret_paths_still_secret(
+        schema,
+        stored_keys,
+    ));
+    partitioned.secret_field_paths = paths.into_iter().collect();
 }
 
 /// Returns `values` without the blank secret fields whose value is stored (`stored_keys`, a
@@ -191,6 +361,7 @@ pub(super) fn drop_blank_stored_secret_values(
         }
     }
     fn strip(
+        resolver: &keel_core::SchemaResolver<'_>,
         schema: &Value,
         values: &mut Value,
         prefix: &str,
@@ -204,19 +375,26 @@ pub(super) fn drop_blank_stored_secret_values(
         };
         for (key, child_schema) in props {
             let path = format!("{prefix}{key}");
-            if keel_core::is_secret_schema_node(child_schema) {
+            if resolver.is_secret_node(child_schema) {
                 if stored_keys.contains(&path)
                     && obj.get(key).is_some_and(|v| is_blank(v, child_schema))
                 {
                     obj.remove(key);
                 }
             } else if let Some(child) = obj.get_mut(key) {
-                strip(child_schema, child, &format!("{path}."), stored_keys);
+                strip(
+                    resolver,
+                    child_schema,
+                    child,
+                    &format!("{path}."),
+                    stored_keys,
+                );
             }
         }
     }
+    let resolver = keel_core::SchemaResolver::new(schema);
     let mut out = values.clone();
-    strip(schema, &mut out, "", stored_keys);
+    strip(&resolver, schema, &mut out, "", stored_keys);
     out
 }
 
@@ -440,6 +618,55 @@ pub(super) async fn tenant_sops_recipients(
     Ok(resolve_sops_recipients(&state.repo_workdir, &age_key.public_key).await)
 }
 
+/// Writes (or, with no overrides, removes) the instance's [`keel_core::SECRET_OVERRIDES_FILE`] in
+/// `rel_dir` and stages the change.
+pub(super) async fn write_secret_overrides(
+    repo_workdir: &Path,
+    rel_dir: &str,
+    non_secret_paths: &[String],
+    staged_paths: &mut Vec<String>,
+) -> Result<(), ServerError> {
+    if non_secret_paths.is_empty() {
+        return super::manifests::remove_stale_entries(
+            repo_workdir,
+            rel_dir,
+            &[keel_core::SECRET_OVERRIDES_FILE],
+            staged_paths,
+        )
+        .await;
+    }
+    let path = repo_workdir
+        .join(rel_dir)
+        .join(keel_core::SECRET_OVERRIDES_FILE);
+    crate::routes::write_contained(
+        repo_workdir,
+        &path,
+        keel_core::render_secret_overrides(non_secret_paths),
+    )
+    .await?;
+    staged_paths.push(format!("{rel_dir}/{}", keel_core::SECRET_OVERRIDES_FILE));
+    Ok(())
+}
+
+/// A hint for errors caused by secret fields: names the values treated as secret only because
+/// their key looks like one (`""` when there are none).
+pub(super) fn heuristic_secret_hint(notices: &[keel_core::SecretNotice]) -> String {
+    let heuristic: Vec<&str> = notices
+        .iter()
+        .filter(|n| n.reason == keel_core::SecretNoticeReason::HeuristicSecret)
+        .map(|n| n.path.as_str())
+        .collect();
+    if heuristic.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " (treated as secret because the key looks like one: {}; mark them not secret with \
+             nonSecretPaths / --not-secret if they are not)",
+            heuristic.join(", ")
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -632,6 +859,64 @@ mod tests {
         assert_eq!(
             manifest_placeholder_secret_fields(&paths),
             vec!["apiToken".to_string(), "webhook".to_string()]
+        );
+    }
+}
+
+#[cfg(test)]
+mod resolver_tests {
+    use std::collections::BTreeSet;
+
+    use serde_json::json;
+
+    use super::*;
+
+    fn keys(items: &[&str]) -> BTreeSet<String> {
+        items.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// Edits treat `$ref` secrets like inline ones: a blank stored secret is dropped and no
+    /// longer required.
+    #[test]
+    fn edit_helpers_follow_ref_secrets() {
+        let schema = json!({
+            "type": "object",
+            "$defs": { "pw": { "type": "string", "writeOnly": true, "minLength": 8 } },
+            "required": ["adminPassword", "name"],
+            "properties": { "adminPassword": { "$ref": "#/$defs/pw" }, "name": { "type": "string" } }
+        });
+        let stored = keys(&["adminPassword"]);
+        let relaxed = relax_stored_secret_requirements(&schema, &stored);
+        assert_eq!(relaxed["required"], json!(["name"]));
+        let values = drop_blank_stored_secret_values(
+            &schema,
+            &json!({"adminPassword": null, "name": "n"}),
+            &stored,
+        );
+        assert_eq!(values, json!({"name": "n"}));
+    }
+
+    /// A stored `patternProperties` secret left blank stays a secret field (its stored value is
+    /// kept), while stored keys the schema no longer marks secret are not added.
+    #[test]
+    fn stored_pattern_secrets_stay_secret_fields() {
+        let schema = json!({
+            "properties": {
+                "env": { "patternProperties": { "^SECRET_": { "writeOnly": true } } },
+                "token": { "writeOnly": true }
+            }
+        });
+        let mut partitioned =
+            keel_core::partition_values_by_schema(&schema, &json!({"env": {"LOG": "x"}})).unwrap();
+        assert_eq!(partitioned.secret_field_paths, vec!["token"]);
+        extend_secret_field_paths(
+            &mut partitioned,
+            &schema,
+            &keys(&["env.SECRET_DB", "env.LOG", "token"]),
+        );
+        assert_eq!(
+            partitioned.secret_field_paths,
+            vec!["env.SECRET_DB", "token"]
         );
     }
 }

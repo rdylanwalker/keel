@@ -118,6 +118,7 @@ pub(super) async fn publish_proposal(
             branch,
             preview_stack: preview_stack.stack,
             report,
+            secret_notices: Vec::new(),
         }),
     )
 }

@@ -61,6 +61,13 @@ pub struct CreateProposalRequest {
     /// removes a key. Ignored on a first install.
     #[serde(default)]
     pub merge_stored_values: bool,
+    /// Dot paths (`auth.tlsSecret`, list items as `users[].password`; bundles prefix the item id:
+    /// `db.auth.tlsSecret`) of values whose key looks like a secret but that the user declares
+    /// not secret: they stay plaintext in `values.yaml`. Only name-heuristic matches can be
+    /// overridden, never fields the catalog declares secret (`writeOnly` / `format: password`).
+    /// Persisted with the instance; omitted (`null`) keeps the persisted ones, `[]` clears them.
+    #[serde(default)]
+    pub non_secret_paths: Option<Vec<String>>,
 }
 
 /// Response body for `POST /api/v1/tenants/{tenant}/proposals`.
@@ -72,6 +79,9 @@ pub struct CreateProposalResponse {
     pub branch: String,
     pub preview_stack: PkoStack,
     pub report: PreviewReport,
+    /// Values treated as secret because their key looks like one, or marked not secret by the
+    /// user (path and reason only, never the value; bundle paths start with the item id).
+    pub secret_notices: Vec<keel_core::SecretNotice>,
 }
 
 /// Locks held by a tenant proposal from its first read to its push: `git_lock` (tenant
