@@ -1,3 +1,15 @@
+## [0.15.0](https://github.com/rdylanwalker/keel/compare/v0.14.0...v0.15.0) (2026-11-25)
+
+### Features
+
+* **cli:** pull the local GitOps clone without keel serve ([34c06ae](https://github.com/rdylanwalker/keel/commit/34c06ae814409bdb4a768b945380b6358f0ea7a3))
+* **cli:** uninstall apps and destroy stacks from the CLI ([6ff0d7c](https://github.com/rdylanwalker/keel/commit/6ff0d7c6e82d422ae8bde1d1aadeef67bf6f7982))
+
+### Bug Fixes
+
+* **server:** apply the once-per-cluster guard to Helm add-on twins ([2ca7161](https://github.com/rdylanwalker/keel/commit/2ca71613cdda3a7edee6b7c308d0685b007397b3))
+* **server:** keep stored Helm app secrets that are not re-entered on Edit ([a16230f](https://github.com/rdylanwalker/keel/commit/a16230f63bcdf73ba6df47127e7616561d491942))
+
 ## [0.14.0](https://github.com/rdylanwalker/keel/compare/v0.13.0...v0.14.0) (2026-11-24)
 
 ### ⚠ BREAKING CHANGES
