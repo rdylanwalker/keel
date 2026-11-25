@@ -1158,3 +1158,294 @@ describe("DeployInstanceModal cluster-scoped placement", () => {
     expect(screen.queryByTestId("cluster-placement-hint")).toBeNull()
   })
 })
+
+describe("DeployInstanceModal name-heuristic secrets (AST-2)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    vi.mocked(api.createProposal).mockResolvedValue({
+      id: "7",
+      title: "t",
+      branch: "b",
+      tenant: "default",
+      scope: "default",
+      status: "open",
+      createdAt: "now",
+      secretNotices: [
+        {
+          path: "auth.password",
+          reason: "heuristicSecret",
+          message: "looks like a secret; stored encrypted with SOPS",
+        },
+      ],
+    })
+  })
+
+  const heuristicItem: CatalogItem = {
+    id: "db",
+    name: "Database",
+    description: "Upstream-derived schema",
+    category: "apps",
+    type: "app",
+    runtime: "helm",
+    version: "1.0.0",
+    schema: {
+      type: "object",
+      required: ["auth"],
+      properties: {
+        auth: {
+          type: "object",
+          required: ["password"],
+          properties: {
+            username: { type: "string", title: "Username", default: "app" },
+            password: { type: "string", title: "Password" },
+            existingSecret: { type: "string", title: "Existing Secret" },
+          },
+        },
+        ingress: {
+          type: "object",
+          properties: {
+            tlsSecret: { type: "string", title: "TLS Secret" },
+          },
+        },
+      },
+    },
+  }
+
+  const submit = () =>
+    fireEvent.click(
+      screen.getByRole("button", { name: /Submit & Open Git PR Proposal/i })
+    )
+
+  it("renders a password input with an inline warning, masks the preview and submits no overrides", async () => {
+    const onProposalCreated = vi.fn()
+    render(
+      <DeployInstanceModal
+        isOpen
+        onClose={vi.fn()}
+        catalogItem={heuristicItem}
+        tenant="default"
+        onProposalCreated={onProposalCreated}
+      />
+    )
+    const password = screen.getByLabelText(/^Password/)
+    expect(password).toHaveAttribute("type", "password")
+    expect(screen.getByLabelText(/Existing Secret/)).toHaveAttribute(
+      "type",
+      "text"
+    )
+    const notices = screen.getAllByTestId("heuristic-secret-notice")
+    expect(notices.map((n) => n.getAttribute("data-path"))).toEqual([
+      "auth.password",
+      "ingress.tlsSecret",
+    ])
+    expect(notices[0]).toHaveTextContent(/stored encrypted with SOPS/)
+
+    fireEvent.change(password, { target: { value: "hunter2" } })
+    const preview = screen.getByLabelText("values.yaml preview")
+    expect(preview.textContent).toContain('password: "********"')
+    expect(preview.textContent).not.toContain("hunter2")
+
+    submit()
+    await waitFor(() => expect(api.createProposal).toHaveBeenCalled())
+    const payload = vi.mocked(api.createProposal).mock.calls[0][0]
+    expect(payload.values).toMatchObject({ auth: { password: "hunter2" } })
+    expect(payload).not.toHaveProperty("nonSecretPaths")
+    // The server's notices reach the caller with the proposal.
+    expect(onProposalCreated.mock.calls[0][0].secretNotices).toHaveLength(1)
+  })
+
+  it("'Not a secret' switches the field to plaintext and sends the override", async () => {
+    render(
+      <DeployInstanceModal
+        isOpen
+        onClose={vi.fn()}
+        catalogItem={heuristicItem}
+        tenant="default"
+      />
+    )
+    fireEvent.change(screen.getByLabelText(/^Password/), {
+      target: { value: "pw" },
+    })
+    fireEvent.change(screen.getByLabelText(/TLS Secret/), {
+      target: { value: "my-tls" },
+    })
+    fireEvent.click(
+      screen.getByRole("checkbox", { name: "Not a secret: ingress.tlsSecret" })
+    )
+    expect(screen.getByLabelText(/TLS Secret/)).toHaveAttribute("type", "text")
+    const tlsNotice = screen
+      .getAllByTestId("heuristic-secret-notice")
+      .find((n) => n.getAttribute("data-path") === "ingress.tlsSecret")!
+    expect(tlsNotice).toHaveTextContent(/stored in plaintext/)
+    const preview = screen.getByLabelText("values.yaml preview")
+    expect(preview.textContent).toContain("tlsSecret: my-tls")
+
+    submit()
+    await waitFor(() => expect(api.createProposal).toHaveBeenCalled())
+    expect(
+      vi.mocked(api.createProposal).mock.calls[0][0].nonSecretPaths
+    ).toEqual(["ingress.tlsSecret"])
+  })
+
+  it("lists matches under open objects in a summary with the same toggle", async () => {
+    render(
+      <DeployInstanceModal
+        isOpen
+        onClose={vi.fn()}
+        catalogItem={{
+          ...heuristicItem,
+          schema: { type: "object" },
+          defaultValues: { cloudflare: { apiToken: "cf" }, replicas: 1 },
+        }}
+        tenant="default"
+      />
+    )
+    const summary = screen.getByTestId("heuristic-secret-summary")
+    expect(summary).toHaveTextContent("cloudflare.apiToken")
+    fireEvent.click(
+      screen.getByRole("checkbox", {
+        name: "Not a secret: cloudflare.apiToken",
+      })
+    )
+    submit()
+    await waitFor(() => expect(api.createProposal).toHaveBeenCalled())
+    expect(
+      vi.mocked(api.createProposal).mock.calls[0][0].nonSecretPaths
+    ).toEqual(["cloudflare.apiToken"])
+  })
+
+  it("edit mode keeps stored heuristic secrets and persisted overrides unless changed", async () => {
+    const { unmount } = render(
+      <DeployInstanceModal
+        isOpen
+        onClose={vi.fn()}
+        catalogItem={heuristicItem}
+        tenant="default"
+        isEditMode
+        initialConfig={{
+          name: "db",
+          values: { auth: { username: "app" }, ingress: { tlsSecret: "tls" } },
+        }}
+      />
+    )
+    expect(screen.getByLabelText(/^Password/)).toHaveAttribute(
+      "placeholder",
+      "Leave blank to keep existing secret"
+    )
+    // A plaintext match in the stored values was marked not secret earlier.
+    expect(
+      screen.getByRole("checkbox", { name: "Not a secret: ingress.tlsSecret" })
+    ).toHaveAttribute("data-state", "checked")
+    submit()
+    await waitFor(() => expect(api.createProposal).toHaveBeenCalledTimes(1))
+    const first = vi.mocked(api.createProposal).mock.calls[0][0]
+    expect(first).not.toHaveProperty("nonSecretPaths")
+    expect(first.values).toEqual({
+      auth: { username: "app" },
+      ingress: { tlsSecret: "tls" },
+    })
+    unmount()
+
+    render(
+      <DeployInstanceModal
+        isOpen
+        onClose={vi.fn()}
+        catalogItem={heuristicItem}
+        tenant="default"
+        isEditMode
+        initialConfig={{
+          name: "db",
+          values: { auth: { username: "app" }, ingress: { tlsSecret: "tls" } },
+          nonSecretPaths: ["ingress.tlsSecret"],
+        }}
+      />
+    )
+    fireEvent.click(
+      screen.getByRole("checkbox", { name: "Not a secret: ingress.tlsSecret" })
+    )
+    submit()
+    await waitFor(() => expect(api.createProposal).toHaveBeenCalledTimes(2))
+    expect(
+      vi.mocked(api.createProposal).mock.calls[1][0].nonSecretPaths
+    ).toEqual([])
+  })
+
+  it("edit mode asks to re-enter a stored heuristic secret newly marked not secret", async () => {
+    render(
+      <DeployInstanceModal
+        isOpen
+        onClose={vi.fn()}
+        catalogItem={heuristicItem}
+        tenant="default"
+        isEditMode
+        initialConfig={{
+          name: "db",
+          values: { auth: { username: "app" } },
+          nonSecretPaths: [],
+        }}
+      />
+    )
+    expect(screen.queryByTestId("heuristic-secret-reenter")).toBeNull()
+    fireEvent.click(
+      screen.getByRole("checkbox", { name: "Not a secret: auth.password" })
+    )
+    const notice = screen
+      .getAllByTestId("heuristic-secret-notice")
+      .find((n) => n.getAttribute("data-path") === "auth.password")!
+    expect(notice).toHaveTextContent(/re-enter the value/)
+    fireEvent.change(screen.getByLabelText(/^Password/), {
+      target: { value: "now-plain" },
+    })
+    expect(screen.queryByTestId("heuristic-secret-reenter")).toBeNull()
+    submit()
+    await waitFor(() => expect(api.createProposal).toHaveBeenCalled())
+    const payload = vi.mocked(api.createProposal).mock.calls[0][0]
+    expect(payload.nonSecretPaths).toEqual(["auth.password"])
+    expect(payload.values).toMatchObject({ auth: { password: "now-plain" } })
+  })
+
+  it("treats a password field from Sync Upstream Schema as secret", async () => {
+    vi.mocked(api.fetchCatalogSchema).mockResolvedValueOnce({
+      schema: {
+        type: "object",
+        properties: {
+          adminPassword: { type: "string", default: "" },
+          replicaCount: { type: "integer", default: 1 },
+        },
+      },
+      source: "values.yaml",
+    })
+    render(
+      <DeployInstanceModal
+        isOpen
+        onClose={vi.fn()}
+        catalogItem={{
+          ...sampleAppItem,
+          schema: { type: "object", properties: {} },
+        }}
+        tenant="default"
+      />
+    )
+    fireEvent.click(screen.getByRole("button", { name: /Sync Upstream/i }))
+    const field = await screen.findByLabelText(/^adminPassword/)
+    expect(field).toHaveAttribute("type", "password")
+    expect(
+      screen
+        .getAllByTestId("heuristic-secret-notice")
+        .map((n) => n.getAttribute("data-path"))
+    ).toEqual(["adminPassword"])
+  })
+
+  it("does not apply the heuristic to management add-on upgrades", () => {
+    render(
+      <DeployInstanceModal
+        isOpen
+        onClose={vi.fn()}
+        catalogItem={null}
+        managementAddon={{ ...heuristicItem, id: "dex", repoUrl: undefined }}
+        tenant="default"
+      />
+    )
+    expect(screen.queryByTestId("heuristic-secret-notice")).toBeNull()
+  })
+})

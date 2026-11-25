@@ -62,11 +62,16 @@ export function deployPlacementError(
   return `${item.name} installs cluster-scoped resources (CRDs, ClusterRoles or webhooks) and can only be deployed to a remote workload cluster. Select a Target Cluster other than the management cluster.`
 }
 
-/** Builds the `POST /api/v1/tenants/{tenant}/proposals` payload for a catalog deployment / edit. */
+/**
+ * Builds the `POST /api/v1/tenants/{tenant}/proposals` payload for a catalog deployment / edit.
+ * `nonSecretPaths` (name-heuristic matches the user marked not secret) is sent only when given:
+ * omitted keeps the overrides persisted with the instance, `[]` clears them.
+ */
 export function buildDeployProposalPayload(
   item: CatalogItem,
   target: DeployTargetState,
-  values: Record<string, unknown>
+  values: Record<string, unknown>,
+  nonSecretPaths?: string[]
 ): CreateProposalPayload {
   const resolvedTargetCluster = resolveTargetCluster(item, target)
   const name = target.instanceName.trim()
@@ -93,6 +98,7 @@ export function buildDeployProposalPayload(
     ...(item.runtime === "manifest"
       ? { actionEngine: target.actionEngine }
       : {}),
+    ...(nonSecretPaths ? { nonSecretPaths } : {}),
   }
 }
 

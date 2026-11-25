@@ -5,6 +5,7 @@ import { Proposal, ProposalRef } from "../../types/api"
 import { safeHttpUrl } from "../../lib/forgeLinks"
 import { Button } from "../ui/button"
 import { ProposalRepoLabel } from "../preview/ProposalRepoLabel"
+import { SecretNoticeList } from "../catalog/SecretNoticeList"
 
 export const ProposalToast: React.FC<{
   proposal: Proposal
@@ -40,6 +41,7 @@ export const ProposalToast: React.FC<{
           <X className="h-3.5 w-3.5" />
         </button>
       </div>
+      <SecretNoticeList notices={proposal.secretNotices} />
       <div className="flex items-center justify-end gap-2">
         {prUrl && (
           <Button asChild variant="secondary" size="sm">

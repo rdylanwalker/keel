@@ -16,7 +16,16 @@ export interface SchemaFormProps {
   onSubmit: (data: Values) => void
   customValidate?: CustomValidator<Values, RJSFSchema>
   extraErrors?: ErrorSchema<Values>
+  /** Passed to templates (e.g. {@link SchemaFormContext.onToggleNotSecret}). */
+  formContext?: SchemaFormContext
   children?: React.ReactNode
+}
+
+/** `formContext` understood by the Shadcn templates. */
+export interface SchemaFormContext {
+  /** Marks a name-heuristic secret field (dot path) as not secret, or secret again. */
+  onToggleNotSecret?: (path: string, notSecret: boolean) => void
+  [key: string]: unknown
 }
 
 /**
@@ -32,6 +41,7 @@ export const SchemaForm: React.FC<SchemaFormProps> = ({
   onSubmit,
   customValidate,
   extraErrors,
+  formContext,
   children,
 }) => (
   <div className="rjsf-container">
@@ -45,6 +55,7 @@ export const SchemaForm: React.FC<SchemaFormProps> = ({
       transformErrors={transformErrors}
       customValidate={customValidate}
       extraErrors={extraErrors}
+      formContext={formContext}
       showErrorList="top"
       focusOnFirstError
       noHtml5Validate

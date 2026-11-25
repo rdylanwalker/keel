@@ -18,6 +18,7 @@ import {
   RawResourceDiff,
   ResourceDiff,
   Proposal,
+  SecretNotice,
   ProviderRegistryEntry,
   ReleaseConfig,
   ReleaseSummary,
@@ -399,8 +400,15 @@ export async function createProposal(
       body: JSON.stringify(payload),
     }
   )
-  const raw = await handleResponse<{ proposal: RawProposal }>(res)
-  return normalizeProposal(raw.proposal)
+  const raw = await handleResponse<{
+    proposal: RawProposal
+    secretNotices?: SecretNotice[]
+  }>(res)
+  const proposal = normalizeProposal(raw.proposal)
+  if (Array.isArray(raw.secretNotices) && raw.secretNotices.length > 0) {
+    proposal.secretNotices = raw.secretNotices
+  }
+  return proposal
 }
 
 /** Maps a wire (camelCase) resource diff to the UI shape. */

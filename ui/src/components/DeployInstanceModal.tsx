@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from "react"
+import React, { useCallback, useMemo, useState } from "react"
 import type { CustomValidator, RJSFSchema } from "@rjsf/utils"
 import { AlertTriangle, ArrowRight, Loader2, RefreshCw } from "lucide-react"
 import {
@@ -24,9 +24,18 @@ import {
 import { jsonToYaml } from "../lib/utils"
 import {
   buildSecretAwareUiSchema,
+  HeuristicSecretField,
+  heuristicSecretCandidates,
+  heuristicSecretSchemaPaths,
+  isBlankValue,
   maskSecretValues,
+  maskValuesAtPaths,
+  relaxRequiredAtPaths,
   relaxSecretRequirements,
+  valueAtDotPath,
+  withHeuristicSecretUi,
 } from "../lib/secretFields"
+import { SchemaResolver, splitDotPath } from "../lib/schemaResolver"
 import { Button } from "./ui/button"
 import { Badge } from "./ui/badge"
 import {
@@ -52,6 +61,7 @@ import {
   requiresRemoteCluster,
 } from "./deploy/deployPayload"
 import { serverFieldErrors } from "./deploy/serverFieldErrors"
+import { HeuristicSecretSummary } from "./deploy/HeuristicSecretSummary"
 
 type Values = Record<string, unknown>
 
@@ -64,6 +74,8 @@ export interface DeployInstanceInitialConfig {
   targetNamespace?: string
   canary?: boolean
   actionEngine?: "flux" | "pulumi"
+  /** "Not secret" overrides persisted with the instance (when the config endpoint reports them). */
+  nonSecretPaths?: string[]
 }
 
 export interface DeployInstanceModalProps {
@@ -151,6 +163,48 @@ function initialTargetState(
   }
 }
 
+/**
+ * "Not secret" overrides an edit starts from: the persisted list when the config endpoint
+ * reports it, otherwise every heuristic match present in the loaded plaintext values (a
+ * heuristic secret is never in `values.yaml`, so a plaintext match was marked not secret).
+ */
+function initialNotSecretPaths(
+  schema: unknown,
+  initialConfig: DeployInstanceInitialConfig | null | undefined,
+  editMode: boolean
+): string[] {
+  if (initialConfig?.nonSecretPaths) return [...initialConfig.nonSecretPaths]
+  if (!editMode || !initialConfig?.values) return []
+  return heuristicSecretCandidates(schema ?? {}, initialConfig.values).map(
+    (c) => c.path
+  )
+}
+
+/** Whether every segment of the dot `path` is a named `properties` entry (rendered inline). */
+function isSchemaNamedPath(schema: unknown, path: string): boolean {
+  const resolver = new SchemaResolver(schema ?? {})
+  const segments = splitDotPath(path)
+  if (segments.length === 0 || segments[0] === "[]") return false
+  let set: unknown[] = [schema ?? {}]
+  for (const segment of segments) {
+    if (segment === "[]") {
+      set = resolver.itemSchemas(set)
+      continue
+    }
+    const named = resolver
+      .expand(set)
+      .some(
+        (n) =>
+          n.properties !== null &&
+          typeof n.properties === "object" &&
+          Object.prototype.hasOwnProperty.call(n.properties, segment)
+      )
+    if (!named) return false
+    set = resolver.propertySchemas(set, segment)
+  }
+  return true
+}
+
 const DeployInstanceModalBody: React.FC<DeployInstanceModalProps> = (props) => {
   const {
     onClose,
@@ -194,6 +248,20 @@ const DeployInstanceModalBody: React.FC<DeployInstanceModalProps> = (props) => {
   const [error, setError] = useState<string | null>(null)
   const [fieldErrors, setFieldErrors] = useState<Record<string, string[]>>({})
   const [isFullscreen, setIsFullscreen] = useState(false)
+  // Name-heuristic secrets (AST-2): values whose key looks like a secret are stored encrypted
+  // unless the user marks them not secret. Management add-ons use their own upgrade route.
+  const heuristicEnabled = !isManagementAddon
+  // The overrides the edit started from (persisted with the instance).
+  const [startNotSecretPaths] = useState<string[]>(() =>
+    initialNotSecretPaths(
+      resolvedCatalogItem?.schema,
+      initialConfig,
+      isEditMode && heuristicEnabled
+    )
+  )
+  const [notSecretPaths, setNotSecretPaths] =
+    useState<string[]>(startNotSecretPaths)
+  const [overridesTouched, setOverridesTouched] = useState(false)
 
   const effectiveTenant = target.tenant || tenant || "default"
   const effectiveTarget = { ...target, tenant: effectiveTenant }
@@ -229,22 +297,109 @@ const DeployInstanceModalBody: React.FC<DeployInstanceModalProps> = (props) => {
   // they are optional and hint so. Infrastructure stacks re-encrypt only the submitted
   // secrets: their secret fields stay required and must be re-entered.
   const keepsStoredSecrets = isEditMode && itemType !== "infra"
+  const schemaHeuristicPaths = useMemo(
+    () => (heuristicEnabled ? heuristicSecretSchemaPaths(itemSchema) : []),
+    [heuristicEnabled, itemSchema]
+  )
+  const valueHeuristicPaths = useMemo(
+    () =>
+      heuristicEnabled
+        ? heuristicSecretCandidates(itemSchema ?? {}, formData).map(
+            (c) => c.path
+          )
+        : [],
+    [heuristicEnabled, itemSchema, formData]
+  )
+  const heuristicFields = useMemo<HeuristicSecretField[]>(() => {
+    const paths = [
+      ...new Set([...schemaHeuristicPaths, ...valueHeuristicPaths]),
+    ].sort()
+    return paths.map((path) => {
+      const notSecret = notSecretPaths.includes(path)
+      return {
+        path,
+        notSecret,
+        fromSchema: schemaHeuristicPaths.includes(path),
+        // A stored heuristic secret opens blank: marking it not secret needs the value again.
+        reenter:
+          keepsStoredSecrets &&
+          notSecret &&
+          !startNotSecretPaths.includes(path) &&
+          isBlankValue(valueAtDotPath(formData, path)),
+      }
+    })
+  }, [
+    schemaHeuristicPaths,
+    valueHeuristicPaths,
+    notSecretPaths,
+    startNotSecretPaths,
+    keepsStoredSecrets,
+    formData,
+  ])
+  // Matches the form cannot show inline (keys added under additionalProperties).
+  const unnamedHeuristicFields = useMemo(
+    () => heuristicFields.filter((f) => !isSchemaNamedPath(itemSchema, f.path)),
+    [heuristicFields, itemSchema]
+  )
+  const relaxedHeuristicPaths = useMemo(
+    () =>
+      keepsStoredSecrets
+        ? schemaHeuristicPaths.filter((p) => !notSecretPaths.includes(p))
+        : [],
+    [keepsStoredSecrets, schemaHeuristicPaths, notSecretPaths]
+  )
   const formSchema = useMemo(() => {
     const base = keepsStoredSecrets
-      ? relaxSecretRequirements(itemSchema)
+      ? relaxRequiredAtPaths(
+          relaxSecretRequirements(itemSchema),
+          relaxedHeuristicPaths
+        )
       : itemSchema
     const withHosts =
       itemType === "bundle"
         ? withBundleCanaryHostsRequired(base, bundleItems)
         : withCanaryHostRequired(base, canaryEnabled)
     return withHosts as RJSFSchema | undefined
-  }, [itemSchema, itemType, bundleItems, keepsStoredSecrets, canaryEnabled])
+  }, [
+    itemSchema,
+    itemType,
+    bundleItems,
+    keepsStoredSecrets,
+    canaryEnabled,
+    relaxedHeuristicPaths,
+  ])
   const formUiSchema = useMemo(
     () =>
-      buildSecretAwareUiSchema(activeItem?.schema, activeItem?.uiSchema, {
-        editMode: keepsStoredSecrets,
-      }),
-    [activeItem?.schema, activeItem?.uiSchema, keepsStoredSecrets]
+      withHeuristicSecretUi(
+        buildSecretAwareUiSchema(activeItem?.schema, activeItem?.uiSchema, {
+          editMode: keepsStoredSecrets,
+        }),
+        heuristicFields,
+        { editMode: keepsStoredSecrets }
+      ),
+    [
+      activeItem?.schema,
+      activeItem?.uiSchema,
+      keepsStoredSecrets,
+      heuristicFields,
+    ]
+  )
+  const handleToggleNotSecret = useCallback(
+    (path: string, notSecret: boolean) => {
+      setOverridesTouched(true)
+      setNotSecretPaths((prev) =>
+        notSecret
+          ? prev.includes(path)
+            ? prev
+            : [...prev, path].sort()
+          : prev.filter((p) => p !== path)
+      )
+    },
+    []
+  )
+  const formContext = useMemo(
+    () => ({ onToggleNotSecret: handleToggleNotSecret }),
+    [handleToggleNotSecret]
   )
   const manifestTemplate =
     activeItem?.runtime === "manifest" ? activeItem.manifestsYaml : undefined
@@ -316,8 +471,18 @@ const DeployInstanceModalBody: React.FC<DeployInstanceModalProps> = (props) => {
         setError(placementError)
         return
       }
+      // New instances send the overrides that apply; edits send them only once the user
+      // changed one (omitted keeps the overrides persisted with the instance).
+      const flagged = new Set(heuristicFields.map((f) => f.path))
+      const overrides = notSecretPaths.filter((p) => flagged.has(p))
+      const sendOverrides = isEditMode ? overridesTouched : overrides.length > 0
       const proposal = await createProposal(
-        buildDeployProposalPayload(activeItem, effectiveTarget, values)
+        buildDeployProposalPayload(
+          activeItem,
+          effectiveTarget,
+          values,
+          sendOverrides ? overrides : undefined
+        )
       )
       onProposalCreated?.(proposal)
       onClose()
@@ -329,9 +494,13 @@ const DeployInstanceModalBody: React.FC<DeployInstanceModalProps> = (props) => {
     }
   }
 
-  // Secret (writeOnly / format: password) values are masked in the on-screen preview.
+  // Secret (writeOnly / format: password, and name-heuristic matches not marked "not a
+  // secret") values are masked in the on-screen preview.
   const yamlPreview = jsonToYaml(
-    maskSecretValues(activeItem?.schema, formData)
+    maskValuesAtPaths(
+      maskSecretValues(activeItem?.schema, formData),
+      valueHeuristicPaths.filter((p) => !notSecretPaths.includes(p))
+    )
   ).trim()
 
   const effectiveInstanceName =
@@ -392,6 +561,13 @@ const DeployInstanceModalBody: React.FC<DeployInstanceModalProps> = (props) => {
         </div>
       )}
 
+      {unnamedHeuristicFields.length > 0 && (
+        <HeuristicSecretSummary
+          fields={unnamedHeuristicFields}
+          onToggle={handleToggleNotSecret}
+        />
+      )}
+
       <div className="bg-slate-950 p-4 sm:p-5 rounded-xl border border-slate-800">
         <SchemaForm
           key={activeItem.id}
@@ -402,6 +578,7 @@ const DeployInstanceModalBody: React.FC<DeployInstanceModalProps> = (props) => {
           onSubmit={handleSubmit}
           customValidate={customValidate}
           extraErrors={toErrorSchema(fieldErrors)}
+          formContext={formContext}
         >
           <div className="mt-4 pt-4 border-t border-slate-800 flex flex-col-reverse sm:flex-row sm:items-center sm:justify-end gap-2">
             <Button variant="secondary" size="lg" onClick={onClose}>

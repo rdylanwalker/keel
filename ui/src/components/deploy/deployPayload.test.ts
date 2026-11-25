@@ -124,3 +124,18 @@ describe("deploy placement helpers", () => {
     )
   })
 })
+
+describe("buildDeployProposalPayload not-secret overrides", () => {
+  it("sends nonSecretPaths only when given (omitted keeps the persisted ones)", () => {
+    expect(buildDeployProposalPayload(app, target, {})).not.toHaveProperty(
+      "nonSecretPaths"
+    )
+    expect(
+      buildDeployProposalPayload(app, target, {}, []).nonSecretPaths
+    ).toEqual([])
+    expect(
+      buildDeployProposalPayload(app, target, {}, ["ingress.tlsSecret"])
+        .nonSecretPaths
+    ).toEqual(["ingress.tlsSecret"])
+  })
+})

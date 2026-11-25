@@ -267,6 +267,55 @@ describe("api client module", () => {
     ])
   })
 
+  it("creates proposal and keeps the server's secret notices (never values)", async () => {
+    const notices = [
+      {
+        path: "auth.password",
+        reason: "heuristicSecret",
+        message: "looks like a secret; stored encrypted with SOPS",
+      },
+      {
+        path: "ingress.tlsSecret",
+        reason: "markedNotSecret",
+        message: "marked not-secret by you; stored in plaintext",
+      },
+    ]
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          proposal: wireProposal({ id: "101", scope: "acme" }),
+          secretNotices: notices,
+        }),
+      })
+    )
+    const payload = {
+      catalogId: "podinfo",
+      tenant: "acme",
+      values: { auth: { password: "hunter2" } },
+      nonSecretPaths: ["ingress.tlsSecret"],
+    }
+    const res = await createProposal(payload)
+    expect(res.secretNotices).toEqual(notices)
+    expect(fetch).toHaveBeenCalledWith(
+      "/api/v1/tenants/acme/proposals",
+      expect.objectContaining({ body: JSON.stringify(payload) })
+    )
+
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          proposal: wireProposal({ id: "102", scope: "acme" }),
+          secretNotices: [],
+        }),
+      })
+    )
+    expect((await createProposal(payload)).secretNotices).toBeUndefined()
+  })
+
   it("creates proposal", async () => {
     const payload = {
       catalogId: "podinfo",

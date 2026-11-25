@@ -1,11 +1,24 @@
 import { describe, it, expect } from "vitest"
 import {
+  HEURISTIC_SECRET_UI_OPTION,
   KEEP_EXISTING_SECRET_PLACEHOLDER,
+  KEY_NAME_SUBJECTS,
+  REFERENCE_SUFFIXES,
+  SECRET_KEY_WORDS,
   SECRET_MASK,
   buildSecretAwareUiSchema,
+  heuristicSecretCandidates,
+  heuristicSecretSchemaPaths,
+  looksLikeSecretKey,
+  looksLikeSecretKeyUnder,
+  PASS_NON_SECRETS,
+  maskValuesAtPaths,
+  relaxRequiredAtPaths,
   relaxSecretRequirements,
   isSecretSchemaNode,
   maskSecretValues,
+  splitDotPath,
+  withHeuristicSecretUi,
 } from "./secretFields"
 
 const schema = {
@@ -160,5 +173,303 @@ describe("secretFields helpers", () => {
       "name",
       "secret",
     ])
+  })
+})
+
+// ---------------------------------------------------------------------------------------------
+// Name-based secret heuristic (AST-2): the shared corpus keeps this mirror identical to keel-core.
+// ---------------------------------------------------------------------------------------------
+
+// Node's fs is loaded through a non-literal specifier so the browser tsconfig needs no node types.
+const fsModule = "node:fs"
+const { readFileSync } = (await import(/* @vite-ignore */ fsModule)) as {
+  readFileSync: (file: URL, encoding: "utf8") => string
+}
+
+function repoFile(relative: string): URL {
+  // Bind import.meta.url first so Vite's `new URL(…, import.meta.url)` asset rewrite skips it.
+  const here = import.meta.url
+  return new URL(relative, here)
+}
+
+interface Corpus {
+  keys: { key: string; secret: boolean; source?: string }[]
+  values: {
+    name: string
+    schema: unknown
+    values: unknown
+    expected: string[]
+  }[]
+}
+
+const corpus = JSON.parse(
+  readFileSync(repoFile("../test/fixtures/secret-key-heuristic.json"), "utf8")
+) as Corpus
+
+describe("name-based secret heuristic (shared corpus with keel-core)", () => {
+  it("never matches keys of annotation and label maps", () => {
+    expect(looksLikeSecretKeyUnder(undefined, "apiToken")).toBe(true)
+    expect(looksLikeSecretKeyUnder("auth", "apiToken")).toBe(true)
+    for (const parent of ["annotations", "podAnnotations", "commonLabels"]) {
+      expect(looksLikeSecretKeyUnder(parent, "apiToken")).toBe(false)
+    }
+  })
+
+  it("classifies every corpus key like the server", () => {
+    expect(corpus.keys.length).toBeGreaterThan(50)
+    const failures = corpus.keys
+      .filter((c) => looksLikeSecretKey(c.key) !== c.secret)
+      .map((c) => `${c.key}: expected secret=${c.secret}`)
+    expect(failures).toEqual([])
+  })
+
+  it.each(corpus.values.map((c) => [c.name, c] as const))(
+    "flags the same values as the server: %s",
+    (_name, c) => {
+      expect(
+        heuristicSecretCandidates(c.schema, c.values).map((l) => l.path)
+      ).toEqual(c.expected)
+    }
+  )
+
+  it("uses the same word lists as keel-core", () => {
+    const rust = readFileSync(
+      repoFile("../../../crates/keel-core/src/secret_heuristic.rs"),
+      "utf8"
+    )
+    const list = (name: string): string[] => {
+      const match = new RegExp(
+        `${name}: &\\[&str\\] = &\\[([\\s\\S]*?)\\];`
+      ).exec(rust)
+      expect(match, name).not.toBeNull()
+      return [...match![1].matchAll(/"([^"]+)"/g)].map((m) => m[1])
+    }
+    expect([...SECRET_KEY_WORDS]).toEqual(list("SECRET_KEY_WORDS"))
+    expect([...REFERENCE_SUFFIXES]).toEqual(list("REFERENCE_SUFFIXES"))
+    expect([...KEY_NAME_SUBJECTS]).toEqual(list("KEY_NAME_SUBJECTS"))
+    expect([...PASS_NON_SECRETS]).toEqual(list("PASS_NON_SECRETS"))
+  })
+
+  it("follows $ref, patternProperties and combinators like the server resolver", () => {
+    const resolverSchema = {
+      $defs: { plain: { type: "string", writeOnly: false } },
+      properties: {
+        tlsSecret: { $ref: "#/$defs/plain" },
+        opts: {
+          patternProperties: { "^.*Token$": { format: "password" } },
+        },
+      },
+    }
+    expect(
+      heuristicSecretCandidates(resolverSchema, {
+        tlsSecret: "my-tls",
+        opts: { apiToken: "a", webhookSecret: "w" },
+      })
+    ).toEqual([{ pointer: "/opts/webhookSecret", path: "opts.webhookSecret" }])
+  })
+
+  it("escapes JSON pointer tokens and keeps list paths", () => {
+    expect(
+      heuristicSecretCandidates(
+        { type: "object" },
+        { "a~b": { token: "t" }, users: [{ password: "p" }] }
+      )
+    ).toEqual([
+      { pointer: "/a~0b/token", path: "a~b.token" },
+      { pointer: "/users/0/password", path: "users[].password" },
+    ])
+  })
+})
+
+describe("heuristicSecretSchemaPaths", () => {
+  it("lists schema-named fields the heuristic will treat as secret", () => {
+    const formSchema = {
+      type: "object",
+      properties: {
+        auth: {
+          type: "object",
+          properties: {
+            password: { type: "string" },
+            existingSecret: { type: "string" },
+            adminPassword: { type: "string", writeOnly: true },
+            tokenMode: { type: "string" },
+          },
+        },
+        apiTokens: { type: "array", items: { type: "string" } },
+        secretCount: { type: "integer" },
+        tlsSecret: { type: "string", writeOnly: false },
+        backendKind: { type: "string" },
+        // An enum is no opt-out (only writeOnly: false is).
+        token: { type: "string", enum: ["a", "b"] },
+        pin: { type: "integer" },
+        enabled: { type: "boolean" },
+        users: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: { password: { type: "string" } },
+          },
+        },
+        smtp: {
+          type: "object",
+          writeOnly: true,
+          properties: { password: { type: "string" } },
+        },
+        ref: { $ref: "#/$defs/creds" },
+      },
+      $defs: {
+        creds: { type: "object", properties: { clientSecret: {} } },
+      },
+    }
+    expect(heuristicSecretSchemaPaths(formSchema)).toEqual([
+      "apiTokens",
+      "auth.password",
+      "ref.clientSecret",
+      "token",
+      "users[].password",
+    ])
+  })
+
+  it("terminates on recursive $ref schemas", () => {
+    const recursive = {
+      $defs: {
+        node: {
+          type: "object",
+          properties: { child: { $ref: "#/$defs/node" }, token: {} },
+        },
+      },
+      $ref: "#/$defs/node",
+    }
+    // Each schema node is walked once: the cycle stops after the first repetition.
+    expect(heuristicSecretSchemaPaths(recursive)).toEqual([
+      "child.token",
+      "token",
+    ])
+  })
+})
+
+describe("heuristic presentation helpers", () => {
+  it("masks values at dot paths, including list items", () => {
+    expect(
+      maskValuesAtPaths(
+        {
+          auth: { password: "hunter2", user: "u" },
+          users: [{ password: "p" }, { name: "n" }],
+          empty: null,
+        },
+        ["auth.password", "users[].password", "missing.path", "empty"]
+      )
+    ).toEqual({
+      auth: { password: SECRET_MASK, user: "u" },
+      users: [{ password: SECRET_MASK }, { name: "n" }],
+      empty: null,
+    })
+  })
+
+  it("splits dot paths with list segments", () => {
+    expect(splitDotPath("a.users[].b[][]")).toEqual([
+      "a",
+      "users",
+      "[]",
+      "b",
+      "[]",
+      "[]",
+    ])
+  })
+
+  it("adds password widgets, placeholders and the notice option", () => {
+    const ui = withHeuristicSecretUi(
+      { auth: { password: { "ui:help": "h" } } },
+      [
+        { path: "auth.password", notSecret: false, fromSchema: true },
+        { path: "users[].token", notSecret: true, fromSchema: true },
+        { path: "extra.apiKey", notSecret: false, fromSchema: false },
+      ],
+      { editMode: true }
+    )
+    expect(ui).toEqual({
+      auth: {
+        password: {
+          "ui:help": "h",
+          "ui:widget": "password",
+          "ui:placeholder": KEEP_EXISTING_SECRET_PLACEHOLDER,
+          "ui:options": {
+            [HEURISTIC_SECRET_UI_OPTION]: {
+              path: "auth.password",
+              notSecret: false,
+              fromSchema: true,
+            },
+          },
+        },
+      },
+      users: {
+        items: {
+          token: {
+            "ui:options": {
+              [HEURISTIC_SECRET_UI_OPTION]: {
+                path: "users[].token",
+                notSecret: true,
+                fromSchema: true,
+              },
+            },
+          },
+        },
+      },
+      extra: {
+        apiKey: {
+          "ui:options": {
+            [HEURISTIC_SECRET_UI_OPTION]: {
+              path: "extra.apiKey",
+              notSecret: false,
+              fromSchema: false,
+            },
+          },
+        },
+      },
+    })
+  })
+
+  it("relaxes required only at the given object paths", () => {
+    const required = {
+      type: "object",
+      required: ["token", "name"],
+      properties: {
+        token: { type: "string" },
+        name: { type: "string" },
+        auth: {
+          type: "object",
+          required: ["password"],
+          properties: { password: { type: "string" } },
+        },
+      },
+    }
+    expect(
+      relaxRequiredAtPaths(required, ["token", "auth.password", "list[].x"])
+    ).toEqual({
+      ...required,
+      required: ["name"],
+      properties: {
+        ...required.properties,
+        auth: { ...required.properties.auth, required: [] },
+      },
+    })
+  })
+
+  it("masks secrets reached through $ref and patternProperties in previews", () => {
+    expect(
+      maskSecretValues(
+        {
+          $defs: { pw: { type: "string", format: "password" } },
+          properties: {
+            db: { properties: { pass: { $ref: "#/$defs/pw" } } },
+            env: { patternProperties: { _KEY$: { writeOnly: true } } },
+          },
+        },
+        { db: { pass: "x" }, env: { API_KEY: "k", HOST: "h" } }
+      )
+    ).toEqual({
+      db: { pass: SECRET_MASK },
+      env: { API_KEY: SECRET_MASK, HOST: "h" },
+    })
   })
 })

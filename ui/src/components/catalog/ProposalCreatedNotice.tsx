@@ -5,6 +5,7 @@ import { Button } from "@/components/ui/button"
 import { Proposal } from "@/types/api"
 import { safeHttpUrl } from "@/lib/forgeLinks"
 import { ProposalRepoLabel } from "@/components/preview/ProposalRepoLabel"
+import { SecretNoticeList } from "@/components/catalog/SecretNoticeList"
 
 /** Floating toast + inline success panel shown after a catalog action opened a PR. */
 export const ProposalCreatedNotice: React.FC<{
@@ -84,6 +85,7 @@ export const ProposalCreatedNotice: React.FC<{
             <ProposalRepoLabel proposal={proposal} linked />
           </div>
         </div>
+        <SecretNoticeList notices={proposal.secretNotices} />
         <div className="text-xs bg-slate-900/90 border border-slate-800 rounded-xl p-4 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 text-slate-300 font-mono">
           <div className="min-w-0 break-words">
             <span className="text-slate-500">PR Title: </span>

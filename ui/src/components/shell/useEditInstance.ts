@@ -73,6 +73,7 @@ export function useEditInstance() {
             targetCluster: cfg.targetCluster,
             targetNamespace: cfg.targetNamespace,
             canary: cfg.canary,
+            nonSecretPaths: cfg.nonSecretPaths,
           },
         })
       } catch (err) {

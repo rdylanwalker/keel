@@ -143,6 +143,7 @@ export const CatalogWizardView: React.FC<CatalogWizardViewProps> = ({
                   tenant: cfg.tenant || "default",
                   targetCluster: cfg.targetCluster,
                   targetNamespace: cfg.targetNamespace,
+                  nonSecretPaths: cfg.nonSecretPaths,
                 },
               }
             : null

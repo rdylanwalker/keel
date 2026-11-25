@@ -123,6 +123,23 @@ export interface Proposal {
   repository?: ProposalRepository
   /** Forge web page of the repository, derived from `prUrl` (http(s) forges only). */
   repoUrl?: string
+  /**
+   * Secret-handling decisions of the proposal that created this PR (`secretNotices` of
+   * `POST /api/v1/tenants/{tenant}/proposals`): values treated as secret because of their key
+   * name, or marked not secret by the user. Path and reason only, never the value.
+   */
+  secretNotices?: SecretNotice[]
+}
+
+/** Why a value is listed in a {@link SecretNotice} (`keel_core::SecretNoticeReason`). */
+export type SecretNoticeReason = "heuristicSecret" | "markedNotSecret"
+
+/** A secret-handling decision the user should see (`keel_core::SecretNotice`; never the value). */
+export interface SecretNotice {
+  /** Dot path of the value (`auth.password`; bundles prefix the item id). */
+  path: string
+  reason: SecretNoticeReason
+  message: string
 }
 
 /** Identity of a proposal across repositories: PR ids repeat between tenant repositories. */
@@ -446,6 +463,8 @@ export interface ReleaseConfig {
   canary?: boolean
   actionEngine?: "flux" | "pulumi"
   values: Record<string, unknown>
+  /** "Not secret" overrides persisted with the instance, when the server reports them. */
+  nonSecretPaths?: string[]
 }
 
 export interface CreateProposalPayload {
@@ -460,6 +479,11 @@ export interface CreateProposalPayload {
   targetCluster?: string
   canary?: boolean
   actionEngine?: "flux" | "pulumi"
+  /**
+   * Dot paths of name-heuristic secret matches the user declares not secret (stored in
+   * plaintext). Omitted keeps the overrides persisted with the instance; `[]` clears them.
+   */
+  nonSecretPaths?: string[]
 }
 
 export interface UpgradeManagementAddonPayload {

@@ -1151,6 +1151,50 @@ describe("CatalogWizardView component and jsonToYaml helper", () => {
     expect(onClear).toHaveBeenCalled()
   })
 
+  it("restores the persisted 'Not a secret' overrides from the release config", async () => {
+    vi.mocked(api.getCatalog).mockResolvedValue([
+      {
+        id: "mailer",
+        name: "Mailer",
+        description: "Mailer app",
+        type: "app",
+        category: "Apps",
+        version: "1.0.0",
+        schema: {
+          type: "object",
+          properties: {
+            smtp: {
+              type: "object",
+              properties: {
+                host: { type: "string", title: "Host" },
+                tlsSecret: { type: "string", title: "TLS Secret" },
+              },
+            },
+          },
+        },
+      },
+    ])
+    // The override's path holds no value (cleared earlier): only the server's persisted list
+    // knows it was marked not secret.
+    vi.mocked(api.getReleaseConfig).mockResolvedValue({
+      catalogId: "mailer",
+      tenant: "default",
+      name: "mailer",
+      values: { smtp: { host: "mail.local" } },
+      nonSecretPaths: ["smtp.tlsSecret"],
+    })
+    render(
+      <CatalogWizardView
+        initialReleaseTarget={{ namespace: "tenant-default", name: "mailer" }}
+      />
+    )
+    const toggle = await screen.findByRole("checkbox", {
+      name: "Not a secret: smtp.tlsSecret",
+    })
+    expect(toggle).toHaveAttribute("data-state", "checked")
+    expect(screen.getByLabelText(/TLS Secret/)).toHaveAttribute("type", "text")
+  })
+
   it("edits an existing catalog item via modal and submits PUT update PR", async () => {
     vi.mocked(api.getCatalog).mockResolvedValue([
       {
