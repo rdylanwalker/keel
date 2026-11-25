@@ -14,6 +14,7 @@ use crate::models::{
     CATALOG_INFRA_BLUEPRINT_KIND, CatalogApplication, CatalogBundle, CatalogInfraBlueprint,
     CatalogManifest, HelmGatewayRouteSpec,
 };
+use crate::secret_schema::SchemaResolver;
 use crate::yaml::split_yaml_documents;
 
 /// Structured JSON Schema validation error tied to a specific instance field path.
@@ -124,25 +125,84 @@ pub fn parse_catalog_bundle(yaml: &str) -> Result<CatalogBundle, CoreError> {
     Ok(bundle)
 }
 
+/// Refuses every external schema resource: catalog schemas must be self-contained, so compiling
+/// one never fetches a URL or reads a file (`$ref` is checked by
+/// [`validate_secret_schema_support`] before a catalog is accepted).
+struct NoExternalSchemas;
+
+impl jsonschema::Retrieve for NoExternalSchemas {
+    fn retrieve(
+        &self,
+        uri: &jsonschema::Uri<String>,
+    ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+        Err(format!(
+            "external schema reference '{}' is not allowed; catalog schemas must be self-contained",
+            uri.as_str()
+        )
+        .into())
+    }
+}
+
 fn compile_schema(schema: &Value) -> Result<jsonschema::Validator, CoreError> {
     jsonschema::options()
         .should_validate_formats(true)
+        .with_retriever(NoExternalSchemas)
         .build(schema)
         .map_err(|e| CoreError::Validation(format!("Invalid JSON Schema in catalog: {e}")))
 }
 
 /// Validates user input `values` against a JSON Schema, returning structured `SchemaFieldError`s on failure.
+///
+/// Messages never echo a secret (`NFR-SEC-05`): see [`validate_schema_values_with_secrets`].
 pub fn validate_schema_values(schema: &Value, values: &Value) -> Result<(), CoreError> {
+    validate_schema_values_with_secrets(schema, values, &[])
+}
+
+/// [`validate_schema_values`], also treating the values at the JSON Pointers
+/// `extra_secret_pointers` as secret (e.g. name-based secret heuristics on top of the schema).
+///
+/// An error whose instance lies at or inside a secret value, or contains one (a parent object
+/// failing `anyOf`/`oneOf`/`maxProperties`/`enum`/`const`/`not`, or the root), gets a generic
+/// message naming only the failing keyword. `required` and `additionalProperties` errors on such
+/// a parent keep jsonschema's masked message, which names keys, never values. Other errors on an
+/// object or array use the masked message too; only scalar non-secret values are quoted.
+pub fn validate_schema_values_with_secrets(
+    schema: &Value,
+    values: &Value,
+    extra_secret_pointers: &[String],
+) -> Result<(), CoreError> {
     let validator = compile_schema(schema)?;
+    let mut secret_pointers: Vec<String> = SchemaResolver::new(schema)
+        .secret_value_locations(values)
+        .into_iter()
+        .map(|l| l.pointer)
+        .collect();
+    secret_pointers.extend(extra_secret_pointers.iter().cloned());
     let mut errors: Vec<SchemaFieldError> = validator
         .iter_errors(values)
         .map(|err| {
             let field_path = err.instance_path().to_string();
             let schema_path = err.schema_path().to_string();
-            // Validation messages quote the offending value: never echo a secret field back.
-            let message = if instance_path_is_secret(schema, &field_path) {
-                let keyword = schema_path.rsplit('/').next().unwrap_or("schema");
+            let keyword = err.kind().keyword();
+            let inside_secret = secret_pointers
+                .iter()
+                .any(|p| pointer_is_within(&field_path, p));
+            let contains_secret = secret_pointers
+                .iter()
+                .any(|p| pointer_is_within(p, &field_path));
+            let names_keys_only = matches!(
+                err.kind(),
+                jsonschema::error::ValidationErrorKind::Required { .. }
+                    | jsonschema::error::ValidationErrorKind::AdditionalProperties { .. }
+            );
+            let message = if inside_secret {
                 format!("Secret value does not satisfy the '{keyword}' constraint")
+            } else if contains_secret && !names_keys_only {
+                format!(
+                    "Value containing secret fields does not satisfy the '{keyword}' constraint"
+                )
+            } else if err.instance().is_object() || err.instance().is_array() {
+                err.masked().to_string()
             } else {
                 err.to_string()
             };
@@ -167,99 +227,58 @@ pub fn validate_schema_values(schema: &Value, values: &Value) -> Result<(), Core
     }
 }
 
-/// Whether the value at JSON pointer `pointer` (e.g. `/gitea/oauth/0/secret`) lies inside a
-/// secret field of `schema` (the field itself or any enclosing node is secret).
-fn instance_path_is_secret(schema: &Value, pointer: &str) -> bool {
-    let mut node = schema;
-    if is_secret_schema_node(node) {
-        return true;
-    }
-    for raw in pointer.split('/').skip(1) {
-        let seg = raw.replace("~1", "/").replace("~0", "~");
-        let next = match node.get("items").filter(|i| i.is_object()) {
-            Some(items) if seg.parse::<usize>().is_ok() => Some(items),
-            _ => find_property_schema(node, &seg),
-        };
-        let Some(next) = next else {
-            return false;
-        };
-        if is_secret_schema_node(next) {
-            return true;
-        }
-        node = next;
-    }
-    false
+/// Whether JSON Pointer `pointer` equals `ancestor` or lies below it.
+fn pointer_is_within(pointer: &str, ancestor: &str) -> bool {
+    ancestor.is_empty()
+        || pointer == ancestor
+        || pointer
+            .strip_prefix(ancestor)
+            .is_some_and(|rest| rest.starts_with('/'))
 }
 
-/// Returns `true` if a JSON Schema property node marks a field as secret (`writeOnly: true` or `format: "password"`).
+/// Returns `true` if the JSON Schema `schema_node` marks a value secret (`writeOnly: true` or
+/// `format: "password"`), following its `$ref`s (resolved against `schema_node` itself) and
+/// every combinator/conditional branch. For a node inside a larger document use
+/// [`SchemaResolver::is_secret_node`] on the document, so `$ref`s resolve against its root.
 pub fn is_secret_schema_node(schema_node: &Value) -> bool {
-    let Some(obj) = schema_node.as_object() else {
-        return false;
-    };
-
-    if obj.get("writeOnly").and_then(Value::as_bool) == Some(true) {
-        return true;
-    }
-    if obj.get("format").and_then(Value::as_str) == Some("password") {
-        return true;
-    }
-
-    for combinator in ["allOf", "anyOf", "oneOf"] {
-        if let Some(subschemas) = obj.get(combinator).and_then(Value::as_array)
-            && subschemas.iter().any(is_secret_schema_node)
-        {
-            return true;
-        }
-    }
-
-    false
+    SchemaResolver::new(schema_node).is_secret_node(schema_node)
 }
 
 /// Extracts sorted, deduplicated dot-notated paths of all secret fields (`writeOnly: true` or `format: "password"`)
-/// defined in a JSON Schema.
+/// a JSON Schema names statically (see [`SchemaResolver::declared_secret_paths`]).
 pub fn extract_secret_field_paths(schema: &Value) -> Vec<String> {
-    let mut paths = BTreeSet::new();
-    collect_secret_paths(schema, "", &mut paths);
+    SchemaResolver::new(schema).declared_secret_paths()
+}
+
+/// Sorted dot paths of the secret fields of `schema`: the statically named ones plus every
+/// secret value actually present in `values` (fields under `patternProperties`/
+/// `additionalProperties`, recursive `$ref`s). The building block for "effective" secret paths
+/// that callers extend (stored secret keys, heuristics).
+pub fn secret_field_paths_for_values(schema: &Value, values: &Value) -> Vec<String> {
+    let resolver = SchemaResolver::new(schema);
+    let mut paths: BTreeSet<String> = resolver.declared_secret_paths().into_iter().collect();
+    paths.extend(
+        resolver
+            .secret_value_locations(values)
+            .into_iter()
+            .map(|l| l.path)
+            .filter(|p| !p.is_empty()),
+    );
     paths.into_iter().collect()
 }
 
-fn collect_secret_paths(schema_node: &Value, prefix: &str, out: &mut BTreeSet<String>) {
-    let Some(obj) = schema_node.as_object() else {
-        return;
-    };
-
-    if !prefix.is_empty() && is_secret_schema_node(schema_node) {
-        out.insert(prefix.to_string());
-        return;
-    }
-
-    if let Some(props) = obj.get("properties").and_then(Value::as_object) {
-        for (prop_name, prop_schema) in props {
-            let next_prefix = if prefix.is_empty() {
-                prop_name.clone()
-            } else {
-                format!("{prefix}.{prop_name}")
-            };
-            collect_secret_paths(prop_schema, &next_prefix, out);
-        }
-    }
-
-    if let Some(items_schema) = obj.get("items") {
-        let next_prefix = if prefix.is_empty() {
-            "[]".to_string()
-        } else {
-            format!("{prefix}[]")
-        };
-        collect_secret_paths(items_schema, &next_prefix, out);
-    }
-
-    for combinator in ["allOf", "anyOf", "oneOf"] {
-        if let Some(subschemas) = obj.get(combinator).and_then(Value::as_array) {
-            for sub in subschemas {
-                collect_secret_paths(sub, prefix, out);
-            }
-        }
-    }
+/// Returns the `stored_paths` (dot paths of stored secret keys) that `schema` still declares
+/// secret, e.g. a `patternProperties` secret left blank on an edit.
+pub fn stored_secret_paths_still_secret<'p>(
+    schema: &Value,
+    stored_paths: impl IntoIterator<Item = &'p String>,
+) -> Vec<String> {
+    let resolver = SchemaResolver::new(schema);
+    stored_paths
+        .into_iter()
+        .filter(|p| resolver.is_secret_path(p))
+        .cloned()
+        .collect()
 }
 
 /// Partitions a JSON object of user values into `normal_values` and `secret_values` according to `schema`.
@@ -273,8 +292,9 @@ pub fn partition_values_by_schema(
         ));
     }
 
-    let secret_field_paths = extract_secret_field_paths(schema);
-    let (normal_opt, secret_opt) = split_node(Some(schema), values);
+    let resolver = SchemaResolver::new(schema);
+    let secret_field_paths = secret_field_paths_for_values(schema, values);
+    let (normal_opt, secret_opt) = resolver.split(&[schema], values);
 
     let normal_values = normal_opt.unwrap_or_else(|| Value::Object(Map::new()));
     let secret_values = secret_opt.unwrap_or_else(|| Value::Object(Map::new()));
@@ -301,46 +321,58 @@ pub fn partition_values_by_schema(
 /// Callers apply this on first install only. An edit submits the complete desired values and
 /// must not get defaults back for keys the user removed.
 pub fn apply_schema_defaults(schema: &Value, values: &Value) -> Value {
+    let resolver = SchemaResolver::new(schema);
     match values {
-        Value::Object(map) => Value::Object(fill_object_defaults(schema, map.clone())),
+        Value::Object(map) => Value::Object(fill_object_defaults(&resolver, schema, map.clone())),
         other => other.clone(),
     }
 }
 
-fn fill_object_defaults(schema: &Value, mut map: Map<String, Value>) -> Map<String, Value> {
+fn fill_object_defaults<'a>(
+    resolver: &SchemaResolver<'a>,
+    schema: &'a Value,
+    mut map: Map<String, Value>,
+) -> Map<String, Value> {
     let Some(props) = schema.get("properties").and_then(Value::as_object) else {
         return map;
     };
     for (key, prop) in props {
-        if !prop.is_object() || is_secret_schema_node(prop) {
+        if !prop.is_object() || resolver.is_secret_node(prop) {
             continue;
         }
         match map.get(key) {
             None => {
                 if let Some(default) = prop.get("default") {
                     // An object default keeps only its non-secret parts.
-                    if let (Some(normal), _) = split_node(Some(prop), default) {
+                    if let (Some(normal), _) = resolver.split(&[prop], default) {
                         map.insert(key.clone(), normal);
                     }
                 } else if prop.get("properties").is_some_and(Value::is_object) {
-                    let nested = fill_object_defaults(prop, Map::new());
+                    let nested = fill_object_defaults(resolver, prop, Map::new());
                     if !nested.is_empty() {
                         map.insert(key.clone(), Value::Object(nested));
                     }
                 }
             }
             Some(Value::Object(existing)) => {
-                let nested = fill_object_defaults(prop, existing.clone());
+                let nested = fill_object_defaults(resolver, prop, existing.clone());
                 map.insert(key.clone(), Value::Object(nested));
             }
             Some(Value::Array(items)) => {
                 if let Some(item_schema) = prop
                     .get("items")
-                    .filter(|s| s.is_object() && !is_secret_schema_node(s))
+                    .filter(|s| s.is_object() && !resolver.is_secret_node(s))
                 {
                     let filled = items
                         .iter()
-                        .map(|item| apply_schema_defaults(item_schema, item))
+                        .map(|item| match item {
+                            Value::Object(m) => Value::Object(fill_object_defaults(
+                                resolver,
+                                item_schema,
+                                m.clone(),
+                            )),
+                            other => other.clone(),
+                        })
                         .collect();
                     map.insert(key.clone(), Value::Array(filled));
                 }
@@ -378,108 +410,6 @@ pub fn merge_values_patch(base: &Value, patch: &Value) -> Value {
 /// a merge patch leaves once there is nothing to merge into.
 pub fn strip_null_values(values: &Value) -> Value {
     merge_values_patch(&Value::Object(Map::new()), values)
-}
-
-fn find_property_schema<'a>(schema: &'a Value, prop_name: &str) -> Option<&'a Value> {
-    let obj = schema.as_object()?;
-    if let Some(prop) = obj
-        .get("properties")
-        .and_then(Value::as_object)
-        .and_then(|p| p.get(prop_name))
-    {
-        return Some(prop);
-    }
-
-    for combinator in ["allOf", "anyOf", "oneOf"] {
-        if let Some(subschemas) = obj.get(combinator).and_then(Value::as_array) {
-            for sub in subschemas {
-                if let Some(found) = find_property_schema(sub, prop_name) {
-                    return Some(found);
-                }
-            }
-        }
-    }
-
-    obj.get("additionalProperties").filter(|v| v.is_object())
-}
-
-fn split_node(schema: Option<&Value>, value: &Value) -> (Option<Value>, Option<Value>) {
-    if let Some(s) = schema
-        && is_secret_schema_node(s)
-    {
-        return (None, Some(value.clone()));
-    }
-
-    match value {
-        Value::Object(map) => {
-            if map.is_empty() {
-                return (Some(Value::Object(Map::new())), None);
-            }
-            let mut normal_map = Map::new();
-            let mut secret_map = Map::new();
-
-            for (k, v) in map {
-                let child_schema = schema.and_then(|s| find_property_schema(s, k));
-                let (n_part, s_part) = split_node(child_schema, v);
-                if let Some(nv) = n_part {
-                    normal_map.insert(k.clone(), nv);
-                }
-                if let Some(sv) = s_part {
-                    secret_map.insert(k.clone(), sv);
-                }
-            }
-
-            let normal_res = if normal_map.is_empty() {
-                None
-            } else {
-                Some(Value::Object(normal_map))
-            };
-            let secret_res = if secret_map.is_empty() {
-                None
-            } else {
-                Some(Value::Object(secret_map))
-            };
-            (normal_res, secret_res)
-        }
-        Value::Array(items) => {
-            let item_schema = schema
-                .and_then(Value::as_object)
-                .and_then(|o| o.get("items"));
-            if let Some(is) = item_schema
-                && is_secret_schema_node(is)
-            {
-                return (None, Some(value.clone()));
-            }
-
-            let mut normal_arr = Vec::new();
-            let mut secret_arr = Vec::new();
-            let mut any_secret = false;
-
-            for item in items {
-                let (n_part, s_part) = split_node(item_schema, item);
-                if let Some(nv) = n_part {
-                    normal_arr.push(nv);
-                }
-                if let Some(sv) = s_part {
-                    any_secret = true;
-                    secret_arr.push(sv);
-                }
-            }
-
-            let normal_res = if normal_arr.is_empty() && any_secret {
-                None
-            } else {
-                Some(Value::Array(normal_arr))
-            };
-            let secret_res = if any_secret {
-                Some(Value::Array(secret_arr))
-            } else {
-                None
-            };
-            (normal_res, secret_res)
-        }
-        _ => (Some(value.clone()), None),
-    }
 }
 
 /// Renders an unmodified upstream Helm `values.yaml` string directly from a JSON value (`crate::yaml::to_string`).
@@ -1194,24 +1124,18 @@ pub fn resolve_helm_gateway_routes(
     Ok(hostnames)
 }
 
-/// Whether a schema node (or one of its `allOf`/`anyOf`/`oneOf` members) explicitly allows
-/// arbitrary extra keys (`additionalProperties: true`).
-fn allows_any_additional_property(schema: &Value) -> bool {
-    let Some(obj) = schema.as_object() else {
-        return false;
-    };
-    if obj.get("additionalProperties") == Some(&Value::Bool(true)) {
-        return true;
-    }
-    ["allOf", "anyOf", "oneOf"].iter().any(|c| {
-        obj.get(*c)
-            .and_then(Value::as_array)
-            .is_some_and(|subs| subs.iter().any(allows_any_additional_property))
-    })
+/// Whether one of the schemas applying at a location (after `$ref`/combinator expansion)
+/// explicitly allows arbitrary extra keys (`additionalProperties: true`).
+fn allows_any_additional_property<'a>(resolver: &SchemaResolver<'a>, set: &[&'a Value]) -> bool {
+    resolver
+        .expand(set)
+        .into_iter()
+        .any(|node| node.get("additionalProperties") == Some(&Value::Bool(true)))
 }
 
-fn collect_undeclared_paths(
-    schema: Option<&Value>,
+fn collect_undeclared_paths<'a>(
+    resolver: &SchemaResolver<'a>,
+    set: &[&'a Value],
     value: &Value,
     path: &str,
     out: &mut Vec<String>,
@@ -1224,22 +1148,18 @@ fn collect_undeclared_paths(
                 } else {
                     format!("{path}.{key}")
                 };
-                match schema.and_then(|s| find_property_schema(s, key)) {
-                    Some(child_schema) => {
-                        collect_undeclared_paths(Some(child_schema), child, &child_path, out);
-                    }
-                    None if schema.is_some_and(allows_any_additional_property) => {}
-                    None => out.push(child_path),
+                let child_set = resolver.property_schemas(set, key);
+                if !child_set.is_empty() {
+                    collect_undeclared_paths(resolver, &child_set, child, &child_path, out);
+                } else if !allows_any_additional_property(resolver, set) {
+                    out.push(child_path);
                 }
             }
         }
         Value::Array(items) => {
-            let item_schema = schema
-                .and_then(Value::as_object)
-                .and_then(|o| o.get("items"))
-                .filter(|v| v.is_object());
             for (i, item) in items.iter().enumerate() {
-                collect_undeclared_paths(item_schema, item, &format!("{path}[{i}]"), out);
+                let item_set = resolver.item_schemas(set, Some(i));
+                collect_undeclared_paths(resolver, &item_set, item, &format!("{path}[{i}]"), out);
             }
         }
         _ => {}
@@ -1254,8 +1174,9 @@ fn collect_undeclared_paths(
 /// accept far more values than the form exposes (extra routes, `extraDeploy`, sidecars,
 /// ServiceAccounts), and those would bypass the locked values and route guards.
 pub fn undeclared_value_paths(schema: &Value, values: &Value) -> Vec<String> {
+    let resolver = SchemaResolver::new(schema);
     let mut out = Vec::new();
-    collect_undeclared_paths(Some(schema), values, "", &mut out);
+    collect_undeclared_paths(&resolver, &[schema], values, "", &mut out);
     out.sort();
     out
 }
@@ -3120,6 +3041,274 @@ spec:
                 .iter()
                 .any(|e| e.field_path == "/oauth/0/secret" && e.message.contains("'pattern'"))
         );
+    }
+
+    /// AST-4: an error on a *parent* of a secret (or at the root) must not quote the parent value.
+    #[test]
+    fn test_parent_and_root_schema_errors_never_echo_secret_children() {
+        fn errors_for(schema: &Value, values: &Value) -> Vec<SchemaFieldError> {
+            match validate_schema_values(schema, values) {
+                Err(CoreError::SchemaValidation(errors)) => errors,
+                other => panic!("expected schema errors, got {other:?}"),
+            }
+        }
+        fn assert_no_echo(label: &str, schema: &Value, values: &Value) -> Vec<SchemaFieldError> {
+            let errors = errors_for(schema, values);
+            let rendered = format!("{errors:?}");
+            assert!(
+                !rendered.contains("TOP-SECRET"),
+                "{label}: schema errors echoed a secret: {rendered}"
+            );
+            errors
+        }
+        for marker in [json!({"writeOnly": true}), json!({"format": "password"})] {
+            let mut secret = json!({"type": "string"});
+            secret
+                .as_object_mut()
+                .unwrap()
+                .extend(marker.as_object().unwrap().clone());
+            let child = json!({"properties": {"password": secret, "user": {"type": "string"}}});
+            let parent_constraints = [
+                (
+                    "anyOf",
+                    json!({"anyOf": [{"required": ["missing"]}, {"maxProperties": 0}]}),
+                ),
+                (
+                    "oneOf",
+                    json!({"oneOf": [{"required": ["missing"]}, {"required": ["other"]}]}),
+                ),
+                ("maxProperties", json!({"maxProperties": 1})),
+                ("minProperties", json!({"minProperties": 5})),
+                ("enum", json!({"enum": [{"password": "x"}]})),
+                ("const", json!({"const": {"password": "x"}})),
+                ("not", json!({"not": {"required": ["password"]}})),
+            ];
+            for (keyword, constraint) in &parent_constraints {
+                let mut auth = child.clone();
+                auth.as_object_mut()
+                    .unwrap()
+                    .extend(constraint.as_object().unwrap().clone());
+                let schema = json!({"type": "object", "properties": {"auth": auth}});
+                let values = json!({"auth": {"password": "TOP-SECRET-1", "user": "u"}});
+                let errors = assert_no_echo(keyword, &schema, &values);
+                assert!(
+                    errors
+                        .iter()
+                        .any(|e| e.field_path == "/auth"
+                            && e.message.contains(&format!("'{keyword}'"))),
+                    "{keyword}: keyword is still named: {errors:?}"
+                );
+
+                // The same constraint on the root object, the secret one level below it.
+                let mut root = child.clone();
+                root.as_object_mut()
+                    .unwrap()
+                    .extend(constraint.as_object().unwrap().clone());
+                let values = json!({"password": "TOP-SECRET-2", "user": "u"});
+                let errors = assert_no_echo(&format!("root {keyword}"), &root, &values);
+                assert!(errors.iter().any(|e| e.field_path.is_empty()));
+            }
+        }
+
+        // `required` on a parent of a secret keeps its useful (value-free) message.
+        let schema = json!({
+            "type": "object",
+            "required": ["name"],
+            "properties": { "token": { "type": "string", "writeOnly": true }, "name": {} }
+        });
+        let errors = assert_no_echo("required", &schema, &json!({"token": "TOP-SECRET-3"}));
+        assert!(
+            errors[0]
+                .message
+                .contains("\"name\" is a required property")
+        );
+
+        // Secrets reached through `$ref` and `patternProperties` are redacted as well.
+        let schema = json!({
+            "$defs": { "pw": { "type": "string", "writeOnly": true, "minLength": 50 } },
+            "properties": {
+                "admin": { "$ref": "#/$defs/pw" },
+                "env": { "patternProperties": { "^SECRET_": { "format": "password", "pattern": "^x" } } }
+            }
+        });
+        let errors = assert_no_echo(
+            "ref/pattern",
+            &schema,
+            &json!({"admin": "TOP-SECRET-4", "env": {"SECRET_A": "TOP-SECRET-5"}}),
+        );
+        assert_eq!(errors.len(), 2);
+
+        // Extra (heuristic) secret pointers are honoured.
+        let schema = json!({"properties": {"apiToken": {"type": "string", "pattern": "^x"}}});
+        let values = json!({"apiToken": "TOP-SECRET-6"});
+        let Err(CoreError::SchemaValidation(errors)) =
+            validate_schema_values_with_secrets(&schema, &values, &["/apiToken".to_string()])
+        else {
+            panic!("expected schema errors");
+        };
+        assert!(!format!("{errors:?}").contains("TOP-SECRET"));
+        // Without the extra pointer the (non-secret) value is quoted as before.
+        let errors = errors_for(&schema, &values);
+        assert!(errors[0].message.contains("TOP-SECRET-6"));
+
+        // A non-secret object value is masked, a non-secret scalar keeps its detail.
+        let schema = json!({"properties": {"cfg": {"maxProperties": 0}, "n": {"maximum": 1}}});
+        let errors = errors_for(&schema, &json!({"cfg": {"k": "visible"}, "n": 7}));
+        let rendered = format!("{errors:?}");
+        assert!(!rendered.contains("visible"));
+        assert!(rendered.contains('7'));
+    }
+
+    /// AST-3: secrets declared through `$ref`, `patternProperties`, conditionals and every
+    /// combinator branch never land in plaintext values.
+    #[test]
+    fn test_partition_follows_refs_patterns_conditionals_and_all_branches() {
+        let schema = json!({
+            "type": "object",
+            "$defs": { "pw": { "type": "string", "writeOnly": true } },
+            "properties": {
+                "adminPassword": { "$ref": "#/$defs/pw" },
+                "extra": { "type": "object", "patternProperties": { "Token$": { "format": "password" } } },
+                "mode": { "type": "string" }
+            },
+            "if": { "properties": { "mode": { "const": "ldap" } } },
+            "then": { "properties": { "bindPassword": { "writeOnly": true } } },
+            "anyOf": [
+                { "properties": { "apiKey": { "type": "string" } } },
+                { "properties": { "apiKey": { "writeOnly": true } } }
+            ]
+        });
+        let values = json!({
+            "adminPassword": "s1",
+            "extra": { "githubToken": "s2", "org": "acme" },
+            "mode": "local",
+            "bindPassword": "s3",
+            "apiKey": "s4"
+        });
+        let p = partition_values_by_schema(&schema, &values).unwrap();
+        assert_eq!(
+            p.normal_values,
+            json!({"extra": {"org": "acme"}, "mode": "local"})
+        );
+        assert!(!p.normal_values.to_string().contains("s1"));
+        assert_eq!(
+            p.secret_field_paths,
+            vec![
+                "adminPassword",
+                "apiKey",
+                "bindPassword",
+                "extra.githubToken"
+            ]
+        );
+        let fragments =
+            helm_secret_value_fragments(&p.secret_values, &p.secret_field_paths).unwrap();
+        assert_eq!(fragments.len(), 4);
+        assert!(fragments["extra.githubToken"].contains("githubToken: s2"));
+        assert_eq!(
+            stored_secret_paths_still_secret(
+                &schema,
+                &["extra.gitlabToken".to_string(), "extra.org".to_string()]
+            ),
+            vec!["extra.gitlabToken"]
+        );
+        // Declared-but-unsupplied pattern secrets have no static path.
+        assert_eq!(
+            extract_secret_field_paths(&schema),
+            vec!["adminPassword", "apiKey", "bindPassword"]
+        );
+        // Defaults are never filled into a `$ref` secret.
+        let with_default = json!({
+            "$defs": { "pw": { "writeOnly": true, "default": "changeme" } },
+            "properties": { "pw": { "$ref": "#/$defs/pw" }, "n": { "default": 1 } }
+        });
+        assert_eq!(
+            apply_schema_defaults(&with_default, &json!({})),
+            json!({"n": 1})
+        );
+        assert!(is_secret_schema_node(
+            &json!({"$defs": {"a": {"writeOnly": true}}, "$ref": "#/$defs/a"})
+        ));
+    }
+
+    #[test]
+    fn test_undeclared_value_paths_follow_refs_and_patterns() {
+        let schema = json!({
+            "$defs": { "res": { "type": "object", "properties": { "cpu": {} } } },
+            "properties": {
+                "resources": { "$ref": "#/$defs/res" },
+                "labels": { "patternProperties": { "^app\\.": {} } },
+                "list": { "prefixItems": [{ "properties": { "a": {} } }] }
+            }
+        });
+        let values = json!({
+            "resources": { "cpu": 1, "gpu": 1 },
+            "labels": { "app.kubernetes.io/name": "x", "team": "y" },
+            "list": [{ "a": 1, "b": 2 }]
+        });
+        assert_eq!(
+            undeclared_value_paths(&schema, &values),
+            vec!["labels.team", "list[0].b", "resources.gpu"]
+        );
+    }
+
+    #[test]
+    fn test_catalog_parse_fails_closed_on_unreachable_secrets_and_remote_refs() {
+        let app = |schema: &str| {
+            format!(
+                r#"
+apiVersion: keel.io/v1alpha1
+kind: CatalogApplication
+metadata:
+  id: demo
+  name: Demo
+  category: demo
+  runtime: helm
+spec:
+  upstream:
+    repoURL: https://charts.example.com
+    chart: demo
+    version: 1.0.0
+  schema:
+{schema}
+"#
+            )
+        };
+        let hidden = app(
+            "    type: object\n    not:\n      properties:\n        pw:\n          writeOnly: true",
+        );
+        let err = parse_catalog_application(&hidden).unwrap_err().to_string();
+        assert!(err.contains("#/not/properties/pw"), "{err}");
+        assert!(matches!(
+            parse_catalog(&hidden),
+            Err(CoreError::Validation(_))
+        ));
+
+        let remote = app(
+            "    type: object\n    properties:\n      a:\n        $ref: https://example.com/s.json",
+        );
+        let err = parse_catalog_application(&remote).unwrap_err().to_string();
+        assert!(err.contains("not a local reference"), "{err}");
+
+        let supported = app(
+            "    type: object\n    $defs:\n      pw:\n        type: string\n        writeOnly: true\n    properties:\n      adminPassword:\n        $ref: '#/$defs/pw'",
+        );
+        let parsed = parse_catalog_application(&supported).unwrap();
+        assert_eq!(
+            extract_secret_field_paths(&parsed.spec.schema),
+            vec!["adminPassword"]
+        );
+    }
+
+    #[test]
+    fn test_compile_schema_never_fetches_external_references() {
+        // Bypasses the catalog check on purpose: compiling alone must not fetch or read files.
+        for reference in ["https://example.com/schema.json", "file:///etc/passwd"] {
+            let schema = json!({"properties": {"a": {"$ref": reference}}});
+            let err = validate_schema_values(&schema, &json!({"a": 1}))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("Invalid JSON Schema"), "{reference}: {err}");
+        }
     }
 
     #[test]

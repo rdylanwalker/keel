@@ -10,6 +10,8 @@ mod crypto;
 mod kustomize;
 mod management_addon;
 mod models;
+mod secret_heuristic;
+mod secret_schema;
 pub mod yaml;
 
 use thiserror::Error;
@@ -24,15 +26,17 @@ pub use bootstrap::{
 };
 pub use catalog::{
     PartitionedValues, PreparedHelmValues, SchemaFieldError, apply_schema_defaults,
-    changed_immutable_values, extract_manifest_variables, gateway_route_hostnames,
-    helm_secret_value_fragments, is_secret_schema_node, is_tld_wide_wildcard,
-    keel_ingress_parent_refs, manifest_cluster_scoped_kinds, merge_values_patch, parse_catalog,
-    parse_catalog_application, parse_catalog_blueprint, parse_catalog_bundle,
-    partition_values_by_schema, platform_reserved_hostnames, prepare_helm_values,
-    render_helm_values_yaml, render_manifest_template, resolve_helm_gateway_routes,
-    route_hostname_matches, shared_gateway_catch_all_routes, strip_null_values,
+    changed_immutable_values, extract_manifest_variables, extract_secret_field_paths,
+    gateway_route_hostnames, helm_secret_value_fragments, is_secret_schema_node,
+    is_tld_wide_wildcard, keel_ingress_parent_refs, manifest_cluster_scoped_kinds,
+    merge_values_patch, parse_catalog, parse_catalog_application, parse_catalog_blueprint,
+    parse_catalog_bundle, partition_values_by_schema, platform_reserved_hostnames,
+    prepare_helm_values, render_helm_values_yaml, render_manifest_template,
+    resolve_helm_gateway_routes, route_hostname_matches, secret_field_paths_for_values,
+    shared_gateway_catch_all_routes, stored_secret_paths_still_secret, strip_null_values,
     undeclared_value_paths, validate_k8s_manifests_yaml, validate_route_hostnames,
-    validate_schema_values, verify_rendered_manifest_structure,
+    validate_schema_values, validate_schema_values_with_secrets,
+    verify_rendered_manifest_structure,
 };
 pub use crypto::{
     EnvelopeCrypto, SopsConfig, SopsCreationRule, SopsManager, generate_admin_password, sha256_hex,
@@ -61,6 +65,18 @@ pub use models::{
     StackSshInfoResponse, UpstreamSource, clean_candidate_ssh_host, clean_candidate_ssh_user,
     is_private_or_internal_ip, is_private_or_internal_ssh_host, is_unresolved_ssh_target,
     resolve_ssh_host_key_from_sources, resolve_ssh_target_from_sources, validate_https_origin,
+};
+pub use secret_heuristic::{
+    HeuristicPartition, KEY_NAME_SUBJECTS, PASS_NON_SECRETS, REFERENCE_SUFFIXES, SECRET_KEY_WORDS,
+    SECRET_OVERRIDES_FILE, SecretNotice, SecretNoticeReason, drop_blank_values_at_paths,
+    heuristic_secret_candidates, heuristic_secret_pointers, looks_like_secret_key,
+    looks_like_secret_key_under, mask_secret_values, overridden_stored_secrets_left_blank,
+    parse_secret_overrides, partition_values_with_heuristics, render_secret_overrides,
+    stored_heuristic_secret_paths, validate_non_secret_paths,
+};
+pub use secret_schema::{
+    SchemaResolver, SecretValueLocation, restore_standalone_keywords, standalone_subschema,
+    validate_secret_schema_support, validate_standalone_subschema,
 };
 
 pub use yaml::{replace_yaml_document, split_yaml_documents, to_yaml_documents};

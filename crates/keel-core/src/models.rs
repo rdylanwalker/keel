@@ -1395,6 +1395,8 @@ impl CatalogApplication {
                 "spec.schema must be a JSON Schema object".to_string(),
             ));
         }
+        // Fail closed on secret fields the partitioner could not find (`NFR-SEC-05`).
+        crate::secret_schema::validate_secret_schema_support(&self.spec.schema)?;
         if let Some(ns) = &self.spec.placement.namespace {
             validate_dns_label(ns, "spec.placement.namespace")?;
             if !self.spec.placement.requires_remote_cluster() {
@@ -1713,6 +1715,8 @@ impl CatalogInfraBlueprint {
                 "spec.schema must be a JSON Schema object".to_string(),
             ));
         }
+        // Fail closed on secret fields the partitioner could not find (`NFR-SEC-05`).
+        crate::secret_schema::validate_secret_schema_support(&self.spec.schema)?;
         Ok(())
     }
 
@@ -1811,6 +1815,17 @@ pub struct CatalogBundle {
 }
 
 impl CatalogBundle {
+    /// The self-contained schema of item `item_id` declared in the bundle schema
+    /// (`spec.schema.properties.<item_id>`, with the bundle's `$defs`/`definitions`, see
+    /// [`crate::standalone_subschema`]), or `None` when the bundle schema does not declare it.
+    pub fn item_schema(&self, item_id: &str) -> Option<serde_json::Value> {
+        self.spec
+            .schema
+            .get("properties")
+            .and_then(|p| p.get(item_id))
+            .map(|sub| crate::secret_schema::standalone_subschema(&self.spec.schema, sub))
+    }
+
     /// Validates `CatalogBundle` envelope, metadata, item references, `targetClusterFrom` rules, and acyclic DAG.
     pub fn validate(&self) -> Result<(), CoreError> {
         if self.api_version != CATALOG_API_VERSION {
@@ -1843,6 +1858,31 @@ impl CatalogBundle {
             return Err(CoreError::Validation(
                 "spec.schema must be a JSON Schema object".to_string(),
             ));
+        }
+        // Fail closed on secret fields the partitioner could not find (`NFR-SEC-05`).
+        crate::secret_schema::validate_secret_schema_support(&self.spec.schema)?;
+        // Each item's values are partitioned and masked with its own self-contained schema
+        // ([`Self::item_schema`]): a `$ref` it cannot resolve would hide a secret there.
+        for item in &self.spec.items {
+            if let Some(sub) = self
+                .spec
+                .schema
+                .get("properties")
+                .and_then(|p| p.get(&item.id))
+            {
+                crate::secret_schema::validate_standalone_subschema(&self.spec.schema, sub)
+                    .map_err(|e| {
+                        let e = match e {
+                            CoreError::Validation(msg) => msg,
+                            other => other.to_string(),
+                        };
+                        CoreError::Validation(format!(
+                            "spec.schema.properties.{}: {e}; a bundle item's schema may only \
+                             reference the bundle schema's $defs/definitions",
+                            item.id
+                        ))
+                    })?;
+            }
         }
         if self.spec.items.is_empty() {
             return Err(CoreError::Validation(

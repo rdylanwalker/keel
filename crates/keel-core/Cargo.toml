@@ -13,6 +13,7 @@ noyalib.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 jsonschema.workspace = true
+fancy-regex.workspace = true
 aes-gcm.workspace = true
 sha2.workspace = true
 rand.workspace = true

@@ -2068,6 +2068,7 @@ dependencies = [
  "aes-gcm",
  "async-trait",
  "base64 0.23.1",
+ "fancy-regex",
  "hex",
  "jsonschema",
  "noyalib",
