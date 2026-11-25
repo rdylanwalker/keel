@@ -1,3 +1,15 @@
+## [0.16.0](https://github.com/rdylanwalker/keel/compare/v0.15.0...v0.16.0) (2026-11-25)
+
+### Features
+
+* **cli:** mark secret-looking values as not secret on install and provision ([296073a](https://github.com/rdylanwalker/keel/commit/296073a64c9658642d5e5da61527cc936a9281fb))
+* **ui:** flag secret-looking fields and let users mark them not secret ([40176a8](https://github.com/rdylanwalker/keel/commit/40176a8c1bc8137045208512b9b28674432e253d))
+
+### Bug Fixes
+
+* **core:** resolve secret schemas fully and keep secrets out of errors ([5c1b8b1](https://github.com/rdylanwalker/keel/commit/5c1b8b13d99d6962475582b9e09bab3f03c00f7e))
+* **server:** encrypt secret-looking values and mask config responses ([629c16d](https://github.com/rdylanwalker/keel/commit/629c16dd97742fe45711418cdd4c3653ac8683fb))
+
 ## [0.15.0](https://github.com/rdylanwalker/keel/compare/v0.14.0...v0.15.0) (2026-11-25)
 
 ### Features

@@ -55,7 +55,7 @@ spec:
   upstream:
     repoURL: https://github.com/rdylanwalker/keel
     path: ./manifests.yaml
-    version: "0.15.0"
+    version: "0.16.0"
   placement:
     scope: cluster
     namespace: keel-system

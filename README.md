@@ -55,12 +55,12 @@ This follows the path the live E2E suite tests: `e2e/tests/09-readme-quickstart.
 
 <!-- quickstart:begin  (the marked blocks up to quickstart:end are executed by e2e/tests/09-readme-quickstart.spec.ts; keep the markers in place) -->
 
-**1. Install the binary (Linux x86_64).** This README describes v0.15.0, so the commands pin that release; for a newer release, read the docs at its tag. Other platforms: see the [release page](https://github.com/rdylanwalker/keel/releases/tag/v0.15.0).
+**1. Install the binary (Linux x86_64).** This README describes v0.16.0, so the commands pin that release; for a newer release, read the docs at its tag. Other platforms: see the [release page](https://github.com/rdylanwalker/keel/releases/tag/v0.16.0).
 
 <!-- quickstart:step install install -->
 ```bash
 mkdir -p ~/.local/bin && cd "$(mktemp -d)"
-base=https://github.com/rdylanwalker/keel/releases/download/v0.15.0
+base=https://github.com/rdylanwalker/keel/releases/download/v0.16.0
 curl -fsSL -O "$base/keel-linux-amd64.tar.gz" -O "$base/SHA256SUMS"
 sha256sum -c SHA256SUMS --ignore-missing   # macOS: shasum -a 256 -c SHA256SUMS --ignore-missing
 tar -xzf keel-linux-amd64.tar.gz -C ~/.local/bin keel

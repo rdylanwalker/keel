@@ -37,4 +37,4 @@ configMapGenerator:
       - KEEL_GIT_USERNAME=keel
 images:
   - name: ghcr.io/rdylanwalker/keel
-    newTag: "0.15.0"
+    newTag: "0.16.0"
