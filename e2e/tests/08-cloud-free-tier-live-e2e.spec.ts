@@ -4,6 +4,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
+import { classifyPreviewResponse, type PreviewVerdict } from './support/preview-report.js';
+
 /**
  * Multi-Cloud Free-Tier Live E2E Suite (Stage 1 VMs via `kind` Management Cluster)
  *
@@ -555,6 +557,76 @@ test.describe('08 - Multi-Cloud Free-Tier Dual-Guard Contract & Blueprint Valida
     ).toBe(true);
   });
 
+  test('08.0c - Preview poller requires a final PKO report with resource changes', () => {
+    const response = (report: unknown) => ({
+      prId: '7',
+      previewKey: 'default-7',
+      scope: 'default',
+      report,
+    });
+    const create = {
+      urn: 'urn:a',
+      resourceType: 'aws:ec2/instance:Instance',
+      name: 'vm',
+      op: 'create',
+    };
+
+    // `previewKey` alone (the old text match) must never count as a finished preview.
+    expect(classifyPreviewResponse(response({ source: 'synthesized', resources: [] })).state).toBe(
+      'waiting',
+    );
+    for (const phase of ['pending', 'running']) {
+      expect(
+        classifyPreviewResponse(
+          response({ source: 'synthesized', run: { phase }, resources: [create] }),
+        ).state,
+      ).toBe('waiting');
+    }
+
+    const failed = classifyPreviewResponse(
+      response({
+        source: 'pko',
+        run: { phase: 'failed', message: 'provider credentials missing' },
+      }),
+    );
+    expect(failed).toMatchObject({ state: 'failed', status: 'pko/failed' });
+    expect(failed.state === 'failed' && failed.reason).toBe(
+      'phase failed: provider credentials missing',
+    );
+
+    const notExecuted = classifyPreviewResponse(
+      response({ source: 'synthesized', run: { phase: 'notExecuted' }, resources: [create] }),
+    );
+    expect(notExecuted).toMatchObject({ state: 'failed', status: 'synthesized/notExecuted' });
+    expect(notExecuted.state === 'failed' && notExecuted.reason).toContain('no reason reported');
+
+    const longReason = classifyPreviewResponse(
+      response({ source: 'pko', run: { phase: 'failed', message: 'x'.repeat(2_000) } }),
+    );
+    expect(longReason.state === 'failed' && longReason.reason.length).toBeLessThan(600);
+
+    expect(
+      classifyPreviewResponse(
+        response({ source: 'synthesized', run: { phase: 'succeeded' }, resources: [create] }),
+      ).state,
+    ).toBe('failed');
+    expect(
+      classifyPreviewResponse(
+        response({
+          source: 'pko',
+          run: { phase: 'succeeded' },
+          resources: [{ ...create, op: 'same' }],
+        }),
+      ).state,
+    ).toBe('failed');
+
+    expect(
+      classifyPreviewResponse(
+        response({ source: 'pko', run: { phase: 'succeeded' }, resources: [create] }),
+      ),
+    ).toEqual({ state: 'succeeded', status: 'pko/succeeded', changes: 1 });
+  });
+
   test('08.0b - Free-tier catalog blueprints & Stage 0 k3s templates exist on disk with required outputs', () => {
     const deployDir = path.resolve(process.cwd(), '../deploy');
 
@@ -921,37 +993,46 @@ test.describe('08.1 - Multi-Cloud Free-Tier Stage 1 Live E2E (kind Management Cl
         `Polling preview diff for proposal #${prId} (timeout ${previewTimeoutSec}s)...`,
         provider,
       );
+      // Parse the report: every response carries `previewKey`, so only a final PKO run that
+      // succeeded with real resource changes proves the cloud-credential preview worked.
       const prevStart = Date.now();
       let prevLastLog = 0;
-      const done = await pollUntil(
-        async () => {
-          const prevRes = await request.get(
-            `${BASE_URL}/api/v1/tenants/${tenant}/proposals/${prId}/preview`,
+      let verdict: PreviewVerdict = { state: 'waiting', status: 'no response yet' };
+      while (Date.now() - prevStart < PREVIEW_TIMEOUT_MS) {
+        const prevRes = await request.get(
+          `${BASE_URL}/api/v1/tenants/${tenant}/proposals/${prId}/preview`,
+        );
+        if (prevRes.ok()) {
+          verdict = classifyPreviewResponse(await prevRes.json());
+          if (verdict.state !== 'waiting') break;
+        } else {
+          verdict = { state: 'waiting', status: `http ${prevRes.status()}` };
+        }
+        if (Date.now() - prevLastLog > 15_000) {
+          const elapsed = Math.round((Date.now() - prevStart) / 1000);
+          logStep(
+            `Still waiting for preview #${prId} (${verdict.status}, ${elapsed}s/${previewTimeoutSec}s)...`,
+            provider,
           );
-          if (prevRes.ok()) {
-            const body = await prevRes.text();
-            if (body.includes('+ Create') || body.includes('create') || body.includes('preview')) {
-              return true;
-            }
-          }
-          if (Date.now() - prevLastLog > 15_000) {
-            const elapsed = Math.round((Date.now() - prevStart) / 1000);
-            logStep(
-              `Still waiting for preview #${prId} (${elapsed}s/${previewTimeoutSec}s)...`,
-              provider,
-            );
-            prevLastLog = Date.now();
-          }
-          return false;
-        },
-        PREVIEW_TIMEOUT_MS,
-        5_000,
-      );
-      const previewReady = done;
+          prevLastLog = Date.now();
+        }
+        await new Promise((resolve) => setTimeout(resolve, 5_000));
+      }
+      if (verdict.state === 'failed') {
+        throw new Error(
+          `[${provider}] PKO preview for proposal #${prId} did not succeed (${verdict.status}): ${verdict.reason}`,
+        );
+      }
       expect(
-        previewReady,
-        `[${provider}] Timed out after ${previewTimeoutSec}s waiting for preview #${prId}`,
-      ).toBe(true);
+        verdict.state,
+        `[${provider}] Timed out after ${previewTimeoutSec}s waiting for a final PKO preview for #${prId} (last status ${verdict.status})`,
+      ).toBe('succeeded');
+      if (verdict.state === 'succeeded') {
+        logStep(
+          `Preview #${prId} executed by PKO and succeeded (${verdict.changes} resource change(s))`,
+          provider,
+        );
+      }
 
       logStep(`Merging proposal #${prId}...`, provider);
       let mergeRes = await request.post(
