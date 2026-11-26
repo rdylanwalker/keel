@@ -4240,6 +4240,264 @@ spec:
     assert!(tenants_kustomization.contains("acme/infra/my-gcp-vm/secret.enc.yaml"));
 }
 
+/// NEW-1: an infrastructure stack keeps its stored secrets on edit like Helm and manifest apps:
+/// a declared secret and a name-heuristic secret (`apiToken`, moved out of `values.yaml` on
+/// provision) left blank or omitted keep their SOPS ciphertext and their `Stack` reference, also
+/// for the CLI's `mergeStoredValues` re-provision. Non-credential secrets reach the program as
+/// Pulumi secret config of the same key (`secretsRef`), where `${apiToken}` reads them.
+#[tokio::test]
+async fn test_infra_edit_keeps_stored_declared_and_heuristic_secrets() {
+    let fixture = setup_fixture().await;
+    let cookie = login_and_get_cookie(&fixture).await;
+    commit_to_main(
+        &fixture,
+        &[
+            (
+                "catalog/infra/token-vm/catalog.yaml",
+                r#"apiVersion: keel.io/v1alpha1
+kind: CatalogInfraBlueprint
+metadata:
+  id: token-vm
+  name: Token VM
+  category: Compute
+  provider: proxmox
+spec:
+  pulumiRuntime: yaml
+  entrypoint: Pulumi.yaml
+  protectByDefault: false
+  schema:
+    type: object
+    required: [vmName, dbPassword]
+    properties:
+      vmName:
+        type: string
+      region:
+        type: string
+      apiToken:
+        type: string
+      dbPassword:
+        type: string
+        writeOnly: true
+        minLength: 8
+"#,
+            ),
+            (
+                "catalog/infra/token-vm/Pulumi.yaml",
+                "name: token-vm\nruntime: yaml\nconfig:\n  apiToken:\n    type: string\n    secret: true\nresources: {}\n",
+            ),
+        ],
+        "feat(catalog): token-vm blueprint",
+    )
+    .await;
+    let workdir = fixture.state.repo_workdir.clone();
+    let dir = workdir.join("tenants/acme/infra/vm1");
+    let assert_refs = |stack: &Value, keys: &[&str]| {
+        let refs = stack["spec"]["secretsRef"]
+            .as_object()
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(
+            refs.keys().map(String::as_str).collect::<Vec<_>>(),
+            keys,
+            "{stack}"
+        );
+        for key in keys {
+            assert_eq!(refs[*key]["type"], "Secret");
+            assert_eq!(refs[*key]["secret"]["name"], "vm1-secrets");
+            assert_eq!(refs[*key]["secret"]["key"], *key);
+            assert!(stack["spec"]["envRefs"].get(*key).is_none(), "{stack}");
+        }
+    };
+
+    // Provision: `apiToken` is a heuristic secret, `dbPassword` a declared one.
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "token-vm", "name": "vm1",
+                "values": { "vmName": "vm-a", "apiToken": "TOKEN-ONE-SECRET",
+                            "dbPassword": "PW-ONE-SECRET" } }),
+    )
+    .await;
+    if sops_unavailable(status, &body) {
+        return;
+    }
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(
+        secret_notices(&body),
+        vec![("apiToken".to_string(), "heuristicSecret".to_string())]
+    );
+    checkout_proposal_branch(&fixture, &body).await;
+    assert!(!read_tree(&dir).contains("SECRET"));
+    let stack = read_yaml(&dir.join("stack.yaml"));
+    assert_eq!(stack["spec"]["config"]["vmName"], "vm-a");
+    assert!(stack["spec"]["config"].get("apiToken").is_none());
+    assert_refs(&stack, &["apiToken", "dbPassword"]);
+    // The SOPS-encrypted Secret is the only copy (no separate encrypted values file).
+    assert!(!dir.join("secrets.enc.yaml").exists());
+    let stored = std::fs::read_to_string(dir.join("secret.enc.yaml")).unwrap();
+    assert_eq!(sops_secret_keys(&stored), vec!["apiToken", "dbPassword"]);
+    merge_proposal_and_sync(&fixture, &cookie, &body).await;
+
+    // GUI edit: the masked secrets come back blank (`""`) or omitted and keep their values.
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "token-vm", "name": "vm1",
+                "values": { "vmName": "vm-b", "apiToken": "" } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(
+        secret_notices(&body),
+        vec![("apiToken".to_string(), "heuristicSecret".to_string())]
+    );
+    checkout_proposal_branch(&fixture, &body).await;
+    let stack = read_yaml(&dir.join("stack.yaml"));
+    assert_eq!(stack["spec"]["config"]["vmName"], "vm-b");
+    assert_refs(&stack, &["apiToken", "dbPassword"]);
+    assert_eq!(
+        std::fs::read_to_string(dir.join("secret.enc.yaml")).unwrap(),
+        stored,
+        "blank secrets keep the stored ciphertext"
+    );
+    assert!(
+        tenants_kustomization_resources(&fixture)
+            .contains(&"acme/infra/vm1/secret.enc.yaml".to_string())
+    );
+    merge_proposal_and_sync(&fixture, &cookie, &body).await;
+
+    // CLI re-provision (`mergeStoredValues`): a partial patch re-entering one secret keeps the
+    // other stored one and the committed plaintext values.
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "token-vm", "name": "vm1",
+                "mergeStoredValues": true,
+                "values": { "region": "eu", "dbPassword": "PW-TWO-SECRET" } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    checkout_proposal_branch(&fixture, &body).await;
+    let stack = read_yaml(&dir.join("stack.yaml"));
+    assert_eq!(stack["spec"]["config"]["vmName"], "vm-b");
+    assert_eq!(stack["spec"]["config"]["region"], "eu");
+    assert_refs(&stack, &["apiToken", "dbPassword"]);
+    let merged = std::fs::read_to_string(dir.join("secret.enc.yaml")).unwrap();
+    assert!(!merged.contains("SECRET"));
+    let plain = decrypt_tenant_secret(&fixture, &merged).await;
+    assert_eq!(
+        plain["stringData"],
+        json!({ "apiToken": "TOKEN-ONE-SECRET", "dbPassword": "PW-TWO-SECRET" })
+    );
+    merge_proposal_and_sync(&fixture, &cookie, &body).await;
+
+    // Marking the stored heuristic secret not secret needs the value again ...
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "token-vm", "name": "vm1",
+                "nonSecretPaths": ["apiToken"], "values": { "vmName": "vm-b" } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body.contains("Marked not secret but left blank: apiToken"),
+        "{body}"
+    );
+    // ... and, re-entered, moves it to plaintext config: the Secret and the Stack drop it.
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "token-vm", "name": "vm1",
+                "nonSecretPaths": ["apiToken"],
+                "values": { "vmName": "vm-b", "apiToken": "now-plain" } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    checkout_proposal_branch(&fixture, &body).await;
+    let stack = read_yaml(&dir.join("stack.yaml"));
+    assert_eq!(stack["spec"]["config"]["apiToken"], "now-plain");
+    assert_refs(&stack, &["dbPassword"]);
+    let remaining = std::fs::read_to_string(dir.join("secret.enc.yaml")).unwrap();
+    assert_eq!(sops_secret_keys(&remaining), vec!["dbPassword"]);
+    assert_eq!(
+        decrypt_tenant_secret(&fixture, &remaining).await["stringData"],
+        json!({ "dbPassword": "PW-TWO-SECRET" })
+    );
+}
+
+/// A stack value cannot be split between plaintext config and the Secret under one top-level
+/// key: the program receives each top-level value whole.
+#[tokio::test]
+async fn test_infra_proposal_rejects_secret_nested_beside_plaintext() {
+    let fixture = setup_fixture().await;
+    let cookie = login_and_get_cookie(&fixture).await;
+    commit_to_main(
+        &fixture,
+        &[(
+            "catalog/infra/nested-vm/catalog.yaml",
+            r#"apiVersion: keel.io/v1alpha1
+kind: CatalogInfraBlueprint
+metadata:
+  id: nested-vm
+  name: Nested VM
+  category: Compute
+  provider: proxmox
+spec:
+  pulumiRuntime: yaml
+  entrypoint: Pulumi.yaml
+  protectByDefault: false
+  schema:
+    type: object
+    properties:
+      cloudInit:
+        type: object
+        additionalProperties: true
+"#,
+        )],
+        "feat(catalog): nested-vm blueprint",
+    )
+    .await;
+    let head = fixture
+        .state
+        .git_runner
+        .rev_parse(&fixture.state.repo_workdir, "HEAD")
+        .await
+        .unwrap();
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "nested-vm", "name": "nv",
+                "values": { "cloudInit": { "apiKey": "NESTED-KEY-SECRET", "user": "ops" } } }),
+    )
+    .await;
+    if sops_unavailable(status, &body) {
+        return;
+    }
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("'cloudInit'"), "{body}");
+    assert!(!body.contains("NESTED-KEY-SECRET"), "{body}");
+    assert_eq!(
+        fixture
+            .state
+            .git_runner
+            .rev_parse(&fixture.state.repo_workdir, "HEAD")
+            .await
+            .unwrap(),
+        head
+    );
+    // Marked not secret, the whole object is plaintext config.
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "nested-vm", "name": "nv",
+                "nonSecretPaths": ["cloudInit.apiKey"],
+                "values": { "cloudInit": { "apiKey": "not-a-secret", "user": "ops" } } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+}
+
 #[tokio::test]
 async fn test_remote_canary_kustomization_creates_target_namespace_first() {
     let fixture = setup_fixture().await;
@@ -8942,6 +9200,151 @@ spec:
             .await
             .unwrap(),
         head_before
+    );
+}
+
+/// NEW-2: editing one item of a custom-named bundle through `POST /proposals` rebuilds its
+/// documents but keeps the `keel.io/bundle-catalog-id` label, so
+/// `GET /bundles/{ns}/{name}/config` still masks the item with the bundle schema (a field only
+/// the bundle declares secret).
+#[tokio::test]
+async fn test_bundle_item_edit_keeps_bundle_catalog_id_label() {
+    let fixture = setup_fixture().await;
+    let cookie = login_and_get_cookie(&fixture).await;
+    seed_rauthy_catalog(&fixture).await;
+    commit_to_main(
+        &fixture,
+        &[(
+            "catalog/bundles/idp-bundle/catalog.yaml",
+            r#"apiVersion: keel.io/v1alpha1
+kind: CatalogBundle
+metadata:
+  id: idp-bundle
+  name: IdP Bundle
+  category: security-identity
+spec:
+  items:
+    - id: idp
+      kind: app
+      catalogRef: rauthy
+    - id: web
+      kind: app
+      catalogRef: grafana
+  schema:
+    type: object
+    properties:
+      idp:
+        type: object
+        properties:
+          adminEmail:
+            type: string
+            writeOnly: true
+          encKey:
+            type: string
+            writeOnly: true
+          hiqliteSecretRaft:
+            type: string
+            writeOnly: true
+          hiqliteSecretApi:
+            type: string
+            writeOnly: true
+          adminPassword:
+            type: string
+            writeOnly: true
+        additionalProperties: true
+      web:
+        type: object
+        properties:
+          contactEmail:
+            type: string
+            writeOnly: true
+        additionalProperties: true
+"#,
+        )],
+        "feat(catalog): idp-bundle",
+    )
+    .await;
+    let workdir = fixture.state.repo_workdir.clone();
+    let item_dir = |item: &str| workdir.join(format!("tenants/acme/bundles/corp/{item}"));
+    let label = |path: std::path::PathBuf| {
+        read_yaml(&path)["metadata"]["labels"]["keel.io/bundle-catalog-id"].clone()
+    };
+
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "idp-bundle", "kind": "bundle", "name": "corp",
+                "values": { "idp": rauthy_values("idp.acme.example"),
+                            "web": { "replicas": 1, "contactEmail": "ops@acme.example" } } }),
+    )
+    .await;
+    if sops_unavailable(status, &body) {
+        return;
+    }
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    merge_proposal_and_sync(&fixture, &cookie, &body).await;
+    assert_eq!(
+        label(item_dir("idp").join("flux-kustomization.yaml")),
+        "idp-bundle"
+    );
+
+    // Edit each item on its own (`<bundle>-<item>`): the item schema does not declare the
+    // fields secret, so they are committed in plaintext.
+    let mut idp_values = rauthy_values_without_secrets("login.acme.example");
+    idp_values["adminEmail"] = json!("corp-admin@acme.example");
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "rauthy", "name": "corp-idp",
+                "values": idp_values }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    checkout_proposal_branch(&fixture, &body).await;
+    for file in ["flux-kustomization.yaml", "config-kustomization.yaml"] {
+        let doc = read_yaml(&item_dir("idp").join(file));
+        assert_eq!(
+            doc["metadata"]["labels"]["keel.io/bundle"], "corp",
+            "{file}"
+        );
+        assert_eq!(
+            doc["metadata"]["labels"]["keel.io/bundle-item"], "idp",
+            "{file}"
+        );
+    }
+    assert_eq!(
+        label(item_dir("idp").join("flux-kustomization.yaml")),
+        "idp-bundle"
+    );
+    merge_proposal_and_sync(&fixture, &cookie, &body).await;
+
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "grafana", "name": "corp-web",
+                "values": { "replicas": 2, "contactEmail": "web-team@acme.example" } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    checkout_proposal_branch(&fixture, &body).await;
+    assert_eq!(
+        label(item_dir("web").join("helmrelease.yaml")),
+        "idp-bundle"
+    );
+    merge_proposal_and_sync(&fixture, &cookie, &body).await;
+
+    let app = build_router(fixture.state.clone());
+    let (status, config) =
+        get_json_status(&app, "/api/v1/bundles/tenant-acme/corp/config", &cookie).await;
+    assert_eq!(status, StatusCode::OK, "{config}");
+    let text = config.to_string();
+    for plain in ["corp-admin@acme.example", "web-team@acme.example"] {
+        assert!(!text.contains(plain), "{plain} not masked: {config}");
+    }
+    assert_eq!(config["values"]["web"]["replicas"], 2, "{config}");
+    assert_eq!(
+        config["values"]["idp"]["hostname"], "login.acme.example",
+        "{config}"
     );
 }
 

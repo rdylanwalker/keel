@@ -38,7 +38,7 @@ Keel is alpha software. This page collects the limitations and open bugs a user 
 
 ## Apps and Canaries
 
-- **Editing an infrastructure stack does not keep its secrets.** Apps (Helm and manifest) and bundle items keep a secret field left blank on Edit, but a stack re-encrypts only the secrets you submit. The web UI's Edit form keeps stack secret fields required, so re-enter every one.
+- **A stack secret nested beside plaintext values is rejected.** An infrastructure stack receives each top-level value whole, as one Pulumi config value or environment variable, so a secret inside an object that also holds plaintext values (for example a name-matched `cloudInit.apiKey` next to `cloudInit.user`) fails the proposal with `400`. Mark the nested value not secret, or make the whole object secret (`writeOnly`). A secret object is stored and kept on Edit as a whole: re-enter all of it to change any part.
 - **The web UI cannot clear a stored secret.** A secret field left blank on Edit keeps its stored value. To unset an optional secret, submit `""` for it through the API or a CLI values file.
 - **Canary analysis is not tested.** E2E checks that a canary deploys and initializes, but not traffic shifting, promotion or rollback.
 - **Apps are served over HTTPS only.** Canary apps are reachable through `keel-ingress` at `https://<host>:8888` on local `kind`. Plain HTTP on port 8888 does not respond.

@@ -68,7 +68,8 @@ pub(super) fn build_infra_secret_manifest_yaml(
     Ok((yaml, keys))
 }
 
-/// SOPS-encrypted `<name>-secrets` `Secret` of a committed Flux manifest app.
+/// SOPS-encrypted `<name>-secrets` `Secret` of a committed Flux manifest app, Helm app or
+/// infrastructure stack.
 pub(super) struct StoredManifestAppSecret {
     ciphertext: String,
     /// `stringData` / `data` keys (SOPS keeps key names in plaintext).
@@ -105,7 +106,31 @@ pub(super) async fn read_stored_manifest_app_secret(
     } else {
         dir.join(HELM_APP_SECRETS_FILE)
     };
-    let ciphertext = read_contained_to_string(repo_workdir, &path).await.ok()?;
+    read_stored_secret_file(repo_workdir, &path).await
+}
+
+/// File of an infrastructure stack's SOPS-encrypted `<name>-secrets` `Secret`: one key per
+/// top-level secret value, referenced by the `Stack`'s `secretsRef` / `envRefs`
+/// ([`crate::routes::attach_infra_secret_refs`]).
+pub(super) const INFRA_SECRET_FILE: &str = "secret.enc.yaml";
+
+/// Reads the committed `<name>-secrets` `Secret` of the infrastructure stack in `rel_dir`
+/// ([`INFRA_SECRET_FILE`]), so an edit keeps the secrets it leaves blank.
+pub(super) async fn read_stored_infra_secret(
+    repo_workdir: &Path,
+    rel_dir: &str,
+) -> Option<StoredManifestAppSecret> {
+    let path = repo_workdir.join(rel_dir).join(INFRA_SECRET_FILE);
+    read_stored_secret_file(repo_workdir, &path).await
+}
+
+/// Parses a committed SOPS-encrypted `Secret` at `path`: `None` when it is absent, not
+/// SOPS-encrypted, not a `Secret`, or has no keys. Values are never decrypted here.
+async fn read_stored_secret_file(
+    repo_workdir: &Path,
+    path: &Path,
+) -> Option<StoredManifestAppSecret> {
+    let ciphertext = read_contained_to_string(repo_workdir, path).await.ok()?;
     let doc = noyalib::from_str::<Value>(&ciphertext).ok()?;
     if doc.get("sops").is_none() || doc.get("kind").and_then(Value::as_str) != Some("Secret") {
         return None;
@@ -476,7 +501,9 @@ fn manifest_placeholder_secret_fields(schema_secret_paths: &[String]) -> Vec<Str
 ///
 /// * The schema has no secret fields: `None` (any stored secret is removed).
 /// * Nothing stored: a fresh `Secret` of the submitted values (`None` when none were submitted).
-/// * Stored, no secret values submitted (edit): the stored ciphertext, unchanged.
+/// * Stored, no secret values submitted (edit): the stored ciphertext, unchanged, unless a
+///   stored key is no longer a secret field (then decrypted, filtered and re-encrypted).
+/// * Nothing left after dropping keys that are no longer secret fields: `None`.
 /// * Stored, every stored key re-submitted: a fresh `Secret` of the submitted values.
 /// * Stored, some keys re-submitted: the stored `Secret` is decrypted with the tenant `age` key,
 ///   the submitted keys are overlaid, and the result is re-encrypted.
@@ -504,9 +531,20 @@ pub(super) async fn resolve_tenant_app_secret(
             !submitted.contains_key(*key) && !stored.is_some_and(|s| s.keys.contains(*key))
         })
         .collect();
+    // Stored keys whose field is no longer a secret field (catalog schema change, or marked
+    // not secret) are dropped.
+    let still_secret = |key: &str| {
+        schema_secret_paths.iter().any(|p| {
+            p == key || p.starts_with(&format!("{key}.")) || p.starts_with(&format!("{key}["))
+        })
+    };
     let mut merged = match stored {
         None if submitted.is_empty() && missing_defaults.is_empty() => return Ok(None),
-        Some(stored) if submitted.is_empty() && missing_defaults.is_empty() => {
+        Some(stored)
+            if submitted.is_empty()
+                && missing_defaults.is_empty()
+                && stored.keys.iter().all(|k| still_secret(k)) =>
+        {
             return Ok(Some((stored.ciphertext.clone(), stored.keys.clone())));
         }
         Some(stored) if !stored.keys.iter().all(|k| submitted.contains_key(k)) => {
@@ -514,16 +552,14 @@ pub(super) async fn resolve_tenant_app_secret(
         }
         _ => std::collections::BTreeMap::new(),
     };
-    // Drop stored keys whose field is no longer a secret field of the catalog schema.
-    merged.retain(|key, _| {
-        schema_secret_paths.iter().any(|p| {
-            p == key || p.starts_with(&format!("{key}.")) || p.starts_with(&format!("{key}["))
-        })
-    });
+    merged.retain(|key, _| still_secret(key));
     for key in missing_defaults {
         merged.insert(key.clone(), String::new());
     }
     merged.extend(submitted);
+    if merged.is_empty() {
+        return Ok(None);
+    }
     let keys = merged.keys().cloned().collect();
     let merged_values = Value::Object(
         merged

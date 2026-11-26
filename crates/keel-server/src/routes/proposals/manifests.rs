@@ -791,3 +791,72 @@ pub(super) async fn read_flux_depends_on(
         })
         .collect()
 }
+
+/// Committed documents of a bundle item that carry its bundle labels.
+const BUNDLE_ITEM_LABELLED_FILES: [&str; 4] = [
+    "flux-kustomization.yaml",
+    "helmrelease.yaml",
+    "helmrelease-canary.yaml",
+    "stack.yaml",
+];
+
+/// The [`crate::routes::BUNDLE_CATALOG_ID_LABEL`] of the bundle item committed in `rel_dir` (the
+/// first one found on its Flux/PKO documents), so a single-item edit keeps the bundle catalog
+/// item the deployment came from. `None` when absent, unparsable, or not a DNS label.
+pub(super) async fn read_bundle_catalog_id(repo_workdir: &Path, rel_dir: &str) -> Option<String> {
+    for file in BUNDLE_ITEM_LABELLED_FILES {
+        let path = repo_workdir.join(rel_dir).join(file);
+        let Ok(raw) = read_contained_to_string(repo_workdir, &path).await else {
+            continue;
+        };
+        let found = keel_core::split_yaml_documents(&raw)
+            .into_iter()
+            .filter_map(|doc| noyalib::from_str::<Value>(&doc).ok())
+            .find_map(|doc| {
+                doc.get("metadata")
+                    .and_then(|m| m.get("labels"))
+                    .and_then(|l| l.get(crate::routes::BUNDLE_CATALOG_ID_LABEL))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            });
+        if let Some(id) = found {
+            return keel_core::validate_dns_label(&id, "bundle catalog id")
+                .is_ok()
+                .then_some(id);
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn bundle_catalog_id_is_read_from_the_item_documents() {
+        let dir = tempfile::tempdir().unwrap();
+        let rel = "tenants/acme/bundles/shop/web";
+        let item = dir.path().join(rel);
+        std::fs::create_dir_all(&item).unwrap();
+        assert_eq!(read_bundle_catalog_id(dir.path(), rel).await, None);
+
+        // Multi-document file: the label on any document counts.
+        std::fs::write(
+            item.join("helmrelease.yaml"),
+            "kind: HelmRepository\nmetadata:\n  name: r\n---\nkind: HelmRelease\nmetadata:\n  labels:\n    keel.io/bundle-catalog-id: ref-stack\n",
+        )
+        .unwrap();
+        assert_eq!(
+            read_bundle_catalog_id(dir.path(), rel).await.as_deref(),
+            Some("ref-stack")
+        );
+
+        // The Flux Kustomization is read first; a value that is not a DNS label is ignored.
+        std::fs::write(
+            item.join("flux-kustomization.yaml"),
+            "kind: Kustomization\nmetadata:\n  labels:\n    keel.io/bundle-catalog-id: \"../x\"\n",
+        )
+        .unwrap();
+        assert_eq!(read_bundle_catalog_id(dir.path(), rel).await, None);
+    }
+}

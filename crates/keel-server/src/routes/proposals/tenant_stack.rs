@@ -410,9 +410,63 @@ pub(super) fn populate_stack_config_from_values(
     }
 }
 
+/// Fails when a top-level stack value would be split between plaintext `Stack.spec.config`
+/// (`normal_values`) and the `<instance>-secrets` Secret (`secret_keys`): a secret nested in an
+/// object with plaintext siblings (e.g. a key-name match `cloudInit.apiKey`). Each top-level key
+/// reaches the Pulumi program as one config value or environment variable, so the program would
+/// see only one half. The error names paths only, never values.
+pub(super) fn ensure_stack_values_split_by_top_level_key(
+    normal_values: &Value,
+    secret_keys: &[String],
+) -> Result<(), ServerError> {
+    let Some(normal) = normal_values.as_object() else {
+        return Ok(());
+    };
+    let mixed: Vec<&str> = secret_keys
+        .iter()
+        .filter(|k| normal.get(k.as_str()).is_some_and(|v| !v.is_null()))
+        .map(String::as_str)
+        .collect();
+    if mixed.is_empty() {
+        return Ok(());
+    }
+    Err(ServerError::BadRequest(format!(
+        "Infrastructure stack values {} mix secret and plaintext fields under one top-level key; \
+         a stack receives each top-level value as a whole (Pulumi config or environment \
+         variable). Mark the nested secret not secret (nonSecretPaths), or make the whole object \
+         secret (writeOnly)",
+        mixed
+            .iter()
+            .map(|k| format!("'{k}'"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn stack_values_must_not_split_a_top_level_key() {
+        let keys = vec!["apiToken".to_string(), "cloudInit".to_string()];
+        assert!(
+            ensure_stack_values_split_by_top_level_key(&json!({ "region": "eu" }), &keys).is_ok()
+        );
+        assert!(
+            ensure_stack_values_split_by_top_level_key(&json!({ "cloudInit": null }), &keys)
+                .is_ok()
+        );
+        let err = ensure_stack_values_split_by_top_level_key(
+            &json!({ "cloudInit": { "passwordFile": "/etc/pw" } }),
+            &keys,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("'cloudInit'"), "{err}");
+        assert!(!err.contains("/etc/pw"), "{err}");
+    }
 
     #[test]
     fn pulumi_project_name_matches_committed_pulumi_yaml_never_display_name() {

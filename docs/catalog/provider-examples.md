@@ -4,7 +4,7 @@ Each example below provides a ready-to-use `catalog.yaml` (`CatalogInfraBlueprin
 
 Remember to enable the corresponding provider on **Control Plane & Providers** (or in `providers/registry.yaml`) so the blueprint appears in **Catalog & Form Wizard**.
 
-> **Credential & API Key Secrets:** Properties marked with `writeOnly: true` (and `format: password`) are partitioned out of plaintext `Stack.spec.config`, encrypted with SOPS + `age` into `secret.enc.yaml`, and injected into the PKO v2 workspace pod via `Stack.spec.envRefs` using the exact property name as the environment variable name.
+> **Credential & API Key Secrets:** Properties marked with `writeOnly: true` (and `format: password`) are partitioned out of plaintext `Stack.spec.config` and encrypted with SOPS + `age` into `secret.enc.yaml`. A property named like an environment variable (`HCLOUD_TOKEN`) is injected into the PKO v2 workspace pod via `Stack.spec.envRefs` under that exact name; any other secret property (`dbPassword`) becomes Pulumi secret config of the same name via `Stack.spec.secretsRef`. See [Catalog overview](overview.md) for the AWS/Azure/GCP credential mappings.
 
 ---
 

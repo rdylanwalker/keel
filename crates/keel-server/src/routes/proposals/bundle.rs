@@ -23,8 +23,8 @@ use crate::auth::AuthSession;
 use crate::error::ServerError;
 use crate::proposal_repo::{ScopeRepo, TenantIndex};
 use crate::routes::{
-    create_dir_all_contained, load_catalog_manifest_for_tenant, next_unique_branch_timestamp,
-    read_contained_optional, stage_commit_push_in, write_contained,
+    BUNDLE_CATALOG_ID_LABEL, create_dir_all_contained, load_catalog_manifest_for_tenant,
+    next_unique_branch_timestamp, read_contained_optional, stage_commit_push_in, write_contained,
 };
 use crate::state::AppState;
 
@@ -327,7 +327,7 @@ pub(super) async fn create_bundle_proposal(
         // Which bundle catalog item the deployment came from (its instance name may differ):
         // `GET /bundles/{ns}/{name}/config` masks the item with that bundle's schema.
         bundle_labels.insert(
-            "keel.io/bundle-catalog-id".to_string(),
+            BUNDLE_CATALOG_ID_LABEL.to_string(),
             bundle.metadata.id.clone(),
         );
 

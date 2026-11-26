@@ -402,7 +402,8 @@ pub trait PreviewCluster: Send + Sync {
     /// `tenant-<id>` into `keel-previews` under their per-preview names, labelled
     /// `keel.io/secret-kind=preview-provider-credentials`, `keel.io/tenant` and
     /// `keel.io/pr-id=<pr_id>` (normalized like the preview `Stack` label). Copies carrying
-    /// `proposed_data` use those PR values instead of the live tenant Secret. Fails if a source
+    /// `proposed_data` use those PR values instead of the live tenant Secret; keys the PR does
+    /// not propose (stored secrets an edit keeps) come from the live Secret. Fails if a source
     /// Secret or referenced key is missing.
     ///
     /// Runs **before** the preview `Stack` is applied: PKO resolves `spec.gitAuth`/`envRefs`
@@ -491,8 +492,15 @@ fn preview_copy_payload(
     }
     let mut out = BTreeMap::new();
     for key in &copy.keys {
-        let value = match (&copy.proposed_data, tenant_secret) {
-            (Some(proposed), _) => proposed.get(key).map(|v| v.as_bytes().to_vec()),
+        // A PR-proposed value wins; a key the PR keeps (an edit leaving a stored secret blank)
+        // comes from the live tenant Secret.
+        let proposed = copy
+            .proposed_data
+            .as_ref()
+            .and_then(|p| p.get(key))
+            .map(|v| v.as_bytes().to_vec());
+        let value = match (proposed, tenant_secret) {
+            (Some(value), _) => Some(value),
             (None, Some(live)) => live.get(key).cloned(),
             (None, None) => {
                 return Err(KubeError::InvalidInput(format!(
@@ -1014,7 +1022,12 @@ impl PreviewCluster for KubePreviewCluster {
             Api::namespaced(self.client.clone(), KEEL_PREVIEWS_NAMESPACE);
         let mut created = Vec::new();
         for copy in copies {
-            let live = if copy.proposed_data.is_some() {
+            // The live Secret is only read for keys the PR does not propose.
+            let fully_proposed = copy
+                .proposed_data
+                .as_ref()
+                .is_some_and(|p| copy.keys.iter().all(|k| p.contains_key(k)));
+            let live = if fully_proposed {
                 None
             } else {
                 tenant_api.get_opt(&copy.source_name).await?.map(|s| {
@@ -1900,6 +1913,36 @@ spec:
             keys: keys.iter().map(|k| k.to_string()).collect(),
             proposed_data: None,
         }
+    }
+
+    #[test]
+    fn partially_proposed_copies_keep_live_values_for_kept_keys() {
+        let mut partial = copy(
+            "vm1-secrets",
+            "keel-preview-5-vm1-secrets",
+            &["apiToken", "dbPassword"],
+        );
+        partial.proposed_data = Some(BTreeMap::from([(
+            "dbPassword".to_string(),
+            "new-pw".to_string(),
+        )]));
+        let live = BTreeMap::from([
+            ("apiToken".to_string(), b"stored-token".to_vec()),
+            ("dbPassword".to_string(), b"old-pw".to_vec()),
+        ]);
+        let payload = preview_copy_payload(&partial, Some(&live)).unwrap();
+        assert_eq!(payload["dbPassword"], b"new-pw");
+        assert_eq!(payload["apiToken"], b"stored-token");
+        // A kept key needs the live Secret (a brand-new stack proposes every key).
+        assert!(preview_copy_payload(&partial, None).is_err());
+        let fully = PreviewSecretCopy {
+            keys: BTreeSet::from(["dbPassword".to_string()]),
+            ..partial.clone()
+        };
+        assert_eq!(
+            preview_copy_payload(&fully, None).unwrap()["dbPassword"],
+            b"new-pw"
+        );
     }
 
     #[tokio::test]

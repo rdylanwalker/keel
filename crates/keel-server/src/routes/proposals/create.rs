@@ -4,8 +4,8 @@ use axum::Json;
 use axum::extract::{Path as AxumPath, State};
 use axum::http::StatusCode;
 use keel_core::{
-    AppRuntime, CatalogManifest, ManifestEngine, SopsManager, apply_schema_defaults,
-    merge_values_patch, render_helm_values_yaml, tenant_namespace, validate_dns_label,
+    AppRuntime, CatalogManifest, ManifestEngine, apply_schema_defaults, merge_values_patch,
+    render_helm_values_yaml, tenant_namespace, validate_dns_label,
 };
 use keel_kube::{
     FluxDependencyRef, HelmChartSourceKind, HelmChartSourceRef, HelmReleaseSpecInput,
@@ -23,7 +23,7 @@ use crate::error::ServerError;
 use crate::preview_lifecycle::launch_pko_preview;
 use crate::proposal_repo::{ScopeRepo, TenantIndex};
 use crate::routes::{
-    attach_infra_secret_refs, create_dir_all_contained, exists_contained,
+    BUNDLE_CATALOG_ID_LABEL, attach_infra_secret_refs, create_dir_all_contained, exists_contained,
     load_catalog_manifest_for_tenant, next_unique_branch_timestamp, read_contained_optional,
     read_contained_to_string, resolve_tenant_resource_dir, stage_commit_push_in, write_contained,
 };
@@ -39,8 +39,8 @@ use super::guards::{
 use super::manifests::{
     FLUX_MANIFEST_APP_KUSTOMIZATION_FILES, FluxManifestAppFiles, FluxManifestAppLayoutInput,
     HelmAppExtrasInput, build_flux_manifest_app_files, build_remote_canary_files,
-    helm_app_canary_input, helm_repository_yaml, prepare_helm_app_extras, read_flux_depends_on,
-    remove_stale_entries, render_manifest_app, write_relative_files,
+    helm_app_canary_input, helm_repository_yaml, prepare_helm_app_extras, read_bundle_catalog_id,
+    read_flux_depends_on, remove_stale_entries, render_manifest_app, write_relative_files,
 };
 use super::pr::{OpenedProposal, PushedProposal, open_proposal_pr, publish_proposal};
 use super::preview::{ProposedChange, synthesize_proposal_report};
@@ -48,13 +48,14 @@ use super::preview_inputs::{
     apply_preview_source_trust, attach_preview_cluster_inputs, plan_preview_credentials,
 };
 use super::secrets::{
-    EffectiveSecrets, build_infra_secret_manifest_yaml, effective_non_secret_paths,
-    heuristic_secret_hint, partition_effective_secrets, read_secret_overrides,
-    read_stored_manifest_app_secret, resolve_manifest_app_secret, tenant_sops_recipients,
-    write_secret_overrides,
+    EffectiveSecrets, INFRA_SECRET_FILE, effective_non_secret_paths, heuristic_secret_hint,
+    partition_effective_secrets, read_secret_overrides, read_stored_infra_secret,
+    read_stored_manifest_app_secret, render_secret_string_data, resolve_manifest_app_secret,
+    resolve_tenant_app_secret, write_secret_overrides,
 };
 use super::tenant_stack::{
-    apply_tenant_source_trust, attach_tenant_stack_credentials, populate_stack_config_from_values,
+    apply_tenant_source_trust, attach_tenant_stack_credentials,
+    ensure_stack_values_split_by_top_level_key, populate_stack_config_from_values,
     read_pulumi_project_name, resolve_tenant_stack_source, tenant_stack_backend_url,
     tenant_stack_git_source,
 };
@@ -212,6 +213,22 @@ pub async fn create_proposal(
         .as_ref()
         .map(|r| r.rel_dir.clone())
         .unwrap_or_else(|| format!("tenants/{}/{subdir}/{instance_name}", req.tenant));
+    // A bundle item edited on its own keeps the bundle catalog item it was deployed from (the
+    // documents are rebuilt below), so its bundle's config read still masks it with the
+    // bundle schema.
+    let bundle_catalog_id = match bundle_item {
+        Some(_) => read_bundle_catalog_id(&repo.workdir, &own_rel_dir).await,
+        None => None,
+    };
+    let bundle_labels = |labels: &mut std::collections::BTreeMap<String, String>| {
+        if let Some((bundle_name, item_id)) = &bundle_item {
+            labels.insert("keel.io/bundle".to_string(), bundle_name.clone());
+            labels.insert("keel.io/bundle-item".to_string(), item_id.clone());
+            if let Some(id) = &bundle_catalog_id {
+                labels.insert(BUNDLE_CATALOG_ID_LABEL.to_string(), id.clone());
+            }
+        }
+    };
     // Helm apps (`HelmRelease` path): secrets, routes and NetworkPolicy via `HelmAppExtras`.
     // Their secrets are applied by the root tenants Kustomization: no `<name>-config`.
     let is_helm_app = is_app && manifest_engine.is_none();
@@ -242,10 +259,13 @@ pub async fn create_proposal(
         let stored = read_stored_values(&repo.workdir, &own_rel_dir).await?;
         req.values = merge_values_patch(&stored, &req.values);
     }
-    // Edit (Flux manifest and Helm apps): secret fields left blank or omitted keep the committed
-    // values (the UI never receives them); provided ones replace them.
+    // Edit (Flux manifest apps, Helm apps and infrastructure stacks): secret fields left blank or
+    // omitted keep the committed values (the UI never receives them); provided ones replace
+    // them. Pulumi-engine manifest apps cannot have secret fields (rejected below).
     let stored_manifest_secret = if manifest_engine == Some(ManifestEngine::Flux) || is_helm_app {
         read_stored_manifest_app_secret(&repo.workdir, &own_rel_dir).await
+    } else if !is_app {
+        read_stored_infra_secret(&repo.workdir, &own_rel_dir).await
     } else {
         None
     };
@@ -295,59 +315,50 @@ pub async fn create_proposal(
         )));
     }
     let values_yaml = render_helm_values_yaml(&partitioned.normal_values)?;
-    let plaintext_secrets_yaml = match partitioned.secret_values.as_object() {
-        Some(obj) if !obj.is_empty() => Some(render_helm_values_yaml(&partitioned.secret_values)?),
-        _ => None,
-    };
 
     let tenant_ns = tenant_namespace(&req.tenant)?;
     let infra_secret_name = format!("{instance_name}-secrets");
 
-    // Encrypt extracted secret fields via SOPS + age before touching Git (`SDD.md` §6.3)
-    let (encrypted_secrets_yaml, encrypted_infra_k8s_secret_yaml, infra_secret_keys) =
-        // Flux manifest apps and Helm apps commit only the `<instance>-secrets` Secret
-        // (resolved below / in `prepare_helm_app_extras`).
-        if let Some(plaintext_secrets) = plaintext_secrets_yaml
-            .as_ref()
-            .filter(|_| manifest_engine != Some(ManifestEngine::Flux) && !is_helm_app)
-        {
-            let sops = SopsManager::new();
-            let sops_recipients = tenant_sops_recipients(&state, &req.tenant).await?;
-            let enc_values = sops
-                .encrypt_yaml(&sops_recipients, plaintext_secrets)
-                .await?;
-            let (enc_k8s_secret, keys) = if !is_app || manifest_engine == Some(ManifestEngine::Pulumi) {
-                let (plain_k8s_secret, keys) = build_infra_secret_manifest_yaml(
-                    &infra_secret_name,
-                    &tenant_ns,
-                    &partitioned.secret_values,
-                )?;
-                let enc_k8s = sops
-                    .encrypt_k8s_secret_yaml(&sops_recipients, &plain_k8s_secret)
-                    .await?;
-                (Some(enc_k8s), keys)
-            } else {
-                (None, Vec::new())
-            };
-            (Some(enc_values), enc_k8s_secret, keys)
+    // Encrypt extracted secret fields via SOPS + age before touching Git (`SDD.md` §6.3).
+    // Flux manifest apps and infrastructure stacks commit the `<instance>-secrets` Secret
+    // resolved against the stored one (blank secrets keep their stored values); Helm apps
+    // resolve theirs in `prepare_helm_app_extras`.
+    let (encrypted_infra_k8s_secret_yaml, infra_secret_keys) =
+        if manifest_engine == Some(ManifestEngine::Flux) {
+            let secret = resolve_manifest_app_secret(
+                &state,
+                &req.tenant,
+                &tenant_ns,
+                &infra_secret_name,
+                schema,
+                &partitioned.secret_field_paths,
+                &partitioned.secret_values,
+                stored_manifest_secret.as_ref(),
+            )
+            .await?;
+            (secret, Vec::new())
+        } else if !is_app {
+            match resolve_tenant_app_secret(
+                &state,
+                &req.tenant,
+                &tenant_ns,
+                &infra_secret_name,
+                &partitioned.secret_field_paths,
+                render_secret_string_data(&partitioned.secret_values),
+                &[],
+                stored_manifest_secret.as_ref(),
+            )
+            .await?
+            {
+                Some((ciphertext, keys)) => (Some(ciphertext), keys.into_iter().collect()),
+                None => (None, Vec::new()),
+            }
         } else {
-            (None, None, Vec::new())
+            (None, Vec::new())
         };
-    let encrypted_infra_k8s_secret_yaml = if manifest_engine == Some(ManifestEngine::Flux) {
-        resolve_manifest_app_secret(
-            &state,
-            &req.tenant,
-            &tenant_ns,
-            &infra_secret_name,
-            schema,
-            &partitioned.secret_field_paths,
-            &partitioned.secret_values,
-            stored_manifest_secret.as_ref(),
-        )
-        .await?
-    } else {
-        encrypted_infra_k8s_secret_yaml
-    };
+    if !is_app {
+        ensure_stack_values_split_by_top_level_key(&partitioned.normal_values, &infra_secret_keys)?;
+    }
 
     let helm_extras = match &manifest {
         CatalogManifest::Application(app) if is_helm_app => {
@@ -443,9 +454,8 @@ pub async fn create_proposal(
                     labels.insert("keel.io/engine".to_string(), "flux".to_string());
                     labels.insert("keel.io/catalog-id".to_string(), req.catalog_id.clone());
                     let mut depends_on = Vec::new();
-                    if let Some((ref bundle_name, ref item_id)) = bundle_item {
-                        labels.insert("keel.io/bundle".to_string(), bundle_name.clone());
-                        labels.insert("keel.io/bundle-item".to_string(), item_id.clone());
+                    bundle_labels(&mut labels);
+                    if bundle_item.is_some() {
                         // Keep the bundle ordering of the item's Kustomization on edit.
                         depends_on = read_flux_depends_on(
                             &repo.workdir,
@@ -585,14 +595,8 @@ pub async fn create_proposal(
                     namespace: Some(tenant_ns.clone()),
                 },
             );
-            if let Some((ref bundle_name, ref item_id)) = bundle_item {
-                hr_input
-                    .extra_labels
-                    .insert("keel.io/bundle".to_string(), bundle_name.clone());
-                hr_input
-                    .extra_labels
-                    .insert("keel.io/bundle-item".to_string(), item_id.clone());
-
+            bundle_labels(&mut hr_input.extra_labels);
+            if bundle_item.is_some() {
                 let abs_dir = repo.workdir.join(&rel_dir);
                 let existing_hr_path =
                     if tokio::fs::try_exists(abs_dir.join("helmrelease-canary.yaml"))
@@ -1020,14 +1024,7 @@ pub async fn create_proposal(
                     app,
                     &partitioned.normal_values,
                 );
-                if let Some((ref bundle_name, ref item_id)) = bundle_item {
-                    canary_input
-                        .extra_labels
-                        .insert("keel.io/bundle".to_string(), bundle_name.clone());
-                    canary_input
-                        .extra_labels
-                        .insert("keel.io/bundle-item".to_string(), item_id.clone());
-                }
+                bundle_labels(&mut canary_input.extra_labels);
                 let canary_yaml = synthesize_flagger_canary_yaml(&canary_input)?;
                 let np_yaml = synthesize_canary_gateway_network_policy_yaml(
                     &req.tenant,
@@ -1096,14 +1093,19 @@ pub async fn create_proposal(
             staged_paths.push(format!("{rel_dir}/Pulumi.yaml"));
 
             if let Some(enc_k8s_secret) = &encrypted_infra_k8s_secret_yaml {
-                let secret_path = target_dir.join("secret.enc.yaml");
+                let secret_path = target_dir.join(INFRA_SECRET_FILE);
                 write_contained(workdir, &secret_path, enc_k8s_secret).await?;
-                staged_paths.push(format!("{rel_dir}/secret.enc.yaml"));
-                bundle_item_kustomize_resources.push("secret.enc.yaml".to_string());
+                staged_paths.push(format!("{rel_dir}/{INFRA_SECRET_FILE}"));
+                bundle_item_kustomize_resources.push(INFRA_SECRET_FILE.to_string());
                 extra_kustomize_resources.push(format!(
-                    "{}/infra/{instance_name}/secret.enc.yaml",
+                    "{}/infra/{instance_name}/{INFRA_SECRET_FILE}",
                     req.tenant
                 ));
+            } else {
+                // No secret value left (none stored or submitted, or all marked not secret):
+                // the Stack no longer references the Secret.
+                remove_stale_entries(workdir, &rel_dir, &[INFRA_SECRET_FILE], &mut staged_paths)
+                    .await?;
             }
         }
 
@@ -1221,14 +1223,6 @@ pub async fn create_proposal(
         resources
             .retain(|r| !r.starts_with(&own_prefix) || workdir.join("tenants").join(r).is_file());
         staged_paths.push(index.store(workdir, &resources).await?);
-
-        if manifest_engine.is_none()
-            && let Some(enc_yaml) = encrypted_secrets_yaml
-        {
-            let enc_path = target_dir.join("secrets.enc.yaml");
-            write_contained(workdir, &enc_path, enc_yaml).await?;
-            staged_paths.push(format!("{rel_dir}/secrets.enc.yaml"));
-        }
 
         let commit_msg = format!(
             "feat({}): propose {} {}",

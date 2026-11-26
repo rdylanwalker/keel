@@ -24,6 +24,34 @@ use crate::state::AppState;
 
 static LAST_BRANCH_TS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Label recording the bundle catalog item a bundle item was deployed from (its instance name
+/// may differ): written on every Flux/PKO document of the item, kept on single-item edits, and
+/// read by `GET /bundles/{ns}/{name}/config` to mask the item with that bundle's schema.
+pub(crate) const BUNDLE_CATALOG_ID_LABEL: &str = "keel.io/bundle-catalog-id";
+
+/// Whether `key` is shaped like an environment variable name (`[A-Z_][A-Z0-9_]*`), the
+/// documented convention for provider credentials read from the workspace environment
+/// (`HCLOUD_TOKEN`, `PROXMOX_VE_API_TOKEN`, ...).
+fn is_env_var_name(key: &str) -> bool {
+    let mut chars = key.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_uppercase() || c == '_')
+        && chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+}
+
+/// Binds the keys of an infrastructure stack's `<instance>-secrets` Secret to its PKO `Stack`:
+///
+/// * known cloud provider credentials map to the provider's config keys (`aws:accessKey`,
+///   `aws:secretKey` via `secretsRef`, so the S3 state backend's `AWS_*` variables stay intact)
+///   or standard environment variables (`ARM_*`, `GOOGLE_CREDENTIALS`);
+/// * other keys shaped like an environment variable (`HCLOUD_TOKEN`) become `envRefs` of the
+///   same name, read by Terraform-bridged providers;
+/// * every other key (`dbPassword`, a name-heuristic `apiToken`) becomes a Pulumi **secret
+///   config** value of the same name via `secretsRef`: exactly where the same value would be
+///   in `spec.config` were it not secret, so a blueprint reads `${dbPassword}` either way.
+///
+/// Only Secret references are written: no plaintext reaches Git or the `Stack`.
 pub(crate) fn attach_infra_secret_refs(
     env_refs: &mut std::collections::BTreeMap<String, keel_pko::PkoEnvRef>,
     secrets_ref: &mut std::collections::BTreeMap<String, keel_pko::PkoEnvRef>,
@@ -58,8 +86,11 @@ pub(crate) fn attach_infra_secret_refs(
             "googleCredentials" | "GOOGLE_CREDENTIALS" => {
                 env_refs.insert("GOOGLE_CREDENTIALS".to_string(), ref_val);
             }
-            other => {
+            other if is_env_var_name(other) => {
                 env_refs.insert(other.to_string(), ref_val);
+            }
+            other => {
+                secrets_ref.insert(other.to_string(), ref_val);
             }
         }
     }
@@ -2478,6 +2509,9 @@ spec:
                 "AWS_SECRET_ACCESS_KEY".to_string(),
                 "ARM_CLIENT_ID".to_string(),
                 "GOOGLE_CREDENTIALS".to_string(),
+                "HCLOUD_TOKEN".to_string(),
+                "dbPassword".to_string(),
+                "apiToken".to_string(),
             ],
         );
         assert!(secrets_ref.contains_key("aws:accessKey"));
@@ -2486,6 +2520,22 @@ spec:
         assert!(!env_refs.contains_key("AWS_SECRET_ACCESS_KEY"));
         assert!(env_refs.contains_key("ARM_CLIENT_ID"));
         assert!(env_refs.contains_key("GOOGLE_CREDENTIALS"));
+        // Env-var-shaped keys stay environment variables (Terraform-bridged providers).
+        assert_eq!(env_refs["HCLOUD_TOKEN"].secret.key, "HCLOUD_TOKEN");
+        assert!(!secrets_ref.contains_key("HCLOUD_TOKEN"));
+        // Any other key is Pulumi secret config of the same name (`${dbPassword}`), never an
+        // environment variable the program cannot read.
+        for key in ["dbPassword", "apiToken"] {
+            assert_eq!(secrets_ref[key].secret.name, "aws-vm-secrets");
+            assert_eq!(secrets_ref[key].secret.key, key);
+            assert!(!env_refs.contains_key(key));
+        }
+        assert!(is_env_var_name("PROXMOX_VE_API_TOKEN"));
+        assert!(is_env_var_name("_X1"));
+        assert!(!is_env_var_name("apiToken"));
+        assert!(!is_env_var_name("Api_TOKEN"));
+        assert!(!is_env_var_name("1TOKEN"));
+        assert!(!is_env_var_name(""));
 
         // 3. Non-admin tenant-alpha user is denied diagnostics & config reads for tenant-default and system namespaces
         let alpha_user = AuthSession {

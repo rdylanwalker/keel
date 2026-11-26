@@ -371,6 +371,52 @@ test.describe('02 - Catalog Dynamic Forms & PR Proposal Generation', () => {
     await expect(preview).not.toContainText(heuristic);
   });
 
+  test('02.12 - Editing an infrastructure stack keeps its stored secrets', async ({ page }) => {
+    const api = await apiAs(USERS.admin);
+    const name = uniq('kcsec');
+    const token = `HeurT0ken-${uniq('tk')}`;
+    // `apiToken` is not in the kind-cluster schema: secret by its key name, so it is moved out
+    // of values.yaml into the SOPS-encrypted `<name>-secrets` Secret.
+    const created = await createProposal(api, {
+      tenant: 'acme',
+      catalogId: 'kind-cluster',
+      name,
+      values: { nodeCount: 1, apiToken: token },
+    });
+    const dir = `tenants/acme/infra/${name}`;
+    expect(treeContains(created.branch, token)).toBe(false);
+    const stored = showFile(created.branch, `${dir}/secret.enc.yaml`);
+    expect(stored).toMatch(/apiToken: ENC\[AES256_GCM,/);
+    const merged = await api.post(proposalPath(created.proposal, 'merge'));
+    expect(merged.status(), await merged.text()).toBe(200);
+    const configRes = await api.get(`/api/v1/stacks/tenant-acme/${name}/config`);
+    expect(configRes.status()).toBe(200);
+    expect(await configRes.text()).not.toContain(token);
+    await api.dispose();
+
+    // The GUI edit cannot show the stored secret; editing another field keeps it.
+    await uiLogin(page, USERS.admin);
+    await openTab(page, 'Topology Map');
+    await page.getByRole('button', { name: `Edit stack ${name}` }).click();
+    const modal = page.getByTestId('deploy-instance-modal');
+    await expect(modal).toBeVisible();
+    await expect(modal.getByLabel('values.yaml preview')).not.toContainText(token);
+    await modal.getByLabel(/nodeCount/).fill('2');
+    const proposed = page.waitForResponse(
+      (r) =>
+        r.request().method() === 'POST' && /\/api\/v1\/tenants\/acme\/proposals$/.test(r.url()),
+    );
+    await modal.getByRole('button', { name: /Submit & Open Git PR Proposal/i }).click();
+    const res = await proposed;
+    expect(res.status(), await res.text()).toBe(201);
+    const edit = (await res.json()) as { branch: string };
+    expect(showFile(edit.branch, `${dir}/secret.enc.yaml`)).toBe(stored);
+    const stack = showFile(edit.branch, `${dir}/stack.yaml`);
+    // Pulumi secret config of the same key, never plaintext in the Stack.
+    expect(stack).toMatch(/secretsRef:\s+apiToken:/);
+    expect(stack).not.toContain(token);
+  });
+
   test('02.6 - Deploy dialog closes with Escape without opening a PR', async ({ page }) => {
     await uiLogin(page, USERS.admin);
     const modal = await openPodinfoDeployForm(page);

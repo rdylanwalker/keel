@@ -21,8 +21,9 @@ use crate::state::{AppState, MANAGEMENT_TENANT, ReleaseSummary, StackSummary};
 use crate::proposal_repo::{ScopeRepo, TenantIndex};
 
 use super::{
-    RepoReader, exists_contained, load_catalog_manifest_for_tenant, read_contained_to_string,
-    remove_dir_all_contained, resolve_tenant_resource_dir, stage_commit_push_in,
+    BUNDLE_CATALOG_ID_LABEL, RepoReader, exists_contained, load_catalog_manifest_for_tenant,
+    read_contained_to_string, remove_dir_all_contained, resolve_tenant_resource_dir,
+    stage_commit_push_in,
 };
 
 /// Query parameters for `GET /api/v1/stacks`.
@@ -885,9 +886,6 @@ pub struct BundleConfigResponse {
     /// The items' persisted "not secret" overrides that still apply, as `<item>.<path>`.
     pub non_secret_paths: Vec<String>,
 }
-
-/// Label recording the bundle catalog item a bundle item was deployed from.
-const BUNDLE_CATALOG_ID_LABEL: &str = "keel.io/bundle-catalog-id";
 
 /// The catalog schemas that may describe bundle item `item_id` of a deployed bundle, for masking
 /// its values; the caller masks with all of them (masking can only get stricter):

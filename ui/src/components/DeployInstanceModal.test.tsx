@@ -764,30 +764,71 @@ describe("DeployInstanceModal validation, secrets and server errors", () => {
     })
   })
 
-  it("keeps infrastructure secrets required on edit (stacks do not keep blank secrets)", async () => {
+  it("keeps stored infrastructure secrets on edit like app secrets", async () => {
+    vi.mocked(api.createProposal).mockResolvedValue({
+      id: "1",
+      title: "t",
+      branch: "b",
+      tenant: "default",
+      scope: "default",
+      status: "open",
+      createdAt: "now",
+    })
+    const infraItem: CatalogItem = {
+      ...secretItem,
+      type: "infra",
+      runtime: undefined,
+      schema: {
+        type: "object",
+        required: ["dbPassword", "host"],
+        properties: {
+          host: { type: "string", title: "Host" },
+          dbPassword: {
+            type: "string",
+            title: "Database Password",
+            writeOnly: true,
+          },
+          apiToken: { type: "string", title: "API Token" },
+        },
+      },
+    }
     render(
       <DeployInstanceModal
         isOpen
         onClose={vi.fn()}
-        catalogItem={{ ...secretItem, type: "infra", runtime: undefined }}
+        catalogItem={infraItem}
         tenant="default"
         isEditMode
         initialConfig={{ name: "svc", values: { host: "h" } }}
       />
     )
-    const token = screen.getByLabelText(/API Secret Token/)
-    expect(token).toHaveAttribute("type", "password")
-    expect(token).not.toHaveAttribute(
-      "placeholder",
-      "Leave blank to keep existing secret"
+    // Declared and name-heuristic secrets both open blank with the keep hint.
+    for (const label of [/Database Password/, /API Token/]) {
+      const field = screen.getByLabelText(label)
+      expect(field).toHaveAttribute("type", "password")
+      expect(field).toHaveAttribute(
+        "placeholder",
+        "Leave blank to keep existing secret"
+      )
+    }
+    // Marking the stored heuristic secret not secret asks to re-enter it.
+    fireEvent.click(
+      screen.getByRole("checkbox", { name: "Not a secret: apiToken" })
     )
+    expect(screen.getByTestId("heuristic-secret-reenter")).toBeInTheDocument()
+    fireEvent.click(
+      screen.getByRole("checkbox", { name: "Not a secret: apiToken" })
+    )
+    expect(screen.queryByTestId("heuristic-secret-reenter")).toBeNull()
+
     fireEvent.click(
       screen.getByRole("button", { name: /Submit & Open Git PR Proposal/i })
     )
-    expect(
-      await screen.findByText("API Secret Token is required")
-    ).toBeInTheDocument()
-    expect(api.createProposal).not.toHaveBeenCalled()
+    await waitFor(() => expect(api.createProposal).toHaveBeenCalled())
+    expect(screen.queryByText(/is required/)).toBeNull()
+    expect(vi.mocked(api.createProposal).mock.calls[0][0].values).toEqual({
+      host: "h",
+    })
   })
 
   it("refills a missing schema default when an edit opens (documented in Schema Defaults)", async () => {

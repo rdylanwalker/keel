@@ -293,10 +293,9 @@ const DeployInstanceModalBody: React.FC<DeployInstanceModalProps> = (props) => {
   const itemSchema = activeItem?.schema
   const itemType = activeItem?.type
   const bundleItems = activeItem?.bundleItems
-  // Edit: app (Helm and manifest) and bundle secrets left blank keep their stored values, so
-  // they are optional and hint so. Infrastructure stacks re-encrypt only the submitted
-  // secrets: their secret fields stay required and must be re-entered.
-  const keepsStoredSecrets = isEditMode && itemType !== "infra"
+  // Edit: secrets left blank keep their stored values for every kind (Helm and manifest apps,
+  // infrastructure stacks, bundles), so they are optional and hint so.
+  const keepsStoredSecrets = isEditMode
   const schemaHeuristicPaths = useMemo(
     () => (heuristicEnabled ? heuristicSecretSchemaPaths(itemSchema) : []),
     [heuristicEnabled, itemSchema]
