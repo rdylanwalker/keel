@@ -9,6 +9,7 @@ import {
   openTab,
   proposalPath,
   showFile,
+  tenantProposalsPath,
   uiLogin,
   uniq,
 } from './support/harness.js';
@@ -392,6 +393,18 @@ test.describe('02 - Catalog Dynamic Forms & PR Proposal Generation', () => {
     const configRes = await api.get(`/api/v1/stacks/tenant-acme/${name}/config`);
     expect(configRes.status()).toBe(200);
     expect(await configRes.text()).not.toContain(token);
+    // Re-submitting the committed values (the secret left blank keeps its stored value)
+    // changes nothing: a clear 400, not a server error.
+    const unchanged = await api.post(tenantProposalsPath('acme'), {
+      data: {
+        tenant: 'acme',
+        catalogId: 'kind-cluster',
+        name,
+        values: { nodeCount: 1, apiToken: '' },
+      },
+    });
+    expect(unchanged.status()).toBe(400);
+    expect(await unchanged.text()).toContain('No changes to propose');
     await api.dispose();
 
     // The GUI edit cannot show the stored secret; editing another field keeps it.

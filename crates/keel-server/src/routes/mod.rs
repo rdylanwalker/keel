@@ -630,7 +630,8 @@ where
 
 /// Stages `staged_paths` in the working tree `workdir` (the platform checkout or a tenant
 /// repository clone), commits as the session user, pushes `branch` to `origin` and checks out
-/// `main` again (also on failure). Callers hold the repository's lock.
+/// `main` again (also on failure). Fails with `400 Bad Request` when the staged paths change
+/// nothing. Callers hold the repository's lock.
 pub(crate) async fn stage_commit_push_in<I, S>(
     state: &AppState,
     workdir: &Path,
@@ -645,6 +646,14 @@ where
 {
     let result = async {
         state.git_runner.add(workdir, staged_paths).await?;
+        // Nothing differs from `main` (e.g. an edit submitted unchanged, blank secrets keeping
+        // their stored values): a clear client error instead of git's "nothing to commit".
+        if !state.git_runner.has_staged_changes(workdir).await? {
+            return Err(ServerError::BadRequest(
+                "No changes to propose: the submitted values match what is already committed"
+                    .to_string(),
+            ));
+        }
         let author = commit_author_for_session(auth);
         let sha = state
             .git_runner

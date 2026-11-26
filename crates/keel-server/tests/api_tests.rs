@@ -4366,6 +4366,33 @@ spec:
     );
     merge_proposal_and_sync(&fixture, &cookie, &body).await;
 
+    // The same edit again changes nothing (the blank secret keeps its value): a clear 400, not
+    // git's "nothing to commit" as a 500, and nothing is committed.
+    let head = fixture
+        .state
+        .git_runner
+        .rev_parse(&workdir, "HEAD")
+        .await
+        .unwrap();
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({ "tenant": "acme", "catalogId": "token-vm", "name": "vm1",
+                "values": { "vmName": "vm-b", "apiToken": "" } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("No changes to propose"), "{body}");
+    assert_eq!(
+        fixture
+            .state
+            .git_runner
+            .rev_parse(&workdir, "HEAD")
+            .await
+            .unwrap(),
+        head
+    );
+
     // CLI re-provision (`mergeStoredValues`): a partial patch re-entering one secret keeps the
     // other stored one and the committed plaintext values.
     let (status, body) = post_proposal(
@@ -4426,10 +4453,12 @@ spec:
     );
 }
 
-/// A stack value cannot be split between plaintext config and the Secret under one top-level
-/// key: the program receives each top-level value whole.
+/// A stack secret must be a whole top-level value: the program receives, and an edit keeps,
+/// each top-level value whole. A nested secret is rejected, with plaintext siblings (the value
+/// would be split between config and the Secret) or without (stored under its parent key, an
+/// edit leaving it blank would drop it), name-matched or declared `writeOnly`.
 #[tokio::test]
-async fn test_infra_proposal_rejects_secret_nested_beside_plaintext() {
+async fn test_infra_proposal_rejects_nested_secrets() {
     let fixture = setup_fixture().await;
     let cookie = login_and_get_cookie(&fixture).await;
     commit_to_main(
@@ -4450,9 +4479,22 @@ spec:
   schema:
     type: object
     properties:
+      vmName:
+        type: string
       cloudInit:
         type: object
         additionalProperties: true
+      auth:
+        type: object
+        properties:
+          apiKey:
+            type: string
+      ssh:
+        type: object
+        properties:
+          key:
+            type: string
+            writeOnly: true
 "#,
         )],
         "feat(catalog): nested-vm blueprint",
@@ -4464,19 +4506,31 @@ spec:
         .rev_parse(&fixture.state.repo_workdir, "HEAD")
         .await
         .unwrap();
-    let (status, body) = post_proposal(
-        &fixture,
-        &cookie,
-        json!({ "tenant": "acme", "catalogId": "nested-vm", "name": "nv",
-                "values": { "cloudInit": { "apiKey": "NESTED-KEY-SECRET", "user": "ops" } } }),
-    )
-    .await;
-    if sops_unavailable(status, &body) {
-        return;
+    for (values, path) in [
+        (
+            json!({ "cloudInit": { "apiKey": "NESTED-KEY-SECRET", "user": "ops" } }),
+            "cloudInit.apiKey",
+        ),
+        (
+            json!({ "vmName": "a", "auth": { "apiKey": "NESTED-KEY-SECRET" } }),
+            "auth.apiKey",
+        ),
+        (
+            json!({ "vmName": "a", "ssh": { "key": "NESTED-KEY-SECRET" } }),
+            "ssh.key",
+        ),
+    ] {
+        let (status, body) = post_proposal(
+            &fixture,
+            &cookie,
+            json!({ "tenant": "acme", "catalogId": "nested-vm", "name": "nv", "values": values }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains(&format!("'{path}'")), "{body}");
+        assert!(body.contains("whole top-level values"), "{body}");
+        assert!(!body.contains("NESTED-KEY-SECRET"), "{body}");
     }
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-    assert!(body.contains("'cloudInit'"), "{body}");
-    assert!(!body.contains("NESTED-KEY-SECRET"), "{body}");
     assert_eq!(
         fixture
             .state
@@ -4491,10 +4545,14 @@ spec:
         &fixture,
         &cookie,
         json!({ "tenant": "acme", "catalogId": "nested-vm", "name": "nv",
-                "nonSecretPaths": ["cloudInit.apiKey"],
-                "values": { "cloudInit": { "apiKey": "not-a-secret", "user": "ops" } } }),
+                "nonSecretPaths": ["cloudInit.apiKey", "auth.apiKey"],
+                "values": { "cloudInit": { "apiKey": "not-a-secret", "user": "ops" },
+                            "auth": { "apiKey": "also-plain" } } }),
     )
     .await;
+    if sops_unavailable(status, &body) {
+        return;
+    }
     assert_eq!(status, StatusCode::CREATED, "{body}");
 }
 

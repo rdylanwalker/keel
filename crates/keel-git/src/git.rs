@@ -670,6 +670,20 @@ impl GitRunner {
         Ok(())
     }
 
+    /// Whether the index differs from `HEAD` (`git diff --cached --name-only`): `false` when a
+    /// [`Self::commit`] would fail with "nothing to commit".
+    pub async fn has_staged_changes(&self, work_dir: &Path) -> Result<bool, GitError> {
+        let out = self
+            .exec(
+                Some(work_dir),
+                "diff",
+                &["diff", "--cached", "--name-only", "--"],
+                &[],
+            )
+            .await?;
+        Ok(out.lines().any(|l| !l.trim().is_empty()))
+    }
+
     /// Commits staged changes with explicit authorship and returns the new commit SHA.
     pub async fn commit(
         &self,
@@ -2012,6 +2026,7 @@ mod tests {
             .await
             .unwrap();
         runner.add(&work_a, ["README.md"]).await.unwrap();
+        assert!(runner.has_staged_changes(&work_a).await.unwrap());
 
         // Commit message containing shell metacharacters must NEVER be interpreted by a shell
         let msg = format!(
@@ -2021,6 +2036,9 @@ mod tests {
         );
         let initial_sha = runner.commit(&work_a, &msg, &author).await.unwrap();
         assert_eq!(initial_sha.len(), 40);
+        // Re-staging an unchanged file stages nothing: a commit would fail.
+        runner.add(&work_a, ["README.md"]).await.unwrap();
+        assert!(!runner.has_staged_changes(&work_a).await.unwrap());
         assert!(
             !marker_file.exists(),
             "shell metacharacters in commit message must never execute"

@@ -410,36 +410,54 @@ pub(super) fn populate_stack_config_from_values(
     }
 }
 
-/// Fails when a top-level stack value would be split between plaintext `Stack.spec.config`
-/// (`normal_values`) and the `<instance>-secrets` Secret (`secret_keys`): a secret nested in an
-/// object with plaintext siblings (e.g. a key-name match `cloudInit.apiKey`). Each top-level key
-/// reaches the Pulumi program as one config value or environment variable, so the program would
-/// see only one half. The error names paths only, never values.
-pub(super) fn ensure_stack_values_split_by_top_level_key(
-    normal_values: &Value,
-    secret_keys: &[String],
+/// Fails when a submitted stack secret sits below a top-level key that is not itself a secret
+/// field (a key-name match `auth.apiKey`, or a `writeOnly` field nested in a plain object),
+/// with or without plaintext siblings. A stack stores, references and keeps secrets per
+/// top-level key (one `<instance>-secrets` key, one Pulumi config value or environment
+/// variable), so a nested secret would either split its object between `Stack.spec.config` and
+/// the Secret, or be stored under its parent key, which an edit leaving it blank cannot match to
+/// its dot path (the stored value would be dropped). Only whole top-level values are secret on a
+/// stack. The error names paths only, never values.
+pub(super) fn ensure_stack_secrets_are_top_level(
+    partitioned: &keel_core::PartitionedValues,
 ) -> Result<(), ServerError> {
-    let Some(normal) = normal_values.as_object() else {
+    let Some(secret) = partitioned.secret_values.as_object() else {
         return Ok(());
     };
-    let mixed: Vec<&str> = secret_keys
+    let nested: Vec<String> = secret
         .iter()
-        .filter(|k| normal.get(k.as_str()).is_some_and(|v| !v.is_null()))
-        .map(String::as_str)
+        .filter(|(key, value)| {
+            !value.is_null() && !partitioned.secret_field_paths.iter().any(|p| p == *key)
+        })
+        .flat_map(|(key, _)| {
+            let under: Vec<String> = partitioned
+                .secret_field_paths
+                .iter()
+                .filter(|p| p.starts_with(&format!("{key}.")) || p.starts_with(&format!("{key}[")))
+                .cloned()
+                .collect();
+            if under.is_empty() {
+                vec![key.clone()]
+            } else {
+                under
+            }
+        })
         .collect();
-    if mixed.is_empty() {
+    if nested.is_empty() {
         return Ok(());
     }
     Err(ServerError::BadRequest(format!(
-        "Infrastructure stack values {} mix secret and plaintext fields under one top-level key; \
-         a stack receives each top-level value as a whole (Pulumi config or environment \
-         variable). Mark the nested secret not secret (nonSecretPaths), or make the whole object \
-         secret (writeOnly)",
-        mixed
+        "Infrastructure stack secrets must be whole top-level values, but {} {} nested inside an \
+         object: a stack stores and passes each top-level value as a whole (Pulumi config or \
+         environment variable). Mark the nested value not secret (nonSecretPaths / \
+         --not-secret), or ask the catalog author to make the whole top-level object secret \
+         (writeOnly)",
+        nested
             .iter()
             .map(|k| format!("'{k}'"))
             .collect::<Vec<_>>()
-            .join(", ")
+            .join(", "),
+        if nested.len() == 1 { "is" } else { "are" }
     )))
 }
 
@@ -448,24 +466,44 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn partitioned(secret_values: Value, paths: &[&str]) -> keel_core::PartitionedValues {
+        keel_core::PartitionedValues {
+            normal_values: json!({}),
+            secret_values,
+            secret_field_paths: paths.iter().map(|p| p.to_string()).collect(),
+        }
+    }
+
     #[test]
-    fn stack_values_must_not_split_a_top_level_key() {
-        let keys = vec!["apiToken".to_string(), "cloudInit".to_string()];
+    fn stack_secrets_must_be_whole_top_level_values() {
+        // Top-level secrets (declared, heuristic or a whole writeOnly object) are fine, and a
+        // nested secret field that was not submitted is ignored.
         assert!(
-            ensure_stack_values_split_by_top_level_key(&json!({ "region": "eu" }), &keys).is_ok()
+            ensure_stack_secrets_are_top_level(&partitioned(
+                json!({ "apiToken": "t", "creds": { "a": "b" } }),
+                &["apiToken", "creds", "other.nested"],
+            ))
+            .is_ok()
         );
-        assert!(
-            ensure_stack_values_split_by_top_level_key(&json!({ "cloudInit": null }), &keys)
-                .is_ok()
-        );
-        let err = ensure_stack_values_split_by_top_level_key(
-            &json!({ "cloudInit": { "passwordFile": "/etc/pw" } }),
-            &keys,
-        )
+        // A nested secret without plaintext siblings (stored under its parent key, so an edit
+        // leaving it blank would drop it) is rejected by path, never echoing the value.
+        let err = ensure_stack_secrets_are_top_level(&partitioned(
+            json!({ "auth": { "apiKey": "NESTED-KEY-SECRET" } }),
+            &["auth.apiKey"],
+        ))
         .unwrap_err()
         .to_string();
-        assert!(err.contains("'cloudInit'"), "{err}");
-        assert!(!err.contains("/etc/pw"), "{err}");
+        assert!(err.contains("'auth.apiKey'"), "{err}");
+        assert!(!err.contains("NESTED-KEY-SECRET"), "{err}");
+        // A nested secret beside plaintext siblings too; whole top-level secrets are not named.
+        let err = ensure_stack_secrets_are_top_level(&partitioned(
+            json!({ "cloudInit": { "apiKey": "k" }, "dbPassword": "p" }),
+            &["cloudInit.apiKey", "dbPassword"],
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("'cloudInit.apiKey'"), "{err}");
+        assert!(!err.contains("dbPassword"), "{err}");
     }
 
     #[test]

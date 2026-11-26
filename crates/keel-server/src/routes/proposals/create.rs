@@ -54,10 +54,9 @@ use super::secrets::{
     resolve_tenant_app_secret, write_secret_overrides,
 };
 use super::tenant_stack::{
-    apply_tenant_source_trust, attach_tenant_stack_credentials,
-    ensure_stack_values_split_by_top_level_key, populate_stack_config_from_values,
-    read_pulumi_project_name, resolve_tenant_stack_source, tenant_stack_backend_url,
-    tenant_stack_git_source,
+    apply_tenant_source_trust, attach_tenant_stack_credentials, ensure_stack_secrets_are_top_level,
+    populate_stack_config_from_values, read_pulumi_project_name, resolve_tenant_stack_source,
+    tenant_stack_backend_url, tenant_stack_git_source,
 };
 use super::{CreateProposalRequest, CreateProposalResponse, ProposalGuards};
 
@@ -287,6 +286,11 @@ pub async fn create_proposal(
         non_secret_paths,
         true,
     )?;
+    // A stack keeps and passes secrets per top-level key: fail closed on a nested one before
+    // encrypting or committing (an edit leaving it blank could not keep it).
+    if !is_app {
+        ensure_stack_secrets_are_top_level(&partitioned)?;
+    }
     let has_secret_fields = partitioned
         .secret_values
         .as_object()
@@ -356,9 +360,6 @@ pub async fn create_proposal(
         } else {
             (None, Vec::new())
         };
-    if !is_app {
-        ensure_stack_values_split_by_top_level_key(&partitioned.normal_values, &infra_secret_keys)?;
-    }
 
     let helm_extras = match &manifest {
         CatalogManifest::Application(app) if is_helm_app => {
