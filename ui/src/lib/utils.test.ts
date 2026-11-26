@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach } from "vitest"
+import { describe, it, expect, afterEach, vi } from "vitest"
 import { parse as parseYaml } from "yaml"
 import {
   cn,
@@ -113,5 +113,18 @@ describe("isDemoMode utility", () => {
   it("returns true when demo=true is in location search", () => {
     window.history.replaceState({}, "", "/?demo=true")
     expect(isDemoMode()).toBe(true)
+  })
+
+  it("ignores ?demo=true in production builds without VITE_ENABLE_DEMO", () => {
+    vi.stubEnv("DEV", false)
+    vi.stubEnv("VITE_ENABLE_DEMO", undefined)
+    try {
+      window.history.replaceState({}, "", "/?demo=true")
+      expect(isDemoMode()).toBe(false)
+      vi.stubEnv("VITE_ENABLE_DEMO", "true")
+      expect(isDemoMode()).toBe(true)
+    } finally {
+      vi.unstubAllEnvs()
+    }
   })
 })

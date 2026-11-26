@@ -5696,6 +5696,102 @@ async fn test_pr_diff_is_merge_base_and_merge_deletes_stacks_from_diff() {
     assert!(!diff.contains("tenants/acme/apps/redis"), "{diff}");
 }
 
+/// Read-only endpoints never wait for `git_lock`: a long mutation holding the platform lock
+/// (clone, rebase, push) must not stall proposal previews or Stack config reads.
+#[tokio::test]
+async fn test_preview_and_stack_config_reads_do_not_wait_for_git_lock() {
+    let fixture = setup_fixture().await;
+    let app = build_router(fixture.state.clone());
+    let cookie = login_and_get_cookie(&fixture).await;
+    let (status, pr) = send_json(
+        &app,
+        Method::DELETE,
+        "/api/v1/stacks/tenant-acme/net",
+        &cookie,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{pr}");
+    let pr_id = pr["proposal"]["id"].as_str().unwrap().to_string();
+
+    let _held = fixture.state.git_lock.clone().lock_owned().await;
+    let deadline = std::time::Duration::from_secs(5);
+    for uri in [
+        format!("/api/v1/tenants/acme/proposals/{pr_id}/preview"),
+        "/api/v1/stacks/tenant-acme/net/config".to_string(),
+    ] {
+        let (status, body) =
+            tokio::time::timeout(deadline, send_json(&app, Method::GET, &uri, &cookie, None))
+                .await
+                .unwrap_or_else(|_| panic!("GET {uri} waited for git_lock"));
+        assert_eq!(status, StatusCode::OK, "GET {uri}: {body}");
+    }
+}
+
+/// A schema error reported on a parent object (here an `anyOf` over the object holding a
+/// `writeOnly` field) never echoes the submitted secret in the 422 response.
+#[tokio::test]
+async fn test_parent_schema_errors_do_not_echo_nested_secret_values() {
+    let fixture = setup_fixture().await;
+    let cookie = login_and_get_cookie(&fixture).await;
+    commit_to_main(
+        &fixture,
+        &[(
+            "catalog/apps/vaultish/catalog.yaml",
+            r#"apiVersion: keel.io/v1alpha1
+kind: CatalogApplication
+metadata:
+  id: vaultish
+  name: Vaultish
+  description: Secret parent validation
+  category: security
+  runtime: helm
+spec:
+  upstream:
+    repoURL: https://charts.example.com
+    chart: vaultish
+    version: "1.0.0"
+  schema:
+    type: object
+    properties:
+      auth:
+        type: object
+        properties:
+          mode:
+            type: string
+          token:
+            type: string
+            writeOnly: true
+        anyOf:
+          - properties:
+              mode:
+                const: oidc
+          - properties:
+              mode:
+                const: token
+"#,
+        )],
+        "feat(catalog): add vaultish",
+    )
+    .await;
+
+    let secret = "hunter2-very-secret-token-value";
+    let (status, body) = post_proposal(
+        &fixture,
+        &cookie,
+        json!({
+            "tenant": "acme",
+            "catalogId": "vaultish",
+            "name": "vault",
+            "values": { "auth": { "mode": "ldap", "token": secret } }
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert!(!body.contains(secret), "{body}");
+    assert!(body.contains("/auth"), "{body}");
+}
+
 /// Snag #9 of the v0.12.0 dry run in the platform repository (Local Git provider): two
 /// deletions opened from the same `main` conflict in `tenants/kustomization.yaml` once the first
 /// merges. The second merge rebuilds the branch on `main` (index re-merged) and asks for a new

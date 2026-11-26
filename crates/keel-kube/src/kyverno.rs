@@ -1583,11 +1583,36 @@ mod tests {
             "local-kind-docker-socket-exception"
         );
         assert_eq!(exc["metadata"]["namespace"], "keel-system");
-        assert_eq!(exc["spec"]["policyRefs"][0]["kind"], "ValidatingPolicy");
-        assert_eq!(
-            exc["spec"]["policyRefs"][0]["name"],
-            "disallow-privileged-containers"
-        );
+        // Every policyRef must resolve to a policy this bundle actually generates (same kind and
+        // name); a dangling reference silently exempts nothing.
+        let refs = exc["spec"]["policyRefs"]
+            .as_array()
+            .expect("policyRefs must be a list");
+        assert!(!refs.is_empty());
+        let generated = bundle
+            .cluster_policies
+            .iter()
+            .chain(&bundle.supporting_manifests);
+        for policy_ref in refs {
+            let target = generated
+                .clone()
+                .find(|p| {
+                    p["kind"] == policy_ref["kind"] && p["metadata"]["name"] == policy_ref["name"]
+                })
+                .unwrap_or_else(|| panic!("policyRef {policy_ref} matches no generated policy"));
+            // CEL ValidatingPolicies have no named rules; if a ref ever narrows by rule name, the
+            // names must exist among the target's validations.
+            if let Some(rule_names) = policy_ref.get("ruleNames").and_then(Value::as_array) {
+                let validations = target["spec"]["validations"].as_array().unwrap();
+                for rule in rule_names {
+                    assert!(
+                        validations.iter().any(|v| v["name"] == *rule),
+                        "ruleName {rule} not found in {}",
+                        policy_ref["name"]
+                    );
+                }
+            }
+        }
 
         let yaml = bundle.to_multi_doc_yaml().unwrap();
         assert!(yaml.contains("apiVersion: policies.kyverno.io/v1"));

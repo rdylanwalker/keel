@@ -40,7 +40,9 @@ use crate::error::ServerError;
 
 /// Infix of tenant repository names: `<monorepo>-tenant-<id>` (D10).
 pub const TENANT_REPO_NAME_INFIX: &str = "-tenant-";
-/// Generic description of every tenant repository (never tenant data).
+/// Generic description of every tenant repository (never tenant data). Keep it generic: Forgejo
+/// repository-scoped tokens can still read the name and description of other repositories in the
+/// organization, so a tenant-specific description would leak to every other tenant.
 pub const TENANT_REPO_DESCRIPTION: &str = "Keel tenant GitOps repository (managed by Keel; changes arrive through reviewed pull requests)";
 /// Title / comment of the read-only deploy key of an SSH tenant repository.
 pub const TENANT_DEPLOY_KEY_TITLE_PREFIX: &str = "keel-tenant-";
@@ -1516,6 +1518,16 @@ mod tests {
             ca_crt: None,
             admin: Arc::new(LocalGitProvider::new(std::env::temp_dir())),
             token_minter: None,
+        }
+    }
+
+    #[test]
+    fn tenant_repository_description_is_identical_for_every_tenant() {
+        for marker in ["{", "}", "<", ">", "%", "$", "tenant-", "acme"] {
+            assert!(
+                !TENANT_REPO_DESCRIPTION.contains(marker),
+                "{marker:?} in {TENANT_REPO_DESCRIPTION}"
+            );
         }
     }
 

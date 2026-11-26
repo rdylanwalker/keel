@@ -420,6 +420,28 @@ async fn provision_tenant_repo_foundations(
     .await
 }
 
+/// In-container script registering the Rauthy auth source: reads the client secret from stdin
+/// (first line) and takes the discovery URL as positional `$1`.
+const FORGEJO_OIDC_REGISTER_SCRIPT: &str = r#"IFS= read -r KEEL_OIDC_SECRET; exec env SSL_CERT_DIR=/etc/ssl/certs:/etc/ssl/keel-ca forgejo admin auth add-oauth --name rauthy --provider openidConnect --key forgejo --secret "$KEEL_OIDC_SECRET" --auto-discover-url "$1" --scopes "openid email profile groups""#;
+
+/// `kubectl` argv for [`register_forgejo_oidc_source`]. Takes no secret by construction: the
+/// client secret travels on stdin only.
+fn forgejo_oidc_register_argv(discovery_url: &str) -> [&str; 11] {
+    [
+        "-n",
+        KEEL_SYSTEM_NAMESPACE,
+        "exec",
+        "-i",
+        "deploy/forgejo",
+        "--",
+        "sh",
+        "-c",
+        FORGEJO_OIDC_REGISTER_SCRIPT,
+        "keel-register-oidc",
+        discovery_url,
+    ]
+}
+
 /// Registers the Rauthy OIDC auth source in Forgejo.
 ///
 /// The client secret is streamed over `kubectl exec` **stdin** so it never appears in the host
@@ -431,26 +453,11 @@ async fn register_forgejo_oidc_source(
     oidc_secret: &str,
     discovery_url: &str,
 ) -> Result<(), CliError> {
-    const SCRIPT: &str = r#"IFS= read -r KEEL_OIDC_SECRET; exec env SSL_CERT_DIR=/etc/ssl/certs:/etc/ssl/keel-ca forgejo admin auth add-oauth --name rauthy --provider openidConnect --key forgejo --secret "$KEEL_OIDC_SECRET" --auto-discover-url "$1" --scopes "openid email profile groups""#;
+    let argv = forgejo_oidc_register_argv(discovery_url);
     let mut last_err = String::new();
     for attempt in 1..=15 {
         let out = target
-            .output_with_stdin(
-                &[
-                    "-n",
-                    KEEL_SYSTEM_NAMESPACE,
-                    "exec",
-                    "-i",
-                    "deploy/forgejo",
-                    "--",
-                    "sh",
-                    "-c",
-                    SCRIPT,
-                    "keel-register-oidc",
-                    discovery_url,
-                ],
-                format!("{oidc_secret}\n").as_bytes(),
-            )
+            .output_with_stdin(&argv, format!("{oidc_secret}\n").as_bytes())
             .await?;
         if out.status.success() {
             tracing::info!(attempt, "Registered Rauthy OIDC SSO provider in Forgejo");
@@ -681,13 +688,14 @@ pub(crate) fn build_remote_forge_provider(
 /// from "empty" asynchronously and answer 404 for pull-request listings until they have.
 async fn list_prs_with_settle_retry(
     forge: &dyn ForgeProvider,
+    initial_delay: Duration,
 ) -> Result<Vec<keel_git::PullRequestInfo>, keel_git::ForgeError> {
-    let mut delay = std::time::Duration::from_millis(500);
+    let mut delay = initial_delay;
     for attempt in 1..=8 {
         match forge.list_open_pull_requests(None).await {
             Err(keel_git::ForgeError::NotFound(_)) if attempt < 8 => {
                 tokio::time::sleep(delay).await;
-                delay = (delay * 2).min(std::time::Duration::from_secs(5));
+                delay = (delay * 2).min(Duration::from_secs(5));
             }
             other => return other,
         }
@@ -704,18 +712,20 @@ pub(crate) async fn verify_forge_access(
     token: &str,
 ) -> bool {
     match build_remote_forge_provider(forge_kind, repo_url, api_url, token) {
-        Ok(Some(forge)) => match list_prs_with_settle_retry(forge.as_ref()).await {
-            Ok(_) => true,
-            Err(err) => {
-                tracing::warn!(
-                    forge = ?forge_kind,
-                    repo = repo_url,
-                    error = %err,
-                    "Forge API access check failed; `keel serve` will be unable to open PRs until the token/API URL is fixed"
-                );
-                false
+        Ok(Some(forge)) => {
+            match list_prs_with_settle_retry(forge.as_ref(), Duration::from_millis(500)).await {
+                Ok(_) => true,
+                Err(err) => {
+                    tracing::warn!(
+                        forge = ?forge_kind,
+                        repo = repo_url,
+                        error = %err,
+                        "Forge API access check failed; `keel serve` will be unable to open PRs until the token/API URL is fixed"
+                    );
+                    false
+                }
             }
-        },
+        }
         Ok(None) => true,
         Err(err) => {
             tracing::warn!(forge = ?forge_kind, repo = repo_url, error = %err, "Could not build ForgeProvider for access check");
@@ -1412,6 +1422,111 @@ mod tests {
         assert!(s.bot_ssh_keys.is_empty());
         drop(s);
         handle.abort();
+    }
+
+    #[test]
+    fn forgejo_oidc_registration_passes_the_client_secret_on_stdin_only() {
+        let url = "https://rauthy.example/auth/v1/.well-known/openid-configuration";
+        let argv = forgejo_oidc_register_argv(url);
+        // The script is a constant that reads the secret from stdin; argv carries no secret
+        // (the builder takes none) and the discovery URL is a positional argument only.
+        assert!(argv.contains(&"-i"));
+        assert!(FORGEJO_OIDC_REGISTER_SCRIPT.starts_with("IFS= read -r KEEL_OIDC_SECRET;"));
+        assert!(FORGEJO_OIDC_REGISTER_SCRIPT.contains(r#"--secret "$KEEL_OIDC_SECRET""#));
+        assert!(FORGEJO_OIDC_REGISTER_SCRIPT.contains(r#"--auto-discover-url "$1""#));
+        assert_eq!(argv.last(), Some(&url));
+        assert_eq!(argv.iter().filter(|a| a.contains(url)).count(), 1);
+        assert!(!argv.iter().any(|a| a.contains("--secret=")));
+    }
+
+    /// `ForgeProvider` whose PR listing answers `NotFound` a fixed number of times first.
+    struct SettlingForge {
+        not_found: usize,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl ForgeProvider for SettlingForge {
+        async fn create_pull_request(
+            &self,
+            _req: keel_git::CreatePrRequest,
+        ) -> Result<keel_git::PullRequestInfo, keel_git::ForgeError> {
+            unimplemented!()
+        }
+        async fn get_pull_request(
+            &self,
+            _pr_id: &str,
+        ) -> Result<keel_git::PullRequestInfo, keel_git::ForgeError> {
+            unimplemented!()
+        }
+        async fn post_preview_comment(
+            &self,
+            _pr_id: &str,
+            _markdown_report: &str,
+        ) -> Result<(), keel_git::ForgeError> {
+            unimplemented!()
+        }
+        async fn list_pull_requests(
+            &self,
+            _tenant: Option<&str>,
+            _state: Option<keel_git::PullRequestState>,
+        ) -> Result<Vec<keel_git::PullRequestInfo>, keel_git::ForgeError> {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n < self.not_found {
+                Err(keel_git::ForgeError::NotFound("pulls".into()))
+            } else {
+                Ok(Vec::new())
+            }
+        }
+        async fn merge_pull_request(
+            &self,
+            _pr_id: &str,
+            _expected_head_sha: Option<&str>,
+        ) -> Result<keel_git::PullRequestInfo, keel_git::ForgeError> {
+            unimplemented!()
+        }
+        async fn close_pull_request(
+            &self,
+            _pr_id: &str,
+        ) -> Result<keel_git::PullRequestInfo, keel_git::ForgeError> {
+            unimplemented!()
+        }
+        async fn reopen_pull_request(
+            &self,
+            _pr_id: &str,
+        ) -> Result<keel_git::PullRequestInfo, keel_git::ForgeError> {
+            unimplemented!()
+        }
+        async fn ensure_repository(
+            &self,
+            _private: bool,
+        ) -> Result<RepositoryEnsureOutcome, keel_git::ForgeError> {
+            unimplemented!()
+        }
+    }
+
+    #[tokio::test]
+    async fn forge_access_check_retries_not_found_until_the_repository_settles() {
+        let settling = SettlingForge {
+            not_found: 2,
+            calls: 0.into(),
+        };
+        assert!(
+            list_prs_with_settle_retry(&settling, Duration::ZERO)
+                .await
+                .is_ok()
+        );
+        assert_eq!(settling.calls.into_inner(), 3);
+
+        let missing = SettlingForge {
+            not_found: usize::MAX,
+            calls: 0.into(),
+        };
+        assert!(matches!(
+            list_prs_with_settle_retry(&missing, Duration::ZERO).await,
+            Err(keel_git::ForgeError::NotFound(_))
+        ));
+        assert!(missing.calls.into_inner() > 1);
     }
 
     #[test]

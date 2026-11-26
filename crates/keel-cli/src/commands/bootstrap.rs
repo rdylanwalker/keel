@@ -3025,6 +3025,45 @@ mod security_hardening_tests {
         }
     }
 
+    #[test]
+    fn release_is_gated_on_live_e2e_and_ci_installs_use_frozen_lockfiles() {
+        let ci = include_str!("../../../../.github/workflows/ci.yml");
+        let e2e = include_str!("../../../../.github/workflows/e2e.yml");
+        let release = include_str!("../../../../.github/workflows/release.yml");
+
+        // release.yml calls e2e.yml with `run_live: true` and the release job waits for it.
+        let release_doc: Value = noyalib::from_str(release).unwrap();
+        let jobs = release_doc["jobs"].as_object().unwrap();
+        let (gate_name, gate) = jobs
+            .iter()
+            .find(|(_, j)| j["uses"] == "./.github/workflows/e2e.yml")
+            .expect("release.yml calls e2e.yml");
+        assert_eq!(gate["with"]["run_live"], true);
+        let needs = jobs["release"]["needs"].as_array().unwrap();
+        assert!(needs.iter().any(|n| n == gate_name.as_str()));
+
+        // In a called workflow `github.event_name` is the caller's event, so the live jobs
+        // must gate on the explicit input, never on `event_name == 'workflow_call'`.
+        assert!(!e2e.contains("event_name == 'workflow_call'"));
+        let e2e_doc: Value = noyalib::from_str(e2e).unwrap();
+        assert_eq!(
+            e2e_doc["jobs"]["e2e-live-kind"]["if"],
+            "inputs.run_live == true"
+        );
+
+        for (name, raw) in [("ci.yml", ci), ("e2e.yml", e2e), ("release.yml", release)] {
+            for line in raw.lines().filter(|l| {
+                l.contains("pnpm") && l.contains(" install") && !l.contains("playwright install")
+            }) {
+                assert!(
+                    line.contains("--frozen-lockfile"),
+                    "{name}: unfrozen install `{}`",
+                    line.trim()
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn seed_files_include_keel_server_only_with_flag() {
         for with_keel_server in [false, true] {

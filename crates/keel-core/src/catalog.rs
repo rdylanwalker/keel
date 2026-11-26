@@ -2335,6 +2335,70 @@ spec:
                     "cluster blueprint {} must output kubeconfig",
                     bp.metadata.id
                 );
+
+                // Flux impersonates `tenant-<id>-sa` through the kubeconfig Secret, so the program
+                // must grant that identity on the *workload* cluster (not the management one).
+                let tenant_flux_binding = resources
+                    .values()
+                    .find(|r| {
+                        r.get("type").and_then(|t| t.as_str())
+                            == Some("kubernetes:rbac.authorization.k8s.io/v1:ClusterRoleBinding")
+                            && r.get("properties")
+                                .and_then(|p| p.get("metadata"))
+                                .and_then(|m| m.get("name"))
+                                .and_then(|n| n.as_str())
+                                == Some("keel-tenant-flux")
+                    })
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "cluster blueprint {} must bind ClusterRoleBinding keel-tenant-flux",
+                            bp.metadata.id
+                        )
+                    });
+                assert_eq!(
+                    tenant_flux_binding
+                        .get("options")
+                        .and_then(|o| o.get("provider"))
+                        .and_then(|p| p.as_str()),
+                    Some("${workloadProvider}"),
+                    "{}: keel-tenant-flux must target the workload cluster",
+                    bp.metadata.id
+                );
+                let subject = tenant_flux_binding
+                    .get("properties")
+                    .and_then(|p| p.get("subjects"))
+                    .and_then(|s| s.get(0))
+                    .expect("keel-tenant-flux must have a subject");
+                assert_eq!(
+                    subject.get("name").and_then(|n| n.as_str()),
+                    Some("${kubeconfigSecretNamespace}-sa")
+                );
+                assert_eq!(
+                    subject.get("namespace").and_then(|n| n.as_str()),
+                    Some("${kubeconfigSecretNamespace}")
+                );
+
+                // Flux controllers cannot run exec credential plugins, so the kubeconfig Flux reads
+                // must carry static credentials (resolving a `${variable}` indirection once).
+                let kubeconfig = kubeconfig_secret
+                    .get("properties")
+                    .and_then(|p| p.get("stringData"))
+                    .and_then(|s| s.get("kubeconfig"))
+                    .expect("kubeconfigSecret must set stringData.kubeconfig");
+                let mut kubeconfig_text = noyalib::to_string(kubeconfig).unwrap();
+                if let Some(var) = kubeconfig
+                    .as_str()
+                    .and_then(|s| s.strip_prefix("${"))
+                    .and_then(|s| s.strip_suffix('}'))
+                    && let Some(resolved) = parsed_pulumi.get("variables").and_then(|v| v.get(var))
+                {
+                    kubeconfig_text.push_str(&noyalib::to_string(resolved).unwrap());
+                }
+                assert!(
+                    !kubeconfig_text.contains("exec:"),
+                    "{}: Flux kubeconfig Secret must not use an exec credential plugin",
+                    bp.metadata.id
+                );
             }
 
             // Test protected/tenant serialization round-trips

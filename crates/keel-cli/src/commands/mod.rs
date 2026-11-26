@@ -2658,4 +2658,58 @@ spec:
         .unwrap();
         assert!(dispatch(&cli, &ctx).await.is_err());
     }
+
+    #[test]
+    fn tenant_arg_strips_namespace_prefix_and_whitespace_but_keeps_bare_prefix() {
+        assert_eq!(normalize_tenant_arg("tenant-default"), "default");
+        assert_eq!(normalize_tenant_arg(" acme "), "acme");
+        assert_eq!(normalize_tenant_arg("acme"), "acme");
+        // A bare `tenant-` has no id after the prefix, so it is passed through for validation.
+        assert_eq!(normalize_tenant_arg("tenant-"), "tenant-");
+    }
+
+    #[test]
+    fn corrupt_credentials_file_is_ignored_and_overwritten_on_next_save() {
+        let tmp = TempTestDir::new("corrupt-creds");
+        let path = tmp.path().join("credentials.json");
+        std::fs::write(&path, "{not json").unwrap();
+        let ctx = CliContext::with_credentials_path(&path);
+        assert_eq!(ctx.load_session_token("https://keel.local"), None);
+        assert!(ctx.stored_session_servers().is_empty());
+        ctx.save_session_token("https://keel.local", "tok").unwrap();
+        assert_eq!(
+            ctx.load_session_token("https://keel.local").as_deref(),
+            Some("tok")
+        );
+    }
+
+    #[tokio::test]
+    async fn transport_errors_render_one_line_unless_verbose() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let err: CliError = reqwest::Client::new()
+            .get(format!("http://127.0.0.1:{port}/api/v1/health"))
+            .send()
+            .await
+            .unwrap_err()
+            .into();
+        let short = err.render(false);
+        assert!(!short.contains('\n'), "{short}");
+        assert!(short.contains(&format!("cannot reach server at http://127.0.0.1:{port}")));
+        let verbose = err.render(true);
+        assert!(verbose.starts_with(&short));
+        assert!(verbose.contains("\n  caused by: "), "{verbose}");
+    }
+
+    #[tokio::test]
+    async fn values_file_yaml_parse_errors_name_the_file() {
+        let tmp = TempTestDir::new("bad-values");
+        let path = tmp.path().join("broken-values.yaml");
+        tokio::fs::write(&path, "replicaCount: [1, 2\n")
+            .await
+            .unwrap();
+        let msg = load_values_file(&path).await.unwrap_err().to_string();
+        assert!(msg.contains(&path.display().to_string()), "{msg}");
+    }
 }

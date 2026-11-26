@@ -1506,4 +1506,38 @@ mod tests {
         assert_eq!(merge_args.tenant, "management");
         assert_eq!(prev_cli.server.as_deref(), Some("http://127.0.0.1:8080"));
     }
+
+    #[test]
+    fn parse_rejects_unsupported_flags_and_version_is_top_level_only() {
+        use clap::CommandFactory;
+        use clap::error::ErrorKind;
+        Cli::command().debug_assert();
+
+        // `infra ssh` prints `table|json|command`; `yaml` must fail at parse time.
+        assert!(
+            Cli::try_parse_from([
+                "keel", "infra", "ssh", "vm", "--tenant", "acme", "--output", "yaml"
+            ])
+            .is_err()
+        );
+        // `-V` is a top-level flag only; subcommands must not accept it.
+        assert_eq!(
+            Cli::try_parse_from(["keel", "-V"]).unwrap_err().kind(),
+            ErrorKind::DisplayVersion
+        );
+        let sub = Cli::try_parse_from(["keel", "app", "list", "-V"]).unwrap_err();
+        assert_ne!(sub.kind(), ErrorKind::DisplayVersion);
+
+        for argv in [
+            &["keel", "proposal", "list"][..],
+            &[
+                "keel", "proposal", "list", "--tenant", "acme", "--output", "json",
+            ],
+            &["keel", "catalog", "list"],
+            &["keel", "catalog", "list", "--tenant", "acme"],
+            &["keel", "auth", "status"],
+        ] {
+            assert!(Cli::try_parse_from(argv).is_ok(), "{argv:?}");
+        }
+    }
 }

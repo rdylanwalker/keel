@@ -2183,6 +2183,50 @@ mod tests {
         }
     }
 
+    /// In-memory `.tgz` of `(path, declared size, data)` entries (data may be shorter than the
+    /// declared size, like a hostile archive).
+    fn chart_tgz(entries: &[(&str, u64, &[u8])]) -> Vec<u8> {
+        use std::io::Write;
+        let mut tar = Vec::new();
+        for (path, size, data) in entries {
+            let mut header = [0u8; 512];
+            header[..path.len()].copy_from_slice(path.as_bytes());
+            let size_field = format!("{size:011o}");
+            header[124..135].copy_from_slice(size_field.as_bytes());
+            header[156] = b'0';
+            tar.extend_from_slice(&header);
+            tar.extend_from_slice(data);
+            tar.resize(tar.len().div_ceil(512) * 512, 0);
+        }
+        tar.extend_from_slice(&[0u8; 1024]);
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        gz.write_all(&tar).unwrap();
+        gz.finish().unwrap()
+    }
+
+    #[test]
+    fn chart_archive_extraction_enforces_schema_and_unpacked_size_caps() {
+        let ok = chart_tgz(&[("demo/values.schema.json", 2, b"{}")]);
+        let files = extract_chart_schema_files(&ok).unwrap();
+        assert_eq!(files.values_schema_json.as_deref(), Some(&b"{}"[..]));
+
+        let big = vec![b' '; MAX_SCHEMA_BYTES + 1];
+        let oversized = chart_tgz(&[("demo/values.schema.json", big.len() as u64, &big)]);
+        let err = extract_chart_schema_files(&oversized).err();
+        assert!(
+            matches!(err, Some(ServerError::BadRequest(ref m)) if m.contains("exceeds 2 MiB")),
+            "{err:?}"
+        );
+
+        // A (decompression-bomb) entry larger than the unpack cap is refused, not skipped.
+        let bomb = chart_tgz(&[("demo/templates/big.yaml", MAX_HELM_UNPACKED_BYTES, b"")]);
+        let err = extract_chart_schema_files(&bomb).err();
+        assert!(
+            matches!(err, Some(ServerError::BadRequest(ref m)) if m.contains("decompressed size limit")),
+            "{err:?}"
+        );
+    }
+
     #[test]
     fn fetched_schema_with_unreachable_secret_is_rejected() {
         let hidden = json!({

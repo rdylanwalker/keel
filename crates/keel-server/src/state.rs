@@ -2702,6 +2702,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn management_core_row_takes_live_status_and_count_from_flux_kustomizations() {
+        let mgmt_row = |stacks: HashMap<(String, String), keel_kube::LiveResourceInfo>| async {
+            let tmp = tempfile::tempdir().unwrap();
+            let provider = KubeClusterStateProvider::new(
+                RepoClusterStateProvider::new(tmp.path()),
+                Arc::new(DetailLiveStatus { stacks }),
+            );
+            provider
+                .list_stacks(None, None)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|s| s.name == "management-cluster-core")
+                .unwrap()
+        };
+        let flux = |name: &str, status, count| {
+            let mut info = keel_kube::LiveResourceInfo::from_status(status);
+            info.resource_count = Some(count);
+            (("flux-system".to_string(), name.to_string()), info)
+        };
+
+        // No live `management-cluster-core`: the root `flux-system` sync stands in.
+        let row = mgmt_row(HashMap::from([flux(
+            "flux-system",
+            LiveResourceStatus::Reconciling,
+            12,
+        )]))
+        .await;
+        assert_eq!(row.status, "Reconciling");
+        assert_eq!(row.resource_count, Some(12));
+
+        // `core-addons` (the management add-ons) is preferred over the root sync.
+        let row = mgmt_row(HashMap::from([
+            flux("flux-system", LiveResourceStatus::Error, 12),
+            flux("core-addons", LiveResourceStatus::Synced, 5),
+        ]))
+        .await;
+        assert_eq!(row.status, "Synced");
+        assert_eq!(row.resource_count, Some(5));
+    }
+
+    #[tokio::test]
     async fn live_only_stacks_respect_provider_filter_and_report_orphaned_vs_deleting() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path().join(".keel")).unwrap();

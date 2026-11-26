@@ -55,6 +55,8 @@ struct ForgeLog {
     protected: AtomicBool,
     /// Published SSH host keys (`GET /meta`); `None` means `[HOST_KEY]`.
     host_keys: Mutex<Option<Vec<String>>>,
+    /// Platform repository merges: `(pr_id, expected_head_sha)`.
+    merges: Mutex<Vec<(String, Option<String>)>>,
 }
 
 impl ForgeLog {
@@ -98,6 +100,11 @@ impl ForgeProvider for MockForge {
         pr_id: &str,
         expected_head_sha: Option<&str>,
     ) -> Result<PullRequestInfo, ForgeError> {
+        self.log
+            .merges
+            .lock()
+            .unwrap()
+            .push((pr_id.to_string(), expected_head_sha.map(str::to_string)));
         self.inner
             .merge_pull_request(pr_id, expected_head_sha)
             .await
@@ -551,6 +558,38 @@ fn data(secret: &Secret, key: &str) -> String {
 
 fn annotation(secret: &Secret, key: &str) -> String {
     secret.metadata.annotations.as_ref().unwrap()[key].clone()
+}
+
+/// A merge through the API pins the forge merge to the PR head the server verified, so a push
+/// racing the merge cannot land unreviewed commits.
+#[tokio::test]
+async fn merge_is_pinned_to_the_verified_pr_head_sha() {
+    let fx = fixture(TenantRepoForgeKind::Forgejo).await;
+    let (status, body, _) = create(&fx.state, "acme").await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let pr_id = body["proposal"]["id"].as_str().unwrap().to_string();
+    let branch = body["branch"].as_str().unwrap();
+    let out = std::process::Command::new("git")
+        .arg("--git-dir")
+        .arg(fx.root.join("infra-gitops.git"))
+        .args(["rev-parse", &format!("refs/heads/{branch}")])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let head = String::from_utf8(out.stdout).unwrap().trim().to_string();
+
+    let (status, merged, _) = send(
+        &fx.state,
+        Method::POST,
+        &format!("/api/v1/tenants/management/proposals/{pr_id}/merge"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{merged}");
+    assert_eq!(
+        fx.log.merges.lock().unwrap().clone(),
+        vec![(pr_id, Some(head))]
+    );
 }
 
 #[tokio::test]
