@@ -1,19 +1,40 @@
 //! Real `russh` WebSocket-to-SSH PTY bridge (`SDD.md` §7.3).
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use axum::extract::ws::{Message, WebSocket};
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::response::Response;
 use futures::StreamExt;
 use keel_core::{
-    StackSshInfoResponse, clean_candidate_ssh_host, clean_candidate_ssh_user,
-    is_private_or_internal_ssh_host,
+    AuthPhase, StackSshInfoResponse, clean_candidate_ssh_host, clean_candidate_ssh_user,
+    is_forbidden_ssh_proxy_host, is_forbidden_ssh_proxy_ip, is_private_or_internal_ssh_host,
 };
 use keel_core::{is_private_or_internal_ip, is_unresolved_ssh_target};
 use russh::keys::{HashAlg, PrivateKeyWithHashAlg, PublicKey, decode_secret_key};
 use russh::{ChannelMsg, client};
 use serde::{Deserialize, Serialize};
+use tokio::time::Instant;
+
+/// Largest WebSocket message (and frame) the SSH bridge accepts: 64 KiB. Bigger frames (an
+/// oversized paste or a flood) fail the WebSocket read and end the session.
+pub(crate) const SSH_WS_MAX_MESSAGE_BYTES: usize = 64 * 1024;
+/// How long a new browser terminal may take to send its initial `connect` frame.
+pub(crate) const SSH_CONNECT_FRAME_TIMEOUT: Duration = Duration::from_secs(30);
+/// A session with no `input` or `resize` frame for this long is closed (terminal output does not
+/// count, and SSH keepalives would otherwise keep an abandoned tab open forever).
+pub(crate) const SSH_INPUT_IDLE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+/// Absolute cap on a browser SSH session: never longer than the `keel_session` lifetime.
+pub(crate) const SSH_MAX_SESSION_DURATION: Duration =
+    Duration::from_secs(crate::auth::SESSION_TTL_SECONDS as u64);
+/// Concurrent browser SSH sessions allowed per user (OIDC `sub`) on one keel-server replica.
+pub(crate) const SSH_MAX_SESSIONS_PER_USER: usize = 4;
+/// How often an open session re-checks the server's auth phase.
+pub(crate) const SSH_AUTH_PHASE_POLL_INTERVAL: Duration = Duration::from_secs(5);
+/// Bound on SSH setup after the handshake (authentication, channel open, PTY and shell).
+const SSH_SETUP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Providers that do not expose an SSH-accessible VM/node endpoint.
 const NON_SSH_PROVIDERS: &[&str] = &[
@@ -106,6 +127,39 @@ async fn send_ws_json(socket: &mut WebSocket, msg: &SshWsServerMessage) -> Resul
     Ok(())
 }
 
+/// Time limits of a browser SSH session. Production uses [`Default`] (the `SSH_*` constants);
+/// tests shorten them.
+#[derive(Debug, Clone)]
+pub(crate) struct SshSessionLimits {
+    /// [`SSH_CONNECT_FRAME_TIMEOUT`].
+    pub connect_frame_timeout: Duration,
+    /// [`SSH_INPUT_IDLE_TIMEOUT`].
+    pub idle_timeout: Duration,
+    /// [`SSH_MAX_SESSION_DURATION`].
+    pub max_duration: Duration,
+    /// [`SSH_AUTH_PHASE_POLL_INTERVAL`].
+    pub phase_poll_interval: Duration,
+}
+
+impl Default for SshSessionLimits {
+    fn default() -> Self {
+        Self {
+            connect_frame_timeout: SSH_CONNECT_FRAME_TIMEOUT,
+            idle_timeout: SSH_INPUT_IDLE_TIMEOUT,
+            max_duration: SSH_MAX_SESSION_DURATION,
+            phase_poll_interval: SSH_AUTH_PHASE_POLL_INTERVAL,
+        }
+    }
+}
+
+/// The auth phase a session was issued under and the server's live phase. A change (e.g. leaving
+/// break-glass) invalidates every session, so open SSH sessions close too.
+#[derive(Debug, Clone)]
+pub(crate) struct AuthPhaseWatch {
+    pub issued: AuthPhase,
+    pub current: Arc<tokio::sync::RwLock<AuthPhase>>,
+}
+
 /// Per-session security policy computed by the authenticated HTTP layer
 /// (`routes::workloads::stack_ssh_ws`).
 #[derive(Debug, Clone, Default)]
@@ -118,6 +172,174 @@ pub(crate) struct SshSessionPolicy {
     /// Granted only to tenant administrators; tenant members are restricted to stack-resolved
     /// targets.
     pub allow_unresolved_target_override: bool,
+    /// `exp` (Unix seconds) of the `keel_session` that opened the WebSocket: the SSH session
+    /// closes then. Logout only clears cookies (sessions are stateless and cannot be revoked
+    /// server-side), so this is also what bounds a session that outlives a logout.
+    pub session_expires_at: Option<i64>,
+    /// Closes the session when the server's auth phase changes.
+    pub auth_phase: Option<AuthPhaseWatch>,
+    pub limits: SshSessionLimits,
+    /// Tests only: lets stack-resolved targets reach loopback, where the test SSH server listens.
+    #[cfg(test)]
+    pub allow_host_local_targets: bool,
+}
+
+impl SshSessionPolicy {
+    fn host_local_targets_allowed(&self) -> bool {
+        #[cfg(test)]
+        {
+            self.allow_host_local_targets
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
+    }
+
+    /// The instant the session must end and why: the earlier of the `keel_session` expiry and
+    /// `started + limits.max_duration`.
+    fn deadline(&self, started: Instant) -> (Instant, &'static str) {
+        let cap = started + self.limits.max_duration;
+        let Some(exp) = self.session_expires_at else {
+            return (cap, MAX_DURATION_MESSAGE);
+        };
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+            .unwrap_or(0);
+        let remaining_ms = exp.saturating_mul(1000).saturating_sub(now_ms).max(0);
+        let expiry = started + Duration::from_millis(remaining_ms.unsigned_abs());
+        if expiry <= cap {
+            (expiry, SESSION_EXPIRED_MESSAGE)
+        } else {
+            (cap, MAX_DURATION_MESSAGE)
+        }
+    }
+}
+
+const SESSION_EXPIRED_MESSAGE: &str =
+    "SSH session closed: your Keel login session expired. Log in again to reconnect.";
+const MAX_DURATION_MESSAGE: &str =
+    "SSH session closed: it reached the maximum browser terminal duration. Reconnect to continue.";
+const AUTH_PHASE_CHANGED_MESSAGE: &str =
+    "SSH session closed: the Keel authentication mode changed. Log in again to reconnect.";
+
+/// Counts open browser SSH sessions per user and caps them at `max_per_user`
+/// ([`SSH_MAX_SESSIONS_PER_USER`]). In-memory and per replica, like the sessions themselves.
+#[derive(Debug)]
+pub(crate) struct SshSessionRegistry {
+    max_per_user: usize,
+    active: Mutex<HashMap<String, usize>>,
+}
+
+impl Default for SshSessionRegistry {
+    fn default() -> Self {
+        Self::new(SSH_MAX_SESSIONS_PER_USER)
+    }
+}
+
+impl SshSessionRegistry {
+    pub(crate) fn new(max_per_user: usize) -> Self {
+        Self {
+            max_per_user,
+            active: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Reserves a session slot for `user`, or `None` when the user is at the limit. The slot is
+    /// released when the returned guard drops (the session ends, or the upgrade never happens).
+    pub(crate) fn try_acquire(self: &Arc<Self>, user: &str) -> Option<SshSessionSlot> {
+        let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+        let count = active.entry(user.to_string()).or_insert(0);
+        if *count >= self.max_per_user {
+            return None;
+        }
+        *count += 1;
+        Some(SshSessionSlot {
+            registry: Arc::clone(self),
+            user: user.to_string(),
+        })
+    }
+
+    /// Open sessions of `user`.
+    #[cfg(test)]
+    pub(crate) fn active_sessions(&self, user: &str) -> usize {
+        let active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+        active.get(user).copied().unwrap_or(0)
+    }
+}
+
+/// RAII slot from [`SshSessionRegistry::try_acquire`].
+#[derive(Debug)]
+pub(crate) struct SshSessionSlot {
+    registry: Arc<SshSessionRegistry>,
+    user: String,
+}
+
+impl Drop for SshSessionSlot {
+    fn drop(&mut self) {
+        let mut active = self
+            .registry
+            .active
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(count) = active.get_mut(&self.user) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                active.remove(&self.user);
+            }
+        }
+    }
+}
+
+/// Upgrades `GET /api/v1/stacks/{ns}/{name}/ssh/ws` to the SSH bridge: caps WebSocket messages
+/// and frames at [`SSH_WS_MAX_MESSAGE_BYTES`] and takes one of the user's session slots. A user
+/// at the limit still gets the upgrade, but only to receive an error frame and a close, because
+/// browsers cannot read the body of a refused upgrade.
+pub(crate) fn upgrade_ssh_ws(
+    ws: WebSocketUpgrade,
+    sessions: &Arc<SshSessionRegistry>,
+    ssh_info: StackSshInfoResponse,
+    saved_ssh_key: Option<String>,
+    user_subject: String,
+    policy: SshSessionPolicy,
+) -> Response {
+    let ws = ws
+        .max_message_size(SSH_WS_MAX_MESSAGE_BYTES)
+        .max_frame_size(SSH_WS_MAX_MESSAGE_BYTES);
+    match sessions.try_acquire(&user_subject) {
+        Some(slot) => ws.on_upgrade(move |socket| async move {
+            handle_stack_ssh_ws(socket, ssh_info, saved_ssh_key, user_subject, policy).await;
+            drop(slot);
+        }),
+        None => {
+            let max = sessions.max_per_user;
+            tracing::warn!(
+                target: "keel::audit",
+                user = %user_subject,
+                tenant = %ssh_info.tenant,
+                stack = %ssh_info.stack_name,
+                max_sessions = max,
+                "WebSocket SSH session refused: concurrent session limit reached"
+            );
+            ws.on_upgrade(move |mut socket| async move {
+                close_with_error(
+                    &mut socket,
+                    format!(
+                        "Too many open SSH sessions: at most {max} browser terminals per user. Close another terminal and try again."
+                    ),
+                )
+                .await;
+            })
+        }
+    }
+}
+
+/// Sends an error frame, `disconnected` and a WebSocket close.
+async fn close_with_error(socket: &mut WebSocket, message: String) {
+    let _ = send_ws_json(socket, &SshWsServerMessage::Error { message }).await;
+    let _ = send_ws_json(socket, &SshWsServerMessage::Disconnected).await;
+    let _ = socket.send(Message::Close(None)).await;
 }
 
 /// Final SSH connection target selected for a session.
@@ -201,9 +423,12 @@ pub(crate) fn select_connect_target(
     })
 }
 
-/// Picks the socket address to connect to from a DNS resolution result. For untrusted
-/// (client-supplied) targets **every** resolved address must be public, which defeats DNS
-/// rebinding: the vetted `SocketAddr` itself (not the hostname) is then passed to `connect`.
+/// Picks the socket address to connect to from a DNS resolution result; **every** resolved
+/// address is vetted, which defeats DNS rebinding (the vetted `SocketAddr` itself, not the
+/// hostname, is then passed to `connect`). Untrusted (client-supplied) targets must be public
+/// ([`is_private_or_internal_ip`]). Trusted (stack-resolved) targets may be private VMs but never
+/// loopback, link-local/cloud metadata, multicast or unspecified ([`is_forbidden_ssh_proxy_ip`]),
+/// so a forged or mistaken stack output cannot point the proxy at keel-server or its node.
 pub(crate) fn pick_vetted_socket_addr(
     addrs: &[SocketAddr],
     trusted: bool,
@@ -217,18 +442,53 @@ pub(crate) fn pick_vetted_socket_addr(
                 .to_string(),
         );
     }
+    if trusted && addrs.iter().any(|a| is_forbidden_ssh_proxy_ip(a.ip())) {
+        return Err(
+            "Refusing SSH target: it resolves to a loopback, link-local (cloud metadata), multicast or unspecified address"
+                .to_string(),
+        );
+    }
     Ok(*first)
 }
 
-async fn resolve_vetted_socket_addr(target: &ConnectTarget) -> Result<SocketAddr, String> {
-    let addrs: Vec<SocketAddr> = tokio::time::timeout(
-        Duration::from_secs(5),
-        tokio::net::lookup_host((target.host.as_str(), target.port)),
-    )
-    .await
-    .map_err(|_| format!("DNS resolution for SSH host '{}' timed out", target.host))?
-    .map_err(|e| format!("DNS resolution for SSH host '{}' failed: {e}", target.host))?
-    .collect();
+async fn resolve_vetted_socket_addr(
+    target: &ConnectTarget,
+    host_local_allowed: bool,
+) -> Result<SocketAddr, String> {
+    if target.trusted && !host_local_allowed && is_forbidden_ssh_proxy_host(&target.host) {
+        return Err(format!(
+            "Refusing SSH target '{}': loopback, link-local (cloud metadata), cluster-internal (`*.svc`, `*.cluster.local`) and single-label hosts are never reachable through the browser terminal",
+            target.host
+        ));
+    }
+    let literal = target
+        .host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<std::net::IpAddr>()
+        .ok();
+    let addrs: Vec<SocketAddr> = match literal {
+        Some(ip) => vec![SocketAddr::new(ip, target.port)],
+        None => {
+            // Resolve as an absolute name, so the pod's cluster search domains never turn a stack
+            // output into `<name>.<ns>.svc.cluster.local`.
+            let absolute = format!("{}.", target.host.trim_end_matches('.'));
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                tokio::net::lookup_host((absolute.as_str(), target.port)),
+            )
+            .await
+            .map_err(|_| format!("DNS resolution for SSH host '{}' timed out", target.host))?
+            .map_err(|e| format!("DNS resolution for SSH host '{}' failed: {e}", target.host))?
+            .collect()
+        }
+    };
+    if target.trusted && host_local_allowed {
+        return addrs
+            .first()
+            .copied()
+            .ok_or_else(|| "SSH target hostname did not resolve to any address".to_string());
+    }
     pick_vetted_socket_addr(&addrs, target.trusted)
 }
 
@@ -327,6 +587,11 @@ impl client::Handler for SshClientHandler {
 }
 
 /// Bridges an authenticated WebSocket client to a real `russh` SSH PTY shell session.
+///
+/// The session ends, with an error frame and a WebSocket close, when the `keel_session` that
+/// opened it expires or `limits.max_duration` passes, when the server's auth phase changes, when
+/// no `input`/`resize` frame arrives for `limits.idle_timeout`, or when the client does not send
+/// its `connect` frame within `limits.connect_frame_timeout`.
 pub(crate) async fn handle_stack_ssh_ws(
     mut socket: WebSocket,
     ssh_info: StackSshInfoResponse,
@@ -334,6 +599,8 @@ pub(crate) async fn handle_stack_ssh_ws(
     user_subject: String,
     policy: SshSessionPolicy,
 ) {
+    let (deadline, deadline_message) = policy.deadline(Instant::now());
+
     if !is_ssh_supported_infra(&ssh_info.provider, &ssh_info.stack_name) {
         let _ = send_ws_json(
             &mut socket,
@@ -369,9 +636,22 @@ pub(crate) async fn handle_stack_ssh_ws(
     let mut rows: u16 = 24;
     let ephemeral_key: Option<String>;
 
-    // Wait for the initial Connect frame
+    // Wait for the initial Connect frame, bounded by the connect timeout and the session deadline.
+    let connect_deadline = deadline.min(Instant::now() + policy.limits.connect_frame_timeout);
     loop {
-        match socket.next().await {
+        let next = match tokio::time::timeout_at(connect_deadline, socket.next()).await {
+            Ok(next) => next,
+            Err(_) => {
+                let message = if connect_deadline >= deadline {
+                    deadline_message.to_string()
+                } else {
+                    "Timed out waiting for the SSH 'connect' frame".to_string()
+                };
+                close_with_error(&mut socket, message).await;
+                return;
+            }
+        };
+        match next {
             Some(Ok(Message::Text(text))) => {
                 match serde_json::from_str::<SshWsClientMessage>(&text) {
                     Ok(SshWsClientMessage::Connect {
@@ -457,7 +737,8 @@ pub(crate) async fn handle_stack_ssh_ws(
                     }
                 }
             }
-            Some(Ok(Message::Close(_))) | None => return,
+            // Oversized (> SSH_WS_MAX_MESSAGE_BYTES) or malformed frames end the connection.
+            Some(Ok(Message::Close(_))) | Some(Err(_)) | None => return,
             _ => {}
         }
     }
@@ -500,14 +781,24 @@ pub(crate) async fn handle_stack_ssh_ws(
         port: active_port,
         trusted: target_trusted,
     };
-    let socket_addr = match resolve_vetted_socket_addr(&target).await {
-        Ok(addr) => addr,
-        Err(message) => {
-            let _ = send_ws_json(&mut socket, &SshWsServerMessage::Error { message }).await;
-            let _ = send_ws_json(&mut socket, &SshWsServerMessage::Disconnected).await;
-            return;
-        }
-    };
+    let socket_addr =
+        match resolve_vetted_socket_addr(&target, policy.host_local_targets_allowed()).await {
+            Ok(addr) => addr,
+            Err(message) => {
+                tracing::warn!(
+                    target: "keel::audit",
+                    user = %user_subject,
+                    tenant = %ssh_info.tenant,
+                    stack = %ssh_info.stack_name,
+                    ssh_host = %active_host,
+                    trusted = target_trusted,
+                    "WebSocket SSH target refused"
+                );
+                let _ = send_ws_json(&mut socket, &SshWsServerMessage::Error { message }).await;
+                let _ = send_ws_json(&mut socket, &SshWsServerMessage::Disconnected).await;
+                return;
+            }
+        };
 
     let (handler, observed_fingerprint) = SshClientHandler::new(expected_fingerprints.clone());
     let mut session = match tokio::time::timeout(
@@ -562,55 +853,30 @@ pub(crate) async fn handle_stack_ssh_ws(
         }
     };
 
-    let best_hash = session
-        .best_supported_rsa_hash()
-        .await
-        .ok()
-        .flatten()
-        .flatten();
-    let auth_res = session
-        .authenticate_publickey(
+    let mut channel = match tokio::time::timeout(
+        SSH_SETUP_TIMEOUT,
+        open_shell(
+            &mut session,
             &active_user,
-            PrivateKeyWithHashAlg::new(key_pair, best_hash),
-        )
-        .await;
-
-    match auth_res {
-        Ok(res) if res.success() => {}
-        Ok(_) => {
-            let _ = send_ws_json(
-                &mut socket,
-                &SshWsServerMessage::Error {
-                    message: format!(
-                        "SSH public-key authentication rejected for {}@{}",
-                        active_user, active_host
-                    ),
-                },
-            )
-            .await;
+            &active_host,
+            key_pair,
+            cols,
+            rows,
+        ),
+    )
+    .await
+    {
+        Ok(Ok(channel)) => channel,
+        Ok(Err(message)) => {
+            let _ = send_ws_json(&mut socket, &SshWsServerMessage::Error { message }).await;
             let _ = send_ws_json(&mut socket, &SshWsServerMessage::Disconnected).await;
             return;
         }
-        Err(err) => {
+        Err(_) => {
             let _ = send_ws_json(
                 &mut socket,
                 &SshWsServerMessage::Error {
-                    message: format!("SSH authentication error: {err}"),
-                },
-            )
-            .await;
-            let _ = send_ws_json(&mut socket, &SshWsServerMessage::Disconnected).await;
-            return;
-        }
-    }
-
-    let mut channel = match session.channel_open_session().await {
-        Ok(ch) => ch,
-        Err(err) => {
-            let _ = send_ws_json(
-                &mut socket,
-                &SshWsServerMessage::Error {
-                    message: format!("Failed to open SSH session channel: {err}"),
+                    message: format!("SSH session setup for {active_user}@{active_host} timed out"),
                 },
             )
             .await;
@@ -618,33 +884,6 @@ pub(crate) async fn handle_stack_ssh_ws(
             return;
         }
     };
-
-    if let Err(err) = channel
-        .request_pty(false, "dumb", cols as u32, rows as u32, 0, 0, &[])
-        .await
-    {
-        let _ = send_ws_json(
-            &mut socket,
-            &SshWsServerMessage::Error {
-                message: format!("Failed to allocate SSH PTY: {err}"),
-            },
-        )
-        .await;
-        let _ = send_ws_json(&mut socket, &SshWsServerMessage::Disconnected).await;
-        return;
-    }
-
-    if let Err(err) = channel.request_shell(false).await {
-        let _ = send_ws_json(
-            &mut socket,
-            &SshWsServerMessage::Error {
-                message: format!("Failed to start remote shell: {err}"),
-            },
-        )
-        .await;
-        let _ = send_ws_json(&mut socket, &SshWsServerMessage::Disconnected).await;
-        return;
-    }
 
     let host_key_fingerprint = observed_fingerprint.lock().ok().and_then(|g| g.clone());
     let host_key_verified = !expected_fingerprints.is_empty() && host_key_fingerprint.is_some();
@@ -685,6 +924,19 @@ pub(crate) async fn handle_stack_ssh_ws(
     // incrementally so characters straddling a chunk boundary are not replaced with U+FFFD.
     let mut stdout_decoder = Utf8StreamDecoder::default();
     let mut stderr_decoder = Utf8StreamDecoder::default();
+    let mut idle_deadline = Instant::now() + policy.limits.idle_timeout;
+    let mut phase_check = tokio::time::interval(policy.limits.phase_poll_interval);
+    phase_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let audit_close = |reason: &str| {
+        tracing::info!(
+            target: "keel::audit",
+            user = %user_subject,
+            tenant = %ssh_info.tenant,
+            stack = %ssh_info.stack_name,
+            reason,
+            "WebSocket SSH session closed by server"
+        );
+    };
     loop {
         tokio::select! {
             msg = channel.wait() => {
@@ -723,12 +975,14 @@ pub(crate) async fn handle_stack_ssh_ws(
                     Some(Ok(Message::Text(text))) => {
                         match serde_json::from_str::<SshWsClientMessage>(&text) {
                             Ok(SshWsClientMessage::Input { data }) => {
+                                idle_deadline = Instant::now() + policy.limits.idle_timeout;
                                 if channel.data(data.as_bytes()).await.is_err() {
                                     let _ = send_ws_json(&mut socket, &SshWsServerMessage::Disconnected).await;
                                     break;
                                 }
                             }
                             Ok(SshWsClientMessage::Resize { cols, rows }) => {
+                                idle_deadline = Instant::now() + policy.limits.idle_timeout;
                                 let _ = channel.window_change(cols as u32, rows as u32, 0, 0).await;
                             }
                             Ok(SshWsClientMessage::Disconnect) => {
@@ -755,11 +1009,43 @@ pub(crate) async fn handle_stack_ssh_ws(
                             }
                         }
                     }
-                    Some(Ok(Message::Close(_))) | None => {
+                    // Oversized (> SSH_WS_MAX_MESSAGE_BYTES) or malformed frames end the session.
+                    Some(Ok(Message::Close(_))) | Some(Err(_)) | None => {
                         let _ = channel.eof().await;
                         break;
                     }
                     _ => {}
+                }
+            }
+            () = tokio::time::sleep_until(deadline) => {
+                audit_close("deadline");
+                let _ = channel.eof().await;
+                close_with_error(&mut socket, deadline_message.to_string()).await;
+                break;
+            }
+            () = tokio::time::sleep_until(idle_deadline) => {
+                audit_close("idle");
+                let _ = channel.eof().await;
+                close_with_error(
+                    &mut socket,
+                    format!(
+                        "SSH session closed after {} without input. Reconnect to continue.",
+                        format_duration(policy.limits.idle_timeout)
+                    ),
+                )
+                .await;
+                break;
+            }
+            _ = phase_check.tick(), if policy.auth_phase.is_some() => {
+                let changed = match &policy.auth_phase {
+                    Some(watch) => *watch.current.read().await != watch.issued,
+                    None => false,
+                };
+                if changed {
+                    audit_close("auth-phase-changed");
+                    let _ = channel.eof().await;
+                    close_with_error(&mut socket, AUTH_PHASE_CHANGED_MESSAGE.to_string()).await;
+                    break;
                 }
             }
         }
@@ -768,6 +1054,61 @@ pub(crate) async fn handle_stack_ssh_ws(
     let _ = session
         .disconnect(russh::Disconnect::ByApplication, "", "en")
         .await;
+}
+
+/// Authenticates with `key_pair`, then opens a session channel with a PTY and a shell.
+async fn open_shell(
+    session: &mut client::Handle<SshClientHandler>,
+    user: &str,
+    host: &str,
+    key_pair: Arc<russh::keys::PrivateKey>,
+    cols: u16,
+    rows: u16,
+) -> Result<russh::Channel<client::Msg>, String> {
+    let best_hash = session
+        .best_supported_rsa_hash()
+        .await
+        .ok()
+        .flatten()
+        .flatten();
+    match session
+        .authenticate_publickey(user, PrivateKeyWithHashAlg::new(key_pair, best_hash))
+        .await
+    {
+        Ok(res) if res.success() => {}
+        Ok(_) => {
+            return Err(format!(
+                "SSH public-key authentication rejected for {user}@{host}"
+            ));
+        }
+        Err(err) => return Err(format!("SSH authentication error: {err}")),
+    }
+    let channel = session
+        .channel_open_session()
+        .await
+        .map_err(|err| format!("Failed to open SSH session channel: {err}"))?;
+    channel
+        .request_pty(false, "dumb", cols as u32, rows as u32, 0, 0, &[])
+        .await
+        .map_err(|err| format!("Failed to allocate SSH PTY: {err}"))?;
+    channel
+        .request_shell(false)
+        .await
+        .map_err(|err| format!("Failed to start remote shell: {err}"))?;
+    Ok(channel)
+}
+
+/// `15 minutes`, `90 seconds`, ... for user-facing messages.
+fn format_duration(d: Duration) -> String {
+    let secs = d.as_secs();
+    if secs >= 60 && secs.is_multiple_of(60) {
+        let mins = secs / 60;
+        format!("{mins} minute{}", if mins == 1 { "" } else { "s" })
+    } else if secs >= 1 {
+        format!("{secs} second{}", if secs == 1 { "" } else { "s" })
+    } else {
+        format!("{} ms", d.as_millis())
+    }
 }
 
 /// Incremental UTF-8 decoder for byte streams delivered in arbitrary chunks.
@@ -1014,16 +1355,47 @@ mod tests {
             let len = payload.len();
             if len < 126 {
                 frame.push(0x80 | (len as u8));
-            } else {
+            } else if len <= usize::from(u16::MAX) {
                 frame.push(0x80 | 126);
                 frame.extend_from_slice(&(len as u16).to_be_bytes());
+            } else {
+                frame.push(0x80 | 127);
+                frame.extend_from_slice(&(len as u64).to_be_bytes());
             }
             let mask = [0x12, 0x34, 0x56, 0x78];
             frame.extend_from_slice(&mask);
             for (i, b) in payload.iter().enumerate() {
                 frame.push(b ^ mask[i % 4]);
             }
-            self.stream.write_all(&frame).await.unwrap();
+            // The server may already have closed the connection (oversized frames).
+            let _ = self.stream.write_all(&frame).await;
+        }
+
+        /// Next text frame, or `None` once the server sends a close frame or the stream ends.
+        async fn recv_text_or_end(&mut self) -> Option<String> {
+            use tokio::io::AsyncReadExt;
+            loop {
+                let mut hdr = [0u8; 2];
+                self.stream.read_exact(&mut hdr).await.ok()?;
+                let opcode = hdr[0] & 0x0f;
+                let mut len = (hdr[1] & 0x7f) as usize;
+                if len == 126 {
+                    let mut ext = [0u8; 2];
+                    self.stream.read_exact(&mut ext).await.ok()?;
+                    len = u16::from_be_bytes(ext) as usize;
+                } else if len == 127 {
+                    let mut ext = [0u8; 8];
+                    self.stream.read_exact(&mut ext).await.ok()?;
+                    len = u64::from_be_bytes(ext) as usize;
+                }
+                let mut payload = vec![0u8; len];
+                self.stream.read_exact(&mut payload).await.ok()?;
+                match opcode {
+                    0x8 => return None,
+                    0x1 => return Some(String::from_utf8(payload).unwrap()),
+                    _ => {}
+                }
+            }
         }
 
         async fn recv_text(&mut self) -> String {
@@ -1088,11 +1460,19 @@ mod tests {
         }
     }
 
+    /// Default policy, except that stack-resolved targets may be the loopback test SSH server.
+    fn loopback_policy() -> SshSessionPolicy {
+        SshSessionPolicy {
+            allow_host_local_targets: true,
+            ..Default::default()
+        }
+    }
+
     async fn spawn_ws_handler(
         info: StackSshInfoResponse,
         saved_key: Option<String>,
     ) -> std::net::SocketAddr {
-        spawn_ws_handler_with_policy(info, saved_key, SshSessionPolicy::default()).await
+        spawn_ws_handler_with_policy(info, saved_key, loopback_policy()).await
     }
 
     async fn spawn_ws_handler_with_policy(
@@ -1100,8 +1480,18 @@ mod tests {
         saved_key: Option<String>,
         policy: SshSessionPolicy,
     ) -> std::net::SocketAddr {
+        spawn_ws_handler_with_registry(info, saved_key, policy, Arc::default()).await
+    }
+
+    /// Serves the SSH bridge at `/ws` exactly like `routes::workloads::stack_ssh_ws` does after
+    /// authentication (message caps and per-user slots from `upgrade_ssh_ws`), as user `tester`.
+    async fn spawn_ws_handler_with_registry(
+        info: StackSshInfoResponse,
+        saved_key: Option<String>,
+        policy: SshSessionPolicy,
+        sessions: Arc<SshSessionRegistry>,
+    ) -> std::net::SocketAddr {
         use axum::Router;
-        use axum::extract::ws::WebSocketUpgrade;
         use axum::routing::get;
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1112,10 +1502,9 @@ mod tests {
                 let info = info.clone();
                 let saved_key = saved_key.clone();
                 let policy = policy.clone();
+                let sessions = sessions.clone();
                 async move {
-                    ws.on_upgrade(move |socket| {
-                        handle_stack_ssh_ws(socket, info, saved_key, "tester".to_string(), policy)
-                    })
+                    upgrade_ssh_ws(ws, &sessions, info, saved_key, "tester".to_string(), policy)
                 }
             }),
         );
@@ -1316,6 +1705,24 @@ mod tests {
         assert!(pick_vetted_socket_addr(&[metadata], false).is_err());
         assert_eq!(pick_vetted_socket_addr(&[private], true).unwrap(), private);
         assert!(pick_vetted_socket_addr(&[], true).is_err());
+        // Trusted (stack-resolved) targets may be private VMs but never host-local addresses,
+        // even when only one of the resolved addresses is.
+        for forbidden in [
+            "127.0.0.1:22",
+            "169.254.169.254:22",
+            "0.0.0.0:22",
+            "[::1]:22",
+            "[fd00:ec2::254]:22",
+            "[fe80::1]:22",
+            "[::ffff:169.254.169.254]:22",
+        ] {
+            let addr: SocketAddr = forbidden.parse().unwrap();
+            let err = pick_vetted_socket_addr(&[addr], true).unwrap_err();
+            assert!(err.contains("loopback, link-local"), "{forbidden}");
+            assert!(pick_vetted_socket_addr(&[private, addr], true).is_err());
+        }
+        let cgnat: SocketAddr = "100.64.0.9:22".parse().unwrap();
+        assert_eq!(pick_vetted_socket_addr(&[cgnat], true).unwrap(), cgnat);
     }
 
     #[test]
@@ -1392,6 +1799,8 @@ mod tests {
             SshSessionPolicy {
                 expected_host_key: Some(other_pub),
                 allow_unresolved_target_override: false,
+                allow_host_local_targets: true,
+                ..Default::default()
             },
         )
         .await;
@@ -1410,6 +1819,8 @@ mod tests {
             SshSessionPolicy {
                 expected_host_key: Some(host_fp.clone()),
                 allow_unresolved_target_override: false,
+                allow_host_local_targets: true,
+                ..Default::default()
             },
         )
         .await;
@@ -1429,6 +1840,8 @@ mod tests {
             SshSessionPolicy {
                 expected_host_key: Some("garbage".to_string()),
                 allow_unresolved_target_override: false,
+                allow_host_local_targets: true,
+                ..Default::default()
             },
         )
         .await;
@@ -1449,5 +1862,323 @@ mod tests {
         ws.send_text(r#"{"type":"connect","host":"203.0.113.5"}"#)
             .await;
         assert!(ws.recv_text().await.contains("only tenant administrators"));
+    }
+
+    fn client_keypair() -> (PrivateKey, String) {
+        let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
+        let pem = key
+            .to_openssh(russh::keys::ssh_key::LineEnding::LF)
+            .unwrap()
+            .to_string();
+        (key, pem)
+    }
+
+    /// Next text frame within 10 s (`None`: closed). Guards tests against hanging forever.
+    async fn recv_within(ws: &mut MiniWsClient) -> Option<String> {
+        tokio::time::timeout(Duration::from_secs(10), ws.recv_text_or_end())
+            .await
+            .expect("no WebSocket frame within 10s")
+    }
+
+    /// Opens a browser SSH session against a fresh loopback test SSH server under `policy` and
+    /// consumes the `connected` frame and the shell prompt.
+    async fn connected_session(mut policy: SshSessionPolicy) -> MiniWsClient {
+        let host_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
+        let (client_key, client_pem) = client_keypair();
+        let port = spawn_test_ssh_server(host_key, client_key.public_key().clone()).await;
+        policy.allow_host_local_targets = true;
+        let addr = spawn_ws_handler_with_policy(
+            test_ssh_info("proxmox", "pve-vm", "127.0.0.1", port),
+            Some(client_pem),
+            policy,
+        )
+        .await;
+        let mut ws = MiniWsClient::connect(addr, "/ws").await;
+        ws.send_text(r#"{"type":"connect"}"#).await;
+        let connected = recv_within(&mut ws).await.unwrap();
+        assert!(connected.contains("\"type\":\"connected\""), "{connected}");
+        let prompt = recv_within(&mut ws).await.unwrap();
+        assert!(prompt.contains("ubuntu@test-vm:~$"), "{prompt}");
+        ws
+    }
+
+    /// Reads frames until an `error` frame, returning its JSON; asserts `disconnected` and a close
+    /// follow it.
+    async fn expect_closed_with_error(ws: &mut MiniWsClient) -> String {
+        loop {
+            let frame = recv_within(ws).await.expect("closed before an error frame");
+            if frame.contains("\"type\":\"error\"") {
+                assert!(
+                    recv_within(ws)
+                        .await
+                        .unwrap()
+                        .contains("\"type\":\"disconnected\"")
+                );
+                assert_eq!(
+                    recv_within(ws).await,
+                    None,
+                    "expected a close after {frame}"
+                );
+                return frame;
+            }
+        }
+    }
+
+    fn unix_now() -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+    }
+
+    fn limits(f: impl FnOnce(&mut SshSessionLimits)) -> SshSessionLimits {
+        let mut l = SshSessionLimits::default();
+        f(&mut l);
+        l
+    }
+
+    #[test]
+    fn session_limits_default_to_bounded_constants() {
+        let l = SshSessionLimits::default();
+        assert_eq!(l.connect_frame_timeout, Duration::from_secs(30));
+        assert_eq!(l.idle_timeout, Duration::from_secs(15 * 60));
+        assert!(
+            l.max_duration <= Duration::from_secs(crate::auth::SESSION_TTL_SECONDS as u64),
+            "a browser SSH session must never outlive the login session TTL"
+        );
+        assert_eq!(SSH_WS_MAX_MESSAGE_BYTES, 64 * 1024);
+        assert_eq!(SSH_MAX_SESSIONS_PER_USER, 4);
+    }
+
+    #[test]
+    fn session_deadline_is_the_earlier_of_login_expiry_and_max_duration() {
+        let started = Instant::now();
+        let policy = SshSessionPolicy {
+            session_expires_at: Some(unix_now() + 120),
+            ..Default::default()
+        };
+        let (at, why) = policy.deadline(started);
+        assert_eq!(why, SESSION_EXPIRED_MESSAGE);
+        assert!(at <= started + Duration::from_secs(120));
+        assert!(at >= started + Duration::from_secs(118));
+
+        let policy = SshSessionPolicy {
+            session_expires_at: Some(unix_now() + 7200),
+            ..Default::default()
+        };
+        let (at, why) = policy.deadline(started);
+        assert_eq!(why, MAX_DURATION_MESSAGE);
+        assert_eq!(at, started + SSH_MAX_SESSION_DURATION);
+
+        // Already expired: the deadline is now.
+        let policy = SshSessionPolicy {
+            session_expires_at: Some(unix_now() - 10),
+            ..Default::default()
+        };
+        assert_eq!(policy.deadline(started), (started, SESSION_EXPIRED_MESSAGE));
+    }
+
+    #[test]
+    fn session_registry_caps_sessions_per_user_and_releases_on_drop() {
+        let registry = Arc::new(SshSessionRegistry::new(2));
+        let a1 = registry.try_acquire("alice").unwrap();
+        let _a2 = registry.try_acquire("alice").unwrap();
+        assert!(registry.try_acquire("alice").is_none());
+        // Other users have their own budget.
+        let b1 = registry.try_acquire("bob").unwrap();
+        assert_eq!(registry.active_sessions("alice"), 2);
+        drop(a1);
+        assert_eq!(registry.active_sessions("alice"), 1);
+        let _a3 = registry.try_acquire("alice").unwrap();
+        drop(b1);
+        assert_eq!(registry.active_sessions("bob"), 0);
+        assert!(registry.active.lock().unwrap().get("bob").is_none());
+    }
+
+    #[tokio::test]
+    async fn handle_stack_ssh_ws_refuses_trusted_host_local_targets() {
+        let (_, client_pem) = client_keypair();
+        for host in [
+            "127.0.0.1",
+            "169.254.169.254",
+            "kubernetes.default.svc",
+            "keel-server.keel-system.svc.cluster.local",
+            "localhost",
+        ] {
+            // Stack-resolved (trusted) target, production policy.
+            let addr = spawn_ws_handler_with_policy(
+                test_ssh_info("proxmox", "pve-vm", host, 22),
+                Some(client_pem.clone()),
+                SshSessionPolicy::default(),
+            )
+            .await;
+            let mut ws = MiniWsClient::connect(addr, "/ws").await;
+            ws.send_text(r#"{"type":"connect"}"#).await;
+            let err = recv_within(&mut ws).await.unwrap();
+            assert!(err.contains("Refusing SSH target"), "{host}: {err}");
+            assert!(recv_within(&mut ws).await.unwrap().contains("disconnected"));
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_stack_ssh_ws_times_out_waiting_for_connect_frame() {
+        let addr = spawn_ws_handler_with_policy(
+            test_ssh_info("proxmox", "pve-vm", "127.0.0.1", 22),
+            None,
+            SshSessionPolicy {
+                limits: limits(|l| l.connect_frame_timeout = Duration::from_millis(150)),
+                ..loopback_policy()
+            },
+        )
+        .await;
+        let mut ws = MiniWsClient::connect(addr, "/ws").await;
+        let err = expect_closed_with_error(&mut ws).await;
+        assert!(
+            err.contains("Timed out waiting for the SSH 'connect' frame"),
+            "{err}"
+        );
+
+        // A login session that is already expired never gets to connect either.
+        let addr = spawn_ws_handler_with_policy(
+            test_ssh_info("proxmox", "pve-vm", "127.0.0.1", 22),
+            None,
+            SshSessionPolicy {
+                session_expires_at: Some(unix_now() - 1),
+                ..loopback_policy()
+            },
+        )
+        .await;
+        let mut ws = MiniWsClient::connect(addr, "/ws").await;
+        let err = expect_closed_with_error(&mut ws).await;
+        assert!(err.contains("login session expired"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn handle_stack_ssh_ws_closes_when_login_session_expires() {
+        let mut ws = connected_session(SshSessionPolicy {
+            // Whole seconds: at least one second left after connecting.
+            session_expires_at: Some(unix_now() + 2),
+            ..Default::default()
+        })
+        .await;
+        let err = expect_closed_with_error(&mut ws).await;
+        assert!(err.contains("login session expired"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn handle_stack_ssh_ws_enforces_max_duration() {
+        let mut ws = connected_session(SshSessionPolicy {
+            session_expires_at: Some(unix_now() + 3600),
+            limits: limits(|l| l.max_duration = Duration::from_millis(400)),
+            ..Default::default()
+        })
+        .await;
+        // Typing does not extend the absolute cap.
+        ws.send_text(r#"{"type":"input","data":"ls\n"}"#).await;
+        let err = expect_closed_with_error(&mut ws).await;
+        assert!(err.contains("maximum browser terminal duration"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn handle_stack_ssh_ws_closes_on_auth_phase_change() {
+        let current = Arc::new(tokio::sync::RwLock::new(AuthPhase::BreakGlass));
+        let mut ws = connected_session(SshSessionPolicy {
+            auth_phase: Some(AuthPhaseWatch {
+                issued: AuthPhase::BreakGlass,
+                current: current.clone(),
+            }),
+            limits: limits(|l| l.phase_poll_interval = Duration::from_millis(20)),
+            ..Default::default()
+        })
+        .await;
+        // Unchanged phase: the session keeps working.
+        ws.send_text(r#"{"type":"input","data":"whoami\n"}"#).await;
+        assert!(recv_within(&mut ws).await.unwrap().contains("exec:whoami"));
+
+        *current.write().await = AuthPhase::OidcActive;
+        let err = expect_closed_with_error(&mut ws).await;
+        assert!(err.contains("authentication mode changed"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn handle_stack_ssh_ws_closes_idle_sessions_and_input_resets_the_timer() {
+        let idle = Duration::from_millis(600);
+        let mut ws = connected_session(SshSessionPolicy {
+            limits: limits(|l| l.idle_timeout = idle),
+            ..Default::default()
+        })
+        .await;
+        // Keep typing for longer than the idle timeout: the session stays open.
+        for i in 0..4 {
+            tokio::time::sleep(idle / 3).await;
+            ws.send_text(&format!(r#"{{"type":"input","data":"cmd{i}\n"}}"#))
+                .await;
+            assert!(
+                recv_within(&mut ws)
+                    .await
+                    .unwrap()
+                    .contains(&format!("exec:cmd{i}"))
+            );
+        }
+        let last_input = std::time::Instant::now();
+        let err = expect_closed_with_error(&mut ws).await;
+        assert!(err.contains("without input"), "{err}");
+        assert!(last_input.elapsed() >= idle / 2, "closed too early");
+    }
+
+    #[tokio::test]
+    async fn handle_stack_ssh_ws_rejects_oversized_frames() {
+        let mut ws = connected_session(SshSessionPolicy::default()).await;
+        let big = "x".repeat(SSH_WS_MAX_MESSAGE_BYTES + 1024);
+        ws.send_text(&format!(r#"{{"type":"input","data":"{big}"}}"#))
+            .await;
+        // The frame is never forwarded to the SSH server; the session ends instead.
+        while let Some(frame) = recv_within(&mut ws).await {
+            assert!(!frame.contains("exec:"), "oversized input reached SSH");
+        }
+    }
+
+    #[tokio::test]
+    async fn upgrade_ssh_ws_limits_concurrent_sessions_per_user() {
+        let sessions: Arc<SshSessionRegistry> = Arc::default();
+        let addr = spawn_ws_handler_with_registry(
+            test_ssh_info("proxmox", "pve-vm", "127.0.0.1", 22),
+            None,
+            loopback_policy(),
+            sessions.clone(),
+        )
+        .await;
+        // Four terminals waiting for their `connect` frame hold the user's four slots.
+        let mut open = Vec::new();
+        for _ in 0..SSH_MAX_SESSIONS_PER_USER {
+            open.push(MiniWsClient::connect(addr, "/ws").await);
+        }
+        let mut fifth = MiniWsClient::connect(addr, "/ws").await;
+        let err = expect_closed_with_error(&mut fifth).await;
+        assert!(err.contains("Too many open SSH sessions"), "{err}");
+        assert!(err.contains("at most 4"), "{err}");
+        assert_eq!(
+            sessions.active_sessions("tester"),
+            SSH_MAX_SESSIONS_PER_USER
+        );
+
+        // Closing a terminal frees its slot.
+        drop(open.pop());
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while sessions.active_sessions("tester") >= SSH_MAX_SESSIONS_PER_USER {
+                tokio::task::yield_now().await;
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("slot was not released");
+        let mut again = MiniWsClient::connect(addr, "/ws").await;
+        again.send_text(r#"{"type":"connect"}"#).await;
+        assert!(
+            recv_within(&mut again)
+                .await
+                .unwrap()
+                .contains("No SSH private key available")
+        );
     }
 }

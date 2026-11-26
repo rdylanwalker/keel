@@ -324,11 +324,21 @@ describe("VmSshModal component", () => {
       rows: 40,
     })
 
+    // A large paste is split into several input frames (the server caps messages at 64 KiB)
+    const paste = "x".repeat(10000)
+    act(() => {
+      term.emitData(paste)
+    })
+    const pasted = ws.sentMessages.slice(5).map((m) => JSON.parse(m))
+    expect(pasted.map((f) => f.data.length)).toEqual([4096, 4096, 1808])
+    expect(pasted.every((f) => f.type === "input")).toBe(true)
+    expect(pasted.map((f) => f.data).join("")).toBe(paste)
+
     // Disconnect terminal: polite disconnect frame, then close
     const disconnectBtn = screen.getByTestId("disconnect-browser-terminal-btn")
     fireEvent.click(disconnectBtn)
 
-    expect(JSON.parse(ws.sentMessages[5])).toEqual({ type: "disconnect" })
+    expect(JSON.parse(ws.sentMessages[8])).toEqual({ type: "disconnect" })
     expect(ws.readyState).toBe(MockWebSocket.CLOSED)
     expect(term.destroyed).toBe(true)
     expect(

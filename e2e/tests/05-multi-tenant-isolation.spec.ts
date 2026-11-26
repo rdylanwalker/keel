@@ -305,4 +305,58 @@ test.describe('05 - Multi-Tenant Namespace & Secret Isolation Guards', () => {
     ).toBeVisible();
     await expect(page.locator('#header-tenant-select option', { hasText: tenantB })).toHaveCount(1);
   });
+
+  test('05.9 - Browser SSH terminals are limited to 4 concurrent sessions per user', async ({
+    page,
+  }) => {
+    const info = await acmeDev.get('/api/v1/stacks/tenant-acme/acme-vm/ssh-info');
+    expect(info.status(), await info.text()).toBe(200);
+    await uiLogin(page, USERS.acmeDev);
+
+    const result = await page.evaluate(async () => {
+      const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
+      const url = `${scheme}://${location.host}/api/v1/stacks/tenant-acme/acme-vm/ssh/ws`;
+      const open = (): Promise<WebSocket> =>
+        new Promise((resolve, reject) => {
+          const ws = new WebSocket(url);
+          ws.onopen = () => resolve(ws);
+          ws.onerror = () => reject(new Error('WebSocket failed to open'));
+        });
+      const nextFrame = (ws: WebSocket): Promise<string> =>
+        new Promise((resolve) => {
+          ws.onmessage = (e) => resolve(String(e.data));
+          ws.onclose = () => resolve('closed');
+        });
+
+      // Four open terminals (waiting for their `connect` frame) hold the user's slots.
+      const held: WebSocket[] = [];
+      for (let i = 0; i < 4; i++) held.push(await open());
+      const fifth = await open();
+      const refused = await nextFrame(fifth);
+
+      // Closing one terminal frees its slot for a new session.
+      held.shift()?.close();
+      let accepted = '';
+      for (let attempt = 0; attempt < 50; attempt++) {
+        const ws = await open();
+        const frame = nextFrame(ws);
+        ws.send(JSON.stringify({ type: 'connect' }));
+        accepted = await frame;
+        held.push(ws);
+        if (!accepted.includes('Too many open SSH sessions')) break;
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      for (const ws of held) ws.close();
+      return { refused, accepted };
+    });
+
+    const refused = JSON.parse(result.refused);
+    expect(refused.type).toBe('error');
+    expect(refused.message).toContain('Too many open SSH sessions');
+    expect(refused.message).toContain('at most 4');
+    // The freed slot admits a real session; it stops at the stack's unresolved target, which
+    // only tenant admins may supply.
+    expect(result.accepted).not.toContain('Too many open SSH sessions');
+    expect(result.accepted).toContain('only tenant administrators may supply a target host');
+  });
 });

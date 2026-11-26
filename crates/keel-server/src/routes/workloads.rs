@@ -1573,6 +1573,10 @@ pub async fn get_stack_ssh_info(
 /// possible when the stack has no resolved endpoint) additionally requires tenant-admin
 /// privileges, and such targets must resolve to public addresses. When the stack publishes an
 /// expected host key (`sshHostKeyFingerprint` / `sshHostKey`), the server key is enforced.
+///
+/// The session is bounded by the authenticating `keel_session` (closed at its `exp` and on an
+/// auth phase change), an input idle timeout, a 64 KiB message cap and a per-user concurrent
+/// session limit (`crate::ssh::upgrade_ssh_ws`).
 pub async fn stack_ssh_ws(
     auth: AuthSession,
     State(state): State<AppState>,
@@ -1587,6 +1591,12 @@ pub async fn stack_ssh_ws(
     let policy = crate::ssh::SshSessionPolicy {
         allow_unresolved_target_override: auth.is_tenant_admin(&ssh_info.tenant),
         expected_host_key,
+        session_expires_at: Some(auth.claims.exp),
+        auth_phase: Some(crate::ssh::AuthPhaseWatch {
+            issued: auth.claims.auth_phase,
+            current: state.auth_phase.clone(),
+        }),
+        ..Default::default()
     };
     tracing::info!(
         target: "keel::audit",
@@ -1600,10 +1610,14 @@ pub async fn stack_ssh_ws(
         host_key_pinned = policy.expected_host_key.is_some(),
         "WebSocket SSH session initiated"
     );
-    let user_sub = auth.claims.sub.clone();
-    Ok(ws.on_upgrade(move |socket| {
-        crate::ssh::handle_stack_ssh_ws(socket, ssh_info, saved_ssh_key, user_sub, policy)
-    }))
+    Ok(crate::ssh::upgrade_ssh_ws(
+        ws,
+        &state.ssh_sessions,
+        ssh_info,
+        saved_ssh_key,
+        auth.claims.sub.clone(),
+        policy,
+    ))
 }
 
 /// Response body for `POST /api/v1/releases/{namespace}/{name}/reconcile`.

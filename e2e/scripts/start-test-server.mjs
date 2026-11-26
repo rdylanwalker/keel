@@ -590,6 +590,25 @@ spec:
 `,
   );
 
+  // An SSH-capable VM stack without outputs (browser terminal session limits, spec 05): its
+  // target is unresolved, so a tenant member's session stops before any SSH connection.
+  const tenantAcmeVm = path.join(workDir, 'tenants', 'acme', 'infra', 'vm');
+  fs.mkdirSync(tenantAcmeVm, { recursive: true });
+  fs.writeFileSync(
+    path.join(tenantAcmeVm, 'stack.yaml'),
+    `apiVersion: pulumi.com/v1
+kind: Stack
+metadata:
+  name: acme-vm
+  namespace: tenant-acme
+  labels:
+    keel.io/tenant: acme
+    keel.io/provider: proxmox
+spec:
+  stack: keel/acme/vm
+`,
+  );
+
   // Platform-written tenant Git source stubs (`tenants/<id>/git-repository.yaml`): tenant PKO
   // Stacks and previews clone only the tenant's own source and fail closed without one.
   for (const tenant of ['acme', 'default']) {

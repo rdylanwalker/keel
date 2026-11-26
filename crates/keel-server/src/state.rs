@@ -1583,6 +1583,8 @@ pub struct AppState {
     pub tenant_repos: crate::tenant_repos::TenantRepos,
     /// Disposable TTL cache of per-repository PR listings (with forge rate-limit back-off).
     pub proposal_cache: Arc<crate::proposal_repo::ProposalListCache>,
+    /// Open browser SSH sessions per user (concurrency limit, `crate::ssh`).
+    pub(crate) ssh_sessions: Arc<crate::ssh::SshSessionRegistry>,
 }
 
 impl AppState {
@@ -1626,6 +1628,7 @@ impl AppState {
             require_pulumi_passphrase: true,
             tenant_repos,
             proposal_cache: Arc::default(),
+            ssh_sessions: Arc::default(),
         }
     }
 

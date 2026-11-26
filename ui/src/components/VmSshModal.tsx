@@ -16,6 +16,7 @@ import {
 import { StackSshInfo } from "../types/api"
 import { fetchStackSshInfo } from "../lib/api"
 import { errorMessage } from "../lib/errors"
+import { chunkTerminalInput } from "../lib/terminalInput"
 import { cn } from "../lib/utils"
 import {
   Dialog,
@@ -198,7 +199,10 @@ export const VmSshModal: React.FC<VmSshModalProps> = ({
 
   const handleTerminalData = useCallback(
     (data: string) => {
-      sendFrame({ type: "input", data })
+      // Large pastes go out as several frames: the server ends sessions on messages > 64 KiB.
+      for (const chunk of chunkTerminalInput(data)) {
+        sendFrame({ type: "input", data: chunk })
+      }
     },
     [sendFrame]
   )

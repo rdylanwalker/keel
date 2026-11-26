@@ -33,7 +33,8 @@ pub const PKCE_COOKIE_NAME: &str = "keel_pkce";
 /// Marker cookie set on logout so the next OIDC login forces `prompt=login`.
 pub const LOGGED_OUT_COOKIE_NAME: &str = "keel_logged_out";
 
-const SESSION_TTL_SECONDS: i64 = 3600;
+/// Lifetime of a `keel_session` (seconds). Browser SSH sessions never outlive it (`crate::ssh`).
+pub(crate) const SESSION_TTL_SECONDS: i64 = 3600;
 const PKCE_TTL_SECONDS: i64 = 300;
 
 /// Authenticated session claims encrypted inside `keel_session`.
