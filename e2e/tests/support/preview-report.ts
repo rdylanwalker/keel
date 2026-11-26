@@ -63,7 +63,8 @@ export function classifyPreviewResponse(body: unknown): PreviewVerdict {
     return {
       state: 'failed',
       status,
-      reason: 'PKO preview succeeded but reported no resource changes',
+      // Keep the server's explanation (e.g. the plan could not be read from the workspace logs).
+      reason: describeReason(phase, report.run?.message ?? 'reported no resource changes'),
     };
   }
   return { state: 'succeeded', status, changes };

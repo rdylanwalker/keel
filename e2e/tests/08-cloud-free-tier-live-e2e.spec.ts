@@ -620,6 +620,17 @@ test.describe('08 - Multi-Cloud Free-Tier Dual-Guard Contract & Blueprint Valida
       ).state,
     ).toBe('failed');
 
+    const unreadablePlan = classifyPreviewResponse(
+      response({
+        source: 'pko',
+        run: { phase: 'succeeded', message: 'plan could not be read from the workspace logs' },
+        resources: [],
+      }),
+    );
+    expect(unreadablePlan.state === 'failed' && unreadablePlan.reason).toContain(
+      'plan could not be read',
+    );
+
     expect(
       classifyPreviewResponse(
         response({ source: 'pko', run: { phase: 'succeeded' }, resources: [create] }),
@@ -999,14 +1010,20 @@ test.describe('08.1 - Multi-Cloud Free-Tier Stage 1 Live E2E (kind Management Cl
       let prevLastLog = 0;
       let verdict: PreviewVerdict = { state: 'waiting', status: 'no response yet' };
       while (Date.now() - prevStart < PREVIEW_TIMEOUT_MS) {
-        const prevRes = await request.get(
-          `${BASE_URL}/api/v1/tenants/${tenant}/proposals/${prId}/preview`,
-        );
-        if (prevRes.ok()) {
-          verdict = classifyPreviewResponse(await prevRes.json());
-          if (verdict.state !== 'waiting') break;
-        } else {
-          verdict = { state: 'waiting', status: `http ${prevRes.status()}` };
+        try {
+          const prevRes = await request.get(
+            `${BASE_URL}/api/v1/tenants/${tenant}/proposals/${prId}/preview`,
+          );
+          if (prevRes.ok()) {
+            verdict = classifyPreviewResponse(await prevRes.json());
+            if (verdict.state !== 'waiting') break;
+          } else {
+            verdict = { state: 'waiting', status: `http ${prevRes.status()}` };
+          }
+        } catch (err) {
+          // A transient transport or non-JSON response must not end a long, costly cloud run.
+          const detail = err instanceof Error ? err.message.split('\n')[0] : String(err);
+          verdict = { state: 'waiting', status: `request error: ${detail.slice(0, 200)}` };
         }
         if (Date.now() - prevLastLog > 15_000) {
           const elapsed = Math.round((Date.now() - prevStart) / 1000);
