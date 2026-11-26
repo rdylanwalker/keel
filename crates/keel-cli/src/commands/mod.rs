@@ -17,9 +17,8 @@ use keel_core::CoreError;
 use keel_git::{ForgeError, GitError};
 use keel_kube::KubeError;
 use keel_pko::PkoError;
-use keel_server::SESSION_COOKIE_NAME;
 use reqwest::Client;
-use reqwest::header::{AUTHORIZATION, COOKIE};
+use reqwest::header::AUTHORIZATION;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -455,8 +454,9 @@ pub(crate) fn attach_auth(
     server_url: &str,
 ) -> reqwest::RequestBuilder {
     if let Some(token) = ctx.load_session_token(server_url) {
+        // Bearer only: the server rejects requests that also carry a `keel_session` cookie
+        // (one-credential rule).
         req.header(AUTHORIZATION, format!("Bearer {token}"))
-            .header(COOKIE, format!("{SESSION_COOKIE_NAME}={token}"))
     } else {
         req
     }
@@ -2560,6 +2560,8 @@ spec:
                 "/api/v1/releases/tenant-acme/podinfo",
                 delete(|headers: axum::http::HeaderMap| async move {
                     assert_eq!(headers.get("authorization").unwrap(), "Bearer test-bearer");
+                    // One credential only: the server rejects cookie + Bearer with 400.
+                    assert!(headers.get("cookie").is_none());
                     axum::Json(removal_response("release", "podinfo"))
                 }),
             )

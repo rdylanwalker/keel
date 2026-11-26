@@ -251,7 +251,7 @@ impl FromRequestParts<AppState> for AuthSession {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        let token = extract_session_token(&parts.headers).ok_or_else(|| {
+        let token = extract_session_token(&parts.headers)?.ok_or_else(|| {
             ServerError::Unauthorized("Missing or invalid authentication session".to_string())
         })?;
 
@@ -378,21 +378,68 @@ fn extract_cookie_value<'a>(headers: &'a HeaderMap, cookie_name: &str) -> Option
     None
 }
 
-fn extract_session_token(headers: &HeaderMap) -> Option<String> {
+/// Error message returned when a request carries both credential kinds (RD-3).
+const AMBIGUOUS_CREDENTIALS_MSG: &str = "Request carries both a keel_session cookie and an Authorization: Bearer token; send exactly one credential";
+
+/// Returns `true` when the request carries a non-empty `keel_session` cookie.
+fn has_session_cookie(headers: &HeaderMap) -> bool {
+    extract_cookie_value(headers, SESSION_COOKIE_NAME).is_some_and(|v| !v.is_empty())
+}
+
+/// Returns `true` when any `Authorization` header uses the `Bearer` scheme (case-insensitive),
+/// regardless of whether the token itself is empty or valid.
+fn has_bearer_authorization(headers: &HeaderMap) -> bool {
+    headers.get_all(AUTHORIZATION).iter().any(|v| {
+        v.to_str().ok().is_some_and(|raw| {
+            let raw = raw.trim_start();
+            raw.len() >= 6
+                && raw.as_bytes()[..6].eq_ignore_ascii_case(b"bearer")
+                && (raw.len() == 6 || raw.as_bytes()[6].is_ascii_whitespace())
+        })
+    })
+}
+
+/// Rejects requests that present both a `keel_session` cookie and an `Authorization: Bearer`
+/// header with `400 Bad Request` (RD-3). The message never echoes either credential.
+fn reject_ambiguous_credentials(headers: &HeaderMap) -> Result<(), ServerError> {
+    if has_session_cookie(headers) && has_bearer_authorization(headers) {
+        return Err(ServerError::BadRequest(
+            AMBIGUOUS_CREDENTIALS_MSG.to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Extracts the session token from a request under the **one-credential rule** (RD-3).
+///
+/// A request authenticates with exactly one credential:
+///
+/// - the browser `keel_session` cookie (`HttpOnly`, `SameSite=Strict`), which is always subject
+///   to the same-origin CSRF checks in [`csrf_origin_guard`]; or
+/// - an `Authorization: Bearer <token>` header (CLI / API clients), which browsers cannot attach
+///   cross-site without a CORS preflight and is therefore CSRF-exempt.
+///
+/// A request carrying a non-empty `keel_session` cookie **and** any `Authorization: Bearer`
+/// header (even an empty or junk token) is rejected with `400 Bad Request`, so a forged Bearer
+/// header can never switch off the CSRF checks for a cookie-authenticated request.
+///
+/// Returns `Ok(None)` when neither credential is present.
+fn extract_session_token(headers: &HeaderMap) -> Result<Option<String>, ServerError> {
+    reject_ambiguous_credentials(headers)?;
     if let Some(cookie_val) = extract_cookie_value(headers, SESSION_COOKIE_NAME)
         && !cookie_val.is_empty()
     {
-        return Some(cookie_val.to_string());
+        return Ok(Some(cookie_val.to_string()));
     }
     if let Some(auth_hdr) = headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok())
         && let Some(bearer) = auth_hdr.strip_prefix("Bearer ")
     {
         let trimmed = bearer.trim();
         if !trimmed.is_empty() {
-            return Some(trimmed.to_string());
+            return Ok(Some(trimmed.to_string()));
         }
     }
-    None
+    Ok(None)
 }
 
 /// Response body for OIDC login callback.
@@ -696,7 +743,7 @@ pub async fn auth_status(
     let mut groups = Vec::new();
     let mut is_admin = false;
 
-    if let Some(token) = extract_session_token(&headers)
+    if let Some(token) = extract_session_token(&headers)?
         && let Ok(session_key) = state.secret_store.get_or_create_session_key().await
         && let Ok(claims) = decrypt_session_token(&session_key, &token)
         && claims.exp > Utc::now().timestamp()
@@ -1491,8 +1538,11 @@ fn validate_oidc_redirect_uri(
 ///   present a same-origin `Origin`, `Referer`, or `Sec-Fetch-Site: same-origin|none`; requests
 ///   where all three are absent are rejected;
 /// - WebSocket upgrades must carry a same-origin `Origin` when cookie-authenticated;
-/// - requests authenticated with `Authorization: Bearer` (CLI) are exempt, since browsers cannot
-///   attach that header cross-site without a CORS preflight.
+/// - requests authenticated with `Authorization: Bearer` (CLI) and no session cookie are exempt,
+///   since browsers cannot attach that header cross-site without a CORS preflight;
+/// - requests carrying both the session cookie and a Bearer header are rejected with `400` for
+///   every method (one-credential rule, RD-3; see [`extract_session_token`]), so the checks above
+///   apply whenever a session cookie is present.
 pub(crate) async fn csrf_origin_guard(
     req: axum::extract::Request,
     next: axum::middleware::Next,
@@ -1506,76 +1556,68 @@ pub(crate) async fn csrf_origin_guard(
             | axum::http::Method::PATCH
     );
     let headers = req.headers();
+    reject_ambiguous_credentials(headers)?;
     let is_ws_upgrade = headers
         .get(axum::http::header::UPGRADE)
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| v.trim().eq_ignore_ascii_case("websocket"));
-    if is_mutating || is_ws_upgrade {
-        let has_bearer = headers
-            .get(AUTHORIZATION)
+    if (is_mutating || is_ws_upgrade) && has_session_cookie(headers) {
+        // Effective request authority: `Host` (HTTP/1.1) or the URI authority (HTTP/2).
+        let host_owned = headers
+            .get(axum::http::header::HOST)
             .and_then(|v| v.to_str().ok())
-            .is_some_and(|v| v.starts_with("Bearer "));
-        let has_session_cookie =
-            extract_cookie_value(headers, SESSION_COOKIE_NAME).is_some_and(|v| !v.is_empty());
+            .map(|h| h.trim().to_string())
+            .or_else(|| req.uri().authority().map(|a| a.as_str().to_string()));
+        let host = host_owned.as_deref();
+        let origin_hdr = headers
+            .get(axum::http::header::ORIGIN)
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim);
+        let referer_hdr = headers
+            .get(axum::http::header::REFERER)
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim);
+        let sec_fetch_site = headers
+            .get("sec-fetch-site")
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim);
 
-        if has_session_cookie && !has_bearer {
-            // Effective request authority: `Host` (HTTP/1.1) or the URI authority (HTTP/2).
-            let host_owned = headers
-                .get(axum::http::header::HOST)
-                .and_then(|v| v.to_str().ok())
-                .map(|h| h.trim().to_string())
-                .or_else(|| req.uri().authority().map(|a| a.as_str().to_string()));
-            let host = host_owned.as_deref();
-            let origin_hdr = headers
-                .get(axum::http::header::ORIGIN)
-                .and_then(|v| v.to_str().ok())
-                .map(str::trim);
-            let referer_hdr = headers
-                .get(axum::http::header::REFERER)
-                .and_then(|v| v.to_str().ok())
-                .map(str::trim);
-            let sec_fetch_site = headers
-                .get("sec-fetch-site")
-                .and_then(|v| v.to_str().ok())
-                .map(str::trim);
+        if let Some(site) = sec_fetch_site
+            && !site.eq_ignore_ascii_case("same-origin")
+            && !site.eq_ignore_ascii_case("none")
+        {
+            return Err(ServerError::Forbidden(
+                "Cross-site request rejected by CSRF guard".to_string(),
+            ));
+        }
 
-            if let Some(site) = sec_fetch_site
-                && !site.eq_ignore_ascii_case("same-origin")
-                && !site.eq_ignore_ascii_case("none")
-            {
+        if let Some(origin_raw) = origin_hdr {
+            let origin_url = Url::parse(origin_raw)
+                .map_err(|_| ServerError::Forbidden("Invalid Origin header".to_string()))?;
+            if !url_matches_host(&origin_url, host) {
                 return Err(ServerError::Forbidden(
-                    "Cross-site request rejected by CSRF guard".to_string(),
+                    "Cross-origin request rejected by CSRF guard".to_string(),
                 ));
             }
-
-            if let Some(origin_raw) = origin_hdr {
-                let origin_url = Url::parse(origin_raw)
-                    .map_err(|_| ServerError::Forbidden("Invalid Origin header".to_string()))?;
-                if !url_matches_host(&origin_url, host) {
-                    return Err(ServerError::Forbidden(
-                        "Cross-origin request rejected by CSRF guard".to_string(),
-                    ));
-                }
-            } else if is_ws_upgrade && host.is_some() {
+        } else if is_ws_upgrade && host.is_some() {
+            return Err(ServerError::Forbidden(
+                "WebSocket upgrade requires a same-origin Origin header".to_string(),
+            ));
+        } else if let Some(referer_raw) = referer_hdr {
+            let referer_url = Url::parse(referer_raw)
+                .map_err(|_| ServerError::Forbidden("Invalid Referer header".to_string()))?;
+            if !url_matches_host(&referer_url, host) {
                 return Err(ServerError::Forbidden(
-                    "WebSocket upgrade requires a same-origin Origin header".to_string(),
+                    "Cross-origin Referer rejected by CSRF guard".to_string(),
                 ));
-            } else if let Some(referer_raw) = referer_hdr {
-                let referer_url = Url::parse(referer_raw)
-                    .map_err(|_| ServerError::Forbidden("Invalid Referer header".to_string()))?;
-                if !url_matches_host(&referer_url, host) {
-                    return Err(ServerError::Forbidden(
-                        "Cross-origin Referer rejected by CSRF guard".to_string(),
-                    ));
-                }
-            } else if sec_fetch_site.is_none() && host.is_some() {
-                // No provenance signal at all on a cookie-authenticated mutation: fail closed.
-                // (Requests without any authority cannot originate from a browser.)
-                return Err(ServerError::Forbidden(
+            }
+        } else if sec_fetch_site.is_none() && host.is_some() {
+            // No provenance signal at all on a cookie-authenticated mutation: fail closed.
+            // (Requests without any authority cannot originate from a browser.)
+            return Err(ServerError::Forbidden(
                     "Cookie-authenticated mutation without Origin/Referer/Sec-Fetch-Site rejected by CSRF guard"
                         .to_string(),
                 ));
-            }
         }
     }
     Ok(next.run(req).await)
@@ -1995,6 +2037,37 @@ mod tests {
         assert!(status.is_admin);
         assert_eq!(status.sub.as_deref(), Some("alice"));
 
+        // One-credential rule (RD-3): a valid cookie plus any Bearer header (junk, valid, or
+        // empty) is rejected with 400 by the extractor and auth status, never echoing secrets.
+        for bearer in [
+            "Bearer junk".to_string(),
+            format!("Bearer {valid_tok}"),
+            "bearer ".to_string(),
+        ] {
+            for path in ["/protected", "/status"] {
+                let resp = app
+                    .clone()
+                    .oneshot(
+                        Request::get(path)
+                            .header(COOKIE, format!("{SESSION_COOKIE_NAME}={valid_tok}"))
+                            .header(AUTHORIZATION, bearer.as_str())
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{path} {bearer}");
+                let body = http_body_util::BodyExt::collect(resp.into_body())
+                    .await
+                    .unwrap()
+                    .to_bytes();
+                let body = String::from_utf8_lossy(&body);
+                assert!(body.contains("send exactly one credential"), "{body}");
+                assert!(!body.contains(&valid_tok), "{body}");
+                assert!(!body.contains("junk"), "{body}");
+            }
+        }
+
         // Logout clears cookies
         let resp = app
             .oneshot(Request::post("/logout").body(Body::empty()).unwrap())
@@ -2158,6 +2231,118 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn csrf_origin_guard_enforces_one_credential_rule() {
+        let app = Router::new()
+            .route(
+                "/mutate",
+                post(|| async { StatusCode::OK }).get(|| async { StatusCode::OK }),
+            )
+            .route("/ws", get(|| async { StatusCode::OK }))
+            .layer(middleware::from_fn(csrf_origin_guard));
+
+        // Cross-origin POST with cookie + junk Bearer: previously the Bearer prefix switched off
+        // the CSRF checks while the cookie authenticated the request. Now rejected with 400.
+        for (method, path, origin, upgrade) in [
+            ("POST", "/mutate", Some("https://evil.example.com"), false),
+            ("POST", "/mutate", None, false),
+            ("POST", "/mutate", Some("https://keel.local"), false),
+            ("GET", "/mutate", None, false),
+            ("GET", "/ws", Some("https://evil.example.com"), true),
+        ] {
+            let mut builder = Request::builder()
+                .method(method)
+                .uri(path)
+                .header("host", "keel.local")
+                .header(COOKIE, format!("{SESSION_COOKIE_NAME}=tok"))
+                .header(AUTHORIZATION, "Bearer junk");
+            if let Some(o) = origin {
+                builder = builder.header("origin", o);
+            }
+            if upgrade {
+                builder = builder
+                    .header("upgrade", "websocket")
+                    .header("connection", "upgrade");
+            }
+            let resp = app
+                .clone()
+                .oneshot(builder.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "{method} {path} origin={origin:?}"
+            );
+            let body = http_body_util::BodyExt::collect(resp.into_body())
+                .await
+                .unwrap()
+                .to_bytes();
+            let body = String::from_utf8_lossy(&body);
+            assert!(!body.contains("junk") && !body.contains("tok\""), "{body}");
+        }
+
+        // Same-origin cookie-only mutation still passes.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/mutate")
+                    .header("host", "keel.local")
+                    .header("origin", "https://keel.local")
+                    .header(COOKIE, format!("{SESSION_COOKIE_NAME}=tok"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Bearer-only mutation (CLI) without any Origin still passes.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/mutate")
+                    .header("host", "keel.local")
+                    .header(AUTHORIZATION, "Bearer cli-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // An empty keel_session cookie is no credential, so Bearer + empty cookie passes.
+        let resp = app
+            .oneshot(
+                Request::post("/mutate")
+                    .header("host", "keel.local")
+                    .header(COOKIE, format!("{SESSION_COOKIE_NAME}="))
+                    .header(AUTHORIZATION, "Bearer cli-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn bearer_authorization_detection_is_scheme_based() {
+        let mut h = HeaderMap::new();
+        assert!(!has_bearer_authorization(&h));
+        for (raw, expected) in [
+            ("Bearer abc", true),
+            ("bearer abc", true),
+            ("BEARER", true),
+            ("Bearer", true),
+            ("Basic dXNlcjpwYXNz", false),
+            ("Bearerx abc", false),
+        ] {
+            h.insert(AUTHORIZATION, HeaderValue::from_static(raw));
+            assert_eq!(has_bearer_authorization(&h), expected, "{raw}");
+        }
     }
 
     #[tokio::test]

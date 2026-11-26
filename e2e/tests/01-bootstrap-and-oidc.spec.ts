@@ -175,6 +175,13 @@ test.describe('01 - OIDC PKCE Auth Flow (GUI + CLI loopback)', () => {
       headers: { 'Sec-Fetch-Site': 'cross-site' },
     });
     expect(crossSite.status()).toBe(403);
+    // One-credential rule: a junk Bearer header alongside the cookie must not switch off the guard.
+    const cookieAndBearer = await page.request.post(
+      '/api/v1/tenants/default/proposals/999999/reject',
+      { headers: { Origin: 'http://evil.example', Authorization: 'Bearer junk' } },
+    );
+    expect(cookieAndBearer.status()).toBe(400);
+    expect(await cookieAndBearer.text()).not.toContain('junk');
     // Same-origin requests pass the guard and reach the handler (unknown PR -> 404).
     const sameOrigin = await page.request.post('/api/v1/tenants/default/proposals/999999/reject', {
       headers: { Origin: new URL(BASE_URL).origin },
