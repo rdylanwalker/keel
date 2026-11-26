@@ -33,6 +33,10 @@ pub(crate) const SSH_MAX_SESSION_DURATION: Duration =
 pub(crate) const SSH_MAX_SESSIONS_PER_USER: usize = 4;
 /// How often an open session re-checks the server's auth phase.
 pub(crate) const SSH_AUTH_PHASE_POLL_INTERVAL: Duration = Duration::from_secs(5);
+/// Longest a single write may stall: a browser that stops reading the WebSocket, or a remote
+/// whose SSH window stays full, would otherwise block the bridge loop and keep its deadline,
+/// idle and auth-phase checks from ever running.
+pub(crate) const SSH_WRITE_STALL_TIMEOUT: Duration = Duration::from_secs(30);
 /// Bound on SSH setup after the handshake (authentication, channel open, PTY and shell).
 const SSH_SETUP_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -120,11 +124,21 @@ pub(crate) enum SshWsServerMessage {
     Disconnected,
 }
 
-async fn send_ws_json(socket: &mut WebSocket, msg: &SshWsServerMessage) -> Result<(), axum::Error> {
-    if let Ok(json_str) = serde_json::to_string(msg) {
-        socket.send(Message::Text(json_str.into())).await?;
+/// Sends one JSON frame; fails when the socket errors or the write stalls for longer than
+/// [`SSH_WRITE_STALL_TIMEOUT`].
+async fn send_ws_json(socket: &mut WebSocket, msg: &SshWsServerMessage) -> Result<(), ()> {
+    let Ok(json_str) = serde_json::to_string(msg) else {
+        return Ok(());
+    };
+    match tokio::time::timeout(
+        SSH_WRITE_STALL_TIMEOUT,
+        socket.send(Message::Text(json_str.into())),
+    )
+    .await
+    {
+        Ok(Ok(())) => Ok(()),
+        _ => Err(()),
     }
-    Ok(())
 }
 
 /// Time limits of a browser SSH session. Production uses [`Default`] (the `SSH_*` constants);
@@ -339,7 +353,7 @@ pub(crate) fn upgrade_ssh_ws(
 async fn close_with_error(socket: &mut WebSocket, message: String) {
     let _ = send_ws_json(socket, &SshWsServerMessage::Error { message }).await;
     let _ = send_ws_json(socket, &SshWsServerMessage::Disconnected).await;
-    let _ = socket.send(Message::Close(None)).await;
+    let _ = tokio::time::timeout(SSH_WRITE_STALL_TIMEOUT, socket.send(Message::Close(None))).await;
 }
 
 /// Final SSH connection target selected for a session.
@@ -976,14 +990,23 @@ pub(crate) async fn handle_stack_ssh_ws(
                         match serde_json::from_str::<SshWsClientMessage>(&text) {
                             Ok(SshWsClientMessage::Input { data }) => {
                                 idle_deadline = Instant::now() + policy.limits.idle_timeout;
-                                if channel.data(data.as_bytes()).await.is_err() {
+                                let written = tokio::time::timeout(
+                                    SSH_WRITE_STALL_TIMEOUT,
+                                    channel.data(data.as_bytes()),
+                                )
+                                .await;
+                                if !matches!(written, Ok(Ok(()))) {
                                     let _ = send_ws_json(&mut socket, &SshWsServerMessage::Disconnected).await;
                                     break;
                                 }
                             }
                             Ok(SshWsClientMessage::Resize { cols, rows }) => {
                                 idle_deadline = Instant::now() + policy.limits.idle_timeout;
-                                let _ = channel.window_change(cols as u32, rows as u32, 0, 0).await;
+                                let _ = tokio::time::timeout(
+                                    SSH_WRITE_STALL_TIMEOUT,
+                                    channel.window_change(cols as u32, rows as u32, 0, 0),
+                                )
+                                .await;
                             }
                             Ok(SshWsClientMessage::Disconnect) => {
                                 tracing::info!(
@@ -993,7 +1016,7 @@ pub(crate) async fn handle_stack_ssh_ws(
                                     stack = %ssh_info.stack_name,
                                     "WebSocket SSH session disconnected by client"
                                 );
-                                let _ = channel.eof().await;
+                                let _ = tokio::time::timeout(SSH_WRITE_STALL_TIMEOUT, channel.eof()).await;
                                 let _ = send_ws_json(&mut socket, &SshWsServerMessage::Disconnected).await;
                                 break;
                             }
@@ -1011,7 +1034,7 @@ pub(crate) async fn handle_stack_ssh_ws(
                     }
                     // Oversized (> SSH_WS_MAX_MESSAGE_BYTES) or malformed frames end the session.
                     Some(Ok(Message::Close(_))) | Some(Err(_)) | None => {
-                        let _ = channel.eof().await;
+                        let _ = tokio::time::timeout(SSH_WRITE_STALL_TIMEOUT, channel.eof()).await;
                         break;
                     }
                     _ => {}
@@ -1019,13 +1042,13 @@ pub(crate) async fn handle_stack_ssh_ws(
             }
             () = tokio::time::sleep_until(deadline) => {
                 audit_close("deadline");
-                let _ = channel.eof().await;
+                let _ = tokio::time::timeout(SSH_WRITE_STALL_TIMEOUT, channel.eof()).await;
                 close_with_error(&mut socket, deadline_message.to_string()).await;
                 break;
             }
             () = tokio::time::sleep_until(idle_deadline) => {
                 audit_close("idle");
-                let _ = channel.eof().await;
+                let _ = tokio::time::timeout(SSH_WRITE_STALL_TIMEOUT, channel.eof()).await;
                 close_with_error(
                     &mut socket,
                     format!(
@@ -1043,7 +1066,7 @@ pub(crate) async fn handle_stack_ssh_ws(
                 };
                 if changed {
                     audit_close("auth-phase-changed");
-                    let _ = channel.eof().await;
+                    let _ = tokio::time::timeout(SSH_WRITE_STALL_TIMEOUT, channel.eof()).await;
                     close_with_error(&mut socket, AUTH_PHASE_CHANGED_MESSAGE.to_string()).await;
                     break;
                 }
