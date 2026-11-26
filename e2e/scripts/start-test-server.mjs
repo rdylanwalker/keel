@@ -218,15 +218,17 @@ function findCargoBinary() {
   return 'cargo';
 }
 
+/**
+ * Returns `target/debug/keel`, always running an incremental `cargo build` first. Reusing an
+ * existing binary without rebuilding silently tested stale code after server changes or a
+ * version bump. A no-op build takes a few seconds.
+ */
 function findKeelBinary() {
   const rootDir = path.resolve(__dirname, '../..');
   const binPath = path.join(rootDir, 'target', 'debug', 'keel');
-  if (fs.existsSync(binPath)) {
-    return binPath;
-  }
-  console.log('Building keel binary via cargo...');
+  console.log('Building keel binary via cargo (incremental)...');
   const cargoCmd = findCargoBinary();
-  const buildResult = spawnSync(cargoCmd, ['build'], {
+  const buildResult = spawnSync(cargoCmd, ['build', '--bin', 'keel'], {
     cwd: rootDir,
     stdio: 'inherit',
     shell: false,

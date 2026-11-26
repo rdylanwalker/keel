@@ -19,7 +19,8 @@ export default defineConfig({
           command: 'node ./scripts/start-test-server.mjs',
           url: `${baseURL}/healthz`,
           reuseExistingServer: !process.env.CI,
-          timeout: 60000,
+          // Covers the incremental `cargo build` in start-test-server.mjs after code changes.
+          timeout: 10 * 60 * 1000,
         },
       }),
   use: {
