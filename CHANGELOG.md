@@ -1,3 +1,14 @@
+## [0.16.1](https://github.com/rdylanwalker/keel/compare/v0.16.0...v0.16.1) (2026-11-26)
+
+### Bug Fixes
+
+* **kube:** trust only operator-written Stack outputs for SSH targets ([9464457](https://github.com/rdylanwalker/keel/commit/9464457430bf3af29b79e0b950cea87b9107fed0))
+* **server:** bound browser SSH sessions and refuse host-local targets ([8c2eab8](https://github.com/rdylanwalker/keel/commit/8c2eab8a243151b0f621a13cde8b48fb03452f04))
+* **server:** bound stalled writes in the browser SSH bridge ([f1e6524](https://github.com/rdylanwalker/keel/commit/f1e6524d494ba09de1622653d4de4d8aa2295e0b))
+* **server:** keep stored infra stack secrets and bundle catalog labels on edit ([ea6795d](https://github.com/rdylanwalker/keel/commit/ea6795d8169ae6faef6071916c9deaeb9d4caf73))
+* **server:** reject nested stack secrets and unchanged proposals ([abf397b](https://github.com/rdylanwalker/keel/commit/abf397be680619ab85e57134c6e58bd3dda76b3b))
+* **server:** reject requests carrying both a session cookie and a Bearer token ([f60c849](https://github.com/rdylanwalker/keel/commit/f60c849ea7d4d691a8894c2f839126f5f56552ee))
+
 ## [0.16.0](https://github.com/rdylanwalker/keel/compare/v0.15.0...v0.16.0) (2026-11-25)
 
 ### Features

@@ -31,7 +31,7 @@ spec:
           # to the release matching this checkout (the workspace crate version; bumped by
           # semantic-release), never the `latest` tag. Override the tag/registry via `images:` in
           # kustomization.yaml, or `spec.images` of the `flux-system/keel-server` Flux Kustomization.
-          image: ghcr.io/rdylanwalker/keel:0.16.0
+          image: ghcr.io/rdylanwalker/keel:0.16.1
           args:
             - serve
             - --bind
