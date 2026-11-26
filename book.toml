@@ -10,4 +10,5 @@ build-dir = "book"
 [output.html]
 default-theme = "navy"
 preferred-dark-theme = "navy"
+# Mermaid renders client-side and is lazy-loaded by mermaid-init.js; do not add the mdbook-mermaid preprocessor or mermaid.min.js to additional-js (5 MB per page).
 additional-js = ["mermaid-init.js"]
