@@ -2082,8 +2082,8 @@ pub fn default_ssh_user_for_provider(provider: &str) -> &'static str {
 ///
 /// Used to vet **client-supplied** SSH targets (and their DNS resolutions) so the SSH proxy cannot
 /// be abused to reach the control-plane's internal networks. Stack-resolved targets from Pulumi
-/// outputs / GitOps manifests are trusted and are *not* subject to this check (Proxmox/kind VMs
-/// legitimately live on RFC 1918 networks).
+/// outputs / GitOps manifests are trusted and only get the narrower
+/// [`is_forbidden_ssh_proxy_ip`] check (Proxmox/kind VMs legitimately live on RFC 1918 networks).
 pub fn is_private_or_internal_ip(ip: std::net::IpAddr) -> bool {
     fn v4_internal(v4: std::net::Ipv4Addr) -> bool {
         let o = v4.octets();
@@ -2141,6 +2141,77 @@ pub fn is_private_or_internal_ssh_host(host: &str) -> bool {
     }
     // Single-label hostnames resolve through the pod's cluster search domains
     // (`<svc>.<ns>.svc.cluster.local`), so they are treated as cluster-internal.
+    !lower.contains('.')
+}
+
+/// AWS Nitro instance metadata service IPv6 address (`fd00:ec2::254`).
+const AWS_IMDS_IPV6: std::net::Ipv6Addr =
+    std::net::Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254);
+
+/// Returns `true` if `ip` must never be an SSH proxy target, **even for stack-resolved (trusted)
+/// targets**: loopback, unspecified, "this network" (`0.0.0.0/8`), link-local (`169.254.0.0/16`
+/// incl. the cloud metadata endpoint `169.254.169.254`, `fe80::/10`), the AWS IPv6 metadata
+/// endpoint `fd00:ec2::254`, multicast and broadcast. IPv4-mapped (`::ffff:a.b.c.d`) and NAT64
+/// (`64:ff9b::/96`) IPv6 forms are checked as IPv4.
+///
+/// Unlike [`is_private_or_internal_ip`], RFC 1918, CGNAT and IPv6 unique-local ranges pass: trusted
+/// targets are Proxmox/kind/cloud VMs that legitimately live on private networks. These addresses
+/// only ever reach keel-server itself or the node it runs on, never a VM.
+pub fn is_forbidden_ssh_proxy_ip(ip: std::net::IpAddr) -> bool {
+    fn v4_forbidden(v4: std::net::Ipv4Addr) -> bool {
+        v4.is_loopback()
+            || v4.is_unspecified()
+            || v4.is_link_local()
+            || v4.is_multicast()
+            || v4.is_broadcast()
+            || v4.octets()[0] == 0
+    }
+    match ip {
+        std::net::IpAddr::V4(v4) => v4_forbidden(v4),
+        std::net::IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return v4_forbidden(v4);
+            }
+            let seg = v6.segments();
+            if seg[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
+                let [a, b] = seg[6].to_be_bytes();
+                let [c, d] = seg[7].to_be_bytes();
+                return v4_forbidden(std::net::Ipv4Addr::new(a, b, c, d));
+            }
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_unicast_link_local()
+                || v6.is_multicast()
+                || v6 == AWS_IMDS_IPV6
+        }
+    }
+}
+
+/// Returns `true` if `host` must never be an SSH proxy target, even when it was resolved from the
+/// stack: `localhost`/`*.localhost`, cluster-internal names (`*.svc`, `*.svc.cluster.local`,
+/// `*.cluster.local`), single-label names (in a pod they resolve through the cluster search
+/// domains to Services), or an IP literal rejected by [`is_forbidden_ssh_proxy_ip`].
+///
+/// Other names must be resolved as absolute names (no search domains) and every resolved address
+/// re-checked with [`is_forbidden_ssh_proxy_ip`] before connecting.
+pub fn is_forbidden_ssh_proxy_host(host: &str) -> bool {
+    let lower = host
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    if lower.is_empty()
+        || lower == "localhost"
+        || lower.ends_with(".localhost")
+        || lower.ends_with(".cluster.local")
+        || lower.ends_with(".svc")
+    {
+        return true;
+    }
+    if let Ok(ip) = lower.parse::<std::net::IpAddr>() {
+        return is_forbidden_ssh_proxy_ip(ip);
+    }
     !lower.contains('.')
 }
 
@@ -3011,6 +3082,61 @@ mod tests {
             assert_eq!(policy.to_string(), flux);
         }
         assert!(noyalib::from_str::<HelmCrdPolicy>("replace").is_err());
+    }
+
+    #[test]
+    fn forbidden_ssh_proxy_targets_cover_host_local_and_metadata_but_not_private_vms() {
+        for host in [
+            "127.0.0.1",
+            "127.8.9.10",
+            "0.0.0.0",
+            "0.1.2.3",
+            "169.254.169.254",
+            "169.254.0.1",
+            "224.0.0.1",
+            "255.255.255.255",
+            "::1",
+            "[::1]",
+            "::",
+            "fe80::1",
+            "ff02::1",
+            "fd00:ec2::254",
+            "::ffff:127.0.0.1",
+            "::ffff:169.254.169.254",
+            "64:ff9b::a9fe:a9fe",
+            "localhost",
+            "LOCALHOST.",
+            "foo.localhost",
+            "kubernetes",
+            "kubernetes.default.svc",
+            "keel-server.keel-system.svc.cluster.local",
+            "db.cluster.local",
+            "",
+        ] {
+            assert!(is_forbidden_ssh_proxy_host(host), "{host}");
+        }
+        // Trusted VM targets on private networks and ordinary DNS names stay reachable.
+        for host in [
+            "10.0.0.5",
+            "172.16.0.1",
+            "192.168.10.25",
+            "100.64.0.1",
+            "fd12:3456::1",
+            "fd00:ec2::253",
+            "203.0.113.10",
+            "2001:db8::1",
+            "::ffff:192.168.1.1",
+            "64:ff9b::c000:0201",
+            "pve-vm.lab.example.com",
+            "vm.acme.local",
+            "db.internal",
+        ] {
+            assert!(!is_forbidden_ssh_proxy_host(host), "{host}");
+        }
+        assert!(is_forbidden_ssh_proxy_ip(
+            "169.254.169.254".parse().unwrap()
+        ));
+        assert!(!is_forbidden_ssh_proxy_ip("10.1.2.3".parse().unwrap()));
     }
 
     #[test]

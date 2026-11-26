@@ -770,6 +770,12 @@ const CEL_NO_SUBRESOURCE: &str = "(has(request.subResource) ? request.subResourc
 /// ([`crate::live::is_stack_object_protected`], [`keel_pko::PkoStack::is_protected`]).
 const CEL_STACK_PROTECT_CONFIG_KEYS: &str = "['protect', 'keel:protect']";
 
+/// `matchConditions` term of `restrict-tenant-pulumi-objects` that lets only PKO update output
+/// Secrets through among Secrets (every other kind passes unchanged): a Secret named
+/// `*-stack-outputs` or carrying an `auto.pulumi.com/*` label on the new or old object. Other
+/// tenant Secrets never reach the webhook, so an unavailable Kyverno cannot block them.
+const CEL_PKO_OUTPUTS_SECRET_OR_NOT_SECRET: &str = "request.kind.group != '' || request.kind.kind != 'Secret' || request.name.endsWith('-stack-outputs') || (object != null && has(object.metadata.labels) && object.metadata.labels.exists(k, k.startsWith('auto.pulumi.com/'))) || (oldObject != null && has(oldObject.metadata.labels) && oldObject.metadata.labels.exists(k, k.startsWith('auto.pulumi.com/')))";
+
 /// Generates `ValidatingPolicy/restrict-tenant-pulumi-objects` (`policies.kyverno.io/v1`).
 ///
 /// The PKO chart's aggregated `edit`/`admin` roles (`rbac.createClusterAggregationRoles`, pinned
@@ -789,7 +795,13 @@ const CEL_STACK_PROTECT_CONFIG_KEYS: &str = "['protect', 'keel:protect']";
 /// * adding or changing `spec.config.protect` / `spec.config["keel:protect"]` on a `Stack` (Keel's
 ///   force-delete and preview GC treat them as protection, and previews inherit tenant config);
 ///   same keep-or-drop semantics as the label;
-/// * creating a `Stack` named `management-cluster-core` (also undeletable by name).
+/// * creating a `Stack` named `management-cluster-core` (also undeletable by name);
+/// * creating or changing a PKO update output Secret (`<update>-stack-outputs`, or any Secret
+///   labelled `auto.pulumi.com/*`). The operator copies that Secret into the Stack's
+///   `status.outputs`, which Keel trusts for SSH targets and pinned host keys
+///   ([`keel_pko::stack_status_outputs`]); a tenant replacing it before the copy could forge them.
+///   A second `matchConditions` entry ([`CEL_PKO_OUTPUTS_SECRET_OR_NOT_SECRET`]) keeps every other
+///   Secret away from the webhook.
 ///
 /// Like [`build_restrict_tenant_flux_source_status_policy`], the tenant-subject test sits inline
 /// in `matchConditions`: the PKO operator, keel-server, keel-tenant-reconciler and cluster admins
@@ -829,6 +841,12 @@ pub fn build_restrict_tenant_pulumi_objects_policy() -> Value {
                         "apiVersions": ["*"],
                         "operations": ["CREATE", "UPDATE"],
                         "resources": ["stacks", "stacks/status"]
+                    },
+                    {
+                        "apiGroups": [""],
+                        "apiVersions": ["v1"],
+                        "operations": ["CREATE", "UPDATE"],
+                        "resources": ["secrets"]
                     }
                 ]
             },
@@ -836,6 +854,10 @@ pub fn build_restrict_tenant_pulumi_objects_policy() -> Value {
                 {
                     "name": "tenant-subject",
                     "expression": cel_tenant_subject(CEL_REQUEST_USERNAME, CEL_REQUEST_GROUPS)
+                },
+                {
+                    "name": "pko-outputs-secret-only",
+                    "expression": CEL_PKO_OUTPUTS_SECRET_OR_NOT_SECRET
                 }
             ],
             "variables": [
@@ -864,6 +886,10 @@ pub fn build_restrict_tenant_pulumi_objects_policy() -> Value {
                 {
                     "expression": format!("!variables.stack || request.operation != 'CREATE' || request.name != '{core}'"),
                     "message": format!("The Stack name `{core}` is reserved for the protected management control-plane Stack.")
+                },
+                {
+                    "expression": "request.kind.group != '' || request.kind.kind != 'Secret'",
+                    "message": "Tenant identities may not create or change PKO update output Secrets (`*-stack-outputs` or labelled `auto.pulumi.com/*`): the Pulumi Kubernetes Operator writes them and copies them into the Stack status, which Keel trusts for SSH targets and host keys."
                 }
             ]
         }
@@ -2046,6 +2072,12 @@ mod tests {
                     "apiVersions": ["*"],
                     "operations": ["CREATE", "UPDATE"],
                     "resources": ["stacks", "stacks/status"]
+                },
+                {
+                    "apiGroups": [""],
+                    "apiVersions": ["v1"],
+                    "operations": ["CREATE", "UPDATE"],
+                    "resources": ["secrets"]
                 }
             ])
         );
@@ -2069,11 +2101,23 @@ mod tests {
         // Only tenant requesters reach Kyverno: the PKO operator, keel-server, the tenant
         // reconciler and admins never do (anti-lockout).
         let conds = policy["spec"]["matchConditions"].as_array().unwrap();
-        assert_eq!(conds.len(), 1);
+        assert_eq!(conds.len(), 2);
         assert_eq!(
             conds[0]["expression"].as_str().unwrap(),
             cel_tenant_subject(CEL_REQUEST_USERNAME, CEL_REQUEST_GROUPS)
         );
+        // Among Secrets only PKO update output Secrets (by name or `auto.pulumi.com/*` label, on
+        // the new or old object) reach the webhook; every other kind passes this condition.
+        let secret_cond = conds[1]["expression"].as_str().unwrap();
+        assert_eq!(conds[1]["name"], "pko-outputs-secret-only");
+        for needle in [
+            "request.kind.group != '' || request.kind.kind != 'Secret'",
+            "request.name.endsWith('-stack-outputs')",
+            "object != null && has(object.metadata.labels) && object.metadata.labels.exists(k, k.startsWith('auto.pulumi.com/'))",
+            "oldObject != null && has(oldObject.metadata.labels) && oldObject.metadata.labels.exists(k, k.startsWith('auto.pulumi.com/'))",
+        ] {
+            assert!(secret_cond.contains(needle), "{needle}");
+        }
         for platform in [
             "system:serviceaccount:keel-system:pulumi-kubernetes-operator-controller-manager",
             "system:serviceaccount:keel-system:keel-server",
@@ -2098,7 +2142,7 @@ mod tests {
             }])
         );
         let exprs = expressions(&policy);
-        assert_eq!(exprs.len(), 5);
+        assert_eq!(exprs.len(), 6);
         // 1: no auto.pulumi.com write at all.
         assert_eq!(exprs[0], "request.kind.group != 'auto.pulumi.com'");
         // 2: no Stack status write.
@@ -2146,6 +2190,17 @@ mod tests {
         // 5: the anti-lockout Stack name is reserved.
         assert!(exprs[4].contains("request.operation != 'CREATE'"));
         assert!(exprs[4].contains("request.name != 'management-cluster-core'"));
+        // 6: no tenant write to a PKO update output Secret (it feeds Stack `status.outputs`).
+        assert_eq!(
+            exprs[5],
+            "request.kind.group != '' || request.kind.kind != 'Secret'"
+        );
+        assert!(
+            policy["spec"]["validations"][5]["message"]
+                .as_str()
+                .unwrap()
+                .contains("stack-outputs")
+        );
         // The name and label match what `protect-control-plane` treats as undeletable.
         let guard = expressions(&build_protect_control_plane_policy())[0].clone();
         assert!(guard.contains(keel_pko::MANAGEMENT_CORE_STACK_NAME));

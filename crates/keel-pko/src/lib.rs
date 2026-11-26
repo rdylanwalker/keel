@@ -13,9 +13,10 @@ pub use preview::{
     ChangeOp, PreviewReport, PreviewSource, PreviewSummary, ResourceDiff, format_markdown_report,
 };
 pub use run::{
-    ANNOTATION_HEAD_SHA, ANNOTATION_REPORTED_COMMIT, PREVIEW_LOG_TAIL_LINES,
-    PREVIEW_REPORT_CONFIGMAP_KEY, PrLifecycle, PreviewPhase, PreviewRecord, PreviewRunStatus,
-    build_pko_preview_report, map_pko_preview_status, plan_preview_reconcile, select_update_name,
+    ANNOTATION_HEAD_SHA, ANNOTATION_REPORTED_COMMIT, PKO_SECRET_OUTPUT_PLACEHOLDER,
+    PREVIEW_LOG_TAIL_LINES, PREVIEW_REPORT_CONFIGMAP_KEY, PrLifecycle, PreviewPhase, PreviewRecord,
+    PreviewRunStatus, build_pko_preview_report, map_pko_preview_status, plan_preview_reconcile,
+    select_update_name, stack_status_outputs,
 };
 pub use stack::{
     ANNOTATION_RECONCILE_REQUEST, CONFIG_PROTECT_KEYS, CrObjectMeta, DEFAULT_FLUX_POLL_INTERVAL,

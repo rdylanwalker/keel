@@ -287,7 +287,8 @@ pub trait LiveStatusSource: Send + Sync {
         ))
     }
 
-    /// Reads the `<name>-outputs` Kubernetes `Secret` (if present) for a PKO `Stack` in `namespace`.
+    /// Returns the exported outputs of a PKO `Stack` in `namespace` from its operator-written
+    /// `status.outputs` ([`keel_pko::stack_status_outputs`]); never from tenant-writable Secrets.
     async fn stack_outputs(&self, _namespace: &str, _name: &str) -> HashMap<String, String> {
         HashMap::new()
     }
@@ -391,24 +392,6 @@ impl KubeClusterStatusReader {
         let data = secret.data?;
         let bytes = data.get(key)?;
         String::from_utf8(bytes.0.clone()).ok()
-    }
-
-    /// Reads all UTF-8 key-value pairs from a Kubernetes `Secret` (such as `<stack>-outputs`).
-    pub async fn read_secret_map(&self, namespace: &str, name: &str) -> HashMap<String, String> {
-        use k8s_openapi::api::core::v1::Secret;
-        let secrets: Api<Secret> = Api::namespaced(self.client.clone(), namespace);
-        let Ok(secret) = secrets.get(name).await else {
-            return HashMap::new();
-        };
-        let mut out = HashMap::new();
-        if let Some(data) = secret.data {
-            for (k, bytes) in data {
-                if let Ok(val) = String::from_utf8(bytes.0) {
-                    out.insert(k, val);
-                }
-            }
-        }
-        out
     }
 
     async fn collect_canary_statuses_for_client(
@@ -1484,48 +1467,24 @@ impl LiveStatusSource for KubeClusterStatusReader {
     }
 
     async fn stack_outputs(&self, namespace: &str, name: &str) -> HashMap<String, String> {
-        let secret_name = format!("{name}-outputs");
-        let direct = self.read_secret_map(namespace, &secret_name).await;
-        if !direct.is_empty() {
-            return direct;
-        }
-        use k8s_openapi::api::core::v1::Secret;
-        let secrets: Api<Secret> = Api::namespaced(self.client.clone(), namespace);
-        let lp = ListParams::default().labels("auto.pulumi.com/component=update");
-        let Ok(list) = secrets.list(&lp).await else {
+        // Only the operator-written `status.outputs` is trusted. Secrets in the tenant namespace
+        // (`<stack>-outputs`, the PKO `<update>-stack-outputs`) are writable by anything the
+        // tenant deploys, so they could forge SSH targets and pinned host keys.
+        let ar = ApiResource {
+            group: "pulumi.com".to_string(),
+            version: "v1".to_string(),
+            api_version: "pulumi.com/v1".to_string(),
+            kind: "Stack".to_string(),
+            plural: "stacks".to_string(),
+        };
+        let api: Api<DynamicObject> = Api::namespaced_with(self.client.clone(), namespace, &ar);
+        let Ok(stack) = api.get(name).await else {
             return HashMap::new();
         };
-        let prefix = format!("{name}-");
-        let suffix = "-stack-outputs";
-        let latest = list
-            .items
-            .into_iter()
-            .filter(|s| {
-                s.metadata
-                    .name
-                    .as_deref()
-                    .is_some_and(|n| n.starts_with(&prefix) && n.ends_with(suffix))
-            })
-            .max_by_key(|s| {
-                s.metadata
-                    .resource_version
-                    .as_deref()
-                    .and_then(|rv| rv.parse::<u64>().ok())
-                    .unwrap_or(0)
-            });
-        let mut out = HashMap::new();
-        if let Some(secret) = latest
-            && let Some(data) = secret.data
-        {
-            for (k, bytes) in data {
-                if let Ok(raw) = String::from_utf8(bytes.0) {
-                    let parsed = serde_json::from_str::<String>(&raw)
-                        .unwrap_or_else(|_| raw.trim().trim_matches('"').to_string());
-                    out.insert(k, parsed);
-                }
-            }
-        }
-        out
+        let Ok(value) = serde_json::to_value(&stack) else {
+            return HashMap::new();
+        };
+        keel_pko::stack_status_outputs(&value).into_iter().collect()
     }
 
     async fn delete_dynamic_resource(
@@ -3086,13 +3045,12 @@ current-context: workload
                 .as_deref(),
             Some("10.0.0.5")
         );
-        assert_eq!(
+        // A `<stack>-outputs` Secret is tenant-writable and never an output source.
+        assert!(
             reader
                 .stack_outputs("tenant-a", "my-stack")
                 .await
-                .get("endpoint")
-                .map(String::as_str),
-            Some("10.0.0.5")
+                .is_empty()
         );
         assert_eq!(
             reader
@@ -3308,6 +3266,115 @@ current-context: workload
         let doc = serde_json::to_value(&stack).unwrap();
         assert!(stack.is_protected());
         assert_eq!(is_stack_manifest_protected(&doc), stack.is_protected());
+    }
+
+    /// RD-1: a Secret an app in the tenant namespace planted (`<stack>-outputs`, or a fake PKO
+    /// `<stack>-<update>-stack-outputs` with the operator's label and an ownerReference copied from
+    /// a real `Update`) must never become the SSH target or pinned host key. Only the
+    /// operator-written Stack `status.outputs` counts.
+    #[tokio::test]
+    async fn stack_outputs_ignore_forged_tenant_secrets_and_read_stack_status() {
+        fn secret(name: &str, labels: Value, host: &str) -> Value {
+            let b64 = |s: &str| {
+                base64::Engine::encode(&base64::engine::general_purpose::STANDARD, s.as_bytes())
+            };
+            json!({
+                "apiVersion": "v1",
+                "kind": "Secret",
+                "metadata": {
+                    "name": name,
+                    "namespace": "tenant-a",
+                    "resourceVersion": "999999",
+                    "labels": labels,
+                    "ownerReferences": [{
+                        "apiVersion": "auto.pulumi.com/v1alpha1",
+                        "kind": "Update",
+                        "name": "vm-1a2b3c",
+                        "uid": "11111111-2222-3333-4444-555555555555"
+                    }]
+                },
+                "data": {
+                    "sshHost": b64(&format!("\"{host}\"")),
+                    "sshHostKeyFingerprint": b64("\"SHA256:forged\"")
+                }
+            })
+        }
+        let forged_direct = secret("vm-outputs", json!({}), "127.0.0.1");
+        let forged_update = secret(
+            "vm-1a2b3c-stack-outputs",
+            json!({ "auto.pulumi.com/component": "update" }),
+            "169.254.169.254",
+        );
+        let url = spawn_mock_k8s_server(move |method, path| {
+            let path_only = path.split('?').next().unwrap_or(path);
+            match (method, path_only) {
+                ("GET", "/api/v1/namespaces/tenant-a/secrets/vm-outputs") => {
+                    (200, forged_direct.to_string())
+                }
+                ("GET", "/api/v1/namespaces/tenant-a/secrets") => (
+                    200,
+                    json!({
+                        "apiVersion": "v1",
+                        "kind": "SecretList",
+                        "metadata": {},
+                        "items": [forged_update]
+                    })
+                    .to_string(),
+                ),
+                ("GET", "/apis/pulumi.com/v1/namespaces/tenant-a/stacks/vm") => (
+                    200,
+                    json!({
+                        "apiVersion": "pulumi.com/v1",
+                        "kind": "Stack",
+                        "metadata": { "name": "vm", "namespace": "tenant-a" },
+                        "spec": {},
+                        "status": {
+                            "lastUpdate": { "name": "vm-1a2b3c", "state": "succeeded" },
+                            "outputs": {
+                                "sshHost": "203.0.113.10",
+                                "sshPort": 22,
+                                "sshHostKeyFingerprint": "SHA256:genuine",
+                                "rootPassword": "[secret]"
+                            }
+                        }
+                    })
+                    .to_string(),
+                ),
+                ("GET", "/apis/pulumi.com/v1/namespaces/tenant-a/stacks/bare") => (
+                    200,
+                    json!({
+                        "apiVersion": "pulumi.com/v1",
+                        "kind": "Stack",
+                        "metadata": { "name": "bare", "namespace": "tenant-a" },
+                        "spec": {}
+                    })
+                    .to_string(),
+                ),
+                _ => (
+                    404,
+                    json!({ "kind": "Status", "status": "Failure", "code": 404, "message": "not found", "reason": "NotFound" }).to_string(),
+                ),
+            }
+        })
+        .await;
+        let reader = KubeClusterStatusReader::from_client(mock_k8s_client(&url));
+
+        let outputs = reader.stack_outputs("tenant-a", "vm").await;
+        assert_eq!(
+            outputs.get("sshHost").map(String::as_str),
+            Some("203.0.113.10")
+        );
+        assert_eq!(
+            outputs.get("sshHostKeyFingerprint").map(String::as_str),
+            Some("SHA256:genuine")
+        );
+        assert_eq!(outputs.get("sshPort").map(String::as_str), Some("22"));
+        assert!(!outputs.contains_key("rootPassword"));
+
+        // No operator-written outputs yet: the planted Secrets still do not count.
+        assert!(reader.stack_outputs("tenant-a", "bare").await.is_empty());
+        // Unknown Stack: nothing.
+        assert!(reader.stack_outputs("tenant-a", "ghost").await.is_empty());
     }
 
     #[tokio::test]

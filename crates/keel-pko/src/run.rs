@@ -155,6 +155,35 @@ pub fn select_update_name(stack: &Value) -> Option<String> {
     str_at(stack, "/status/currentUpdate/name").or_else(|| str_at(stack, "/status/lastUpdate/name"))
 }
 
+/// Placeholder PKO writes into `Stack` `status.outputs` for outputs Pulumi marks secret.
+pub const PKO_SECRET_OUTPUT_PLACEHOLDER: &str = "[secret]";
+
+/// Returns the exported outputs of a live PKO v2 `Stack` from its `status.outputs`.
+///
+/// Only the Pulumi Kubernetes Operator writes `status.outputs`: on a successful update it copies
+/// the update's `<update>-stack-outputs` Secret into the Stack status, masking secret outputs as
+/// [`PKO_SECRET_OUTPUT_PLACEHOLDER`]. Tenant identities cannot write `stacks/status` (Kyverno
+/// `restrict-tenant-pulumi-objects`), so unlike a Secret in the tenant namespace these values
+/// cannot be forged by an app deployed into the tenant. String outputs are returned as-is, other
+/// JSON values in compact JSON form; masked secret outputs and `null`s are skipped.
+pub fn stack_status_outputs(stack: &Value) -> BTreeMap<String, String> {
+    let Some(outputs) = stack.pointer("/status/outputs").and_then(Value::as_object) else {
+        return BTreeMap::new();
+    };
+    outputs
+        .iter()
+        .filter_map(|(key, value)| {
+            let text = match value {
+                Value::Null => return None,
+                Value::String(s) if s == PKO_SECRET_OUTPUT_PLACEHOLDER => return None,
+                Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            Some((key.clone(), text))
+        })
+        .collect()
+}
+
 /// Maps a live PKO `Stack` object (and optionally its latest `Update`) to a [`PreviewRunStatus`].
 ///
 /// Precedence: an `Update` with terminal conditions is authoritative; otherwise `Stack`
@@ -583,6 +612,42 @@ mod tests {
     use super::*;
     use crate::gc::PreviewResourceKind;
     use crate::preview::ChangeOp;
+
+    #[test]
+    fn stack_status_outputs_reads_operator_written_status_only() {
+        let stack = json!({
+            "spec": { "config": { "sshHost": "10.9.9.9" } },
+            "status": {
+                "outputs": {
+                    "sshHost": "203.0.113.10",
+                    "sshPort": 2222,
+                    "ready": true,
+                    "tags": { "env": "prod" },
+                    "adminPassword": "[secret]",
+                    "nothing": null
+                }
+            }
+        });
+        let outputs = stack_status_outputs(&stack);
+        assert_eq!(
+            outputs.get("sshHost").map(String::as_str),
+            Some("203.0.113.10")
+        );
+        assert_eq!(outputs.get("sshPort").map(String::as_str), Some("2222"));
+        assert_eq!(outputs.get("ready").map(String::as_str), Some("true"));
+        assert_eq!(
+            outputs.get("tags").map(String::as_str),
+            Some(r#"{"env":"prod"}"#)
+        );
+        // Masked secret outputs and nulls are not usable outputs.
+        assert!(!outputs.contains_key("adminPassword"));
+        assert!(!outputs.contains_key("nothing"));
+        assert_eq!(outputs.len(), 4);
+
+        assert!(stack_status_outputs(&json!({ "status": {} })).is_empty());
+        assert!(stack_status_outputs(&json!({ "status": { "outputs": "x" } })).is_empty());
+        assert!(stack_status_outputs(&json!({})).is_empty());
+    }
 
     fn preview_stack(generation: i64, status: Value) -> Value {
         json!({

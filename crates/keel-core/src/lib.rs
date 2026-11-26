@@ -63,8 +63,9 @@ pub use models::{
     OIDC_CLIENT_ID_ENV, OIDC_CLIENT_SECRET_ENV, OIDC_ISSUER_URL_ENV, OIDC_REDIRECT_URL_ENV,
     OidcConfig, PlacementScope, PlacementSpec, ProgressiveDeliverySpec, ProviderRegistry,
     StackSshInfoResponse, UpstreamSource, clean_candidate_ssh_host, clean_candidate_ssh_user,
-    is_private_or_internal_ip, is_private_or_internal_ssh_host, is_unresolved_ssh_target,
-    resolve_ssh_host_key_from_sources, resolve_ssh_target_from_sources, validate_https_origin,
+    is_forbidden_ssh_proxy_host, is_forbidden_ssh_proxy_ip, is_private_or_internal_ip,
+    is_private_or_internal_ssh_host, is_unresolved_ssh_target, resolve_ssh_host_key_from_sources,
+    resolve_ssh_target_from_sources, validate_https_origin,
 };
 pub use secret_heuristic::{
     HeuristicPartition, KEY_NAME_SUBJECTS, PASS_NON_SECRETS, REFERENCE_SUFFIXES, SECRET_KEY_WORDS,
